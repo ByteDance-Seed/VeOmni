@@ -227,6 +227,7 @@ class EnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
             parallel_state=self.parallel_state,
+            dpo_provenance_enabled=getattr(getattr(args, "dpo_config", None), "explicit_segment_provenance", False),
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:

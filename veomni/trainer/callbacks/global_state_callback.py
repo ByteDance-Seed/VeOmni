@@ -136,7 +136,7 @@ class GlobalStateCallback(Callback):
         offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
         offline_cache_writer_state = offline_cache_writer.state_dict() if offline_cache_writer is not None else None
 
-        return {
+        result = {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
             "environ_meter": self.trainer.environ_meter.state_dict(),
@@ -145,6 +145,12 @@ class GlobalStateCallback(Callback):
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
+        dpo_protocol = getattr(type(self.trainer), "dpo_provenance_checkpoint_state", None)
+        if callable(dpo_protocol):
+            dpo_protocol_state = dpo_protocol(self.trainer)
+            if dpo_protocol_state is not None:
+                result["dpo_provenance_protocol"] = dpo_protocol_state
+        return result
 
     def save_global_state(self, state: TrainerState) -> None:
         """Clear the step's manifest, write this rank's cursor files, write it back.
@@ -262,6 +268,12 @@ class GlobalStateCallback(Callback):
                 from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
 
                 legacy_state = apply_legacy_global_state(load_path, self.rank)
+            loaded_state = current_state if current_state is not None else legacy_state
+            validator = getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None)
+            if callable(validator):
+                validator(
+                    self.trainer, loaded_state.get("dpo_provenance_protocol") if loaded_state is not None else None
+                )
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e

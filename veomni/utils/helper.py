@@ -47,6 +47,7 @@ from .device import (
     get_torch_device,
 )
 from .dist_utils import all_reduce
+from .dpo_provenance import DPO_APPROVED_KEY, DPOPackedProof
 from .multisource_utils import parse_multisource_config
 from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
@@ -87,7 +88,10 @@ logger = logging.get_logger(__name__)
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "veomni")))
 
 
-def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"], dpo_provenance_enabled: bool = False) -> List[int]:
+    approved = micro_batch.get(DPO_APPROVED_KEY) if dpo_provenance_enabled else None
+    if isinstance(approved, DPOPackedProof):
+        return list(approved.segment_lengths)
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
         tail_padding_length = micro_batch.get("tail_padding_length")
@@ -232,10 +236,12 @@ class EnvironMeter:
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
         parallel_state: Optional["ParallelState"] = None,
+        dpo_provenance_enabled: bool = False,
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
         self.enable_multisource = enable_multisource
+        self.dpo_provenance_enabled = dpo_provenance_enabled
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
 
@@ -245,6 +251,7 @@ class EnvironMeter:
         self.consume_chunks = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
+        self.batch_source_seqlens = []
         self.images_seqlens = []
 
         if self.enable_multisource:
@@ -287,15 +294,25 @@ class EnvironMeter:
         if getattr(self.config, "condition_model_type", None) is None:  # hf model
             if isinstance(micro_batch, List):
                 for sample in micro_batch:
-                    self.batch_seqlens.extend(_compute_seqlens(sample))
+                    seq_lens = _compute_seqlens(sample, self.dpo_provenance_enabled)
+                    self.batch_seqlens.extend(seq_lens)
                     self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
                     if self.enable_multisource:
                         self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+                        approved = sample.get(DPO_APPROVED_KEY) if self.dpo_provenance_enabled else None
+                        self.batch_source_seqlens.extend(
+                            approved.feature_token_counts if isinstance(approved, DPOPackedProof) else seq_lens
+                        )
             else:
-                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+                seq_lens = _compute_seqlens(micro_batch, self.dpo_provenance_enabled)
+                self.batch_seqlens.extend(seq_lens)
                 self.images_seqlens.extend(_compute_image_seqlens(micro_batch, self.config))
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+                    approved = micro_batch.get(DPO_APPROVED_KEY) if self.dpo_provenance_enabled else None
+                    self.batch_source_seqlens.extend(
+                        approved.feature_token_counts if isinstance(approved, DPOPackedProof) else seq_lens
+                    )
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
@@ -357,7 +374,8 @@ class EnvironMeter:
         metrics.update(compute_device_memory_metrics())
 
         if self.enable_multisource:
-            metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
+            source_seqlens = self.batch_source_seqlens if self.batch_source_seqlens else self.batch_seqlens
+            metrics.update(self.multisource_tracker.step(self.batch_ds_idx, source_seqlens))
 
         if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
             empty_cache()
@@ -367,6 +385,7 @@ class EnvironMeter:
 
         self.batch_seqlens = []
         self.batch_ds_idx = []
+        self.batch_source_seqlens = []
         self.images_seqlens = []
 
         return metrics
