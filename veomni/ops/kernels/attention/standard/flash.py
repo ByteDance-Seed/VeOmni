@@ -203,14 +203,15 @@ def flash_attention_forward(
             )
         if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
             raise NotImplementedError("USP does not support attention weights or head masks.")
-        from .....distributed.sequence_parallel.ring_attention import FA_BACKEND
+        from .....distributed.sequence_parallel.ring_attention import resolve_ring_backend
 
         selected_ring_impl = kwargs.get("implementation") or module.config._attn_implementation
         expected_backend = {"flash_attention_2": "fa2", "flash_attention_4": "fa4"}.get(
             selected_ring_impl.removeprefix("veomni_")
         )
-        if expected_backend is None or FA_BACKEND != expected_backend:
-            raise NotImplementedError(f"USP ring backend {FA_BACKEND!r} does not match {selected_ring_impl!r}.")
+        if expected_backend is None:
+            raise NotImplementedError(f"USP does not support {selected_ring_impl!r}.")
+        ring_backend = resolve_ring_backend(expected_backend)
         if kwargs.get("cu_seq_lens_q") is not None and kwargs["cu_seq_lens_q"].numel() > 2:
             if query.shape[0] != 1 or any(
                 kwargs.get(name) is None for name in ("usp_cu_seqlens", "usp_max_seqlen", "usp_half0", "usp_half1")
@@ -284,6 +285,7 @@ def flash_attention_forward(
                 softmax_scale=scaling,
                 group=cp_state.cp_group,
                 half_indices=(kwargs["usp_half0"], kwargs["usp_half1"]),
+                backend=ring_backend,
             ).unsqueeze(0)
         else:
             attn_output = zigzag_ring_flash_attn_func(
@@ -292,6 +294,7 @@ def flash_attention_forward(
                 value,
                 softmax_scale=scaling,
                 group=cp_state.cp_group,
+                backend=ring_backend,
             )
     else:
         attn_output = _flash_attention_forward(

@@ -188,3 +188,109 @@ def test_installed_ops_cannot_bypass_usp_with_plain_attention(monkeypatch, backe
     config.model_type = "qwen3"
     with pytest.raises(NotImplementedError, match="VeOmni FlashAttention"):
         auto.build_foundation_model(config, attn_implementation=backend, init_device="meta")
+
+
+@pytest.mark.parametrize("kind", ["plain", "zigzag", "varlen"])
+def test_ring_pins_backend_through_interleaved_backward(monkeypatch, kind):
+    from veomni.distributed.sequence_parallel import ring_attention as ring
+
+    monkeypatch.setattr(ring, "FA_BACKENDS", frozenset({"fa2", "fa4"}))
+    monkeypatch.setattr(ring, "FA_BACKEND", "fa2")
+    calls = []
+
+    def forward(group, q, k, v, *args, backend):
+        calls.append(("forward", backend))
+        return q + k + v, torch.zeros(1)
+
+    def backward(group, dout, q, k, v, *args, backend):
+        calls.append(("backward", backend))
+        return dout, dout, dout
+
+    prefix = {"plain": "_ring", "zigzag": "_zigzag_ring", "varlen": "_zigzag_ring_varlen"}[kind]
+    monkeypatch.setattr(ring, prefix + "_forward", forward)
+    monkeypatch.setattr(ring, prefix + "_backward", backward)
+    func = {
+        "plain": ring.ring_flash_attn_func,
+        "zigzag": ring.zigzag_ring_flash_attn_func,
+        "varlen": ring.zigzag_ring_flash_attn_varlen_func,
+    }[kind]
+    shape = (8, 2, 4) if kind == "varlen" else (1, 8, 2, 4)
+    inputs = [torch.ones(shape, requires_grad=True) for _ in range(3)]
+    args = (torch.tensor([0, 8], dtype=torch.int32), 8) if kind == "varlen" else ()
+    first = func(*inputs, *args, group=object(), backend="fa4")
+    second = func(*inputs, *args, group=object(), backend="fa2")
+    monkeypatch.setattr(ring, "FA_BACKEND", "fa4")
+    second.sum().backward()
+    first.sum().backward()
+    assert calls == [("forward", "fa4"), ("forward", "fa2"), ("backward", "fa2"), ("backward", "fa4")]
+    for tensor in inputs:
+        torch.testing.assert_close(tensor.grad, torch.full_like(tensor, 2.0))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_flash_selects_explicit_fa4_when_both_backends_exist(monkeypatch, packed):
+    from veomni.distributed.sequence_parallel import ring_attention as ring
+
+    monkeypatch.setattr(ring, "FA_BACKENDS", frozenset({"fa2", "fa4"}))
+    monkeypatch.setattr(ring, "FA_BACKEND", "fa2")
+    monkeypatch.setattr(
+        flash, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", cp_group=object())
+    )
+    monkeypatch.setattr(flash, "should_apply_ulysses", lambda **kwargs: False)
+    calls = []
+
+    def selected(query, *args, backend, **kwargs):
+        calls.append(backend)
+        return query
+
+    monkeypatch.setattr(ring, "zigzag_ring_flash_attn_func", selected)
+    monkeypatch.setattr(ring, "zigzag_ring_flash_attn_varlen_func", selected)
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2"), is_causal=True)
+    q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
+    kwargs = {}
+    if packed:
+        from veomni.distributed.sequence_parallel.data import prepare_usp_metadata
+
+        cu = torch.tensor([0, 8, 16], dtype=torch.int32)
+        kwargs.update(prepare_usp_metadata(cu, cp_size=2), cu_seq_lens_q=cu)
+    flash.flash_attention_forward(module, q, q, q, None, implementation="veomni_flash_attention_4", **kwargs)
+    assert calls == ["fa4"]
+
+
+@pytest.mark.parametrize("primitive", ["forward", "backward"])
+@pytest.mark.parametrize("missing", ["window_size_left", "window_size_right", "cu_seqlens_k", "max_seqlen_k"])
+def test_fa4_probe_rejects_missing_wrapper_arguments(primitive, missing):
+    import inspect
+
+    from veomni.distributed.sequence_parallel import ring_attention as ring
+
+    shared = {
+        "softmax_scale",
+        "causal",
+        "window_size_left",
+        "window_size_right",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "max_seqlen_q",
+        "max_seqlen_k",
+    }
+
+    def forward():
+        pass
+
+    def backward():
+        pass
+
+    parameters = {"forward": shared | {"return_lse"}, "backward": shared | {"dq", "dk", "dv"}}
+
+    def set_signatures():
+        for name, function in (("forward", forward), ("backward", backward)):
+            function.__signature__ = inspect.Signature(
+                inspect.Parameter(key, inspect.Parameter.KEYWORD_ONLY) for key in sorted(parameters[name])
+            )
+
+    set_signatures()
+    assert ring._supports_fa4_interface(forward, backward)
+    parameters[primitive].remove(missing)
+    set_signatures()
+    assert not ring._supports_fa4_interface(forward, backward)

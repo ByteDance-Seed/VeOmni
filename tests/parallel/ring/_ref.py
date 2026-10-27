@@ -42,8 +42,8 @@ ATTN_IMPL_WITH_SP = {
 }.get(FA_BACKEND)
 
 
-def _import_backend_funcs():
-    if FA_BACKEND == "fa4":
+def _import_backend_funcs(backend=None):
+    if (backend or FA_BACKEND) == "fa4":
         from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
         return flash_attn_func, flash_attn_varlen_func
@@ -57,15 +57,15 @@ def _unwrap(out):
     return out[0] if isinstance(out, (tuple, list)) else out
 
 
-def ref_attn_func(q, k, v, softmax_scale, causal=True):
+def ref_attn_func(q, k, v, softmax_scale, causal=True, backend=None):
     """Single-device dense causal attention. ``q/k/v`` are ``(b, s, h, d)``."""
-    flash_attn_func, _ = _import_backend_funcs()
+    flash_attn_func, _ = _import_backend_funcs(backend)
     return _unwrap(flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal))
 
 
-def ref_attn_varlen_func(q, k, v, cu_seqlens, max_seqlen, softmax_scale, causal=True):
+def ref_attn_varlen_func(q, k, v, cu_seqlens, max_seqlen, softmax_scale, causal=True, backend=None):
     """Single-device packed varlen causal attention. ``q/k/v`` are ``(total, h, d)``."""
-    _, flash_attn_varlen_func = _import_backend_funcs()
+    _, flash_attn_varlen_func = _import_backend_funcs(backend)
     return _unwrap(
         flash_attn_varlen_func(
             q,

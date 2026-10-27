@@ -267,6 +267,9 @@ Core files:
   `MODELING_BACKEND=veomni`. RL/DPO, deterministic backward and
   unsupported attention modifiers must fail before training rather than silently
   using a different attention function.
+- Ring detects FA2/FA4 independently and uses the configured backend, saved on
+  the autograd context for backward. Package import order must not override an
+  explicit implementation.
 - Packed USP half indices and CP-local offsets are computed on CPU in the
   collator and passed with the batch; do not rebuild them using GPU scalar reads
   or dynamic boolean indexing in every attention layer.

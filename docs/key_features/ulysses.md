@@ -453,15 +453,16 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   padding is coalesced into one aligned segment. The lower-level USP reorder
   helpers still validate the invariant and reject manually constructed
   unaligned batches.
-- **Flash-attention backend**: ring attention builds on a `flash_attn`
-  forward/backward pair, auto-selected at import time (FA2 when installed, otherwise FA4) (see `FA_BACKEND` in
-  `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
-  Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
-  Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
-  used by the ring path. The configured attention implementation must match the detected backend.
-  For an FA4 Ring backend (including Blackwell/GB200), add
+- **Flash-attention backend**: Ring uses the implementation selected by
+  `model.ops_implementation.attn_implementation`. FA2 and FA4 are detected
+  independently, so installing both does not override an explicit FA4 choice.
+  The selected backend is saved for backward; unavailable or incompatible
+  primitives are rejected before communication. FA3 is not a Ring backend.
+  The example YAML selects FA2. For FA4 (including Blackwell/GB200), add
   `--model.ops_implementation.attn_implementation flash_attention_4` to the command
-  above; the example YAML defaults to FA2. FA4 requires separate hardware validation.
+  above. Blackwell requires separate hardware validation.
+  Direct Ring primitive callers can pass `backend="fa2"` or `backend="fa4"`;
+  omitting it retains the default of FA2 when installed, otherwise FA4.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out

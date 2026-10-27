@@ -39,7 +39,13 @@ from scripts.ci.accelerator.pytest_plugin import validate_launch
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
-if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
+if not c10d.is_available():
+    pytest.skip("torch.distributed unavailable", allow_module_level=True)
+try:
+    _DIST_BACKEND = get_dist_comm_backend()
+except RuntimeError as exc:
+    pytest.skip(f"distributed accelerator backend unavailable: {exc}", allow_module_level=True)
+if not c10d.is_backend_available(_DIST_BACKEND):
     pytest.skip("c10d backend unavailable", allow_module_level=True)
 
 import torch.distributed as dist
@@ -55,9 +61,11 @@ from veomni.distributed.sequence_parallel.data import (
     zigzag_reorder_varlen,
 )
 from veomni.distributed.sequence_parallel.ring_attention import (
+    FA_BACKENDS,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
 )
+from veomni.ops.platform.gpu import NvidiaGpuPlatform
 
 from ..ulysses.utils import SequenceParallelTest
 from ._ref import ATTN_IMPL_WITH_SP, ref_attn_func, ref_attn_varlen_func
@@ -136,7 +144,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
     def _init(self):
         store = dist.FileStore(self.file_name, self.world_size)
         get_torch_device().set_device(self.rank)
-        c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
+        c10d.init_process_group(_DIST_BACKEND, store=store, rank=self.rank, world_size=self.world_size)
 
     def _run_case(self):
         self._init()
@@ -219,18 +227,21 @@ class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
 class _AttnModule(torch.nn.Module):
     """Minimal module exposing the attributes flash_attention_forward reads."""
 
-    def __init__(self):
+    def __init__(self, implementation=ATTN_IMPL_WITH_SP):
         super().__init__()
         self.is_causal = True
 
         class _Cfg:
-            _attn_implementation = ATTN_IMPL_WITH_SP
+            _attn_implementation = implementation
 
         self.config = _Cfg()
         self.layer_idx = 0
 
 
 class USPAttentionE2ETest(MultiProcessTestCase):
+    backend = None
+    attn_implementation = ATTN_IMPL_WITH_SP
+
     def ci_launch_plan(self):
         return LaunchSpec(nproc=self.world_size)
 
@@ -247,7 +258,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
     def _init(self):
         store = dist.FileStore(self.file_name, self.world_size)
         get_torch_device().set_device(self.rank)
-        c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
+        c10d.init_process_group(_DIST_BACKEND, store=store, rank=self.rank, world_size=self.world_size)
         mesh = init_device_mesh(get_device_type(), (CP, ULYSSES), mesh_dim_names=("cp", "ulysses"))
         mesh[("cp", "ulysses")]._flatten(mesh_dim_name="sp")
         state = PS.ParallelState(
@@ -304,6 +315,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             v.transpose(1, 2).contiguous(),
             scale,
             causal=True,
+            backend=self.backend,
         )  # (b, s, h, d)
 
         # local shards in (b, h, s_local, d) as the model produces pre-op
@@ -316,7 +328,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         lk = shard_bhsd(k).requires_grad_(True)
         lv = shard_bhsd(v).requires_grad_(True)
 
-        module = _AttnModule().to(dev)
+        module = _AttnModule(self.attn_implementation).to(dev)
         out, _ = flash_attention_forward(module, lq, lk, lv, attention_mask=None, scaling=scale)
         # out is (b, s_local, h, d)
         ref_local = self._usp_slice(ref, mesh)
@@ -376,6 +388,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             max_seqlen,
             scale,
             causal=True,
+            backend=self.backend,
         ).reshape(b, seq, h, d)
 
         def shard_bhsd(full_bhsd):
@@ -387,7 +400,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         lk = shard_bhsd(k).requires_grad_(True)
         lv = shard_bhsd(v).requires_grad_(True)
 
-        module = _AttnModule().to(dev)
+        module = _AttnModule(self.attn_implementation).to(dev)
         # Match the CPU metadata prepared by the production collator.
         metadata = prepare_usp_metadata(cu.cpu(), CP)
         metadata = {k: v.to(dev) if torch.is_tensor(v) else v for k, v in metadata.items()}
@@ -412,6 +425,16 @@ class USPAttentionE2ETest(MultiProcessTestCase):
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_mqa_packed_matches_full(self):
         self._run_varlen_case(kv_heads=1)
+
+
+@pytest.mark.skipif(
+    "fa4" not in FA_BACKENDS or not NvidiaGpuPlatform(min_cc=90).matches(),
+    reason="FA4 Ring requires a compatible FA4 installation and SM90+",
+)
+class USPAttentionFA4E2ETest(USPAttentionE2ETest):
+    # Exercise explicit selection while FA2 remains the default when installed.
+    backend = "fa4"
+    attn_implementation = "veomni_flash_attention_4"
 
 
 if __name__ == "__main__":
