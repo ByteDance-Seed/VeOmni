@@ -61,7 +61,7 @@ def solve_tril_16x16_kernel(
             p_A = tl.make_block_ptr(
                 A, (T_eff, BT), (H * BT, 1), (tile_row, offset), (16, 16), (1, 0)
             )
-            b_A_raw = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+            b_A_raw = tl.load(p_A, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
         else:
             desc = make_tensor_descriptor(A, [T_eff, BT], [H * BT, 1], [16, 16])
             desc_o = make_tensor_descriptor(Ai, [T_eff, 16], [H * 16, 1], [16, 16])
@@ -121,8 +121,8 @@ def merge_16x16_to_32x32_inverse_kernel(
     if not USE_TMA:
         p_A_11 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
         p_A_22 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -146,7 +146,7 @@ def merge_16x16_to_32x32_inverse_kernel(
 
     if not USE_TMA:
         p_A_21 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0))
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
 
@@ -196,7 +196,7 @@ def solve_tril_64x64_kernel(
     offset = (i_t * 64) % BT
     if not USE_TMA:
         p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * 64, offset), (64, 64), (1, 0))
-        b_A = -tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        b_A = -tl.load(p_A, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [64, 64])
         desc_o = make_tensor_descriptor(Ai, [T, 64], [H * 64, 1], [64, 64])
