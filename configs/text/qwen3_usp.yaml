@@ -18,6 +18,7 @@
 
 model:
   model_path: Qwen3-8B-Base
+  chat_template: chatml
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:
@@ -41,7 +42,6 @@ model:
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 131072
   train_size: 750000
   text_keys: messages

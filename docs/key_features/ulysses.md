@@ -428,6 +428,10 @@ owns blocks `r` and `2·cp_size-1-r`.
 
 ### Quick Start
 
+The configuration below uses 32 sequence-parallel ranks; the world size must
+be divisible by 32. For one eight-GPU node, override with
+`--model.accelerator.ulysses_size 4 --model.accelerator.cp_size 2`.
+
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
     --model.model_path YOUR_MODEL_PATH \
@@ -454,7 +458,10 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
   Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
   Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
-  used by the ring path. The configured attention implementation must match the detected backend. FA4 requires separate hardware validation.
+  used by the ring path. The configured attention implementation must match the detected backend.
+  For an FA4 Ring backend (including Blackwell/GB200), add
+  `--model.ops_implementation.attn_implementation flash_attention_4` to the command
+  above; the example YAML defaults to FA2. FA4 requires separate hardware validation.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
