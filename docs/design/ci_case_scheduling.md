@@ -60,11 +60,11 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1174)
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
-[training command resolution](../../tests/tools/training_utils.py#L226) provide
+[training command resolution](../../tests/tools/training_utils.py#L242) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests
@@ -109,7 +109,7 @@ Use the `provider` keyword on `pytest.mark.launch_plan`. A provider is either a
 [CasePlan](../../scripts/ci/accelerator/launch_plan.py#L48), or a callable accepting a
 [PlanContext](../../scripts/ci/accelerator/launch_plan.py#L81) and returning one of those
 values. The planner calls it through
-[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L22). Using a keyword prevents pytest from interpreting a
+[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L23). Using a keyword prevents pytest from interpreting a
 callable provider as the test function being decorated.
 
 A fixed distributed launch keeps its process count in one place:
@@ -220,7 +220,7 @@ Unrelated processes are outside the cancellation scope. Interrupted execution
 records retain a failure return code and the summary records the interruption.
 
 Foreground case logs use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`,
-with `[e2e-57-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
+with `[e2e-59-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
 IDs come from the manifest; case IDs are one-based indices within each entry's
 collected inventory, including parameterized cases. IDs remain stable across
 batching, sorting and dispatch order. Batch indices are not displayed.
@@ -278,6 +278,20 @@ defaults. The torch_npu optimizer override queries the NPU device name even
 when optimizer parameters are all CPU tensors. The worker restores that
 override after the case; explicit `foreach` and `fused` settings keep their
 normal Torch behavior, and accelerator cases retain the vendor policy.
+The same CPU scope temporarily uses torch_npu's saved Torch multi-worker
+DataLoader iterator constructor. Its vendor wrapper otherwise queries NPU
+affinity before starting CPU workers. The worker replaces only that known
+wrapper and restores it after teardown or failure; unrelated constructor
+patches and accelerator cases retain their original behavior.
+CPU compilation also temporarily disables the loaded vendor registry's NPU
+Inductor registration, which otherwise queries a hidden device before compiling
+CPU graphs. The prior registration policy is restored after teardown or failure.
+This keeps actual CPU compilation enabled and leaves accelerator cases unchanged.
+The worker also initializes a missing built-in CPU device-op override. In Torch
+2.10, torch_npu's eager NPU entry makes the registry nonempty and prevents the
+ordinary lazy import of CPU overrides. Existing CPU and vendor entries are
+preserved; this is standard CPU backend initialization rather than a temporary
+replacement of an existing policy.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.

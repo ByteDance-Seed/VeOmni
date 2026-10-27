@@ -232,7 +232,7 @@ NPU validation runs at two times:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires NVIDIA CUDA and a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. SM90+ selects FA4 when supported, with Triton fallback for unsupported inputs; the registered mask builder uses 256×128 blocks on SM100+ and 128×128 elsewhere. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It requires NVIDIA SM100+ and uses CUTE DSL/JIT. SageAttention is inference-only and does not take a dense mask. |
-| moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
+| moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `deepgemm_fp8` runs native FP8 expert forward/dgrad/wgrad (Hopper SM90 / Blackwell SM100; see [requirements](../design/deepgemm_fp8_moe.md)); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
 | cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU default, GPU only), `torch_npu` (NPU default for weighted variants; `unweighted` has no Ascend kernel and uses `eager`, including an explicit `torch_npu` for compatibility), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU default, GPU only), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
@@ -246,7 +246,7 @@ NPU validation runs at two times:
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "cann", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. `cann` selects the DeepSeek-V4 Ascend CANN sparse FlashMLA and requires `cann_ops_transformer`; it covers the same unpacked and packed batches as the `cann` indexer, ignores `attention_mask` (so padded batches are unsupported), and runs layers that have no compressed rows in eager. |
 | mhc_implementation | `Literal["eager", "cann", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. `cann` selects the Ascend CANN fused pre/post kernels with a PyTorch final-head collapse and requires BF16 activations and `cann_ops_transformer`. |
 | qsa_attention_implementation | `Literal["eager", "tilelang", "torch_npu"]` | `"eager"` | Qwen4-Exp QSA sparse attention over the indexer's compact global token selection. `eager` expands the selection to a dense mask and is the numerical reference. `tilelang` gathers the selected K/V rows without the quadratic score tensor and requires `tilelang`, BF16 inputs, and an NVIDIA CUDA GPU. `torch_npu` prunes per-query-chunk KV intervals with an int8 scatter mask and runs `torch_npu.npu_fusion_attention` on Ascend NPUs (BF16). Both fused backends raise on an attention mask, have no KV-cache path, and fall back to `eager` with a warning for nonzero attention dropout. |
-| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than an op-registry implementation. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
+| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than an op-registry implementation. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. Must be `none` when `moe_implementation=deepgemm_fp8`; conflicting selections raise at config-parse time. See `veomni/ops/qat/`. |
 
 #### Deprecated values
 
@@ -552,39 +552,31 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
 adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
-Sampled steps also report `samples/<source-id>__<source>`,
-`input_tokens/<source-id>__<source>`, `label_tokens/<source-id>__<source>`, and
-`label_tokens_per_sample/<source-id>__<source>`. These four counters reuse the
-same packed-segment alignment and per-token observer capture as channel loss.
-Data counters describe the primary micro-batch labels once: auxiliary MTP
-objectives and repeated loss calls do not add samples, input tokens, or auxiliary
-targets to these counters. Channel CE continues to aggregate observed objectives;
-it is not the physical-data denominator. The callback supplies the primary labels
-from the device-resident micro-batch; strict mode rejects a forward whose observed
-loss calls cannot be matched to those labels.
-They add only compact integer reductions proportional to the number of sources;
-they do not launch another projection, full-vocabulary CE, or observer workspace.
-This side channel does not change the returned training loss or gradients.
-Observer-only CE failures are recorded before the shared capture preflight;
-they do not trigger another detached CE attempt. Non-strict mode skips invalid
-observations, while strict mode reports failures at the globally synchronized
-step end. Errors in the main training forward or loss still propagate normally. A failed
-forward discards pending observations without entering observer collectives.
-When `cross_entropy_loss_implementation` is `chunk_loss` (or its `npu` alias),
-the observer reuses the main loss projection, but the detached per-token CE
-still needs a chunk-sized full-vocabulary workspace. Other fused-loss backends,
-including the GPU default `liger_kernel`, may recompute the LM-head projection
-on sampled steps, so the default
-interval is 10 steps; set `interval=1` for per-step metrics. On memory-constrained
-profiles, `release_cache=true` synchronizes and releases the detached CE
-workspace after each sampled forward and before training backward. This does
-not change the objective or gradients, but adds synchronization and allocator
-churn. DiT trainers and
+Sampled steps also report per-source `samples`, `input_tokens`, `label_tokens`,
+and `label_tokens_per_sample`. Physical-data counters use the primary labels once;
+auxiliary objectives do not add extra samples or input tokens. Channel CE continues
+to aggregate all observed objectives. The observer does not change training loss
+or gradients. Strict capture and missing-primary-label failures are coordinated
+before optimizer updates; cross-step source-name conflicts are checked at step end.
+A model-forward or communication failure is left to the distributed launcher.
+Auxiliary MTP statistics require the original `mtp_labels` in the micro-batch;
+when source alignment cannot be proven, non-strict mode skips all channel metrics
+for that sampled model forward and strict mode raises. Ambiguous primary/MTP
+targets are handled the same way.
+
+The standard `chunk_loss` backend reuses the main LM-head projection, but detached
+per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
+backends may recompute the LM-head projection on sampled steps, so the default
+interval is 10 steps; set `interval=1` for per-step metrics. When explicitly
+enabled, `release_cache` synchronizes and releases detached CE allocator cache
+before backward, trading extra synchronization for lower memory pressure. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
 alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
-reference-model forward is excluded, and the chosen/rejected segments both use
-their preference pair's source metadata. If distinct source names sanitize to
+reference-model forward is excluded, the chosen/rejected segments use their
+preference pair's source metadata, and `samples` counts the pair once. DPO
+segment-tail masking follows the objective; SP/CP layouts without provable tail
+positions are skipped (or rejected in strict mode). If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
@@ -599,8 +591,8 @@ distinct from the first emission.
 | weighted_loss_metric_prefix | `str` | `"channel_loss_weighted"` | Prefix for loss-sum divided by all logged step tokens. |
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
+| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
-| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards to lower memory carried into backward. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig

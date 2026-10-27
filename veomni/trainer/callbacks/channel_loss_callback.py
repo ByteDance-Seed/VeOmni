@@ -21,14 +21,16 @@ under ``torch.no_grad()`` before the extra CE work runs.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import pickle
 import re
 from collections import defaultdict
 from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
 from numbers import Integral
+from threading import local
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -39,7 +41,6 @@ from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
 from ...utils.device import empty_cache, get_torch_device, stream_synchronize
 from ...utils.logging import get_logger
-from ...utils.loss_observer import capture_chunk_loss_per_token
 from .base import Callback, TrainerState
 
 
@@ -56,6 +57,34 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
+_CHUNK_LOSS_CAPTURE = local()
+
+
+@contextmanager
+def capture_chunk_loss_per_token(
+    consumer: Callable[[torch.Tensor], None], on_error: Callable[[str], None] | None = None
+) -> Iterator[None]:
+    """Enable detached token-loss capture for one sampled model-loss call."""
+    previous = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    _CHUNK_LOSS_CAPTURE.value = (consumer, on_error)
+    try:
+        yield
+    finally:
+        _CHUNK_LOSS_CAPTURE.value = previous
+
+
+def get_chunk_loss_consumer() -> Callable[[torch.Tensor], None] | None:
+    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    return capture[0] if capture is not None else None
+
+
+def report_chunk_loss_observer_error(error: Exception) -> bool:
+    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    handler = capture[1] if capture is not None else None
+    if handler is None:
+        return False
+    handler(f"{type(error).__name__}: {error}")
+    return True
 
 
 class ChannelLossMetadataError(ValueError):
@@ -66,98 +95,163 @@ class ChannelLossCollectiveError(RuntimeError):
     """Raised when an observer collective fails and its process group is unsafe."""
 
 
-@dataclass(frozen=True, eq=False)
-class _SPCaptureDescriptor:
-    """Authoritative cached SP topology for one outer capture."""
-
-    enabled: bool
-    parallel_state: ParallelState | None
-    group: Any | None
-    world: int
-    rank: int
-    resolution_error: str | None = None
-
-
-@dataclass
-class _PendingSPObservation:
-    """Fully materialized SP payload prepared before forward-finally preflight."""
-
-    source_ids: list[ChannelKey]
-    device: torch.device
-    parallel_state: ParallelState
-    include_data_stats: bool
-    group: Any | None
-    world: int
-    capture_descriptor: _SPCaptureDescriptor
-    segment_count: int
-    alignment_mode: str
-    loss_payload: torch.Tensor
-    integer_payload: torch.Tensor
-    gathered_segment_counts: list[int]
-    gathered_loss_payloads: list[torch.Tensor]
-    gathered_integer_payloads: list[torch.Tensor]
-
-
-def _sp_descriptor_from_parallel_state(parallel_state: ParallelState | None) -> _SPCaptureDescriptor:
-    if parallel_state is None or not bool(parallel_state.sp_enabled):
-        return _SPCaptureDescriptor(enabled=False, parallel_state=parallel_state, group=None, world=1, rank=0)
-    group = parallel_state.sp_group
-    rank = int(parallel_state.sp_rank)
-    if rank < 0:
-        rank = dist.get_rank(group) if group is not None else 0
-    return _SPCaptureDescriptor(
-        enabled=True,
-        parallel_state=parallel_state,
-        group=group,
-        world=int(parallel_state.sp_size),
-        rank=rank,
-    )
-
-
-def _sp_descriptors_match(left: _SPCaptureDescriptor, right: _SPCaptureDescriptor) -> bool:
-    return (
-        left.enabled == right.enabled
-        and left.parallel_state is right.parallel_state
-        and left.group is right.group
-        and left.world == right.world
-        and left.rank == right.rank
-        and left.resolution_error == right.resolution_error
-    )
-
-
-def _unresolved_sp_descriptor(
-    parallel_state: ParallelState | None,
-    message: str,
-) -> _SPCaptureDescriptor:
-    resolution_error = message if dist.is_available() and dist.is_initialized() else None
-    return _SPCaptureDescriptor(
-        enabled=False,
-        parallel_state=parallel_state,
-        group=None,
-        world=1,
-        rank=0,
-        resolution_error=resolution_error,
-    )
-
-
-def _resolve_cached_sp_capture_descriptor(parallel_state: ParallelState) -> _SPCaptureDescriptor:
-    try:
-        return _sp_descriptor_from_parallel_state(parallel_state)
-    except Exception as error:
-        return _unresolved_sp_descriptor(
-            parallel_state,
-            f"cached SP descriptor resolution failed: {type(error).__name__}: {error}",
-        )
-
-
 def _release_observer_cache(device: torch.device) -> None:
-    """Release detached CE workspaces before the training backward pass."""
+    """Release detached CE allocator cache before backward, when explicitly requested."""
     if device.type == "cpu":
         return
     accelerator = get_torch_device()
     with accelerator.device(device):
         stream_synchronize()
         empty_cache()
+
+
+def _source_signature_digest(source_ids: list[ChannelKey]) -> str:
+    return hashlib.sha256(repr(_source_id_signature(source_ids)).encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _serialize_channel_sp_observation(observation):
+    segments = observation["segments"]
+    device = observation["device"]
+    losses = (
+        torch.stack([s["loss_sum"].detach().to(device=device, dtype=torch.float32) for s in segments]).cpu().tolist()
+        if segments
+        else []
+    )
+    columns = ("token_count", "has_explicit_padding_mask")
+    if observation["data"]:
+        columns += ("sample_count", "input_token_count")
+    integer = (
+        torch.stack([torch.stack([s[k].to(device=device, dtype=torch.int64) for k in columns]) for s in segments])
+        .cpu()
+        .tolist()
+        if segments
+        else []
+    )
+    integer = [
+        row[:2] + [int(segment["has_only_zero_positions"])] + row[2:]
+        for segment, row in zip(segments, integer, strict=True)
+    ]
+    return {
+        "mode": observation["mode"],
+        "data": observation["data"],
+        "source_digest": _source_signature_digest(observation["source_ids"]),
+        "segments": [
+            (int(s["batch_idx"]), int(s["sp_rank"]), int(s["local_order"]), bool(s["is_start"]), loss, values)
+            for s, loss, values in zip(segments, losses, integer, strict=True)
+        ],
+    }
+
+
+def _channel_sp_topology(parallel_state, *, initialized, global_rank):
+    status = {"enabled": False, "sp_rank": 0, "sp_size": 1, "members": (), "topology_error": ""}
+    try:
+        status["enabled"] = bool(parallel_state.sp_enabled)
+        if status["enabled"]:
+            size = int(parallel_state.sp_size)
+            group = parallel_state.sp_group
+            rank = int(parallel_state.sp_rank)
+            if rank < 0:
+                rank = int(dist.get_rank(group)) if initialized and group is not None else 0
+            if size < 1 or rank < 0 or rank >= size or (size > 1 and (group is None or not initialized)):
+                raise ValueError("invalid or unavailable SP group")
+            if group is None:
+                members = (global_rank,)
+            elif hasattr(dist, "get_process_group_ranks"):
+                members = tuple(int(r) for r in dist.get_process_group_ranks(group))
+            else:
+                members = tuple(int(dist.get_global_rank(group, r)) for r in range(size))
+            status.update(sp_rank=rank, sp_size=size, members=members)
+    except Exception as error:
+        status["topology_error"] = f"{type(error).__name__}: {error}"
+    return status
+
+
+def _validate_channel_sp_topologies(statuses):
+    if not statuses or any(s["topology_error"] for s in statuses):
+        return f"SP topology could not be resolved on all ranks: {[s['topology_error'] for s in statuses]}"
+    if len({s["enabled"] for s in statuses}) != 1:
+        return "SP enablement differs across ranks"
+    if not statuses[0]["enabled"]:
+        return None
+    count = len(statuses)
+    for rank, status in enumerate(statuses):
+        members, local_rank, size = status["members"], status["sp_rank"], status["sp_size"]
+        if (
+            len(members) != size
+            or not 0 <= local_rank < size
+            or len(set(members)) != size
+            or any(not 0 <= member < count for member in members)
+            or members[local_rank] != rank
+            or any(statuses[member]["members"] != members for member in members)
+        ):
+            return "SP group membership differs across ranks"
+    return None
+
+
+def _validate_channel_sp_group(statuses):
+    if not statuses:
+        return "empty SP group"
+    signatures = [s["source_digest"] for s in statuses]
+    source_counts = [s["source_count"] for s in statuses]
+    attempts = [s["attempts"] for s in statuses]
+    data_indices = [s["data_observation_index"] for s in statuses]
+    if not any(source_counts) and all(n == 0 for n in attempts) and not any(s["errors"] for s in statuses):
+        return None
+    if (
+        any(s["errors"] for s in statuses)
+        or any(not count for count in source_counts)
+        or any(count != source_counts[0] for count in source_counts)
+        or any(sig != signatures[0] for sig in signatures)
+        or len(set(attempts)) != 1
+        or attempts[0] < 1
+        or any(index != data_indices[0] for index in data_indices)
+        or any(index is not None and not 0 <= index < attempts[0] for index in data_indices)
+        or any(len(s["observations"]) != attempts[0] for s in statuses)
+    ):
+        return "SP source metadata or observation differs across ranks"
+    for index in range(attempts[0]):
+        observations = [s["observations"][index] for s in statuses]
+        if (
+            len({o["mode"] for o in observations}) != 1
+            or len({o["data"] for o in observations}) != 1
+            or observations[0]["mode"] not in ("packed_cu", "positions")
+        ):
+            return "SP observation layouts differ across ranks"
+        for rank, observation in enumerate(observations):
+            if observation["source_digest"] != signatures[rank]:
+                return "SP observation source metadata changed during capture"
+            if observation["mode"] == "packed_cu" and observation["segment_count"] != source_counts[rank]:
+                return "rank-local packed spans do not match source count"
+            if not observation["valid_rows"]:
+                return "SP observation segment metadata is invalid"
+    return None
+
+
+def _materialize_channel_sp_segments(payloads, observation_index, *, device):
+    observations = [payload[observation_index] for payload in payloads]
+    records = [segment for observation in observations for segment in observation["segments"]]
+    if not records:
+        return []
+    losses = torch.tensor([row[4] for row in records], dtype=torch.float32, device=device)
+    integers = torch.tensor([row[5] for row in records], dtype=torch.int64, device=device)
+    include_data = observations[0]["data"]
+    result = []
+    for index, (batch_idx, sp_rank, local_order, is_start, _, _) in enumerate(records):
+        segment = {
+            "batch_idx": batch_idx,
+            "sp_rank": sp_rank,
+            "local_order": local_order,
+            "is_start": is_start,
+            "loss_sum": losses[index],
+            "token_count": integers[index, 0],
+            "has_explicit_padding_mask": integers[index, 1].bool(),
+            "has_only_zero_positions": integers[index, 2].bool(),
+        }
+        if include_data:
+            segment["sample_count"] = integers[index, 3]
+            segment["input_token_count"] = integers[index, 4]
+        result.append(segment)
+    return result
 
 
 class ChannelLossComputer:
@@ -182,13 +276,18 @@ class ChannelLossComputer:
         self._tail_padding_length: Any | None = None
         self._result: list[dict[str, Any]] | None = None
         self._primary_labels: torch.Tensor | None = None
+        self._require_primary_labels = False
+        self._mtp_labels: torch.Tensor | None = None
+        self._dpo_segments = False
+        self._source_repeat = 1
         self._data_result: list[dict[str, Any]] | None = None
         self._pending_data_observation_index: int | None = None
-        self._pending_observations: list[_PendingSPObservation | list[dict[str, Any]]] = []
+        self._pending_observations: list[dict[str, Any] | list[dict[str, Any]]] = []
         self._observation_attempt_count = 0
         self._capture_errors: list[tuple[str, str]] = []
+        self._capture_topology: dict[str, Any] | None = None
+        self._capture_group: Any | None = None
         self._observer_devices: list[torch.device] = []
-        self._capture_sp_descriptor: _SPCaptureDescriptor | None = None
         self._per_mb_source_ids: list[list[ChannelKey]] = []
         self._per_mb_position_ids: list[torch.Tensor | None] = []
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
@@ -317,62 +416,196 @@ class ChannelLossComputer:
         nested = self.capture_active
         if not nested:
             self._reset_capture_state()
-            self._capture_sp_descriptor = _resolve_cached_sp_capture_descriptor(self.parallel_state)
+            self._capture_topology = self._snapshot_topology()
         token = _ACTIVE_CHANNEL_LOSS_COMPUTER.set(self)
-        forward_completed = False
+        completed = False
         try:
             yield
-            forward_completed = True
+            completed = True
         finally:
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
             if not nested:
-                if forward_completed:
+                if completed:
                     self._finalize_capture()
                 else:
-                    # The training forward failed; do not add observer collectives
-                    # during exception unwinding or mask the original failure.
+                    # Do not issue observer collectives while unwinding model
+                    # exceptions: peers may still be in model collectives.
+                    # The distributed launcher must tear down failed ranks.
                     self._reset_capture_state()
-                    self._capture_sp_descriptor = None
 
     def _reset_capture_state(self) -> None:
         self._pending_observations = []
         self._pending_data_observation_index = None
         self._observation_attempt_count = 0
         self._capture_errors = []
+        self._capture_topology = None
+        self._capture_group = None
         self._observer_devices = []
 
-    def _finalize_capture(self) -> None:
-        """Finalize detached observations before model backward can begin."""
+    def _snapshot_topology(self) -> dict[str, Any]:
+        initialized = dist.is_available() and dist.is_initialized()
+        try:
+            rank = dist.get_rank() if initialized else 0
+            topology = _channel_sp_topology(self.parallel_state, initialized=initialized, global_rank=rank)
+            if topology["enabled"] and not topology["topology_error"]:
+                self._capture_group = self.parallel_state.sp_group
+            return topology
+        except Exception as error:
+            return {
+                "enabled": False,
+                "sp_rank": 0,
+                "sp_size": 1,
+                "members": (),
+                "topology_error": f"{type(error).__name__}: {error}",
+            }
 
-        observer_devices = list(self._observer_devices)
+    def _finalize_capture(self) -> None:
+        """Coordinate detached observations and surface strict failures before backward."""
+        initialized = dist.is_available() and dist.is_initialized()
         collective_failed = False
         try:
-            descriptor = self._capture_sp_descriptor
-            descriptor_error = self._preflight_capture_descriptor(descriptor)
-            if descriptor_error is not None:
-                self._record_capture_failure(descriptor_error)
-            elif descriptor is not None and descriptor.enabled:
-                self._finalize_sp_capture(descriptor)
+            try:
+                world = dist.get_world_size() if initialized else 1
+            except Exception as error:
+                raise ChannelLossCollectiveError(
+                    "Channel loss could not inspect the default process group."
+                ) from error
+            status = dict(self._capture_topology or self._snapshot_topology())
+            status.update(
+                source_count=0,
+                source_digest="",
+                attempts=self._observation_attempt_count,
+                data_observation_index=self._pending_data_observation_index,
+                strict=self.strict,
+                errors=[(kind, message[:512]) for kind, message in self._capture_errors],
+                observations=[],
+            )
+            payload = b""
+            try:
+                status["source_count"] = len(self._source_ids)
+                status["source_digest"] = _source_signature_digest(self._source_ids)
+                if self._source_ids and self._observation_attempt_count == 0:
+                    status["errors"].append(("metadata", "source metadata was present but no loss hook was observed"))
+                if len(self._pending_observations) != self._observation_attempt_count:
+                    status["errors"].append(("metadata", "successful observations do not match loss-hook calls"))
+                if status["enabled"]:
+                    local_observations = [
+                        _serialize_channel_sp_observation(item) for item in self._pending_observations
+                    ]
+                    for observation in local_observations:
+                        rows = observation["segments"]
+                        status["observations"].append(
+                            {
+                                "mode": observation["mode"],
+                                "data": observation["data"],
+                                "source_digest": observation["source_digest"],
+                                "segment_count": len(rows),
+                                "valid_rows": all(
+                                    row[0] >= 0 and row[1] == status["sp_rank"] and row[2] >= 0 for row in rows
+                                ),
+                            }
+                        )
+                    # Prepare the exact CPU bytes before the status exchange.
+                    payload = pickle.dumps(local_observations, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as error:
+                failure = ("generic", f"observation preparation failed: {type(error).__name__}: {str(error)[:512]}")
+                status["errors"].append(failure)
+                self._capture_errors.append(failure)
+            if initialized:
+                statuses = [None] * world
+                try:
+                    dist.all_gather_object(statuses, status)
+                except Exception as error:
+                    raise ChannelLossCollectiveError(
+                        "Channel loss world status exchange failed; the process group is unsafe."
+                    ) from error
             else:
-                self._finalize_local_capture()
+                statuses = [status]
+            topology_error = _validate_channel_sp_topologies(statuses)
+            strict_values = [entry["strict"] for entry in statuses]
+            strict_enabled = any(strict_values)
+            world_error = topology_error
+            if len(set(strict_values)) != 1:
+                world_error = "channel-loss strict mode differs across ranks"
+            if strict_enabled and world_error is None:
+                for rank, entry in enumerate(statuses):
+                    if entry["errors"] or not entry["source_count"]:
+                        world_error = f"rank {rank}: {entry['errors'] or 'source metadata is missing'}"
+                        break
+                if world_error is None and status["enabled"]:
+                    for members in {entry["members"] for entry in statuses}:
+                        group_error = _validate_channel_sp_group([statuses[member] for member in members])
+                        if group_error:
+                            world_error = f"SP group {members}: {group_error}"
+                            break
+            if strict_enabled and world_error:
+                self._record_capture_failure(world_error)
+                raise ChannelLossMetadataError(world_error)
+
+            local_error = None
+            try:
+                if topology_error:
+                    local_error = topology_error
+                elif not status["enabled"]:
+                    prior_errors = len(self.strict_observation_errors)
+                    self._finalize_local_capture()
+                    if self.strict and len(self.strict_observation_errors) > prior_errors:
+                        local_error = self.strict_observation_errors[-1][1]
+                else:
+                    group_statuses = [statuses[member] for member in status["members"]]
+                    local_error = _validate_channel_sp_group(group_statuses)
+                    if not local_error and self._pending_observations:
+                        if status["sp_size"] > 1:
+                            group_payloads = [None] * status["sp_size"]
+                            try:
+                                dist.all_gather_object(group_payloads, payload, group=self._capture_group)
+                            except Exception as error:
+                                raise ChannelLossCollectiveError(
+                                    "Channel loss SP observation exchange failed; the process group is unsafe."
+                                ) from error
+                        else:
+                            group_payloads = [payload]
+                        decoded = [pickle.loads(item) for item in group_payloads]
+                        reduced = []
+                        for index, observation in enumerate(self._pending_observations):
+                            segments = _materialize_channel_sp_segments(decoded, index, device=observation["device"])
+                            aligned = self._merge_sp_segments(
+                                segments, self._source_ids, strict=True, include_data_stats=observation["data"]
+                            )
+                            if not aligned:
+                                raise ChannelLossMetadataError("SP reduction produced no source-aligned CE payload")
+                            reduced.append(aligned)
+                        self._append_observations(reduced)
+            except ChannelLossCollectiveError:
+                raise
+            except Exception as error:
+                local_error = (
+                    f"channel-loss forward finalization failed with {type(error).__name__}: {str(error)[:512]}"
+                )
+
+            if strict_enabled:
+                if initialized:
+                    failures = [None] * world
+                    try:
+                        dist.all_gather_object(failures, local_error)
+                    except Exception as error:
+                        raise ChannelLossCollectiveError(
+                            "Channel loss strict error exchange failed; the process group is unsafe."
+                        ) from error
+                else:
+                    failures = [local_error]
+                if any(failures):
+                    message = f"channel-loss observation failed before backward: {failures}"
+                    self._record_capture_failure(message)
+                    raise ChannelLossMetadataError(message)
+            elif local_error:
+                self._record_capture_failure(local_error)
         except ChannelLossCollectiveError:
-            # A failed process-group operation cannot safely be converted into
-            # rank-local observer state or followed by another collective.
             collective_failed = True
             raise
-        except Exception as error:
-            # Local preparation/reconstruction failures must never escape a
-            # rank before strict world coordination at step end.
-            self._record_capture_failure(
-                f"channel-loss forward finalization failed with {type(error).__name__}: {error}"
-            )
         finally:
             if self.release_cache and not collective_failed:
-                released_devices: list[torch.device] = []
-                for device in observer_devices:
-                    if device in released_devices:
-                        continue
-                    released_devices.append(device)
+                for device in dict.fromkeys(self._observer_devices):
                     try:
                         _release_observer_cache(device)
                     except Exception:
@@ -380,139 +613,7 @@ class ChannelLossComputer:
                             "Channel loss: failed to release detached CE allocator cache; continuing training.",
                             exc_info=True,
                         )
-            self._pending_observations = []
-            self._pending_data_observation_index = None
-            self._capture_errors = []
-            self._observer_devices = []
-            self._capture_sp_descriptor = None
-
-    @staticmethod
-    def _preflight_capture_descriptor(descriptor: _SPCaptureDescriptor | None) -> str | None:
-        """Reject rank-local SP topology divergence before any SP collective."""
-
-        if not dist.is_available() or not dist.is_initialized():
-            if descriptor is None:
-                return "Channel loss: capture has no authoritative SP descriptor."
-            if descriptor.resolution_error is not None:
-                return f"Channel loss: capture SP descriptor resolution failed: {descriptor.resolution_error}."
-            if descriptor.enabled and (
-                descriptor.world < 1
-                or descriptor.rank < 0
-                or descriptor.rank >= descriptor.world
-                or (descriptor.world > 1 and descriptor.group is None)
-            ):
-                return f"Channel loss: capture has an invalid SP descriptor: {descriptor}."
-            return None
-
-        try:
-            global_rank = dist.get_rank()
-            global_world = dist.get_world_size()
-        except Exception as error:
-            raise ChannelLossCollectiveError(
-                "Channel loss could not inspect the initialized default process group for descriptor preflight."
-            ) from error
-
-        errors: list[str] = []
-        group_ranks: tuple[int, ...] = ()
-        if descriptor is None:
-            errors.append("missing capture descriptor")
-            enabled = False
-            sp_world = -1
-            sp_rank = -1
-        else:
-            enabled = descriptor.enabled
-            sp_world = descriptor.world
-            sp_rank = descriptor.rank
-            if descriptor.resolution_error is not None:
-                errors.append(descriptor.resolution_error)
-            if enabled:
-                if descriptor.group is None:
-                    if sp_world == 1:
-                        group_ranks = (global_rank,)
-                    else:
-                        errors.append("enabled multi-rank SP descriptor has no process group")
-                else:
-                    try:
-                        get_process_group_ranks = getattr(dist, "get_process_group_ranks", None)
-                        if get_process_group_ranks is not None:
-                            group_ranks = tuple(int(rank) for rank in get_process_group_ranks(descriptor.group))
-                        else:
-                            group_ranks = tuple(
-                                int(dist.get_global_rank(descriptor.group, local_rank))
-                                for local_rank in range(sp_world)
-                            )
-                    except Exception as error:
-                        errors.append(f"failed to resolve SP group membership: {type(error).__name__}: {error}")
-
-        status = {
-            "global_rank": global_rank,
-            "global_world": global_world,
-            "enabled": enabled,
-            "sp_world": sp_world,
-            "sp_rank": sp_rank,
-            "group_ranks": group_ranks,
-            "errors": errors,
-        }
-        gathered_statuses: list[dict[str, Any] | None] = [None] * global_world
-        try:
-            dist.all_gather_object(gathered_statuses, status)
-        except Exception as error:
-            raise ChannelLossCollectiveError(
-                "Channel loss world descriptor preflight collective failed; the process group is unsafe."
-            ) from error
-        statuses = [item or {} for item in gathered_statuses]
-        return ChannelLossComputer._validate_capture_descriptor_preflight(statuses)
-
-    @staticmethod
-    def _validate_capture_descriptor_preflight(statuses: list[dict[str, Any]]) -> str | None:
-        if not statuses:
-            return "Channel loss: world SP descriptor preflight returned no statuses."
-
-        expected_ranks = list(range(len(statuses)))
-        global_ranks = [status.get("global_rank") for status in statuses]
-        global_worlds = [status.get("global_world") for status in statuses]
-        enabled_values = [status.get("enabled") for status in statuses]
-        errors = [status.get("errors") or [] for status in statuses]
-        valid = (
-            global_ranks == expected_ranks
-            and all(world == len(statuses) for world in global_worlds)
-            and all(isinstance(enabled, bool) for enabled in enabled_values)
-            and len(set(enabled_values)) == 1
-            and all(not rank_errors for rank_errors in errors)
-        )
-
-        if valid and bool(enabled_values[0]):
-            for status_idx, status in enumerate(statuses):
-                sp_world = status.get("sp_world")
-                sp_rank = status.get("sp_rank")
-                group_ranks = status.get("group_ranks")
-                if (
-                    not isinstance(sp_world, int)
-                    or not isinstance(sp_rank, int)
-                    or not isinstance(group_ranks, (list, tuple))
-                    or sp_world < 1
-                    or len(group_ranks) != sp_world
-                    or sp_rank < 0
-                    or sp_rank >= sp_world
-                    or any(
-                        not isinstance(member, int) or member < 0 or member >= len(statuses) for member in group_ranks
-                    )
-                    or len(set(group_ranks)) != sp_world
-                    or group_ranks[sp_rank] != status_idx
-                ):
-                    valid = False
-                    break
-                member_tuple = tuple(group_ranks)
-                if any(tuple(statuses[member].get("group_ranks") or ()) != member_tuple for member in member_tuple):
-                    valid = False
-                    break
-
-        if valid:
-            return None
-        return (
-            "Channel loss: world preflight rejected rank-local SP capture descriptor divergence before "
-            f"group-specific collectives (statuses={statuses})."
-        )
+            self._reset_capture_state()
 
     def _finalize_local_capture(self) -> None:
         errors = list(self._capture_errors)
@@ -520,194 +621,14 @@ class ChannelLossComputer:
             errors.append(("metadata", "source metadata was present but no causal-LM loss hook was observed"))
         if len(self._pending_observations) != self._observation_attempt_count:
             errors.append(
-                (
-                    "metadata",
-                    "successful observation count does not match the number of observed causal-LM loss calls",
-                )
+                ("metadata", "successful observation count does not match the number of observed causal-LM loss calls")
             )
-        if any(isinstance(observation, _PendingSPObservation) for observation in self._pending_observations):
+        if any(not isinstance(observation, list) for observation in self._pending_observations):
             errors.append(("generic", "an SP payload was prepared while sequence parallelism was disabled"))
         if errors:
             self._record_capture_failure(_format_capture_errors(errors))
             return
-
-        observations = [observation for observation in self._pending_observations if isinstance(observation, list)]
-        self._append_observations(observations)
-
-    def _finalize_sp_capture(self, descriptor: _SPCaptureDescriptor) -> None:
-        group = descriptor.group
-        world = descriptor.world
-        pending_sp = [
-            observation for observation in self._pending_observations if isinstance(observation, _PendingSPObservation)
-        ]
-        descriptor_errors: list[tuple[str, str]] = []
-        if not descriptor.enabled or descriptor.world < 1:
-            descriptor_errors.append(("generic", "capture has an invalid enabled SP descriptor"))
-        for observation_idx, observation in enumerate(pending_sp):
-            if not _sp_descriptors_match(observation.capture_descriptor, descriptor):
-                descriptor_errors.append(
-                    (
-                        "generic",
-                        f"observation {observation_idx} was prepared with a different SP capture descriptor",
-                    )
-                )
-            if (
-                observation.parallel_state is not descriptor.parallel_state
-                or observation.group is not descriptor.group
-                or observation.world != descriptor.world
-            ):
-                descriptor_errors.append(
-                    (
-                        "generic",
-                        f"observation {observation_idx} SP group/world does not match its capture descriptor",
-                    )
-                )
-        status = {
-            "has_source": bool(self._source_ids),
-            "observation_count": self._observation_attempt_count,
-            "successful_count": len(self._pending_observations),
-            "data_observation_index": self._pending_data_observation_index,
-            "source_ids": _source_id_signature(self._source_ids),
-            "observation_source_ids": [_source_id_signature(observation.source_ids) for observation in pending_sp],
-            "sp_payload_count": len(pending_sp),
-            "payload_specs": [
-                (
-                    observation.loss_payload.numel(),
-                    observation.integer_payload.size(1),
-                    observation.include_data_stats,
-                )
-                for observation in pending_sp
-            ],
-            "segment_counts": [observation.segment_count for observation in pending_sp],
-            "alignment_modes": [observation.alignment_mode for observation in pending_sp],
-            "descriptor_spec": (descriptor.enabled, descriptor.world, descriptor.group is not None),
-            "errors": [*self._capture_errors, *descriptor_errors],
-        }
-
-        if world > 1 and group is None:
-            status["errors"].append(("generic", "SP process group is unavailable"))
-
-        if world > 1 and group is not None and dist.is_available() and dist.is_initialized():
-            gathered_statuses: list[dict[str, Any] | None] = [None] * world
-            # This is the sole SP collective that decides whether any
-            # conditional observation payload collective may follow.
-            try:
-                dist.all_gather_object(gathered_statuses, status, group=group)
-            except Exception as error:
-                raise ChannelLossCollectiveError(
-                    "Channel loss SP payload preflight collective failed; the process group is unsafe."
-                ) from error
-            statuses = [item or {} for item in gathered_statuses]
-        else:
-            statuses = [status]
-
-        preflight_error = self._validate_sp_preflight(statuses)
-        if preflight_error is not None:
-            self._record_capture_failure(preflight_error)
-            return
-        for observation_idx, observation in enumerate(pending_sp):
-            observation.gathered_segment_counts = [
-                int(status["segment_counts"][observation_idx]) for status in statuses
-            ]
-
-        # No observer-owned tensor allocation, conversion, or validation
-        # is permitted in this loop. All buffers were materialized before the
-        # preflight, so approved ranks execute an unconditional fixed sequence.
-        for observation in pending_sp:
-            self._gather_prepared_sp_payload(observation, descriptor)
-
-        reduced_observations: list[list[dict[str, Any]]] = []
-        reconstruction_errors: list[tuple[str, str]] = []
-        for observation_idx, observation in enumerate(pending_sp):
-            try:
-                reduced = self._reconstruct_prepared_sp_payload(observation, strict=True)
-                if not reduced:
-                    raise ChannelLossMetadataError("SP reduction produced no source-aligned CE payload")
-                reduced_observations.append(reduced)
-            except Exception as error:
-                reconstruction_errors.append(
-                    (
-                        "metadata" if isinstance(error, ChannelLossMetadataError) else "generic",
-                        f"observation {observation_idx}: {type(error).__name__}: {error}",
-                    )
-                )
-
-        if reconstruction_errors:
-            self._record_capture_failure(_format_capture_errors(reconstruction_errors))
-            return
-        self._append_observations(reduced_observations)
-
-    @staticmethod
-    def _validate_sp_preflight(statuses: list[dict[str, Any]]) -> str | None:
-        has_source = [bool(status.get("has_source")) for status in statuses]
-        observation_counts = [int(status.get("observation_count", -1)) for status in statuses]
-        successful_counts = [int(status.get("successful_count", -1)) for status in statuses]
-        payload_counts = [int(status.get("sp_payload_count", -1)) for status in statuses]
-        source_ids = [status.get("source_ids") for status in statuses]
-        data_indices = [status.get("data_observation_index") for status in statuses]
-        errors = [status.get("errors") or [] for status in statuses]
-        observation_sources = [status.get("observation_source_ids") or [] for status in statuses]
-        payload_specs = [status.get("payload_specs") or [] for status in statuses]
-        segment_counts = [status.get("segment_counts") or [] for status in statuses]
-        alignment_modes = [status.get("alignment_modes") or [] for status in statuses]
-        descriptor_specs = [status.get("descriptor_spec") for status in statuses]
-        expected_observation_count = observation_counts[0] if observation_counts else -1
-        segment_count_contract_valid = True
-        for rank_idx, (rank_specs, rank_counts, rank_modes) in enumerate(
-            zip(payload_specs, segment_counts, alignment_modes)
-        ):
-            if (
-                len(rank_specs) != expected_observation_count
-                or len(rank_counts) != expected_observation_count
-                or len(rank_modes) != expected_observation_count
-                or any(mode not in ("packed_cu", "positions") for mode in rank_modes)
-            ):
-                segment_count_contract_valid = False
-                break
-            for observation_idx, segment_count in enumerate(rank_counts):
-                if (
-                    not isinstance(segment_count, int)
-                    or segment_count < 0
-                    or segment_count > int(rank_specs[observation_idx][0])
-                    or (
-                        rank_modes[observation_idx] == "packed_cu" and segment_count != len(source_ids[rank_idx] or ())
-                    )
-                ):
-                    segment_count_contract_valid = False
-                    break
-
-        valid = (
-            bool(statuses)
-            and all(has_source)
-            and len(set(observation_counts)) == 1
-            and expected_observation_count > 0
-            and successful_counts == observation_counts
-            and payload_counts == observation_counts
-            and all(index == data_indices[0] for index in data_indices)
-            and all(index is None or 0 <= index < expected_observation_count for index in data_indices)
-            and all(source_id == source_ids[0] for source_id in source_ids)
-            and all(payload_spec == payload_specs[0] for payload_spec in payload_specs)
-            and all(alignment_mode == alignment_modes[0] for alignment_mode in alignment_modes)
-            and all(descriptor_spec == descriptor_specs[0] for descriptor_spec in descriptor_specs)
-            and all(not rank_errors for rank_errors in errors)
-            and segment_count_contract_valid
-            and all(
-                len(rank_sources) == expected_observation_count
-                and all(observation_source == source_ids[rank_idx] for observation_source in rank_sources)
-                for rank_idx, rank_sources in enumerate(observation_sources)
-            )
-        )
-        if valid:
-            return None
-
-        return (
-            "Channel loss: SP preflight rejected observation payload before conditional collectives "
-            f"(has_source={has_source}, observation_counts={observation_counts}, "
-            f"successful_counts={successful_counts}, payload_counts={payload_counts}, "
-            f"source_ids={source_ids}, data_indices={data_indices}, payload_specs={payload_specs}, "
-            f"segment_counts={segment_counts}, alignment_modes={alignment_modes}, "
-            f"descriptor_specs={descriptor_specs}, errors={errors})."
-        )
+        self._append_observations(self._pending_observations)
 
     def _append_observations(self, observations: list[list[dict[str, Any]]]) -> None:
         if not observations or (self.strict and self._micro_step_failed):
@@ -715,6 +636,10 @@ class ChannelLossComputer:
         if self._result is None:
             self._result = []
         for observation in observations:
+            if self._dpo_segments:
+                for index, item in enumerate(observation):
+                    if "sample_count" in item:
+                        item["sample_count"] = item["sample_count"] * int(index % self._source_repeat == 0)
             self._result.extend(observation)
         # Losses may include auxiliary objectives. Physical samples/tokens and
         # supervised-token counts describe the primary batch exactly once.
@@ -731,9 +656,7 @@ class ChannelLossComputer:
             self._data_result = None
             self._micro_step_observation_count = 0
             self.strict_observation_errors.append((self._micro_step, message))
-            logger.warning_rank0(
-                f"Channel loss: deferring strict observation failure until globally synchronized step end: {message}"
-            )
+            logger.warning_rank0(f"Channel loss: strict observation failure: {message}")
             return
         logger.warning_rank0(f"Channel loss: {message} Skipping this model forward.")
 
@@ -788,7 +711,9 @@ class ChannelLossComputer:
         self.step_totals = {}
         self.step_data_totals = {}
 
-    def before_micro_step(self, primary_labels: torch.Tensor | None = None) -> None:
+    def before_micro_step(
+        self, primary_labels: torch.Tensor | None = None, mtp_labels: torch.Tensor | None = None
+    ) -> None:
         step = self._micro_step
         if step < len(self._per_mb_source_ids):
             self._source_ids = self._per_mb_source_ids[step]
@@ -808,6 +733,8 @@ class ChannelLossComputer:
             self._tail_padding_length = None
         self._result = None
         self._primary_labels = primary_labels
+        self._require_primary_labels = True
+        self._mtp_labels = mtp_labels
         self._data_result = None
         self._micro_step_observation_count = 0
         self._micro_step_failed = False
@@ -853,6 +780,8 @@ class ChannelLossComputer:
         self._tail_padding_length = None
         self._result = None
         self._primary_labels = None
+        self._require_primary_labels = False
+        self._mtp_labels = None
         self._data_result = None
         self._reset_capture_state()
         self._micro_step += 1
@@ -924,21 +853,22 @@ class ChannelLossComputer:
         logits_bias: torch.Tensor | None = None,
         logits_bias_weight: torch.Tensor | None = None,
     ) -> None:
-        observer_device = next(
-            (
-                tensor.device
-                for tensor in (reused_per_token_loss, logits, hidden_states, weights, labels)
-                if isinstance(tensor, torch.Tensor)
-            ),
-            None,
-        )
         standalone = not self.capture_active
         if standalone:
             self._reset_capture_state()
-            self._capture_sp_descriptor = _resolve_cached_sp_capture_descriptor(self.parallel_state)
+            self._capture_topology = self._snapshot_topology()
         self._observation_attempt_count += 1
-        if observer_device is not None:
-            self._observer_devices.append(observer_device)
+        if self.release_cache:
+            device = next(
+                (
+                    tensor.device
+                    for tensor in (reused_per_token_loss, logits, hidden_states, weights, labels)
+                    if isinstance(tensor, torch.Tensor)
+                ),
+                None,
+            )
+            if device is not None:
+                self._observer_devices.append(device)
         try:
             result = self._compute_channel_loss(
                 logits=logits,
@@ -955,7 +885,11 @@ class ChannelLossComputer:
                 logits_bias_weight=logits_bias_weight,
             )
             if result:
-                if self._data_result is None and self._pending_data_observation_index is None:
+                is_mtp = isinstance(result, dict) and "depth_observations" in result
+                observations = result["depth_observations"] if is_mtp else [result]
+                if not observations or any(not item for item in observations):
+                    raise ChannelLossMetadataError("an MTP depth produced no source-aligned CE payload")
+                if not is_mtp and self._data_result is None and self._pending_data_observation_index is None:
                     primary = self._primary_labels
                     # Identity is the usual trainer path. Equal copied labels
                     # also support models that make a contiguous/view copy.
@@ -969,7 +903,8 @@ class ChannelLossComputer:
                         )
                     ):
                         self._pending_data_observation_index = len(self._pending_observations)
-                self._pending_observations.append(result)
+                self._pending_observations.extend(observations)
+                self._observation_attempt_count += len(observations) - 1
             else:
                 self._capture_errors.append(
                     ("metadata", "channel-loss observation produced no source-aligned CE payload")
@@ -981,6 +916,84 @@ class ChannelLossComputer:
         finally:
             if standalone:
                 self._finalize_capture()
+
+    def _matched_mtp_targets(
+        self, labels: torch.Tensor, shift_labels: torch.Tensor | None, ignore_index: int
+    ) -> torch.Tensor | None:
+        """Match the real MTP targets, including the all-ignored safe-label case."""
+        primary = self._primary_labels
+        if self._require_primary_labels and not isinstance(primary, torch.Tensor):
+            raise ChannelLossMetadataError("Channel loss: primary micro-batch labels are missing")
+        same_primary = (
+            isinstance(primary, torch.Tensor)
+            and labels.shape == primary.shape
+            and labels.device == primary.device
+            and (labels is primary or torch.equal(labels, primary))
+        )
+        if labels is primary or (same_primary and shift_labels is None):
+            return None
+
+        targets = self._mtp_labels
+        candidate = shift_labels if shift_labels is not None else labels
+        if isinstance(targets, torch.Tensor) and targets.ndim == 3 and candidate.ndim == 2:
+            batch, depth, width = targets.shape
+            if candidate.shape == (batch * depth, width) and candidate.device == targets.device:
+                flat = targets.reshape_as(candidate)
+                matched = torch.equal(candidate, flat)
+                if flat.numel():
+                    safe = flat.clone()
+                    has_valid = flat.ne(ignore_index).any()
+                    safe.reshape(-1)[0] = torch.where(has_valid, safe.reshape(-1)[0], safe.new_zeros(()))
+                    matched = matched or torch.equal(candidate, safe)
+                if matched:
+                    if same_primary:
+                        raise ChannelLossMetadataError("Channel loss: primary and MTP targets are ambiguous")
+                    return targets
+        if same_primary:
+            return None
+        if primary is not None:
+            raise ChannelLossMetadataError(
+                "Channel loss: auxiliary labels cannot be aligned with primary or recorded MTP targets"
+            )
+        return None
+
+    def _dpo_tail_mask(self, target: torch.Tensor, topology: dict[str, Any]) -> torch.Tensor:
+        """Match DPO's per-segment causal mask without changing training labels."""
+        positions = self._position_ids
+        if not isinstance(positions, torch.Tensor) or target.ndim != 2:
+            raise ChannelLossMetadataError("DPO channel loss requires two-dimensional labels and position IDs")
+        if positions.dim() == 3:
+            positions = positions[:, 0, :]
+        if positions.shape != target.shape:
+            raise ChannelLossMetadataError("DPO channel loss position IDs do not match the local labels")
+        batch, width = target.shape
+        if not topology["enabled"] or topology["sp_size"] == 1:
+            return F.pad(positions[:, 1:].eq(0), (0, 1), value=True).to(target.device)
+
+        if int(getattr(self.parallel_state, "cp_size", 1)) > 1:
+            raise ChannelLossMetadataError("DPO channel loss cannot prove segment tails for context parallelism")
+
+        local_points, local_error = _packed_cu_points(self._packed_cu_seqlens)
+        global_points, global_error = _packed_cu_points(self._packed_global_cu_seqlens)
+        expected_width = batch * width * topology["sp_size"]
+        if (
+            local_error
+            or global_error
+            or local_points is None
+            or global_points is None
+            or local_points != global_points
+            or global_points[-1] != expected_width
+        ):
+            raise ChannelLossMetadataError("DPO channel loss cannot prove segment tails for the current SP/CP layout")
+        mask = torch.zeros((batch, width), dtype=torch.bool)
+        global_row_width = width * topology["sp_size"]
+        for endpoint in global_points[1:]:
+            global_tail = endpoint - 1
+            row, offset = divmod(global_tail, global_row_width)
+            offset -= topology["sp_rank"] * width
+            if 0 <= row < batch and 0 <= offset < width:
+                mask[row, offset] = True
+        return mask.to(target.device)
 
     @torch.no_grad()
     def _compute_channel_loss(
@@ -997,17 +1010,25 @@ class ChannelLossComputer:
         reused_per_token_loss: torch.Tensor | None = None,
         logits_bias: torch.Tensor | None = None,
         logits_bias_weight: torch.Tensor | None = None,
-    ) -> list[dict[str, Any]] | _PendingSPObservation:
-        descriptor = self._capture_sp_descriptor
-        if descriptor is None:
-            descriptor = _resolve_cached_sp_capture_descriptor(self.parallel_state)
-        sp_enabled = descriptor.enabled
-        if shift_labels is not None:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        topology = self._capture_topology or self._snapshot_topology()
+        sp_enabled = topology["enabled"]
+        mtp_targets = self._matched_mtp_targets(labels, shift_labels, ignore_index)
+        if mtp_targets is not None:
+            effective_labels = mtp_targets.reshape(-1, mtp_targets.size(-1))
+        elif shift_labels is not None:
             effective_labels = shift_labels
         elif not sp_enabled:
             effective_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
         else:
             effective_labels = labels
+
+        if self._dpo_segments:
+            if mtp_targets is not None:
+                raise ChannelLossMetadataError("DPO channel loss cannot combine MTP with segment-tail masking")
+            effective_labels = effective_labels.masked_fill(
+                self._dpo_tail_mask(effective_labels, topology), ignore_index
+            )
 
         if reused_per_token_loss is not None:
             reused_per_token_loss = self._align_reused_per_token_loss(
@@ -1035,24 +1056,42 @@ class ChannelLossComputer:
         if attention_mask_flat is not None:
             attention_mask_flat = attention_mask_flat.to(per_token_loss.device)
 
-        return self._aggregate_by_source(
-            per_token_loss=per_token_loss,
-            labels_flat=labels_flat,
-            attention_mask_flat=attention_mask_flat,
-            source_ids=self._source_ids,
-            position_ids=self._position_ids,
-            packed_cu_seqlens=self._packed_cu_seqlens,
-            packed_global_cu_seqlens=self._packed_global_cu_seqlens,
-            packed_global_physical_seq_len=self._packed_global_physical_seq_len,
-            tail_padding_length=self._tail_padding_length,
-            ignore_index=ignore_index,
-            sp_enabled=sp_enabled,
-            parallel_state=descriptor.parallel_state if sp_enabled else None,
-            capture_descriptor=descriptor,
-            strict=self.strict,
-            include_data_stats=True,
-            defer_sp=defer_sp,
-        )
+        def aggregate(loss, target, mask):
+            return self._aggregate_by_source(
+                per_token_loss=loss.reshape(-1),
+                labels_flat=target.reshape(-1),
+                attention_mask_flat=mask,
+                source_ids=self._source_ids,
+                position_ids=self._position_ids,
+                packed_cu_seqlens=self._packed_cu_seqlens,
+                packed_global_cu_seqlens=self._packed_global_cu_seqlens,
+                packed_global_physical_seq_len=self._packed_global_physical_seq_len,
+                tail_padding_length=self._tail_padding_length,
+                ignore_index=ignore_index,
+                sp_enabled=sp_enabled,
+                parallel_state=self.parallel_state if sp_enabled else None,
+                sp_rank_override=topology["sp_rank"] if sp_enabled else None,
+                sp_size_override=topology["sp_size"] if sp_enabled else None,
+                strict=self.strict,
+                include_data_stats=True,
+                defer_sp=defer_sp,
+            )
+
+        if mtp_targets is not None:
+            batch, depth, width = mtp_targets.shape
+            losses = per_token_loss.reshape(batch, depth, width)
+            targets = mtp_targets.to(per_token_loss.device)
+            observations = []
+            for index in range(depth):
+                target = targets[:, index, :]
+                mask = _position_aligned_attention_mask_flat(
+                    attention_mask=attention_mask, labels=target, effective_labels=target
+                )
+                if mask is not None:
+                    mask = mask.to(per_token_loss.device)
+                observations.append(aggregate(losses[:, index, :], target, mask))
+            return {"depth_observations": observations}
+        return aggregate(per_token_loss, labels_flat, attention_mask_flat)
 
     @staticmethod
     def _align_reused_per_token_loss(
@@ -1165,11 +1204,12 @@ class ChannelLossComputer:
         tail_padding_length: Any | None = None,
         sp_enabled: bool = False,
         parallel_state: ParallelState | None = None,
-        capture_descriptor: _SPCaptureDescriptor | None = None,
+        sp_rank_override: int | None = None,
+        sp_size_override: int | None = None,
         strict: bool = False,
         include_data_stats: bool = False,
         defer_sp: bool = False,
-    ) -> list[dict[str, Any]] | _PendingSPObservation:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         if not source_ids:
             return []
 
@@ -1203,7 +1243,8 @@ class ChannelLossComputer:
                     seq_len=seq_len,
                     ignore_index=ignore_index,
                     parallel_state=parallel_state,
-                    capture_descriptor=capture_descriptor,
+                    sp_rank_override=sp_rank_override,
+                    sp_size_override=sp_size_override,
                     strict=strict,
                     include_data_stats=include_data_stats,
                     defer_reduce=defer_sp,
@@ -1283,23 +1324,19 @@ class ChannelLossComputer:
         packed_global_physical_seq_len: int | None = None,
         tail_padding_length: Any | None = None,
         parallel_state: ParallelState | None = None,
-        capture_descriptor: _SPCaptureDescriptor | None = None,
+        sp_rank_override: int | None = None,
+        sp_size_override: int | None = None,
         strict: bool = False,
         include_data_stats: bool = False,
         defer_reduce: bool = False,
-    ) -> list[dict[str, Any]] | _PendingSPObservation:
-        if capture_descriptor is not None:
-            sp_rank = capture_descriptor.rank
-        elif parallel_state is None:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        if parallel_state is None:
             raise ValueError("parallel_state is required for SP channel-loss aggregation.")
-        else:
-            sp_group = parallel_state.sp_group
-            sp_rank = int(parallel_state.sp_rank)
-            if sp_rank < 0:
-                sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        sp_size = int(
-            capture_descriptor.world if capture_descriptor is not None else getattr(parallel_state, "sp_size", 1)
-        )
+        sp_group = parallel_state.sp_group
+        sp_rank = int(parallel_state.sp_rank if sp_rank_override is None else sp_rank_override)
+        if sp_rank < 0:
+            sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+        sp_size = int(getattr(parallel_state, "sp_size", 1) if sp_size_override is None else sp_size_override)
         if sp_size < 1:
             raise ChannelLossMetadataError(f"Channel loss: invalid sequence-parallel size {sp_size}.")
         segments: list[dict[str, Any]] = []
@@ -1429,16 +1466,13 @@ class ChannelLossComputer:
                     local_order += 1
 
         if defer_reduce:
-            return ChannelLossComputer._prepare_sp_observation_payload(
-                local_segments=segments,
-                source_ids=source_ids,
-                device=per_token_loss.device,
-                payload_capacity=max(seq_len, len(source_ids), 1),
-                parallel_state=parallel_state,
-                capture_descriptor=capture_descriptor,
-                include_data_stats=include_data_stats,
-                alignment_mode=alignment_mode,
-            )
+            return {
+                "segments": segments,
+                "source_ids": list(source_ids),
+                "device": per_token_loss.device,
+                "data": include_data_stats,
+                "mode": alignment_mode,
+            }
 
         reduced = ChannelLossComputer._reduce_sp(
             segments,
@@ -1464,175 +1498,6 @@ class ChannelLossComputer:
                 )
             result.append(converted)
         return result
-
-    @staticmethod
-    def _prepare_sp_observation_payload(
-        local_segments: list[dict[str, Any]],
-        source_ids: list[ChannelKey],
-        device: torch.device,
-        payload_capacity: int,
-        parallel_state: ParallelState | None = None,
-        capture_descriptor: _SPCaptureDescriptor | None = None,
-        include_data_stats: bool = False,
-        alignment_mode: str = "positions",
-    ) -> _PendingSPObservation:
-        """Materialize every rank-local buffer before the SP preflight."""
-
-        if payload_capacity < len(local_segments):
-            raise ChannelLossMetadataError(
-                "Channel loss: local SP segment count exceeds its deterministic payload capacity "
-                f"({len(local_segments)} > {payload_capacity})."
-            )
-        if capture_descriptor is None:
-            if parallel_state is None:
-                raise ValueError("parallel_state is required to prepare an SP channel-loss observation.")
-            capture_descriptor = _sp_descriptor_from_parallel_state(parallel_state)
-        group = capture_descriptor.group
-        world = capture_descriptor.world
-
-        loss_values: list[torch.Tensor] = []
-        integer_rows: list[torch.Tensor] = []
-        integer_column_count = 9 if include_data_stats else 7
-        for segment in local_segments:
-            loss_values.append(
-                _as_scalar_tensor(segment["loss_sum"], device=device, dtype=torch.float32, name="loss_sum")
-            )
-            integer_values = [
-                _as_scalar_tensor(segment["batch_idx"], device=device, dtype=torch.int64, name="batch_idx"),
-                _as_scalar_tensor(segment["sp_rank"], device=device, dtype=torch.int64, name="sp_rank"),
-                _as_scalar_tensor(segment["local_order"], device=device, dtype=torch.int64, name="local_order"),
-                _as_scalar_tensor(segment["is_start"], device=device, dtype=torch.int64, name="is_start"),
-                _as_scalar_tensor(segment["token_count"], device=device, dtype=torch.int64, name="token_count"),
-            ]
-            if include_data_stats:
-                integer_values.extend(
-                    [
-                        _as_scalar_tensor(
-                            segment["sample_count"], device=device, dtype=torch.int64, name="sample_count"
-                        ),
-                        _as_scalar_tensor(
-                            segment["input_token_count"],
-                            device=device,
-                            dtype=torch.int64,
-                            name="input_token_count",
-                        ),
-                    ]
-                )
-            integer_values.extend(
-                [
-                    _as_scalar_tensor(
-                        segment["has_explicit_padding_mask"],
-                        device=device,
-                        dtype=torch.int64,
-                        name="has_explicit_padding_mask",
-                    ),
-                    _as_scalar_tensor(
-                        segment["has_only_zero_positions"],
-                        device=device,
-                        dtype=torch.int64,
-                        name="has_only_zero_positions",
-                    ),
-                ]
-            )
-            integer_rows.append(torch.stack(integer_values))
-
-        loss_payload = torch.zeros(payload_capacity, dtype=torch.float32, device=device)
-        integer_payload = torch.zeros((payload_capacity, integer_column_count), dtype=torch.int64, device=device)
-        if loss_values:
-            loss_payload[: len(loss_values)].copy_(torch.stack(loss_values))
-            integer_payload[: len(integer_rows)].copy_(torch.stack(integer_rows))
-
-        if world > 1:
-            gathered_loss_payloads = [torch.empty_like(loss_payload) for _ in range(world)]
-            gathered_integer_payloads = [torch.empty_like(integer_payload) for _ in range(world)]
-        else:
-            gathered_loss_payloads = [loss_payload]
-            gathered_integer_payloads = [integer_payload]
-
-        return _PendingSPObservation(
-            source_ids=list(source_ids),
-            device=device,
-            parallel_state=parallel_state,
-            include_data_stats=include_data_stats,
-            group=group,
-            world=world,
-            capture_descriptor=capture_descriptor,
-            segment_count=len(local_segments),
-            alignment_mode=alignment_mode,
-            loss_payload=loss_payload,
-            integer_payload=integer_payload,
-            gathered_segment_counts=[len(local_segments)] if world <= 1 else [0] * world,
-            gathered_loss_payloads=gathered_loss_payloads,
-            gathered_integer_payloads=gathered_integer_payloads,
-        )
-
-    @staticmethod
-    def _gather_prepared_sp_payload(
-        observation: _PendingSPObservation,
-        descriptor: _SPCaptureDescriptor,
-    ) -> None:
-        if descriptor.group is None or descriptor.world <= 1:
-            return
-        rows = max(max(observation.gathered_segment_counts, default=0), 1)
-        try:
-            dist.all_gather(
-                [payload[:rows] for payload in observation.gathered_loss_payloads],
-                observation.loss_payload[:rows],
-                group=descriptor.group,
-            )
-            dist.all_gather(
-                [payload[:rows] for payload in observation.gathered_integer_payloads],
-                observation.integer_payload[:rows],
-                group=descriptor.group,
-            )
-        except Exception as error:
-            raise ChannelLossCollectiveError(
-                "Channel loss payload collective failed; the SP process group must not be reused by the observer."
-            ) from error
-
-    @staticmethod
-    def _reconstruct_prepared_sp_payload(
-        observation: _PendingSPObservation,
-        strict: bool,
-    ) -> list[dict[str, Any]]:
-        all_segments: list[dict[str, Any]] = []
-        for rank_idx, segment_count in enumerate(observation.gathered_segment_counts):
-            metadata_values = (
-                observation.gathered_integer_payloads[rank_idx][:segment_count, :4].to(device="cpu").tolist()
-            )
-            for segment_idx, (batch_idx, sp_rank, local_order, is_start) in enumerate(metadata_values):
-                if (
-                    int(batch_idx) < 0
-                    or int(sp_rank) != rank_idx
-                    or int(local_order) < 0
-                    or int(is_start) not in (0, 1)
-                ):
-                    raise ChannelLossMetadataError(
-                        "Channel loss: gathered SP segment metadata does not match its fixed payload rank/order."
-                    )
-                integer_stats = observation.gathered_integer_payloads[rank_idx][segment_idx]
-                stats_offset = 2 if observation.include_data_stats else 0
-                segment = {
-                    "batch_idx": int(batch_idx),
-                    "sp_rank": int(sp_rank),
-                    "local_order": int(local_order),
-                    "is_start": bool(is_start),
-                    "loss_sum": observation.gathered_loss_payloads[rank_idx][segment_idx],
-                    "token_count": integer_stats[4],
-                    "has_explicit_padding_mask": integer_stats[5 + stats_offset].to(torch.bool),
-                    "has_only_zero_positions": integer_stats[6 + stats_offset].to(torch.bool),
-                }
-                if observation.include_data_stats:
-                    segment["sample_count"] = integer_stats[5]
-                    segment["input_token_count"] = integer_stats[6]
-                all_segments.append(segment)
-
-        return ChannelLossComputer._merge_sp_segments(
-            all_segments,
-            observation.source_ids,
-            strict=strict,
-            include_data_stats=observation.include_data_stats,
-        )
 
     @staticmethod
     def _reduce_sp(
@@ -1906,6 +1771,8 @@ class ChannelLossCallback(Callback):
                 f"Channel loss channel_loss_source_repeat must be >= 1, got {channel_loss_source_repeat}."
             )
 
+        self.computer._dpo_segments = channel_loss_source_repeat > 1
+        self.computer._source_repeat = channel_loss_source_repeat
         self._collect_step = state.global_step % self.config.interval == 0
         if not self._collect_step:
             self.computer.begin_step([], [], [])
@@ -1996,7 +1863,9 @@ class ChannelLossCallback(Callback):
     ) -> None:
         if not self._collect_step:
             return
-        self.computer.before_micro_step(primary_labels=micro_batch.get("labels"))
+        self.computer.before_micro_step(
+            primary_labels=micro_batch.get("labels"), mtp_labels=micro_batch.get("mtp_labels")
+        )
 
     def strip_model_inputs(self, micro_batch: dict[str, Any]) -> None:
         if not self.enabled or not isinstance(micro_batch, dict):
@@ -2005,12 +1874,18 @@ class ChannelLossCallback(Callback):
             # BaseTrainer and DPO enter the micro-step before preforward moves
             # tensors. Refresh the labels here from the actual model inputs.
             self.computer._primary_labels = micro_batch.get("labels")
+            self.computer._mtp_labels = micro_batch.get("mtp_labels")
         for key in self._strip_keys:
             micro_batch.pop(key, None)
 
     def on_micro_step_end(self, state: TrainerState, **kwargs: Any) -> None:
         if self._collect_step:
             self.computer.after_micro_step()
+            if self.config.strict and self._synchronize_missing_observation():
+                raise ChannelLossMetadataError(
+                    "Channel loss: sampled micro-step had missing or invalid observation before optimizer update "
+                    f"(local errors: {self.computer.strict_observation_errors})."
+                )
 
     @contextmanager
     def micro_step_context(self, state: TrainerState, micro_batch: dict[str, Any]) -> Iterator[None]:
@@ -2018,10 +1893,16 @@ class ChannelLossCallback(Callback):
             yield
             return
         self.on_micro_step_begin(state, micro_batch=micro_batch)
+        completed = False
         try:
             yield
+            completed = True
         finally:
-            self.on_micro_step_end(state)
+            if completed:
+                self.on_micro_step_end(state)
+            else:
+                # Do not enter observer collectives while training unwinds.
+                self.computer.after_micro_step()
 
     @contextmanager
     def model_forward_context(self) -> Iterator[None]:

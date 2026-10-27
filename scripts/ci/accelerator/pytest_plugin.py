@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -203,26 +204,66 @@ def pytest_runtest_protocol(item, nextitem):
     rows = getattr(item.config, "_ci_batch_cases", {})
     case = rows.get(item.nodeid)
     previous_device_type = None
-    if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
-        import torch.optim.optimizer as optimizer_module
-        from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
-        from torch.utils.checkpoint import DefaultDeviceType
-
-        # CPU-only checkpoint inputs fall back to this global default. A
-        # registered NPU backend can otherwise initialize hidden devices while
-        # querying AMP support, even though every tensor stays on CPU.
-        previous_device_type = DefaultDeviceType.get_device_type()
-        DefaultDeviceType.set_device_type("cpu")
-        # torch_npu replaces the optimizer's alias with a device-name query.
-        # CPU optimizers use Torch's original, query-free capability helper;
-        # explicit foreach/fused settings retain their ordinary semantics.
-        previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
-        optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+    previous_foreach_query = None
+    previous_dataloader_init = None
+    previous_npu_registration_disabled = None
     try:
+        if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
+            import torch.optim.optimizer as optimizer_module
+            from torch._inductor.codegen.common import device_op_overrides_dict, register_device_op_overrides
+            from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
+            from torch.utils.checkpoint import DefaultDeviceType
+            from torch.utils.data import dataloader
+
+            # CPU-only checkpoint inputs fall back to this global default. A
+            # registered NPU backend can otherwise initialize hidden devices while
+            # querying AMP support, even though every tensor stays on CPU.
+            previous_device_type = DefaultDeviceType.get_device_type()
+            DefaultDeviceType.set_device_type("cpu")
+            # torch_npu replaces the optimizer's alias with a device-name query.
+            # CPU optimizers use Torch's original, query-free capability helper;
+            # explicit foreach/fused settings retain their ordinary semantics.
+            previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
+            optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+            # torch_npu eagerly registers its device override. Torch 2.10 then skips
+            # all built-in overrides because the registry is already nonempty.
+            # Register only the missing CPU entry, preserving existing vendor rows.
+            if "cpu" not in device_op_overrides_dict:
+                from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+                register_device_op_overrides("cpu", CpuDeviceOpOverrides())
+            # torch_npu's DataLoader constructor queries NPU affinity even for CPU
+            # inputs. Use its saved Torch constructor while devices are hidden,
+            # without importing the vendor package or overriding unrelated patches.
+            npu_module = sys.modules.get("torch_npu.utils._module")
+            if npu_module is not None and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(
+                npu_module, "_mpdl_iter_init", None
+            ):
+                if not hasattr(npu_module, "origin_mpdl_iter_init"):
+                    raise ResourcePlanError("Cannot isolate CPU DataLoader: torch_npu has no saved Torch constructor")
+                previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
+                dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
+            # The vendor Inductor wrapper otherwise registers its NPU backend even
+            # when compiling CPU graphs. Keep real CPU compilation enabled while
+            # suppressing that registration, without importing the vendor package.
+            npu_dynamo = sys.modules.get("torch_npu.utils._dynamo")
+            npu_registry = getattr(npu_dynamo, "_InductorNpuRegistry", None)
+            if npu_registry is not None:
+                if not hasattr(npu_registry, "_disabled_register") or not callable(
+                    getattr(npu_registry, "disable_register", None)
+                ):
+                    raise ResourcePlanError("Cannot isolate CPU Inductor: unsupported torch_npu registry policy")
+                previous_npu_registration_disabled = npu_registry._disabled_register
+                npu_registry.disable_register()
         yield
     finally:
-        if previous_device_type is not None:
+        if previous_npu_registration_disabled is not None:
+            npu_registry._disabled_register = previous_npu_registration_disabled
+        if previous_dataloader_init is not None:
+            dataloader._MultiProcessingDataLoaderIter.__init__ = previous_dataloader_init
+        if previous_foreach_query is not None:
             optimizer_module._get_foreach_kernels_supported_devices = previous_foreach_query
+        if previous_device_type is not None:
             DefaultDeviceType.set_device_type(previous_device_type)
     row = item.config._ci_results.get(item.nodeid)
     if row:

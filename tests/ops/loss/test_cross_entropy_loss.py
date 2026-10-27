@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from contextlib import nullcontext
 
 import pytest
@@ -42,6 +44,27 @@ from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_loss_standalone_does_not_import_trainer():
+    program = """
+import sys
+import torch
+from veomni.ops import resolve_op
+
+callback = 'veomni.trainer.callbacks.channel_loss_callback'
+assert callback not in sys.modules
+hidden = torch.randn(2, 4, requires_grad=True)
+weight = torch.randn(7, 4, requires_grad=True)
+loss = resolve_op('cross_entropy_loss', 'standard', 'chunk_loss').wrapper(
+    hidden, torch.tensor([1, 2]), weight, chunk_size=1
+)
+loss.backward()
+assert callback not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("bias_kind", ["full", "factored"])
 @pytest.mark.parametrize("trainable", ["all", "bias_only", "none"])
 @pytest.mark.parametrize("all_ignored", [False, True])
@@ -49,7 +72,7 @@ def test_chunk_observer_preserves_logits_bias_and_gradients(bias_kind, trainable
     """Observation must preserve both bias forms, including bias-only gradients."""
     from torch.autograd.graph import saved_tensors_hooks
 
-    from veomni.utils.loss_observer import capture_chunk_loss_per_token
+    from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token
 
     torch.manual_seed(712)
     hidden = torch.randn(2, 7, 8)
@@ -87,6 +110,8 @@ def test_chunk_observer_preserves_logits_bias_and_gradients(bias_kind, trainable
     logits = logits + (F.linear(bias, tensors[3]) if bias_kind == "factored" else bias)
     expected_tokens = F.cross_entropy(logits.reshape(-1, 19), labels.reshape(-1), reduction="none").reshape_as(labels)
     assert len(captured) == 1
+    assert not captured[0].requires_grad
+    assert not torch._C._functorch.is_functorch_wrapped_tensor(captured[0])
     torch.testing.assert_close(captured[0], expected_tokens)
 
 

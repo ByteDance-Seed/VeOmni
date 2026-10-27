@@ -8,8 +8,8 @@ from torch.utils.checkpoint import checkpoint
 
 from veomni.distributed.offloading import OffloadPolicy, build_activation_offloading_context
 from veomni.ops import VeomniOp
+from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from veomni.utils.loss_observer import capture_chunk_loss_per_token
 
 
 DEVICES = [

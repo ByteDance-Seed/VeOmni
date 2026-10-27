@@ -81,7 +81,9 @@ def _run_fused_vs_eager(
     shape: str = "small",
     base_trainable: bool = True,
     concentrated_routing: bool = False,
+    routing_dtype: torch.dtype = torch.bfloat16,
 ):
+    """Compare fused MoE-LoRA forward and gradients against the eager reference."""
     torch.manual_seed(0)
     device = torch.device("npu" if impl == "fused_npu" else "cuda")
     dtype = torch.bfloat16
@@ -89,7 +91,7 @@ def _run_fused_vs_eager(
     if concentrated_routing:
         B = 256
     hidden = 0.1 * torch.randn(B, H, device=device, dtype=dtype)
-    routing = torch.softmax(torch.randn(B, top_k, device=device, dtype=torch.float32), dim=-1).to(dtype)
+    routing = torch.softmax(torch.randn(B, top_k, device=device, dtype=torch.float32), dim=-1).to(routing_dtype)
     selected = (
         torch.zeros(B, top_k, device=device, dtype=torch.long)
         if concentrated_routing
@@ -255,9 +257,11 @@ def test_triton_matches_eager(variant, base_trainable, shape):
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton moe_experts_lora needs a GPU + triton",
 )
+@pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_triton_matches_eager_with_concentrated_routes(variant):
-    _run_fused_vs_eager("fused_triton", variant, concentrated_routing=True)
+def test_triton_matches_eager_with_concentrated_routes(variant, routing_dtype):
+    """Triton MoE-LoRA matches eager under concentrated duplicate routing and FP32/BF16 weights."""
+    _run_fused_vs_eager("fused_triton", variant, concentrated_routing=True, routing_dtype=routing_dtype)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")
@@ -557,6 +561,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         generator = torch.Generator().manual_seed(7123)
 
         def random_tensor(shape: tuple[int, ...], scale: float) -> torch.Tensor:
+            """Draw a deterministic scaled random tensor on the worker device."""
             return (torch.randn(shape, generator=generator) * scale).to(device=device, dtype=dtype)
 
         hidden = random_tensor((2, batch, hidden_size), 0.5)[rank]
@@ -565,7 +570,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         down = random_tensor((experts, hidden_size, intermediate_size), 0.05)
         ids = torch.arange(batch, device=device)
         selected = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
-        routing = torch.tensor([0.75, 0.25], dtype=dtype, device=device).expand(batch, 2).contiguous()
+        routing = torch.tensor([0.75, 0.25], dtype=torch.float32, device=device).expand(batch, 2).contiguous()
         if variant == "shared":
             shapes = [
                 (lora_rank, hidden_size),
@@ -586,6 +591,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
             ]
         full_lora = [random_tensor(shape, 0.02).detach().requires_grad_(True) for shape in shapes]
         hidden_reference = hidden.detach().requires_grad_(True)
+        routing_reference = routing.detach().clone().requires_grad_(True)
         non_ep_state = _init_parallel_state(dp_size=2, device_type="cuda", name="non_ep")
         ep_state = _init_parallel_state(dp_size=2, device_type="cuda", extra_parallel_sizes=(2,), name="ep")
 
@@ -594,14 +600,16 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
                 "fused_triton",
                 variant,
                 hidden_reference,
-                routing,
+                routing_reference,
                 selected,
                 gate_up,
                 down,
                 full_lora,
                 num_experts=experts,
             )
-            reference_grads = torch.autograd.grad(reference, [*full_lora, hidden_reference], grad_outputs=upstream)
+            reference_grads = torch.autograd.grad(
+                reference, [*full_lora, hidden_reference, routing_reference], grad_outputs=upstream
+            )
 
         local_lora = []
         for value in full_lora:
@@ -609,25 +617,26 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
                 value = value[rank * 2 : (rank + 1) * 2]
             local_lora.append(value.detach().clone().requires_grad_(True))
         hidden_ep = hidden.detach().requires_grad_(True)
+        routing_ep = routing.detach().clone().requires_grad_(True)
         with use_parallel_state(ep_state):
             actual = _call(
                 "fused_triton",
                 variant,
                 hidden_ep,
-                routing,
+                routing_ep,
                 selected,
                 gate_up[rank * 2 : (rank + 1) * 2].contiguous(),
                 down[rank * 2 : (rank + 1) * 2].contiguous(),
                 local_lora,
                 num_experts=experts,
             )
-            actual_grads = torch.autograd.grad(actual, [*local_lora, hidden_ep], grad_outputs=upstream)
+            actual_grads = torch.autograd.grad(actual, [*local_lora, hidden_ep, routing_ep], grad_outputs=upstream)
 
         # Non-EP computes a full gradient from each rank's tokens. EP computes
         # one local expert shard from both ranks' tokens, or a shared-LoRA
         # partial from its local experts. Compare the logical full gradients.
         gradient_checks = []
-        for index, (local, full) in enumerate(zip(actual_grads[:-1], reference_grads[:-1], strict=True)):
+        for index, (local, full) in enumerate(zip(actual_grads[:-2], reference_grads[:-2], strict=True)):
             expected = full.float().clone()
             dist.all_reduce(expected, op=dist.ReduceOp.SUM)
             if variant == "independent":
@@ -639,9 +648,16 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
                 dist.all_reduce(observed, op=dist.ReduceOp.SUM)
             gradient_checks.append((index, observed, expected))
 
+        assert actual.dtype == dtype, f"{variant}: distributed EP output dtype {actual.dtype} != {dtype}"
         assert _l2_rel(actual, reference) <= _FWD_L2REL_TOL, f"{variant}: distributed EP forward differs from non-EP"
-        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
+        assert _l2_rel(actual_grads[-2], reference_grads[-2]) <= _GRAD_L2REL_TOL, (
             f"{variant}: distributed EP input gradient differs from non-EP"
+        )
+        assert actual_grads[-1].dtype == torch.float32, (
+            f"{variant}: distributed EP routing gradient dtype {actual_grads[-1].dtype} != float32"
+        )
+        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
+            f"{variant}: distributed EP routing gradient differs from non-EP"
         )
         for index, observed, expected in gradient_checks:
             assert expected.count_nonzero().item() > 0, f"{variant}: LoRA gradient {index} was zero"

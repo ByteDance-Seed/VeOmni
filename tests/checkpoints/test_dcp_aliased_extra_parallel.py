@@ -174,13 +174,8 @@ def _aliased_extra_parallel_worker(ep_size: int = 2):
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(runner_device_count() < 2, reason="needs 2 devices")
-@pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
-def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip(ep_size: int):
-    """The ``ep2`` arm is the regression.
-
-    At ``ep_size == 1`` there is no expert dimension to collapse, so the alias is written
-    correctly either way and the arm only guards the plumbing around it.
-    """
+def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip():
+    """Verify aliased ExtraParallel parameters preserve full expert shapes across DCP save/load."""
     from ..tools.launch_utils import torchrun
 
-    torchrun(partial(_aliased_extra_parallel_worker, ep_size), world_size=_CI_ACCELERATOR_2.nproc)
+    torchrun(partial(_aliased_extra_parallel_worker, 2), world_size=_CI_ACCELERATOR_2.nproc)

@@ -16,15 +16,15 @@
 
 from __future__ import annotations
 
+import sys
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from veomni.utils.loss_observer import get_chunk_loss_consumer, report_chunk_loss_observer_error
-
 from .....registry import SavedState
 from . import eager as _eager
-from .eager import _grad_and_value, _Meta, _needs_input_grad, _suspend_saved_tensor_hooks
+from .eager import _grad_and_value, _Meta, _needs_input_grad
 
 
 def _ce_loss_func(
@@ -35,23 +35,9 @@ def _ce_loss_func(
     ignore_index: int,
     logits_bias: Tensor | None = None,
     logits_bias_weight: Tensor | None = None,
+    observe=None,
 ) -> Tensor:
-    """Per-chunk linear, optional logits bias, and eager CE."""
-    return _ce_loss_and_logits(
-        hidden_states, weight, labels, num_items_in_batch, ignore_index, logits_bias, logits_bias_weight
-    )[0]
-
-
-def _ce_loss_and_logits(
-    hidden_states: Tensor,
-    weight: Tensor,
-    labels: Tensor,
-    num_items_in_batch: int | Tensor,
-    ignore_index: int,
-    logits_bias: Tensor | None = None,
-    logits_bias_weight: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Per-chunk body: linear (+ optional full or factored logits_bias) then eager CE."""
+    """Per-chunk projection and CE, optionally recording detached token losses."""
     labels_flat = labels.reshape(-1)
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
     logits = F.linear(hidden_flat, weight).float()
@@ -64,56 +50,9 @@ def _ce_loss_and_logits(
     loss = _eager.cross_entropy_from_logits(
         logits, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
     )
-
-    return loss, logits
-
-
-class _ChunkObserver:
-    """Reuse one projection; observer errors cannot retry or mutate training CE."""
-
-    def __init__(self):
-        self.consumer = get_chunk_loss_consumer()
-        self.chunks = []
-
-    def evaluate(
-        self, argnums, hidden, weight, labels, denom, ignore_index, logits_bias=None, logits_bias_weight=None
-    ):
-        """Evaluate one training chunk and observe detached token losses if requested."""
-        args = (hidden, weight, labels, denom, ignore_index, logits_bias, logits_bias_weight)
-        if self.consumer is None:
-            if argnums:
-                return _grad_and_value(_ce_loss_func, argnums, *args)
-            return (), _ce_loss_func(*args)
-        if argnums:
-            with _suspend_saved_tensor_hooks():
-                grads, (loss, logits) = torch.func.grad_and_value(_ce_loss_and_logits, argnums=argnums, has_aux=True)(
-                    *args
-                )
-        else:
-            grads, (loss, logits) = (), _ce_loss_and_logits(*args)
-        try:
-            with torch.no_grad():
-                tokens = F.cross_entropy(
-                    logits.detach(), labels.reshape(-1), ignore_index=ignore_index, reduction="none"
-                ).reshape_as(labels)
-            self.chunks.append(tokens)
-        except Exception as error:
-            if not report_chunk_loss_observer_error(error):
-                raise
-            self.consumer = None
-            self.chunks.clear()
-        return grads, loss
-
-    def finish(self, split_dim):
-        """Deliver collected token losses and release their retained storage."""
-        if self.consumer is not None:
-            try:
-                self.consumer(torch.cat(self.chunks, dim=split_dim).detach())
-            except Exception as error:
-                if not report_chunk_loss_observer_error(error):
-                    raise
-            finally:
-                self.chunks.clear()
+    if observe is not None:
+        observe(logits, labels)
+    return loss
 
 
 def forward(
@@ -203,15 +142,49 @@ def forward(
     bias_chunks = (
         logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
     )
-    observer = _ChunkObserver()
+    # A capture can only be active after the callback module is loaded. Looking
+    # it up avoids importing the trainer stack for standalone loss-op callers.
+    callback = sys.modules.get("veomni.trainer.callbacks.channel_loss_callback")
+    consumer = callback.get_chunk_loss_consumer() if callback is not None else None
+    token_chunks: list[Tensor] = []
+    capture_failed = False
+
+    def observe(logits: Tensor, chunk_labels: Tensor) -> None:
+        nonlocal capture_failed
+        if capture_failed:
+            return
+        try:
+            with torch.no_grad():
+                token_chunks.append(
+                    F.cross_entropy(
+                        logits.detach(), chunk_labels.reshape(-1), ignore_index=ignore_index, reduction="none"
+                    ).reshape_as(chunk_labels)
+                )
+        except Exception as error:
+            capture_failed = True
+            token_chunks.clear()
+            if callback is None or not callback.report_chunk_loss_observer_error(error):
+                raise
+
+    def finish_capture() -> None:
+        if consumer is not None and not capture_failed:
+            try:
+                consumer(torch.cat(token_chunks, dim=split_dim).detach())
+            except Exception as error:
+                if callback is None or not callback.report_chunk_loss_observer_error(error):
+                    raise
+            finally:
+                token_chunks.clear()
+
+    observe_chunk = observe if consumer is not None else None
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
     if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad or bias_weight_needs_grad):
         for hidden_chunk, label_chunk, bias_chunk in zip(hidden_chunks, label_chunks, bias_chunks, strict=True):
-            _, chunk_loss = observer.evaluate(
-                (), hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk, logits_bias_weight
+            chunk_loss = _ce_loss_func(
+                hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk, logits_bias_weight, observe_chunk
             )
             accumulated_loss = accumulated_loss + chunk_loss
-        observer.finish(split_dim)
+        finish_capture()
         return accumulated_loss, SavedState(
             (hidden.new_empty(0), weight.new_empty(0)),
             _Meta(True, False, False, False, False),
@@ -242,7 +215,8 @@ def forward(
     for hidden_chunk, label_chunk, bias_chunk, grad_hidden_chunk, grad_bias_chunk in zip(
         hidden_chunks, label_chunks, bias_chunks, grad_hidden_chunks, grad_bias_chunks, strict=True
     ):
-        grads, chunk_loss = observer.evaluate(
+        grads, chunk_loss = _grad_and_value(
+            _ce_loss_func,
             argnums,
             hidden_chunk,
             weight,
@@ -251,6 +225,7 @@ def forward(
             ignore_index,
             bias_chunk,
             logits_bias_weight,
+            observe_chunk,
         )
         accumulated_loss = accumulated_loss + chunk_loss
         grad_iter = iter(grads)
@@ -263,7 +238,7 @@ def forward(
         if bias_weight_needs_grad and grad_bias_weight is not None:
             grad_bias_weight.add_(next(grad_iter))
 
-    observer.finish(split_dim)
+    finish_capture()
     saved_tensors = (
         grad_hidden if grad_hidden is not None else hidden.new_empty(0),
         grad_weight if grad_weight is not None else weight.new_empty(0),
