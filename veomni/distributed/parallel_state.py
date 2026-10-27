@@ -541,7 +541,7 @@ def _init_parallel_state(
         return _PARALLEL_STATE_REGISTRY[name]
 
     if _PARALLEL_STATE is not None:
-        logger.warning("Parallel state has already been initialized.")
+        logger.debug("Parallel state has already been initialized.")
 
     if device_type is None:
         device_type = get_device_type()
@@ -584,7 +584,7 @@ def _init_parallel_state(
     )
     cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
     if cached_state is not None:
-        logger.info_rank0("Reusing cached parallel state for identical topology.")
+        logger.debug("Reusing cached parallel state for identical topology.")
         # Mirror the build path below: only (re)establish the default global if it
         # has not been set yet. The cache is a module-level global that outlives the
         # global state (e.g. tests reset ``_PARALLEL_STATE = None`` at teardown but
