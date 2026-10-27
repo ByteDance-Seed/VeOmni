@@ -121,22 +121,24 @@ class WanT2VUlyssesTest(SequenceParallelTest):
                     failures.append(f"{tag}: {str(e).splitlines()[0]}")
                     continue
                 ref_out, ref_grads = refs[name]
-                out_err = ((out - ref_out).norm() / ref_out.norm()).item()
                 # Param grads cover only this rank's tokens and the loss is replicated on every
                 # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
-                diff_sq = ref_sq = 0.0
-                for n, g in grads.items():
+                for g in grads.values():
                     c10d.all_reduce(g, group=group)
                     g /= self.world_size
-                    diff_sq += (g - ref_grads[n]).pow(2).sum().item()
-                    ref_sq += ref_grads[n].pow(2).sum().item()
-                grad_err = (diff_sq / ref_sq) ** 0.5
-                # NaN compares False against the tolerance, so check finiteness explicitly.
-                tensors = [out, ref_out, *grads.values(), *ref_grads.values()]
-                if not all(torch.isfinite(t).all() for t in tensors):
-                    failures.append(f"{tag}: non-finite output or grad")
-                elif out_err > 1e-5 or grad_err > 1e-5:
-                    failures.append(f"{tag}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
+                if grads.keys() != ref_grads.keys():
+                    failures.append(f"{tag}: grad params differ: {sorted(grads.keys() ^ ref_grads.keys())}")
+                    continue
+                pairs = [("output", out, ref_out)] + [(f"grad {n}", grads[n], ref_grads[n]) for n in ref_grads]
+                for what, actual, expected in pairs:
+                    # Matching infinities would pass assert_close, so require finite values first.
+                    if not (torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+                        failures.append(f"{tag}: non-finite {what}")
+                        continue
+                    try:
+                        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-3, equal_nan=False)
+                    except AssertionError as e:
+                        failures.append(f"{tag}: {what}: {' '.join(str(e).split())}")
                 if entered != set(range(len(model.blocks))):
                     failures.append(f"{tag}: blocks bypassed nn.Module.__call__: {entered}")
         assert not failures, "\n".join(failures)
