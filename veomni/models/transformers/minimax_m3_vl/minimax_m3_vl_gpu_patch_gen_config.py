@@ -51,7 +51,6 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
@@ -85,7 +84,6 @@ config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
 )
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 
 
@@ -289,9 +287,15 @@ def _require_varlen_attention(attention_implementation, *, num_segments, ulysses
     attention (the dense language layers) needs the varlen backend even for a
     single sequence: eager attention, for one, applies no causal mask itself.
     """
-    varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
-        not ulysses_enabled or attention_implementation.startswith("veomni_")
-    )
+    # This mask-free model requires FlashAttention's varlen contract; other
+    # attention implementations need their own mask preparation.
+    varlen_backend = attention_implementation.removeprefix("veomni_") in (
+        "flash_attention_2",
+        "flash_attention_2_hub",
+        "flash_attention_3",
+        "flash_attention_3_hub",
+        "flash_attention_4",
+    ) and (not ulysses_enabled or attention_implementation.startswith("veomni_"))
     if not varlen_backend and (causal or num_segments > 1 or ulysses_enabled):
         requirement = "causal masking" if causal else "multiple packed sequences"
         raise ValueError(

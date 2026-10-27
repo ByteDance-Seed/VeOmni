@@ -80,7 +80,6 @@ config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
 )
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_helper(_grid_thw_to_list)
 config.add_helper(_drop_sp_padding_features)

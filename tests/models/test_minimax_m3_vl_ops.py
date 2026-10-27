@@ -410,12 +410,27 @@ def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible(module_name):
     """HF replaces a flash backend missing from this list with its first entry, MiniMax's own Hub kernel."""
-    from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-
     modeling = importlib.import_module(module_name)
     compatible = modeling.MiniMaxM3VLPreTrainedModel._compatible_flash_implementations
-    sp_backends = [name for name in VARLEN_ATTENTION_TYPES if name.startswith("veomni_")]
+    sp_backends = [
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_2_hub",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_3_hub",
+        "veomni_flash_attention_4",
+    ]
     assert set(sp_backends) <= set(compatible)
+    for backend in sp_backends:
+        modeling._require_varlen_attention(
+            backend, num_segments=2, ulysses_enabled=True, attention_name="test", causal=True
+        )
+        modeling._require_varlen_attention(
+            backend.removeprefix("veomni_"),
+            num_segments=2,
+            ulysses_enabled=False,
+            attention_name="test",
+            causal=True,
+        )
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

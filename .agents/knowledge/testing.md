@@ -208,9 +208,7 @@ needed" without a reason is what the reviewer is looking for.
   graph and differentiate each graph once without retaining it. Keep test inputs
   deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
-  consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
-  their incoming dtype and casts them for fused MoE; a recording double must
-  identify which path it represents and assert the corresponding dtype.
+  consumer reads, including `impl`.
 - CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
   pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
   replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed

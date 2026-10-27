@@ -34,7 +34,7 @@ MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
 the LoRA targets. This restriction does not apply to LoRA on dense modules.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
-integration test, using its existing merged weights and routing-score cast.
+integration test, using its existing merged weights and FP32 router scores.
 This is operator integration, not full-model convergence validation.
 
 ## Requirements and tensor contract
@@ -55,7 +55,7 @@ This is operator integration, not full-model convergence validation.
 - Routing weights and int64 expert ids have shape `[tokens, top_k]` and share
   the hidden states' device. Routing weights retain the dtype supplied by the
   model and are applied after the down projection; output and hidden gradients
-  are BF16. Standard model adapters may cast router scores before the op.
+  are BF16.
 - Uneven loads, empty experts, empty batches and repeated expert ids are
   supported. The mainline EP dispatcher counts unique token/expert pairs and
   combines repeated slot weights. `assume_distinct_experts` remains an accepted
