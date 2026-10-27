@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.offloading import OffloadPolicy, build_activation_offloading_context
 from veomni.ops import VeomniOp
 from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token
@@ -119,17 +120,20 @@ def test_registered_chunk_loss_offload_preserves_loss_and_gradients(device, dtyp
             torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU")
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("recompute", [False, True])
 @pytest.mark.parametrize("bias_kind", ["full", "factored"])
-def test_npu_chunk_observer_bias_offload_parity(dtype, recompute, bias_kind):
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(device="cpu" if context.params["device"] == "cpu" else "accelerator")
+)
+def test_chunk_observer_bias_offload_parity(device, dtype, recompute, bias_kind):
     """Keep loss, all gradients and observations exact with native bias/offload."""
     kwargs = dict(recompute=recompute, frozen=None, all_ignored=False, bias_kind=bias_kind)
-    expected = _run("npu", dtype, offload=False, **kwargs)
+    expected = _run(device, dtype, offload=False, **kwargs)
     reference_tokens, actual_tokens = [], []
-    observed = _run("npu", dtype, offload=False, observed=reference_tokens, **kwargs)
-    actual = _run("npu", dtype, offload=True, observed=actual_tokens, **kwargs)
+    observed = _run(device, dtype, offload=False, observed=reference_tokens, **kwargs)
+    actual = _run(device, dtype, offload=True, observed=actual_tokens, **kwargs)
     for result in (observed, actual):
         for value, reference in zip(result, expected, strict=True):
             if reference is None:
