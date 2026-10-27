@@ -10,6 +10,15 @@
     ]
   },
   {
+    "name": "qwen38-channel_loss_callback-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_channel_loss_callback.py"
+    ]
+  },
+  {
     "name": "npu-unit-02",
     "suite": "unit",
     "args": [
@@ -417,15 +426,6 @@
       "-s",
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
-    ]
-  },
-  {
-    "name": "qwen38-channel_loss_callback-unit",
-    "suite": "unit",
-    "args": [
-      "-s",
-      "-x",
-      "tests/trainer/test_channel_loss_callback.py"
     ]
   }
 ]
