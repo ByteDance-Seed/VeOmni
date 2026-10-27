@@ -563,6 +563,21 @@ their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
+The standard `MainCollator` records source IDs, original feature boundaries and
+padding before packing. The observer intersects those boundaries with the
+contiguous SP shards used by the collator, including Ulysses and CP; attention
+sequence boundaries are kept separate because one source feature can contain
+more than one attention segment. DPO requires exactly two nonempty attention
+segments per preference pair, and the observer masks their last positions
+without changing the training labels. Private source metadata is removed before
+the model forward, including on unsampled steps.
+
+Custom collators and model hooks that reorder token inputs are not automatically
+covered by this provenance contract. If source layout cannot be proved or SP
+ranks disagree, non-strict mode skips the affected channel metrics; strict mode
+raises a metadata error. The non-strict path leaves the training objective and
+gradients unchanged.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable channel loss logging. |

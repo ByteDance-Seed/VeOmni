@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import math
 import os
@@ -103,6 +104,135 @@ def _expected_segment(logits, labels, start, end):
     )
     valid = shifted[start : end + 1] != IGNORE_INDEX
     return losses[start : end + 1][valid].sum().item(), valid.sum().item()
+
+
+def _channel_features():
+    return [
+        {
+            "input_ids": torch.tensor([], dtype=torch.long),
+            "labels": torch.tensor([], dtype=torch.long),
+            "attention_mask": torch.tensor([], dtype=torch.long),
+            "ds_idx": 0,
+        },
+        {
+            "input_ids": torch.tensor([0, 1, 2, 3]),
+            "labels": torch.tensor([0, 1, 2, 3]),
+            "attention_mask": torch.tensor([1, 0, 1, 1]),
+            "position_ids": torch.tensor([0, 1, 0, 1]),
+            "ds_idx": 1,
+        },
+    ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_uses_original_feature_boundaries_without_changing_training(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+    baseline = data_collator.MainCollator()(_channel_features())
+    observed = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(_channel_features())
+    proof = observed[data_collator.CHANNEL_LOSS_PROVENANCE]
+    assert proof["source_cu"] == [0, 0, 4]
+    assert observed["cu_seq_lens_q"].tolist() == [0, 2, 4]
+    for key in baseline:
+        if isinstance(baseline[key], torch.Tensor):
+            torch.testing.assert_close(observed[key], baseline[key], rtol=0, atol=0)
+        else:
+            assert observed[key] == baseline[key]
+
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[observed])
+    assert data_collator.CHANNEL_LOSS_PROVENANCE not in observed
+    callback.computer.before_micro_step()
+    callback.computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].reshape(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+    logits = torch.randn(1, 4, 5, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_()
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits, observed["labels"], 5)
+    reference_loss = callback.computer._original_loss_fn(reference, baseline["labels"], 5)
+    loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+    result = callback.computer._result
+    assert [(item["source_id"], item["token_count"].item()) for item in result] == [(0, 0), (1, 3)]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_private_provenance_is_removed_on_unsampled_step(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    cfg = ChannelLossConfig(enable=True, interval=2)
+    batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(_channel_features())
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    assert data_collator.CHANNEL_LOSS_PROVENANCE not in batch
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_metadata_hook_token_reordering(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+
+    def reorder(batch, _sp_pad):
+        batch["input_ids"] = batch["input_ids"].flip(-1)
+
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    batch = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=reorder
+    )(_channel_features())
+    assert batch[data_collator.CHANNEL_LOSS_PROVENANCE] == {"error": "unsupported source layout"}
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    callback.computer.before_micro_step()
+    callback.computer._original_loss_fn = lambda logits, labels, vocab_size: logits.sum()
+    logits = torch.ones(1, 4, 5, requires_grad=True)
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits, batch["labels"], 5)
+    loss.backward()
+    assert callback.computer._result is None
+    assert torch.equal(logits.grad, torch.ones_like(logits))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_diagnostic_snapshot_failure_preserves_collation(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    hook_calls = []
+
+    def hook(batch, _sp_pad):
+        hook_calls.append(True)
+
+    baseline = data_collator.MainCollator(metadata_collate_func=hook)(_channel_features())
+    cfg = ChannelLossConfig(enable=True, interval=1)
+
+    def fail_clone(*args, **kwargs):
+        raise RuntimeError("injected observer-only snapshot failure")
+
+    monkeypatch.setattr(torch.Tensor, "clone", fail_clone)
+    observed = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=hook
+    )(_channel_features())
+    assert observed.pop(data_collator.CHANNEL_LOSS_PROVENANCE) == {"error": "unsupported source layout"}
+    assert len(hook_calls) == 2
+    for key in baseline:
+        if isinstance(baseline[key], torch.Tensor):
+            torch.testing.assert_close(observed[key], baseline[key], rtol=0, atol=0)
+        else:
+            assert observed[key] == baseline[key]
 
 
 def test_channel_loss_uses_shift_labels_when_sequence_parallel_is_on():
@@ -386,6 +516,8 @@ def test_channel_loss_sp_reduce_preserves_batch_order_for_multiple_sources(monke
         attention_mask_flat=None,
         source_ids=["batch0", "batch1"],
         positions=torch.tensor([[0, 1], [0, 1]]),
+        packed_global_cu_seqlens=[0, 4, 8],
+        tail_padding_length=0,
         seq_len=4,
         ignore_index=IGNORE_INDEX,
         strict=True,
@@ -457,6 +589,8 @@ def test_channel_loss_sp_reduce_filters_uneven_remote_padding_segments(monkeypat
         attention_mask_flat=torch.ones(2, dtype=torch.long),
         source_ids=["doc"],
         positions=torch.tensor([[0, 1]]),
+        packed_global_cu_seqlens=[0, 2, 4],
+        tail_padding_length=2,
         seq_len=2,
         ignore_index=IGNORE_INDEX,
         strict=True,
@@ -898,7 +1032,8 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     assert base.channel_loss_callback.computer._source_ids == []
 
 
-def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_dpo_channel_loss_emits_policy_totals(monkeypatch, compact):
     _stub_parallel_state(monkeypatch)
 
     class DpoLossModel(torch.nn.Module):
@@ -916,8 +1051,17 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
             seq_len = labels.size(-1) if labels is not None else 8
             logits = torch.randn(1, seq_len, 8)
             if labels is not None:
-                self.loss_function(logits=logits, labels=labels, vocab_size=8)
-            log_probs = self.scale * (-torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10)
+                self.loss_function(
+                    logits=logits[:, :4] if compact else logits,
+                    labels=labels[:, :4] if compact else labels,
+                    vocab_size=8,
+                )
+            if compact:
+                rows = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3])
+                log_probs = -torch.arange(1, 5, dtype=torch.float32).index_select(0, rows).unsqueeze(0) / 10
+            else:
+                log_probs = -torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10
+            log_probs = self.scale * log_probs
             return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=log_probs))
 
     cfg = ChannelLossConfig(enable=True, interval=1)
@@ -958,6 +1102,15 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
         "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
         "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
+        "_veomni_channel_loss_source_provenance": {
+            "source_ids": [3, 4],
+            "source_cu": [0, 4, 8],
+            "input_mask": torch.ones(8, dtype=torch.bool),
+            "tail": 0,
+            "sp_size": 1,
+            "sp_rank": 0,
+        },
         "ds_idx": torch.tensor([3, 4]),
         "source_name": ["train/a", "train/b"],
     }
@@ -965,19 +1118,93 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
     try:
         base.channel_loss_callback.computer.install(policy_model)
         TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
-        TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 4]]
+        loss, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
 
         assert policy_model.loss_calls == 1
         assert reference_model.loss_calls == 1
         assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
         assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
         assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[3][0], torch.tensor(0.2 if compact else 0.4)
+        )
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[4][0], torch.tensor(0.6 if compact else 1.2)
+        )
         assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
         assert policy_model.scale.grad is not None
         assert reference_model.scale.grad is None
+        observed_grad = policy_model.scale.grad.detach().clone()
+        policy_model.scale.grad = None
+        base.channel_loss_callback.computer.uninstall()
+        trainer.channel_loss_callback = None
+        baseline, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+        torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+        torch.testing.assert_close(observed_grad, policy_model.scale.grad, rtol=0, atol=0)
     finally:
         base.channel_loss_callback.computer.uninstall()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_shared_prefix_reordering_uses_expanded_policy_log_probs(monkeypatch):
+    from veomni.data.data_collator import CHANNEL_LOSS_PROVENANCE
+    from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
+
+    _stub_parallel_state(monkeypatch)
+    prefix = list(range(64))
+    ids = torch.tensor([prefix + [100, 101] + prefix + [102, 103]])
+    positions = torch.tensor([list(range(66)) * 2])
+    cu = torch.tensor([0, 66, 132], dtype=torch.int32)
+    plan = build_shared_prefix_plan(ids, cu, positions)
+    assert plan is not None
+    labels = torch.tensor([prefix + [100, 101] + [IGNORE_INDEX] * 64 + [102, 103]])
+    target = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    _, compact_labels, inverse = plan.lm_rows(target)
+    assert compact_labels.numel() == target.numel() == 132
+    assert not torch.equal(inverse, torch.arange(132))
+
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    batch = {
+        "labels": labels,
+        "position_ids": positions,
+        "cu_seq_lens_q": cu,
+        "ds_idx": torch.tensor([0]),
+        CHANNEL_LOSS_PROVENANCE: {
+            "source_ids": [0],
+            "source_cu": [0, 132],
+            "input_mask": torch.ones(132, dtype=torch.bool),
+            "tail": 0,
+            "sp_size": 1,
+            "sp_rank": 0,
+        },
+    }
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch], source_repeat=2)
+    callback.computer.before_micro_step()
+
+    def compact_loss(logits, labels, vocab_size):
+        return F.cross_entropy(logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX)
+
+    callback.computer._original_loss_fn = compact_loss
+    torch.manual_seed(3)
+    logits = torch.randn(132, 106, requires_grad=True)
+    baseline_logits = logits.detach().clone().requires_grad_()
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits.unsqueeze(0), compact_labels.unsqueeze(0), 106)
+        per_token = F.cross_entropy(logits, compact_labels, ignore_index=IGNORE_INDEX, reduction="none")
+        expanded = per_token.index_select(0, inverse).unsqueeze(0)
+        callback.computer.observe_dpo_log_probs(-expanded, labels, batch["cu_seq_lens_q"])
+    baseline = compact_loss(baseline_logits.unsqueeze(0), compact_labels.unsqueeze(0), 106)
+    loss.backward()
+    baseline.backward()
+    torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, baseline_logits.grad, rtol=0, atol=0)
+    valid = target.ne(IGNORE_INDEX)
+    valid[0, torch.tensor([65, 131])] = False
+    result = callback.computer._result[0]
+    assert result["token_count"].item() == valid.sum().item() == 67
+    torch.testing.assert_close(result["loss_sum"], expanded.detach()[valid].sum())
 
 
 def test_dit_rejects_channel_loss_before_initialization():
@@ -1525,6 +1752,7 @@ def test_channel_loss_headwise_cp_keeps_empty_source():
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_channel_loss_rejects_stale_local_cu_without_global_mask():
     state = _test_parallel_state(sp_enabled=True, sp_size=2)
+    state.cp_size = 2
     with pytest.raises(ChannelLossMetadataError, match="global geometry"):
         ChannelLossComputer._aggregate_sp(
             per_token_loss=torch.ones(4),
@@ -1539,6 +1767,13 @@ def test_channel_loss_rejects_stale_local_cu_without_global_mask():
             parallel_state=state,
             strict=True,
         )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ulysses_global_spans_are_intersected_per_batch_row():
+    points = [0, 3, 6, 8, 11, 14, 16]
+    assert channel_loss_module._ulysses_local_span_lengths(points, 2, 4, 0, 2) == [3, 1, 0, 3, 1, 0]
+    assert channel_loss_module._ulysses_local_span_lengths(points, 2, 4, 1, 2) == [0, 2, 2, 0, 2, 2]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -1611,6 +1846,89 @@ def test_channel_loss_rejects_concurrent_capture_on_same_computer():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_async_child_capture_on_same_computer():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+
+    async def run():
+        async def child():
+            with pytest.raises(RuntimeError, match="Concurrent capture"), computer.capture():
+                pass
+
+        with computer.capture():
+            await asyncio.gather(child(), child())
+            with computer.capture():
+                pass
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_async_child_direct_and_expired_context():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.tensor([[0, 1]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size, shift_labels: torch.tensor(1.0)
+    logits, labels = torch.randn(1, 2, 4), torch.tensor([[1, 2]])
+
+    async def run():
+        release = asyncio.Event()
+
+        async def child():
+            with pytest.raises(RuntimeError, match="Concurrent capture"):
+                computer._wrapped_loss_fn(logits, labels, 4, labels)
+            await release.wait()
+            assert not computer.capture_active
+            computer._wrapped_loss_fn(logits, labels, 4, labels)
+            assert computer._result is None
+            with computer.capture():
+                assert computer.capture_active
+
+        with computer.capture():
+            task = asyncio.create_task(child())
+            await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_async_child_without_sources_runs_main_loss():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
+    computer._dpo_segments = True
+
+    async def run():
+        async def child():
+            assert computer._wrapped_loss_fn(labels=torch.tensor([[1]])).item() == 1.0
+            computer.observe_dpo_log_probs(torch.zeros(1, 1), torch.ones(1, 1), None)
+
+        with computer.capture():
+            await asyncio.create_task(child())
+            assert computer._result is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_loss_wrapper_async_child_with_sources_uses_main_loss_only():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
+    computer._dpo_segments = True
+    computer._source_ids = [0]
+
+    async def run():
+        async def child():
+            assert computer._wrapped_loss_fn(labels=torch.tensor([[1]])).item() == 1.0
+
+        with computer.capture():
+            await asyncio.create_task(child())
+            computer._source_ids = []
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("nested", [False, True])
 def test_channel_loss_discards_observation_when_forward_fails(nested):
     computer = ChannelLossComputer(parallel_state=_test_parallel_state())
@@ -1628,6 +1946,173 @@ def test_channel_loss_discards_observation_when_forward_fails(nested):
         assert computer._result is None
 
 
+def _gloo_channel_provenance_worker(rank, world_size, scenario, endpoint):
+    import veomni.data.data_collator as data_collator
+
+    global_rank = rank
+    try:
+        torch.distributed.init_process_group(
+            "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=40)
+        )
+        sp_size = 2 if scenario in {"two_stripes", "strict_two_stripes"} else world_size
+        dp_size = world_size // sp_size
+        dpo = scenario in {"dpo_cp", "dpo_observer_error", "dpo_global_cu_mismatch", "dpo_attention_cu_mismatch"}
+        use_cp = scenario in {
+            "cp_tail",
+            "dpo_cp",
+            "dpo_observer_error",
+            "dpo_global_cu_mismatch",
+            "dpo_attention_cu_mismatch",
+            "two_stripes",
+            "strict_two_stripes",
+            "mismatched_mask",
+            "mismatched_global_cu",
+        }
+        state = parallel_state_module._init_parallel_state(
+            dp_size=dp_size,
+            dp_shard_size=dp_size,
+            cp_size=sp_size if use_cp else 1,
+            ulysses_size=1 if use_cp else sp_size,
+            device_type="cpu",
+            name="channel-provenance-test",
+        )
+        source_base = 10 * (global_rank // sp_size) if scenario in {"two_stripes", "strict_two_stripes"} else 0
+        if scenario == "empty_internal_reset":
+            positions = [[], [0, 1, 0, 1]]
+        elif dpo:
+            positions = [[0, 1, 2, 0, 1], [0, 0, 1, 2]]
+        elif scenario == "ulysses_no_tail":
+            positions = [[0, 1, 2], [0, 1, 2, 3, 4]]
+        else:
+            positions = [[0, 1, 2], [0, 1, 2, 3]]
+
+        def features():
+            return [
+                {
+                    "input_ids": torch.arange(len(pos), dtype=torch.long) % 5,
+                    "labels": torch.arange(len(pos), dtype=torch.long) % 5,
+                    "position_ids": torch.tensor(pos, dtype=torch.long),
+                    "attention_mask": torch.tensor([int(i % 3 != 1) for i in range(len(pos))]),
+                    "ds_idx": source_base + index,
+                }
+                for index, pos in enumerate(positions)
+            ]
+
+        cfg = ChannelLossConfig(enable=True, interval=1, strict=scenario == "strict_two_stripes")
+        batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(features())
+        proof = batch[data_collator.CHANNEL_LOSS_PROVENANCE]
+        if (scenario == "mismatched_mask" and state.sp_rank == 1) or (
+            scenario == "strict_two_stripes" and global_rank == 3
+        ):
+            proof["input_mask"][0] = ~proof["input_mask"][0]
+        if scenario in {"mismatched_global_cu", "dpo_global_cu_mismatch"} and state.sp_rank == 1:
+            key = "linear_attn_cu_seqlens_list_q"
+            if key not in batch:
+                key = "linear_attn_cu_seq_lens_q"
+            cu = batch[key]
+            cu = cu.clone() if isinstance(cu, torch.Tensor) else list(cu)
+            cu[1] -= 1
+            batch[key] = cu
+        if scenario == "dpo_attention_cu_mismatch" and state.sp_rank == 1:
+            batch["cu_seq_lens_q"] = batch["cu_seq_lens_q"].clone()
+            batch["cu_seq_lens_q"][1] -= 1
+        trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+        callback = ChannelLossCallback(trainer)
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch], source_repeat=2 if dpo else 1)
+        callback.computer.before_micro_step()
+
+        def training_loss(logits, labels, vocab_size, shift_labels=None):
+            return F.cross_entropy(logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
+
+        callback.computer._original_loss_fn = training_loss
+        labels = batch["labels"]
+        logits = torch.zeros(*labels.shape, 5, requires_grad=True)
+        reference = logits.detach().clone().requires_grad_()
+        failed = False
+        try:
+            with callback.computer.capture():
+                loss = callback.computer._wrapped_loss_fn(logits, labels, 5, shift_labels=labels)
+                if dpo:
+                    token_loss = F.cross_entropy(
+                        logits.reshape(-1, 5), labels.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
+                    ).reshape_as(labels)
+                    log_probs = -token_loss
+                    if scenario == "dpo_observer_error" and state.sp_rank == 1:
+
+                        class FaultyLogProbs:
+                            def detach(self):
+                                raise RuntimeError("injected observer-only allocation failure")
+
+                        log_probs = FaultyLogProbs()
+                    callback.computer.observe_dpo_log_probs(log_probs, labels, batch["cu_seq_lens_q"])
+        except ChannelLossMetadataError:
+            if scenario != "strict_two_stripes":
+                raise
+            failed = True
+        if scenario == "strict_two_stripes":
+            assert failed
+        expected_loss = training_loss(reference, labels, 5, shift_labels=labels)
+        loss.backward()
+        expected_loss.backward()
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+        result = callback.computer._result
+        if scenario in {
+            "mismatched_mask",
+            "mismatched_global_cu",
+            "dpo_global_cu_mismatch",
+            "dpo_attention_cu_mismatch",
+            "dpo_observer_error",
+            "strict_two_stripes",
+        }:
+            assert result is None
+            return
+
+        # Recreate the exact global shifted training labels independently of the
+        # source observer, then mask DPO chosen/rejected segment ends.
+        raw_labels = [torch.arange(len(pos), dtype=torch.long) % 5 for pos in positions]
+        for raw in raw_labels[1:]:
+            if raw.numel():
+                raw[0] = IGNORE_INDEX
+        shifted = F.pad(torch.cat(raw_labels), (0, 1), value=IGNORE_INDEX)[1:]
+        if dpo:
+            shifted[torch.tensor([2, 4, 5, 8])] = IGNORE_INDEX
+        expected = []
+        start = 0
+        for pos in positions:
+            expected.append(int((shifted[start : start + len(pos)] != IGNORE_INDEX).sum()))
+            start += len(pos)
+        assert [item["source_id"] for item in result] == [source_base, source_base + 1]
+        assert [int(item["token_count"].item()) for item in result] == expected
+        for item, count in zip(result, expected):
+            torch.testing.assert_close(item["loss_sum"], torch.tensor(count * math.log(5)), rtol=1e-6, atol=1e-6)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        parallel_state_module.clear_parallel_state()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "world_size"),
+    [
+        ("empty_internal_reset", 2),
+        ("ulysses_no_tail", 2),
+        ("cp_tail", 2),
+        ("dpo_cp", 2),
+        ("mismatched_mask", 2),
+        ("mismatched_global_cu", 2),
+        ("dpo_global_cu_mismatch", 2),
+        ("dpo_attention_cu_mismatch", 2),
+        ("dpo_observer_error", 2),
+        ("two_stripes", 4),
+        ("strict_two_stripes", 4),
+    ],
+)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_real_gloo_channel_provenance(scenario, world_size):
+    spawn_with_rendezvous(_gloo_channel_provenance_worker, args=(world_size, scenario), nprocs=world_size)
+
+
 def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
     global_rank = rank
     try:
@@ -1636,7 +2121,25 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
         )
         sp_size = 2 if scenario == "two_stripes" else world_size
         dp_size = world_size // sp_size
-        use_cp = scenario in ("headwise", "headwise_tail")
+        use_cp = scenario in (
+            "headwise",
+            "headwise_tail",
+            "cu_mismatch",
+            "layout_mismatch",
+            "global_cu_mismatch",
+            "cp_contiguous",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "cp_mixed_geometry",
+            "cp_shared_stale",
+            "cp_no_global",
+            "cp_only_global",
+            "cp_only_global_strict",
+            "cp_asymmetric",
+            "cp_stale_contiguous",
+            "cp_no_local",
+            "two_stripes",
+        )
         state = parallel_state_module._init_parallel_state(
             dp_size=dp_size,
             dp_shard_size=dp_size,
@@ -1658,19 +2161,65 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
                 callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
             return
         computer = ChannelLossComputer(parallel_state=state)
-        computer.strict = scenario in ("headwise", "headwise_tail", "ulysses", "strict_missing")
-        if scenario == "ulysses":
+        computer.strict = scenario in (
+            "headwise",
+            "headwise_tail",
+            "ulysses",
+            "ulysses_local_cu",
+            "ulysses_local_tail",
+            "cp_contiguous",
+            "strict_missing",
+            "cp_only_global_strict",
+            "bad_global_no_local_strict",
+        )
+        if scenario in (
+            "ulysses",
+            "ulysses_local_cu",
+            "ulysses_local_tail",
+            "ulysses_stale_local",
+            "cp_contiguous",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "ulysses_no_global",
+            "ulysses_no_global_stale",
+        ):
             computer._source_ids = ["first", "second", "third"]
-            full_labels = torch.tensor([0, 1, IGNORE_INDEX, 2, 3, 4, 1, 0])
-            full_positions = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])
-            full_logits = torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19
-            width = 8 // world_size
+            tail = scenario in ("ulysses_local_tail", "cp_global_tail")
+            full_labels = torch.tensor(
+                [0, 1, IGNORE_INDEX, 2, 3, 4, 1, 0] + ([IGNORE_INDEX, IGNORE_INDEX] if tail else [])
+            )
+            full_positions = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1] + ([0, 0] if tail else []))
+            full_logits = torch.arange(full_labels.numel() * 5, dtype=torch.float32).reshape(-1, 5) / 19
+            width = full_labels.numel() // world_size
             start, end = rank * width, (rank + 1) * width
             labels = full_labels[start:end]
             logits = full_logits[start:end].clone().requires_grad_()
             computer._position_ids = full_positions[start:end].reshape(1, -1)
-            computer._packed_cu_seqlens = [0, 3, 6, 8]
-            computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+            if scenario == "cp_global_tail":
+                computer._packed_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._tail_padding_length = 2
+            elif scenario == "ulysses_local_tail":
+                computer._packed_cu_seqlens = [0, 3, 5, 5, 5] if rank == 0 else [0, 0, 1, 3, 5]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._tail_padding_length = 2
+            elif scenario in (
+                "ulysses_local_cu",
+                "ulysses_stale_local",
+                "cp_contiguous",
+                "ulysses_no_global",
+                "ulysses_no_global_stale",
+            ):
+                computer._packed_cu_seqlens = [0, 3, 4, 4] if rank == 0 else [0, 0, 2, 4]
+                if scenario in ("ulysses_stale_local", "ulysses_no_global_stale") and rank == 1:
+                    computer._packed_cu_seqlens = [0, 0, 1, 4]
+                if scenario not in ("ulysses_no_global", "ulysses_no_global_stale"):
+                    computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+            else:
+                computer._packed_cu_seqlens = [0, 3, 6, 8]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+                if scenario == "ulysses":
+                    computer._tail_padding_length = 0
             tokens = F.cross_entropy(full_logits, full_labels, ignore_index=IGNORE_INDEX, reduction="none")
             expected = torch.stack((tokens[:3].sum(), tokens[3:6].sum(), tokens[6:].sum()))
             expected_counts = [2, 3, 2]
@@ -1718,6 +2267,9 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
             )
             computer._position_ids = torch.tensor([[0, 1, 0, 0]])
             computer._packed_cu_seqlens = [0, 2, 4]
+            if use_cp and scenario != "cp_no_global":
+                computer._packed_global_cu_seqlens = [0, 2 * world_size, 4 * world_size]
+                computer._packed_global_physical_seq_len = 4 * world_size
             labels = torch.tensor([0, 1, 2, IGNORE_INDEX])
             logits = (torch.arange(20, dtype=torch.float32).reshape(4, 5) / 19 + rank / 13).requires_grad_()
             expected = torch.zeros(2)
@@ -1737,6 +2289,92 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
             computer._packed_global_cu_seqlens = [0, 4, 8]
         if scenario == "cu_mismatch" and rank == 0:
             computer._packed_cu_seqlens = [0, 1, 4]
+        if scenario == "global_cu_mismatch":
+            computer._packed_global_cu_seqlens = [0, 3, 6] if rank == 0 else [0, 4, 8]
+            computer._packed_global_physical_seq_len = 8
+        if scenario == "cp_mixed_geometry":
+            computer._packed_cu_seqlens = [0, 2, 4] if rank == 0 else [0, 0, 4]
+            computer._packed_global_cu_seqlens = [0, 4, 8]
+            computer._packed_global_physical_seq_len = 8
+        if scenario == "cp_shared_stale":
+            computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+        if scenario == "cp_only_global":
+            computer._packed_cu_seqlens = [0, 4, 8]
+            computer._position_ids = torch.tensor([[0, 3, 0, 3] if rank == 0 else [1, 2, 1, 2]])
+        if scenario == "cp_only_global_strict" and rank == 0:
+            computer._packed_cu_seqlens = [0, 4, 8]
+        if scenario == "cp_asymmetric":
+            computer._packed_cu_seqlens = [0, 4, 16]
+            computer._packed_global_cu_seqlens = [0, 4, 16]
+            computer._packed_global_physical_seq_len = 16
+            computer._position_ids = torch.tensor(
+                [[0, 1, 2, 3, 0, 1, 2, 3] if rank == 0 else [1, 2, 3, 4, 5, 6, 7, 8]]
+            )
+            labels = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+            logits = (torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19 + rank / 13).requires_grad_()
+        if scenario == "cp_stale_contiguous":
+            computer._packed_cu_seqlens = [0, 3, 4] if rank == 0 else [0, 0, 4]
+            computer._packed_global_cu_seqlens = [0, 3, 8]
+            computer._packed_global_physical_seq_len = 8
+            computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+        if scenario in (
+            "ulysses_empty_tail_no_global",
+            "ulysses_empty_tail_global_missing",
+            "ulysses_empty_tail_global_explicit",
+            "ulysses_empty_tail_local_explicit",
+            "ulysses_empty_tail_unknown",
+            "ulysses_empty_tail_local_missing",
+        ):
+            computer._source_ids = ["empty", "real"]
+            computer._position_ids = torch.tensor([[0, 1] if rank == 0 else [2, 0]])
+            computer._tail_padding_length = 1
+            all_labels = torch.tensor([0, 1, 2, IGNORE_INDEX])
+            all_logits = torch.arange(20, dtype=torch.float32).reshape(4, 5) / 19
+            labels = all_labels[rank * 2 : rank * 2 + 2]
+            logits = all_logits[rank * 2 : rank * 2 + 2].clone().requires_grad_()
+            if scenario == "ulysses_empty_tail_no_global":
+                computer._packed_cu_seqlens = [0, 0, 2]
+            elif scenario == "ulysses_empty_tail_global_missing":
+                computer._packed_cu_seqlens = [0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+            elif scenario == "ulysses_empty_tail_unknown":
+                computer._packed_cu_seqlens = [0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+                computer._tail_padding_length = None
+            elif scenario == "ulysses_empty_tail_local_missing":
+                computer._packed_cu_seqlens = [0, 2, 2] if rank == 0 else [0, 1, 2]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+            elif scenario == "ulysses_empty_tail_global_explicit":
+                computer._packed_cu_seqlens = [0, 0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 0, 3, 4]
+            else:
+                computer._packed_cu_seqlens = [0, 0, 2, 2] if rank == 0 else [0, 0, 1, 2]
+                computer._packed_global_cu_seqlens = [0, 0, 3, 4]
+                computer._packed_global_physical_seq_len = 4
+                tokens = F.cross_entropy(all_logits, all_labels, ignore_index=IGNORE_INDEX, reduction="none")
+                expected = torch.stack((tokens[:0].sum(), tokens[:3].sum()))
+                expected_counts = [0, 3]
+        if scenario in ("ulysses_supervised_tail", "ulysses_valid_tail"):
+            computer._source_ids = ["first", "second"]
+            computer._position_ids = torch.tensor([[0, 1, 2, 0] if rank == 0 else [1, 2, 0, 0]])
+            computer._packed_cu_seqlens = [0, 3, 6, 8]
+            computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+            computer._tail_padding_length = 2
+            all_labels = torch.tensor([0, 1, 2, 3, 4, 0, IGNORE_INDEX, IGNORE_INDEX])
+            if scenario == "ulysses_supervised_tail":
+                all_labels[-2:] = torch.tensor([1, 2])
+            all_logits = torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19
+            labels = all_labels[rank * 4 : rank * 4 + 4]
+            logits = all_logits[rank * 4 : rank * 4 + 4].clone().requires_grad_()
+            tokens = F.cross_entropy(all_logits, all_labels, ignore_index=IGNORE_INDEX, reduction="none")
+            expected = torch.stack((tokens[:3].sum(), tokens[3:6].sum()))
+            expected_counts = [3, 3]
+        if scenario == "cp_no_local":
+            computer._packed_cu_seqlens = None
+            computer._packed_global_cu_seqlens = None
+        if scenario in ("bad_global_no_local", "bad_global_no_local_strict"):
+            computer._packed_cu_seqlens = None
+            computer._packed_global_cu_seqlens = torch.tensor([[0, 8]]) if rank == 0 else [0, 8]
         reference = logits.detach().clone().requires_grad_()
         reference_loss = F.cross_entropy(reference, labels, ignore_index=IGNORE_INDEX, reduction="sum")
 
@@ -1746,8 +2384,10 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
             )
 
         computer._original_loss_fn = main_loss
-        if scenario == "strict_missing":
-            with pytest.raises(ChannelLossMetadataError, match="SP ranks disagree|no causal-loss"):
+        if scenario in ("strict_missing", "bad_global_no_local_strict", "cp_only_global_strict"):
+            with pytest.raises(
+                ChannelLossMetadataError, match="SP ranks disagree|no causal-loss|global packed CU|CP requires"
+            ):
                 with computer.capture():
                     computer._wrapped_loss_fn(logits.unsqueeze(0), labels.unsqueeze(0), 5, labels.unsqueeze(0))
             return
@@ -1757,7 +2397,32 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
         reference_loss.backward()
         torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
         torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
-        if scenario in ("missing", "side_failure", "layout_mismatch", "cu_mismatch"):
+        if scenario in (
+            "missing",
+            "side_failure",
+            "layout_mismatch",
+            "cu_mismatch",
+            "global_cu_mismatch",
+            "ulysses_stale_local",
+            "ulysses_no_global",
+            "ulysses_no_global_stale",
+            "ulysses_empty_tail_no_global",
+            "ulysses_empty_tail_global_missing",
+            "ulysses_empty_tail_global_explicit",
+            "ulysses_empty_tail_unknown",
+            "ulysses_empty_tail_local_missing",
+            "ulysses_supervised_tail",
+            "cp_mixed_geometry",
+            "cp_no_global",
+            "cp_shared_stale",
+            "cp_only_global",
+            "cp_asymmetric",
+            "cp_stale_contiguous",
+            "cp_no_local",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "bad_global_no_local",
+        ):
             assert computer._result is None
             return
         assert [item["source_id"] for item in computer._result] == computer._source_ids
@@ -1778,6 +2443,22 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
         (4, "headwise_tail"),
         (4, "two_stripes"),
         (2, "ulysses"),
+        (2, "ulysses_local_cu"),
+        (2, "ulysses_local_tail"),
+        (2, "ulysses_no_global"),
+        (2, "ulysses_no_global_stale"),
+        (2, "ulysses_empty_tail_no_global"),
+        (2, "ulysses_empty_tail_global_missing"),
+        (2, "ulysses_empty_tail_global_explicit"),
+        (2, "ulysses_empty_tail_local_explicit"),
+        (2, "ulysses_empty_tail_unknown"),
+        (2, "ulysses_empty_tail_local_missing"),
+        (2, "ulysses_supervised_tail"),
+        (2, "ulysses_valid_tail"),
+        (2, "cp_contiguous"),
+        (2, "cp_global_contiguous"),
+        (2, "cp_global_tail"),
+        (2, "ulysses_stale_local"),
         (4, "ulysses"),
         (2, "missing"),
         (2, "strict_missing"),
@@ -1785,6 +2466,17 @@ def _gloo_packed_loss_worker(rank, world_size, scenario, endpoint):
         (2, "side_failure"),
         (2, "layout_mismatch"),
         (2, "cu_mismatch"),
+        (2, "global_cu_mismatch"),
+        (2, "cp_mixed_geometry"),
+        (2, "cp_shared_stale"),
+        (2, "cp_no_global"),
+        (2, "cp_only_global"),
+        (2, "cp_only_global_strict"),
+        (2, "cp_asymmetric"),
+        (2, "cp_stale_contiguous"),
+        (2, "cp_no_local"),
+        (2, "bad_global_no_local"),
+        (2, "bad_global_no_local_strict"),
     ],
 )
 def test_channel_loss_real_gloo_packed_parity(world_size, scenario):

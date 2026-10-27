@@ -452,6 +452,9 @@ class BaseTrainer(Stateful, ABC):
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
+            channel_loss_source_id_keys=(
+                tuple(self.args.train.channel_loss.source_id_keys) if self.args.train.channel_loss.enable else None
+            ),
         )
 
     def _build_dataloader(self):

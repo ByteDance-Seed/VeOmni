@@ -341,6 +341,11 @@ class TextDPOTrainer:
         """
         model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        if channel_loss_callback is not None:
+            channel_loss_callback.computer.observe_dpo_log_probs(
+                outputs.fused_linear_aux.log_probs, micro_batch["labels"], micro_batch.get("cu_seq_lens_q")
+            )
 
         # ``outputs.fused_linear_aux.log_probs`` is shape [1, packed_L]
         # (actual log-probabilities; sign already flipped). PostCollator

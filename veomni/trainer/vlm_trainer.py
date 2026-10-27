@@ -283,6 +283,11 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
+            channel_loss_source_id_keys=(
+                tuple(self.base.args.train.channel_loss.source_id_keys)
+                if self.base.args.train.channel_loss.enable
+                else None
+            ),
         )
 
     def on_train_begin(self):
