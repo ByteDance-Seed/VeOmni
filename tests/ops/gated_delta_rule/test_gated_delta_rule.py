@@ -734,11 +734,12 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, dim
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
-    # The Ascend910B v26.6 RecomputeWUFwd kernel supports V=128/256, not 64.
-    # Keep Triton padding coverage and both supported AscendC widths.
+    # Ascend910B v26.6 uses K=128 while V can be 128 or 256.
+    # Keep Triton padding coverage without testing AscendC with K=256.
     batch, seq, heads = 1, 128, 4
-    q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
+    key_dim = dim if impl == "triton" else 128
+    q = torch.randn(batch, seq, heads, key_dim, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, heads, key_dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
