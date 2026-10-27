@@ -199,13 +199,17 @@ apart from the compatibility aliases documented below.
 
 | Field | GPU | Ascend NPU | Cambricon MLU |
 |---|---|---|---|
-| `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` with Apex, else `fused_triton` |
-| `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `eager` |
-| `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `eager` |
-| `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `eager` |
-| `rotary_pos_emb_implementation` | `liger_kernel` | `torch_npu` | `eager` |
-| `rotary_pos_emb_vision_implementation` | `liger_kernel` | `torch_npu` | `eager` |
+| `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` |
+| `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `liger_kernel` |
+| `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `liger_kernel` |
+| `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `liger_kernel` |
+| `rotary_pos_emb_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
+| `rotary_pos_emb_vision_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
 | `load_balancing_loss_implementation` | `triton` | `eager` | `eager` |
+
+**Note:** `moe_implementation=fused_mlu` on MLU requires the Cambricon MLU Apex build, else fallback to `fused_triton`;
+`liger_kernel` on MLU requires the Cambricon MLU liger_kernel build (the `liger_kernel` wheel
+versioned `+mlu*`). Without it, MLU fields default to `eager`.
 
 Explicit values are never rewritten, including explicit GPU values on NPU.
 Unsupported NPU values such as `liger_kernel` or `fused_triton` raise during
@@ -233,11 +237,11 @@ NPU validation runs at two times:
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires NVIDIA CUDA and a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. SM90+ selects FA4 when supported, with Triton fallback for unsupported inputs; the registered mask builder uses 256×128 blocks on SM100+ and 128×128 elsewhere. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It requires NVIDIA SM100+ and uses CUTE DSL/JIT. SageAttention is inference-only and does not take a dense mask. |
 | moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `deepgemm_fp8` runs native FP8 expert forward/dgrad/wgrad (Hopper SM90 / Blackwell SM100; see [requirements](../design/deepgemm_fp8_moe.md)); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
-| cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
-| rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU default, GPU only), `torch_npu` (NPU default for weighted variants; `unweighted` has no Ascend kernel and uses `eager`, including an explicit `torch_npu` for compatibility), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
-| swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU default, GPU only), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
-| rotary_pos_emb_implementation | `Optional[str]` | host default | Rotary pos emb. Known values: `liger_kernel` (GPU default, GPU only), `torch_npu` (NPU default), `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. Variants without a default row (such as `deepseek_v4`, `wan`, `interleave`, `mrope`) resolve to `eager` when unset. |
-| rotary_pos_emb_vision_implementation | `Optional[str]` | host default | Independent implementation choice for the rank-3 vision layout of `rope/full`. Known values: `liger_kernel` (GPU default), `torch_npu` (NPU default), `eager` (MLU default). |
+| cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU/MLU default) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
+| rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default for weighted variants; `unweighted` has no Ascend kernel and uses `eager`, including an explicit `torch_npu` for compatibility), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU/MLU default), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
+| rotary_pos_emb_implementation | `Optional[str]` | host default | Rotary pos emb. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default), `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. Variants without a default row (such as `deepseek_v4`, `wan`, `interleave`, `mrope`) resolve to `eager` when unset. |
+| rotary_pos_emb_vision_implementation | `Optional[str]` | host default | Independent implementation choice for the rank-3 vision layout of `rope/full`. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default). |
 | load_balancing_loss_implementation | `Optional[str]` | host default | MoE load-balancing loss. `triton` (GPU default) uses the fused GPU kernel; `eager` (NPU and MLU default) is the pure-PyTorch reference. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`; GPU, MLU, NPU), `torch_npu` (`npu_swiglu` for SiLU, eager gate multiply for sigmoid). |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU, MLU, NPU), `triton` (vendored Triton-Ascend; requires `triton-ascend`). `eager` does not support the varlen path. |

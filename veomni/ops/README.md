@@ -57,6 +57,12 @@ when the selected implementation runs.
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
+The MLU `liger_kernel` rows reuse the CUDA adapters and use
+`MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
+liger build keeps the upstream `liger_kernel.ops.*` API, and the registry
+checks its `__mlu_version__` marker so upstream GPU liger on an MLU host is
+never selected.
+
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
 and derives visibility itself rather than reading a dense mask. Each row
