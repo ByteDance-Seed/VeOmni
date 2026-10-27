@@ -47,6 +47,7 @@ optional_roots = {
     "cuda",
     "cudnn",
     "debugpy",
+    "deep_gemm",
     "fla",
     "fla_npu",
     "flash_attn",
@@ -99,6 +100,7 @@ for module in (
     "veomni.ops.kernels.moe_experts_lora.shared.triton",
     "veomni.ops.kernels.moe_experts_lora.independent.triton",
     "veomni.ops.kernels.moe_experts.shared._triton_swiglu",
+    "veomni.ops.kernels.moe_experts.shared.deepgemm_fp8",
     "veomni.ops.qat.quant",
 ):
     assert module not in sys.modules

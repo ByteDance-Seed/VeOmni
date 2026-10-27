@@ -167,7 +167,7 @@ kernel-load and JIT cost (~550 s on a cold cache).
 Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses SP, expert parallel EP, VLM/Omni, DiT) works and aligns numerically. Known limitations:
 
 - **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative.
-- **Attention sinks are not supported by `aiter`** — DeepSeek-V4 and `gpt_oss` raise rather than silently dropping the sinks. Use `eager` if they are required.
+- **Attention sinks are not supported by `aiter`** — models that pass `s_aux` / `learnable_sink` (such as DeepSeek-V4; `gpt_oss` only declares FA3 Hub and FA4 as compatible flash implementations) raise rather than silently dropping the sinks. Use `eager` if they are required.
 - **`aiter` cannot train with an attention logits softcap.** Its varlen forward applies the cap, but its backward ignores it. VeOmni raises under autograd and permits the correct inference-only forward; use `eager` for training.
 - **`aiter` rejects a `window_size` tuple that is neither 2 nor 3 elements wide.** `None` is accepted and selects full attention.
 - **GatedDeltaNet (qwen3_5 / qwen3_5_moe)**: the tilelang ROCm backend has a HIP wrapper/codegen defect; set `FLA_TILELANG=0` to use the Triton fallback (validated to train and align correctly).

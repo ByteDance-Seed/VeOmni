@@ -48,23 +48,23 @@ when the selected implementation runs.
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
-| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
 and derives visibility itself rather than reading a dense mask. Each row
-expands that contract its own way: `eager` and `tilelang` build explicit
+expands that contract its own way: `eager`, `tilelang`, and `triton` build explicit
 candidate slots, where repeated valid indices participate once per occurrence
 and sentinel entries contribute no attention mass, while `cann` passes mask
-modes to the kernel. With `return_lse=True`, `eager` and `tilelang` return a
-detached base-2 log-sum-exp tensor.
+modes to the kernel. With `return_lse=True`, `eager`, `tilelang`, and `triton` return a
+detached base-2 log-sum-exp tensor. The `triton` row is ROCm-only.
 
 Qwen4-Exp `qsa_attention` takes the indexer's compact `[B, S, K]` selection of
 global K/V token indices, where `-1` marks an unused slot. The selection
@@ -107,6 +107,14 @@ and is optional; install it with:
 ```bash
 uv sync --extra gpu --extra magi --dev
 ```
+
+The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
+Its hidden states and expert weights remain BF16; routing weights retain their
+supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+for dependency installation, configuration, precision and distributed coverage.
 
 ## Registering an op
 

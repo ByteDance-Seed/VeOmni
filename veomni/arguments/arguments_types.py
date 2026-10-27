@@ -859,6 +859,8 @@ class AcceleratorConfig:
         # "derive it", cp_size is always an explicit divisor of the world size.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:
@@ -1415,7 +1417,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
@@ -1528,12 +1530,12 @@ class OpsImplementationConfig:
             "cann_ops_transformer)."
         },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={
-            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or "
-            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA (requires "
-            "cann_ops_transformer)."
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', "
+            "'tilelang', or 'triton'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA "
+            "(requires cann_ops_transformer); 'triton' is DeepSeek-V4 sparse MQA on AMD ROCm."
         },
     )
     mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
@@ -1557,7 +1559,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1602,7 +1604,7 @@ class OpsImplementationConfig:
 
     @staticmethod
     def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
-        """Validate Hub requests and resolve their registered VeOmni names."""
+        """Validate Hub and AITER requests and resolve their registered VeOmni names."""
         OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
         return {
@@ -1620,7 +1622,6 @@ class OpsImplementationConfig:
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
                 "flex_attention": "veomni_flex_attention",
-                "aiter": "veomni_flash_attention_aiter",
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
@@ -1666,13 +1667,20 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,

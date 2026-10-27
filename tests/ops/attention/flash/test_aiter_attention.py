@@ -22,11 +22,29 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import install as install_backend
 from veomni.ops.kernels.attention.standard import aiter as aiter_backend
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 AITER_IMPL = "veomni_flash_attention_aiter"
+
+
+def test_aiter_preserves_packed_varlen_attention_metadata():
+    from veomni.models.utils.attention_utils import drop_packed_attention_metadata, prepare_dense_attention_inputs
+
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
+    mask = torch.ones(1, 8, dtype=torch.long)
+    hidden = torch.randn(1, 8, 4)
+
+    assert drop_packed_attention_metadata(kwargs, impl=AITER_IMPL) is kwargs
+    filtered, out_mask = prepare_dense_attention_inputs(
+        kwargs, impl=AITER_IMPL, attention_mask=mask, hidden_states=hidden
+    )
+    assert filtered is kwargs
+    assert out_mask is mask
 
 
 def _install_fake_aiter(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict]:

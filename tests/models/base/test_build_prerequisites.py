@@ -25,9 +25,13 @@ import torch
 from transformers import PretrainedConfig
 
 import veomni.models.auto as auto
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.ops.config import get_ops_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _TOY_CONFIG_DIR = Path(__file__).resolve().parents[2] / "toy_config"
