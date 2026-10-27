@@ -73,10 +73,17 @@ on-device until the retention counter reaches the threshold; subsequent tensors
 move to CPU. The trainer uses pageable host memory (`pin_memory=False`). The
 synchronous threshold applies as follows:
 
-| Gradient checkpointing | Where `activation_gpu_limit` applies |
-| --- | --- |
-| Disabled | Controls retained activations when saving tensors during forward. |
-| Enabled | Forward uses a zero retention threshold for inter-layer activations; the parameter applies to tensors saved during backward recomputation. |
+| Gradient checkpointing             | Where `activation_gpu_limit` applies                                                                                                                                                                                                                                                    |
+|------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Disabled                           | Controls retained activations when saving tensors during forward.                                                                                                                                                                                                                       |
+| Enabled, `enable_reentrant: true`  | The outer forward offload context uses a zero threshold. During backward recomputation, the outer backward offload hook can apply `activation_gpu_limit` to eligible saved tensors.                                                                                                     |
+| Enabled, `enable_reentrant: false` | The outer forward offload context uses a zero threshold for eligible checkpoint inputs. PyTorch's inner recomputation hook takes precedence over the outer backward offload hook, so `activation_gpu_limit` does **not** control retained activations inside checkpoint recomputation.  |
+
+The distinction comes from hook nesting: only the innermost saved-tensor hook
+handles a tensor. Non-reentrant checkpointing installs its own hooks to recover
+intermediate results by recomputation. An outer offload context does not override
+that behavior. Tensors saved outside those checkpoint regions can still reach
+the outer hook; this is not a claim that all offloading is disabled.
 
 This is a saved-tensor accounting threshold, **not a limit on total device memory**;
 retaining a whole tensor can also cross it.
@@ -117,9 +124,13 @@ model:
       enable_reentrant: false
     offload_config:
       enable_activation: true
-      activation_gpu_limit: 1.0
+      activation_gpu_limit: 0.0
       enable_async_activation: false
 ```
+
+This example uses non-reentrant checkpointing. The explicit `0.0` is the default;
+increasing it does not tune retention inside checkpoint recomputation. Choose
+checkpoint mode according to model compatibility, not just to make this knob active.
 
 For asynchronous offload, replace the preceding offload settings with:
 

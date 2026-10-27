@@ -9,8 +9,7 @@ This can overlap part of checkpoint I/O with subsequent training. It does not
 make every checkpoint-related operation asynchronous or guarantee a stall-free
 save.
 
-This page follows revision `b8a3edcc01dba6026c785fa087a9ca1a59c9c9e2`.
-Use a working distributed training recipe and the repository's pinned hardware
+The repository's pinned hardware
 dependencies; see [Ascend installation](../get_started/installation/install_ascend_x86.md)
 and [trainer usage](../usage/trainer.md).
 
@@ -37,21 +36,31 @@ This is a schematic timeline: preparing/staging state and writing some sidecar
 files can still block, so the entire save call is not an immediate return. The
 opportunity is to overlap **part of storage I/O with subsequent computation**.
 
-### Completion tracking and synchronization
+### Independent save slots and completion
 
-VeOmni retains a future object to track the background result. Think of it as a
-task result that is not available yet: successful submission hands the work off;
-successfully waiting for the result confirms completion of that background work.
+VeOmni tracks weights and optimizer writes separately. Each kind has one future
+(the handle used to retrieve its background result) and its own Gloo process
+group. The weights slot is named `ckpt`; the optimizer slot is named `optimizer`.
+The two writes can overlap, although state preparation and submission still run
+on the calling path.
 
-`wait_for_pending_save()` calls `future.result()` to wait. A background failure is
-raised here. The wait clears the recorded future and, on success, executes a
-barrier so participating processes synchronize at this point. A `saved` log or
-an existing directory therefore cannot replace a completion check.
+A new submission waits only for the previous write **in the same slot**. For
+example, a weights save at step 200 drains the previous weights future before
+reusing that slot; it does not directly drain the optimizer future. The optimizer
+submission later drains its own previous future. This bounds the outstanding
+work to one write per slot, rather than accumulating a queue. These slots belong
+to the checkpointer class, not to each step or each model: a multi-model job also
+reuses them across model submissions.
 
-There is only one pending-save slot. Suppose step 100 starts an async save and it
-is still running at the next save boundary: the new async save waits for it,
-rather than building an ever-growing queue. Loading, HF/LoRA export and normal
-training shutdown also wait for an existing save.
+`wait_for_pending_save()` drains every recorded future. It first waits for all
+local tasks, collecting failures even if one task raises, then performs failure
+agreement on the corresponding slot's Gloo group. A reported save failure is
+therefore propagated across ranks. This coordination is not the old single-future
+wait followed by a default-group barrier.
+
+Loading, export preparation and normal training shutdown use this completion
+entry point. An early `saved` log or an existing directory does not mean that
+both tensor writes have finished.
 
 ### Checkpoint state composition
 
@@ -70,10 +79,15 @@ files, not just the presence of weights.
 
 `CheckpointCallback` decides when to save by step or epoch.
 `ModelCheckpointManager` forwards `train.checkpoint.save_async` to the DCP
-checkpointer, which calls `dcp.async_save` and manages its future.
+checkpointer, which calls `dcp.async_save` and manages the two slots' futures.
 
-The first async save creates a dedicated Gloo process group for coordination
-between saving processes. Even when model training uses CUDA or Ascend, those
+The standard manager also calls a training-group barrier after submitting the
+saves. That barrier coordinates the calling ranks; it does not resolve the
+background futures or establish that their writes have completed.
+
+The first async submission for each slot creates that slot's dedicated Gloo
+process group. Separate groups keep concurrent weights and optimizer collectives
+from sharing one background communication sequence. Even when model training uses CUDA or Ascend, those
 processes therefore still need a working Gloo communication environment.
 
 Custom loops should follow the standard trainer by waiting for pending saves
@@ -93,6 +107,7 @@ Fields are under `train.checkpoint`.
 | `save_steps` | `0` | DCP step interval; zero disables step scheduling. |
 | `save_epochs` | `1` | DCP epoch interval; zero disables epoch scheduling. |
 | `stage_dir` | `null` | Optional staging directory for the synchronous path; a nonempty value cannot be combined with `save_async`. |
+| `save_timeout_seconds` | `null` | Positive integer collective timeout for async-slot and staged-save Gloo groups; unset uses Gloo's default. Applied when each cached group is first created, not a per-file I/O deadline. |
 | `dcp_save_to_lowest_rank` | `false` | Route replicated shards to their lowest holder rank instead of distributing replica writes. Does not consolidate unique EP/TP/PP shards. |
 | `load_path` | `null` | Specific completed checkpoint directory to resume. |
 | `save_hf_weights` | `true` | Enable HF exports; those use a separate path and are not made async by `save_async`. |
@@ -101,7 +116,9 @@ Fields are under `train.checkpoint`.
 Step and epoch schedules are independent, with duplicate saves at the same step
 suppressed by the callback. `save_async: true` alone does not enable a step
 schedule. Ending training does not unconditionally create a new final DCP;
-it drains the pending one and handles the separately configured final HF export.
+it drains pending writes. If final HF/LoRA export is enabled, export preparation
+can first create a DCP for the final step when that step has not yet been saved,
+and then wait for it. The example below disables that export.
 
 ## Usage example and recovery
 
@@ -128,8 +145,30 @@ output/async-check/
   model_assets/
   checkpoints/
     global_step_100/
-      ... DCP metadata, tensor shards and state sidecars ...
+      checkpoint_manifest.json
+      model/
+        ckpt/                 # .metadata + .distcp
+        optimizer/            # .metadata + .distcp
+        extra_state/extra_state_rank_0.pt # one file per rank
+      loader/rank_0.pt        # one file per rank
+      extra_state/rank_0.pt   # one file per rank
 ```
+
+This shows a single-model job with optimizer state; `rank_0.pt` represents each
+rank's file. Multi-model jobs nest each model's state under `model/<module>/`.
+At this revision, scheduler state is inside the model's per-rank `extra_state`
+dictionary, together with any runtime-specific state.
+
+`checkpoint_manifest.json` covers trainer-level cursor/state completion only.
+It can appear while DCP is still writing. For each discovered model, automatic
+resume discovery requires `.metadata` in its weights directory and, **if its
+optimizer directory exists**, in that directory too. A weights-only save therefore
+does not require an optimizer marker. A manifest with `model_state: false`
+requires no model markers. These are marker-existence checks, not validation of
+every shard, sidecar or file's contents; successful discovery alone does not prove
+that a full training resume will succeed. See [checkpoint layout](../usage/checkpoint.md) for discovery and
+legacy layouts; the per-rank model sidecar shown above follows this revision's
+`_save_extra_state` implementation.
 
 Do not set the derived `save_path` field in YAML. For recovery after successful
 completion, merge this setting into an otherwise compatible recipe:
