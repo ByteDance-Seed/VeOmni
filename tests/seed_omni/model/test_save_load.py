@@ -326,7 +326,7 @@ def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_pat
     loaded = OmniModel.from_pretrained(tmp_path)
 
     assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
-    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
 def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
@@ -347,7 +347,7 @@ def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
     loaded = OmniModel.from_pretrained(tmp_path, attn_implementation="sdpa")
 
     assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
-    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
 def test_kernel_layers_merge_per_field_across_the_model_and_the_module(tmp_path):
@@ -493,7 +493,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     assert saved_root["_module_entries"][FAKE_A]["ops_implementation"] == {"attn_implementation": "eager"}
     # The saved module config is the resolved one: B's own attention plus the root default.
     assert json.loads((resaved / FAKE_B / "config.json").read_text(encoding="utf-8"))["ops_implementation"] == {
-        "attn_implementation": "sdpa",
+        "attn_implementation": "veomni_sdpa",
         "rms_norm_implementation": "eager",
     }
 
@@ -501,7 +501,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     assert reloaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
     assert reloaded.config._module_configs[FAKE_B].ops_implementation == {
         "rms_norm_implementation": "eager",
-        "attn_implementation": "sdpa",
+        "attn_implementation": "veomni_sdpa",
     }
 
 
@@ -527,7 +527,7 @@ def test_a_kernel_block_kwarg_merges_per_field_like_any_other_layer(tmp_path):
         "rms_norm_implementation": "eager",
         "attn_implementation": "sdpa",
     }
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
     assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "eager"
 
 

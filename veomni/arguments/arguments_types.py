@@ -15,9 +15,10 @@
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -1655,6 +1656,49 @@ class OpsImplementationConfig:
                 self.attn_implementation = new_impl
 
         self._validate_implementations()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize non-None op implementation selections to a dict."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+    @classmethod
+    def validate_and_extract_dict(cls, d: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Validate a sparse op-selection mapping and return only its explicitly provided non-None keys."""
+        if not d:
+            return {}
+        validated = cls.from_dict(d, validate=True)
+        return {key: value for key in d if hasattr(validated, key) and (value := getattr(validated, key)) is not None}
+
+    @classmethod
+    def from_dict(
+        cls,
+        d: Optional[Mapping[str, Any]] = None,
+        validate: bool = True,
+    ) -> "OpsImplementationConfig":
+        """Construct an :class:`OpsImplementationConfig` from a mapping.
+
+        When ``validate=True``, runs ``__post_init__`` alias resolution,
+        attention backend normalization, and hardware checks. When
+        ``validate=False``, populates fields directly without re-running
+        ``__post_init__`` for fast repeated access from
+        :attr:`~veomni.models.VeOmniPretrainedConfig.ops_config`.
+        """
+        data = dict(d or {})
+        if validate:
+            return cls(**data)
+
+        instance = object.__new__(cls)
+        for f in fields(cls):
+            if f.name in data:
+                setattr(instance, f.name, data[f.name])
+            elif f.default is not MISSING:
+                setattr(instance, f.name, f.default)
+            elif f.default_factory is not MISSING:
+                setattr(instance, f.name, f.default_factory())
+        for k, v in data.items():
+            if not hasattr(instance, k):
+                setattr(instance, k, v)
+        return instance
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""
