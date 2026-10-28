@@ -432,7 +432,6 @@ def parallelize_model_fsdp2(
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
-    preserve_frozen_dtype: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -916,7 +915,6 @@ def parallelize_model_ddp(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     should_skip_hf_weight_load: bool = False,
-    preserve_frozen_dtype: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Replicate the model with DDP, materializing it first under meta-init.
