@@ -264,7 +264,7 @@ def _chunk_kda_core(
     for i in range(NT):
         q_i, k_i, u_i, g_i, w_i = q[:, :, i], k[:, :, i], u[:, :, i], g[:, :, i], w[:, :, i]
         if return_h:
-            h[:, :, i] = S
+            h[:, i] = S
         # inter: (q * exp(g)) @ S (q already carries the scale)
         attn_inter = (q_i * g_i.exp()) @ S
         # intra: Aqk[i, j] = <q_i, k_j> * exp(g_i - g_j), lower triangular incl. diagonal

@@ -97,8 +97,11 @@ have a hub repo, use the in-repo downloader:
 python3 scripts/download_hf_model.py --repo_id <kimi-k3-repo> --local_dir ./kimi_k3_hf
 ```
 
-The recipe trains from random init (`model_path: null`), so only the
-tokenizer is required.
+The recipe trains from random init (`model_path: null`), so no pretrained
+weights are needed — but the tokenizer directory must still include the
+image processor assets (`preprocessor_config.json`): the transform
+preprocesses images through the processor built from the same path, and a
+tokenizer-only directory leaves it unset.
 
 ## Start training on NPU
 
@@ -115,7 +118,7 @@ Expected on 8×910B3: step-1 loss ≈ 13 (random init over the 163 840 vocab),
 ## Start training on GPU
 
 The model package runs the same trainer on NVIDIA GPUs. Install the GPU
-extra (Python >= 3.10, glibc >= 2.28, CUDA 12.x / 13.x):
+extra (Python 3.11 or 3.12, glibc >= 2.28, CUDA 12.x / 13.x):
 
 ```bash
 uv sync --extra gpu          # or: pip install -e ".[gpu]"

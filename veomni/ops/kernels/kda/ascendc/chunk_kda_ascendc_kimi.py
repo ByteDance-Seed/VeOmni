@@ -717,9 +717,14 @@ def chunk_kda_ascendc(
         )
         state_v_first = kwargs.pop("transpose_state_layout")
 
-    # state_v_first is deprecated in favor of the explicit argument, but we keep
-    # the value as False for the AscendC implementation.
-    state_v_first = False
+    if state_v_first:
+        # The AscendC kernel only produces final states in the [B, H, K, V]
+        # layout; reject the request instead of silently returning the other
+        # axis order.
+        raise NotImplementedError(
+            "state_v_first=True is not supported by the AscendC chunk_kda path; the fused kernel only "
+            "produces final states in the [B, H, K, V] layout."
+        )
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:

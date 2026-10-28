@@ -564,6 +564,57 @@ class TestKimiK3ConverterFinalize:
             converter.finalize()
 
 
+class TestKimiK3ConverterExpertStreaming:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    @pytest.mark.parametrize(
+        ("name", "target"),
+        [
+            (
+                "language_model.model.layers.0.block_sparse_moe.experts.3.w1.weight",
+                ("language_model.model.layers.0.block_sparse_moe.experts.gate_up_proj", 3),
+            ),
+            (
+                "language_model.model.layers.5.block_sparse_moe.experts.7.w3.weight",
+                ("language_model.model.layers.5.block_sparse_moe.experts.gate_up_proj", 7),
+            ),
+            (
+                "language_model.model.layers.0.block_sparse_moe.experts.2.w2.weight",
+                ("language_model.model.layers.0.block_sparse_moe.experts.down_proj", 2),
+            ),
+            ("language_model.model.layers.0.self_attn.q_proj.weight", None),
+        ],
+    )
+    def test_fused_expert_target_maps_to_fused_names(self, name, target):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        assert converter.fused_expert_target(name) == target
+        if target is not None:
+            assert checkpoint_converter_fused_expert_target(converter, name) == target
+
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_for_expert_range_stacks_only_its_experts_as_local_rows(self):
+        local = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS).for_expert_range(2, 2)
+        assert (local.num_experts, local.expert_offset) == (2, 2)
+
+        assert local.convert(_make_kimi_k3_expert_key(0, 2, "w2"), _make_kimi_k3_expert_tensor("w2", 2)) is None
+        converted = local.convert(_make_kimi_k3_expert_key(0, 3, "w2"), _make_kimi_k3_expert_tensor("w2", 3))
+        assert converted.name == "language_model.model.layers.0.block_sparse_moe.experts.down_proj"
+        assert converted.tensor.shape == (2, HIDDEN_DIM, INTERMEDIATE_DIM)
+        assert torch.equal(converted.tensor[0], _make_kimi_k3_expert_tensor("w2", 2))
+        assert torch.equal(converted.tensor[1], _make_kimi_k3_expert_tensor("w2", 3))
+        assert local.finalize() == []
+
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_a_range_converter_rejects_other_experts(self):
+        local = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS).for_expert_range(2, 2)
+        with pytest.raises(ValueError, match=r"expert 0 is outside this converter's range \[2, 4\)"):
+            local.convert(_make_kimi_k3_expert_key(0, 0, "w2"), _make_kimi_k3_expert_tensor("w2", 0))
+
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_for_expert_range_rejects_an_out_of_bounds_range(self):
+        with pytest.raises(ValueError, match="outside this converter's 4 experts"):
+            KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS).for_expert_range(3, 2)
+
+
 class TestKimiK3ConverterFactoryAndMapping:
     def test_factory_reads_text_config_expert_count(self):
         model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_experts=8)))

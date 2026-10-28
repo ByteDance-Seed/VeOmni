@@ -100,10 +100,11 @@ def _situ_and_mul_fwd_kernel(
             up = tl.load(x_row + d + cols, mask=mask, other=0.0).to(tl.float32)
 
             if beta == 1.0:
+                # tanh(gate) in the stable sigmoid form: e2 = exp(-2*gate)
+                # overflows to inf for gate < ~-44 and would NaN the ratio.
                 e = tl.exp(-gate)
                 s = 1.0 / (1.0 + e)
-                e2 = e * e
-                t = (1.0 - e2) / (1.0 + e2)
+                t = 2.0 * tl.sigmoid(2.0 * gate) - 1.0
             else:
                 s = tl.sigmoid(gate)
                 t = 2.0 * tl.sigmoid(2.0 * gate / beta) - 1.0
@@ -149,10 +150,10 @@ def _situ_and_mul_bwd_kernel(
             gout = tl.load(dout_row + cols, mask=mask, other=0.0).to(tl.float32)
 
             if beta == 1.0:
+                # stable tanh(gate), same overflow fix as the forward kernel
                 e = tl.exp(-gate)
                 s = 1.0 / (1.0 + e)
-                e2 = e * e
-                t = (1.0 - e2) / (1.0 + e2)
+                t = 2.0 * tl.sigmoid(2.0 * gate) - 1.0
                 ts = t * s
                 a = ts
                 da = s + ts * (1.0 - s - t)

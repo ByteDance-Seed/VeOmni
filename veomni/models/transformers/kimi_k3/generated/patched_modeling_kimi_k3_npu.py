@@ -3061,7 +3061,14 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 if self.mm_projector:
                     image_features = self.mm_projector(image_features)
 
-                inputs_embeds = inputs_embeds.to(image_features[0].dtype)  # num_tokens, embed_dim
+                # NPU/FSDP2 mixed-precision fix (mirrors the source forward): align
+                # the fused embeds to the *text embedding* dtype instead of the
+                # vision dtype. Under mixed precision the text parameters are bf16,
+                # and a fp32 vision path would leak fp32 activations into the first
+                # decoder layer and the attn-residual block_residual chain.
+                target_dtype = self.get_input_embeddings().weight.dtype
+                image_features = [f.to(target_dtype) for f in image_features]
+                inputs_embeds = inputs_embeds.to(target_dtype)  # num_tokens, embed_dim
                 pre_merge_position_ids = position_ids
                 inputs_embeds, attention_mask, labels, position_ids, merged_first_positions = (
                     self._merge_input_ids_with_image_features(

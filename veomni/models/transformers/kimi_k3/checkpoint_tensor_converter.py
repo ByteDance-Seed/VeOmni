@@ -54,12 +54,17 @@ class KimiK3CheckpointTensorConverter:
     merged tensors once all experts for a given (prefix, projection) are collected.
 
     Args:
-        num_experts: Number of routed experts per MoE layer.
+        num_experts: Number of routed experts emitted by this converter (the full
+            MoE by default, or the rank-local count for a converter returned by
+            ``for_expert_range``).
+        expert_offset: First global expert id emitted by this converter (0 for the
+            full MoE; shifted by ``start`` for a range converter).
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, *, expert_offset: int = 0):
         self.num_experts = num_experts
-        # {(prefix, proj_name): {expert_id: tensor}}
+        self.expert_offset = expert_offset
+        # {(prefix, proj_name): {local_expert_id: tensor}}
         self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for w1/w3 merge waiting
         self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -74,6 +79,12 @@ class KimiK3CheckpointTensorConverter:
 
         prefix, expert_id_str, proj_name = match.groups()
         expert_id = int(expert_id_str)
+        if not 0 <= expert_id - self.expert_offset < self.num_experts:
+            raise ValueError(
+                f"expert {expert_id} is outside this converter's range "
+                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+            )
+        expert_id -= self.expert_offset
         buf_key = (prefix, proj_name)
 
         if buf_key not in self._expert_buffer:
@@ -125,6 +136,34 @@ class KimiK3CheckpointTensorConverter:
         if errors:
             raise RuntimeError("KimiK3 checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
         return []
+
+    def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
+        """Map a per-expert key to ``(fused_name, expert_index)`` for EP streaming.
+
+        Returns the fused parameter the expert stacks into (``gate_up_proj`` for
+        w1/w3, ``down_proj`` for w2) and the expert's global row index, so the
+        EP-sharded loader can route each expert tensor to the rank whose
+        ``Shard(0)`` row range owns it. ``None`` for non-expert keys.
+        """
+        match = _EXPERT_PATTERN.match(name)
+        if not match:
+            return None
+        prefix, expert_id_str, proj_name = match.groups()
+        fused_proj = "down_proj" if proj_name == "w2" else "gate_up_proj"
+        return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
+
+    def for_expert_range(self, start: int, num_local: int) -> "KimiK3CheckpointTensorConverter":
+        """Return a fresh converter restricted to experts ``[start, start + num_local)``.
+
+        The returned converter emits the same fused names with ``num_local``
+        rows — the rank-local ``Shard(0)`` slice of this converter's output —
+        so each EP rank reads and stacks only its own experts.
+        """
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
+            raise ValueError(
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        return KimiK3CheckpointTensorConverter(num_experts=num_local, expert_offset=self.expert_offset + start)
 
 
 def _get_text_config(config):

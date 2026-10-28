@@ -1125,7 +1125,7 @@
          if inputs_embeds is None:
              # 1. Extra the input embeddings
              inputs_embeds = self.get_input_embeddings()(input_ids)
-@@ -2762,21 +3070,16 @@
+@@ -2762,21 +3070,23 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
@@ -1135,7 +1135,12 @@
 -                # fp32 vision path would leak fp32 activations into the first
 -                # decoder layer and the attn-residual block_residual chain
 -                # (breaking e.g. npu_rms_norm and the GC recompute path).
--                target_dtype = self.get_input_embeddings().weight.dtype
++                # NPU/FSDP2 mixed-precision fix (mirrors the source forward): align
++                # the fused embeds to the *text embedding* dtype instead of the
++                # vision dtype. Under mixed precision the text parameters are bf16,
++                # and a fp32 vision path would leak fp32 activations into the first
++                # decoder layer and the attn-residual block_residual chain.
+                 target_dtype = self.get_input_embeddings().weight.dtype
 -                image_features = tuple(f.to(target_dtype) for f in image_features)
 -                inputs_embeds = inputs_embeds.to(target_dtype)
 -                inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_image_features(
@@ -1144,7 +1149,8 @@
 -                    input_ids,
 -                    attention_mask,
 -                    labels,
-+                inputs_embeds = inputs_embeds.to(image_features[0].dtype)  # num_tokens, embed_dim
++                image_features = [f.to(target_dtype) for f in image_features]
++                inputs_embeds = inputs_embeds.to(target_dtype)  # num_tokens, embed_dim
 +                pre_merge_position_ids = position_ids
 +                inputs_embeds, attention_mask, labels, position_ids, merged_first_positions = (
 +                    self._merge_input_ids_with_image_features(
@@ -1157,7 +1163,7 @@
                  )
 
              # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
-@@ -2812,46 +3115,182 @@
+@@ -2812,46 +3122,182 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -1364,7 +1370,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2917,3 +3356,37 @@
+@@ -2917,3 +3363,37 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)

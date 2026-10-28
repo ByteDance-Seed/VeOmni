@@ -23,6 +23,9 @@ def main():
     parser.add_argument("--split", default="val2017", help="COCO split dir name (default: val2017)")
     parser.add_argument("--output", required=True, help="Output JSONL path")
     args = parser.parse_args()
+    # Manifests may be consumed from a different working directory later;
+    # store absolute image paths so a relative --coco-root still resolves.
+    args.coco_root = os.path.abspath(args.coco_root)
 
     ann_path = os.path.join(args.coco_root, "annotations", f"captions_{args.split}.json")
     with open(ann_path, encoding="utf-8") as f:

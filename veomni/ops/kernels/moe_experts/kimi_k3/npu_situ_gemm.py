@@ -27,9 +27,9 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch_npu
 
 from .....distributed.parallel_state import get_parallel_state
+from .....utils.device import IS_NPU_AVAILABLE
 from ...situ_and_mul.situ_triton import situ_and_mul
 from ..standard.npu import (
     alltoall_combine,
@@ -37,6 +37,12 @@ from ..standard.npu import (
     dispatch_preprocess,
     npu_group_gemm,
 )
+
+
+# NPU-only op: guard torch_npu so the module stays importable on non-NPU hosts
+# (e.g. GPU CI collecting tests); the forward is only selected on NPU anyway.
+if IS_NPU_AVAILABLE:
+    import torch_npu
 
 
 def _situ(x: torch.Tensor, beta: float, linear_beta: Optional[float]) -> torch.Tensor:

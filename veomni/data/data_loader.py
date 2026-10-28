@@ -177,7 +177,16 @@ def build_native_dataloader(
         )
         dyn_bsz_collate_fn = collate_fn
         # A model-provided length fn (e.g. multimodal models that expand modality
-        # placeholders inside the model) overrides the count-mode default.
+        # placeholders inside the model) overrides the count-mode default. It
+        # reports the expanded *total* token count, so it cannot serve the
+        # supervised-label budget of dyn_bsz_count_mode="effective"; reject the
+        # combination instead of silently budgeting the wrong count.
+        if dyn_bsz_length_fn is not None and dyn_bsz_count_mode == "effective":
+            raise ValueError(
+                "dyn_bsz_count_mode='effective' is unsupported together with a model-provided "
+                "dyn_bsz_length_fn hook: the hook reports the in-model expanded total length, "
+                "while 'effective' budgets supervised labels. Use dyn_bsz_count_mode='total'."
+            )
         if dyn_bsz_length_fn is None:
             dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
         if dyn_bsz_count_mode == "effective":
