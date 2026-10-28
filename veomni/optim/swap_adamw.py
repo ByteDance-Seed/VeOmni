@@ -316,6 +316,10 @@ class SwapAdamW(Optimizer):
         base class does; param-group hyperparameters are merged from the checkpoint,
         except ``amsgrad``, which is structural and must match the construction-time
         value.
+
+        As in ``torch.optim.Optimizer``, the checkpoint *replaces* the state: a
+        parameter it does not carry goes back to zero moments and step 0 instead
+        of keeping this optimizer instance's history.
         """
         groups = self.param_groups
         saved_groups = state_dict["param_groups"]
@@ -338,10 +342,27 @@ class SwapAdamW(Optimizer):
             # ``amsgrad`` is structural (it decides whether a third moment buffer
             # exists); keep the constructor's value rather than the checkpoint's.
             group.update({k: v for k, v in saved_group.items() if k not in ("params", "amsgrad")})
+
+        loaded = set()
         for key, value in state_dict["state"].items():
             param = id_map.get(key)
-            if param is not None:
-                self._load_param_state(param, value)
+            if param is None:
+                continue
+            # A parameter absent from the checkpoint still gets an entry from the
+            # flattened loader, carrying only empty dicts (``{"exp_avg": {}, ...}``),
+            # so judge presence by values that actually hold state -- not by the key
+            # existing or the entry being truthy.
+            if any(isinstance(v, (torch.Tensor, int, float)) for v in value.values()):
+                loaded.add(param)
+            self._load_param_state(param, value)
+        # ``torch.optim.Optimizer.load_state_dict`` installs a fresh state mapping,
+        # so an unseen parameter carries no history there; reset ours to match.
+        for param, host_state in self._host_states.items():
+            if param in loaded:
+                continue
+            for host_tensor in host_state.values():
+                host_tensor.zero_()
+            self.state[param]["step"] = 0
 
     def _load_param_state(self, p: Tensor, value: dict) -> None:
         host_state = self._host_states.get(p)

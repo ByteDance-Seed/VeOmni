@@ -404,6 +404,86 @@ def test_load_state_dict_tolerates_missing_param_state(cpu_mesh):
         assert torch.count_nonzero(opt._host_states[param][key]).item() == 0
 
 
+def test_sparse_checkpoint_resets_omitted_param_state(cpu_mesh):
+    """Loading a sparse checkpoint into a reused optimizer must not keep history.
+
+    Stock ``Optimizer.load_state_dict`` installs a fresh state mapping, so a
+    parameter the checkpoint omits starts from zero moments. The flattened DCP
+    loader represents that absence as an entry whose *values* are empty dicts, so
+    the reset has to key off the values, not on the entry being present.
+    """
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    torch.manual_seed(41)
+
+    class _Plain(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Parameter(torch.randn(4, 3))
+            self.b = nn.Parameter(torch.randn(4, 3))
+
+    class _Swapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = _swap_param(torch.randn(4, 3), cpu_mesh)
+            self.b = _swap_param(torch.randn(4, 3), cpu_mesh)
+
+    # Source checkpoint: stock AdamW that only ever stepped ``a`` -> sparse.
+    src = _Plain()
+    src_opt = torch.optim.AdamW(src.parameters(), lr=1e-2, foreach=False)
+    src.a.grad = torch.randn(4, 3)
+    src_opt.step()
+    assert len(src_opt.state[src.a]) > 0 and len(src_opt.state[src.b]) == 0
+
+    flat = get_optimizer_state_dict(
+        src, optimizers=[src_opt], options=StateDictOptions(flatten_optimizer_state_dict=True)
+    )
+    assert not any(key.startswith("state.b") for key in flat), sorted(flat)
+
+    # Target: a SwapAdamW that already stepped both parameters.
+    dst = _Swapped()
+    swap_opt = SwapAdamW(list(dst.parameters()), lr=1e-2, pin_memory=False)
+    for _ in range(3):
+        for param in dst.parameters():
+            param.grad = _partition(torch.randn(4, 3), cpu_mesh)
+        swap_opt.step()
+    assert int(swap_opt.state[dst.b]["step"]) == 3
+    assert torch.count_nonzero(swap_opt._host_states[dst.b]["exp_avg"]).item() > 0
+
+    # Load through the same flatten/unflatten path DCP uses.
+    set_optimizer_state_dict(
+        dst, swap_opt, optim_state_dict=flat, options=StateDictOptions(flatten_optimizer_state_dict=True)
+    )
+
+    assert int(swap_opt.state[dst.a]["step"]) == 1  # restored from the checkpoint
+    assert int(swap_opt.state[dst.b]["step"]) == 0  # absent from it -> reset
+    for key in ("exp_avg", "exp_avg_sq"):
+        assert torch.count_nonzero(swap_opt._host_states[dst.b][key]).item() == 0
+
+    # The next updates must match stock AdamW loaded from the same checkpoint.
+    ref = _Plain()
+    with torch.no_grad():
+        ref.a.copy_(dst.a.to_local())
+        ref.b.copy_(dst.b.to_local())
+    ref_opt = torch.optim.AdamW(ref.parameters(), lr=1e-2, foreach=False)
+    ref_opt.load_state_dict(src_opt.state_dict())
+
+    for _ in range(2):
+        grads = {"a": torch.randn(4, 3), "b": torch.randn(4, 3)}
+        dst.a.grad = _partition(grads["a"].clone(), cpu_mesh)
+        dst.b.grad = _partition(grads["b"].clone(), cpu_mesh)
+        ref.a.grad = grads["a"].clone()
+        ref.b.grad = grads["b"].clone()
+        swap_opt.step()
+        ref_opt.step()
+        torch.testing.assert_close(dst.a.to_local(), ref.a.detach(), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(dst.b.to_local(), ref.b.detach(), atol=1e-6, rtol=1e-6)
+
+
 def test_multi_optimizer_steps_and_frees_storages(cpu_mesh):
     from veomni.optim.optimizer import MultiOptimizer
 
