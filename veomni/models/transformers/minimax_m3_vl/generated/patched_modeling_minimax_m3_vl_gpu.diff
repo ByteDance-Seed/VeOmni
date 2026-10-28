@@ -672,7 +672,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +1030,86 @@
+@@ -738,48 +1030,95 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -713,8 +713,17 @@
 +                    "produced by VeOmni's collator. Without them only a single unpadded sequence (batch size 1, no "
 +                    "sequence parallelism) is accepted; padded batches are not supported."
 +                )
-+            # A lone sequence is a one-segment pack. The attention mask is assumed
-+            # all-ones as in VeOmni's collator: reading it would cost a device sync.
++            if attention_mask is not None and (
++                attention_mask.shape != inputs_embeds.shape[:2] or not bool(torch.all(attention_mask == 1))
++            ):
++                raise ValueError(
++                    "MiniMax M3 VL language attention without varlen metadata accepts only a single unpadded sequence; "
++                    "attention_mask must match the input shape and contain only ones. Remove padding and supply "
++                    "cu_seq_lens_q/max_length_q for packed inputs."
++                )
++            # A lone unpadded sequence is a one-segment pack. Validating an explicit
++            # device mask can synchronize this public-entry fallback; the packed
++            # collator path skips the reduction entirely.
 +            # Metadata is built from shapes, on the device for CUDA FlashAttention
 +            # and on the host for NPU's host-side varlen interface.
 +            sequence_length = inputs_embeds.shape[1]
@@ -786,7 +795,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1119,6 @@
+@@ -789,180 +1128,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -967,7 +976,7 @@
          )
 
 
-@@ -990,6 +1146,12 @@
+@@ -990,6 +1155,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -980,7 +989,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1181,18 @@
+@@ -1019,13 +1190,18 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -1006,7 +1015,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1049,11 +1216,18 @@
+@@ -1049,11 +1225,18 @@
      return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
@@ -1025,7 +1034,7 @@
      def __init__(self, config: MiniMaxM3VLVisionConfig):
          super().__init__()
          self.config = config
-@@ -1071,15 +1245,11 @@
+@@ -1071,15 +1254,11 @@
          # The vision tower has no grouped-query attention; the shared eager kernel
          # still expects this attribute to drive its (no-op) `repeat_kv`.
          self.num_key_value_groups = 1
@@ -1046,7 +1055,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -1091,10 +1261,7 @@
+@@ -1091,10 +1270,7 @@
          queries, keys = apply_rotary_pos_emb_vision(queries, keys, cos, sin)
          queries, keys = queries.transpose(1, 2), keys.transpose(1, 2)
 
@@ -1058,7 +1067,7 @@
              self,
              queries,
              keys,
-@@ -1156,6 +1323,12 @@
+@@ -1156,6 +1332,12 @@
          return hidden_states
 
 
@@ -1071,7 +1080,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1351,140 @@
+@@ -1178,23 +1360,140 @@
          )
          self.post_init()
 
@@ -1218,7 +1227,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1568,26 @@
+@@ -1278,6 +1577,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1245,7 +1254,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1660,141 @@
+@@ -1350,46 +1669,141 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1404,7 +1413,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,15 +1831,25 @@
+@@ -1426,15 +1840,25 @@
          return vision_outputs
 
 
@@ -1431,7 +1440,7 @@
          self.post_init()
 
      def get_output_embeddings(self) -> nn.Module:
-@@ -1448,48 +1863,25 @@
+@@ -1448,48 +1872,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1498,7 +1507,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1896,29 @@
+@@ -1504,15 +1905,29 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1533,7 +1542,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1930,19 @@
+@@ -1524,9 +1939,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

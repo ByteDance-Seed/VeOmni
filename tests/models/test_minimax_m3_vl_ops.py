@@ -228,7 +228,8 @@ def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name):
+@pytest.mark.parametrize("mask_dtype", [None, torch.bool, torch.long], ids=["no_mask", "bool_mask", "int_mask"])
+def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name, mask_dtype):
     """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
@@ -236,7 +237,8 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
     position_ids = torch.arange(7).unsqueeze(0)
 
     with torch.no_grad():
-        output = model(inputs_embeds=hidden_states, attention_mask=torch.ones(1, 7, dtype=torch.long))
+        attention_mask = None if mask_dtype is None else torch.ones(1, 7, dtype=mask_dtype)
+        output = model(inputs_embeds=hidden_states, attention_mask=attention_mask)
         packed = model(
             inputs_embeds=hidden_states,
             position_ids=position_ids,
@@ -255,6 +257,27 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
     assert output.past_key_values is None
     torch.testing.assert_close(output.last_hidden_state, packed.last_hidden_state, rtol=0, atol=0)
     torch.testing.assert_close(output.last_hidden_state, expected.last_hidden_state)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"])
+@pytest.mark.parametrize(
+    "mask",
+    [[0, 0, 1, 1], [1, 1, 0, 0], [1, 0, 1, 1], [0, 0, 0, 0]],
+    ids=["left_padding", "right_padding", "internal_padding", "all_padding"],
+)
+def test_minimax_m3_vl_text_model_rejects_unpacked_single_sequence_padding(module_name, layer_type, mask):
+    """Reject single-row padding before dense or sparse attention can silently ignore it."""
+    modeling = importlib.import_module(module_name)
+    model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=[layer_type])).eval()
+    model.config._attn_implementation = "veomni_flash_attention_2"
+    if layer_type == "full_attention":
+        model.layers[0].self_attn.veomni_attn = _VarlenReferenceAttention()
+    with pytest.raises(ValueError, match="single unpadded sequence"):
+        model(
+            inputs_embeds=torch.randn(1, 4, model.config.hidden_size),
+            attention_mask=torch.tensor([mask], dtype=torch.long),
+        )
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

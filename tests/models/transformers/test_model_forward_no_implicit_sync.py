@@ -310,7 +310,8 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "over-reported by torch sync-debug mode."
         ),
         ("patched_modeling_minimax_m3_vl_gpu.py", "MiniMaxM3VLTextModel.forward"): (
-            "public-entry-fallback: one-segment cu_seq_lens built when the caller passes no varlen kwargs."
+            "public-entry-fallback: validate an explicit mask is all ones and build one-segment cu_seq_lens "
+            "only when the caller passes no varlen kwargs; packed training skips the mask reduction."
         ),
     },
 }
