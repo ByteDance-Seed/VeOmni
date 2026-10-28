@@ -809,12 +809,7 @@ The context preserves prior disable states across nesting and exceptions.
 An expert without a base operator fails before any adapter state changes.
 
 
-The MiniMax model and its base `moe_experts/swiglu_oai` row are supplied by
-[VeOmni #1315](https://github.com/ByteDance-Seed/VeOmni/pull/1315), reviewed at
-`3fc30d7f306aa086e16859622b0369eab454f8df`. This addition also extends the
-native reference context from [#1337](https://github.com/ByteDance-Seed/VeOmni/pull/1337)
-(`3780b042594d8597b34e4fbc5e683de3aea2fac6`). These are unmerged dependencies;
-the combined source and accelerator paths still require integration acceptance.
+The base `moe_experts/swiglu_oai` row serves MiniMax M3.1-Flash experts.
 Clamped standard experts are explicitly rejected until their adapter activation
 has a matching implementation, preventing an incorrect unclamped reference.
 
