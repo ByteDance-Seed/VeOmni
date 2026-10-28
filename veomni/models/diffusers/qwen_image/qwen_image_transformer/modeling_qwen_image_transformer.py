@@ -689,15 +689,16 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         if attn_implementation is not None:
             override_kwargs["attn_implementation"] = attn_implementation
 
+        valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
+        caller_diffuser_overrides = {k: kwargs[k] for k in valid_keys if k in kwargs}
+
         veomni_cfg = None
         if provided_config is not None:
             if isinstance(provided_config, cls.config_class):
                 veomni_cfg = copy.deepcopy(provided_config)
-                if attn_implementation is not None:
-                    veomni_cfg._attn_implementation = attn_implementation
-                veomni_cfg._set_ops_implementation(
-                    ops_implementation if ops_implementation is not None else {},
-                    _validate_tree=True,
+                veomni_cfg._apply_ops_overrides(
+                    ops_implementation=ops_implementation,
+                    attn_implementation=attn_implementation,
                 )
             elif isinstance(provided_config, Mapping):
                 veomni_cfg = cls.config_class.from_dict(dict(provided_config), **override_kwargs)
@@ -711,7 +712,6 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         diffusers_model = loaded[0] if isinstance(loaded, tuple) else loaded
         diffusers_model.__class__ = cls
 
-        valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
         diffusers_cfg = dict(diffusers_model.config)
         if veomni_cfg is None:
             cfg_kwargs = {k: v for k, v in diffusers_cfg.items() if k in valid_keys}
@@ -721,9 +721,8 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
                 cfg_kwargs["ops_implementation"] = diffusers_cfg["ops_implementation"]
             veomni_cfg = cls.config_class.from_dict(cfg_kwargs, **override_kwargs)
         else:
-            for k in valid_keys:
-                if k in diffusers_cfg:
-                    setattr(veomni_cfg, k, diffusers_cfg[k])
+            for k, v in caller_diffuser_overrides.items():
+                setattr(veomni_cfg, k, v)
 
         if (
             "attn_implementation" not in veomni_cfg.ops_implementation

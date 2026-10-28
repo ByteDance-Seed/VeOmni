@@ -296,7 +296,25 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
 
-    # 3. Explicit ops_implementation / attn_implementation overrides bind to both config and processor.
+    # 3. When both ops_implementation and explicit attn_implementation are passed at load time,
+    # explicit attn_implementation wins (verified BEFORE mocking FA2 so FA2 would fail on CPU).
+    for cfg_arg in (None, gpu_cfg, gpu_cfg_dict):
+        both_kwargs = {" config": cfg_arg} if cfg_arg is not None else {}
+        both_kwargs = {k.strip(): v for k, v in both_kwargs.items()}
+        loaded_both = QwenImageTransformer2DModel.from_pretrained(
+            ckpt_dir,
+            ops_implementation={"attn_implementation": "veomni_flash_attention_2"},
+            attn_implementation="sdpa",
+            **both_kwargs,
+        )
+        assert loaded_both.config._attn_implementation == "sdpa"
+        assert loaded_both.config.ops_config.attn_implementation == "sdpa"
+        for block in loaded_both.transformer_blocks:
+            assert block.attn.processor.veomni_attn.impl == "sdpa"
+            assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
+            assert block.attn.processor.config._attn_implementation == "sdpa"
+
+    # 4. Explicit ops_implementation / attn_implementation overrides bind to both config and processor.
     # Ensure VeomniOp can resolve veomni_flash_attention_2 even on CPU-only test runners.
     fa2_handle = SimpleNamespace(op="attention", variant="standard", impl="veomni_flash_attention_2")
     sdpa_handle = VeomniOp("attention", "standard", "veomni_sdpa")

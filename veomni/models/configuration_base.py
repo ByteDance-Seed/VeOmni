@@ -105,6 +105,17 @@ def _collect_explicit_attn_map_ids(config: PretrainedConfig, attn_value: Any) ->
     return ids
 
 
+def _normalize_explicit_attn(attn_value: Any) -> Any:
+    """Validate and normalize explicit ``attn_implementation`` overrides (scalar or nested mapping)."""
+    from ..arguments import OpsImplementationConfig
+
+    if isinstance(attn_value, str):
+        return OpsImplementationConfig.normalize_hub_attention_backend(attn_value)
+    if isinstance(attn_value, Mapping):
+        return {k: _normalize_explicit_attn(v) for k, v in attn_value.items()}
+    return attn_value
+
+
 def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
     from ..arguments import OpsImplementationConfig
 
@@ -269,20 +280,41 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                     sub._attn_implementation_internal = sub_attn
             raise
 
+    def _apply_ops_overrides(
+        self,
+        *,
+        ops_implementation: dict[str, Any] | OpsImplementationConfig | Any | None = None,
+        attn_implementation: str | dict[str, Any] | None = None,
+    ) -> None:
+        """Merge load-time ``ops_implementation`` and ``attn_implementation`` overrides, then validate once.
+
+        Explicit ``attn_implementation`` ranks above ``ops_implementation`` (matching
+        ``build_foundation_model``), and hardware/cross-field validation runs only after both
+        overrides have been applied to the config tree.
+        """
+        normalized_attn = _normalize_explicit_attn(attn_implementation) if attn_implementation is not None else None
+        with _defer_ops_validation():
+            if ops_implementation is not None:
+                self._set_ops_implementation(ops_implementation)
+            if normalized_attn is not None:
+                self._attn_implementation = normalized_attn
+        if not _DEFER_OPS_VALIDATION.get() and not isinstance(ops_implementation, SimpleNamespace):
+            self._set_ops_implementation({}, _validate_tree=True)
+        if normalized_attn is not None:
+            self._attn_implementation = normalized_attn
+
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs: Any):
         ops_implementation = kwargs.pop("ops_implementation", None)
         has_explicit_attn = "attn_implementation" in kwargs and kwargs["attn_implementation"] is not None
         explicit_attn = kwargs.get("attn_implementation") if has_explicit_attn else None
         with _defer_ops_validation():
-            result = _orig_from_dict(cls, config_dict, **kwargs)
+            result = _orig_from_dict(cls, dict(config_dict), **kwargs)
         config = result[0] if isinstance(result, tuple) else result
-        if explicit_attn is not None:
-            config._attn_implementation = explicit_attn
-        if ops_implementation is not None:
-            config._set_ops_implementation(ops_implementation, _validate_tree=True)
-        elif not _DEFER_OPS_VALIDATION.get():
-            config._set_ops_implementation({}, _validate_tree=True)
+        config._apply_ops_overrides(
+            ops_implementation=ops_implementation,
+            attn_implementation=explicit_attn,
+        )
         return result
 
     def to_diff_dict(self) -> dict[str, Any]:
@@ -299,6 +331,7 @@ def apply_pretrained_config_ops_patch() -> None:
     PretrainedConfig._attn_implementation = _veomni_attn_implementation  # type: ignore[assignment]
     PretrainedConfig.ops_config = VeOmniPretrainedConfig.ops_config  # type: ignore[attr-defined]
     PretrainedConfig._set_ops_implementation = VeOmniPretrainedConfig._set_ops_implementation  # type: ignore[attr-defined]
+    PretrainedConfig._apply_ops_overrides = VeOmniPretrainedConfig._apply_ops_overrides  # type: ignore[attr-defined]
     PretrainedConfig.from_dict = classmethod(VeOmniPretrainedConfig.from_dict.__func__)  # type: ignore[assignment]
     PretrainedConfig.to_diff_dict = VeOmniPretrainedConfig.to_diff_dict  # type: ignore[method-assign]
     PretrainedConfig._veomni_ops_config_patched = True  # type: ignore[attr-defined]

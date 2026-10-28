@@ -624,3 +624,14 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
         **{"fake_module_a.rms_norm_implementation": "torch_npu"},
     )
     assert omni_slot_npu._module_configs["fake_module_a"].ops_config.rms_norm_implementation == "torch_npu"
+
+    # Explicit attn_implementation kwarg at load time ranks above ops_implementation["attn_implementation"]
+    # and is merged before NPU hardware validation runs.
+    llama_both_npu = LlamaConfig.from_pretrained(
+        llama_dir,
+        ops_implementation={"attn_implementation": "flash_attention_2_hub", "rms_norm_implementation": "torch_npu"},
+        attn_implementation="sdpa",
+    )
+    assert llama_both_npu._attn_implementation == "sdpa"
+    assert llama_both_npu.ops_config.attn_implementation == "sdpa"
+    assert llama_both_npu.ops_config.rms_norm_implementation == "torch_npu"
