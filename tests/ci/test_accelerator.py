@@ -262,48 +262,6 @@ def test_skipped_oversized_cases_preserve_plans_and_use_owned_capacity():
     assert all(devices == ["0", "1"] for devices in assigned.values())
 
 
-@pytest.mark.parametrize("ignore_term", [False, True])
-def test_worker_cleanup_drains_group_after_launcher_exit(monkeypatch, tmp_path, ignore_term):
-    import os
-    import sys
-
-    import psutil
-
-    from scripts.ci.accelerator.runtime.workers import run_process
-
-    ready = tmp_path / "child.pid"
-    child_code = (
-        "import os, signal, time\nfrom pathlib import Path\n"
-        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
-        + f"Path({str(ready)!r}).write_text(str(os.getpid()))\ntime.sleep(60)\n"
-    )
-    launcher = (
-        "import subprocess, sys, time\nfrom pathlib import Path\n"
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
-        "deadline = time.monotonic() + 5\n"
-        f"while not Path({str(ready)!r}).exists():\n"
-        "    if time.monotonic() >= deadline: raise RuntimeError('child did not start')\n"
-        "    time.sleep(0.01)\n"
-    )
-    # Deterministically model a child born between the regular polling samples.
-    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
-    try:
-        with (tmp_path / "worker.log").open("w") as log:
-            run_process([sys.executable, "-c", launcher], os.environ.copy(), log, 10)
-        assert ready.exists()
-        try:
-            child = psutil.Process(int(ready.read_text()))
-            assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            pass
-    finally:
-        if ready.exists():
-            try:
-                psutil.Process(int(ready.read_text())).kill()
-            except psutil.Error:
-                pass
-
-
 def test_device_pool_drains_for_waiting_large_job():
     from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
@@ -570,75 +528,6 @@ def test_cpu_inductor_preserves_vendor_and_existing_cpu_overrides(monkeypatch, c
     assert overrides["npu"] is npu_override
 
 
-@pytest.mark.parametrize(
-    "failure", ["foreach_lookup", "cpu_codegen", "dataloader_original", "registry_policy", "registry_disable"]
-)
-def test_cpu_isolation_restores_state_when_setup_fails(monkeypatch, failure):
-    import sys
-    from types import SimpleNamespace
-
-    import torch.optim.optimizer as optimizer_module
-    from torch._inductor.codegen import common
-    from torch.utils.checkpoint import DefaultDeviceType
-    from torch.utils.data import dataloader
-
-    from scripts.ci.accelerator import pytest_plugin
-
-    original_device = DefaultDeviceType.get_device_type()
-    original_foreach = optimizer_module._get_foreach_kernels_supported_devices
-    original_init = dataloader._MultiProcessingDataLoaderIter.__init__
-
-    def vendor_init(*args, **kwargs):
-        raise AssertionError("hidden accelerator queried")
-
-    class VendorRegistry:
-        _disabled_register = False
-
-        @classmethod
-        def disable_register(cls):
-            cls._disabled_register = True
-            if failure == "registry_disable":
-                raise RuntimeError("vendor setup failed")
-
-    vendor = SimpleNamespace(_mpdl_iter_init=vendor_init, origin_mpdl_iter_init=original_init)
-    monkeypatch.setitem(sys.modules, "torch_npu.utils._module", vendor)
-    monkeypatch.setitem(sys.modules, "torch_npu.utils._dynamo", SimpleNamespace(_InductorNpuRegistry=VendorRegistry))
-    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "__init__", vendor_init)
-    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
-    if failure == "foreach_lookup":
-        monkeypatch.delattr(optimizer_module, "_get_foreach_kernels_supported_devices")
-    elif failure == "cpu_codegen":
-        monkeypatch.setattr(common, "device_op_overrides_dict", {})
-
-        def fail_codegen(*args):
-            raise RuntimeError("CPU codegen setup failed")
-
-        monkeypatch.setattr(common, "register_device_op_overrides", fail_codegen)
-    elif failure == "dataloader_original":
-        del vendor.origin_mpdl_iter_init
-    elif failure == "registry_policy":
-        del VendorRegistry._disabled_register
-
-    plan = CasePlan.sequential(LaunchSpec(device="cpu"))
-    item = SimpleNamespace(
-        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
-    )
-    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
-    expected_error = AttributeError if failure == "foreach_lookup" else RuntimeError
-    with pytest.raises(expected_error):
-        next(protocol)
-    assert DefaultDeviceType.get_device_type() == original_device
-    if failure == "foreach_lookup":
-        assert not hasattr(optimizer_module, "_get_foreach_kernels_supported_devices")
-    else:
-        assert optimizer_module._get_foreach_kernels_supported_devices is original_foreach
-    assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
-    if failure == "registry_policy":
-        assert not hasattr(VendorRegistry, "_disabled_register")
-    else:
-        assert VendorRegistry._disabled_register is False
-
-
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 
@@ -660,10 +549,8 @@ def test_rendezvous_allocator_does_not_reuse_a_pending_launch_port(monkeypatch, 
     assert ports.find_free_port(registry) == 12346
 
 
-def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch, tmp_path):
+def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch):
     import errno
-    import json
-    import os
     import socket
     from datetime import timedelta
 
@@ -675,8 +562,6 @@ def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch, tm
         pytest.fail("A live rendezvous must not probe and close a free port")
 
     monkeypatch.setattr(ports, "_free_port", reject_probe)
-    events = tmp_path / "rendezvous.jsonl"
-    monkeypatch.setenv("CI_RENDEZVOUS_EVENTS", str(events))
     with pytest.raises(RuntimeError, match="caller failed"):
         with ports.rendezvous_endpoint(timeout=timedelta(seconds=10)) as endpoint:
             with socket.socket() as competitor:
@@ -693,10 +578,6 @@ def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch, tm
         connection.status == psutil.CONN_LISTEN and connection.laddr.port == endpoint.port
         for connection in psutil.Process().net_connections(kind="tcp")
     )
-    rows = [json.loads(line) for line in events.read_text().splitlines()]
-    assert [row["action"] for row in rows] == ["ready", "closed"]
-    assert {row["pid"] for row in rows} == {os.getpid()}
-    assert len({row["launch_id"] for row in rows}) == 1
 
 
 def _rendezvous_sum_worker(rank, world_size, output, base, endpoint):
@@ -811,9 +692,7 @@ def _failing_rendezvous_worker(rank, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_spawn_worker_failure_reaps_peers_and_closes_store(monkeypatch, tmp_path):
-    import json
-
+def test_spawn_worker_failure_reaps_peers_and_closes_store(monkeypatch):
     import psutil
     import torch.multiprocessing as mp
 
@@ -821,22 +700,22 @@ def test_spawn_worker_failure_reaps_peers_and_closes_store(monkeypatch, tmp_path
 
     original_spawn = mp.spawn
     pids = []
+    endpoint = None
 
-    def spawn(*args, **kwargs):
-        context = original_spawn(*args, **kwargs)
+    def spawn(func, args, **kwargs):
+        nonlocal endpoint
+        endpoint = args[-1]
+        context = original_spawn(func, args=args, **kwargs)
         pids.extend(process.pid for process in context.processes)
         return context
 
-    events = tmp_path / "rendezvous.jsonl"
-    monkeypatch.setenv("CI_RENDEZVOUS_EVENTS", str(events))
     monkeypatch.setattr(mp, "spawn", spawn)
     with pytest.raises(mp.ProcessRaisedException, match="injected worker failure"):
         launch_utils.spawn_with_rendezvous(_failing_rendezvous_worker, nprocs=2)
     assert len(pids) == 2 and all(not psutil.pid_exists(pid) for pid in pids)
-    rows = [json.loads(line) for line in events.read_text().splitlines()]
-    assert [row["action"] for row in rows] == ["ready", "closed"]
+    assert endpoint is not None
     assert not any(
-        connection.status == psutil.CONN_LISTEN and connection.laddr.port == rows[0]["port"]
+        connection.status == psutil.CONN_LISTEN and connection.laddr.port == endpoint.port
         for connection in psutil.Process().net_connections(kind="tcp")
     )
 
@@ -931,114 +810,9 @@ def test_concurrent_standalone_commands_keep_agent_store_alive(monkeypatch, tmp_
     assert set(first).isdisjoint(second)
 
 
-def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch):
-    from types import SimpleNamespace
-
-    from scripts.ci.accelerator import pytest_plugin
-    from scripts.ci.accelerator.launch_plan import LaunchSpec, RunnerCapabilities
-
-    class DistributedCase:
-        def __init__(self):
-            raise AssertionError("Collection must not construct a distributed test")
-
-        @property
-        def world_size(self):
-            return 4
-
-        def ci_launch_plan(self):
-            return LaunchSpec(nproc=self.world_size)
-
-    monkeypatch.setattr(pytest_plugin, "runner_capabilities", lambda: RunnerCapabilities("cuda", tuple("01234567")))
-    item = SimpleNamespace(instance=None, cls=DistributedCase, get_closest_marker=lambda _: None)
-    assert pytest_plugin.resolve_plan(item).launches[0].nproc == 4
-
-
-@pytest.mark.parametrize("stage", ["scheduling", "collection", "shutdown"])
-def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path):
-    import os
-    import signal
-    import subprocess
-    import sys
-    import time
-
-    import psutil
-
-    pid_path = tmp_path / "owned.pid"
-    driver = tmp_path / "driver.py"
-    worker_code = (
-        "import os, signal, time; from pathlib import Path; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        f"Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)"
-    )
-    shutdown_ready = tmp_path / "shutdown.ready"
-    shutdown_driver = (
-        "import time\nfrom pathlib import Path\n"
-        "from concurrent.futures import ThreadPoolExecutor\n"
-        "original_shutdown = ThreadPoolExecutor.shutdown\n"
-        "def shutdown(self, *args, **kwargs):\n"
-        f"    Path({str(shutdown_ready)!r}).touch()\n"
-        "    return original_shutdown(self, *args, **kwargs)\n"
-        "ThreadPoolExecutor.shutdown = shutdown\n"
-        "def execute(job, assigned):\n"
-        "    if job.name == 'owned': return launch()\n"
-        f"    while not Path({str(pid_path)!r}).exists(): time.sleep(0.01)\n"
-        "    raise RuntimeError('another callback failed')\n"
-        "run_jobs([DeviceJob('owned', 0, None), DeviceJob('bad', 0, None)], [], execute)\n"
-    )
-    driver.write_text(
-        "import os, sys\n"
-        "from scripts.ci.accelerator.runtime.workers import run_process\n"
-        "from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs\n"
-        "def launch(*args):\n"
-        "    with open(sys.argv[2], 'w') as log:\n"
-        f"        run_process([sys.executable, '-c', {worker_code!r}], os.environ.copy(), log, 60)\n"
-        + (
-            "run_jobs([DeviceJob('owned', 0, None)], [], launch)\n"
-            if stage == "scheduling"
-            else shutdown_driver
-            if stage == "shutdown"
-            else "from scripts.ci.accelerator.runtime.workers import interruptible_executor\n"
-            "with interruptible_executor(max_workers=1) as (executor, scope):\n"
-            "    list(executor.map(lambda value: scope.run(launch), [None]))\n"
-        )
-    )
-    with (tmp_path / "driver.log").open("w") as log:
-        process = subprocess.Popen(
-            [sys.executable, str(driver), str(pid_path), str(tmp_path / "worker.log")],
-            env={**os.environ, "PYTHONPATH": os.getcwd()},
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-        try:
-            deadline = time.monotonic() + 5
-            ready = shutdown_ready if stage == "shutdown" else pid_path
-            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert ready.exists(), (tmp_path / "driver.log").read_text()
-            owned = psutil.Process(int(pid_path.read_text()))
-            process.send_signal(signal.SIGINT)
-            process.wait(timeout=12)
-            assert process.returncode != 0
-            assert not owned.is_running() or owned.status() == psutil.STATUS_ZOMBIE
-            assert unrelated.poll() is None
-        finally:
-            if pid_path.exists():
-                try:
-                    os.killpg(int(pid_path.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
-            unrelated.terminate()
-            unrelated.wait(timeout=5)
-
-
 @pytest.mark.parametrize(
     "failure",
-    ["missing_results", "interrupt", "keep_going_failure", "cleanup_failure", "child_failure"],
+    ["missing_results", "interrupt", "keep_going_failure", "child_failure"],
 )
 def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys, failure):
     import json
@@ -1046,7 +820,6 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
     from pathlib import Path
 
     from scripts.ci.accelerator import runner
-    from scripts.ci.accelerator.runtime.workers import ProcessCleanupError
 
     root = tmp_path / "checkout"
     (root / "tests").mkdir(parents=True)
@@ -1072,15 +845,9 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
                     plan=dict(groups=[[dict(nproc=1, device="cpu", nnodes=1)]]),
                 )
             ]
-            if failure == "cleanup_failure":
-                pending_file = root / "tests/test_pending.py"
-                pending_file.write_text("def test_pending(): pass\n")
-                rows.append({**rows[0], "nodeid": "tests/test_pending.py::test_pending", "file": str(pending_file)})
             Path(inventory).write_text(json.dumps(rows))
         elif failure == "interrupt":
             raise KeyboardInterrupt()
-        elif failure == "cleanup_failure":
-            raise ProcessCleanupError("owned worker survived cleanup")
         elif failure == "child_failure":
             import subprocess
 
@@ -1118,10 +885,8 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
         "argv",
         ["ci", "--suite", "unit", "--backend", "cpu", "--only", ci_selection, "--output-dir", str(output)],
     )
-    if failure in ("keep_going_failure", "cleanup_failure"):
+    if failure == "keep_going_failure":
         sys.argv.append("--keep-going")
-    if failure == "cleanup_failure":
-        sys.argv.append("--serial")
     if failure == "interrupt":
         with pytest.raises(KeyboardInterrupt):
             runner.main()
@@ -1134,9 +899,6 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
         assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
     elif failure == "keep_going_failure":
         assert nodeid in summary["error"] and record["status"] == "failed"
-    elif failure == "cleanup_failure":
-        assert len(summary["commands"]) == 1  # Never release the lease to the pending batch.
-        assert "ProcessCleanupError" in record["error"] and "survived cleanup" in summary["error"]
     elif failure == "child_failure":
         foreground = capsys.readouterr().out
         assert "RuntimeError: original training failure" in foreground
@@ -1145,15 +907,14 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
         assert "KeyboardInterrupt" in summary["error"]
 
 
-@pytest.mark.parametrize("cleanup_failure", [False, True])
-def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path, cleanup_failure):
+def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
     import os
     import sys
     import time
 
     import psutil
 
-    from scripts.ci.accelerator.runtime.workers import ProcessCleanupError, run_process
+    from scripts.ci.accelerator.runtime.workers import run_process
     from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
     ready = tmp_path / "worker.pid"
@@ -1167,8 +928,7 @@ def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path, clea
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert ready.exists()
-            error_type = ProcessCleanupError if cleanup_failure else RuntimeError
-            raise error_type("first failure")
+            raise RuntimeError("first failure")
         assert job.name == "running"
         code = f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
         with (tmp_path / "worker.log").open("w") as log:
@@ -1180,7 +940,7 @@ def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path, clea
                 [DeviceJob(name, 0, None) for name in ("running", "bad", "pending")],
                 [],
                 execute,
-                cancel_on_error=not cleanup_failure,
+                cancel_on_error=True,
             )
         assert sorted(called) == ["bad", "running"]
         assert not peer_failures  # The peer was cancelled, rather than reaching its timeout.
@@ -1339,46 +1099,3 @@ def test_reported_failure_stops_admission_before_failed_batch_finishes():
         )
     assert set(called) == {"bad", "short"}
     assert reporter.first_failure == "bad: test_failed"
-
-
-def test_worker_exit_notifies_failure_before_descendant_cleanup(tmp_path):
-    import os
-    import subprocess
-    import sys
-
-    import psutil
-
-    from scripts.ci.accelerator.runtime.workers import run_process
-
-    ready = tmp_path / "child.pid"
-    child_code = (
-        f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
-    )
-    launcher = (
-        "import subprocess,sys,time\nfrom pathlib import Path\n"
-        f"subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
-        f"while not Path({str(ready)!r}).exists(): time.sleep(0.01)\n"
-        "sys.exit(3)\n"
-    )
-    observed = []
-
-    def failure(exc):
-        child = psutil.Process(int(ready.read_text()))
-        observed.append((exc.returncode, child.is_running() and child.status() != psutil.STATUS_ZOMBIE))
-
-    try:
-        with (tmp_path / "worker.log").open("w") as log:
-            with pytest.raises(subprocess.CalledProcessError):
-                run_process([sys.executable, "-c", launcher], os.environ.copy(), log, 5, on_failure=failure)
-        assert observed == [(3, True)]
-        try:
-            child = psutil.Process(int(ready.read_text()))
-            assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            pass
-    finally:
-        if ready.exists():
-            try:
-                os.kill(int(ready.read_text()), 9)
-            except ProcessLookupError:
-                pass

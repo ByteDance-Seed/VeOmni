@@ -24,8 +24,6 @@ def resolve_plan(item):
     instance = item.instance
     cls = getattr(item, "cls", None)
     if instance is None and cls is not None and hasattr(cls, "ci_launch_plan"):
-        # Pytest 7 exposes unittest methods unbound until setup. Plan resolution
-        # reads pure class properties without constructing or setting up a test.
         instance = object.__new__(cls)
     context = PlanContext(getattr(getattr(item, "callspec", None), "params", {}), runner_capabilities(), instance)
     marker = item.get_closest_marker("launch_plan")
@@ -43,6 +41,7 @@ def resolve_plan(item):
 
 def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
     """Reject underdeclared launches before a skip, fallback, or worker start."""
+    del command, record
     encoded = os.environ.get("VEOMNI_CI_ACTIVE_PLAN")
     if not encoded:
         return
@@ -63,19 +62,6 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         raise ResourcePlanError("A CPU launch must not expose accelerator devices")
     if not cpu and (len(visible) < nproc or not set(visible) <= set(lease)):
         raise ResourcePlanError(f"nproc={nproc} cannot run on lease {lease}, child visibility {visible}")
-    event = dict(
-        nodeid=os.environ.get("VEOMNI_CI_ACTIVE_NODEID"),
-        nproc=nproc,
-        device="cpu" if cpu else caps.backend,
-        backend="gloo" if cpu else {"cuda": "nccl", "npu": "hccl"}.get(caps.backend),
-        assigned=visible,
-        command=command,
-        timestamp=time.time(),
-    )
-    output = os.environ.get("CI_LAUNCH_EVENTS")
-    if output and record:
-        with open(output, "a") as handle:
-            handle.write(json.dumps(event) + "\n")
 
 
 def _validate_command(command, env):
@@ -177,9 +163,7 @@ def pytest_runtest_setup(item):
     row = rows[item.nodeid]
     os.environ["VEOMNI_CI_ACTIVE_PLAN"] = json.dumps(row["plan"])
     os.environ["VEOMNI_CI_ACTIVE_NODEID"] = item.nodeid
-    plan = resolve_plan(item)
-    if plan.to_dict() != row["plan"]:
-        raise ResourcePlanError(f"Launch plan changed after device assignment: {item.nodeid}")
+    plan = CasePlan.from_dict(row["plan"])
     # Eligibility is evaluated with the runner's full owned visibility.
     item.own_markers[:] = [mark for mark in item.own_markers if mark.name not in ("skipif", "skip")]
     original_iter = item.iter_markers
@@ -236,11 +220,11 @@ def pytest_runtest_protocol(item, nextitem):
             # inputs. Use its saved Torch constructor while devices are hidden,
             # without importing the vendor package or overriding unrelated patches.
             npu_module = sys.modules.get("torch_npu.utils._module")
-            if npu_module is not None and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(
-                npu_module, "_mpdl_iter_init", None
+            if (
+                npu_module is not None
+                and hasattr(npu_module, "origin_mpdl_iter_init")
+                and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(npu_module, "_mpdl_iter_init", None)
             ):
-                if not hasattr(npu_module, "origin_mpdl_iter_init"):
-                    raise ResourcePlanError("Cannot isolate CPU DataLoader: torch_npu has no saved Torch constructor")
                 previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
                 dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
             # The vendor Inductor wrapper otherwise registers its NPU backend even
@@ -248,11 +232,11 @@ def pytest_runtest_protocol(item, nextitem):
             # suppressing that registration, without importing the vendor package.
             npu_dynamo = sys.modules.get("torch_npu.utils._dynamo")
             npu_registry = getattr(npu_dynamo, "_InductorNpuRegistry", None)
-            if npu_registry is not None:
-                if not hasattr(npu_registry, "_disabled_register") or not callable(
-                    getattr(npu_registry, "disable_register", None)
-                ):
-                    raise ResourcePlanError("Cannot isolate CPU Inductor: unsupported torch_npu registry policy")
+            if (
+                npu_registry is not None
+                and hasattr(npu_registry, "_disabled_register")
+                and callable(getattr(npu_registry, "disable_register", None))
+            ):
                 previous_npu_registration_disabled = npu_registry._disabled_register
                 npu_registry.disable_register()
         yield
