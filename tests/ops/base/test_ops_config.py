@@ -364,3 +364,38 @@ def test_subconfig_hf_attn_implementation_merges_and_roundtrips(tmp_path, sub_as
     assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
     assert reloaded.vision_config._attn_implementation == "eager"
     assert reloaded.vision_config.ops_config.attn_implementation == "eager"
+
+
+def test_nested_attn_implementation_mapping_overrides_grandchild():
+    """Nested HF attn_implementation dict on a 3-level root config overrides grandchild's initial selection."""
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+
+    import veomni.models  # noqa: F401
+
+    cfg = Qwen3OmniMoeConfig(
+        thinker_config={
+            "text_config": {"attn_implementation": "sdpa"},
+            "vision_config": {"attn_implementation": "sdpa"},
+        },
+        attn_implementation={"thinker_config": {"text_config": "eager"}},
+    )
+    assert cfg.thinker_config.text_config._attn_implementation == "eager"
+    assert cfg.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert cfg.thinker_config.text_config.ops_implementation["attn_implementation"] == "eager"
+    assert cfg.thinker_config.vision_config._attn_implementation == "veomni_sdpa"
+    assert cfg.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+
+    # A scalar value under an intermediate sub-config key overrides the entire subtree.
+    cfg_subtree = Qwen3OmniMoeConfig(
+        thinker_config={
+            "text_config": {"attn_implementation": "sdpa"},
+            "vision_config": {"attn_implementation": "sdpa"},
+        },
+        attn_implementation={"thinker_config": "eager"},
+    )
+    assert cfg_subtree.thinker_config._attn_implementation == "eager"
+    assert cfg_subtree.thinker_config.ops_config.attn_implementation == "eager"
+    assert cfg_subtree.thinker_config.text_config._attn_implementation == "eager"
+    assert cfg_subtree.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert cfg_subtree.thinker_config.vision_config._attn_implementation == "eager"
+    assert cfg_subtree.thinker_config.vision_config.ops_config.attn_implementation == "eager"

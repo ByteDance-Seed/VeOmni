@@ -67,13 +67,34 @@ def _snapshot_subconfigs(config: PretrainedConfig) -> dict[int, tuple[Pretrained
     return snapshots
 
 
+def _collect_explicit_attn_map_ids(config: PretrainedConfig, attn_value: Any) -> set[int]:
+    """Return ``id(sub)`` for every descendant explicitly targeted by a nested ``attn_implementation`` mapping."""
+    if attn_value is None:
+        return set()
+    if not isinstance(attn_value, Mapping):
+        ids = {id(config)}
+        for key in config.sub_configs:
+            sub = getattr(config, key, None)
+            if isinstance(sub, PretrainedConfig):
+                ids.update(_collect_explicit_attn_map_ids(sub, attn_value))
+        return ids
+
+    ids: set[int] = set()
+    if attn_value.get("") is not None:
+        ids.add(id(config))
+    for key in config.sub_configs:
+        if key not in attn_value:
+            continue
+        sub = getattr(config, key, None)
+        if isinstance(sub, PretrainedConfig):
+            ids.update(_collect_explicit_attn_map_ids(sub, attn_value[key]))
+    return ids
+
+
 def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
     from ..arguments import OpsImplementationConfig
 
     sub_snapshots = _snapshot_subconfigs(self)
-    direct_sub_ids = {
-        key: id(sub) for key in self.sub_configs if isinstance(sub := getattr(self, key, None), PretrainedConfig)
-    }
     ops_implementation = kwargs.pop("ops_implementation", getattr(self, "ops_implementation", None))
     explicit_attn = kwargs.get("attn_implementation")
 
@@ -81,17 +102,20 @@ def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
     _orig_post_init(self, **kwargs)
 
     explicit_map_ids = (
-        {direct_sub_ids[key] for key in explicit_attn if key in direct_sub_ids}
-        if isinstance(explicit_attn, Mapping)
-        else set()
+        _collect_explicit_attn_map_ids(self, explicit_attn) if isinstance(explicit_attn, Mapping) else set()
     )
     has_ops_attn = isinstance(ops_implementation, (OpsImplementationConfig, SimpleNamespace)) or (
         isinstance(ops_implementation, Mapping) and ops_implementation.get("attn_implementation") is not None
     )
     for sub_id, (sub, sub_ops, sub_attn) in sub_snapshots.items():
-        sub.ops_implementation = dict(sub_ops)
         if sub_id in explicit_map_ids:
+            override_attn = getattr(sub, "_attn_implementation_internal", None)
+            restored_ops = dict(sub_ops)
+            if override_attn is not None:
+                restored_ops["attn_implementation"] = override_attn
+            sub.ops_implementation = restored_ops
             continue
+        sub.ops_implementation = dict(sub_ops)
         if sub_attn is not None:
             sub._attn_implementation_internal = sub_attn
         elif not isinstance(explicit_attn, str) or has_ops_attn:
