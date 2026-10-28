@@ -304,7 +304,15 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     "qwen2_5_omni-fa2": {},
     # MiniMax's collator hook supplies image/video grid lists, so the patched
     # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
-    "minimax_m3_vl-fa2-fused": {},
+    "minimax_m3_vl-fa2-fused": {
+        ("patched_modeling_minimax_m3_vl_gpu.py", "MiniMaxM3VL3DRotaryEmbedding.forward"): (
+            "algorithm-essential: host-built vision coordinates `.to(device)` H2D copy; "
+            "over-reported by torch sync-debug mode."
+        ),
+        ("patched_modeling_minimax_m3_vl_gpu.py", "MiniMaxM3VLTextModel.forward"): (
+            "public-entry-fallback: one-segment cu_seq_lens built when the caller passes no varlen kwargs."
+        ),
+    },
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
