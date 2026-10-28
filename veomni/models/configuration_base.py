@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +32,18 @@ if TYPE_CHECKING:
 _orig_post_init = PretrainedConfig.__post_init__
 _orig_from_dict = PretrainedConfig.from_dict.__func__
 _orig_to_diff_dict = PretrainedConfig.to_diff_dict
+
+_DEFER_OPS_VALIDATION: ContextVar[bool] = ContextVar("_DEFER_OPS_VALIDATION", default=False)
+
+
+@contextmanager
+def _defer_ops_validation():
+    """Defer hardware and cross-field ``OpsImplementationConfig`` validation until overrides are applied."""
+    token = _DEFER_OPS_VALIDATION.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_OPS_VALIDATION.reset(token)
 
 
 def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) -> None:
@@ -188,56 +202,87 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         ops_implementation: dict[str, Any] | OpsImplementationConfig | Any | None,
         *,
         _is_post_init: bool = False,
+        _validate_tree: bool = False,
     ) -> None:
         from ..arguments import OpsImplementationConfig
 
+        defer_validation = _DEFER_OPS_VALIDATION.get()
         replace_all = isinstance(ops_implementation, (OpsImplementationConfig, SimpleNamespace))
-        validated: dict[str, Any] = {}
+        raw_override: dict[str, Any] = {}
+        override_for_children: dict[str, Any] = {}
+
         if isinstance(ops_implementation, OpsImplementationConfig):
-            self.ops_implementation = ops_implementation.to_dict()
+            new_ops = ops_implementation.to_dict()
         elif isinstance(ops_implementation, SimpleNamespace):
-            self.ops_implementation = {k: v for k, v in vars(ops_implementation).items() if v is not None}
+            new_ops = {k: v for k, v in vars(ops_implementation).items() if v is not None}
         elif ops_implementation is None or isinstance(ops_implementation, Mapping):
-            validated = OpsImplementationConfig.validate_and_extract_dict(ops_implementation)
+            raw_override = dict(ops_implementation or {})
             if _is_post_init:
-                self.ops_implementation = validated
+                merged = {k: v for k, v in raw_override.items() if v is not None}
             else:
                 own = dict(getattr(self, "ops_implementation", None) or {})
-                self.ops_implementation = {**own, **validated}
+                merged = {**own, **raw_override}
+            if defer_validation:
+                new_ops = {k: v for k, v in merged.items() if v is not None}
+                override_for_children = dict(raw_override)
+            else:
+                new_ops = OpsImplementationConfig.validate_and_extract_dict(merged)
+                override_for_children = {k: new_ops.get(k) for k in raw_override}
         else:
             raise ValueError(
                 f"ops_implementation must be a dict or OpsImplementationConfig, got {type(ops_implementation).__name__}."
             )
 
-        if _is_post_init or replace_all:
+        tree_snapshots = None if _is_post_init else _snapshot_subconfigs(self)
+        prev_self_ops = dict(getattr(self, "ops_implementation", None) or {})
+        prev_self_attn = getattr(self, "_attn_implementation_internal", None)
+
+        self.ops_implementation = new_ops
+        if _is_post_init or replace_all or _validate_tree:
             if "attn_implementation" in self.ops_implementation:
                 self._attn_implementation_internal = self.ops_implementation["attn_implementation"]
-        elif "attn_implementation" in validated:
-            self._attn_implementation_internal = validated["attn_implementation"]
+        elif "attn_implementation" in raw_override and "attn_implementation" in self.ops_implementation:
+            self._attn_implementation_internal = self.ops_implementation["attn_implementation"]
 
-        for key in self.sub_configs:
-            subconfig = getattr(self, key, None)
-            if not isinstance(subconfig, PretrainedConfig):
-                continue
-            if replace_all:
-                subconfig._set_ops_implementation(ops_implementation)
-            elif _is_post_init:
-                sub_own = dict(getattr(subconfig, "ops_implementation", None) or {})
-                sub_attn = getattr(subconfig, "_attn_implementation_internal", None)
-                if "attn_implementation" not in sub_own and sub_attn is not None:
-                    sub_own["attn_implementation"] = sub_attn
-                merged = {**self.ops_implementation, **sub_own}
-                subconfig._set_ops_implementation(merged, _is_post_init=True)
-            elif validated:
-                subconfig._set_ops_implementation(validated)
+        try:
+            for key in self.sub_configs:
+                subconfig = getattr(self, key, None)
+                if not isinstance(subconfig, PretrainedConfig):
+                    continue
+                if replace_all:
+                    subconfig._set_ops_implementation(ops_implementation, _validate_tree=_validate_tree)
+                elif _is_post_init:
+                    sub_own = dict(getattr(subconfig, "ops_implementation", None) or {})
+                    sub_attn = getattr(subconfig, "_attn_implementation_internal", None)
+                    if "attn_implementation" not in sub_own and sub_attn is not None:
+                        sub_own["attn_implementation"] = sub_attn
+                    sub_merged = {**self.ops_implementation, **sub_own}
+                    subconfig._set_ops_implementation(sub_merged, _is_post_init=True)
+                elif override_for_children or _validate_tree:
+                    subconfig._set_ops_implementation(override_for_children, _validate_tree=_validate_tree)
+        except Exception:
+            if tree_snapshots is not None:
+                self.ops_implementation = prev_self_ops
+                self._attn_implementation_internal = prev_self_attn
+                for sub, sub_ops, sub_attn in tree_snapshots.values():
+                    sub.ops_implementation = dict(sub_ops)
+                    sub._attn_implementation_internal = sub_attn
+            raise
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs: Any):
         ops_implementation = kwargs.pop("ops_implementation", None)
-        result = _orig_from_dict(cls, config_dict, **kwargs)
+        has_explicit_attn = "attn_implementation" in kwargs and kwargs["attn_implementation"] is not None
+        explicit_attn = kwargs.get("attn_implementation") if has_explicit_attn else None
+        with _defer_ops_validation():
+            result = _orig_from_dict(cls, config_dict, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        if explicit_attn is not None:
+            config._attn_implementation = explicit_attn
         if ops_implementation is not None:
-            config = result[0] if isinstance(result, tuple) else result
-            config._set_ops_implementation(ops_implementation)
+            config._set_ops_implementation(ops_implementation, _validate_tree=True)
+        elif not _DEFER_OPS_VALIDATION.get():
+            config._set_ops_implementation({}, _validate_tree=True)
         return result
 
     def to_diff_dict(self) -> dict[str, Any]:

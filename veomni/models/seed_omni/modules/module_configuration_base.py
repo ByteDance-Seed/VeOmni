@@ -29,7 +29,7 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from ...configuration_base import VeOmniPretrainedConfig
+from ...configuration_base import VeOmniPretrainedConfig, _defer_ops_validation
 
 
 class OmniModuleConfig(VeOmniPretrainedConfig):
@@ -128,15 +128,16 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
 
             cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
 
-        hf_config = super().from_pretrained(
-            pretrained_model_name_or_path,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
-            revision=revision,
-            **kwargs,
-        )
+        with _defer_ops_validation():
+            hf_config = super().from_pretrained(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                local_files_only=local_files_only,
+                token=token,
+                revision=revision,
+                **kwargs,
+            )
         if not isinstance(hf_config, OmniModuleConfig):
             raise TypeError(
                 f"Module config loaded from {pretrained_model_name_or_path} is a "
@@ -147,6 +148,7 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
             processor_config=processor_config,
             ops_implementation=entry_ops,
             base_ops_implementation=base_ops,
+            validate_ops=True,
         )
         return hf_config
 
@@ -157,6 +159,7 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
         processor_config: dict[str, Any] | None,
         ops_implementation: dict[str, Any] | None,
         base_ops_implementation: dict[str, Any] | None,
+        validate_ops: bool = False,
     ) -> None:
         """Write a composed model's overwrites onto this module config."""
 
@@ -180,8 +183,11 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
         if processor_config:
             current = dict(getattr(self, "processor_config", None) or {})
             self.processor_config = {**current, **deepcopy(processor_config)}
-        if base_ops or entry_ops:
-            self._set_ops_implementation({**(base_ops or {}), **(entry_ops or {})})
+        if base_ops or entry_ops or validate_ops:
+            self._set_ops_implementation(
+                {**(base_ops or {}), **(entry_ops or {})},
+                _validate_tree=validate_ops,
+            )
 
 
 __all__ = [

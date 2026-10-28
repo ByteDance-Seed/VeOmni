@@ -456,3 +456,130 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
     assert omni_reloaded.thinker_config.text_config._attn_implementation == "eager"
     assert omni_reloaded.thinker_config.text_config.ops_config.attn_implementation == "eager"
     assert omni_reloaded.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
+
+
+def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
+    """Sparse overrides on existing or loaded configs validate the merged state at every node."""
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    import veomni.models  # noqa: F401
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
+
+    llama_dir = tmp_path / "llama"
+    cfg = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        ops_implementation={"moe_implementation": "deepgemm_fp8"},
+    )
+    cfg.save_pretrained(llama_dir)
+
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
+        cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    assert cfg.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
+        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+
+    # Overriding moe_implementation away from deepgemm_fp8 at the same time is valid.
+    reloaded = LlamaConfig.from_pretrained(
+        llama_dir,
+        ops_implementation={"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
+    )
+    assert reloaded.ops_implementation == {
+        "moe_implementation": "fused_triton",
+        "qat_implementation": "fp8_blockwise",
+    }
+
+    # Sub-config cross-field conflicts must also be rejected atomically.
+    vl_dir = tmp_path / "qwen3_vl"
+    vl_cfg = Qwen3VLConfig(
+        text_config={"ops_implementation": {"moe_implementation": "deepgemm_fp8"}},
+    )
+    vl_cfg.save_pretrained(vl_dir)
+
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
+        vl_cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    assert vl_cfg.ops_implementation == {}
+    assert vl_cfg.text_config.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
+        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+
+
+def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path, monkeypatch):
+    """Loading a GPU checkpoint on NPU succeeds when caller overrides GPU-only ops to NPU-supported ones."""
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    import veomni.models  # noqa: F401
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+
+    # 1. Export configs on simulated GPU host with GPU-only liger_kernel.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+
+    llama_dir = tmp_path / "llama_gpu"
+    LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        ops_implementation={"rms_norm_implementation": "liger_kernel"},
+    ).save_pretrained(llama_dir)
+
+    vl_dir = tmp_path / "vl_gpu"
+    Qwen3VLConfig(
+        ops_implementation={"rms_norm_implementation": "liger_kernel", "attn_implementation": "sdpa"},
+        vision_config={"ops_implementation": {"attn_implementation": "eager"}},
+    ).save_pretrained(vl_dir)
+
+    module_dir = tmp_path / "omni_module_gpu"
+    FakeModuleAConfig(
+        hidden_size=8,
+        ops_implementation={"rms_norm_implementation": "liger_kernel"},
+    ).save_pretrained(module_dir)
+
+    # 2. Switch host to simulated Ascend NPU.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
+
+    # Without an override, loading the GPU checkpoint on NPU must still fail validation.
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        LlamaConfig.from_pretrained(llama_dir)
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        Qwen3VLConfig.from_pretrained(vl_dir)
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        FakeModuleAConfig.from_pretrained(module_dir)
+
+    # With a valid NPU override, the override is applied before hardware validation.
+    llama_npu = LlamaConfig.from_pretrained(
+        llama_dir,
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
+    )
+    assert llama_npu.ops_config.rms_norm_implementation == "torch_npu"
+
+    vl_npu = Qwen3VLConfig.from_pretrained(
+        vl_dir,
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
+    )
+    assert vl_npu.ops_config.rms_norm_implementation == "torch_npu"
+    assert vl_npu.text_config.ops_config.rms_norm_implementation == "torch_npu"
+    assert vl_npu.vision_config.ops_config.rms_norm_implementation == "torch_npu"
+    assert vl_npu.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert vl_npu.vision_config.ops_config.attn_implementation == "eager"
+
+    mod_npu = FakeModuleAConfig.from_pretrained(
+        module_dir,
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
+    )
+    assert mod_npu.ops_config.rms_norm_implementation == "torch_npu"
