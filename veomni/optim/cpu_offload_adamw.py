@@ -12,11 +12,10 @@ import re
 import time
 
 import torch
-from torch.optim import Optimizer
 
 from veomni.utils.logging import get_logger
 
-from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
+from .master_fp32_adamw import FullFP32AdamW, _local
 
 
 logger = get_logger(__name__)
@@ -89,19 +88,23 @@ class CPUOffloadAdamW(FullFP32AdamW):
             # Consuming our runtime-only flag must not erase the caller's policy
             # when the same group definitions are used to construct a resume.
             params = [dict(group) for group in params]
-        super().__init__(params, lr, betas, eps, weight_decay, chunk_size)
-        # Keep storage policy out of serialized param groups. PyTorch's FQN
-        # loader expects every current group key in older checkpoints; adding
-        # cpu_offload there would prevent loading FullFP32AdamW checkpoints.
         self._offloaded = set()
-        for group in self.param_groups:
-            policy = group.pop("cpu_offload", False)
-            if not isinstance(policy, bool):
-                raise ValueError("cpu_offload must be a bool")
-            if policy:
-                self._offloaded.update(id(param) for param in group["params"])
+        super().__init__(params, lr, betas, eps, weight_decay, chunk_size)
         self._staging = {}
         self._state_receipt_emitted = False
+
+    def _group_moment_dtype(self, group):
+        policy = group.get("cpu_offload", False)
+        if not isinstance(policy, bool):
+            raise ValueError("cpu_offload must be a bool")
+        return self.cpu_moment_dtype if policy else self.resident_moment_dtype
+
+    def add_param_group(self, param_group):
+        group = dict(param_group)
+        super().add_param_group(group)
+        registered = self.param_groups[-1]
+        if registered.pop("cpu_offload", False):
+            self._offloaded.update(id(param) for param in registered["params"])
 
     def _state_dtype(self, param, name):
         if name == "master_weight":
@@ -128,46 +131,11 @@ class CPUOffloadAdamW(FullFP32AdamW):
     def _finish_state_chunk(self, param, state, start, count):
         """Hook for bounded storage policies after a moment chunk is written."""
 
-    def load_state_dict(self, state_dict):
-        restored = []
-        for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            for key, param in zip(saved_group["params"], group["params"], strict=True):
-                saved = state_dict["state"].get(key, {})
-                if saved:
-                    required = self.checkpoint_state_fields(param)
-                    if set(saved) != set(required):
-                        raise RuntimeError("CPU offload requires complete master_weight/exp_avg/exp_avg_sq/step state")
-                    for name in required:
-                        if name == "step":
-                            continue
-                        expected_dtype = self._state_dtype(param, name)
-                        if saved[name].dtype != expected_dtype:
-                            raise RuntimeError(
-                                f"Optimizer checkpoint dtype mismatch for {name}: saved={saved[name].dtype}, "
-                                f"configured={expected_dtype}; explicit precision migration is required"
-                            )
-                        saved[name] = _align_state_to_parameter(saved[name], param)
-                        if tuple(saved[name].shape) != tuple(param.shape):
-                            raise RuntimeError(f"Shape mismatch for optimizer state {name}")
-                restored.append((param, saved, id(param) in self._offloaded))
-        # PyTorch's normal loader casts all states to the compute parameter's
-        # dtype/device. Even restoring afterwards transiently allocates the full
-        # optimizer on the accelerator. Load group metadata without any tensors.
-        Optimizer.load_state_dict(self, {**state_dict, "state": {}})
-        for param, saved, offload in restored:
-            if not saved:
-                continue
-            target = torch.device("cpu") if offload else param.device
-            state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
-            for name in self.checkpoint_state_fields(param):
-                if name == "step":
-                    continue
-                tensor = saved[name]
-                # Reuse DCP's already correctly placed buffers. Cloning every
-                # resident state here would transiently double accelerator
-                # optimizer memory during resume.
-                state[name] = tensor.detach().to(device=target, dtype=self._state_dtype(param, name))
-            self.state[param] = state
+    def _state_device(self, param):
+        return torch.device("cpu") if id(param) in self._offloaded else param.device
+
+    def _restore_step(self, step):
+        return torch.as_tensor(step).detach().cpu().clone()
 
     def _emit_state_receipt(self):
         if self._state_receipt_emitted or not any(group["lr"] != 0 for group in self.param_groups):

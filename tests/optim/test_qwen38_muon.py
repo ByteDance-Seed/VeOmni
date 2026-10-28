@@ -187,6 +187,20 @@ def test_resume_rejects_old_adam_and_changed_splits():
         make_optimizer(p, [("muon", 0, 8)], cpu_moment_dtype="bfloat16")
 
 
+def test_resume_validates_qwen_recipe_after_pre_hook():
+    p = torch.nn.Parameter(torch.ones(8, 5, dtype=torch.bfloat16))
+    opt = make_optimizer(p, [("muon", 0, 8)])
+    saved = copy.deepcopy(opt.state_dict())
+
+    def alter(_optimizer, incoming):
+        incoming["param_groups"][0]["qwen38_plan"] = json.dumps([("adamw", 0, 8)])
+
+    opt.register_load_state_dict_pre_hook(alter)
+    with pytest.raises(RuntimeError, match="Muon resume recipe mismatch"):
+        opt.load_state_dict(saved)
+    assert json.loads(opt.param_groups[0]["qwen38_plan"]) == [["muon", 0, 8]]
+
+
 def test_logical_model_layout_and_frozen_rules():
     class Model(torch.nn.Module):
         def __init__(self):
@@ -577,3 +591,11 @@ def test_unused_ple_snapshot_does_not_initialize_or_advance_live_state():
     direct["param_groups"][0].pop("qwen38_ple_step_layout")
     with pytest.raises(RuntimeError, match="explicit migration"):
         opt.load_state_dict(direct)
+
+
+def test_qwen38_recipe_rejects_dynamic_parameter_group():
+    existing = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = make_optimizer(existing, [["adamw", 0, 2]])
+    lookup = torch.nn.Parameter(torch.ones(2, 2))
+    with pytest.raises(RuntimeError, match="complete parameter recipe"):
+        optimizer.add_param_group({"params": [lookup], "qwen38_ple_lookup": True, "weight_decay": 0.2})

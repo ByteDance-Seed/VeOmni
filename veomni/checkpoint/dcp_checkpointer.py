@@ -21,7 +21,7 @@ import os
 import shutil
 import threading
 import weakref
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right, insort
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -38,7 +38,7 @@ from torch.distributed.checkpoint import (
     load,
 )
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     _get_fqns,
@@ -322,16 +322,26 @@ def _abort_file_backed_optimizers(optimizer):
             abort()
 
 
-def _validate_file_backed_nonple_save_state(model, optimizer, group=None):
+def _validate_nonple_save_state(model, optimizer, group=None, *, require_step=False):
     """Fail closed if non-PLE shards cannot share a faithful DCP state."""
     if not dist.is_initialized():
         return
     local_rows, error = {}, None
     try:
+        validate_groups = getattr(optimizer, "_validate_checkpoint_param_groups", None)
+        if validate_groups is not None:
+            validate_groups()
         names = {id(param): name for name, param in model.named_parameters()}
         for leaf in _iter_optimizer_leaves(optimizer):
             for param_group in leaf.param_groups:
+                if not param_group["params"]:
+                    raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
                 if param_group.get("qwen38_ple_lookup"):
+                    layout = json.loads(param_group.get("qwen38_ple_step_layout", "null"))
+                    if not getattr(leaf, "requires_exact_recipe", False) or not (
+                        isinstance(layout, list) and len(layout) == 2 and layout[0] == "owner-grid-v1"
+                    ):
+                        raise RuntimeError("Unrecognized PLE checkpoint owner-step layout")
                     continue
                 for param in param_group["params"]:
                     if not param.requires_grad:
@@ -342,16 +352,26 @@ def _validate_file_backed_nonple_save_state(model, optimizer, group=None):
                     local_param = param.to_local() if isinstance(param, DTensor) else param
                     value = leaf.state.get(param, {})
                     if value:
+                        fields = tuple(
+                            (str(name), str(item.dtype) if torch.is_tensor(item) else type(item).__qualname__)
+                            for name, item in sorted(value.items())
+                        )
                         step = value.get("step")
                         step = step.to_local() if isinstance(step, DTensor) else step
-                        if not torch.is_tensor(step) or step.ndim != 0:
-                            raise RuntimeError("Non-PLE optimizer checkpoint step must be a scalar")
-                        step_value = float(step.item())
-                        if not math.isfinite(step_value) or step_value < 0 or not step_value.is_integer():
-                            raise RuntimeError(
-                                "Non-PLE optimizer checkpoint step must be a finite nonnegative integer"
-                            )
-                        signature = (tuple(sorted(value)), str(step.dtype), step_value)
+                        if step is None and not require_step:
+                            signature = (fields, None, None)
+                        else:
+                            if torch.is_tensor(step) and step.ndim == 0:
+                                step_value, step_type = float(step.item()), str(step.dtype)
+                            elif not require_step and type(step) in (int, float):
+                                step_value, step_type = float(step), type(step).__qualname__
+                            else:
+                                raise RuntimeError("Non-PLE optimizer checkpoint step must be a scalar")
+                            if not math.isfinite(step_value) or step_value < 0 or not step_value.is_integer():
+                                raise RuntimeError(
+                                    "Non-PLE optimizer checkpoint step must be a finite nonnegative integer"
+                                )
+                            signature = (fields, step_type, step_value)
                     else:
                         signature = None
                     local_rows[name] = (bool(local_param.numel()), signature)
@@ -580,6 +600,76 @@ def _drop_absent_optimizer_state(model, optimizer) -> None:
         logger.info_rank0("DCP resume dropped %d wholly absent optimizer state entr(ies)", dropped)
 
 
+@contextmanager
+def _filter_synthetic_optimizer_state_on_load(model, optimizer):
+    """Hide DCP-created placeholder entries before user load hooks run.
+
+    PyTorch reconstructs the state dict using the target optimizer's entries,
+    including temporary entries for parameters absent from the checkpoint.
+    Filtering the incoming dict, rather than deleting state after loading,
+    preserves both the hook contract and changes made by user post-load hooks.
+    """
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    handles, expected, invoked = [], set(), set()
+    names = None
+    try:
+        for target in targets:
+            zero = getattr(target, "_veomni_resume_zero_optimizer_state", False)
+            bases = getattr(target, _ABSENT_OPTIMIZER_STATE_ATTR, ())
+            leaves = tuple(_iter_optimizer_leaves(target))
+            for leaf in leaves:
+                if isinstance(leaf, torch.optim.AdamW):
+                    expected.add(id(leaf))
+
+                    def validate_adamw(current, incoming):
+                        if any(group.get("decoupled_weight_decay") is not True for group in incoming["param_groups"]):
+                            raise RuntimeError("AdamW checkpoint requires decoupled weight decay; migrate explicitly")
+                        invoked.add(id(current))
+
+                    # Validate the saved value and the result of any user hook.
+                    handles.append(leaf.register_load_state_dict_pre_hook(validate_adamw, prepend=True))
+                    handles.append(leaf.register_load_state_dict_pre_hook(validate_adamw))
+            if not zero and not bases:
+                continue
+            if names is None:
+                names = _dcp_parameter_name_map(model)
+            missing = set()
+            for base in bases:
+                if not isinstance(base, str) or not base.startswith("optimizer.state."):
+                    raise RuntimeError(f"Invalid absent optimizer state name: {base!r}")
+                fqn = base.removeprefix("optimizer.state.")
+                if fqn not in names:
+                    raise RuntimeError(f"Cannot resolve parameter for absent optimizer state: {fqn}")
+                missing.add(id(names[fqn]))
+
+            for leaf in leaves:
+                expected.add(id(leaf))
+
+                def filter_state(current, incoming, *, missing=missing, zero=zero):
+                    groups = incoming["param_groups"]
+                    if len(groups) != len(current.param_groups) or any(
+                        len(saved["params"]) != len(group["params"])
+                        for saved, group in zip(groups, current.param_groups, strict=True)
+                    ):
+                        raise RuntimeError("Cannot filter synthetic state with mismatched optimizer groups")
+                    result = incoming.copy()
+                    result["state"] = incoming["state"].copy()
+                    for saved, group in zip(groups, current.param_groups, strict=True):
+                        for key, param in zip(saved["params"], group["params"], strict=True):
+                            if zero or id(param) in missing:
+                                result["state"].pop(key, None)
+                    invoked.add(id(current))
+                    return result
+
+                handles.append(leaf.register_load_state_dict_pre_hook(filter_state, prepend=True))
+        yield
+        if invoked != expected:
+            raise RuntimeError("Optimizer load bypassed hooks needed to remove synthetic checkpoint state")
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 def _requires_exact_optimizer_state_dtypes(optimizer):
     """Opt in only precision-sensitive optimizers, including MultiOptimizer."""
     optimizer = getattr(optimizer, "optimizer", optimizer)
@@ -595,6 +685,19 @@ def _requires_exact_optimizer_recipe(optimizer):
         return True
     children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
     return any(_requires_exact_optimizer_recipe(child) for child in children.values())
+
+
+def _validate_unique_optimizer_parameters(optimizer):
+    """Flattened DCP optimizer groups cannot encode repeated parameters."""
+    seen = set()
+    for leaf in _iter_optimizer_leaves(optimizer):
+        for group in leaf.param_groups:
+            for param in group["params"]:
+                if id(param) in seen:
+                    raise RuntimeError(
+                        "DCP optimizer groups contain duplicate parameters; explicit migration required"
+                    )
+                seen.add(id(param))
 
 
 def _validate_exact_optimizer_state_targets(optimizer):
@@ -625,6 +728,45 @@ def _validate_exact_optimizer_state_targets(optimizer):
                 )
 
 
+def _optimizer_chunks_are_complete(tensor_metadata: TensorStorageMetadata) -> bool:
+    """Reject missing, overlapping or out-of-bounds optimizer state shards."""
+    shape, chunks = tensor_metadata.size, tensor_metadata.chunks
+    if not shape:
+        return len(chunks) == 1 and not chunks[0].offsets and not chunks[0].sizes
+    ndim = len(shape)
+    volume = 0
+    for chunk in chunks:
+        if len(chunk.offsets) != ndim or len(chunk.sizes) != ndim:
+            return False
+        if any(
+            start < 0 or size < 0 or start + size > bound
+            for start, size, bound in zip(chunk.offsets, chunk.sizes, shape, strict=True)
+        ):
+            return False
+        volume += math.prod(chunk.sizes)
+    if volume != math.prod(shape):
+        return False
+
+    # Sweep the axis with the lowest average interval coverage. The widest
+    # tensor dimension is often not the sharded dimension and can leave all
+    # chunks active, producing quadratic planner cost for FSDP matrices.
+    axis = min(range(ndim), key=lambda dim: sum(chunk.sizes[dim] for chunk in chunks) / (shape[dim] or 1))
+    ordered = sorted((chunk for chunk in chunks if math.prod(chunk.sizes)), key=lambda chunk: chunk.offsets[axis])
+    active = []
+    for index, chunk in enumerate(ordered):
+        start, end = chunk.offsets[axis], chunk.offsets[axis] + chunk.sizes[axis]
+        del active[: bisect_right(active, (start, len(ordered)))]
+        for _, other_index in active:
+            other = ordered[other_index]
+            if all(
+                max(a, b) < min(a + size_a, b + size_b)
+                for a, size_a, b, size_b in zip(chunk.offsets, chunk.sizes, other.offsets, other.sizes, strict=True)
+            ):
+                return False
+        insort(active, (end, index))
+    return True
+
+
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
@@ -635,6 +777,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         strict_optimizer_recipe: bool = False,
         strict_gdn_fp32: bool = False,
         optimizer=None,
+        model=None,
         source_cache_evictor=None,
     ):
         super().__init__(allow_partial_load=True)
@@ -643,7 +786,25 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.strict_optimizer_recipe = strict_optimizer_recipe
         self.strict_gdn_fp32 = strict_gdn_fp32
         self.optimizer = optimizer
+        self.model = model
         self.source_cache_evictor = source_cache_evictor
+
+    def set_up_planner(self, state_dict, metadata=None, is_coordinator=False):
+        super().set_up_planner(state_dict, metadata, is_coordinator)
+        if metadata is None:
+            return
+        # Older runs may have saved the PyTorch-added differentiable flag even
+        # when the fresh custom optimizer has no such default. Preserve an
+        # existing source value instead of silently dropping the group field.
+        for key in metadata.state_dict_metadata:
+            if not key.startswith("optimizer.param_groups.") or not key.endswith(".differentiable"):
+                continue
+            reference = key.removesuffix("differentiable") + "lr"
+            if key in self.mappings or reference not in self.mappings:
+                continue
+            path = self.mappings[reference]
+            self.mappings[key] = (*path[:-1], path[-1].removesuffix("lr") + "differentiable")
+            self.state_dict[key] = False
 
     def load_bytes(self, read_item, value):
         super().load_bytes(read_item, value)
@@ -667,6 +828,13 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         if self.optimizer is not None:
             _reset_absent_optimizer_state(self.optimizer)
         metadata = self.metadata.state_dict_metadata if self.metadata is not None else {}
+        optimizer_tensors = {
+            key: value
+            for key, value in metadata.items()
+            if key.startswith("optimizer.state.") and key in self.mappings and isinstance(value, TensorStorageMetadata)
+        }
+        if any(not _optimizer_chunks_are_complete(value) for value in optimizer_tensors.values()):
+            raise RuntimeError("DCP optimizer tensor chunks do not completely and uniquely cover their global shape")
         if self.strict_gdn_fp32:
             for key, path in self.mappings.items():
                 if not path or path[0] != "model" or not is_qwen4_gdn_parameter(key):
@@ -689,30 +857,10 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         if has_zero_state_marker and has_optimizer_state:
             raise RuntimeError(
                 "DCP zero-state optimizer marker conflicts with saved tensor state; "
-                "refusing to discard loaded optimizer state"
+                "rank-local lazy state cannot be reconstructed without explicit checkpoint migration"
             )
         resume_zero_optimizer_state = has_zero_state_marker and not has_optimizer_state
 
-        # A marker-only sparse MultiOptimizer checkpoint intentionally has no
-        # param-group metadata. There is no state to migrate, so recipe identity
-        # comes from the fresh target optimizer rather than the empty checkpoint.
-        if self.strict_optimizer_recipe and not resume_zero_optimizer_state:
-            assert self.metadata is not None
-            for key, path in self.mappings.items():
-                # Recipe identity lives in param-group metadata. Tensor state is
-                # validated below and may legitimately be absent for a parameter
-                # that never received a gradient.
-                if (
-                    path
-                    and path[0] == "optimizer"
-                    and len(path) > 1
-                    and (path[1] == "param_groups" or str(path[1]).startswith("param_groups."))
-                    and key not in self.metadata.state_dict_metadata
-                ):
-                    raise RuntimeError(
-                        f"DCP optimizer recipe/state is incomplete: {key}; "
-                        "AdamW-to-Muon migration must not use partial resume"
-                    )
         if self.strict_optimizer_dtype:
             # DCP otherwise casts saved tensors to the target placeholders before
             # optimizer.load_state_dict sees them. Validate original metadata
@@ -720,58 +868,184 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             assert self.metadata is not None
             if any(path and path[0] == "optimizer" for path in self.mappings.values()):
                 _validate_exact_optimizer_state_targets(self.optimizer)
-            missing_state_fields = []
-            for key, path in self.mappings.items():
-                if (
-                    not path
-                    or path[0] != "optimizer"
-                    or not key.endswith((".master_weight", ".exp_avg", ".exp_avg_sq", ".step"))
-                ):
+        # DCP silently ignores saved keys without target placeholders. Check
+        # the optimizer-owned names from its parameter groups, so partially
+        # initialized targets or a changed optimizer recipe cannot drop a
+        # saved moment while still allowing unrelated frozen parameters.
+        owned_names = set()
+        group_prefix = "optimizer.param_groups."
+        for key in self.mappings:
+            if not key.startswith(group_prefix):
+                continue
+            if key.endswith(".params"):
+                params = self.state_dict.get(key)
+                if isinstance(params, (tuple, list)):
+                    owned_names.update(name for name in params if isinstance(name, str))
+            elif key.endswith(".lr") and getattr(self.optimizer, "_is_multi_optimizer", False):
+                name = key[len(group_prefix) : -len(".lr")]
+                if name:
+                    owned_names.add(name)
+        saved_keys = sorted(metadata)
+        # A tied parameter may acquire a different canonical FQN if model
+        # registration order changes. Its old moment must not be mistaken for
+        # an unrelated frozen parameter while the new name appears lazy.
+        alias_model = self.model if self.model is not None else getattr(self.optimizer, "model", None)
+        if alias_model is not None and owned_names:
+            aliases_by_id = {}
+            for runtime_name, parameter in alias_model.named_parameters(remove_duplicate=False):
+                aliases_by_id.setdefault(id(parameter), set()).update(_get_fqns(alias_model, runtime_name))
+            for aliases in aliases_by_id.values():
+                if not aliases.intersection(owned_names):
                     continue
-                source = self.metadata.state_dict_metadata.get(key)
-                target = self.state_dict.get(key)
-                if source is None:
-                    missing_state_fields.append(key)
-                    continue
-                if not torch.is_tensor(target):
-                    continue
-                source_shape = getattr(source, "size", None)
-                if source_shape != target.shape:
+                for alias in aliases.difference(owned_names):
+                    base = f"optimizer.state.{alias}"
+                    index = bisect_left(saved_keys, base + ".")
+                    if base in metadata or (index < len(saved_keys) and saved_keys[index].startswith(base + ".")):
+                        raise RuntimeError("DCP optimizer tied parameter name changed; explicit migration is required")
+        name_map = None
+        for name in owned_names:
+            base = f"optimizer.state.{name}"
+            if base in metadata and base not in self.mappings:
+                raise RuntimeError(f"DCP optimizer state has an incompatible target for {base}")
+            prefix = base + "."
+            index = bisect_left(saved_keys, prefix)
+            while index < len(saved_keys) and saved_keys[index].startswith(prefix):
+                key = saved_keys[index]
+                if key not in self.mappings:
+                    # Older compact Muon expert checkpoints can contain an
+                    # unused FP32 second moment. Validate and ignore only that
+                    # explicitly supported legacy field on a real compact expert.
+                    if key == prefix + "exp_avg_sq":
+                        model = self.model if self.model is not None else getattr(self.optimizer, "model", None)
+                        if model is not None:
+                            if name_map is None:
+                                name_map = _dcp_parameter_name_map(model)
+                            param = name_map.get(name)
+                            master = self.state_dict.get(prefix + "master_weight")
+                            source = metadata[key]
+                            compact = param is not None and any(
+                                id(param) in getattr(leaf, "_compact_expert_ids", ())
+                                for leaf in _iter_optimizer_leaves(self.optimizer)
+                            )
+                            if (
+                                compact
+                                and torch.is_tensor(master)
+                                and isinstance(source, TensorStorageMetadata)
+                                and source.size == master.shape
+                                and source.properties.dtype == torch.float32
+                                and _optimizer_chunks_are_complete(source)
+                            ):
+                                index += 1
+                                continue
                     raise RuntimeError(
-                        f"DCP optimizer shape mismatch for {key}: saved={source_shape}, configured={target.shape}; "
-                        "explicit shape migration is required"
+                        f"DCP saved optimizer state has no target placeholder: {key}; "
+                        "use a fresh optimizer with the same recipe or explicitly migrate its state"
                     )
-                source_dtype = getattr(getattr(source, "properties", None), "dtype", None)
-                if source_dtype != target.dtype:
+                index += 1
+        # A parameter's tensor state may be lazy, but a missing group option
+        # cannot safely be replaced by the new run's value for any optimizer.
+        for key, path in self.mappings.items():
+            if (
+                path
+                and path[0] == "optimizer"
+                and len(path) > 1
+                and (path[1] == "param_groups" or str(path[1]).startswith("param_groups."))
+                and key not in metadata
+            ):
+                raise RuntimeError(
+                    f"DCP optimizer recipe/state is incomplete: {key}; "
+                    "missing optimizer group fields require explicit checkpoint migration"
+                )
+        group_prefixes = {
+            key.removesuffix(".lr")
+            for key in self.mappings
+            if key.startswith("optimizer.param_groups.") and key.endswith(".lr")
+        }
+        group_prefixes.update(
+            f"optimizer.param_groups.{path[2]}"
+            for path in self.mappings.values()
+            if len(path) > 2 and path[:2] == ("optimizer", "param_groups") and isinstance(path[2], int)
+        )
+        model = self.model if self.model is not None else getattr(self.optimizer, "model", None)
+        if model is not None:
+            if name_map is None:
+                name_map = _dcp_parameter_name_map(model)
+            group_prefixes.update(f"optimizer.param_groups.{name}" for name in name_map)
+        for key in metadata:
+            if not key.startswith("optimizer.param_groups.") or key in self.mappings:
+                continue
+            if any(key.startswith(prefix + ".") for prefix in group_prefixes):
+                raise RuntimeError(
+                    f"DCP optimizer parameter group has an unsupported saved field: {key}; "
+                    "explicit checkpoint migration is required"
+                )
+        target_group_indices = {
+            path[2]
+            for path in self.mappings.values()
+            if len(path) > 2 and path[:2] == ("optimizer", "param_groups") and isinstance(path[2], int)
+        }
+        if target_group_indices:
+            source_group_indices = {
+                path[2]
+                for path in (getattr(self.metadata, "planner_data", None) or {}).values()
+                if len(path) > 2 and path[:2] == ("optimizer", "param_groups") and isinstance(path[2], int)
+            }
+            if source_group_indices != target_group_indices:
+                raise RuntimeError("DCP optimizer parameter group count changed; explicit migration is required")
+        missing_state_fields = []
+        for key, path in self.mappings.items():
+            if not path or path[0] != "optimizer" or not key.startswith("optimizer.state."):
+                continue
+            # Optimizer state may have arbitrary, nested fields (e.g. Kahan
+            # compensation); match the longest owned FQN rather than using a
+            # fixed list of Adam field names.
+            parts = key.removeprefix("optimizer.state.").split(".")
+            name = next(
+                (".".join(parts[:i]) for i in range(len(parts) - 1, 0, -1) if ".".join(parts[:i]) in owned_names), None
+            )
+            base = f"optimizer.state.{name}" if name is not None else key.rpartition(".")[0]
+            source = metadata.get(key)
+            target = self.state_dict.get(key)
+            if source is None:
+                missing_state_fields.append(base)
+                continue
+            if not self.strict_optimizer_dtype or not torch.is_tensor(target):
+                continue
+            source_shape = getattr(source, "size", None)
+            if source_shape != target.shape:
+                raise RuntimeError(
+                    f"DCP optimizer shape mismatch for {key}: saved={source_shape}, configured={target.shape}; "
+                    "explicit shape migration is required"
+                )
+            source_dtype = getattr(getattr(source, "properties", None), "dtype", None)
+            if source_dtype != target.dtype:
+                raise RuntimeError(
+                    f"DCP optimizer dtype mismatch for {key}: saved={source_dtype}, configured={target.dtype}; "
+                    "explicit precision migration is required"
+                )
+        if missing_state_fields:
+            lazy_bases = set()
+            for base in missing_state_fields:
+                prefix = base + "."
+                saved_index = bisect_left(saved_keys, prefix)
+                if base in metadata or (saved_index < len(saved_keys) and saved_keys[saved_index].startswith(prefix)):
+                    kind = "precision-sensitive optimizer state" if self.strict_optimizer_dtype else "optimizer state"
                     raise RuntimeError(
-                        f"DCP optimizer dtype mismatch for {key}: saved={source_dtype}, configured={target.dtype}; "
-                        "explicit precision migration is required"
+                        f"DCP is missing part of {kind} for {base}; explicit checkpoint migration is required"
                     )
-            if missing_state_fields:
-                lazy_bases = set()
-                saved_keys = sorted(metadata)
-                for key in missing_state_fields:
-                    base, _, _ = key.rpartition(".")
-                    prefix = base + "."
-                    saved_index = bisect_left(saved_keys, prefix)
-                    if saved_index < len(saved_keys) and saved_keys[saved_index].startswith(prefix):
-                        raise RuntimeError(
-                            f"DCP is missing part of precision-sensitive optimizer state for {base}; "
-                            "explicit checkpoint migration is required"
-                        )
-                    lazy_bases.add(base)
-                if not has_optimizer_state and not has_zero_state_marker:
-                    raise RuntimeError(
-                        "DCP is missing every precision-sensitive optimizer state entry; "
-                        "explicit checkpoint migration is required"
-                    )
-                if lazy_bases and not resume_zero_optimizer_state:
-                    if self.optimizer is not None:
-                        _record_absent_optimizer_state(self.optimizer, lazy_bases)
-                    logger.info_rank0(
-                        "DCP resume keeps default lazy optimizer state for %d parameter(s) absent from the checkpoint",
-                        len(lazy_bases),
-                    )
+                lazy_bases.add(base)
+            if self.strict_optimizer_dtype and not has_optimizer_state and not has_zero_state_marker:
+                raise RuntimeError(
+                    "DCP is missing every precision-sensitive optimizer state entry; "
+                    "explicit checkpoint migration is required"
+                )
+            if lazy_bases and not resume_zero_optimizer_state:
+                if self.optimizer is not None:
+                    _record_absent_optimizer_state(self.optimizer, lazy_bases)
+                logger.info_rank0(
+                    "DCP resume preserves lazy optimizer state for %d parameter(s) absent from the checkpoint",
+                    len(lazy_bases),
+                )
         plan = super().create_local_plan()
         if self.strict_model:
             assert self.metadata is not None
@@ -1066,6 +1340,33 @@ class ModelState(Stateful):
         )
 
 
+def _has_optimizer_checkpoint_state(state_dict):
+    """Ignore empty per-parameter mappings, which DCP does not serialize."""
+    if any(key.startswith("state.") for key in state_dict):
+        return True
+    nested = state_dict.get("state", {})
+    return any(not isinstance(value, dict) or bool(value) for value in nested.values())
+
+
+def _validate_single_optimizer_groups(model, optimizer, saved_state):
+    groups = saved_state.get("param_groups", ())
+    if len(groups) != len(optimizer.param_groups):
+        raise RuntimeError("DCP optimizer parameter group count changed; explicit migration is required")
+    names_to_ids = {}
+    for runtime_name, parameter in model.named_parameters(remove_duplicate=False):
+        for name in _get_fqns(model, runtime_name):
+            names_to_ids.setdefault(name, set()).add(id(parameter))
+    for saved, current in zip(groups, optimizer.param_groups, strict=True):
+        saved_ids = set()
+        for name in saved.get("params", ()):
+            identities = names_to_ids.get(name, set())
+            if len(identities) != 1:
+                raise RuntimeError("DCP optimizer parameter group has an unknown or ambiguous parameter")
+            saved_ids.update(identities)
+        if saved_ids != {id(parameter) for parameter in current["params"]}:
+            raise RuntimeError("DCP optimizer parameter group membership changed; explicit migration is required")
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -1078,8 +1379,9 @@ class OptimizerState(Stateful):
     normal resume path), ``set_optimizer_state_dict`` internally calls
     ``_init_optim_state`` which pre-fills zero/default state for every
     param; DCP then overwrites the entries that exist in the checkpoint.
-    Params absent from the checkpoint keep their default-initialised state,
-    equivalent to what AdamW would create on the next ``step()`` call.
+    Placeholders for entirely absent parameter state are removed from the
+    incoming state before load hooks, preserving lazy initialization and the
+    user hook contract for the parameter's first actual update.
 
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
     cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
@@ -1093,9 +1395,8 @@ class OptimizerState(Stateful):
         load: when ``True`` (the normal resume path), ``state_dict()`` returns a
             dense state dict so DCP knows where to place restored optimizer
             entries.  When ``False`` (the save path), the returned dict is
-            sparse and skips sub-optimizers that have never been stepped,
-            avoiding synthetic zero state for unused parameters (e.g. unused
-            MoE experts) in the checkpoint.
+            sparse, preserving parameter groups while avoiding synthetic
+            optimizer state for unused parameters (e.g. unused MoE experts).
 
     Precision-sensitive optimizers opt out of partial state restoration of an
     existing but incomplete state. A parameter with no saved state at all keeps
@@ -1113,6 +1414,7 @@ class OptimizerState(Stateful):
         load: bool = False,
         coordinated: bool = False,
         coordinated_group=None,
+        coordinated_group_validation: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -1124,11 +1426,52 @@ class OptimizerState(Stateful):
         self._load = load
         self._coordinated = coordinated
         self._coordinated_group = coordinated_group
+        self._coordinated_group_validation = coordinated_group_validation
         self._coordinated_file_mode = False
+        self._coordinate_state_dict = False
 
     def state_dict(self):
         if not self._coordinated:
-            return self._state_dict_impl()
+            if not self._coordinated_group_validation:
+                return self._state_dict_impl()
+            from torch.distributed.fsdp import FullyShardedDataParallel
+
+            if any(isinstance(module, FullyShardedDataParallel) for module in self.model.modules()):
+                # FSDP1's state-dict construction contains its own collectives;
+                # do not interleave them with the FSDP2/DDP error agreement.
+                return self._state_dict_impl()
+            # DCP calls Stateful.state_dict before its own planning collectives.
+            # Prepare custom optimizer buffers locally and agree on failures
+            # before EP mesh construction or DCP planning on any rank.
+            with ExitStack() as prepared:
+                error = None
+                try:
+                    if self._load:
+                        for optimizer in _iter_optimizer_leaves(self.optimizer):
+                            prepare = getattr(optimizer, "checkpoint_state", None)
+                            if prepare is not None:
+                                prepared.enter_context(prepare(load=True))
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "preparing optimizer checkpoint state", group=self._coordinated_group)
+                self._agree_parameter_uniqueness()
+                self._agree_external_optimizer_hooks()
+                if not self._load:
+                    _validate_nonple_save_state(self.model, self.optimizer, group=self._coordinated_group)
+                self._prime_checkpoint_meshes()
+                result, error = None, None
+                try:
+                    self._coordinate_state_dict = True
+                    result = self._state_dict_impl()
+                except BaseException as exc:
+                    error = exc
+                finally:
+                    self._coordinate_state_dict = False
+                raise_if_any_rank_failed(
+                    error, "constructing optimizer checkpoint state", group=self._coordinated_group
+                )
+                self._agree_save_state_coverage(result)
+                return result
         self._coordinated_file_mode = _agree_file_backed_mode(self.optimizer, group=self._coordinated_group)
         if not self._coordinated_file_mode:
             return self._state_dict_impl()
@@ -1143,7 +1486,7 @@ class OptimizerState(Stateful):
             group=self._coordinated_group,
         )
         if not self._load:
-            _validate_file_backed_nonple_save_state(self.model, self.optimizer, group=self._coordinated_group)
+            _validate_nonple_save_state(self.model, self.optimizer, group=self._coordinated_group, require_step=True)
         # Allocate local file-backed targets before entering state-dict code
         # that may contain FSDP/ExtraParallel collectives. A local allocation
         # failure is coordinated while every peer is still at this preflight.
@@ -1155,12 +1498,17 @@ class OptimizerState(Stateful):
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "preparing optimizer checkpoint state", group=self._coordinated_group)
+            self._agree_parameter_uniqueness()
+            self._agree_external_optimizer_hooks()
             self._prime_checkpoint_meshes()
             result, error = None, None
             try:
+                self._coordinate_state_dict = True
                 result = self._state_dict_impl()
             except BaseException as exc:
                 error = exc
+            finally:
+                self._coordinate_state_dict = False
             try:
                 raise_if_any_rank_failed(
                     error, "constructing optimizer checkpoint state", group=self._coordinated_group
@@ -1168,13 +1516,7 @@ class OptimizerState(Stateful):
             except BaseException:
                 _abort_file_backed_optimizers(self.optimizer)
                 raise
-            # This collective must be after the preceding failure agreement.
-            # Otherwise an exception on one rank could make its error reduction
-            # pair with another rank's empty-state reduction, stranding peers.
-            if not self._load:
-                local_has_state = bool(result.get("state")) or any(key.startswith("state.") for key in result)
-                if not any_rank_failed(local_has_state, group=self._coordinated_group):
-                    result[_ZERO_OPTIMIZER_STATE_MARKER] = True
+            self._agree_save_state_coverage(result)
             return result
 
     def _prime_checkpoint_meshes(self):
@@ -1182,7 +1524,52 @@ class OptimizerState(Stateful):
             self.extra_parallel_fqn2spec_info, self.should_extra_parallel_aware, self._coordinated_group
         )
 
+    def _agree_parameter_uniqueness(self):
+        error = None
+        try:
+            _validate_unique_optimizer_parameters(self.optimizer)
+            for leaf in _iter_optimizer_leaves(self.optimizer):
+                if any(not group["params"] for group in leaf.param_groups):
+                    raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "validating optimizer checkpoint parameters", group=self._coordinated_group)
+
+    def _agree_save_state_coverage(self, state_dict):
+        if self._load:
+            return
+        # The per-parameter preflight rejects unrepresentable lazy states.
+        # A rank with only zero-sized shards may legitimately have no local
+        # state; do not publish its local marker when another rank has tensors.
+        local_has_state = _has_optimizer_checkpoint_state(state_dict)
+        any_has_state = any_rank_failed(local_has_state, group=self._coordinated_group)
+        if any_has_state:
+            state_dict.pop(_ZERO_OPTIMIZER_STATE_MARKER, None)
+        else:
+            state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
+
+    def _agree_external_optimizer_hooks(self):
+        if not dist.is_initialized() or dist.get_world_size(self._coordinated_group) <= 1:
+            return
+        error = None
+        try:
+            names = ["_optimizer_state_dict_pre_hooks", "_optimizer_state_dict_post_hooks"]
+            if self._load:
+                names.extend(["_optimizer_load_state_dict_pre_hooks", "_optimizer_load_state_dict_post_hooks"])
+            if any(getattr(leaf, name, None) for leaf in _iter_optimizer_leaves(self.optimizer) for name in names):
+                raise RuntimeError(
+                    "Distributed DCP does not support external optimizer state-dict hooks; "
+                    "remove the hooks or materialize their state before checkpointing"
+                )
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(
+            error, "validating distributed optimizer checkpoint hooks", group=self._coordinated_group
+        )
+
     def _state_dict_impl(self):
+        if not self._coordinate_state_dict:
+            _validate_unique_optimizer_parameters(self.optimizer)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -1194,6 +1581,12 @@ class OptimizerState(Stateful):
             optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                 vanilla_optim_sd, "restore"
             )
+            if (
+                not self._load
+                and not self._coordinated_file_mode
+                and not _has_optimizer_checkpoint_state(optim_sd_with_extra_parallel_dim)
+            ):
+                optim_sd_with_extra_parallel_dim[_ZERO_OPTIMIZER_STATE_MARKER] = True
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
                 optim_sd_with_extra_parallel_dim[_EXTRA_PARALLEL_LAYOUT_MARKER] = True
             return optim_sd_with_extra_parallel_dim
@@ -1209,13 +1602,13 @@ class OptimizerState(Stateful):
 
         state_dict = optimizer_state_dict_for_checkpoint(self.model, self.optimizer, for_load=self._load)
         if not self._load:
-            has_state = bool(state_dict["state"])
+            has_state = _has_optimizer_checkpoint_state(state_dict)
             if not self._coordinated_file_mode and not has_state:
                 state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
         return state_dict
 
     def load_state_dict(self, state_dict):
-        if not self._coordinated_file_mode:
+        if not self._coordinated_file_mode and not self._coordinated_group_validation:
             return self._load_state_dict_impl(state_dict)
         error = None
         try:
@@ -1229,45 +1622,108 @@ class OptimizerState(Stateful):
             raise
 
     def _load_state_dict_impl(self, state_dict):
-        optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
-            state_dict,
-            self.should_extra_parallel_aware
-            and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
-        )
+        succeeded = False
         try:
-            if self.should_extra_parallel_aware:
-                # we need to drop ExtraParallel dim before loading them into optimizers
-                optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                    optim_state_from_dcp_load, "drop"
+            optim_state_from_dcp_load, error = None, None
+            try:
+                optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
+                    state_dict,
+                    self.should_extra_parallel_aware
+                    and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
                 )
-                # Delegate to MultiOptimizer (it will split/filter correctly)
-                self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
-                # MultiOptimizer sub-optimizers can also lose param-group hyperparams
-                # (betas/...) for empty groups after load; restore recurses into them.
-                restore_optimizer_param_group_defaults(self.optimizer)
-            elif getattr(self.optimizer, "_is_multi_optimizer", False):
-                self.optimizer.load_state_dict(optim_state_from_dcp_load)
-                restore_optimizer_param_group_defaults(self.optimizer)
+            except BaseException as exc:
+                error = exc
+            if self._coordinated_group_validation or self._coordinated_file_mode:
+                raise_if_any_rank_failed(error, "reading optimizer checkpoint marker", group=self._coordinated_group)
+                self._agree_parameter_uniqueness()
+                self._agree_external_optimizer_hooks()
+            elif error is not None:
+                raise error
             else:
-                # Single torch optimizer.
-                # ``strict=False`` matches the DCP planner's allow_partial_load intent:
-                # params that never received a gradient (and thus have no saved Adam
-                # state) keep the default-initialized state that
-                # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
-                # Torch 2.11+ raises under the default strict=True when any
-                # requires_grad param is missing from the checkpoint (DeepSeek-V4
-                # indexer ``position_bias`` is one such case on short toy runs).
-                set_optimizer_state_dict(
-                    model=self.model,
-                    optimizers=self.optimizer,
-                    optim_state_dict=optim_state_from_dcp_load,
-                    options=StateDictOptions(strict=False),
-                )
-                restore_optimizer_param_group_defaults(self.optimizer)
-            _drop_absent_optimizer_state(self.model, self.optimizer)
+                _validate_unique_optimizer_parameters(self.optimizer)
+            with ExitStack() as hooks:
+                hook_error = None
+                try:
+                    hooks.enter_context(_filter_synthetic_optimizer_state_on_load(self.model, self.optimizer))
+                except BaseException as exc:
+                    hook_error = exc
+                if self._coordinated_group_validation or self._coordinated_file_mode:
+                    raise_if_any_rank_failed(
+                        hook_error, "preparing optimizer checkpoint load hooks", group=self._coordinated_group
+                    )
+                elif hook_error is not None:
+                    raise hook_error
+                if self.should_extra_parallel_aware:
+                    # we need to drop ExtraParallel dim before loading them into optimizers
+                    optim_state_without_extra_parallel_dim, error = None, None
+                    try:
+                        optim_state_without_extra_parallel_dim = (
+                            self.get_state_dict_with_extra_parallel_dim_preprocess(optim_state_from_dcp_load, "drop")
+                        )
+                    except BaseException as exc:
+                        error = exc
+                    if self._coordinated_group_validation or self._coordinated_file_mode:
+                        raise_if_any_rank_failed(
+                            error, "preparing extra-parallel optimizer restore", group=self._coordinated_group
+                        )
+                    elif error is not None:
+                        raise error
+                    self._validate_multi_optimizer_groups(optim_state_without_extra_parallel_dim)
+                    # Delegate to MultiOptimizer (it will split/filter correctly)
+                    self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+                    # MultiOptimizer sub-optimizers can also lose param-group hyperparams
+                    # (betas/...) for empty groups after load; restore recurses into them.
+                    restore_optimizer_param_group_defaults(self.optimizer)
+                elif getattr(self.optimizer, "_is_multi_optimizer", False):
+                    self._validate_multi_optimizer_groups(optim_state_from_dcp_load)
+                    self.optimizer.load_state_dict(optim_state_from_dcp_load)
+                    restore_optimizer_param_group_defaults(self.optimizer)
+                else:
+                    # Single torch optimizer.
+                    # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+                    # params that never received a gradient (and thus have no saved Adam
+                    # state) keep the default-initialized state that
+                    # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+                    # Torch 2.11+ raises under the default strict=True when any
+                    # requires_grad param is missing from the checkpoint (DeepSeek-V4
+                    # indexer ``position_bias`` is one such case on short toy runs).
+                    self._validate_single_optimizer_groups(optim_state_from_dcp_load)
+                    set_optimizer_state_dict(
+                        model=self.model,
+                        optimizers=self.optimizer,
+                        optim_state_dict=optim_state_from_dcp_load,
+                        options=StateDictOptions(strict=False),
+                    )
+                    restore_optimizer_param_group_defaults(self.optimizer)
+            succeeded = True
         finally:
+            if succeeded:
+                _reset_zero_optimizer_state_resume(self.optimizer)
+            else:
+                _drop_absent_optimizer_state(self.model, self.optimizer)
+                _finish_zero_optimizer_state_resume(self.optimizer)
             _reset_absent_optimizer_state(self.optimizer)
-            _finish_zero_optimizer_state_resume(self.optimizer)
+
+    def _validate_multi_optimizer_groups(self, state_dict):
+        if not self._coordinated_group_validation:
+            return
+        error = None
+        try:
+            self.optimizer.validate_checkpoint_groups(state_dict)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "validating optimizer checkpoint groups", group=self._coordinated_group)
+
+    def _validate_single_optimizer_groups(self, state_dict):
+        error = None
+        try:
+            _validate_single_optimizer_groups(self.model, self.optimizer, state_dict)
+        except BaseException as exc:
+            error = exc
+        if self._coordinated_group_validation or self._coordinated_file_mode:
+            raise_if_any_rank_failed(error, "validating optimizer checkpoint groups", group=self._coordinated_group)
+        elif error is not None:
+            raise error
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
@@ -1981,7 +2437,7 @@ class DistributedCheckpointer(CheckpointerBase):
                                 state["model"],
                                 trainable_only=trainable_only,
                                 parallel_state=parallel_state,
-                                coordinated=file_mode,
+                                coordinated=True,
                             )
                         }
                     else:
@@ -1992,6 +2448,7 @@ class DistributedCheckpointer(CheckpointerBase):
                                 parallel_state=parallel_state,
                                 load=False,
                                 coordinated=file_mode,
+                                coordinated_group_validation=True,
                             )
                         }
                 except BaseException as exc:
@@ -2130,7 +2587,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 state["model"],
                 trainable_only=trainable_only,
                 parallel_state=parallel_state,
-                coordinated=file_mode,
+                # Model loading can construct ExtraParallel meshes before the
+                # optimizer phase. Preflight the same group plan even for the
+                # ordinary path so a cold subgroup cannot create a global mesh.
+                coordinated=True,
                 coordinated_group=process_group,
             )
 
@@ -2142,6 +2602,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=True,
                 coordinated=file_mode,
                 coordinated_group=process_group,
+                coordinated_group_validation=True,
             )
 
         wants_optimizer = state.get("optimizer") is not None
@@ -2164,6 +2625,7 @@ class DistributedCheckpointer(CheckpointerBase):
                             strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                             strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
                             optimizer=state.get("optimizer"),
+                            model=state["model"],
                             source_cache_evictor=cache_evictor,
                         ),
                     )
@@ -2190,6 +2652,7 @@ class DistributedCheckpointer(CheckpointerBase):
                         strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                         strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
                         optimizer=state.get("optimizer"),
+                        model=state["model"],
                         source_cache_evictor=cache_evictor,
                     ),
                 )
@@ -2212,6 +2675,7 @@ class DistributedCheckpointer(CheckpointerBase):
                             strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                             strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
                             optimizer=state.get("optimizer"),
+                            model=state["model"],
                             source_cache_evictor=cache_evictor,
                         ),
                     )
@@ -2385,6 +2849,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 )
 
             cls._drain_slot(slot)
+
+            # async_save resolves Stateful objects synchronously before it
+            # starts the background writer. Use the same slot's long-timeout
+            # Gloo group for that resolution, not the training process group.
+            for value in save_state.values():
+                if isinstance(value, (ModelState, OptimizerState)):
+                    value._coordinated_group = cls._async_process_groups[slot]
 
             cls._save_futures[slot] = dcp.async_save(
                 state_dict=save_state,

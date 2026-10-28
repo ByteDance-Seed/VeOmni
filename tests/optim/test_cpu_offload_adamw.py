@@ -238,6 +238,807 @@ def test_dcp_drops_wholly_absent_optimizer_state_after_resume(tmp_path):
     assert target_optimizer.state[target_model.weight]["step"].item() == 2
 
 
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("kind", ["adamw", "sgd"])
+def test_plain_optimizer_absent_state_stays_lazy_after_dcp_resume(tmp_path, multi, kind):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make_optimizer(model):
+        child = (
+            torch.optim.AdamW(model.parameters(), lr=0.01)
+            if kind == "adamw"
+            else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+        )
+        container = MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+        return child, container
+
+    source_model = torch.nn.Linear(1, 1)
+    source_child, source_optimizer = make_optimizer(source_model)
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    source_optimizer.step()
+    source_child.zero_grad(set_to_none=True)
+    assert source_model.bias not in source_child.state
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+
+    target_model = torch.nn.Linear(1, 1)
+    target_child, target_optimizer = make_optimizer(target_model)
+    get_optimizer_state_dict(target_model, target_child)
+    target_model.load_state_dict(source_model.state_dict())
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=False, optimizer=target_optimizer),
+    )
+    assert target_model.bias not in target_child.state
+    if kind == "adamw":
+        assert target_child.state[target_model.weight]["step"].item() == 1
+
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    target_model.bias.grad = torch.ones_like(target_model.bias)
+    source_optimizer.step()
+    target_optimizer.step()
+    if kind == "adamw":
+        assert source_child.state[source_model.bias]["step"].item() == 1
+        assert target_child.state[target_model.bias]["step"].item() == 1
+    torch.testing.assert_close(source_model.bias, target_model.bias, rtol=0, atol=0)
+    for name in ("exp_avg", "exp_avg_sq") if kind == "adamw" else ("momentum_buffer",):
+        torch.testing.assert_close(
+            source_child.state[source_model.bias][name], target_child.state[target_model.bias][name], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("kind", ["adamw", "sgd"])
+def test_plain_optimizer_zero_step_dcp_does_not_create_state(tmp_path, multi, kind):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make_optimizer(model, lr):
+        child = (
+            torch.optim.AdamW(model.parameters(), lr=lr)
+            if kind == "adamw"
+            else torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, dampening=0.2)
+        )
+        return child, MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+
+    source_model = torch.nn.Linear(1, 1)
+    source_child, source_optimizer = make_optimizer(source_model, 0.01)
+    original = {name: param.detach().clone() for name, param in source_model.named_parameters()}
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+    assert not source_child.state
+    for name, param in source_model.named_parameters():
+        torch.testing.assert_close(param, original[name], rtol=0, atol=0)
+    assert (
+        "optimizer.__veomni_zero_optimizer_state__" in FileSystemReader(tmp_path).read_metadata().state_dict_metadata
+    )
+
+    target_model = torch.nn.Linear(1, 1)
+    target_model.load_state_dict(source_model.state_dict())
+    target_child, target_optimizer = make_optimizer(target_model, 0.1)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target_optimizer),
+    )
+    assert not target_child.state
+    assert target_child.param_groups[0]["lr"] == 0.01
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    target_model.bias.grad = torch.ones_like(target_model.bias)
+    source_optimizer.step()
+    target_optimizer.step()
+    torch.testing.assert_close(source_model.bias, target_model.bias, rtol=0, atol=0)
+    assert source_child.state[source_model.bias].keys() == target_child.state[target_model.bias].keys()
+    for name in source_child.state[source_model.bias]:
+        torch.testing.assert_close(
+            source_child.state[source_model.bias][name], target_child.state[target_model.bias][name], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_stateless_sgd_dcp_preserves_groups_after_updates(tmp_path, multi):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make_optimizer(model, lr, weight_decay):
+        child = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return child, MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+
+    source_model = torch.nn.Linear(1, 1)
+    source_child, source = make_optimizer(source_model, 0.01, 0.3)
+    for _ in range(2):
+        source_model.bias.grad = torch.ones_like(source_model.bias)
+        source.step()
+        source.zero_grad()
+    assert not source_child.state
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    assert not source_child.state
+    target_model = torch.nn.Linear(1, 1)
+    target_model.load_state_dict(source_model.state_dict())
+    target_child, target = make_optimizer(target_model, 0.1, 0.0)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+    )
+    assert target_child.param_groups[0]["lr"] == 0.01
+    assert target_child.param_groups[0]["weight_decay"] == 0.3
+    assert not target_child.state
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    target_model.bias.grad = torch.ones_like(target_model.bias)
+    source.step()
+    target.step()
+    torch.testing.assert_close(source_model.bias, target_model.bias, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("field", ["weight", "bias"])
+def test_optimizer_save_preserves_state_populated_by_state_dict_hook(tmp_path, field):
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    param = getattr(model, field)
+
+    def initialize(optim):
+        optim.state[param] = {
+            "step": torch.tensor(5.0),
+            "exp_avg": torch.full_like(param, 2.0),
+            "exp_avg_sq": torch.full_like(param, 3.0),
+        }
+
+    optimizer.register_state_dict_pre_hook(initialize)
+    state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=tmp_path)
+    assert optimizer.state[param]["step"].item() == 5
+    target_model = torch.nn.Linear(1, 1)
+    target = torch.optim.AdamW(target_model.parameters(), lr=0.001)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+    )
+    target_param = getattr(target_model, field)
+    assert target.state[target_param]["step"].item() == 5
+    torch.testing.assert_close(target.state[target_param]["exp_avg"], torch.full_like(target_param, 2.0))
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("condition", ["empty", "parameter_missing"])
+def test_optimizer_save_pre_hook_observes_empty_live_state(tmp_path, multi, condition):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    child = torch.optim.AdamW(model.parameters())
+    optimizer = MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+    observed = []
+
+    def initialize(optim):
+        observed.append(bool(optim.state))
+        should_initialize = not optim.state if condition == "empty" else model.weight not in optim.state
+        if should_initialize:
+            optim.state[model.weight] = {
+                "step": torch.tensor(7.0),
+                "exp_avg": torch.full_like(model.weight, 0.25),
+                "exp_avg_sq": torch.full_like(model.weight, 0.5),
+            }
+
+    child.register_state_dict_pre_hook(initialize)
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)}, checkpoint_id=tmp_path)
+    assert observed == [False]
+    assert child.state[model.weight]["step"].item() == 7
+    saved = dcp.FileSystemReader(tmp_path).read_metadata().state_dict_metadata
+    assert "optimizer.state.weight.exp_avg" in saved
+    assert f"optimizer.{_ZERO_OPTIMIZER_STATE_MARKER}" not in saved
+
+
+def test_optimizer_save_rejects_custom_state_dict_that_skips_hooks():
+    from veomni.optim.optimizer import optimizer_state_dict_for_checkpoint
+
+    class SkipsHooks(torch.optim.AdamW):
+        def state_dict(self):
+            return {"state": {}, "param_groups": [{"params": [0], "lr": 0.001}]}
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = SkipsHooks(model.parameters())
+    with pytest.raises(RuntimeError, match="did not run registered pre-hooks"):
+        optimizer_state_dict_for_checkpoint(model, optimizer)
+    assert not optimizer.state
+    assert not optimizer._optimizer_state_dict_pre_hooks
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("case", ["partial_target", "sgd_recipe", "amsgrad_recipe"])
+def test_dcp_rejects_saved_state_without_optimizer_target(tmp_path, multi, case):
+    from torch.distributed.checkpoint import CheckpointException
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def wrap(model, child):
+        return MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+
+    source_model, target_model = torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)
+    if case == "sgd_recipe":
+        source_child = torch.optim.SGD(source_model.parameters(), lr=0.01, momentum=0.9)
+        target_child = torch.optim.SGD(target_model.parameters(), lr=0.01, momentum=0.0)
+    else:
+        source_child = torch.optim.AdamW(source_model.parameters(), lr=0.01, amsgrad=case == "amsgrad_recipe")
+        target_child = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    source, target = wrap(source_model, source_child), wrap(target_model, target_child)
+    for param in source_model.parameters():
+        param.grad = torch.ones_like(param)
+    source.step()
+    if case == "partial_target":
+        target_model.weight.grad = torch.ones_like(target_model.weight)
+        target.step()
+        target.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    with pytest.raises(CheckpointException, match="no target placeholder"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+        )
+
+
+def test_dcp_rejects_incompatible_optimizer_state_container(tmp_path):
+    from torch.distributed.checkpoint import CheckpointException
+
+    model = torch.nn.Linear(1, 1, bias=False).bfloat16()
+    optimizer = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    dcp.save({"optimizer": {"state": {"weight": torch.ones(1)}}}, checkpoint_id=tmp_path)
+    with pytest.raises(CheckpointException, match="incompatible target"):
+        dcp.load(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=SimpleNamespace(dp_mode="ddp"), load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=optimizer),
+        )
+
+
+def test_dcp_rejects_optimizer_tensor_with_incomplete_global_chunks():
+    from torch.distributed.checkpoint.metadata import (
+        BytesStorageMetadata,
+        ChunkStorageMetadata,
+        Metadata,
+        TensorProperties,
+        TensorStorageMetadata,
+    )
+
+    key = "optimizer.state.weight.exp_avg"
+    metadata = Metadata(
+        {
+            key: TensorStorageMetadata(
+                TensorProperties(dtype=torch.float32),
+                torch.Size([4]),
+                [ChunkStorageMetadata(torch.Size([2]), torch.Size([2]))],
+            ),
+            "optimizer.__veomni_zero_optimizer_state__": BytesStorageMetadata(),
+        }
+    )
+    target = {"optimizer": {"state": {"weight": {"exp_avg": torch.full((4,), 9.0)}}}}
+    planner = _ModelStrictLoadPlanner(strict_model=False)
+    planner.set_up_planner(target, metadata, is_coordinator=True)
+    with pytest.raises(RuntimeError, match="chunks do not completely and uniquely cover"):
+        planner.create_local_plan()
+
+
+def test_dcp_rejects_optimizer_scalar_with_duplicate_chunks():
+    from torch.distributed.checkpoint.metadata import (
+        ChunkStorageMetadata,
+        Metadata,
+        TensorProperties,
+        TensorStorageMetadata,
+    )
+
+    key = "optimizer.state.weight.step"
+    chunk = ChunkStorageMetadata(torch.Size([]), torch.Size([]))
+    metadata = Metadata(
+        {key: TensorStorageMetadata(TensorProperties(dtype=torch.float32), torch.Size([]), [chunk, chunk])}
+    )
+    planner = _ModelStrictLoadPlanner(strict_model=False)
+    planner.set_up_planner(
+        {"optimizer": {"state": {"weight": {"step": torch.tensor(0.0)}}}}, metadata, is_coordinator=True
+    )
+    with pytest.raises(RuntimeError, match="chunks do not completely and uniquely cover"):
+        planner.create_local_plan()
+
+
+def test_dcp_rejects_missing_target_for_numeric_multioptimizer_parameter(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make_model():
+        return torch.nn.ParameterDict({"0": torch.nn.Parameter(torch.ones(2)), "1": torch.nn.Parameter(torch.ones(2))})
+
+    source_model, target_model = make_model(), make_model()
+    source_child = torch.optim.AdamW(source_model.parameters())
+    target_child = torch.optim.AdamW(target_model.parameters())
+    source = MultiOptimizer(source_model, {"all": source_child}, ["all"])
+    target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
+    for param in source_model.parameters():
+        param.grad = torch.ones_like(param)
+    source.step()
+    target_model["0"].grad = torch.ones_like(target_model["0"])
+    target.step()
+    target.zero_grad()
+    state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=state)}, checkpoint_id=tmp_path)
+    with pytest.raises(CheckpointException, match="no target placeholder"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+        )
+
+
+@pytest.mark.parametrize("same_lr", [False, True])
+def test_multioptimizer_group_merge_requires_identical_saved_hyperparameters(tmp_path, same_lr):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    source_model = torch.nn.Linear(2, 1)
+    source_child = torch.optim.AdamW(
+        [
+            {"params": [source_model.weight], "lr": 0.01},
+            {"params": [source_model.bias], "lr": 0.01 if same_lr else 0.02},
+        ]
+    )
+    source = MultiOptimizer(source_model, {"all": source_child}, ["all"])
+    for param in source_model.parameters():
+        param.grad = torch.ones_like(param)
+    source.step()
+    source.zero_grad()
+    state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=state)}, checkpoint_id=tmp_path)
+
+    target_model = torch.nn.Linear(2, 1)
+    target_model.load_state_dict(source_model.state_dict())
+    target_child = torch.optim.AdamW(target_model.parameters(), lr=0.1)
+    target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
+    load_args = dict(
+        state_dict={"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_recipe=True, optimizer=target),
+    )
+    if not same_lr:
+        with pytest.raises(RuntimeError, match="different saved hyperparameters"):
+            dcp.load(**load_args)
+        return
+    dcp.load(**load_args)
+    assert target_child.param_groups[0]["lr"] == 0.01
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    target_model.bias.grad = torch.ones_like(target_model.bias)
+    source.step()
+    target.step()
+    torch.testing.assert_close(source_model.bias, target_model.bias, rtol=0, atol=0)
+
+
+def _rank_sparse_optimizer_worker(rank, rendezvous, checkpoint_dir):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        if rank == 1:
+            model.weight.grad = torch.ones_like(model.weight)
+            optimizer.step()
+            optimizer.zero_grad()
+        state = SimpleNamespace(dp_mode="ddp")
+        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        target_model = torch.nn.Linear(1, 1, bias=False)
+        target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+        with pytest.raises(CheckpointException, match="rank-local lazy state cannot be reconstructed"):
+            dcp.load(
+                {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+                checkpoint_id=checkpoint_dir,
+                planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_dcp_mixed_rank_empty_state_marker_fails_closed(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _rank_sparse_optimizer_worker,
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _rank_partial_optimizer_guard_worker(rank, rendezvous, checkpoint_dir):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        for param in model.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        optimizer.zero_grad()
+        state = SimpleNamespace(dp_mode="ddp")
+        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        target_model = torch.nn.Linear(1, 1)
+        target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+        if rank == 0:
+            target_model.weight.grad = torch.ones_like(target_model.weight)
+            target.step()
+            target.zero_grad()
+        with pytest.raises(CheckpointException, match="no target placeholder"):
+            dcp.load(
+                {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+                checkpoint_id=checkpoint_dir,
+                planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_dcp_partial_target_error_is_coordinated_across_ranks(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _rank_partial_optimizer_guard_worker,
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _rank_group_mismatch_guard_worker(rank, rendezvous, checkpoint_dir):
+    import torch.distributed as dist
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model = torch.nn.Linear(1, 1)
+        groups = [{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}]
+        optimizer = MultiOptimizer(model, {"all": torch.optim.AdamW(groups)}, ["all"])
+        for param in model.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        optimizer.zero_grad()
+        state = SimpleNamespace(dp_mode="ddp")
+        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        target_model = torch.nn.Linear(1, 1)
+        target_groups = (
+            [{"params": [target_model.weight, target_model.bias]}]
+            if rank == 0
+            else [{"params": [target_model.weight]}, {"params": [target_model.bias]}]
+        )
+        target = MultiOptimizer(target_model, {"all": torch.optim.AdamW(target_groups)}, ["all"])
+        with pytest.raises(
+            RuntimeError, match="different saved hyperparameters|validating optimizer checkpoint groups"
+        ):
+            dcp.load(
+                {
+                    "optimizer": OptimizerState(
+                        target_model,
+                        target,
+                        parallel_state=state,
+                        load=True,
+                        coordinated_group=dist.group.WORLD,
+                        coordinated_group_validation=True,
+                    )
+                },
+                checkpoint_id=checkpoint_dir,
+                planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_dcp_group_mismatch_error_is_coordinated_across_ranks(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _rank_group_mismatch_guard_worker,
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _rank_state_dict_error_worker(rank, rendezvous, checkpoint_dir, phase):
+    from contextlib import contextmanager
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.AdamW(model.parameters())
+        for param in model.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        state = SimpleNamespace(dp_mode="ddp")
+        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        target_model = torch.nn.Linear(1, 1)
+        target = torch.optim.AdamW(target_model.parameters())
+        if rank == 0:
+            if phase == "hook":
+
+                def fail(_optimizer):
+                    raise RuntimeError("injected state-dict hook failure")
+
+                target.register_state_dict_pre_hook(fail)
+            else:
+
+                @contextmanager
+                def fail_prepare(*, load=False):
+                    raise RuntimeError("injected state allocation failure")
+                    yield
+
+                target.checkpoint_state = fail_prepare
+        expected_error = (
+            "state-dict hooks|validating distributed optimizer checkpoint hooks"
+            if phase == "hook"
+            else "injected state.*failure|constructing optimizer checkpoint state|preparing optimizer checkpoint state"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            dcp.load(
+                {
+                    "optimizer": OptimizerState(
+                        target_model,
+                        target,
+                        parallel_state=state,
+                        load=True,
+                        coordinated_group=dist.group.WORLD,
+                        coordinated_group_validation=True,
+                    )
+                },
+                checkpoint_id=checkpoint_dir,
+                planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+            )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("phase", ["hook", "prepare"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_dcp_state_dict_error_is_coordinated_across_ranks(tmp_path, phase):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _rank_state_dict_error_worker,
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint"), phase),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _distributed_optimizer_checkpoint_target_worker(rank, rendezvous, optimizer_kind):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    from veomni.optim.muon import DistributedMuon
+    from veomni.optim.optimizer import AnyPrecisionAdamW
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("fsdp",))
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(distribute_tensor(torch.ones(4, 4), mesh, [Shard(1)]))
+        optimizer = (
+            DistributedMuon([model.weight])
+            if optimizer_kind == "muon"
+            else AnyPrecisionAdamW([model.weight], momentum_dtype=torch.float32, variance_dtype=torch.float32)
+        )
+
+        def reject_step(*_args):
+            raise AssertionError("Checkpoint target preparation must not call optimizer.step")
+
+        optimizer.register_step_pre_hook(reject_step)
+        state = OptimizerState(
+            model,
+            optimizer,
+            parallel_state=SimpleNamespace(dp_mode="fsdp2"),
+            load=True,
+            coordinated_group=dist.group.WORLD,
+            coordinated_group_validation=True,
+        ).state_dict()
+        assert "weight" in state["state"]
+        field = "momentum_buffer" if optimizer_kind == "muon" else "exp_avg"
+        assert torch.count_nonzero(optimizer.state[model.weight][field].to_local()) == 0
+        assert torch.equal(model.weight.to_local(), torch.ones_like(model.weight.to_local()))
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("optimizer_kind", ["muon", "anyprecision"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_distributed_optimizer_checkpoint_target_does_not_step_or_communicate(tmp_path, optimizer_kind):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _distributed_optimizer_checkpoint_target_worker,
+        args=(str(tmp_path / "gloo"), optimizer_kind),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("legacy_differentiable", [False, True])
+def test_distributed_muon_dcp_preserves_groups_and_next_update(tmp_path, legacy_differentiable):
+    from veomni.optim.muon import DistributedMuon
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build():
+        model = torch.nn.Linear(3, 4, bias=False)
+        child = DistributedMuon(model.parameters(), ns_implementation="std", lr=0.001)
+        return model, child, MultiOptimizer(model, {"muon": child}, ["muon"])
+
+    def options(child):
+        return [{key: value for key, value in group.items() if key != "params"} for group in child.param_groups]
+
+    source_model, source_child, source = build()
+    if legacy_differentiable:
+        source_child.param_groups[0]["differentiable"] = False
+    source_model.weight.grad = torch.arange(12).reshape(4, 3).float().div_(16)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+
+    target_model, target_child, target = build()
+    target_model.load_state_dict(source_model.state_dict())
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+    )
+    assert options(source_child) == options(target_child)
+    assert source_child.defaults == target_child.defaults
+    source_model.weight.grad = torch.full_like(source_model.weight, 0.5)
+    target_model.weight.grad = source_model.weight.grad.clone()
+    source.step()
+    target.step()
+    torch.testing.assert_close(source_model.weight, target_model.weight, rtol=0, atol=0)
+    torch.testing.assert_close(
+        source_child.state[source_model.weight]["momentum_buffer"],
+        target_child.state[target_model.weight]["momentum_buffer"],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("source_blocks,target_blocks", [(2, 1), (1, 2), (2, 4)])
+def test_distributed_muon_dcp_rejects_changed_head_blocks(tmp_path, multi, source_blocks, target_blocks):
+    from veomni.optim.muon import DistributedMuon
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build(blocks):
+        model = torch.nn.Linear(4, 4, bias=False)
+        child = DistributedMuon(model.parameters(), ns_implementation="std", head_blocks=blocks)
+        return model, MultiOptimizer(model, {"muon": child}, ["muon"]) if multi else child
+
+    source_model, source = build(source_blocks)
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    target_model, target = build(target_blocks)
+    with pytest.raises((CheckpointException, RuntimeError), match="head_blocks|optimizer recipe/state"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+        )
+
+
+def _rank_extra_parallel_drop_error_worker(rank, rendezvous, checkpoint_dir, phase):
+    import torch.distributed as dist
+
+    from veomni.checkpoint import dcp_checkpointer
+    from veomni.optim.optimizer import MultiOptimizer
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model = torch.nn.Linear(1, 1)
+        model._fqn2spec_info = {}
+        optimizer = MultiOptimizer(model, {"all": torch.optim.AdamW(model.parameters())}, ["all"])
+        for param in model.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        state = SimpleNamespace(dp_mode="fsdp2")
+        source = OptimizerState(model, optimizer, parallel_state=state)
+        source.get_state_dict_with_extra_parallel_dim_preprocess = lambda value, action: value
+        dcp.save({"optimizer": source}, checkpoint_id=checkpoint_dir)
+
+        target_model = torch.nn.Linear(1, 1)
+        target_model._fqn2spec_info = {}
+        target = MultiOptimizer(target_model, {"all": torch.optim.AdamW(target_model.parameters())}, ["all"])
+        target_state = OptimizerState(
+            target_model,
+            target,
+            parallel_state=state,
+            load=True,
+            coordinated_group=dist.group.WORLD,
+            coordinated_group_validation=True,
+        )
+
+        def preprocess(value, action):
+            if action == "drop" and rank == 0 and phase == "drop":
+                raise RuntimeError("injected extra parallel drop error")
+            return value
+
+        target_state.get_state_dict_with_extra_parallel_dim_preprocess = preprocess
+        original_strip = dcp_checkpointer._strip_extra_parallel_layout_marker
+
+        def strip(value, required):
+            if rank == 0 and phase == "marker":
+                raise RuntimeError("injected marker error")
+            return original_strip(value, required)
+
+        dcp_checkpointer._strip_extra_parallel_layout_marker = strip
+        if rank == 0 and phase == "apply":
+
+            def fail_load(value):
+                raise RuntimeError("injected optimizer application error")
+
+            target.load_state_dict = fail_load
+        with pytest.raises(
+            RuntimeError,
+            match="injected|preparing extra-parallel|reading optimizer checkpoint marker|restoring optimizer",
+        ):
+            dcp.load(
+                {"optimizer": target_state},
+                checkpoint_id=checkpoint_dir,
+                planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("phase", ["drop", "marker", "apply"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_dcp_extra_parallel_drop_error_is_coordinated_across_ranks(tmp_path, phase):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _rank_extra_parallel_drop_error_worker,
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint"), phase),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_dcp_drops_wholly_absent_state_from_ddp_wrapped_model(tmp_path):
     import torch.distributed as dist
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -296,6 +1097,46 @@ def test_dcp_drops_wholly_absent_state_from_ddp_wrapped_model(tmp_path):
         assert bias_state["step"].item() == 1
         torch.testing.assert_close(bias_state["master_weight"], torch.full_like(bias_state["master_weight"], 7.0))
         assert target_optimizer.state[target_model.module.weight]["step"].item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+def test_plain_adamw_absent_state_uses_canonical_ddp_names(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+    from torch.nn.parallel import DistributedDataParallel
+
+    if dist.is_initialized():
+        pytest.skip("requires ownership of the default process group")
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'plain-ddp-init'}", rank=0, world_size=1)
+    try:
+        parallel_state = SimpleNamespace(dp_mode="ddp")
+        source = DistributedDataParallel(torch.nn.Linear(1, 1))
+        source_optimizer = torch.optim.AdamW(source.parameters(), lr=0.01)
+        source.module.weight.grad = torch.ones_like(source.module.weight)
+        source_optimizer.step()
+        source_optimizer.zero_grad(set_to_none=True)
+        dcp.save(
+            {"optimizer": OptimizerState(source, source_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path / "checkpoint",
+        )
+
+        target = DistributedDataParallel(torch.nn.Linear(1, 1))
+        target_optimizer = torch.optim.AdamW(target.parameters(), lr=0.01)
+        get_optimizer_state_dict(target, target_optimizer)
+        target.load_state_dict(source.state_dict())
+        dcp.load(
+            {"optimizer": OptimizerState(target, target_optimizer, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path / "checkpoint",
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target_optimizer),
+        )
+        assert target.module.bias not in target_optimizer.state
+        source.module.bias.grad = torch.ones_like(source.module.bias)
+        target.module.bias.grad = torch.ones_like(target.module.bias)
+        source_optimizer.step()
+        target_optimizer.step()
+        assert target_optimizer.state[target.module.bias]["step"].item() == 1
+        torch.testing.assert_close(source.module.bias, target.module.bias, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
@@ -366,7 +1207,9 @@ def test_dcp_zero_step_sparse_multi_optimizer_restores_lazy_state(tmp_path):
     assert not target._veomni_resume_zero_optimizer_state
 
 
-def test_dcp_rejects_zero_state_marker_with_tensor_state_and_clears_stale_flag(tmp_path):
+def test_dcp_rejects_mixed_zero_marker_and_tensor_state(tmp_path):
+    from torch.distributed.checkpoint.api import CheckpointException
+
     from veomni.optim.optimizer import MultiOptimizer
 
     model = torch.nn.Linear(3, 2).bfloat16()
@@ -384,7 +1227,7 @@ def test_dcp_rejects_zero_state_marker_with_tensor_state_and_clears_stale_flag(t
     target_child = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
     target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
     target._veomni_resume_zero_optimizer_state = True
-    with pytest.raises(CheckpointException, match="zero-state optimizer marker conflicts"):
+    with pytest.raises(CheckpointException, match="rank-local lazy state cannot be reconstructed"):
         dcp.load(
             {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
             checkpoint_id=tmp_path,
@@ -429,6 +1272,182 @@ def test_dcp_zero_step_exact_recipe_multi_optimizer_restores_lazy_state(tmp_path
     )
     assert not target_child.state
     assert not target._veomni_resume_zero_optimizer_state
+
+
+def test_dcp_empty_state_entry_is_zero_state_not_missing_precision(tmp_path):
+    model = torch.nn.Linear(2, 1, bias=False).bfloat16()
+    optimizer = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    assert optimizer.state[model.weight] == {}
+    state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=tmp_path)
+    target_model = torch.nn.Linear(2, 1, bias=False).bfloat16()
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.1)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+    )
+    assert not target.state
+    assert target.param_groups[0]["lr"] == 0.001
+
+
+def test_dcp_extra_parallel_empty_optimizer_state_has_marker(tmp_path, monkeypatch):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def setup():
+        model = torch.nn.Linear(2, 1, bias=False).bfloat16()
+        model._fqn2spec_info = {}
+        child = CPUOffloadAdamW(model.parameters(), lr=0.001)
+        optimizer = MultiOptimizer(model, {"all": child}, ["all"])
+        return model, child, optimizer
+
+    model, _, optimizer = setup()
+    parallel_state = SimpleNamespace(dp_mode="fsdp2")
+    source = OptimizerState(model, optimizer, parallel_state=parallel_state)
+    monkeypatch.setattr(source, "get_state_dict_with_extra_parallel_dim_preprocess", lambda value, action: value)
+    assert source.state_dict()[_ZERO_OPTIMIZER_STATE_MARKER] is True
+    dcp.save({"optimizer": source}, checkpoint_id=tmp_path)
+    target_model, target_child, target = setup()
+    target_state = OptimizerState(target_model, target, parallel_state=parallel_state, load=True)
+    monkeypatch.setattr(target_state, "get_state_dict_with_extra_parallel_dim_preprocess", lambda value, action: value)
+    dcp.load(
+        {"optimizer": target_state},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+    )
+    assert not target_child.state
+
+
+def test_dcp_stateless_optimizer_cannot_bypass_strict_muon_recipe(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = torch.nn.Linear(4, 2, bias=False)
+
+    source_model = Model().bfloat16()
+    child = torch.optim.SGD(source_model.parameters(), lr=0.1)
+    source = MultiOptimizer(source_model, {"all": child}, ["all"])
+    source_model.down_proj.weight.grad = torch.ones_like(source_model.down_proj.weight)
+    source.step()
+    source.zero_grad()
+    assert not child.state
+    state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=state)}, checkpoint_id=tmp_path)
+    target_model = Model().bfloat16()
+    groups = add_qwen38_plans(target_model, [{"params": list(target_model.parameters()), "cpu_offload": True}])
+    target = MultiOptimizer(target_model, {"all": Qwen38MuonAdamW(groups, lr=0.001)}, ["all"])
+    with pytest.raises(CheckpointException, match="optimizer recipe/state is incomplete"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False, strict_optimizer_dtype=True, strict_optimizer_recipe=True, optimizer=target
+            ),
+        )
+
+
+def test_muon_adam_fallback_cold_resume_then_first_router_update(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = torch.nn.Linear(4, 2, bias=False)
+            self.router = torch.nn.Linear(4, 2, bias=False)
+
+    def make_optimizer(model):
+        groups = add_qwen38_plans(model, [{"params": list(model.parameters()), "cpu_offload": True}])
+        child = Qwen38MuonAdamW(groups, lr=0.001)
+        return child, MultiOptimizer(model, {"all": child}, ["all"])
+
+    torch.manual_seed(52)
+    model = Model().bfloat16()
+    child, optimizer = make_optimizer(model)
+    model.down_proj.weight.grad = torch.arange(8).view(2, 4).bfloat16().add_(1)
+    optimizer.step()
+    optimizer.zero_grad()
+    assert model.router.weight not in child.state
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)}, checkpoint_id=tmp_path)
+    target_model = Model().bfloat16()
+    target_model.load_state_dict(model.state_dict())
+    target_child, target = make_optimizer(target_model)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(
+            strict_model=False, strict_optimizer_dtype=True, strict_optimizer_recipe=True, optimizer=target
+        ),
+    )
+    assert target_model.router.weight not in target_child.state
+    for src, dst in zip(model.parameters(), target_model.parameters(), strict=True):
+        gradient = torch.arange(src.numel()).view_as(src).bfloat16().add_(0.5)
+        src.grad = gradient.clone()
+        dst.grad = gradient.clone()
+    optimizer.step()
+    target.step()
+    for src, dst in zip(model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(src, dst, rtol=0, atol=0)
+        assert child.state[src].keys() == target_child.state[dst].keys()
+        for key in child.state[src]:
+            torch.testing.assert_close(child.state[src][key], target_child.state[dst][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("legacy", ["valid", "wrong_dtype", "wrong_shape"])
+def test_dcp_compact_muon_expert_legacy_unused_second_moment(tmp_path, legacy):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = torch.nn.Module()
+            self.experts.down_proj = torch.nn.Parameter(torch.randn(2, 4, 3).bfloat16())
+
+    def make_optimizer(model):
+        groups = add_qwen38_plans(model, [{"params": list(model.parameters()), "cpu_offload": True}])
+        child = Qwen38MuonAdamW(groups, lr=0.001)
+        return child, MultiOptimizer(model, {"all": child}, ["all"])
+
+    model = Model()
+    child, optimizer = make_optimizer(model)
+    model.experts.down_proj.grad = torch.ones_like(model.experts.down_proj)
+    optimizer.step()
+    optimizer.zero_grad()
+    state = SimpleNamespace(dp_mode="ddp")
+    saved = OptimizerState(model, optimizer, parallel_state=state).state_dict()
+    assert "state.experts.down_proj.exp_avg_sq" not in saved
+    legacy_tensor = torch.zeros_like(saved["state.experts.down_proj.master_weight"])
+    if legacy == "wrong_dtype":
+        legacy_tensor = legacy_tensor.bfloat16()
+    elif legacy == "wrong_shape":
+        legacy_tensor = legacy_tensor[:-1]
+    saved["state.experts.down_proj.exp_avg_sq"] = legacy_tensor
+    dcp.save({"optimizer": saved}, checkpoint_id=tmp_path)
+    target_model = Model()
+    target_model.load_state_dict(model.state_dict())
+    target_child, target = make_optimizer(target_model)
+    load_args = dict(
+        state_dict={"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(
+            strict_model=False, strict_optimizer_dtype=True, strict_optimizer_recipe=True, optimizer=target
+        ),
+    )
+    if legacy != "valid":
+        with pytest.raises(CheckpointException, match="no target placeholder"):
+            dcp.load(**load_args)
+        return
+    dcp.load(**load_args)
+    actual = target_child.state[target_model.experts.down_proj]
+    expected = child.state[model.experts.down_proj]
+    assert "exp_avg_sq" not in actual
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
 
 
 def _extra_parallel_resume_worker(rank, world, rendezvous, hsdp=False):
@@ -650,6 +1669,9 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
             return child, optimizer
 
         source_child, source = make_optimizer(model, torch.randn_like(full))
+        source_options = [
+            {key: value for key, value in group.items() if key != "params"} for group in source_child.param_groups
+        ]
         dcp.save(
             {"optimizer": OptimizerState(model, source, parallel_state=parallel_state)},
             checkpoint_id=checkpoint,
@@ -665,6 +1687,13 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
             checkpoint_id=checkpoint,
             planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
         )
+        assert [
+            {key: value for key, value in group.items() if key != "params"} for group in source_child.param_groups
+        ] == source_options
+        assert [
+            {key: value for key, value in group.items() if key != "params"} for group in target_child.param_groups
+        ] == source_options
+        assert target_child.defaults == source_child.defaults
         for name in ("master_weight", "exp_avg", "exp_avg_sq"):
             expected = source_child.state[model.weight][name]
             actual = target_child.state[target_model.weight][name]
@@ -672,8 +1701,412 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
             assert actual.placements == target_model.weight.placements
             assert actual.shape == target_model.weight.shape
             torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
+        next_gradient = torch.arange(full.numel(), dtype=torch.float32).reshape(full.shape).bfloat16().div_(32)
+        model.weight.grad = distribute_tensor(next_gradient, mesh, placements)
+        target_model.weight.grad = distribute_tensor(next_gradient, mesh, placements)
+        source.step()
+        target.step()
+        torch.testing.assert_close(model.weight.to_local(), target_model.weight.to_local(), rtol=0, atol=0)
+        for name in ("master_weight", "exp_avg", "exp_avg_sq", "step"):
+            actual = target_child.state[target_model.weight][name]
+            expected = source_child.state[model.weight][name]
+            actual = actual.to_local() if hasattr(actual, "to_local") else actual
+            expected = expected.to_local() if hasattr(expected, "to_local") else expected
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("legacy_differentiable", [False, True])
+def test_mixed_muon_adamw_dcp_restores_groups_and_next_update(tmp_path, legacy_differentiable):
+    import json
+
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import RECIPE, Qwen38MuonAdamW
+
+    def make_model():
+        result = torch.nn.Module()
+        result.muon_weight = torch.nn.Parameter(torch.randn(4, 3, dtype=torch.bfloat16))
+        result.adam_weight = torch.nn.Parameter(torch.randn(3, dtype=torch.bfloat16))
+        return result
+
+    def make_optimizer(model):
+        groups = [
+            {
+                "params": [model.muon_weight],
+                "cpu_offload": True,
+                "qwen38_plan": json.dumps([["muon", 0, 4]]),
+                "qwen38_recipe": RECIPE,
+            },
+            {
+                "params": [model.adam_weight],
+                "cpu_offload": False,
+                "qwen38_plan": json.dumps([["adamw", 0, 1]]),
+                "qwen38_recipe": RECIPE,
+            },
+        ]
+        child = Qwen38MuonAdamW(groups, lr=0.001)
+        return child, MultiOptimizer(model, {"mixed": child}, ["mixed"])
+
+    def set_gradients(model):
+        model.muon_weight.grad = torch.arange(12).reshape(4, 3).to(torch.bfloat16).div_(16)
+        model.adam_weight.grad = torch.tensor([0.25, -0.5, 0.75], dtype=torch.bfloat16)
+
+    def group_options(optimizer):
+        return [{key: value for key, value in group.items() if key != "params"} for group in optimizer.param_groups]
+
+    torch.manual_seed(19)
+    source_model = make_model()
+    source_child, source = make_optimizer(source_model)
+    if legacy_differentiable:
+        for group in source_child.param_groups:
+            group["differentiable"] = False
+    set_gradients(source_model)
+    source.step()
+    source.zero_grad()
+    options = group_options(source_child)
+    parallel_state = SimpleNamespace(dp_mode="ddp", any_extra_parallel_enabled=False)
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+
+    target_model = make_model()
+    target_model.load_state_dict(source_model.state_dict())
+    target_child, target = make_optimizer(target_model)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, strict_optimizer_recipe=True),
+    )
+    assert group_options(source_child) == options == group_options(target_child)
+    assert source_child.defaults == target_child.defaults
+    set_gradients(source_model)
+    set_gradients(target_model)
+    source.step()
+    target.step()
+    for source_param, target_param in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(source_param, target_param, rtol=0, atol=0)
+        for key in source_child.state[source_param]:
+            torch.testing.assert_close(
+                source_child.state[source_param][key], target_child.state[target_param][key], rtol=0, atol=0
+            )
+
+
+def test_legacy_zero_step_muon_without_recipe_requires_migration(tmp_path):
+    import json
+
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import RECIPE, Qwen38MuonAdamW
+
+    dcp.save({"optimizer": {_ZERO_OPTIMIZER_STATE_MARKER: True}}, checkpoint_id=tmp_path)
+    model = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    child = Qwen38MuonAdamW(
+        [{"params": [model.weight], "qwen38_plan": json.dumps([["muon", 0, 2]]), "qwen38_recipe": RECIPE}]
+    )
+    optimizer = MultiOptimizer(model, {"all": child}, ["all"])
+    with pytest.raises(CheckpointException, match="optimizer recipe/state is incomplete"):
+        dcp.load(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=SimpleNamespace(dp_mode="ddp"), load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=optimizer, model=model),
+        )
+
+
+def test_legacy_multi_optimizer_missing_lazy_child_groups_requires_migration(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build():
+        model = torch.nn.Linear(1, 1)
+        children = {
+            "weight": torch.optim.AdamW([model.weight], lr=0.01),
+            "bias": torch.optim.AdamW([model.bias], lr=0.02),
+        }
+        return model, MultiOptimizer(model, children, ["weight", "bias"])
+
+    source_model, source = build()
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    state = OptimizerState(source_model, source, parallel_state=parallel_state).state_dict()
+    state = {key: value for key, value in state.items() if not key.startswith("param_groups.bias.")}
+    dcp.save({"optimizer": state}, checkpoint_id=tmp_path)
+    target_model, target = build()
+    with pytest.raises(CheckpointException, match="optimizer recipe/state is incomplete"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+        )
+
+
+@pytest.mark.parametrize("missing", ["group_lr", "kahan_compensation"])
+def test_dcp_rejects_missing_optimizer_group_or_state_field(tmp_path, missing):
+    from veomni.optim.optimizer import AnyPrecisionAdamW, MultiOptimizer
+
+    def make_optimizer(lr):
+        model = torch.nn.Linear(1, 1, bias=True, dtype=torch.bfloat16)
+        child = AnyPrecisionAdamW(
+            [{"params": [model.weight], "lr": lr}, {"params": [model.bias], "lr": 2 * lr}],
+            weight_decay=0,
+        )
+        return model, MultiOptimizer(model, {"all": child}, ["all"])
+
+    source_model, source = make_optimizer(0.01)
+    for param in source_model.parameters():
+        param.grad = torch.ones_like(param)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    state = OptimizerState(source_model, source, parallel_state=parallel_state).state_dict()
+    del state["param_groups.bias.lr" if missing == "group_lr" else "state.weight.compensation"]
+    dcp.save({"optimizer": state}, checkpoint_id=tmp_path)
+
+    target_model, target = make_optimizer(0.1)
+    with pytest.raises(CheckpointException, match="optimizer (recipe/state is incomplete|state)"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
+        )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("legacy_differentiable", [False, True])
+@pytest.mark.parametrize(
+    "parameter_dtype,moment_dtype,kahan",
+    [
+        (torch.bfloat16, torch.float32, True),
+        (torch.float32, torch.bfloat16, True),
+        (torch.bfloat16, torch.bfloat16, False),
+        (torch.float32, torch.float32, False),
+    ],
+)
+def test_anyprecision_dcp_preserves_state_dtype_and_next_update(
+    tmp_path, multi, legacy_differentiable, parameter_dtype, moment_dtype, kahan
+):
+    from veomni.optim.optimizer import AnyPrecisionAdamW, MultiOptimizer
+
+    def build():
+        model = torch.nn.Linear(2, 2, bias=False, dtype=parameter_dtype)
+        child = AnyPrecisionAdamW(
+            model.parameters(),
+            lr=0.001,
+            momentum_dtype=moment_dtype,
+            variance_dtype=moment_dtype,
+            compensation_buffer_dtype=moment_dtype,
+            use_kahan_summation=kahan,
+        )
+        optimizer = MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+        return model, child, optimizer
+
+    source_model, source_child, source = build()
+    if legacy_differentiable:
+        source_child.param_groups[0]["differentiable"] = False
+    source_model.weight.grad = torch.full_like(source_model.weight, 0.5)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    target_model, target_child, target = build()
+    target_model.load_state_dict(source_model.state_dict())
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+    )
+    source_state = source_child.state[source_model.weight]
+    target_state = target_child.state[target_model.weight]
+    assert [{k: v for k, v in group.items() if k != "params"} for group in source_child.param_groups] == [
+        {k: v for k, v in group.items() if k != "params"} for group in target_child.param_groups
+    ]
+    assert source_state.keys() == target_state.keys()
+    for name, value in source_state.items():
+        assert value.dtype == target_state[name].dtype
+        torch.testing.assert_close(value, target_state[name], rtol=0, atol=0)
+    source_model.weight.grad = torch.full_like(source_model.weight, -0.25)
+    target_model.weight.grad = source_model.weight.grad.clone()
+    source.step()
+    target.step()
+    torch.testing.assert_close(source_model.weight, target_model.weight, rtol=0, atol=0)
+    for name, value in source_state.items():
+        torch.testing.assert_close(value, target_state[name], rtol=0, atol=0)
+
+
+def test_anyprecision_dcp_rejects_changed_moment_dtype(tmp_path):
+    from veomni.optim.optimizer import AnyPrecisionAdamW
+
+    def build(dtype):
+        model = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+        optimizer = AnyPrecisionAdamW(model.parameters(), momentum_dtype=dtype, variance_dtype=dtype)
+        return model, optimizer
+
+    source_model, source = build(torch.float32)
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    target_model, target = build(torch.bfloat16)
+    with pytest.raises(CheckpointException, match="optimizer dtype mismatch"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+        )
+
+
+def test_anyprecision_load_hooks_receive_and_observe_full_precision_state():
+    from veomni.optim.optimizer import AnyPrecisionAdamW
+
+    source_param = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    source = AnyPrecisionAdamW([source_param], momentum_dtype=torch.float32, variance_dtype=torch.float32)
+    source_param.grad = torch.ones_like(source_param)
+    source.step()
+    target_param = torch.nn.Parameter(source_param.detach().clone())
+    target = AnyPrecisionAdamW([target_param], momentum_dtype=torch.float32, variance_dtype=torch.float32)
+    events = []
+
+    def before(_optimizer, state):
+        events.append("before")
+        updated = copy.deepcopy(state)
+        entry = next(iter(updated["state"].values()))
+        assert entry["exp_avg"].dtype == torch.float32
+        entry["exp_avg"].add_(0.125)
+        return updated
+
+    def after(optimizer):
+        events.append("after")
+        assert optimizer.state[target_param]["exp_avg"].dtype == torch.float32
+        torch.testing.assert_close(
+            optimizer.state[target_param]["exp_avg"], source.state[source_param]["exp_avg"] + 0.125, rtol=0, atol=0
+        )
+
+    target.register_load_state_dict_pre_hook(before)
+    target.register_load_state_dict_post_hook(after)
+    target.load_state_dict(source.state_dict())
+    assert events == ["before", "after"]
+
+
+@pytest.mark.parametrize("kind", ["full_fp32", "cpu_offload", "qwen38_muon"])
+def test_fp32_optimizer_load_hooks_receive_and_modify_complete_state(kind):
+    import json
+
+    from veomni.optim.qwen38_muon import RECIPE, Qwen38MuonAdamW
+
+    def build(param):
+        if kind == "full_fp32":
+            return FullFP32AdamW([param])
+        if kind == "cpu_offload":
+            return CPUOffloadAdamW([{"params": [param], "cpu_offload": True}])
+        return Qwen38MuonAdamW(
+            [
+                {
+                    "params": [param],
+                    "cpu_offload": True,
+                    "qwen38_plan": json.dumps([["muon", 0, 2]]),
+                    "qwen38_recipe": RECIPE,
+                }
+            ]
+        )
+
+    source_param = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16))
+    source = build(source_param)
+    source_param.grad = torch.ones_like(source_param)
+    source.step()
+    target_param = torch.nn.Parameter(source_param.detach().clone())
+    target = build(target_param)
+    events = []
+
+    def before(_optimizer, incoming):
+        events.append("before")
+        updated = copy.deepcopy(incoming)
+        next(iter(updated["state"].values()))["exp_avg"].fill_(0.25)
+        return updated
+
+    def after(optimizer):
+        events.append("after")
+        state = optimizer.state[target_param]
+        assert state["exp_avg"].dtype == torch.float32
+        torch.testing.assert_close(state["exp_avg"], torch.full_like(state["exp_avg"], 0.25), rtol=0, atol=0)
+        state["master_weight"].add_(0.5)
+
+    target.register_load_state_dict_pre_hook(before)
+    target.register_load_state_dict_post_hook(after)
+    target.load_state_dict(source.state_dict())
+    assert events == ["before", "after"]
+    torch.testing.assert_close(
+        target.state[target_param]["master_weight"], source.state[source_param]["master_weight"] + 0.5, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("target_groups", ["merged", "swapped"])
+def test_single_optimizer_dcp_rejects_changed_group_membership(tmp_path, target_groups):
+    def make_optimizer(target):
+        model = torch.nn.Linear(1, 1)
+        if not target:
+            groups = [{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}]
+        elif target_groups == "merged":
+            groups = [{"params": [model.weight, model.bias], "lr": 0.1}]
+        else:
+            groups = [{"params": [model.bias], "lr": 0.1}, {"params": [model.weight], "lr": 0.2}]
+        return model, torch.optim.AdamW(groups)
+
+    source_model, source = make_optimizer(False)
+    for param in source_model.parameters():
+        param.grad = torch.ones_like(param)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    target_model, target = make_optimizer(True)
+    with pytest.raises((CheckpointException, RuntimeError), match="optimizer parameter group"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+        )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_dcp_rejects_changed_tied_parameter_canonical_name(tmp_path, multi):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make_model(reverse):
+        model = torch.nn.Module()
+        param = torch.nn.Parameter(torch.ones(1))
+        if reverse:
+            model.alias = param
+            model.a = param
+        else:
+            model.a = param
+            model.alias = param
+        child = torch.optim.AdamW(model.parameters(), lr=0.01)
+        return model, MultiOptimizer(model, {"all": child}, ["all"]) if multi else child
+
+    source_model, source = make_model(False)
+    source_model.a.grad = torch.ones_like(source_model.a)
+    source.step()
+    source.zero_grad()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)}, checkpoint_id=tmp_path
+    )
+    target_model, target = make_model(True)
+    with pytest.raises(
+        CheckpointException, match="optimizer (tied parameter name changed|recipe/state is incomplete)"
+    ):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target, model=target_model),
+        )
 
 
 @pytest.mark.parametrize("optimizer_kind", ["cpu_offload_adamw", "full_fp32_adamw"])

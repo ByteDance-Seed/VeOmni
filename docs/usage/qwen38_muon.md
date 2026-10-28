@@ -5,6 +5,10 @@ for the Qwen4-Exp implementation of Qwen3.8. It leaves model forward/backward,
 Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
 `muon` optimizer and existing AdamW recipes retain their existing behavior.
 
+All parameter groups must be supplied at construction. Adding groups later is
+rejected because PLE owner layout, state placement and the logical Muon recipe
+must be validated together before training begins.
+
 ## Recipe
 
 - FP32 master weights and FP32 optimizer states; BF16 model compute copies.
@@ -140,6 +144,11 @@ bytes. The same exact identity must be supplied on restart. In multisource
 mode the saved sampler step and accumulated counts are checked before any
 cursor is applied. Checkpoints after early data exhaustion or at an epoch
 boundary fail closed until their replay behavior is validated.
+For this profile set `save_epochs: 0` and `save_hf_weights: false`, then choose
+`save_steps` so it never coincides with a planned epoch boundary. Startup
+rejects incompatible schedules; each save also validates its actual position
+before writing model or optimizer shards. These restrictions apply only to the
+file-backed exact-resume profile.
 Deploy an immutable source checkout or image from before Python imports until
 the process exits: runtime source hashes detect later changes but cannot
 prove which bytes were already imported before installation.
@@ -162,6 +171,16 @@ Source DCP metadata must contain the full optimizer recipe and state; partial
 AdamW-to-Muon resume is rejected before placeholder values can hide missing
 fields. A fresh Muon run starts from model weights with new optimizer state.
 Existing AdamW moments are never silently reinterpreted as Muon momentum.
+CPU-offloaded optimizer parameter groups persist the effective moment dtype,
+including for parameters that have not received a gradient yet. A checkpoint
+without that precision policy, or a checkpoint whose policy differs from the
+target, requires explicit migration before exact resume.
+Older zero-step checkpoints that contain only the zero-state marker and omit
+all Muon parameter-group metadata cannot identify the optimizer recipe. They
+are rejected and require an explicit migration using the original recipe;
+the target run's defaults are not a substitute for missing source metadata.
+The same rule applies to older MultiOptimizer checkpoints that omitted groups
+for a still-uninitialized child, even if other children have already stepped.
 
 Local tests cover FP64 polynomial/update references, BF16 compute copies with
 FP32 masters, row/column/whole-expert sharding, exact recipe rejection and DCP

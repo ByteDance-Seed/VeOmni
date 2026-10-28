@@ -355,6 +355,12 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                     raise ValueError(f"Muon reconstruction exceeds the explicit workspace limit: {tuple(shape)}")
                 if any((stop - start) * p.shape[-1] > max_logical_matrix_numel for _, start, stop in plan):
                     raise ValueError("Muon logical matrix exceeds the explicit workspace limit")
+        self._qwen38_groups_sealed = True
+
+    def add_param_group(self, param_group):
+        if getattr(self, "_qwen38_groups_sealed", False):
+            raise RuntimeError("Qwen3.8 Muon requires its complete parameter recipe at construction")
+        super().add_param_group(param_group)
 
     def checkpoint_state_fields(self, param):
         if id(param) in self._compact_expert_ids:
@@ -544,68 +550,80 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             raise
 
     def _load_state_dict_impl(self, state_dict):
-        state_dict = {**state_dict, "state": dict(state_dict["state"])}
         lazy = []
-        for saved, current in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            for key, p in zip(saved["params"], current["params"], strict=True):
-                entry = state_dict["state"].get(key)
-                if id(p) in self._compact_expert_ids and entry and "exp_avg_sq" in entry:
-                    legacy_second = entry["exp_avg_sq"]
-                    if legacy_second.dtype != torch.float32 or legacy_second.shape != p.shape:
-                        raise RuntimeError("Invalid legacy unused expert second moment dtype/shape")
-                    # Pure Muon never reads this tensor. Omit it without copying
-                    # its storage; DCP targets omit it before reading any payload.
-                    state_dict["state"][key] = {k: v for k, v in entry.items() if k != "exp_avg_sq"}
-            if current.get("qwen38_ple_lookup"):
-                if (
-                    saved.get("qwen38_ple_lookup") is not True
-                    or saved.get("weight_decay") != 0.0
-                    or saved.get("qwen38_ple_step_layout") != current["qwen38_ple_step_layout"]
-                ):
-                    raise RuntimeError(
-                        "Muon resume requires the PLE lookup marker and zero weight decay with owner-step layout; explicit migration required"
-                    )
+
+        def prepare(_optimizer, incoming):
+            incoming = {**incoming, "state": dict(incoming["state"])}
+            for saved, current in zip(incoming["param_groups"], self.param_groups, strict=True):
                 for key, p in zip(saved["params"], current["params"], strict=True):
-                    entry = state_dict["state"].get(key)
-                    if not entry:
-                        continue
-                    step = entry["step"]
-                    if isinstance(p, DTensor):
-                        expected = self._ple_step_tensor(p, 0.0)
-                        if (
-                            not isinstance(step, DTensor)
-                            or step.shape != expected.shape
-                            or step.device_mesh != expected.device_mesh
-                            or step.placements != expected.placements
-                        ):
-                            raise RuntimeError("PLE optimizer step requires the exact owner-grid checkpoint layout")
-                    elif isinstance(step, DTensor) or step.ndim != 0:
-                        raise RuntimeError("PLE optimizer step layout does not match parameter")
-                    scalar = _local(step).detach().cpu().reshape(()).clone()
-                    if not torch.isfinite(scalar) or scalar < 0 or scalar != scalar.floor():
-                        raise RuntimeError("Invalid PLE optimizer step")
-                    if scalar.item() == 0:
-                        state_dict["state"].pop(key)
-                        lazy.append(p)
-                    else:
-                        state_dict["state"][key] = {**entry, "step": scalar}
-            for key in ("qwen38_recipe", "qwen38_plan", "muon_momentum"):
-                if saved.get(key) != current[key]:
-                    raise RuntimeError(f"Muon resume recipe mismatch: {key}; AdamW migration is not implicit")
-        super().load_state_dict(state_dict)
-        if self._ple_moment_storage is not None:
-            for group in self.param_groups:
-                if group.get("qwen38_ple_lookup"):
-                    for p in group["params"]:
-                        entry = self.state.get(p)
-                        if entry:
-                            for field in ("exp_avg", "exp_avg_sq"):
-                                if not self._ple_moment_storage.owns(_local(entry[field])):
-                                    raise RuntimeError(
-                                        "PLE restore must use the file-backed DCP target; copying is not implicit"
-                                    )
-        for p in lazy:
-            self.state.pop(p, None)
+                    entry = incoming["state"].get(key)
+                    if id(p) in self._compact_expert_ids and entry and "exp_avg_sq" in entry:
+                        legacy_second = entry["exp_avg_sq"]
+                        if legacy_second.dtype != torch.float32 or legacy_second.shape != p.shape:
+                            raise RuntimeError("Invalid legacy unused expert second moment dtype/shape")
+                        incoming["state"][key] = {k: v for k, v in entry.items() if k != "exp_avg_sq"}
+                if current.get("qwen38_ple_lookup"):
+                    if (
+                        saved.get("qwen38_ple_lookup") is not True
+                        or saved.get("weight_decay") != 0.0
+                        or saved.get("qwen38_ple_step_layout") != current["qwen38_ple_step_layout"]
+                    ):
+                        raise RuntimeError(
+                            "Muon resume requires the PLE lookup marker and zero weight decay with owner-step layout; explicit migration required"
+                        )
+                    for key, p in zip(saved["params"], current["params"], strict=True):
+                        entry = incoming["state"].get(key)
+                        if not entry:
+                            continue
+                        step = entry["step"]
+                        if isinstance(p, DTensor):
+                            expected = self._ple_step_tensor(p, 0.0)
+                            if (
+                                not isinstance(step, DTensor)
+                                or step.shape != expected.shape
+                                or step.device_mesh != expected.device_mesh
+                                or step.placements != expected.placements
+                            ):
+                                raise RuntimeError(
+                                    "PLE optimizer step requires the exact owner-grid checkpoint layout"
+                                )
+                        elif isinstance(step, DTensor) or step.ndim != 0:
+                            raise RuntimeError("PLE optimizer step layout does not match parameter")
+                        scalar = _local(step).detach().cpu().reshape(()).clone()
+                        if not torch.isfinite(scalar) or scalar < 0 or scalar != scalar.floor():
+                            raise RuntimeError("Invalid PLE optimizer step")
+                        if scalar.item() == 0:
+                            incoming["state"].pop(key)
+                            lazy.append(p)
+                        else:
+                            incoming["state"][key] = {**entry, "step": scalar}
+                for key in ("qwen38_recipe", "qwen38_plan", "muon_momentum"):
+                    if saved.get(key) != current[key]:
+                        raise RuntimeError(f"Muon resume recipe mismatch: {key}; AdamW migration is not implicit")
+            return incoming
+
+        def finish(_optimizer):
+            if self._ple_moment_storage is not None:
+                for group in self.param_groups:
+                    if group.get("qwen38_ple_lookup"):
+                        for p in group["params"]:
+                            entry = self.state.get(p)
+                            if entry:
+                                for field in ("exp_avg", "exp_avg_sq"):
+                                    if not self._ple_moment_storage.owns(_local(entry[field])):
+                                        raise RuntimeError(
+                                            "PLE restore must use the file-backed DCP target; copying is not implicit"
+                                        )
+            for p in lazy:
+                self.state.pop(p, None)
+
+        pre_hook = self.register_load_state_dict_pre_hook(prepare)
+        post_hook = self.register_load_state_dict_post_hook(finish, prepend=True)
+        try:
+            super().load_state_dict(state_dict)
+        finally:
+            pre_hook.remove()
+            post_hook.remove()
 
     def register_step_pre_hook(self, hook):
         if getattr(self, "_ple_file_mode_enabled", False):

@@ -15,7 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -23,6 +25,7 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    _get_fqns,
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
@@ -34,7 +37,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.dist_utils import raise_if_any_rank_failed, require_same_rank_value
 from .cpu_offload_adamw import CPUOffloadAdamW, resolve_moment_dtype, select_cpu_offload_groups
-from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW, _align_state_to_parameter
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
 from .qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
 
@@ -187,6 +190,8 @@ def restore_optimizer_param_group_defaults(optimizer: Any) -> None:
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
+    requires_exact_state_dtypes = True
+
     def __init__(
         self,
         params,
@@ -210,6 +215,128 @@ class AnyPrecisionAdamW(Optimizer):
             "compensation_buffer_dtype": compensation_buffer_dtype,
         }
         super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        defaults = state.get("defaults", getattr(self, "defaults", {}))
+        had_differentiable = "differentiable" in defaults
+        super().__setstate__(state)
+        if not had_differentiable:
+            self.defaults.pop("differentiable", None)
+
+    def checkpoint_state_fields(self, param):
+        groups = getattr(self, "_checkpoint_param_groups", None)
+        if groups is None or param not in groups:
+            groups = {item: group for group in self.param_groups for item in group["params"]}
+            self._checkpoint_param_groups = groups
+        if param not in groups:
+            raise RuntimeError("Optimizer parameter is missing from its groups")
+        fields = ["step", "exp_avg", "exp_avg_sq"]
+        if groups[param]["use_kahan_summation"]:
+            fields.append("compensation")
+        return fields
+
+    @contextmanager
+    def checkpoint_state(self, *, load=False):
+        """Construct local targets without synthetic gradients or an optimizer step."""
+        added = []
+        try:
+            if load:
+                for group in self.param_groups:
+                    for param in group["params"]:
+                        if not param.requires_grad:
+                            continue
+                        state = self.state.get(param)
+                        if state:
+                            expected = set(self.checkpoint_state_fields(param))
+                            if expected != set(state):
+                                raise RuntimeError("Incomplete AnyPrecisionAdamW checkpoint target state")
+                            dtypes = {"exp_avg": group["momentum_dtype"], "exp_avg_sq": group["variance_dtype"]}
+                            if group["use_kahan_summation"]:
+                                dtypes["compensation"] = group["compensation_buffer_dtype"]
+                            for name, dtype in dtypes.items():
+                                value = state[name]
+                                if not torch.is_tensor(value) or value.dtype != dtype or value.shape != param.shape:
+                                    raise RuntimeError(
+                                        f"AnyPrecisionAdamW checkpoint target {name} dtype/shape differs from its policy"
+                                    )
+                            continue
+                        state = {
+                            "step": torch.tensor(0.0),
+                            "exp_avg": torch.zeros_like(param, dtype=group["momentum_dtype"]),
+                            "exp_avg_sq": torch.zeros_like(param, dtype=group["variance_dtype"]),
+                        }
+                        if group["use_kahan_summation"]:
+                            state["compensation"] = torch.zeros_like(param, dtype=group["compensation_buffer_dtype"])
+                        self.state[param] = state
+                        added.append(param)
+            yield
+        except BaseException:
+            for param in added:
+                self.state.pop(param, None)
+            raise
+
+    def load_state_dict(self, state_dict):
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+        if any(group.get("differentiable", False) is not False for group in state_dict["param_groups"]):
+            raise RuntimeError("Differentiable optimizer checkpoints are not supported by this no-grad optimizer")
+        groups = self.param_groups
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        if any(
+            len(saved["params"]) != len(group["params"]) for saved, group in zip(saved_groups, groups, strict=True)
+        ):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the optimizer group size"
+            )
+        for saved, group in zip(saved_groups, groups, strict=True):
+            for key in ("momentum_dtype", "variance_dtype", "compensation_buffer_dtype", "use_kahan_summation"):
+                if saved.get(key) != group[key]:
+                    raise RuntimeError(
+                        f"AnyPrecisionAdamW checkpoint precision policy differs: {key}; migrate explicitly"
+                    )
+        restored = defaultdict(dict)
+        assigned = set()
+        for saved_group, group in zip(saved_groups, groups, strict=True):
+            for key, param in zip(saved_group["params"], group["params"], strict=True):
+                assigned.add(key)
+                saved = state_dict["state"].get(key, {})
+                if saved:
+                    expected = {"step", "exp_avg", "exp_avg_sq"}
+                    if saved_group["use_kahan_summation"]:
+                        expected.add("compensation")
+                    if set(saved) != expected:
+                        raise RuntimeError("AnyPrecisionAdamW checkpoint has incomplete or unsupported state")
+                    fields = {
+                        "exp_avg": saved_group["momentum_dtype"],
+                        "exp_avg_sq": saved_group["variance_dtype"],
+                    }
+                    if "compensation" in expected:
+                        fields["compensation"] = saved_group["compensation_buffer_dtype"]
+                    saved = dict(saved)
+                    for name, dtype in fields.items():
+                        tensor = _align_state_to_parameter(saved[name], param)
+                        if tensor.dtype != dtype or tensor.shape != param.shape:
+                            raise RuntimeError(f"AnyPrecisionAdamW checkpoint {name} dtype/shape mismatch")
+                        saved[name] = tensor.detach().to(device=param.device, dtype=dtype)
+                if key in state_dict["state"]:
+                    restored[param] = saved
+        for key, value in state_dict["state"].items():
+            if key not in assigned:
+                restored[key] = value
+        for saved_group, group in zip(saved_groups, groups, strict=True):
+            saved_group["params"] = group["params"]
+            if "param_names" in group and "param_names" not in saved_group:
+                saved_group["param_names"] = group["param_names"]
+        # Preserve configured moment dtypes rather than casting to param.dtype.
+        self.__setstate__({"state": restored, "param_groups": saved_groups})
+        self.__dict__.pop("_checkpoint_param_groups", None)
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -290,13 +417,67 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def _optimizer_group_values_equal(left, right):
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and torch.equal(left, right)
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _optimizer_group_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _optimizer_group_values_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
 def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
-    """Let optimizers prepare exact lazy-state buffers before PyTorch's getter."""
+    """Keep lazy optimizer state untouched while saving its parameter groups."""
+    if any(not group["params"] for group in optimizer.param_groups):
+        raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
     prepare = getattr(optimizer, "checkpoint_state", None)
     with prepare(load=for_load) if prepare is not None else nullcontext():
-        return get_optimizer_state_dict(
-            model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
-        )
+        # PyTorch initializes a wholly empty optimizer by calling step(). A
+        # temporary empty entry makes its getter serialize parameter groups
+        # without performing that update or materializing optimizer state.
+        sentinel = None
+        placeholder = None
+        sentinel_hook = None
+        sentinel_hook_called = False
+        if not for_load and not optimizer.state:
+            sentinel = next((p for group in optimizer.param_groups for p in group["params"]), None)
+            if sentinel is not None:
+                placeholder = {}
+                optimizer.state[sentinel] = placeholder
+
+                def remove_sentinel(optim):
+                    nonlocal sentinel_hook_called
+                    sentinel_hook_called = True
+                    if optim.state.get(sentinel) is placeholder and not placeholder:
+                        optim.state.pop(sentinel, None)
+
+                # _init_optim_state runs before optimizer.state_dict(). Remove
+                # the sentinel before user hooks inspect the live state.
+                sentinel_hook = optimizer.register_state_dict_pre_hook(remove_sentinel, prepend=True)
+        try:
+            result = get_optimizer_state_dict(
+                model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+            )
+            if sentinel_hook is not None and not sentinel_hook_called:
+                raise RuntimeError("Optimizer state_dict did not run registered pre-hooks during checkpoint save")
+        finally:
+            if sentinel_hook is not None:
+                sentinel_hook.remove()
+            if sentinel is not None and optimizer.state.get(sentinel) is placeholder and not placeholder:
+                optimizer.state.pop(sentinel, None)
+        return result
 
 
 class MultiOptimizer(Optimizer, Stateful):
@@ -328,11 +509,18 @@ class MultiOptimizer(Optimizer, Stateful):
         for opt in self.optimizers_dict.values():
             opt.zero_grad()
 
+    def _validate_checkpoint_param_groups(self):
+        for name in self.key_names:
+            optimizer = self.optimizers_dict[name]
+            if any(not group["params"] for group in optimizer.param_groups):
+                raise RuntimeError(f"MultiOptimizer checkpoint cannot represent an empty parameter group in {name!r}")
+
     def state_dict(
         self,
         *,
         for_load=True,
     ) -> Dict[str, Any]:
+        self._validate_checkpoint_param_groups()
         # get the flatten state dict for multi-optimizer
         merged: Dict[str, Any] = {}
         for name in self.key_names:
@@ -355,21 +543,14 @@ class MultiOptimizer(Optimizer, Stateful):
     ) -> Dict[str, Any]:
         """Return a flattened optimizer state dict without materializing state.
 
-        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
-        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
-        call ``_init_optim_state`` and synthesize default state for every
-        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
-        this rank), bloating the checkpoint.
+        State is saved only where it exists, while nonempty parameter groups
+        remain available for exact resume. The flattened representation cannot
+        encode a group with no parameters.
         """
+        self._validate_checkpoint_param_groups()
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            if (
-                not opt.state
-                and not getattr(opt, "checkpoint_save_requires_state", False)
-                and not getattr(opt, "_ple_file_mode_enabled", False)
-            ):
-                continue
             sd = optimizer_state_dict_for_checkpoint(self.model, opt, flatten=True)
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
@@ -382,7 +563,61 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
+    def validate_checkpoint_groups(self, state_dict: Dict[str, Any]) -> None:
+        # PyTorch's unflattening takes each group's first parameter as its
+        # representative. If distinct saved groups were merged, silently using
+        # that first parameter's learning rate/recipe changes training.
+        saved_groups = {}
+        for key, value in state_dict.items():
+            if key.startswith("param_groups."):
+                name, separator, field = key.removeprefix("param_groups.").rpartition(".")
+                if separator:
+                    saved_groups.setdefault(name, {})[field] = value
+        if saved_groups:
+            names_by_id = {}
+            for runtime_name, parameter in self.model.named_parameters():
+                names_by_id.setdefault(id(parameter), set()).update(_get_fqns(self.model, runtime_name))
+            for optimizer in self.optimizers_dict.values():
+                for group in optimizer.param_groups:
+                    names = set()
+                    for parameter in group["params"]:
+                        if id(parameter) not in names_by_id:
+                            raise RuntimeError("Cannot identify an optimizer parameter during DCP group restore")
+                        names.update(names_by_id[id(parameter)])
+                    rows = [saved_groups[name] for name in sorted(names) if name in saved_groups]
+                    if rows and len(rows) != len(names):
+                        raise RuntimeError("DCP optimizer parameter group metadata is incomplete")
+                    for row in rows[1:]:
+                        if row.keys() != rows[0].keys() or any(
+                            not _optimizer_group_values_equal(row[key], rows[0][key]) for key in row
+                        ):
+                            raise RuntimeError(
+                                "DCP cannot merge optimizer parameter groups with different saved hyperparameters"
+                            )
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.validate_checkpoint_groups(state_dict)
+        # DCP's unflattening only reads keys already present on the target
+        # group. Restore this optional field on older checkpoints before the
+        # unflattening so a saved value is not silently dropped.
+        names_by_id = {}
+        for runtime_name, parameter in self.model.named_parameters():
+            names_by_id.setdefault(id(parameter), set()).update(_get_fqns(self.model, runtime_name))
+        for opt in self.optimizers_dict.values():
+            for group in opt.param_groups:
+                if "differentiable" in group:
+                    continue
+                fields = [
+                    state_dict[f"param_groups.{name}.differentiable"]
+                    for parameter in group["params"]
+                    for name in names_by_id.get(id(parameter), ())
+                    if f"param_groups.{name}.differentiable" in state_dict
+                ]
+                if fields:
+                    validator = getattr(opt, "_validate_saved_group_semantics", None)
+                    if validator is not None:
+                        validator({"param_groups": [{"differentiable": fields[0]}]})
+                    group["differentiable"] = fields[0]
         # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
         # pick out only the entries for parameters that belong to that optimizer.
         for name in self.key_names:

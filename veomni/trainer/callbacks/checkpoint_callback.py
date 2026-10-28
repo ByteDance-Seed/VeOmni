@@ -30,6 +30,7 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
+import math
 from typing import TYPE_CHECKING
 
 from torch.distributed.checkpoint.api import CheckpointException
@@ -43,6 +44,24 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+def _validate_file_profile_checkpoint_schedule(trainer):
+    """Reject schedules that would require an unvalidated epoch-boundary resume."""
+    args = trainer.args
+    checkpoint = args.train.checkpoint
+    if checkpoint.save_epochs or checkpoint.save_hf_weights:
+        raise ValueError(
+            "File-backed exact resume does not support epoch/final checkpoint saves; "
+            "set save_epochs=0 and save_hf_weights=false and use a safe step cadence"
+        )
+    steps, interval, epochs = args.train_steps, checkpoint.save_steps, args.train.num_train_epochs
+    if interval and all(type(value) is int and value > 0 for value in (steps, interval, epochs)):
+        if math.lcm(steps, interval) <= steps * epochs:
+            raise ValueError(
+                "File-backed checkpoint step cadence reaches an unvalidated epoch boundary; "
+                "choose save_steps that avoids every planned epoch boundary"
+            )
 
 
 class CheckpointCallback(Callback):
@@ -74,6 +93,7 @@ class CheckpointCallback(Callback):
 
             error, identity, runtime_identity = None, None, None
             try:
+                _validate_file_profile_checkpoint_schedule(self.trainer)
                 contract = _exact_checkpoint_contract(self.trainer)
                 contract.install()
                 identity = _exact_checkpoint_contract(self.trainer, require_identity=True).checkpoint_identity()
@@ -130,9 +150,22 @@ class CheckpointCallback(Callback):
                 )
 
     def _save_dcp(self, state: TrainerState):
-        from .global_state_callback import validate_resumed_prefetch_is_drained
+        from .global_state_callback import (
+            _has_file_profile,
+            _validate_exact_epoch,
+            validate_resumed_prefetch_is_drained,
+        )
 
         validate_resumed_prefetch_is_drained(self.trainer, state)
+        if _has_file_profile(self.trainer):
+            from ...utils.dist_utils import raise_if_any_rank_failed
+
+            error = None
+            try:
+                _validate_exact_epoch(self.trainer, state.global_step, state.epoch)
+            except Exception as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating file-backed checkpoint epoch")
         self.trainer.save_dcp(state)
         self._last_dcp_step = state.global_step
 

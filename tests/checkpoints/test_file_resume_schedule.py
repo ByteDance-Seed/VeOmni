@@ -8,6 +8,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim.lr_scheduler import build_lr_scheduler
+from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback, _validate_file_profile_checkpoint_schedule
 from veomni.trainer.callbacks.global_state_callback import _resume_identity
 
 
@@ -114,6 +115,45 @@ def test_resume_identity_rejects_unvalidated_multisource_dpo():
     trainer.args.data.data_type = "dpo"
     with pytest.raises(RuntimeError, match="preference/DPO"):
         _resume_identity(trainer)
+
+
+@pytest.mark.parametrize("case", ["epoch_save", "final_hf", "step_at_epoch", "second_epoch_boundary"])
+def test_file_profile_rejects_unsupported_checkpoint_schedule_before_training(case):
+    trainer = _trainer()
+    trainer.args.train.checkpoint = SimpleNamespace(save_epochs=0, save_hf_weights=False, save_steps=31)
+    if case == "epoch_save":
+        trainer.args.train.checkpoint.save_epochs = 1
+    elif case == "final_hf":
+        trainer.args.train.checkpoint.save_hf_weights = True
+    elif case == "step_at_epoch":
+        trainer.args.train.checkpoint.save_steps = 20
+    else:
+        trainer.args.train.checkpoint.save_steps = 200
+    with pytest.raises(ValueError, match="File-backed"):
+        _validate_file_profile_checkpoint_schedule(trainer)
+
+
+def test_file_profile_accepts_only_interior_step_saves():
+    trainer = _trainer()
+    trainer.args.train.checkpoint = SimpleNamespace(save_epochs=0, save_hf_weights=False, save_steps=31)
+    _validate_file_profile_checkpoint_schedule(trainer)
+
+
+def test_file_profile_checks_epoch_before_writing_model_checkpoint(monkeypatch):
+    from veomni.trainer.callbacks import global_state_callback
+
+    trainer = _trainer()
+    trainer.args.train.checkpoint = SimpleNamespace(
+        save_epochs=0, save_hf_weights=False, save_steps=31, hf_save_steps=0, hf_save_epochs=0
+    )
+    calls = []
+    trainer.save_dcp = lambda state: calls.append(state)
+    monkeypatch.setattr(global_state_callback, "_has_file_profile", lambda _: True)
+    monkeypatch.setattr(global_state_callback, "validate_resumed_prefetch_is_drained", lambda *args: None)
+    callback = CheckpointCallback(trainer)
+    with pytest.raises(RuntimeError, match="unvalidated epoch"):
+        callback._save_dcp(SimpleNamespace(global_step=100, epoch=0))
+    assert not calls
 
 
 @pytest.mark.parametrize(

@@ -78,25 +78,106 @@ class MasterFP32AdamW(Optimizer):
             raise ValueError("Invalid AdamW betas")
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, chunk_size=chunk_size))
 
+    def _group_moment_dtype(self, group):
+        return self.moment_dtype
+
+    def add_param_group(self, param_group):
+        group = dict(param_group)
+        policy = str(self._group_moment_dtype(group)).removeprefix("torch.")
+        if group.get("veomni_adam_moment_dtype", policy) != policy:
+            raise ValueError("Adam moment precision policy disagrees with the optimizer")
+        group["veomni_adam_moment_dtype"] = policy
+        super().add_param_group(group)
+
+    def __setstate__(self, state):
+        # Optimizer.__setstate__ injects a PyTorch-only differentiable default
+        # even though this optimizer always executes under no_grad. Keep the
+        # original default schema so DCP's group-default repair does not add a
+        # new field to groups restored from an older checkpoint.
+        defaults = state.get("defaults", getattr(self, "defaults", {}))
+        had_differentiable = "differentiable" in defaults
+        super().__setstate__(state)
+        if not had_differentiable:
+            self.defaults.pop("differentiable", None)
+
+    @staticmethod
+    def _validate_saved_group_semantics(state_dict):
+        if any(group.get("differentiable", False) is not False for group in state_dict["param_groups"]):
+            raise RuntimeError("Differentiable optimizer checkpoints are not supported by this no-grad optimizer")
+
+    def _validate_checkpoint_precision_policy(self, state_dict):
+        saved = state_dict["param_groups"]
+        if len(saved) != len(self.param_groups):
+            raise RuntimeError("Optimizer checkpoint group count differs; migrate explicitly")
+        for source, target in zip(saved, self.param_groups, strict=True):
+            if source.get("veomni_adam_moment_dtype") != target["veomni_adam_moment_dtype"]:
+                raise RuntimeError("Adam moment precision policy differs or is missing; explicit migration required")
+
+    def checkpoint_state_fields(self, param):
+        return ("step", "master_weight", "exp_avg", "exp_avg_sq")
+
+    def _state_dtype(self, param, name):
+        return torch.float32 if name == "master_weight" else self.moment_dtype
+
+    def _state_device(self, param):
+        return param.device
+
+    def _restore_step(self, step):
+        return step
+
     def load_state_dict(self, state_dict):
-        preserved = []
-        for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            for key, param in zip(saved_group["params"], group["params"], strict=True):
-                saved = state_dict["state"].get(key, {})
-                if saved and set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
-                    raise RuntimeError("Legacy AdamW checkpoint requires explicit migration")
-                for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                    if name in saved:
-                        expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
-                        saved[name] = _align_state_to_parameter(saved[name], param)
-                        if saved[name].dtype != expected_dtype or saved[name].shape != param.shape:
-                            raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
-                        preserved.append((param, name, saved[name]))
-        super().load_state_dict(state_dict)
-        # Restore original tensors, not the BF16-rounded copies made by PyTorch.
-        for param, name, tensor in preserved:
-            dtype = torch.float32 if name == "master_weight" else self.moment_dtype
-            self.state[param][name] = tensor.to(device=param.device, dtype=dtype)
+        restored, unassigned = [], {}
+
+        def prepare(_optimizer, incoming):
+            self._validate_saved_group_semantics(incoming)
+            validate_policy = getattr(self, "_validate_checkpoint_precision_policy", None)
+            if validate_policy is not None:
+                validate_policy(incoming)
+            assigned = set()
+            for saved_group, group in zip(incoming["param_groups"], self.param_groups, strict=True):
+                for key, param in zip(saved_group["params"], group["params"], strict=True):
+                    assigned.add(key)
+                    saved = dict(incoming["state"].get(key, {}))
+                    if saved:
+                        required = self.checkpoint_state_fields(param)
+                        if set(saved) != set(required):
+                            raise RuntimeError("Optimizer checkpoint has incomplete or unsupported state")
+                        for name in required:
+                            if name == "step":
+                                continue
+                            dtype = self._state_dtype(param, name)
+                            saved[name] = _align_state_to_parameter(saved[name], param)
+                            if saved[name].dtype != dtype or saved[name].shape != param.shape:
+                                raise RuntimeError(
+                                    f"Optimizer state {name} requires explicit precision/shape migration"
+                                )
+                    if key in incoming["state"]:
+                        restored.append((param, saved))
+            unassigned.update({key: value for key, value in incoming["state"].items() if key not in assigned})
+            return {**incoming, "state": {}}
+
+        def install(_optimizer):
+            self.state.update(unassigned)
+            for param, saved in restored:
+                if not saved:
+                    self.state[param] = saved
+                    continue
+                state = {"step": self._restore_step(saved["step"])}
+                for name in self.checkpoint_state_fields(param):
+                    if name == "step":
+                        continue
+                    state[name] = (
+                        saved[name].detach().to(device=self._state_device(param), dtype=self._state_dtype(param, name))
+                    )
+                self.state[param] = state
+
+        pre_hook = self.register_load_state_dict_pre_hook(prepare)
+        post_hook = self.register_load_state_dict_post_hook(install, prepend=True)
+        try:
+            Optimizer.load_state_dict(self, state_dict)
+        finally:
+            pre_hook.remove()
+            post_hook.remove()
 
     @torch.no_grad()
     def step(self, closure=None):
