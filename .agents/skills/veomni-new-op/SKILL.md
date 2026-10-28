@@ -104,10 +104,18 @@ Use these separate mechanisms only when their semantics require them:
    - explicit failure for unknown or unavailable implementations.
 2. Put consumer-specific normalization and model wiring tests under
    `tests/models/` instead of duplicating them in the raw-kernel suite.
+   Cover distinct variants and custom backward implementations separately,
+   including EP/non-EP and split/merged layouts when implemented. Standard
+   Quack and GPT-OSS Quack share GEMM but not the expert computation. An
+   EP-local compute test does not qualify token all-to-all; add a model/backend
+   E2E representative when that integrated path is new. Follow the
+   [new-model coverage policy](../../../docs/transformers_v5/testing_new_model.md)
+   for representative selection and capability exceptions.
 3. Run the family tests plus the registry and documentation guards:
 
-   The GPU job runs `tests/ops/` wholesale. The NPU job enumerates ops files,
-   so add an NPU workflow entry when the new tests must run on Ascend.
+   GPU and NPU unit manifests select `tests/ops/`, with hardware prerequisites
+   and selection filters controlling individual cases. Check both manifests
+   before adding an entry; an already-collected case needs no workflow edit.
 
    ```bash
    pytest -q tests/ops/<kernel_name>/ tests/ops/base/

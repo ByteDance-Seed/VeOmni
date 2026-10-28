@@ -11,6 +11,7 @@ that is a multiple of world_size; a second case pads a non-divisible length and
 applies the global tail mask Wan builds in `WanModel.forward`.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +30,11 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
     pytest.skip("c10d NCCL not available, skipping tests", allow_module_level=True)
 
 
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
+from veomni.distributed.parallel_state import (
+    clear_parallel_state,
+    get_parallel_state,
+    use_parallel_state,
+)
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
 from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
 from veomni.ops import resolve_op
@@ -67,17 +72,9 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
     def world_size(self):
         return 4
 
-    def _init_sp(self):
-        _init_parallel_state(
-            dp_size=1,
-            ulysses_size=self.world_size,
-            device_type=get_device_type(),
-            name=None,
-        )
-        assert get_parallel_state().ulysses_enabled
-
     def _synced_self_attn(self, group, *, dim=64, num_heads=4, dtype=torch.float32):
         device = get_device_type()
+        torch.manual_seed(42)
         config = SimpleNamespace(_attn_implementation="eager")
         self_attn = SelfAttention(config, dim, num_heads).to(device=device, dtype=dtype)
         self._sync_model(self_attn.state_dict(), self.rank)
@@ -97,11 +94,9 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
         c10d.all_gather(chunks, local_out.contiguous(), group=group)
         return torch.cat(chunks, dim=1)
 
-    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
-    def test_sync_path_matches_non_sp_reference(self):
-        group = self._get_process_group()
-        try:
-            self._init_sp()
+    def _check_unpadded_forward(self, group) -> None:
+        with use_parallel_state(self.sp_state):
+            assert get_parallel_state().ulysses_enabled
             device = get_device_type()
             dtype = torch.float32
             dim, num_heads, full_seq_len, batch = 64, 4, 32, 2
@@ -134,15 +129,14 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
             # GPU float32 attention/matmul reduction order differs slightly between
             # "all heads, one process" (reference) and "subset of heads per rank,
             # concatenated" (actual) even though they're mathematically identical.
-            torch.testing.assert_close(gathered, reference, atol=2e-4, rtol=2e-3)
-        finally:
-            clear_parallel_state()
+            torch.testing.assert_close(
+                gathered, reference, atol=2e-4, rtol=2e-3, msg="[unpadded_forward] output parity"
+            )
+            c10d.barrier(group)
 
-    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
-    def test_sync_path_backward_matches_non_sp_reference(self):
-        group = self._get_process_group()
-        try:
-            self._init_sp()
+    def _check_unpadded_backward(self, group) -> None:
+        with use_parallel_state(self.sp_state):
+            assert get_parallel_state().ulysses_enabled
             device = get_device_type()
             dtype = torch.float32
             dim, num_heads, full_seq_len, batch = 64, 4, 32, 2
@@ -173,15 +167,14 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
                 c10d.all_reduce(param.grad, group=group)
 
             for name, param in self_attn.named_parameters():
-                torch.testing.assert_close(param.grad, ref_grads[name], atol=2e-4, rtol=2e-3, msg=name)
-        finally:
-            clear_parallel_state()
+                torch.testing.assert_close(
+                    param.grad, ref_grads[name], atol=2e-4, rtol=2e-3, msg=f"[unpadded_backward] {name}"
+                )
+            c10d.barrier(group)
 
-    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
-    def test_sync_path_padded_seq_matches_non_sp_reference(self):
-        group = self._get_process_group()
-        try:
-            self._init_sp()
+    def _check_padded_forward(self, group) -> None:
+        with use_parallel_state(self.sp_state):
+            assert get_parallel_state().ulysses_enabled
             device = get_device_type()
             dtype = torch.float32
             dim, num_heads, full_seq_len, batch = 64, 4, 33, 2
@@ -221,7 +214,28 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
             gathered = self._gather_local(
                 group, local_out, batch=batch, unit=unit, dim=dim, device=device, dtype=dtype
             )
-            torch.testing.assert_close(gathered[:, :full_seq_len], reference[:, :full_seq_len], atol=2e-4, rtol=2e-3)
+            torch.testing.assert_close(
+                gathered[:, :full_seq_len],
+                reference[:, :full_seq_len],
+                atol=2e-4,
+                rtol=2e-3,
+                msg="[padded_forward] output parity",
+            )
+            c10d.barrier(group)
+
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
+    def test_sync_path_matches_non_sp_reference(self):
+        group = self._get_process_group()
+        try:
+            checks = [
+                self._check_unpadded_forward,
+                self._check_unpadded_backward,
+                self._check_padded_forward,
+            ]
+            if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+                checks = list(reversed(checks))
+            for check in checks:
+                check(group)
         finally:
             clear_parallel_state()
 

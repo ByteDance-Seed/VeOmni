@@ -36,6 +36,7 @@ _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("reduction_scale", [1.0, 0.5, 1.0 / 3.0])
 def test_low_precision_transport_accumulates_and_outputs_fp32(monkeypatch, dtype, reduction_scale):
@@ -57,6 +58,7 @@ def test_low_precision_transport_accumulates_and_outputs_fp32(monkeypatch, dtype
     torch.testing.assert_close(output_tensor, expected, rtol=0, atol=0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fp16_transport_obeys_fp16_finite_range(monkeypatch):
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
     monkeypatch.setattr(
@@ -80,6 +82,7 @@ def test_fp16_transport_obeys_fp16_finite_range(monkeypatch):
     assert torch.isfinite(bf16_output).all()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_bf16_postscale_can_overflow_before_a_representable_average(monkeypatch):
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
     monkeypatch.setattr(dist, "all_to_all_single", lambda output, input, group, async_op: output.copy_(input))
@@ -94,6 +97,7 @@ def test_bf16_postscale_can_overflow_before_a_representable_average(monkeypatch)
     assert torch.isfinite((input_tensor * 0.5).sum())
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_reduce_scatter_rejects_async(dtype):
     with pytest.raises(NotImplementedError, match="async_op=True"):
@@ -106,6 +110,7 @@ def test_low_precision_reduce_scatter_rejects_async(dtype):
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_non_fp32_reduction_buffers_are_rejected():
     with pytest.raises(TypeError, match="requires FP32"):
         FP32ReduceScatterWithLowPrecisionTransport(torch.bfloat16, reduction_scale=0.5)(
@@ -116,6 +121,7 @@ def test_non_fp32_reduction_buffers_are_rejected():
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_reduce_scatter_validates_contract(monkeypatch, dtype):
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
@@ -148,6 +154,7 @@ class _FakeFSDPModule:
         self.comms.append(comm)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkeypatch):
     class FakeModel:
         def __init__(self) -> None:
@@ -178,6 +185,7 @@ def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkey
     assert model.fsdp2.force_sum_reductions == []
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("use_low_precision_transport", [False, True])
 def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(use_low_precision_transport):
     module = _FakeFSDPModule()
@@ -208,6 +216,7 @@ class _FakeReductionMesh:
         return self.groups[name]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("contents", "expected"),
     [
@@ -227,6 +236,7 @@ def test_node_identity_requires_valid_kernel_boot_id(monkeypatch, contents, expe
     assert reduce_scatter_module._get_node_id() == expected
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("ndim", [0, 3, 4])
 def test_transport_policy_rejects_unsupported_mesh_dimensions_before_communication(ndim):
     def get_group(name):
@@ -237,6 +247,7 @@ def test_transport_policy_rejects_unsupported_mesh_dimensions_before_communicati
         ReduceScatterTransportPolicy().can_use(mesh)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_unreadable_node_identity_does_not_trust_environment(monkeypatch):
     def read_text(path):
         raise PermissionError("kernel identity unavailable")
@@ -247,6 +258,7 @@ def test_unreadable_node_identity_does_not_trust_environment(monkeypatch):
     assert reduce_scatter_module._get_node_id() is None
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("node_ids", "expected"),
     [(["node-a", "node-a"], True), (["node-a", "node-b"], False), (["node-a", None], False)],
@@ -277,6 +289,7 @@ def test_transport_policy_uses_actual_group_and_caches_decision(monkeypatch, nod
     assert identity_reads == [True]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("has_replica_group", [False, True])
 def test_singleton_transport_policy_does_not_communicate(monkeypatch, has_replica_group):
     def fail_gather(*args, **kwargs):
@@ -291,6 +304,7 @@ def test_singleton_transport_policy_does_not_communicate(monkeypatch, has_replic
     assert not ReduceScatterTransportPolicy().can_use(mesh)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_transport_policy_does_not_hide_collective_failures(monkeypatch):
     def fail_gather(*args, **kwargs):
         raise RuntimeError("topology collective failed")
@@ -302,6 +316,7 @@ def test_transport_policy_does_not_hide_collective_failures(monkeypatch):
         ReduceScatterTransportPolicy().can_use(_FakeReductionMesh(object()))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("local_ids", [["node-a", "node-a"], ["node-a", "node-b"], [None, None]])
 @pytest.mark.parametrize("peer_status", ["node_local", "cross_node", "unknown"])
 @pytest.mark.parametrize("shard_rank", [0, 1])
@@ -339,6 +354,7 @@ def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, caplog
         assert reason in message
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
     shard_group, replica_a, replica_b = object(), object(), object()
     calls = []
@@ -359,6 +375,7 @@ def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
     assert calls == [shard_group, replica_a, replica_b]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "float16", "float32"])
 def test_low_precision_rs_flag_configuration_reaches_builder(monkeypatch, enabled, param_dtype):
@@ -396,6 +413,7 @@ def test_low_precision_rs_flag_configuration_reaches_builder(monkeypatch, enable
     assert calls[0]["mixed_precision"].param_dtype == param_dtype
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("enabled", [False, True])
 def test_low_precision_rs_flag_yaml_and_cli(monkeypatch, tmp_path, enabled):
     path = tmp_path / "fsdp.yaml"
@@ -408,6 +426,7 @@ def test_low_precision_rs_flag_yaml_and_cli(monkeypatch, tmp_path, enabled):
     assert parse_args(FSDPConfig).low_precision_reduce_scatter_comm is not enabled
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("value", [None, "false", "true", "bfloat16", 0, 1, []])
 def test_low_precision_rs_flag_requires_boolean(monkeypatch, value):
     with pytest.raises(ValueError, match="must be a boolean"):
@@ -417,11 +436,13 @@ def test_low_precision_rs_flag_requires_boolean(monkeypatch, value):
         torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), low_precision_reduce_scatter_comm=value)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_low_precision_rs_flag_defaults_off_and_skips_precision_inspection():
     assert FSDPConfig().low_precision_reduce_scatter_comm is False
     assert not validate_low_precision_reduce_scatter_comm(False, object())
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dp_mode", ["ddp", "eager"])
 @pytest.mark.parametrize("flag", [True, "false", None, 0])
 def test_public_builder_rejects_unsupported_flags_before_side_effects(monkeypatch, dp_mode, flag):
@@ -436,6 +457,7 @@ def test_public_builder_rejects_unsupported_flags_before_side_effects(monkeypatc
         torch_parallelize.build_parallelize_model(model, low_precision_reduce_scatter_comm=flag)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("flag", [False, True])
 def test_public_ddp_builder_preserves_native_bypass(monkeypatch, flag):
     monkeypatch.setattr(
@@ -456,6 +478,7 @@ def test_public_ddp_builder_preserves_native_bypass(monkeypatch, flag):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_public_singleton_fsdp_builder_preserves_native_path(monkeypatch):
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(
@@ -475,6 +498,7 @@ def test_public_singleton_fsdp_builder_preserves_native_path(monkeypatch):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("param_dtype", [None, "bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("reduce_dtype", [None, "bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
@@ -485,6 +509,7 @@ def test_disabled_transport_does_not_constrain_precision(param_dtype, reduce_dty
     assert not validate_low_precision_reduce_scatter_comm(False, mixed_precision, fsdp_mode="ddp")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
 def test_enabled_equal_dtypes_keep_native_path(dtype, enable):
@@ -494,6 +519,7 @@ def test_enabled_equal_dtypes_keep_native_path(dtype, enable):
     assert not validate_low_precision_reduce_scatter_comm(True, mixed_precision, fsdp_mode="ddp")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "float16"])
 def test_enabled_transport_inherits_parameter_precision(param_dtype):
     mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype, reduce_dtype="float32")
@@ -503,6 +529,7 @@ def test_enabled_transport_inherits_parameter_precision(param_dtype):
         FSDPConfig(fsdp_mode="ddp", mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=True)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("param_dtype", "reduce_dtype", "enable"),
     [
@@ -538,6 +565,7 @@ def test_unsupported_precision_is_rejected_before_backend_check(monkeypatch, par
     assert str(direct_error.value) == str(config_error.value)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_matching_transport_round_trip_preserves_all_finite_16bit_values(dtype):
     values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(dtype)
@@ -554,6 +582,7 @@ def mock_fsdp_builder(monkeypatch):
     return state
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
 @pytest.mark.parametrize("low_precision_comm", [False, True])
@@ -583,6 +612,7 @@ def test_native_transport_does_not_register_custom_collective(
     assert result is model
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("transport_dtype", ["bfloat16", "float16"])
 @pytest.mark.parametrize("node_local", [False, True])
 def test_parallelize_registers_transport_only_for_eligible_mesh(
@@ -626,6 +656,7 @@ def test_parallelize_registers_transport_only_for_eligible_mesh(
     assert topology_calls == [mock_fsdp_builder.fsdp_mesh]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dense_eligible", [False, True])
 @pytest.mark.parametrize("expert_eligible", [False, True])
 def test_parallelize_checks_dense_and_expert_meshes_independently(
@@ -980,17 +1011,18 @@ def _run_transport_policy_fsdp2_gradients(fsdp_mesh, hsdp_mesh, device):
         reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = original_comm_class
 
 
+def _run_reduce_scatter_nccl_and_fsdp2_step() -> None:
+    steps = [_run_reduce_scatter_nccl, _run_fsdp2_optimizer_step]
+    if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        steps = list(reversed(steps))
+    for step_fn in steps:
+        step_fn()
+        dist.barrier()
+
+
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
 def test_reduce_scatter_fp32_accumulation_nccl():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_reduce_scatter_nccl, world_size=_CI_ACCELERATOR_4.nproc)
-
-
-@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
-def test_reduce_scatter_fp32_accumulation_fsdp2_step():
-    from ..tools.launch_utils import torchrun
-
-    torchrun(_run_fsdp2_optimizer_step, world_size=_CI_ACCELERATOR_4.nproc)
+    torchrun(_run_reduce_scatter_nccl_and_fsdp2_step, world_size=_CI_ACCELERATOR_4.nproc)

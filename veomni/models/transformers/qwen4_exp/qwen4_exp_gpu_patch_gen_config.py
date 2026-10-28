@@ -67,6 +67,7 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
     local_packed_boundary_indices,
     local_packed_positions,
 )
+from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -150,6 +151,9 @@ def qwen4_exp_text_mlp_forward_patched(self, x):
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+config.add_import(
+    "veomni.models.transformers.qwen4_exp.qsa_metadata", names=["PreparedQSAMetadata", "prepare_qsa_metadata"]
+)
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
@@ -172,6 +176,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads"],
 )
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.config", names=["resolve_op_impl"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
@@ -438,26 +443,36 @@ def qwen4_exp_gated_deltanet_forward_patched(
         local_value_dim = local_num_v_heads * self.head_v_dim
 
         q_proj, k_proj, v_proj = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        q_proj = gather_seq_scatter_heads(
-            q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        k_proj = gather_seq_scatter_heads(
-            k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        v_proj = gather_seq_scatter_heads(
-            v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=sp_group)
-        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=sp_group)
+        if q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
+            q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(
+                q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
+                b,
+                a,
+                sp_group,
+            )
+        else:
+            q_proj = gather_seq_scatter_heads(
+                q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            k_proj = gather_seq_scatter_heads(
+                k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            v_proj = gather_seq_scatter_heads(
+                v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=sp_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=sp_group)
         mixed_qkv = torch.cat(
             (
                 q_proj.flatten(2),
@@ -674,6 +689,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
     past_key_values: Cache | None,
     cu_seq_lens_q: torch.Tensor | None = None,
     packed_seq_lens: list[int] | tuple[int, ...] | None = None,
+    qsa_metadata: PreparedQSAMetadata | None = None,
 ) -> torch.Tensor:
     # --- Patch.1: Select compact global QSA token indices for local queries under Ulysses/CP. ---
     # Using sequence-local RoPE inputs and gathering only the compressed keys
@@ -686,6 +702,8 @@ def qwen4_exp_qsa_indexer_forward_patched(
     _, group, rank, world_size = _qwen4_exp_sequence_parallel_state(parallel_state)
     batch_size, local_seq_len, _ = hidden_states.shape
     global_seq_len = local_seq_len * world_size
+    if global_seq_len + self.compress_ratio > torch.iinfo(torch.int32).max:
+        raise ValueError("Qwen4-Exp compact QSA token positions must fit int32, including compression padding.")
     if self.index_kv_heads != 1:
         raise ValueError(f"Qwen4-Exp compact QSA currently requires one indexer KV head; got {self.index_kv_heads}.")
     if self.compress_ratio > local_seq_len:
@@ -707,83 +725,29 @@ def qwen4_exp_qsa_indexer_forward_patched(
     local_start = rank * local_seq_len
     q, _ = self.veomni_rope(q, q, local_cos, local_sin, unsqueeze_dim=2)
 
-    if cu_seq_lens_q is None:
-        segments = [(batch_idx, 0, global_seq_len) for batch_idx in range(batch_size)]
-    else:
-        # --- Patch.2: Prefer the host-side packed lengths exported once by the
-        # model forward; only direct callers without them pay one GPU->CPU sync. ---
-        if packed_seq_lens is None:
-            boundaries = [int(value) for value in cu_seq_lens_q.tolist()]
-        else:
-            boundaries = [0]
-            for length in packed_seq_lens:
-                boundaries.append(boundaries[-1] + length)
-        # --- Patch.2 ---
-        if not boundaries or boundaries[0] != 0 or boundaries[-1] != batch_size * global_seq_len:
-            raise ValueError(
-                "Qwen4-Exp compact QSA requires cu_seq_lens_q to cover the complete padded batch; "
-                f"got endpoints {boundaries[:1]}..{boundaries[-1:]}, expected 0..{batch_size * global_seq_len}."
-            )
-        segments = []
-        for flat_start, flat_end in zip(boundaries, boundaries[1:]):
-            if flat_end <= flat_start:
-                raise ValueError("Qwen4-Exp compact QSA requires strictly increasing cu_seq_lens_q.")
-            batch_idx = flat_start // global_seq_len
-            if (flat_end - 1) // global_seq_len != batch_idx:
-                raise ValueError("Qwen4-Exp compact QSA packed samples may not cross the batch dimension.")
-            segments.append(
-                (
-                    batch_idx,
-                    flat_start - batch_idx * global_seq_len,
-                    flat_end - batch_idx * global_seq_len,
-                )
-            )
-
-    segment_ids = torch.empty((batch_size, global_seq_len), dtype=torch.long, device=hidden_states.device)
-    segment_starts = torch.empty_like(segment_ids)
-    for segment_id, (batch_idx, start, end) in enumerate(segments):
-        segment_ids[batch_idx, start:end] = segment_id
-        segment_starts[batch_idx, start:end] = start
-
-    blocks = [
-        (segment_id, batch_idx, start)
-        for segment_id, (batch_idx, segment_start, segment_end) in enumerate(segments)
-        for start in range(segment_start, segment_end - self.compress_ratio + 1, self.compress_ratio)
-    ]
-    owned_blocks = [block for block in blocks if block[2] // local_seq_len == rank]
-    gathered_blocks = [block for owner in range(world_size) for block in blocks if block[2] // local_seq_len == owner]
-    # --- Patch.3: Upload all host-derived block metadata in one flat H2D copy. ---
-    # The previous per-list ``torch.tensor(..., device=...)`` calls each blocked
-    # the host on a pageable copy once per full-attention layer; batching them
-    # into a single flat upload leaves one (unavoidable without a pinned
-    # staging buffer) copy for the whole indexer call.
-    count_list = [
-        sum(block_start // local_seq_len == owner for _, _, block_start in blocks) for owner in range(world_size)
-    ]
-    local_batch_id_list = [batch_idx for _, batch_idx, _ in owned_blocks]
-    local_block_start_list = [start for _, _, start in owned_blocks]
-    gathered_segment_id_list = [segment_id for segment_id, _, _ in gathered_blocks]
-    gathered_start_list = [start for _, _, start in gathered_blocks]
-    meta_sections = (
-        count_list,
-        local_batch_id_list,
-        local_block_start_list,
-        gathered_segment_id_list,
-        gathered_start_list,
-    )
-    flat_meta = torch.tensor([value for section in meta_sections for value in section], dtype=torch.long).to(
-        hidden_states.device
-    )
-    counts_end = len(count_list)
-    local_ids_end = counts_end + len(local_batch_id_list)
-    local_starts_end = local_ids_end + len(local_block_start_list)
-    gathered_seg_ids_end = local_starts_end + len(gathered_segment_id_list)
-    counts = flat_meta[:counts_end]
-    local_batch_ids = flat_meta[counts_end:local_ids_end]
-    local_block_starts = flat_meta[local_ids_end:local_starts_end]
-    block_segment_ids = flat_meta[local_starts_end:gathered_seg_ids_end]
-    block_starts = flat_meta[gathered_seg_ids_end:]
-    # --- Patch.3 ---
+    # Reuse tensors prepared once outside the decoder/checkpointed layer loop.
+    # Direct component callers retain the same boundary validation and layout.
+    if qsa_metadata is None:
+        qsa_metadata = prepare_qsa_metadata(
+            batch_size,
+            local_seq_len,
+            self.compress_ratio,
+            rank,
+            world_size,
+            hidden_states.device,
+            cu_seq_lens_q,
+            packed_seq_lens,
+        )
+    if qsa_metadata.layout != (batch_size, local_seq_len, self.compress_ratio, rank, world_size):
+        raise ValueError("Qwen4-Exp QSA metadata does not match the current sequence-parallel layout.")
+    if qsa_metadata.local_segment_ids.device != hidden_states.device:
+        raise ValueError("Qwen4-Exp QSA metadata must be on the hidden states' device.")
+    local_batch_ids = qsa_metadata.local_batch_ids
+    local_block_starts = qsa_metadata.local_block_starts
+    block_segment_ids = qsa_metadata.block_segment_ids
+    block_starts = qsa_metadata.block_starts
+    local_segment_ids = qsa_metadata.local_segment_ids
+    local_segment_starts = qsa_metadata.local_segment_starts
 
     halo = self.compress_ratio - 1
     if halo == 0 or world_size == 1:
@@ -797,7 +761,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
             right_halo = prefixes[:, halo_start : halo_start + halo]
     extended_keys = torch.cat((raw_keys, right_halo), dim=1)
 
-    if owned_blocks:
+    if local_batch_ids.numel():
         local_offsets = local_block_starts - local_start
         window_indices = local_offsets[:, None] + torch.arange(self.compress_ratio, device=hidden_states.device)[None]
         pooled_keys = extended_keys[local_batch_ids[:, None], window_indices].float().mean(dim=1).to(raw_keys.dtype)
@@ -818,16 +782,14 @@ def qwen4_exp_qsa_indexer_forward_patched(
         pooled_keys = self.k_layernorm(extended_keys[:, :0]).reshape(1, 0, self.index_head_dim)
 
     if world_size > 1:
-        pooled_keys = all_gather_compressed_rows(pooled_keys, counts, group)
+        pooled_keys = all_gather_compressed_rows(pooled_keys, qsa_metadata.counts, group)
     output_width = self.token_budget + self.compress_ratio - 1
     query_positions = local_start + torch.arange(local_seq_len, device=hidden_states.device)
-    local_segment_ids = segment_ids[:, local_start : local_start + local_seq_len]
-    local_segment_starts = segment_starts[:, local_start : local_start + local_seq_len]
 
-    if gathered_blocks:
-        top_count = min(self.block_topk, len(gathered_blocks))
-        block_offsets = torch.arange(self.compress_ratio, device=hidden_states.device)
-        elements_per_query = max(1, batch_size * len(gathered_blocks) * self.index_n_heads)
+    if block_starts.numel():
+        top_count = min(self.block_topk, block_starts.numel())
+        block_offsets = torch.arange(self.compress_ratio, dtype=torch.int32, device=hidden_states.device)
+        elements_per_query = max(1, batch_size * block_starts.numel() * self.index_n_heads)
         query_chunk_size = max(1, min(local_seq_len, 16 * 1024 * 1024 // elements_per_query))
         selected_chunks = []
         for query_start in range(0, local_seq_len, query_chunk_size):
@@ -844,8 +806,12 @@ def qwen4_exp_qsa_indexer_forward_patched(
             )
             scores = scores.masked_fill(~visible, float("-inf"))
             top_blocks = scores.topk(top_count, dim=-1).indices
-            top_valid = visible.gather(-1, top_blocks)
-            selected_starts = block_starts[top_blocks]
+            top_valid = (
+                visible.to(torch.int8).gather(-1, top_blocks).bool()
+                if hidden_states.device.type == "npu"
+                else visible.gather(-1, top_blocks)
+            )
+            selected_starts = block_starts[top_blocks].to(torch.int32)
             selected_chunk = selected_starts[..., None] + block_offsets
             selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))
         selected_local = torch.cat(selected_chunks, dim=1)
@@ -866,7 +832,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
     )
     tail_offsets = torch.arange(self.compress_ratio - 1, device=hidden_states.device)
     tails = tail_start[..., None] + tail_offsets
-    tails = tails.masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
+    tails = tails.to(torch.int32).masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
 
     selected_local = torch.cat((selected_local, tails), dim=-1)
     if selected_local.shape[-1] < output_width:
@@ -924,6 +890,7 @@ def qwen4_exp_text_attention_forward_patched(
         past_key_values,
         cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
         packed_seq_lens=kwargs.get("packed_seq_lens"),
+        qsa_metadata=kwargs.pop("qsa_metadata", None),
     )
     # --- Patch.4 ---
     input_shape = hidden_states.shape[:-1]
@@ -1525,6 +1492,7 @@ def qwen4_exp_text_decoder_layer_forward_patched(
     packed_seq_lens: list[int] | tuple[int, ...] | None = None,
     ple_packed_positions: torch.Tensor | None = None,
     ple_packed_boundary_indices: torch.Tensor | None = None,
+    qsa_metadata: PreparedQSAMetadata | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> torch.FloatTensor:
     # --- Patch.1: Thread the packed boundaries into the PLE token mixers. ---
@@ -1565,6 +1533,7 @@ def qwen4_exp_text_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cu_seq_lens_q=cu_seq_lens_q,
             packed_seq_lens=packed_seq_lens,
+            qsa_metadata=qsa_metadata,
             **kwargs,
         )
 
@@ -1732,6 +1701,22 @@ def qwen4_exp_text_model_forward_patched(
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
     hidden_states = hidden_states.repeat(1, 1, self.config.hc_count)
 
+    # Integer metadata is independent of layer weights and hidden-state values.
+    # Keep it local to this forward so checkpoint recomputation can reuse it,
+    # without retaining device tensors in the cross-batch host cache.
+    qsa_metadata = None
+    if not cache_active and "full_attention" in getattr(self.config, "layer_types", ()):
+        qsa_metadata = prepare_qsa_metadata(
+            inputs_embeds.shape[0],
+            inputs_embeds.shape[1],
+            self.config.indexer_compress_ratio,
+            sp_rank,
+            sp_size,
+            inputs_embeds.device,
+            cu_seq_lens_q,
+            packed_seq_lens,
+        )
+
     # --- Patch.4: Run the patched decoder layers and restore the output layout. ---
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(
@@ -1746,6 +1731,7 @@ def qwen4_exp_text_model_forward_patched(
             packed_seq_lens=packed_seq_lens,
             ple_packed_positions=ple_packed_positions,
             ple_packed_boundary_indices=ple_packed_boundary_indices,
+            qsa_metadata=qsa_metadata,
             **kwargs,
         )
     # --- Patch.4 ---
