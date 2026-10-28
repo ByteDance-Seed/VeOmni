@@ -178,10 +178,10 @@ by this adapter:
 - A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
 Before selecting the `fla_npu` backend in either image, replace its legacy package using the
-`v26.10.0` wheel installation steps below. Follow the same steps on a bare host or an A5
+`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an A5
 system, selecting the matching SoC target. A compatible A5 image is not listed here.
 
-Build and install the `v26.10.0` wheel from the
+Build and install the `a7c608f` wheel from the
 [`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
 The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
 your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
@@ -193,7 +193,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu
 cd flash-linear-attention-npu
-git checkout v26.10.0
+git checkout a7c608f
 
 # Build dependencies of the operator library only.
 python -m pip install -r requirements.txt
@@ -213,7 +213,7 @@ python scripts/check_packaged_wheel_api.py
 (`build.sh --pkg`), no install into `$ASCEND_OPP_PATH/vendors` and no separate
 `torch_custom/fla_npu` build are needed any more.
 
-Coming from `v26.6.0` or earlier, uninstall the old package and delete its leftovers under
+Coming from `a7c608f` or earlier, uninstall the old package and delete its leftovers under
 `site-packages` (`fla_npu/`, `custom_aclnn_extension_lib*.so`, any self-built `libopapi.so`)
 before running the steps above. The call entry moved from `torch.ops.npu.*` / `torch_npu.ops.*`
 to `fla_npu.ops.ascendc`, and the legacy `torch.ops.npu.*` path is no longer enabled by default;
