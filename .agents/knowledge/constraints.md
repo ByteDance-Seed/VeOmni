@@ -264,6 +264,8 @@ Core files:
 - `model.accelerator.cp_layout` defaults to `contiguous` for DeepSeek V4.
   USP requires explicit `zigzag`; only this layout pads documents to `2*cp_size`
   and reorders them. Include layout in the parallel-state cache key.
+- Reject CP with async Ulysses in both accelerator arguments and direct ParallelState
+  construction, before mesh initialization. Async callers skip attention-side collectives.
 - USP model builds currently allow only Qwen3 with VeOmni FA2/FA4 and
   `MODELING_BACKEND=veomni`. RL/DPO, deterministic backward and
   unsupported attention modifiers must fail before training rather than silently

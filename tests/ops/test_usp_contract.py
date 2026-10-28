@@ -352,3 +352,24 @@ def test_npu_adapter_uses_shared_dispatch_without_cuda_backend(monkeypatch, pack
     assert calls[0]["device_type"] == "npu"
     assert calls[0]["backend_name"] is None
     assert (calls[0]["usp_metadata"] is not None) == packed
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "zigzag"])
+@pytest.mark.parametrize("entry", ["arguments", "state"])
+def test_async_cp_is_rejected_before_mesh_initialization(monkeypatch, layout, entry):
+    from veomni.distributed.parallel_state import ParallelState
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(NotImplementedError, match="async"):
+        if entry == "arguments":
+            AcceleratorConfig(cp_size=2, cp_layout=layout, enable_async=True)
+        else:
+            ParallelState(cp_size=2, cp_layout=layout, async_enabled=True)
+
+
+def test_async_without_cp_remains_supported(monkeypatch):
+    from veomni.distributed.parallel_state import ParallelState
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    assert AcceleratorConfig(enable_async=True).enable_async
+    assert ParallelState(async_enabled=True).async_enabled
