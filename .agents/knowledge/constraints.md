@@ -253,7 +253,7 @@ Core files:
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
-    - `_Gather.backward` and `_GatherConcatSP.backward` must clone the incoming gradient (`grad_output.clone(memory_format=torch.contiguous_format)`) before running an in-place `dist.all_reduce`. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients across layouts for `_Gather`.
+    - `_Gather.backward` uses out-of-place NCCL reduce-scatter (`reduce_scatter_tensor` for equal shards, `reduce_scatter` for uneven shards) into a freshly allocated local `grad_input` buffer, and clones `grad_output` (`grad_output.clone(memory_format=torch.contiguous_format)`) before running an in-place `dist.all_reduce` on other backends (`_GatherConcatSP.backward` likewise clones before `dist.all_reduce`). Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients across layouts for `_Gather`.
 
 29. **Saved RoPE table metadata must stay stable across checkpoint recomputation**
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.

@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from ...utils.device import get_device_id
+from ...utils.device import get_device_id, is_nccl_backend
 from .comm import (
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
@@ -257,15 +257,30 @@ class _Gather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
-        """All-reduce when ``sum_grad`` is enabled, slice this rank's shard, and optionally scale."""
-        if ctx.sum_grad:
+        """Reduce across the SP group when ``sum_grad`` is enabled, slice this rank's shard, and optionally scale."""
+        if not ctx.sum_grad:
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
+        elif is_nccl_backend(dist.get_backend(ctx.group)):
+            dim = ctx.dim % grad_output.ndim
+            shape = list(grad_output.shape)
+            shape[dim] = ctx.dim_size_list[ctx.rank]
+            grad_input = torch.empty(shape, dtype=grad_output.dtype, device=grad_output.device)
+            if len(set(ctx.dim_size_list)) == 1:
+                packed = (
+                    grad_output.unflatten(dim, (ctx.seq_world_size, ctx.dim_size_list[0])).movedim(dim, 0).contiguous()
+                )
+                dist.reduce_scatter_tensor(grad_input, packed, group=ctx.group)
+            else:
+                chunks = [chunk.contiguous() for chunk in grad_output.split(ctx.dim_size_list, dim=dim)]
+                dist.reduce_scatter(grad_input, chunks, group=ctx.group)
+        else:
             grad_output = grad_output.clone(memory_format=torch.contiguous_format)
             dist.all_reduce(grad_output, group=ctx.group)
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
 
-        grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank]
         if ctx.grad_scale:
             grad_input = grad_input * ctx.seq_world_size
-        return None, grad_input.contiguous(), None, None, None
+        return None, grad_input, None, None, None
 
 
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
