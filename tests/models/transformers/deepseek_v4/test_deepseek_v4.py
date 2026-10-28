@@ -162,8 +162,9 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-@pytest.mark.parametrize("impl", ["eager", "fused_triton"])
+@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
+    """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -176,6 +177,7 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     captured = {}
 
     def record(*args, **kwargs):
+        """Record positional and keyword arguments passed to ``veomni_moe``."""
         captured["args"] = args
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
@@ -186,8 +188,8 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     kwargs = captured["kwargs"]
 
     assert args[0] is hidden_states
-    expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
-    torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
+    assert args[1] is top_k_weights
+    torch.testing.assert_close(args[1], top_k_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert args[3].numel() == 0
     assert args[4].numel() == 0
@@ -199,6 +201,55 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         "assume_distinct_experts": True,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
+
+
+def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
+    """Select FP8 through the public config and execute the real expert module."""
+    from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
+    if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
+        pytest.skip("NVIDIA Hopper or Blackwell is required.")
+    if get_torch_device().get_device_capability() not in ((9, 0), (10, 0)):
+        pytest.skip("Requires SM90 or SM100.")
+    pytest.importorskip("deep_gemm")
+    from deep_gemm.testing import calc_diff
+
+    from tests.ops.moe_experts.reference import standard_ep_reference
+    from veomni.arguments import OpsImplementationConfig
+
+    config = SimpleNamespace(
+        num_local_experts=4,
+        hidden_size=256,
+        intermediate_size=128,
+        hidden_act="silu",
+        swiglu_limit=10.0,
+    )
+    device = get_device_type()
+    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
+    with ops_config_scope(ops):
+        experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
+    assert experts.veomni_moe.impl == "deepgemm_fp8"
+    torch.manual_seed(91)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(std=0.03)
+        experts.down_proj.normal_(std=0.03)
+    x = torch.randn(131, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+    routing = torch.rand(131, 2, device=device, requires_grad=True)
+    indices = torch.randint(0, config.num_local_experts - 1, (131, 2), device=device)
+    grad = torch.randn_like(x) * 0.1
+    y = experts(x, indices, routing)
+    actual = (y, *torch.autograd.grad(y, (x, routing, experts.gate_up_proj, experts.down_proj), grad))
+    xr, rr, w1, w2 = (
+        t.detach().clone().requires_grad_() for t in (x, routing, experts.gate_up_proj, experts.down_proj)
+    )
+    gate, up = w1.chunk(2, dim=1)
+    yr = standard_ep_reference(xr, rr, indices, gate, up, w2, num_experts=config.num_local_experts, swiglu_limit=10.0)
+    expected = (yr, *torch.autograd.grad(yr, (xr, rr, w1, w2), grad))
+    for result, reference in zip(actual, expected):
+        assert torch.isfinite(result).all()
+        assert calc_diff(result, reference) < 0.004
+    assert torch.count_nonzero(actual[-1][-1]) == 0
+    assert torch.count_nonzero(actual[-2][-1]) == 0
 
 
 def test_deepseek_v4_sparse_moe_block_opts_topk_layers_into_tight_max_m_bound():

@@ -97,3 +97,48 @@ def test_resolve_op_impl_preserves_variant_scoped_npu_compatibility(impl):
             from veomni.ops import VeomniOp
 
             assert VeomniOp("rms_norm", "unweighted", resolved).impl == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("parse_config", [False, True], ids=["dataclass", "parser"])
+def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_config):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.arguments.parser import _instantiate_recursive
+
+    # An invalid combination must report the config conflict even without CUDA.
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
+    values = {"moe_implementation": "deepgemm_fp8", "qat_implementation": "fp8_blockwise"}
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise") as error:
+        if parse_config:
+            _instantiate_recursive(OpsImplementationConfig, values)
+        else:
+            OpsImplementationConfig(**values)
+    assert "Set qat_implementation='none'" in str(error.value)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"moe_implementation": "deepgemm_fp8"},
+        {"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
+        {"moe_implementation": None, "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "eager", "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "fused_quack", "qat_implementation": "fp8_blockwise"},
+    ],
+)
+def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
+    from veomni.arguments import OpsImplementationConfig
+
+    # Model a supported QAT host without initializing an accelerator context.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
+
+    config = OpsImplementationConfig(**values)
+    assert config.moe_implementation == values["moe_implementation"]
+    assert config.qat_implementation == values.get("qat_implementation", "none")

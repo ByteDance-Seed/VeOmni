@@ -48,6 +48,7 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -71,6 +72,10 @@ config.add_import("types", names=["SimpleNamespace"])
 # build cu_seqlens and pad window indices, so re-add the alias here.
 config.add_import("torch.nn.functional", alias="F", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
+)
 config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_outputs", "slice_input_tensor", "pad_tensor", "sp_pad_and_slice", "unpad_tensor"],
@@ -1255,6 +1260,13 @@ def qwen2_5_vl_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=self.veomni_attn.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
+
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -1265,7 +1277,7 @@ def qwen2_5_vl_attention_forward_patched(
         scaling=self.scaling,
         sliding_window=self.sliding_window,
         position_ids=position_ids,
-        **kwargs,
+        **attn_kwargs,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

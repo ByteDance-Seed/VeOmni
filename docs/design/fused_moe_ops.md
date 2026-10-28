@@ -33,6 +33,20 @@ Routing weights remain applied after FC2, and the saved tensors and backward
 formulas are unchanged. ROCm and MLU retain their ATen activation inside
 `merged_swiglu_forward`.
 
+## EP tensor lifetimes
+
+The shared EP dispatcher and the Quack EP path release the one-hot expert
+mask after `token_pre_all2all` has produced the routing map. They also drop
+their local reference to the dispatched tokens after the expert function;
+autograd retains any input needed by backward.
+
+Quack's split and merged EP backward functions unpack saved tensors, then
+call `ctx.maybe_clear_saved_tensors()` before releasing intermediates at
+their last use. This allows storage to be reclaimed during backward rather
+than only when it returns. PyTorch preserves the saved state when
+`retain_graph=True`. The GEMMs, activation rounding, routing weights and
+FP32 combine accumulation are unchanged.
+
 ## Backward grouped-GEMM launch bound
 
 For `group_gemm_same_nk`, `max_M` is a per-expert launch bound. It must cover

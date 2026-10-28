@@ -312,34 +312,6 @@ def _dispatch_parameter(
         module._parameters[local_name].data.copy_(tensor)
 
 
-def _get_buffer_aliases(model: "nn.Module") -> Dict[str, str]:
-    """Record tensor-identity aliases before ``to_empty`` splits registrations."""
-    groups: Dict[int, List[str]] = {}
-    for name, buffer in model.named_buffers(remove_duplicate=False):
-        groups.setdefault(id(buffer), []).append(name)
-    return {name: names[0] for names in groups.values() if len(names) > 1 for name in names}
-
-
-def _restore_buffer_aliases(model: "nn.Module", aliases: Dict[str, str], source_prefix: Optional[str] = None) -> None:
-    """Rebind aliases after dispatch, including dispatch that replaces DTensors.
-
-    Composed-model loaders can select the just-loaded child as the source, so
-    the next child's snapshot sees the loaded value rather than stale config.
-    Registration persistence flags are deliberately left unchanged.
-    """
-    sources = {}
-    for name, canonical in aliases.items():
-        if source_prefix is None:
-            sources.setdefault(canonical, canonical)
-        elif name.startswith(source_prefix):
-            sources.setdefault(canonical, name)
-    buffers = {canonical: model.get_buffer(name) for canonical, name in sources.items()}
-    for name, canonical in aliases.items():
-        if canonical in buffers:
-            module, local_name = _find_submodule(model, name)
-            module._buffers[local_name] = buffers[canonical]
-
-
 def _dispatch_buffer(
     module: "nn.Module",
     name: str,
@@ -445,7 +417,6 @@ def load_model_weights(
     """
     Loads pre-trained model states in transformers' format.
     """
-    buffer_aliases = _get_buffer_aliases(model)
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
@@ -477,9 +448,8 @@ def load_model_weights(
     state_dict_iterators = _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
-        buffer_name = buffer_aliases.get(name, name)
-        if buffer_name in buffer_dict:  # persistent buffers, including noncanonical aliases
-            buffer_dict[buffer_name] = tensor.clone()
+        if name in buffer_dict.keys():  # persistent buffers
+            buffer_dict[name] = tensor.clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.remove(name)
             _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
@@ -522,12 +492,7 @@ def load_model_weights(
         )
 
     post_process_after_weight_loading(
-        model,
-        buffer_dict,
-        parameter_names_to_load,
-        dtensor_factory,
-        dtensor_to_cpu=dtensor_to_cpu,
-        buffer_aliases=buffer_aliases,
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
 
     fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
@@ -803,7 +768,6 @@ def load_model_weights_ep_sharded(
                     f"'{_pname}' pattern '{_fqn_pattern}' uses Shard({_dim})."
                 )
 
-    buffer_aliases = _get_buffer_aliases(model)
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     params_by_name = dict(model.named_parameters())
     param_shapes = {name: tuple(p.shape) for name, p in params_by_name.items()}
@@ -931,9 +895,8 @@ def load_model_weights_ep_sharded(
                 f"ep_sharded_stream_load: converter emitted ExtraParallel key '{dest}' from non-expert "
                 f"source '{source}'. Per-expert keys must go through fused_expert_target / for_expert_range."
             )
-        buffer_name = buffer_aliases.get(dest, dest)
-        if buffer_name in buffer_dict:
-            buffer_dict[buffer_name] = converted.tensor.clone()
+        if dest in buffer_dict:
+            buffer_dict[dest] = converted.tensor.clone()
             n_buf += 1
         elif dest in parameter_names_to_load:
             _dispatch_parameter(model, dest, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
@@ -1000,9 +963,8 @@ def load_model_weights_ep_sharded(
                     if converted is not None:
                         _dispatch_whole_converted(converted, bare_name)
                     continue
-                buffer_name = buffer_aliases.get(name, name)
-                if buffer_name in buffer_dict:  # persistent buffers: read whole, including aliases
-                    buffer_dict[buffer_name] = f.get_tensor(raw_name).clone()
+                if name in buffer_dict:  # persistent buffers: read whole
+                    buffer_dict[name] = f.get_tensor(raw_name).clone()
                     n_buf += 1
                     continue
                 if name not in parameter_names_to_load:
@@ -1100,7 +1062,7 @@ def load_model_weights_ep_sharded(
         # whole-tensor loader does.
         for result in expert_converter.finalize():
             dest = _apply_peft_override(result.name)
-            if dest in parameter_names_to_load or buffer_aliases.get(dest, dest) in buffer_dict:
+            if dest in parameter_names_to_load or dest in buffer_dict:
                 raise NotImplementedError(
                     f"ep_sharded_stream_load: expert-range converter emitted '{dest}' at finalize time; "
                     f"rank-local finalize outputs cannot be dispatched."
@@ -1132,12 +1094,7 @@ def load_model_weights_ep_sharded(
         )
 
     post_process_after_weight_loading(
-        model,
-        buffer_dict,
-        parameter_names_to_load,
-        dtensor_factory,
-        dtensor_to_cpu=dtensor_to_cpu,
-        buffer_aliases=buffer_aliases,
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
 
     fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
@@ -1266,7 +1223,6 @@ def rank0_load_and_broadcast_weights(
         logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
         return load_model_weights(model, weights_path, init_device, dtensor_factory, **kwargs)
 
-    buffer_aliases = _get_buffer_aliases(model)
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
@@ -1319,9 +1275,8 @@ def rank0_load_and_broadcast_weights(
         if broadcast_as_bytes:
             tensor = _view_from_bytes(broadcast_tensor, dtype, shape)
 
-        buffer_name = buffer_aliases.get(name, name)
-        if buffer_name in buffer_dict:
-            buffer_dict[buffer_name] = tensor.detach().clone()
+        if name in buffer_dict:
+            buffer_dict[name] = tensor.detach().clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.discard(name)
             _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
@@ -1378,7 +1333,7 @@ def rank0_load_and_broadcast_weights(
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
         logger.info_rank0(f"rank0_load_and_broadcast_weights: chunking and broadcasting {name=}")
 
-        assert buffer_aliases.get(name, name) not in buffer_dict, f"Buffer {name} should not be chunked."
+        assert name not in buffer_dict, f"Buffer {name} should not be chunked."
         assert name in parameter_names_to_load, f"Unexpected key in state dict: {name}."
 
         if global_rank == 0:
@@ -1685,12 +1640,7 @@ def rank0_load_and_broadcast_weights(
         )
 
     post_process_after_weight_loading(
-        model,
-        buffer_dict,
-        parameter_names_to_load,
-        dtensor_factory,
-        dtensor_to_cpu=dtensor_to_cpu,
-        buffer_aliases=buffer_aliases,
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
 
     fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
@@ -1706,7 +1656,6 @@ def post_process_after_weight_loading(
     parameter_names_left: Optional[set[str]] = None,
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     dtensor_to_cpu: bool = False,
-    buffer_aliases: Optional[Dict[str, str]] = None,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
@@ -1741,9 +1690,6 @@ def post_process_after_weight_loading(
         except Exception as e:
             logger.info_rank0(f"Failed to tie embeddings: {e}")
             raise RuntimeError("Failed to tie input/output embeddings") from e
-
-    if buffer_aliases:
-        _restore_buffer_aliases(model, buffer_aliases)
 
 
 def _normalize_save_dtype(save_dtype: Optional[Union[str, "torch.dtype"]]) -> Optional["torch.dtype"]:
