@@ -34,6 +34,9 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     # Ascend NPU rejects Hub attention and re-resolves GPU defaults, which these name tests do not cover.
     monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
+    # Cambricon MLU rejects non-MLU values for the same reason; a simulated NPU or GPU host must
+    # not inherit a real MLU runtime when these tests run on an MLU machine.
+    monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: False)
     return messages
 
 

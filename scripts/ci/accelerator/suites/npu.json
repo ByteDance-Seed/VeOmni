@@ -32,6 +32,15 @@
     ]
   },
   {
+    "name": "qwen38-channel_loss_callback-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_channel_loss_callback.py"
+    ]
+  },
+  {
     "name": "npu-unit-03",
     "suite": "unit",
     "args": [
@@ -39,6 +48,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "npu-unit-03b",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
     ]
   },
   {

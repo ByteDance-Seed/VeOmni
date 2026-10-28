@@ -42,7 +42,7 @@ when the selected implementation runs.
 
 | Op | Variants | Implementations |
 |---|---|---|
-| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
+| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
@@ -53,18 +53,24 @@ when the selected implementation runs.
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
-| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
+
+The MLU `liger_kernel` rows reuse the CUDA adapters and use
+`MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
+liger build keeps the upstream `liger_kernel.ops.*` API, and the registry
+checks its `__mlu_version__` marker so upstream GPU liger on an MLU host is
+never selected.
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
 and derives visibility itself rather than reading a dense mask. Each row
-expands that contract its own way: `eager` and `tilelang` build explicit
+expands that contract its own way: `eager`, `tilelang`, and `triton` build explicit
 candidate slots, where repeated valid indices participate once per occurrence
 and sentinel entries contribute no attention mass, while `cann` passes mask
-modes to the kernel. With `return_lse=True`, `eager` and `tilelang` return a
-detached base-2 log-sum-exp tensor.
+modes to the kernel. With `return_lse=True`, `eager`, `tilelang`, and `triton` return a
+detached base-2 log-sum-exp tensor. The `triton` row is ROCm-only.
 
 Qwen4-Exp `qsa_attention` takes the indexer's compact `[B, S, K]` selection of
 global K/V token indices, where `-1` marks an unused slot. The selection

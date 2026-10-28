@@ -435,7 +435,11 @@ pytest -s tests/models -k your_model_type
 
 ### Level 2 — Parallel Alignment Test
 
-Add to [tests/e2e/test_e2e_parallel.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/e2e/test_e2e_parallel.py):
+Follow the [new-model coverage policy](../../transformers_v5/testing_new_model.md).
+An ordinary Omni MoE uses `(SP1, EP1)` versus `(SP2, EP2)`, with four processes
+per run and loss/grad-norm alignment. Extend the existing Omni family table
+and fixture when possible. If a new modality needs its own fixture/function,
+declare the launch plan as well as the parameter table:
 
 ```python
 your_model_test_cases = [
@@ -455,6 +459,7 @@ def dummy_your_model_dataset():
     yield train_path
     del dummy_dataset
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", your_model_test_cases)
 def test_your_model_parallel_align(
     model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset
@@ -476,7 +481,9 @@ source .venv/bin/activate
 pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
 ```
 
-Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/e2e/test_e2e_parallel.py).
+Reference: `qwen3omni_test_cases`, `test_qwen3omni_parallel_align`, and the
+imported `alignment_case_plan` in
+[tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py).
 
 ### Level 3 — End-to-End Training Test
 
