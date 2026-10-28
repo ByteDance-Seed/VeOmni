@@ -47,6 +47,7 @@ from veomni.models.diffusers.qwen_image21.qwen_image21_transformer.modeling_qwen
     QwenImage21Transformer2DModel,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -328,10 +329,10 @@ class _FakeScheduler(FlowMatchEulerDiscreteScheduler):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen-Image-2.1 condition preprocessing is GPU-only.")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Qwen-Image-2.1 condition preprocessing is GPU-only.")
 @pytest.mark.parametrize(("resolution", "latent_size"), [(512, 32), (1024, 64)])
 def test_qwen_image21_condition_uses_resolution_shifted_schedule(monkeypatch, resolution, latent_size):
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
 
     def fake_load_components(self):
         self.vae = _FakeVAE().to(device)
