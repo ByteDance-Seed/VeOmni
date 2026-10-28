@@ -210,26 +210,32 @@ def test_aiter_legacy_with_sp_name_is_rejected_on_gpu(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize("implementation", ("aiter", "veomni_flash_attention_aiter"))
-@pytest.mark.parametrize("entry", ("ops", "override", "installed"))
+@pytest.mark.parametrize("entry", ("ops", "override", "config_ops"))
 def test_aiter_build_passes_normalized_name_to_loader(
     monkeypatch: pytest.MonkeyPatch, implementation: str, entry: str
 ):
     _host(monkeypatch, on_npu=False, modeling_backend="veomni")
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, global_rank=0))
     load_model = _stub_loader(monkeypatch)
-    installed = eager_ops_config()
+    config = PretrainedConfig()
     kwargs = {}
     if entry == "ops":
         kwargs["ops_implementation"] = OpsImplementationConfig(attn_implementation=implementation)
     elif entry == "override":
+        kwargs["ops_implementation"] = eager_ops_config()
         kwargs["attn_implementation"] = implementation
     else:
-        installed = OpsImplementationConfig(attn_implementation=implementation)
+        config._set_ops_implementation(OpsImplementationConfig(attn_implementation=implementation))
 
-    with ops_config_scope(installed):
-        auto.build_foundation_model(PretrainedConfig(), init_device="cpu", **kwargs)
+    auto.build_foundation_model(config, init_device="cpu", **kwargs)
 
-    assert load_model.call_args.kwargs["init_kwargs"]["attn_implementation"] == "veomni_flash_attention_aiter"
+    init_kwargs = load_model.call_args.kwargs["init_kwargs"]
+    assert init_kwargs["config"]._attn_implementation == "veomni_flash_attention_aiter"
+    assert init_kwargs["config"].ops_config.attn_implementation == "veomni_flash_attention_aiter"
+    if entry == "override":
+        assert init_kwargs["attn_implementation"] == "veomni_flash_attention_aiter"
+    else:
+        assert "attn_implementation" not in init_kwargs
 
 
 @pytest.mark.parametrize("implementation", _AITER_IMPLEMENTATIONS)
@@ -264,10 +270,8 @@ def test_aiter_override_is_refused_before_config_load(
     build_config = _forbid_config_load(monkeypatch)
     installed = eager_ops_config()
 
-    with ops_config_scope(installed):
-        with pytest.raises(ValueError, match=error):
-            auto.build_foundation_model("unused", attn_implementation=implementation)
-        assert get_ops_config() is installed
+    with pytest.raises(ValueError, match=error):
+        auto.build_foundation_model("unused", ops_implementation=installed, attn_implementation=implementation)
 
     build_config.assert_not_called()
 

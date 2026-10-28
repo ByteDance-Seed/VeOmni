@@ -85,7 +85,7 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
         return 2
 
     # Flash kernels only accept FP16/BF16, so this FP32 comparison has to run on SDPA. With no
-    # ops config installed, `bind_flux_attention` binds `veomni_sdpa`.
+    # explicit ops_implementation on FluxConfig, PreTrainedModel.__init__ selects SDPA.
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         group = self._get_process_group()

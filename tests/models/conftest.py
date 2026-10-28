@@ -96,6 +96,7 @@ def available_nvidia_ops(monkeypatch):
     monkeypatch.setattr(op_registry, "get_device_type", lambda: GpuKernelRequirement.device)
     monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
     monkeypatch.setattr(op_registry, "is_package_available", lambda _package: True)
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", lambda *_args, **_kwargs: None)
     yield
     VeomniOp._intern.clear()
     VeomniOp._intern.update(previous_handles)

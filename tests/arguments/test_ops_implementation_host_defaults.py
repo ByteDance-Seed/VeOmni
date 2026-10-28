@@ -192,11 +192,9 @@ def test_unset_fields_resolve_to_mlu_liger_defaults(monkeypatch: pytest.MonkeyPa
     _set_host(monkeypatch, "mlu", mlu_liger=True)
     config = OpsImplementationConfig()
     assert {name: getattr(config, name) for name in _HOST_FIELDS} == dict.fromkeys(_HOST_FIELDS)
-    with ops_config_scope(config):
-        resolved = {
-            name: VeomniOp(op, variant, resolve_op_impl(name)).impl
-            for name, (op, variant) in _FIELD_OP_VARIANTS.items()
-        }
+    resolved = {
+        name: VeomniOp(op, variant, getattr(config, name)).impl for name, (op, variant) in _FIELD_OP_VARIANTS.items()
+    }
     expected = _EXPECTED_DEFAULTS["mlu"] | {
         "cross_entropy_loss_implementation": "liger_kernel",
         "rms_norm_implementation": "liger_kernel",
