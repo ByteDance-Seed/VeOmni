@@ -69,6 +69,16 @@
     ]
   },
   {
+    "name": "05b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
+    ]
+  },
+  {
     "name": "06-unit",
     "suite": "unit",
     "conditional": false,
