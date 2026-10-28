@@ -51,7 +51,16 @@ def test_exact_runtime_identity_is_checked_before_any_checkpoint_io(monkeypatch)
         "_exact_checkpoint_contract",
         lambda *a, **k: SimpleNamespace(install=lambda: None, checkpoint_identity=lambda: "provider"),
     )
-    trainer = SimpleNamespace(save_model_assets=lambda: pytest.fail("checkpoint I/O began"))
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            train_steps=100,
+            train=SimpleNamespace(
+                num_train_epochs=1,
+                checkpoint=SimpleNamespace(save_epochs=0, save_hf_weights=False, save_steps=31),
+            ),
+        ),
+        save_model_assets=lambda: pytest.fail("checkpoint I/O began"),
+    )
     callback = CheckpointCallback.__new__(CheckpointCallback)
     callback.trainer = trainer
     with pytest.raises(RuntimeError, match="runtime/source identity"):

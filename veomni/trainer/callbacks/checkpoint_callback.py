@@ -56,8 +56,18 @@ def _validate_file_profile_checkpoint_schedule(trainer):
             "set save_epochs=0 and save_hf_weights=false and use a safe step cadence"
         )
     steps, interval, epochs = args.train_steps, checkpoint.save_steps, args.train.num_train_epochs
+    verified_stop = getattr(trainer, "_veomni_exact_verified_stop_after_steps", None)
+    if verified_stop is not None and (
+        type(verified_stop) is not int
+        or verified_stop < 0
+        or verified_stop != getattr(args.train, "stop_after_steps", None)
+    ):
+        raise ValueError("File-backed checkpoint stop bound is not attested by the active trainer")
     if interval and all(type(value) is int and value > 0 for value in (steps, interval, epochs)):
-        if math.lcm(steps, interval) <= steps * epochs:
+        final_step = steps * epochs
+        if verified_stop:
+            final_step = min(final_step, verified_stop)
+        if math.lcm(steps, interval) <= final_step:
             raise ValueError(
                 "File-backed checkpoint step cadence reaches an unvalidated epoch boundary; "
                 "choose save_steps that avoids every planned epoch boundary"
@@ -102,6 +112,16 @@ class CheckpointCallback(Callback):
             except (Exception, CheckpointException) as exc:
                 error = exc
             raise_if_any_rank_failed(error, "installing the exact data checkpoint adapter")
+            require_same_rank_value(
+                (
+                    self.trainer.args.train_steps,
+                    self.trainer.args.train.num_train_epochs,
+                    self.trainer.args.train.checkpoint.save_steps,
+                    getattr(self.trainer, "_veomni_exact_verified_stop_after_steps", None),
+                    getattr(self.trainer.args.train, "stop_after_steps", None),
+                ),
+                "exact checkpoint preflight cadence",
+            )
             require_same_rank_value(identity, "data checkpoint contract identity")
             require_same_rank_value(runtime_identity, "exact resume runtime identity")
 

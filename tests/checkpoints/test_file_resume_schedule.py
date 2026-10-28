@@ -139,6 +139,27 @@ def test_file_profile_accepts_only_interior_step_saves():
     _validate_file_profile_checkpoint_schedule(trainer)
 
 
+def test_file_profile_respects_only_matching_trainer_attested_stop():
+    trainer = _trainer()
+    trainer.args.train.num_train_epochs = 1
+    trainer.args.train.checkpoint = SimpleNamespace(save_epochs=0, save_hf_weights=False, save_steps=1)
+    trainer.args.train.stop_after_steps = 2
+    with pytest.raises(ValueError, match="epoch boundary"):
+        _validate_file_profile_checkpoint_schedule(trainer)
+    trainer._veomni_exact_verified_stop_after_steps = 2
+    _validate_file_profile_checkpoint_schedule(trainer)
+    trainer._veomni_exact_verified_stop_after_steps = 3
+    with pytest.raises(ValueError, match="not attested"):
+        _validate_file_profile_checkpoint_schedule(trainer)
+    trainer._veomni_exact_verified_stop_after_steps = True
+    with pytest.raises(ValueError, match="not attested"):
+        _validate_file_profile_checkpoint_schedule(trainer)
+    trainer.args.train.stop_after_steps = 100
+    trainer._veomni_exact_verified_stop_after_steps = 100
+    with pytest.raises(ValueError, match="epoch boundary"):
+        _validate_file_profile_checkpoint_schedule(trainer)
+
+
 def test_file_profile_checks_epoch_before_writing_model_checkpoint(monkeypatch):
     from veomni.trainer.callbacks import global_state_callback
 
