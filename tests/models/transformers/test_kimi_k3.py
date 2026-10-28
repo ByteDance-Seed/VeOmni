@@ -96,6 +96,25 @@ def _packed_batch(model):
     return input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values
 
 
+def _single_image_batch(model):
+    """One un-packed sample containing one image.
+
+    Pre-merge layout ``[T0 T1 PH T2 T3]``; the image (grid 1x4x4,
+    2x2 tpool merge) expands the placeholder to 4 merged tokens, so
+    the merged row is ``[T0 T1 V0 V1 V2 V3 T2 T3]`` (8) -- a single
+    segment, like the collator emits for an un-packed sequence.
+    """
+    ignore = model.config.ignore_index
+    ph = model.config.media_placeholder_token_id
+    input_ids = torch.tensor([[10, 11, ph, 13, 14]])
+    labels = torch.tensor([[ignore, 101, ignore, 103, 104]])
+    position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+    attention_mask = torch.ones_like(input_ids)
+    grid_thws = torch.tensor([[1, 4, 4]])
+    pixel_values = torch.randn(16, 3, 14, 14)
+    return input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values
+
+
 def _spy_on_inner_model(model, recorded):
     inner_forward = model.language_model.model.forward
 
@@ -269,7 +288,7 @@ def test_packed_forward_honors_collator_all_ones_flag(dense_packed_debug):
     assert "cu_seq_lens_q" not in recorded
 
 
-def test_text_only_forward_forwards_collator_kwargs(dense_packed_debug):
+def test_text_only_forward_forwards_collator_kwargs():
     """Text-only batches keep the collator's cu_seq_lens (no expansion ran)."""
     model = _build_model()
     model.eval()
@@ -301,6 +320,47 @@ def test_text_only_forward_forwards_collator_kwargs(dense_packed_debug):
     assert torch.equal(recorded["cu_seq_lens_k"], cu)
     assert torch.equal(recorded["cu_seqlens"], cu)
     assert recorded["max_length_q"] == 4
+
+
+def test_single_sample_image_merge_metadata_runs_dense():
+    """Single-segment varlen metadata must not trip the dense-attention guard.
+
+    The collator emits ``cu_seq_lens_q`` = [0, length] for un-packed
+    sequences too, and the image-merge path rebuilds the same
+    single-segment shape over the expanded row; a dense causal mask is
+    exact for one contiguous sequence, so eager attention runs without
+    the K3_ALLOW_DENSE_PACKED escape.
+    """
+    model = _build_model()
+    model.eval()
+    input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values = _single_image_batch(model)
+    cu = torch.tensor([0, input_ids.shape[1]], dtype=torch.int32)
+
+    recorded = {}
+    inner_forward = _spy_on_inner_model(model, recorded)
+    try:
+        with torch.no_grad():
+            out = model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                grid_thws=grid_thws,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                use_cache=False,
+                cu_seq_lens_q=cu,
+                cu_seq_lens_k=cu,
+                max_length_q=5,
+                max_length_k=5,
+                linear_attn_cu_seq_lens_q=cu,
+            )
+    finally:
+        model.language_model.model.forward = inner_forward
+
+    assert out.loss is not None and torch.isfinite(out.loss)
+    # The merge rebuilt single-segment metadata over the expanded row:
+    # [T0 T1 PH T2 T3] -> [T0 T1 V0 V1 V2 V3 T2 T3] (8), boundary at 0.
+    assert recorded["cu_seq_lens_q"].tolist() == [0, 8]
 
 
 def test_packed_forward_coalesces_collator_tail_pads(dense_packed_debug):

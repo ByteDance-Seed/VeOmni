@@ -1009,22 +1009,33 @@ def kimi_k3_for_conditional_generation_forward_patched(
     # Packed varlen metadata is only honored by the varlen attention
     # implementations: the dense eager/sdpa MLA path would run one causal
     # mask across the whole merged row and leak across packed samples
-    # (eager/sdpa stay available for non-packed batches). Reject the
-    # combination instead of silently corrupting the packed batch;
-    # K3_ALLOW_DENSE_PACKED=1 re-enables the documented debug-only dense
-    # path (used by the CPU packing tests, where no varlen kernel runs).
-    if fa_kwargs.get("cu_seq_lens_q") is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
+    # (eager/sdpa stay available for non-packed batches). cu_seq_lens_q
+    # alone is not evidence of packing -- the collator emits [0, length]
+    # for plain un-packed sequences and the image-merge rebuild produces
+    # the same single-segment shape, which the dense causal mask handles
+    # exactly -- so reject only a real boundary between two non-empty
+    # segments (distinct samples sharing a row), instead of silently
+    # corrupting the packed batch. K3_ALLOW_DENSE_PACKED=1 re-enables the
+    # documented debug-only dense path (used by the CPU packing tests,
+    # where no varlen kernel runs).
+    _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
+    if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
         _attn_impl = getattr(self.config, "_attn_implementation", None)
         if _attn_impl is None:
             _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
         if _attn_impl in ("eager", "sdpa"):
-            raise ValueError(
-                f"attention_implementation={_attn_impl!r} cannot run packed batches: the dense "
-                f"causal mask does not isolate packed samples (cu_seq_lens_q varlen metadata "
-                f"is present). Use a varlen implementation (flash_attention_2 / "
-                f"veomni_flash_attention_2), disable dynamic packing, or set "
-                f"K3_ALLOW_DENSE_PACKED=1 for the documented debug-only dense path."
-            )
+            _cu_t = _cu_seq_lens_q
+            if not isinstance(_cu_t, torch.Tensor):
+                _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
+            _num_samples = int((torch.diff(_cu_t) > 0).sum())
+            if _num_samples > 1:
+                raise ValueError(
+                    f"attention_implementation={_attn_impl!r} cannot run packed batches "
+                    f"({_num_samples} samples share a row): the dense causal mask does not "
+                    f"isolate them. Use a varlen implementation (flash_attention_2 / "
+                    f"veomni_flash_attention_2), disable dynamic packing, or set "
+                    f"K3_ALLOW_DENSE_PACKED=1 for the documented debug-only dense path."
+                )
 
     # Modification (SP): slice the merged embeds / labels back to
     # the local shard and hand the LM a full-sequence cache_position so
