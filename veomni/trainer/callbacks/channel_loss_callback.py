@@ -1332,6 +1332,7 @@ def _filter_surplus_tail_padding_segments(
     attention_mask_flat: torch.Tensor | None,
     ignore_index: int,
 ) -> list[tuple[int, int, int]]:
+    """Drop trailing padding-only segments until segment count matches ``source_count``."""
     while len(segments) > source_count:
         _, start, end = segments[-1]
         mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
@@ -1350,6 +1351,7 @@ def _filter_surplus_tail_padding_sp_segments(
     segments: list[dict[str, Any]],
     source_count: int,
 ) -> list[dict[str, Any]]:
+    """Drop trailing padding-only SP logical segments until start count matches ``source_count``."""
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
         return segments
@@ -1362,12 +1364,12 @@ def _filter_surplus_tail_padding_sp_segments(
             logical_segments[-1].append(segment_idx)
 
     removed: set[int] = set()
+    remaining = surplus
     for logical_segment in reversed(logical_segments):
-        if len(removed) >= surplus or not all(segments[idx].get("is_padding_only", False) for idx in logical_segment):
+        if remaining == 0 or not all(segments[idx].get("is_padding_only", False) for idx in logical_segment):
             break
         removed.update(logical_segment)
-        if sum(1 for idx in removed if segments[idx]["is_start"]) >= surplus:
-            break
+        remaining -= 1
     return [segment for segment_idx, segment in enumerate(segments) if segment_idx not in removed]
 
 
@@ -1377,6 +1379,7 @@ def _is_padding_only_segment(
     attention_mask_slice: torch.Tensor | None,
     ignore_index: int,
 ) -> bool:
+    """Return whether a segment contains only ignored labels and padding positions/mask."""
     if labels_slice.numel() == 0 or labels_slice.ne(ignore_index).any().item():
         return False
 

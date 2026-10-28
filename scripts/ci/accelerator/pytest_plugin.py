@@ -21,6 +21,7 @@ from scripts.ci.accelerator.launch_plan import (
 
 
 def resolve_plan(item):
+    """Resolve the resource launch plan for a collected pytest item."""
     instance = item.instance
     cls = getattr(item, "cls", None)
     if instance is None and cls is not None and hasattr(cls, "ci_launch_plan"):
@@ -157,6 +158,7 @@ def pytest_collection_finish(session):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
+    """Apply pre-resolved skip decisions and record the active launch plan before setup."""
     rows = getattr(item.config, "_ci_batch_cases", None)
     if rows is None:
         return
@@ -183,6 +185,7 @@ def pytest_unconfigure(config):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
+    """Isolate CPU-only cases from hidden accelerator state and record case timing."""
     started = time.time()
     _progress(dict(kind="start", nodeid=item.nodeid, timestamp=started))
     rows = getattr(item.config, "_ci_batch_cases", {})

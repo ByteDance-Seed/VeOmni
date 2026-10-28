@@ -257,6 +257,7 @@ class _Gather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
+        """All-reduce when ``sum_grad`` is enabled, slice this rank's shard, and optionally scale."""
         if ctx.sum_grad:
             grad_output = grad_output.clone(memory_format=torch.contiguous_format)
             dist.all_reduce(grad_output, group=ctx.group)

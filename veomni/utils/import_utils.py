@@ -29,12 +29,27 @@ if TYPE_CHECKING:
     from packaging.version import Version
 
 
+def _find_spec_without_import(fullname: str, path) -> object | None:
+    """Ask active meta-path finders for a spec without executing a parent loader."""
+    for finder in tuple(sys.meta_path):
+        find_spec = getattr(finder, "find_spec", None)
+        if find_spec is None:
+            continue
+        lookup_name = fullname
+        if path is not None and finder is importlib.machinery.PathFinder:
+            lookup_name = fullname.rpartition(".")[2]
+        spec = find_spec(lookup_name, path, None)
+        if spec is not None:
+            return spec
+    return None
+
+
 def _is_package_available(name: str) -> bool:
     """Return whether a module path is discoverable without importing its parents."""
     try:
         search_path = None
         parts = name.split(".")
-        for index, part in enumerate(parts):
+        for index in range(len(parts)):
             fullname = ".".join(parts[: index + 1])
             if fullname in sys.modules:
                 loaded = sys.modules[fullname]
@@ -42,9 +57,7 @@ def _is_package_available(name: str) -> bool:
                     return loaded is not None
                 search_path = getattr(loaded, "__path__", None)
             else:
-                spec = importlib.machinery.PathFinder.find_spec(
-                    part if search_path is not None else fullname, search_path
-                )
+                spec = _find_spec_without_import(fullname, search_path)
                 if spec is None:
                     return False
                 search_path = spec.submodule_search_locations

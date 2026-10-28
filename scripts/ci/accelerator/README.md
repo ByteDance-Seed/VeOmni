@@ -183,9 +183,9 @@ Failures print the node ID and pytest traceback summary (up to 200 lines),
 followed by the complete failed worker's combined stdout/stderr. GitHub Actions
 places this output in a collapsible group labelled with the manifest entry ID;
 local runs print it inline. This preserves training-rank tracebacks and torchrun
-errors that precede pytest's outer `CalledProcessError`. Logs are streamed in
-bounded chunks after worker cleanup; successful batches keep compact progress
-output. GitHub Actions also receives an error annotation. Cancelled
+errors that precede pytest's outer `CalledProcessError`. The full worker log is
+read and written in one call after worker cleanup; successful batches keep
+compact progress output. GitHub Actions also receives an error annotation. Cancelled
 batches are labelled separately from failed tests. The final summary reports
 outcomes, failed/cancelled batches, batches never started and the first failure.
 

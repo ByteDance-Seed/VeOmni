@@ -231,7 +231,7 @@ Failure output includes the node ID and pytest traceback summary, followed by
 the failed worker's complete combined stdout/stderr. Actions groups this output
 under the manifest entry ID so training-rank tracebacks remain accessible when
 pytest reports an outer subprocess error. Local runs print the same output
-inline. Stream the existing log in bounded chunks after worker cleanup, while
+inline. Read and write the full worker log in one call after worker cleanup, while
 successful batches retain compact progress output.
 Cancelled batches are distinguished from test failures, and the original
 failure remains the final error even if a cancelled peer exits first. Preserve

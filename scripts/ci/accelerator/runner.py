@@ -32,6 +32,7 @@ from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
 
 def main():
+    """Collect suite cases, batch by device request, and schedule workers across devices."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("unit", "e2e"), required=True)
     parser.add_argument("--backend", choices=("auto", "cuda", "npu", "cpu"), default="auto")
@@ -87,6 +88,7 @@ def main():
         parser.error("No suite selections matched")
 
     def collect(selection):
+        """Collect test cases and launch plans for one manifest selection."""
         name = selection["name"]
         inventory_path = output / f"{name}.inventory.json"
         collect_env = {**env, **selection.get("env", {})}
@@ -162,6 +164,7 @@ def main():
     )
 
     def execute(job, assigned):
+        """Run one batched pytest job in an isolated workspace on its leased devices."""
         row = job.payload
         name = row["name"]
         workspace = output / "work" / name

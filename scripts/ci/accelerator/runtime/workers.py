@@ -84,7 +84,17 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
         raise
     finally:
 
+        def remember_group():
+            """Record reparented members that still belong to this worker's process group."""
+            for child in psutil.process_iter():
+                try:
+                    if child.pid != process.pid and os.getpgid(child.pid) == process.pid:
+                        known[(child.pid, child.create_time())] = child
+                except (OSError, psutil.Error):
+                    pass
+
         def alive():
+            """Return tracked descendant processes that are still running."""
             running = []
             for child in known.values():
                 try:
@@ -95,6 +105,7 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
             return running
 
         for signum in (signal.SIGTERM, signal.SIGKILL):
+            remember_group()
             try:
                 os.killpg(process.pid, signum)
             except ProcessLookupError:
@@ -109,6 +120,7 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(0.05)
+            remember_group()
             if process.poll() is not None and not alive():
                 break
 
