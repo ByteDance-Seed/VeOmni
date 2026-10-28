@@ -260,7 +260,7 @@ class _Gather(torch.autograd.Function):
         """Reduce across the SP group when ``sum_grad`` is enabled, slice this rank's shard, and optionally scale."""
         if not ctx.sum_grad:
             grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
-        elif is_nccl_backend(dist.get_backend(ctx.group)):
+        elif is_nccl_backend(dist.get_backend(ctx.group)) and not grad_output.is_complex():
             dim = ctx.dim % grad_output.ndim
             shape = list(grad_output.shape)
             shape[dim] = ctx.dim_size_list[ctx.rank]
