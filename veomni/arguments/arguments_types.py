@@ -875,6 +875,9 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        if self.cp_size > 1 and self.enable_async:
+            raise NotImplementedError("Context parallelism cannot be combined with async Ulysses yet.")
+
         if self.cp_layout not in ("contiguous", "zigzag"):
             raise ValueError(f"Unsupported cp_layout: {self.cp_layout!r}.")
         if self.cp_size > 1 and self.ulysses_size > 1 and self.cp_layout != "zigzag":

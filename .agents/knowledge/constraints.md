@@ -265,6 +265,8 @@ Core files:
 - `model.accelerator.cp_layout` defaults to `contiguous` for DeepSeek V4.
   USP requires explicit `zigzag`; only this layout pads documents to `2*cp_size`
   and reorders them. Include layout in the parallel-state cache key.
+- Reject CP with async Ulysses in both accelerator arguments and direct ParallelState
+  construction, before mesh initialization. Async callers skip attention-side collectives.
 - USP model builds currently allow only Qwen3 with VeOmni FA2/FA4 and
   `MODELING_BACKEND=veomni`. RL/DPO, deterministic backward and
   unsupported attention modifiers must fail before training rather than silently
@@ -272,6 +274,10 @@ Core files:
 - Ring detects FA2/FA4 independently and uses the configured backend, saved on
   the autograd context for backward. Package import order must not override an
   explicit implementation.
+- FA4 base interface support is independent of its optional deterministic
+  backward argument. Keep ordinary Ring execution available on older compatible
+  kernels; reject unsupported determinism before communication, including when
+  the environment flag changes between forward and backward.
 - Packed USP half indices and CP-local offsets are computed on CPU in the
   collator and passed with the batch; do not rebuild them using GPU scalar reads
   or dynamic boolean indexing in every attention layer.

@@ -452,7 +452,10 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   Dynamic batching budgets these aligned physical lengths, and fixed/SP tail
   padding is coalesced into one aligned segment. The lower-level USP reorder
   helpers still validate the invariant and reject manually constructed
-  unaligned batches.
+  unaligned batches. Dynamic batching selects both its logical and physical
+  counters via `get_length_fn_by_count_mode(count_mode, cp_size=..., cp_layout=...)`.
+  The explicit topology aligns `total` counts while leaving `effective` counts
+  unchanged; callers without topology retain the original counting behavior.
 - **Flash-attention backend**: Ring uses the implementation selected by
   `model.ops_implementation.attn_implementation`. FA2 and FA4 are detected
   independently, so installing both does not override an explicit FA4 choice.
@@ -465,8 +468,13 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   omitting it retains the default of FA2 when installed, otherwise FA4.
 - **CUDA primitive backward determinism**: direct dense and packed FA2/FA4
   Ring kernels honor `FLASH_ATTENTION_DETERMINISTIC=1` at backward call time.
-  Unset or `0` keeps the non-deterministic backward. This can use more memory
-  and be slower; it does not imply bitwise equality across USP topologies.
+  Unset or `0` keeps the non-deterministic backward. Enabling deterministic
+  backward can use more memory and be slower; it does not imply bitwise equality across USP topologies.
+  FA4 base capability is checked independently of deterministic support. Older
+  compatible FA4 kernels remain usable normally; requesting unsupported
+  deterministic backward raises explicitly before Ring communication. The pinned
+  FA4 backend does not support deterministic backward on SM12x, which is also
+  rejected before communication.
   The model attention adapter still rejects full deterministic training pending
   end-to-end integration; this kernel change does not enable
   `train.enable_full_determinism` for USP. NPU behavior is unchanged.
@@ -495,7 +503,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 
 Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
 layout preserves DeepSeek V4's model-specific CP and does not allow combining
-CP with Ulysses. USP requires `MODELING_BACKEND=veomni`. This release enables
+CP with Ulysses. CP cannot be combined with `model.accelerator.enable_async: true`;
+async Ulysses and Ring are not integrated yet. USP requires `MODELING_BACKEND=veomni`. This release enables
 USP for Qwen3 causal text training with
 VeOmni FlashAttention 2 or 4 on CUDA (`Qwen3ForCausalLM` only).
 On Ascend, select `flash_attention_2`; the VeOmni adapter dispatches to
