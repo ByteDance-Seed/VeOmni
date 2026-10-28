@@ -54,6 +54,7 @@ from torch.optim.optimizer import Optimizer
 from ..utils import logging
 from ..utils.device import (
     FUSED_ADAMW_DEVICE_TYPES,
+    STREAM_DEVICE_TYPES,
     create_stream,
     get_current_stream,
     get_device_id,
@@ -79,8 +80,8 @@ def _storage_nbytes(tensor: Tensor) -> int:
 
 
 # Effectively unlimited budget: used when free device memory cannot be
-# determined or when streams are disabled (CPU tests), so all states are
-# swapped in a single batch.
+# determined, or on CPU where there is no accelerator memory to budget, so all
+# states are swapped in a single batch.
 _INFINITE_BUDGET = 1 << 62
 
 
@@ -165,7 +166,8 @@ class SwapAdamW(Optimizer):
         self.chunk_bytes = int(chunk_bytes)
 
         # Two copy streams so H2D and D2H overlap instead of serializing on one stream.
-        self._use_streams = self._device_type != "cpu"
+        # Only the backends whose stream/event API has been exercised take this path.
+        self._use_streams = self._device_type in STREAM_DEVICE_TYPES
         if self._use_streams:
             self._in_stream: Any | None = create_stream()
             self._out_stream: Any | None = create_stream()
@@ -302,9 +304,12 @@ class SwapAdamW(Optimizer):
         """
         self._bind_host_states()
         state_dict = super().state_dict()
-        for param_state in state_dict["state"].values():
-            if "step" in param_state:
-                param_state["step"] = torch.tensor(float(param_state["step"]))
+        # ``Optimizer.state_dict`` hands back the live inner state dicts; copy
+        # them before swapping the int step for the tensor stock AdamW expects.
+        state_dict["state"] = {
+            key: ({**value, "step": torch.tensor(float(value["step"]))} if "step" in value else value)
+            for key, value in state_dict["state"].items()
+        }
         return state_dict
 
     def load_state_dict(self, state_dict) -> None:
@@ -433,7 +438,7 @@ class SwapAdamW(Optimizer):
         per-parameter temporaries (the negated grad for ``maximize``, ``denom``)
         still need headroom, so keep the static fraction below 1.0.
         """
-        if not self._use_streams:
+        if self._device_type == "cpu":
             return _INFINITE_BUDGET
         return max(int(self._device_free_bytes() * self.mem_fraction_static), 0)
 

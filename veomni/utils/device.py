@@ -38,6 +38,9 @@ if IS_NPU_AVAILABLE:
 MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
 # Backends whose torch build registers a ``torch._fused_adamw_`` kernel.
 FUSED_ADAMW_DEVICE_TYPES = ("cuda", "npu")
+# Backends the swap optimizer's async copy streams are validated on; other
+# accelerators (e.g. MLU) copy synchronously.
+STREAM_DEVICE_TYPES = ("cuda", "npu")
 
 
 def get_device_type() -> str:

@@ -209,6 +209,60 @@ def test_matches_torch_adamw_step_by_step(cpu_mesh):
     assert swapped.to_local().dtype == ref.dtype
 
 
+def test_multi_batch_step_matches_torch_adamw(cpu_mesh, monkeypatch):
+    """Drive ``step()`` across several swap batches and compare with stock AdamW.
+
+    The batching bookkeeping (``_swap_in_batch`` index/end, per-batch swap-out)
+    is only exercised when the budget fits a subset of the parameters; the other
+    parity tests run with an effectively infinite budget.
+    """
+    torch.manual_seed(51)
+    shape = (4, 3)
+    inits = [torch.randn(shape) for _ in range(4)]
+
+    refs = [nn.Parameter(init.clone()) for init in inits]
+    swapped = [_swap_param(init, cpu_mesh) for init in inits]
+
+    ref_opt = torch.optim.AdamW(refs, lr=1e-2, betas=(0.9, 0.95), foreach=False)
+    swap_opt = SwapAdamW(swapped, lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+
+    # Exactly one parameter's moments per batch (two fp32 moments per element).
+    one_param_state = 2 * shape[0] * shape[1] * torch.tensor(0.0).element_size()
+    monkeypatch.setattr(swap_opt, "_batch_budget_bytes", lambda: one_param_state)
+
+    batch_ends = []
+    real_swap_in = swap_opt._swap_in_batch
+
+    def counting_swap_in(params, index):
+        end = real_swap_in(params, index)
+        batch_ends.append(end)
+        return end
+
+    monkeypatch.setattr(swap_opt, "_swap_in_batch", counting_swap_in)
+
+    for _ in range(3):
+        grads = [torch.randn(shape) for _ in range(4)]
+        for param, grad in zip(refs, grads):
+            param.grad = grad.clone()
+        for param, grad in zip(swapped, grads):
+            param.grad = _partition(grad.clone(), cpu_mesh)
+
+        batch_ends.clear()
+        ref_opt.step()
+        swap_opt.step()
+
+        assert len(batch_ends) >= 2, batch_ends  # more than one swap batch was used
+        for swap_param, ref_param in zip(swapped, refs):
+            torch.testing.assert_close(swap_param.to_local(), ref_param.detach(), atol=1e-6, rtol=1e-6)
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    swap_opt._host_states[swap_param][key],
+                    ref_opt.state[ref_param][key],
+                    atol=1e-6,
+                    rtol=1e-6,
+                )
+
+
 def test_device_states_are_freed_after_step(cpu_mesh):
     torch.manual_seed(1)
     init = torch.randn(8, 5)
@@ -525,6 +579,10 @@ def test_state_dict_reads_from_host(cpu_mesh):
         assert local.data_ptr() == opt._host_states[param][key].data_ptr(), (
             f"{key} should be read from the host buffer"
         )
+    # ``step`` is exported as a tensor for stock-AdamW compatibility, but the
+    # optimizer keeps its own counter as an int: state_dict() must not mutate it.
+    assert isinstance(state["step"], torch.Tensor)
+    assert isinstance(opt.state[param]["step"], int)
 
 
 def test_state_dict_load_state_dict_round_trip(cpu_mesh):
