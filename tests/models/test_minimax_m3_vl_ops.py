@@ -438,10 +438,12 @@ def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible(mod
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-@pytest.mark.parametrize("precompute_attention_metadata", [False, True])
+@pytest.mark.parametrize("precompute_cu_seqlens", [False, True])
+@pytest.mark.parametrize("precompute_max_seqlen", [False, True])
 def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
     module_name,
-    precompute_attention_metadata,
+    precompute_cu_seqlens,
+    precompute_max_seqlen,
     monkeypatch,
 ):
     modeling = importlib.import_module(module_name)
@@ -484,13 +486,10 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
 
     grid_thw = torch.tensor([[1, 2, 2], [2, 2, 2]], dtype=torch.long)
     vit_metadata = {"grid_thw_list": [[1, 2, 2], [2, 2, 2]]}
-    if precompute_attention_metadata:
-        vit_metadata.update(
-            {
-                "cu_seqlens": torch.tensor([0, 4, 12, 16], dtype=torch.int32),
-                "max_seqlen": 8,
-            }
-        )
+    if precompute_cu_seqlens:
+        vit_metadata["cu_seqlens"] = torch.tensor([0, 4, 12, 16], dtype=torch.int32)
+    if precompute_max_seqlen:
+        vit_metadata["max_seqlen"] = 8
 
     pixel_values = torch.randn(8, config.num_channels * config.temporal_patch_size * config.patch_size**2)
     output = vision_model(

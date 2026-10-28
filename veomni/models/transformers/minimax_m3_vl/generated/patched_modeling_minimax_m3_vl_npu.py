@@ -1349,7 +1349,7 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
     # 1. consume collator-precomputed grid / varlen-attention metadata
     # 2. pad and slice 3D RoPE identically to the SP-sharded pixel rows
     # 3. isolate the SP-padding tail and pass global sequence boundaries to every
-    #    vision attention layer; keep a runtime fallback for external callers
+    #    vision attention layer; independently fall back for each optional metadata key
     # 4. keep NPU cu_seqlens on CPU as required by its FA2 varlen interface
     # ================================================================
     @merge_with_config_defaults
@@ -1402,11 +1402,9 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
             )
         else:
             cu_seqlens_list = [0]
-            fallback_max_seqlen = 0
             for t, h, w in grid_thw_list:
                 seq_len = t * h * w
                 cu_seqlens_list.append(cu_seqlens_list[-1] + seq_len)
-                fallback_max_seqlen = max(fallback_max_seqlen, seq_len)
             if sp_pad_seq_len > 0:
                 cu_seqlens_list.append(cu_seqlens_list[-1] + sp_pad_seq_len)
             cu_seqlens = torch.tensor(
@@ -1418,7 +1416,11 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
         if precomputed_max_seqlen is not None:
             max_seqlen = precomputed_max_seqlen
         else:
+            # --- Patch.3 ---
+            # cu_seqlens and max_seqlen can be supplied independently.
+            fallback_max_seqlen = max((t * h * w for t, h, w in grid_thw_list), default=0)
             max_seqlen = max(fallback_max_seqlen, sp_pad_seq_len)
+            # --- Patch.3 ---
 
         if IS_NPU_AVAILABLE:
             cu_seqlens = cu_seqlens.cpu()

@@ -1061,7 +1061,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1344,137 @@
+@@ -1178,23 +1344,139 @@
          )
          self.post_init()
 
@@ -1070,7 +1070,7 @@
 +    # 1. consume collator-precomputed grid / varlen-attention metadata
 +    # 2. pad and slice 3D RoPE identically to the SP-sharded pixel rows
 +    # 3. isolate the SP-padding tail and pass global sequence boundaries to every
-+    #    vision attention layer; keep a runtime fallback for external callers
++    #    vision attention layer; independently fall back for each optional metadata key
 +    # 4. keep NPU cu_seqlens on CPU as required by its FA2 varlen interface
 +    # ================================================================
      @merge_with_config_defaults
@@ -1128,11 +1128,9 @@
 +            )
 +        else:
 +            cu_seqlens_list = [0]
-+            fallback_max_seqlen = 0
 +            for t, h, w in grid_thw_list:
 +                seq_len = t * h * w
 +                cu_seqlens_list.append(cu_seqlens_list[-1] + seq_len)
-+                fallback_max_seqlen = max(fallback_max_seqlen, seq_len)
 +            if sp_pad_seq_len > 0:
 +                cu_seqlens_list.append(cu_seqlens_list[-1] + sp_pad_seq_len)
 +            cu_seqlens = torch.tensor(
@@ -1144,7 +1142,11 @@
 +        if precomputed_max_seqlen is not None:
 +            max_seqlen = precomputed_max_seqlen
 +        else:
++            # --- Patch.3 ---
++            # cu_seqlens and max_seqlen can be supplied independently.
++            fallback_max_seqlen = max((t * h * w for t, h, w in grid_thw_list), default=0)
 +            max_seqlen = max(fallback_max_seqlen, sp_pad_seq_len)
++            # --- Patch.3 ---
 +
 +        if IS_NPU_AVAILABLE:
 +            cu_seqlens = cu_seqlens.cpu()
@@ -1205,7 +1207,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1558,26 @@
+@@ -1278,6 +1560,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1232,7 +1234,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1650,141 @@
+@@ -1350,46 +1652,141 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1391,7 +1393,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,15 +1821,25 @@
+@@ -1426,15 +1823,25 @@
          return vision_outputs
 
 
@@ -1418,7 +1420,7 @@
          self.post_init()
 
      def get_output_embeddings(self) -> nn.Module:
-@@ -1448,48 +1853,25 @@
+@@ -1448,48 +1855,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1485,7 +1487,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1886,29 @@
+@@ -1504,15 +1888,29 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1520,7 +1522,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1920,19 @@
+@@ -1524,9 +1922,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

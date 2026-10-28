@@ -47,7 +47,7 @@ def _l2_rel(actual: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _lora_tensors(variant: str, *, E: int, H: int, I: int, r: int, device, dtype):
-    if variant == "shared":
+    if variant.removesuffix("_swiglu_oai") == "shared":
         shapes = [(r, H), (I, r), (r, H), (I, r), (r, I), (H, r)]
     else:
         shapes = [(E, r, H), (E, I, r), (E, r, H), (E, I, r), (E, r, I), (E, H, r)]
@@ -55,6 +55,7 @@ def _lora_tensors(variant: str, *, E: int, H: int, I: int, r: int, device, dtype
 
 
 def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *, num_experts: int):
+    activation_kwargs = dict(swiglu_alpha=1.7, swiglu_limit=0.15) if variant.endswith("_swiglu_oai") else {}
     return VeomniOp("moe_experts_lora", variant, impl)(
         hidden,
         routing,
@@ -64,6 +65,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
         *loras,
         num_experts=num_experts,
         **_SCALES,
+        **activation_kwargs,
     )
 
 
@@ -270,6 +272,14 @@ def test_triton_matches_eager_with_concentrated_routes(variant, routing_dtype):
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_npu_matches_eager(variant, base_trainable, shape):
     _run_fused_vs_eager("fused_npu", variant, shape=shape, base_trainable=base_trainable)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="SwiGLU-OAI MoE-LoRA needs torch_npu")
+@pytest.mark.parametrize("base_trainable", [True, False], ids=["base_trainable", "base_frozen"])
+@pytest.mark.parametrize("variant", ["shared_swiglu_oai", "independent_swiglu_oai"])
+def test_npu_swiglu_oai_matches_eager(variant, base_trainable):
+    """Exercise native registry dispatch, clipping, and all trainable gradients."""
+    _run_fused_vs_eager("fused_npu", variant, base_trainable=base_trainable)
 
 
 @pytest.mark.skipif(
@@ -548,14 +558,20 @@ def test_zero_b_preserves_fused_base_output_and_vjp(variant):
         assert torch.isfinite(lora[key].grad).all() and torch.count_nonzero(lora[key].grad) > 0
 
 
-def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
+def _distributed_ep_parity_worker(rank: int, variant: str, impl: str, endpoint) -> None:
     """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients."""
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", store=endpoint.connect(), rank=rank, world_size=_CI_ACCELERATOR_2.nproc)
+    device_type = "npu" if impl == "fused_npu" else "cuda"
+    getattr(torch, device_type).set_device(rank)
+    dist.init_process_group(
+        "hccl" if device_type == "npu" else "nccl",
+        store=endpoint.connect(),
+        rank=rank,
+        world_size=_CI_ACCELERATOR_2.nproc,
+    )
     try:
-        device = torch.device("cuda", rank)
+        device = torch.device(device_type, rank)
         dtype = torch.bfloat16
         experts, hidden_size, intermediate_size, lora_rank, batch = 4, 64, 96, 8, 16
         generator = torch.Generator().manual_seed(7123)
@@ -570,8 +586,9 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         down = random_tensor((experts, hidden_size, intermediate_size), 0.05)
         ids = torch.arange(batch, device=device)
         selected = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
-        routing = torch.tensor([0.75, 0.25], dtype=torch.float32, device=device).expand(batch, 2).contiguous()
-        if variant == "shared":
+        routing_dtype = dtype if device_type == "npu" else torch.float32
+        routing = torch.tensor([0.75, 0.25], dtype=routing_dtype, device=device).expand(batch, 2).contiguous()
+        if variant.removesuffix("_swiglu_oai") == "shared":
             shapes = [
                 (lora_rank, hidden_size),
                 (intermediate_size, lora_rank),
@@ -592,12 +609,12 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         full_lora = [random_tensor(shape, 0.02).detach().requires_grad_(True) for shape in shapes]
         hidden_reference = hidden.detach().requires_grad_(True)
         routing_reference = routing.detach().clone().requires_grad_(True)
-        non_ep_state = _init_parallel_state(dp_size=2, device_type="cuda", name="non_ep")
-        ep_state = _init_parallel_state(dp_size=2, device_type="cuda", extra_parallel_sizes=(2,), name="ep")
+        non_ep_state = _init_parallel_state(dp_size=2, device_type=device_type, name="non_ep")
+        ep_state = _init_parallel_state(dp_size=2, device_type=device_type, extra_parallel_sizes=(2,), name="ep")
 
         with use_parallel_state(non_ep_state):
             reference = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_reference,
                 routing_reference,
@@ -613,14 +630,14 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
 
         local_lora = []
         for value in full_lora:
-            if variant == "independent":
+            if variant.removesuffix("_swiglu_oai") == "independent":
                 value = value[rank * 2 : (rank + 1) * 2]
             local_lora.append(value.detach().clone().requires_grad_(True))
         hidden_ep = hidden.detach().requires_grad_(True)
         routing_ep = routing.detach().clone().requires_grad_(True)
         with use_parallel_state(ep_state):
             actual = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_ep,
                 routing_ep,
@@ -639,7 +656,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         for index, (local, full) in enumerate(zip(actual_grads[:-2], reference_grads[:-2], strict=True)):
             expected = full.float().clone()
             dist.all_reduce(expected, op=dist.ReduceOp.SUM)
-            if variant == "independent":
+            if variant.removesuffix("_swiglu_oai") == "independent":
                 parts = [torch.empty_like(local) for _ in range(2)]
                 dist.all_gather(parts, local.contiguous())
                 observed = torch.cat(parts, dim=0).float()
@@ -653,8 +670,8 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         assert _l2_rel(actual_grads[-2], reference_grads[-2]) <= _GRAD_L2REL_TOL, (
             f"{variant}: distributed EP input gradient differs from non-EP"
         )
-        assert actual_grads[-1].dtype == torch.float32, (
-            f"{variant}: distributed EP routing gradient dtype {actual_grads[-1].dtype} != float32"
+        assert actual_grads[-1].dtype == routing.dtype, (
+            f"{variant}: distributed EP routing gradient dtype {actual_grads[-1].dtype} != {routing.dtype}"
         )
         assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
             f"{variant}: distributed EP routing gradient differs from non-EP"
@@ -683,6 +700,20 @@ def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant):
         pytest.skip("Distributed EP parity requires two CUDA devices.")
     spawn_with_rendezvous(
         _distributed_ep_parity_worker,
-        args=(variant,),
+        args=(variant, "fused_triton"),
+        nprocs=_CI_ACCELERATOR_2.nproc,
+    )
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="distributed SwiGLU-OAI MoE-LoRA needs NPUs")
+@pytest.mark.parametrize("variant", ["shared_swiglu_oai", "independent_swiglu_oai"])
+def test_npu_swiglu_oai_distributed_ep_dispatch_matches_nonep(variant):
+    """Two NPUs exercise registry dispatch, all-to-all, and both adapter gradient layouts."""
+    if runner_device_count() < _CI_ACCELERATOR_2.nproc:
+        pytest.skip("Distributed EP parity requires two NPU devices.")
+    spawn_with_rendezvous(
+        _distributed_ep_parity_worker,
+        args=(variant, "fused_npu"),
         nprocs=_CI_ACCELERATOR_2.nproc,
     )
