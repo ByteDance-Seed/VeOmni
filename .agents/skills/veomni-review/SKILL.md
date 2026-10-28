@@ -85,7 +85,7 @@ Both the outer agent and the review subagent must enforce two rules:
    - Internal hooks (`metadata_collate_func`, model/callback hooks) and collators are **trusted in-process code**, not adversarial inputs. Do not clone tensors before/after hooks to check for mutation or guard against user keys colliding with private `_veomni_*` keys.
    - Dataset preprocessing already filters empty samples and builds monotonic `position_ids` (`0..L-1`) per sample. Do not demand provenance state machines or dynamic-programming solvers for 0-token samples or mid-sample `position_ids == 0` resets.
    - Activations and gradients in LLM/VLM/DiT training are real floating-point tensors. Do not demand handling for `complex64`, conjugate views, rank-asymmetric C++ `_neg_view` flags, deliberate FP16 pre-sum overflow to `NaN`, or manual `untyped_storage().resize_()` aliasing.
-   - Do not demand defenses for hostile OS/Python environments (custom `sys.meta_path` finders, broken consecutive namespace packages, processes surviving `SIGKILL`, source files mutated mid-CI run, all-zeros `/proc/sys/kernel/random/boot_id` UUIDs) or wrong Python types (`bool` passed as `int`, generators passed as lists) on internal helpers already behind typed config dataclasses.
+   - Do not demand defenses for hostile OS/Python environments (custom `sys.meta_path` finders, broken consecutive namespace packages, source files mutated mid-CI run, all-zeros `/proc/sys/kernel/random/boot_id` UUIDs) or wrong Python types (`bool` passed as `int`, generators passed as lists) on internal helpers already behind typed config dataclasses.
 2. **Flag speculative defensive bloat and synthetic tests as `needs-attention` (for deletion)**:
    - When a diff contains defensive scaffolding, state machines, extra collectives, or synthetic unit tests for any of the hypothetical scenarios above (or meta-tests that parse AST/source text or test another test's `pytest.skip`), flag them as `needs-attention` and require their **removal**.
    - Never promote a test-invented corner case into `.agents/knowledge/constraints.md` or `.agents/knowledge/testing.md`.
@@ -121,7 +121,7 @@ For each changed file, check:
   - Cross-rank SHA-256 digests, `pickle` serialization, or extra preflight `all_gather` / `all_reduce` collectives defending against SP/DP ranks having mismatched configs or corrupted batch metadata.
   - Tensor-cloning guards checking whether internal hooks (`metadata_collate_func`, etc.) mutated inputs, or custom subclasses defending against user dataset keys colliding with private internal keys.
   - Elaborate solvers or provenance tracking for 0-token samples, mid-sample `position_ids` resets, or multi-row packed batches (PackingCollator always packs into 1 row).
-  - Handling or testing `complex64`, `.conj()`, rank-asymmetric `torch._neg_view`, deliberate FP16 overflow to `NaN`, custom `sys.meta_path` finders, processes surviving `SIGKILL`, or `isinstance(x, bool)` on internal `int` helpers.
+  - Handling or testing `complex64`, `.conj()`, rank-asymmetric `torch._neg_view`, deliberate FP16 overflow to `NaN`, custom `sys.meta_path` finders, or `isinstance(x, bool)` on internal `int` helpers.
   - Meta-tests that unit-test a test helper's own AST visitor, use `inspect.getsource` to match substrings in trainer methods, or test another test function's `pytest.skip`.
 - Is the diff size proportional to the problem solved? If a 40-line fix is accompanied by 500+ lines of defensive scaffolding and synthetic tests, require stripping it down to the essential change.
 

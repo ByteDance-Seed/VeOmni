@@ -334,6 +334,7 @@ class OptimizerState(Stateful):
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
+        """Restore optimizer state from the loaded DCP state dict."""
         optim_state_from_dcp_load = state_dict
         if self.should_extra_parallel_aware:
             # we need to drop ExtraParallel dim before loading them into optimizers

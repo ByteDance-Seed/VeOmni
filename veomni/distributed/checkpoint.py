@@ -85,6 +85,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        """Recompute the checkpointed forward and propagate gradients to tensor inputs."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "When use_reentrant=True, torch.utils.checkpoint is incompatible"

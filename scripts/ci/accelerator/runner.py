@@ -24,6 +24,7 @@ from scripts.ci.accelerator.reporting import (
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
 from scripts.ci.accelerator.runtime.workers import (
+    ProcessCleanupError,
     create_workspace,
     interruptible_executor,
     run_process,
@@ -256,10 +257,14 @@ def main():
             raise
         except Exception as exc:
             record.update(returncode=getattr(exc, "returncode", 1), error=repr(exc))
-            progress.worker_failure(exc)
+            if isinstance(exc, ProcessCleanupError):
+                reporter.stop_event.set()
+                reporter.fail(name, str(exc), assigned=assigned, target=progress.current, nodeid=progress.current)
+            else:
+                progress.worker_failure(exc)
             with reporter.lock:
                 print_failure_log(progress.log_path, label=reporter.label(name))
-            if not args.keep_going:
+            if not args.keep_going or isinstance(exc, ProcessCleanupError):
                 raise
         finally:
             progress.poll(check_abort=False)

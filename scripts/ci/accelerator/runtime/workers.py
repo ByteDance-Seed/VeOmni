@@ -4,7 +4,7 @@ import os
 import signal
 import subprocess
 import time
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import Event
@@ -15,6 +15,10 @@ from scripts.ci.accelerator import ROOT
 
 
 _CANCELLATION = ContextVar("ci_worker_cancellation", default=None)
+
+
+class ProcessCleanupError(RuntimeError):
+    """Owned workers survived cleanup; their device lease cannot be reused."""
 
 
 class _CancellationScope:
@@ -37,19 +41,46 @@ class _CancellationScope:
             _CANCELLATION.reset(token)
 
 
+class _WorkerExecutor(ThreadPoolExecutor):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.futures = []
+
+    def submit(self, *args, **kwargs):
+        future = super().submit(*args, **kwargs)
+        self.futures.append(future)
+        return future
+
+
 @contextmanager
 def interruptible_executor(*, max_workers, cancel_on_error=False):
-    """Cancel owned subprocesses before waiting for worker threads."""
+    """Cancel owned subprocesses before waiting for interrupted callbacks."""
     scope = _CancellationScope()
-    executor = ThreadPoolExecutor(max_workers=max_workers)
+    executor = _WorkerExecutor(max_workers=max_workers)
     try:
         yield executor, scope
     except BaseException as exc:
-        if cancel_on_error or not isinstance(exc, Exception):
+        if cancel_on_error or isinstance(exc, ProcessCleanupError) or not isinstance(exc, Exception):
             scope.event.set()
         raise
     finally:
-        executor.shutdown(wait=True, cancel_futures=scope.event.is_set())
+        interrupted = None
+        while True:
+            try:
+                executor.shutdown(wait=False, cancel_futures=scope.event.is_set())
+                pending = [future for future in executor.futures if not future.done()]
+                if pending:
+                    wait(pending, timeout=0.2)
+                    continue
+                executor.shutdown(wait=True)
+                break
+            except (KeyboardInterrupt, SystemExit) as exc:
+                scope.event.set()
+                interrupted = exc
+        # Future completion proves callbacks finished cleanup. A Thread.join
+        # interrupted by SIGINT can report a stopped thread before it returns.
+        if interrupted is not None:
+            raise interrupted
 
 
 def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_poll=None, on_failure=None):
@@ -85,7 +116,7 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
     finally:
 
         def remember_group():
-            """Record reparented members that still belong to this worker's process group."""
+            # Reparented children can outlive the launcher between samples.
             for child in psutil.process_iter():
                 try:
                     if child.pid != process.pid and os.getpgid(child.pid) == process.pid:
@@ -94,7 +125,6 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
                     pass
 
         def alive():
-            """Return tracked descendant processes that are still running."""
             running = []
             for child in known.values():
                 try:
@@ -107,6 +137,8 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
         for signum in (signal.SIGTERM, signal.SIGKILL):
             remember_group()
             try:
+                # This group belongs to start_new_session=True, even if its
+                # original leader has exited. Never sweep unrelated processes.
                 os.killpg(process.pid, signum)
             except ProcessLookupError:
                 pass
@@ -123,6 +155,8 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
             remember_group()
             if process.poll() is not None and not alive():
                 break
+        else:
+            raise ProcessCleanupError("CI worker cleanup could not drain its process group and tracked descendants")
 
 
 def create_workspace(path):

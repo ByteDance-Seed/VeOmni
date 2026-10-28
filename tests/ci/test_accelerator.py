@@ -550,6 +550,7 @@ def test_rendezvous_allocator_does_not_reuse_a_pending_launch_port(monkeypatch, 
 
 
 def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch):
+    """Verify that rendezvous_endpoint holds the TCPStore socket and closes it on error."""
     import errno
     import socket
     from datetime import timedelta
@@ -693,6 +694,7 @@ def _failing_rendezvous_worker(rank, endpoint):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_spawn_worker_failure_reaps_peers_and_closes_store(monkeypatch):
+    """Verify that spawn_with_rendezvous reaps peer workers and closes the store on failure."""
     import psutil
     import torch.multiprocessing as mp
 
@@ -815,6 +817,7 @@ def test_concurrent_standalone_commands_keep_agent_store_alive(monkeypatch, tmp_
     ["missing_results", "interrupt", "keep_going_failure", "child_failure"],
 )
 def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys, failure):
+    """Verify runner summary and foreground output across worker failure modes."""
     import json
     import sys
     from pathlib import Path
@@ -908,6 +911,7 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
 
 
 def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
+    """Verify that the first batch failure cancels active peers and halts queue dispatch."""
     import os
     import sys
     import time
