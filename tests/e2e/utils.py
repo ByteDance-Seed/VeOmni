@@ -185,6 +185,7 @@ def prepare_exec_cmd(
     max_ep_size: int | None = None,
     min_sp_size: int | None = None,
 ) -> list[tuple[str, dict]]:
+    """Build the training launch command for the selected model, topology and test configuration."""
     launches = parallel_launches(
         is_moe,
         max_sp_size,

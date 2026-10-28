@@ -191,6 +191,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         helper.print_device_mem_info("VRAM usage after building model")
 
     def _build_optimizer(self, param_groups=None):
+        """Group trainable parameters and apply the configured vision-tower learning rate."""
         if param_groups is not None:
             return super()._build_optimizer(param_groups=param_groups)
 

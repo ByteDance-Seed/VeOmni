@@ -22,6 +22,7 @@ from torch import Tensor
 
 
 def _check_merged_layout(fc1_1_weight: Tensor, fc1_2_weight: Tensor, fc1_1_2_weight: Tensor) -> None:
+    """Require a nonempty merged FC1 weight and reject nonempty split FC1 weights."""
     if fc1_1_weight.numel() or fc1_2_weight.numel() or not fc1_1_2_weight.numel():
         raise ValueError("SwiGLU-OAI MoE experts require the merged fc1_1_2_weight and no split fc1 weights.")
 

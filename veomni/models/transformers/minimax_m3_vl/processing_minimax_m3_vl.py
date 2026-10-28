@@ -77,6 +77,7 @@ class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         # ``trust_remote_code`` only ever gated the Auto* sub-processor resolution
         # we deliberately bypass; the concrete native classes take no such flag.
+        """Load native MiniMax subprocessors and reject incompatible checkpoint model types."""
         kwargs.pop("trust_remote_code", None)
         _require_minimax_m3_checkpoint(pretrained_model_name_or_path, kwargs)
 

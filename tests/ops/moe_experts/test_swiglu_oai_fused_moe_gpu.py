@@ -13,6 +13,7 @@ _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _skip_if_unsupported():
+    """Skip native Triton tests when the required accelerator or kernel packages are unavailable."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for SwiGLU-OAI fused MoE tests.")
     if not is_fused_moe_available():
@@ -28,6 +29,7 @@ def _eager_swiglu_oai_moe(
     limit,
     alpha,
 ):
+    """Compute a routed, weighted SwiGLU-OAI expert reference with ordinary Torch operations."""
     output = torch.zeros_like(hidden_states)
     num_experts = gate_up_proj.shape[0]
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
@@ -46,6 +48,7 @@ def _eager_swiglu_oai_moe(
 
 
 def test_triton_swiglu_oai_moe_matches_eager_forward_backward(monkeypatch):
+    """Compare native Triton expert outputs and gradients with the eager reference."""
     _skip_if_unsupported()
     from veomni.ops.kernels.moe_experts.standard import triton as group_gemm
 
@@ -212,6 +215,7 @@ def _ep_forward_backward_worker():
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_triton_swiglu_oai_ep2_matches_eager_forward_backward():
+    """Run two-rank expert-parallel Triton parity against the unsharded eager reference."""
     _skip_if_unsupported()
     if get_torch_device().device_count() < 2:
         pytest.skip("SwiGLU-OAI EP parity requires two CUDA devices.")

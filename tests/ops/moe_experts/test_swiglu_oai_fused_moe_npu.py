@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="SwiGLU-OAI fused M
 
 
 def _eager_moe(hidden, routing, selected, gate_up, down, *, limit=None, alpha=None):
+    """Compute routed SwiGLU-OAI expert outputs for comparison with the fused NPU path."""
     output = torch.zeros_like(hidden)
     expert_mask = F.one_hot(selected, num_classes=gate_up.shape[0]).permute(2, 1, 0)
     for expert_idx in range(gate_up.shape[0]):
@@ -66,6 +67,7 @@ def _inputs(device, *, rank=0):
 
 @pytest.mark.parametrize("limit,alpha", [(None, None), (0.7, 1.702)])
 def test_npu_fused_moe_matches_eager_forward_backward(limit, alpha, monkeypatch):
+    """Compare native fused-NPU expert outputs and gradients with eager execution."""
     from veomni.ops.kernels.moe_experts.standard import npu as npu_group_gemm
 
     monkeypatch.setattr(npu_group_gemm, "get_parallel_state", lambda: type("State", (), {"ep_enabled": False})())
@@ -190,6 +192,7 @@ def _npu_ep_forward_backward_worker():
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_npu_swiglu_oai_ep2_matches_eager_forward_backward():
+    """Check two-rank NPU expert-parallel outputs and gradients against the eager reference."""
     if torch.npu.device_count() < 2:
         pytest.skip("SwiGLU-OAI EP parity requires two NPU devices.")
 

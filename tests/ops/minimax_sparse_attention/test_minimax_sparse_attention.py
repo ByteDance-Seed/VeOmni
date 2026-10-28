@@ -51,6 +51,7 @@ def _upstream():
 
 
 def _upstream_indexer():
+    """Construct the upstream MiniMax indexer used as the sparse-selection reference."""
     upstream = _upstream()
     config = upstream.MiniMaxM3VLTextConfig(
         vocab_size=32,
@@ -104,6 +105,7 @@ def _canonical_block_indices(block_indices):
 
 
 def _per_sample_inputs():
+    """Generate independent sample inputs and their sparse-index reference selections."""
     config, indexer, rotary = _upstream_indexer()
     samples = []
     for seq_len in _SEQUENCE_LENGTHS:
@@ -142,6 +144,7 @@ def _upstream_attention(indexer, sample, q, k, v, block_indices):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_indexer_matches_upstream_per_sample():
+    """Compare packed index selection against upstream selection for each sample."""
     _, samples = _per_sample_inputs()
     block_indices = minimax_sparse_indexer_eager(
         torch.cat([sample.index_q for sample in samples]),
@@ -164,6 +167,7 @@ def test_indexer_matches_upstream_per_sample():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_attention_matches_upstream_per_sample_forward_and_backward(dtype):
+    """Check packed sparse attention outputs and gradients against per-sample upstream execution."""
     indexer, samples = _per_sample_inputs()
     for sample in samples:
         sample.q, sample.k, sample.v = (getattr(sample, name).to(dtype) for name in ("q", "k", "v"))
@@ -237,6 +241,7 @@ def test_indexer_output_feeds_attention_with_wider_topk_slots():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_padded_layout_round_trips_sp_padding_segment():
+    """Check that sequence-parallel padding remains isolated from real attention segments."""
     packed = torch.arange(14, dtype=torch.float32).view(7, 2)
 
     indices, padding = _packed_to_padded_indices(_cu_seqlens([2, 3, 2]), 3, 7, packed.device)
@@ -291,6 +296,7 @@ def test_bfloat16_block_expansion_matches_boolean_expansion(seq_len, block_size)
 @pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype):
+    """Compare native NPU sparse-attention outputs and gradients with the CPU reference."""
     torch.manual_seed(42)
     lengths = _SEQUENCE_LENGTHS
     total_length, head_dim = sum(lengths), 64

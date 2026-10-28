@@ -32,6 +32,7 @@ from .shared import npu as shared_npu
 
 
 def _activation(alpha: float, limit: float):
+    """Validate OAI activation attributes and return the clamped shared SwiGLU-OAI composition."""
     if not math.isfinite(alpha) or alpha <= 0 or not math.isfinite(limit) or limit <= 0:
         raise ValueError("SwiGLU-OAI alpha and limit must be positive finite numbers")
 

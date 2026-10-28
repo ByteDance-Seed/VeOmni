@@ -88,6 +88,7 @@ def npu_cpu_primitives(monkeypatch):
         return result.index_add(0, token_ids, output * probs.reshape(-1)[order, None])
 
     def group_gemm(hidden, weight, counts):
+        """Emulate grouped expert matrix multiplication using per-expert CPU tensor slices."""
         chunks = hidden.split(counts.tolist())
         return torch.cat([part @ weight[i] for i, part in enumerate(chunks)])
 
@@ -101,6 +102,7 @@ def npu_cpu_primitives(monkeypatch):
 
 
 def tensors(layout, dtype, tokens=5):
+    """Create deterministic differentiable base and adapter tensors for either expert-LoRA layout."""
     generator = torch.Generator().manual_seed(2307)
 
     def rand(shape):
@@ -124,9 +126,11 @@ def tensors(layout, dtype, tokens=5):
 
 
 def oracle(args, layout, alpha, limit):
+    """Evaluate routed expert LoRA independently with explicit per-token, per-expert linear operations."""
     hidden, routing, selected, fc1, fc2, ag, bg, au, bu, ad, bd = args
 
     def expert(weight, index):
+        """Select the expert-specific adapter tensor or reuse the shared tensor."""
         return weight[index] if layout == "independent" else weight
 
     rows = []
@@ -154,6 +158,7 @@ def oracle(args, layout, alpha, limit):
 def test_forward_and_all_tensor_gradients_match_independent_oracle(
     kernels, npu_cpu_primitives, layout, backend, dtype, alpha, limit
 ):
+    """Compare eager and CPU-emulated NPU LoRA outputs and all differentiable inputs with the oracle."""
     args = tensors(layout, dtype)
     wrapper = getattr(kernels, layout + "_" + backend + "_wrapper")
     output = wrapper(
@@ -244,6 +249,7 @@ def test_native_wrapper_accepts_explicit_oai_without_an_act_fn(runtime):
 
 @pytest.mark.parametrize("layout", ["shared", "independent"])
 def test_expert_reference_bypass_never_reads_adapter_weights(runtime, monkeypatch, layout):
+    """Check that both real expert wrappers run the base operator without reading adapter weights."""
     base = make_experts(runtime)
     cls = runtime.layers.LoraSharedExperts if layout == "shared" else runtime.layers.LoraIndependentExperts
     hidden, routing, selected = tensors(layout, torch.float32)[:3]
@@ -272,6 +278,7 @@ def test_expert_reference_bypass_never_reads_adapter_weights(runtime, monkeypatc
 
 
 def test_expert_disable_context_restores_nested_and_exception_states(runtime):
+    """Check real dense/expert disable flags across nesting, exceptions and unsupported base handles."""
     model_module = importlib.import_module(_PREFIX + ".lora.model")
     layers = importlib.import_module(_PREFIX + ".lora.layers")
     config = importlib.import_module(_PREFIX + ".lora.config")
@@ -305,6 +312,7 @@ def test_clamped_standard_experts_are_rejected_before_wrapping(runtime):
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 def test_opt_in_upcast_preserves_frozen_base_and_buffers(device):
+    """Verify trainable-only FP32 upcasting preserves frozen storage, buffers and parameter identity."""
     path = _ROOT / "veomni/distributed/torch_parallelize.py"
     node = next(
         n
@@ -337,6 +345,7 @@ def test_opt_in_upcast_preserves_frozen_base_and_buffers(device):
     ],
 )
 def test_preserve_frozen_dtype_rejects_execution_without_parameter_casting(enabled, peft, fsdp, mode, error):
+    """Check that the frozen-dtype policy rejects unsupported types, PEFT settings and parallel modes."""
     path = _ROOT / "veomni/distributed/torch_parallelize.py"
     node = next(
         n
@@ -359,6 +368,7 @@ def test_preserve_frozen_dtype_rejects_execution_without_parameter_casting(enabl
 
 @pytest.mark.parametrize("enable,param_dtype", [(False, "bfloat16"), (True, None)])
 def test_preserve_frozen_dtype_requires_active_compute_dtype(enable, param_dtype):
+    """Reject the frozen-dtype policy when mixed-precision compute casting is unavailable."""
     path = _ROOT / "veomni/distributed/torch_parallelize.py"
     node = next(
         n

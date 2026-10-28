@@ -2104,6 +2104,7 @@ class TestQwen3OmniMoeConverterIntegration:
 
 class TestMiniMaxM3VLConverter:
     def test_dense_and_projector_renaming(self):
+        """Check public dense, vision and projector checkpoint names against generated parameter names."""
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
         tensor = torch.ones(3, 4)
         assert converter.convert("language_model.model.embed_tokens.weight", tensor).name == (
@@ -2114,6 +2115,7 @@ class TestMiniMaxM3VLConverter:
         )
 
     def test_dense_gate_up_merge_and_expert_stacking(self):
+        """Check dense gate/up fusion and per-expert stacking into the generated MoE layout."""
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
         gate = torch.ones(3, 4)
         up = torch.full((3, 4), 2.0)
@@ -2139,6 +2141,7 @@ class TestMiniMaxM3VLConverter:
         assert result.tensor.shape == (2, 6, 4)
 
     def test_factory_and_incomplete_checkpoint(self):
+        """Check converter construction and explicit rejection of incomplete checkpoint fragments."""
         model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_local_experts=3)))
         assert create_minimax_m3_vl_checkpoint_tensor_converter(model).num_experts == 3
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
@@ -2147,6 +2150,7 @@ class TestMiniMaxM3VLConverter:
             converter.finalize()
 
     def test_fqn_index_mapping_merges_layouts(self):
+        """Check shard-index rewriting for fused gate/up and stacked expert parameters."""
         mapping = {
             "language_model.model.layers.0.mlp.gate_proj.weight": 2,
             "language_model.model.layers.0.mlp.up_proj.weight": 3,

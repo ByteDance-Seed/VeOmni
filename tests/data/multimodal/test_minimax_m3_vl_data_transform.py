@@ -16,6 +16,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _render_fake_minimax_chat_template(messages, *, add_generation_prompt):
+    """Render deterministic test chat text, including an optional assistant generation prefix."""
     rendered = "]~!b[]~b]system\nMiniMax system prompt[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n"
     for message in messages:
         role = "ai" if message["role"] == "assistant" else message["role"]
@@ -30,6 +31,7 @@ def _render_fake_minimax_chat_template(messages, *, add_generation_prompt):
 
 class _FakeNativeTemplateProcessor:
     def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        """Forward template options to the deterministic native-template renderer."""
         assert tokenize is False
         self.chat_template_calls.append(
             {
@@ -47,6 +49,7 @@ class _FakeImageProcessor:
         self.calls = []
 
     def __call__(self, *, images, return_tensors):
+        """Return synthetic image tensors and grid metadata for the requested images."""
         self.calls.append({"images": images, "return_tensors": return_tensors})
         assert return_tensors == "pt"
         return {
@@ -62,6 +65,7 @@ class _FakeVideoProcessor:
         self.calls = []
 
     def __call__(self, *, videos, video_metadata, do_sample_frames, return_tensors, return_metadata):
+        """Return synthetic video tensors, grids and optional timing metadata."""
         self.calls.append(
             {
                 "videos": videos,
@@ -94,12 +98,14 @@ class _FakeProcessor(_FakeNativeTemplateProcessor):
         self.chat_template_calls = []
 
     def replace_image_token(self, image_inputs, image_idx):
+        """Validate image replacement metadata and return a fixed image token for the fixture."""
         self.replaced_images.append({"image_inputs": image_inputs, "image_idx": image_idx})
         assert "pixel_values" in image_inputs
         assert "image_grid_thw" in image_inputs
         return MiniMaxM3VLChatTemplate.IMAGE_TOKEN
 
     def replace_video_token(self, video_inputs, video_idx):
+        """Validate video replacement metadata and return a fixed video token for the fixture."""
         self.replaced_videos.append({"video_inputs": video_inputs, "video_idx": video_idx})
         assert "pixel_values_videos" in video_inputs
         assert "video_grid_thw" in video_inputs
@@ -122,6 +128,7 @@ class _FakeMiniMaxTokenizer:
         return self._token_ids[token]
 
     def encode(self, text, add_special_tokens=False):
+        """Tokenize test text while preserving the special image and video token IDs."""
         self.last_encoded_text = text
         token_ids = []
         idx = 0
@@ -154,6 +161,7 @@ class _ProcessorWithoutReplacementMethods(_FakeNativeTemplateProcessor):
 
 
 def test_minimax_chat_template_uses_hf_native_template_and_masks_generation_prefix():
+    """Check native template rendering and loss masking of the assistant generation prefix."""
     processor = _ProcessorWithoutReplacementMethods()
     chat_template = MiniMaxM3VLChatTemplate(processor)
     encoded = chat_template.encode_messages(
@@ -180,6 +188,7 @@ def test_minimax_chat_template_uses_hf_native_template_and_masks_generation_pref
 
 
 def test_minimax_chat_template_expands_media_without_processor_replacement_methods():
+    """Check grid-based image and video expansion when the processor has no replacement helpers."""
     processor = _ProcessorWithoutReplacementMethods()
     chat_template = MiniMaxM3VLChatTemplate(processor)
     encoded = chat_template.encode_messages(
@@ -200,6 +209,7 @@ def test_minimax_chat_template_expands_media_without_processor_replacement_metho
 
 @pytest.mark.parametrize("metadata_kwargs", [{"video_metadata": None}, {}], ids=["none", "missing-key"])
 def test_minimax_chat_template_expands_video_without_metadata(metadata_kwargs):
+    """Check that video expansion works when optional timing metadata is absent."""
     processor = _ProcessorWithoutReplacementMethods()
     chat_template = MiniMaxM3VLChatTemplate(processor)
     video_inputs = {"video_grid_thw": torch.tensor([[2, 2, 2]])}
@@ -256,6 +266,7 @@ class _RealMiniMaxVideoProcessorShim(_FakeNativeTemplateProcessor):
         self.chat_template_calls = []
 
     def replace_video_token(self, video_inputs, video_idx):
+        """Adapt the real video replacement API to the processor test fixture."""
         merge_length = self.video_processor.merge_size**2
         grid_thw = video_inputs["video_grid_thw"][video_idx]
         grid_t = int(grid_thw[0])
@@ -269,7 +280,10 @@ class _RealMiniMaxVideoProcessorShim(_FakeNativeTemplateProcessor):
 
 
 def test_minimax_m3_vl_transform_uses_real_chat_template_replacements(monkeypatch):
+    """Verify media preprocessing and native-template expansion through the registered data transform."""
+
     def fake_conv_preprocess(source, conversations, **kwargs):
+        """Return a fixed image/video conversation for the media-transform contract test."""
         assert source == "minimax_template_test"
         return [
             ["user", ("image", None), ("video", None), ("text", "Describe both.")],
@@ -277,10 +291,12 @@ def test_minimax_m3_vl_transform_uses_real_chat_template_replacements(monkeypatc
         ]
 
     def fake_fetch_images(images, **kwargs):
+        """Return fixture image inputs without reading external media."""
         assert images == ["image://one"]
         return ["decoded-image"]
 
     def fake_fetch_videos_metadata(videos, **kwargs):
+        """Return fixture video frames and metadata without decoding external media."""
         assert videos == ["video://one"]
         return ["decoded-video"], [{"fps": 1.0}], None, None
 
@@ -321,6 +337,7 @@ def test_minimax_m3_vl_transform_uses_real_chat_template_replacements(monkeypatc
 
 
 def _video_input(kind, tmp_path):
+    """Build a small video input in the tensor layout expected by the native processor."""
     if kind == "frames":
         return [Image.new("RGB", (28, 28), color=(idx * 40, 64, 32)) for idx in range(2)]
     if not is_ffmpeg_available():
@@ -374,6 +391,7 @@ def test_minimax_m3_vl_transform_with_real_video_processor(monkeypatch, tmp_path
 # must route to VeOmni's processor.
 @pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
 def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_class_name):
+    """Check that MiniMax processor lookup resolves to the VeOmni integration."""
     from veomni.models.registry import MODEL_PROCESSOR_REGISTRY
     from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
 
@@ -384,6 +402,7 @@ def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
     # The checkpoint's bundled processor is unusable, so from_pretrained must
     # build the native tokenizer / image / video processors by concrete class
     # with trust_remote_code=False, and take the chat template from the tokenizer.
+    """Check construction from the checkpoint tokenizer, image processor and video processor."""
     import transformers
 
     from veomni.models.transformers.minimax_m3_vl import processing_minimax_m3_vl as mod

@@ -648,6 +648,7 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
 
     @staticmethod
     def _require_grid(inputs: Dict[str, Any], key: str, index: int, modality: str) -> None:
+        """Require processed grid metadata before expanding an image or video placeholder."""
         grid = inputs.get(key)
         if grid is None or index >= len(grid):
             raise ValueError(f"The conversation has more {modality} placeholders than processed {modality} inputs.")
@@ -659,6 +660,7 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
         return self.image_pattern(token_num)
 
     def _expand_video(self, video_inputs: Dict[str, Any], video_idx: int, video_metadata: Sequence[Any]) -> str:
+        """Expand video frames into timestamped visual placeholders using processed grid metadata."""
         self._require_grid(video_inputs, "video_grid_thw", video_idx, "video")
         video_processor = self.processor.video_processor
         grid_thw = video_inputs["video_grid_thw"][video_idx]
@@ -684,6 +686,7 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
         video_inputs: Dict[str, Any],
         video_metadata: Sequence[Any],
     ) -> List[Dict[str, str]]:
+        """Replace media placeholders in order and reject missing processed image or video inputs."""
         messages = []
         image_idx = video_idx = 0
         for message in conversations:
@@ -711,6 +714,7 @@ class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
 
     @staticmethod
     def _require_prefix(prefix: List[int], sequence: List[int], context: str) -> None:
+        """Reject tokenized conversations whose accumulated prefix no longer matches the next rendering."""
         if sequence[: len(prefix)] != prefix:
             raise ValueError(
                 f"The MiniMax M3 VL native chat template rewrote the {context}; "

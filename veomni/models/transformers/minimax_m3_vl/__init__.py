@@ -43,6 +43,7 @@ def register_minimax_m3_vl_processor():
 # parameter names.
 @MODELING_REGISTRY.register("minimax_m3_vl")
 def register_minimax_m3_vl_modeling(architecture: str):
+    """Register the generated GPU or NPU MiniMax model for the active accelerator backend."""
     from .checkpoint_tensor_converter import (
         convert_minimax_m3_vl_fqn_to_index_mapping,
         create_minimax_m3_vl_checkpoint_tensor_converter,

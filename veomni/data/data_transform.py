@@ -333,6 +333,7 @@ def _process_sample_qwen_vl_base(
     position_id_func: "Callable",
     **kwargs,
 ):
+    """Process conversation media and encode labels through the selected native multimodal template."""
     from .multimodal import conv_preprocess
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")

@@ -47,6 +47,7 @@ def _l2_rel(actual: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _lora_tensors(variant: str, *, E: int, H: int, I: int, r: int, device, dtype):
+    """Create shared or per-expert adapter tensors for standard and SwiGLU-OAI variants."""
     if variant.removesuffix("_swiglu_oai") == "shared":
         shapes = [(r, H), (I, r), (r, H), (I, r), (r, I), (H, r)]
     else:
@@ -55,6 +56,7 @@ def _lora_tensors(variant: str, *, E: int, H: int, I: int, r: int, device, dtype
 
 
 def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *, num_experts: int):
+    """Invoke the selected expert-LoRA registry row with its required activation parameters."""
     activation_kwargs = dict(swiglu_alpha=1.7, swiglu_limit=0.15) if variant.endswith("_swiglu_oai") else {}
     return VeomniOp("moe_experts_lora", variant, impl)(
         hidden,

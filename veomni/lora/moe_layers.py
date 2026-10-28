@@ -445,6 +445,7 @@ class LoraSharedExperts(nn.Module):
         use_rslora: bool = False,
         adapter_name: str = "default",
     ) -> None:
+        """Validate the base experts and wrap their projections with one adapter set shared across experts."""
         super().__init__()
         if r <= 0:
             raise ValueError(f"`r` must be a positive integer, got {r}")
@@ -861,6 +862,7 @@ class LoraIndependentExperts(nn.Module):
         use_rslora: bool = False,
         adapter_name: str = "default",
     ) -> None:
+        """Validate the base experts and allocate separate gate, up and down adapter weights for each expert."""
         super().__init__()
         if r <= 0:
             raise ValueError(f"`r` must be a positive integer, got {r}")

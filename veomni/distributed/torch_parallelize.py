@@ -998,6 +998,7 @@ def parallelize_model_ddp(
 
 
 def _validate_preserve_frozen_dtype(enabled, is_peft_model, parallel_state, mixed_precision):
+    """Require a boolean flag, PEFT and active FSDP2 mixed-precision casting before preserving frozen dtypes."""
     if not isinstance(enabled, bool):
         raise TypeError("preserve_frozen_dtype must be a bool")
     if enabled and not is_peft_model:

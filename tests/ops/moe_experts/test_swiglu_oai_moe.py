@@ -16,6 +16,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_swiglu_oai_moe_variant_registers_eager_gpu_and_npu_rows():
+    """Check registration of the SwiGLU-OAI expert implementations and their device requirements."""
     from veomni.ops.registry import OP_REGISTRY
 
     impls = {entry.impl for entry in OP_REGISTRY.list_entries("moe_experts", "swiglu_oai")}
@@ -40,6 +41,7 @@ def test_swiglu_oai_manual_backward_matches_autograd():
 
 
 def test_swiglu_oai_is_not_standard_swiglu():
+    """Verify that the OAI offset and scaled gate differ from ordinary SwiGLU."""
     gate = torch.tensor([[0.5, -0.5]])
     up = torch.tensor([[0.25, -0.25]])
 
@@ -104,6 +106,7 @@ def test_swiglu_activation_without_alpha_is_bitwise_the_standard_swiglu():
 
 
 def test_swiglu_activation_with_alpha_is_swiglu_oai():
+    """Check the configured SwiGLU-OAI activation against its explicit scaled-gate formula."""
     torch.manual_seed(0)
     gate, up, grad = (torch.randn(64, 32) for _ in range(3))
     alpha = 1.702

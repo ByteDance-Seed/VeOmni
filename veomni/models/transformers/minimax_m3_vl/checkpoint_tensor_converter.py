@@ -68,6 +68,7 @@ _E_SCORE_CORRECTION_BIAS_PATTERN = re.compile(
 
 
 def _map_plain_name(name: str) -> str:
+    """Map public language, vision and projector checkpoint names to generated model names."""
     if name == "language_model.lm_head.weight":
         return "lm_head.weight"
     if name.startswith("language_model.model."):
@@ -114,6 +115,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
         self._gate_up_buffer: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
 
     def can_handle(self, name: str) -> bool:
+        """Identify checkpoint prefixes owned by the MiniMax public-layout converter."""
         return (
             name.startswith("language_model.")
             or name.startswith("vision_tower.vision_model.")
@@ -122,6 +124,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
         )
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
+        """Map one public tensor, buffering expert or gate/up fragments until its fused target is complete."""
         if match := _EXPERT_PATTERN.match(name):
             layer = match.group("layer")
             expert_id = int(match.group("expert"))
@@ -156,6 +159,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
     def _buffer_expert(
         self, prefix: str, proj_name: str, expert_id: int, tensor: "torch.Tensor"
     ) -> Optional[ConvertedCheckpointTensor]:
+        """Collect all expert rows for one projection and emit the stacked target when complete."""
         buf_key = (prefix, proj_name)
         self._expert_buffer.setdefault(buf_key, {})[expert_id] = tensor
         if len(self._expert_buffer[buf_key]) < self.num_experts:
@@ -170,6 +174,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
     def _convert_dense_or_shared(
         self, prefix: str, proj_name: str, tensor: "torch.Tensor"
     ) -> Optional[ConvertedCheckpointTensor]:
+        """Emit down projections directly and buffer dense or shared gate/up pairs for fusion."""
         if proj_name == "down_proj":
             return ConvertedCheckpointTensor(f"{prefix}.down_proj.weight", tensor)
         return self._buffer_gate_up(prefix, proj_name, tensor, weight_suffix=True)
@@ -177,6 +182,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
     def _buffer_gate_up(
         self, prefix: str, proj_name: str, tensor: "torch.Tensor", *, weight_suffix: bool
     ) -> Optional[ConvertedCheckpointTensor]:
+        """Concatenate a completed gate/up pair and emit its parameter with the requested weight suffix."""
         self._gate_up_buffer[prefix][proj_name] = tensor
         if "gate_proj" not in self._gate_up_buffer[prefix] or "up_proj" not in self._gate_up_buffer[prefix]:
             return None
@@ -190,6 +196,7 @@ class MiniMaxM3VLCheckpointTensorConverter:
         return ConvertedCheckpointTensor(f"{prefix}.gate_up_proj{suffix}", merged)
 
     def finalize(self) -> List[ConvertedCheckpointTensor]:
+        """Reject incomplete expert or gate/up buffers; completed tensors were emitted during conversion."""
         errors: List[str] = []
         if self._expert_buffer:
             errors.append(
@@ -213,6 +220,7 @@ def create_minimax_m3_vl_checkpoint_tensor_converter(model):
 
 
 def convert_minimax_m3_vl_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
+    """Rewrite public shard-index keys for generated plain, fused gate/up and stacked expert parameters."""
     converted: Dict[str, int] = {}
     gate_up_indices: Dict[str, List[int]] = defaultdict(list)
     down_indices: Dict[str, List[int]] = defaultdict(list)

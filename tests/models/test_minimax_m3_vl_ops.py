@@ -87,6 +87,7 @@ class _VarlenReferenceAttention:
         self.calls = 0
 
     def __call__(self, module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
+        """Apply independent causal attention to each packed segment for the test reference."""
         assert attention_mask is None
         self.calls += 1
         bounds = kwargs["cu_seq_lens_q"].tolist()
@@ -327,6 +328,7 @@ def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallel
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_sp_padding(module_name):
+    """Check visual segment boundaries and a separate sequence-parallel padding segment."""
     modeling = importlib.import_module(module_name)
     batch = {
         "image_grid_thw": torch.tensor([[1, 2, 2], [2, 1, 2]], dtype=torch.long),
@@ -446,6 +448,7 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
     precompute_max_seqlen,
     monkeypatch,
 ):
+    """Check complete and partial vision metadata with global segment lengths under sequence parallelism."""
     modeling = importlib.import_module(module_name)
     config = modeling.MiniMaxM3VLVisionConfig(
         hidden_size=12,
@@ -470,6 +473,7 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: parallel_state)
 
     def fake_sp_pad_and_slice(tensor, dim, pad_value, pad_scale):
+        """Emulate aligned sequence padding and this rank's local vision slice on CPU."""
         assert dim == 0
         assert pad_value == 0
         assert pad_scale == config.spatial_merge_size**2
@@ -522,6 +526,7 @@ def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(modu
     local_ids = full_ids[:, :local_len]
 
     def fake_all_gather(tensor_list, tensor, group):
+        """Reconstruct the global token IDs from deterministic rank slices."""
         for rank, chunk in enumerate(full_ids.split(local_len, dim=1)):
             tensor_list[rank].copy_(chunk)
 
@@ -582,10 +587,12 @@ def test_minimax_m3_vl_sp_drops_vision_padding_features(module_name, modality, w
     real_feature, padding_feature = torch.randn(1, hidden_size), torch.randn(1, hidden_size)
 
     def fake_all_gather(tensor_list, tensor, group):
+        """Populate gathered rank tensors with the expected global token IDs."""
         for rank, chunk in enumerate(full_ids.split(local_len, dim=1)):
             tensor_list[rank].copy_(chunk)
 
     def fake_gather_outputs(x, gather_dim, group):
+        """Return the expected gathered vision features for the padding-removal test."""
         if gather_dim == 1:
             return embed_tokens(full_ids)
         # Rank 0 holds the four real patch rows, rank 1 the SP-padding rows.
@@ -652,6 +659,7 @@ def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, monkeypatch):
+    """Compare generated expert outputs with the eager SwiGLU-OAI reference."""
     modeling = importlib.import_module(module_name)
     config = SimpleNamespace(
         num_local_experts=2,
@@ -685,6 +693,7 @@ def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
+    """Check generated RMSNorm output against the explicit FP32 normalization reference."""
     modeling = importlib.import_module(module_name)
     norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-6)
     norm.weight.data.copy_(torch.linspace(-0.1, 0.1, 8))

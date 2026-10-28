@@ -344,6 +344,7 @@ def test_disable_adapter_restores_nested_context_after_exception(device_kind):
 
 
 def test_disable_adapter_rejects_merged_layers_before_changing_flags():
+    """Verify that merged adapters are rejected without changing any layer disable flags."""
     model = VeOmniLoraModel(Toy(), _base_config())
     layers = [m for m in model.modules() if isinstance(m, LoraLinear)]
     layers[-1].merge()

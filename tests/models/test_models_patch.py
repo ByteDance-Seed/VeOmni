@@ -500,6 +500,7 @@ TEST_CASES = [
 
 
 def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[ModelMode]]:
+    """Select supported parallel configurations for the requested model patch test."""
     hf_modes, veomni_modes = prepare_model_modes(
         is_moe=is_moe,
         include_fa3=(case_id in _FA3_REPRESENTATIVE_CASES),
@@ -557,6 +558,7 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
 def test_models_patch_fwd_bwd(
     request: pytest.FixtureRequest, tmp_path: Path, toy_config: str, is_moe: bool, rtol: float, atol: float
 ):
+    """Compare patched and reference model forward and backward results in supported modes."""
     case_id = request.node.callspec.id
     hf_modes, veomni_modes = _case_modes(case_id, is_moe)
 

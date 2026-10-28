@@ -142,6 +142,7 @@ class DummyMiniMaxM3VLDataset(Dataset):
         temporal_patch_size: int = 2,
         merge_size: int = 2,
     ):
+        """Configure synthetic MiniMax text, image and video sample shapes and token dimensions."""
         self.size = size
         self.vocab_size = 256
         t, h, w = 1, 2, 2
@@ -401,6 +402,7 @@ class QwenImageDataset(Dataset):
 
 
 def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
+    """Select the model-specific synthetic dataset used by training and alignment tests."""
     if task_type == "text":
         return DummyTextDataset(size=size, seq_length=max_seq_len)
     elif task_type == "qwen2vl":

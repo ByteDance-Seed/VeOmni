@@ -144,6 +144,7 @@ def collate_multimodal_metadata(batch, sp_pad):
 
 
 def _grid_thw_to_list(grid_thw, grid_thw_list):
+    """Reuse host-precomputed grids or convert the supplied grid tensor for fallback callers."""
     if grid_thw_list is not None:
         return grid_thw_list
     return grid_thw.tolist()
@@ -665,6 +666,7 @@ class MiniMaxM3VLAttention(nn.Module):
             MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
         )
         # Bind instance-local attention VeomniOps: standard attention for dense layers, MSA for sparse ones
+        "Initialize attention and bind per-instance VeOmni dense and sparse operator handles."
         if self.indexer is None:
             self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
         else:
@@ -688,6 +690,7 @@ class MiniMaxM3VLAttention(nn.Module):
         past_key_values=None,
         **kwargs,
     ):
+        """Project language Q/K/V and dispatch dense or sparse attention with packed-sequence metadata."""
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -969,6 +972,7 @@ class MiniMaxM3VLPreTrainedModel(PreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
+        """Initialize model weights and reset MiniMax-specific RMSNorm offsets and router correction biases."""
         super()._init_weights(module)
         std = getattr(self.config, "initializer_range", 0.02)
         if isinstance(module, MiniMaxM3VLExperts):
@@ -1031,6 +1035,7 @@ class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
         use_cache: bool | None = None,
         **kwargs,
     ):
+        """Run training-only packed language layers, rejecting unsupported cache, batch and sequence-parallel inputs."""
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1184,6 +1189,7 @@ class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
     # ================================================================
     def forward(self, grid_thw, device, dtype, kwargs=None, grid_thw_list=None):
         # --- Patch.1 ---
+        """Build vision RoPE from host grid metadata when available, then place coordinates on the target device."""
         if grid_thw_list is not None:
             grid_thw = torch.tensor(grid_thw_list, dtype=torch.long)
         # --- Patch.1 ---
@@ -1243,6 +1249,7 @@ class MiniMaxM3VLVisionAttention(nn.Module):
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
+        """Project vision Q/K/V, apply RoPE and call the configured attention operator."""
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -1448,6 +1455,7 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
     # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
+        """Exercise vision parameters on ranks without media using a metadata-consistent synthetic input."""
         patch_size = self.config.patch_size
         temporal_patch_size = self.config.temporal_patch_size
         in_channels = getattr(self.config, "num_channels", getattr(self.config, "in_channels", 3))

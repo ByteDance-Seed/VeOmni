@@ -141,6 +141,7 @@ class LoraLinear(nn.Module, LoraLayer):
         )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Apply the active dense adapter unless disabled or merged, preserving the base result dtype."""
         result = self.base_layer(x, *args, **kwargs)
         if self.merged or self.disable_adapters:
             return result
