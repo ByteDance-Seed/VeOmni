@@ -240,6 +240,61 @@ def test_qwen_image_eager_config_runs_unmasked_attention(monkeypatch):
     assert txt_out.shape == (1, 3, 8)
 
 
+def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monkeypatch):
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
+        QwenImageTransformer2DModel,
+    )
+    from veomni.ops import VeomniOp
+
+    config = _tiny_config()
+    config._set_ops_implementation(_sdpa_ops_config())
+    model = QwenImageTransformer2DModel(config)
+    ckpt_dir = tmp_path / "qwen_image_ckpt"
+    model.save_pretrained(ckpt_dir)
+
+    # Ensure VeomniOp can resolve veomni_flash_attention_2 even on CPU-only test runners.
+    fa2_handle = SimpleNamespace(op="attention", variant="standard", impl="veomni_flash_attention_2")
+    sdpa_handle = VeomniOp("attention", "standard", "veomni_sdpa")
+    monkeypatch.setitem(VeomniOp._intern, ("attention", "standard", "veomni_flash_attention_2"), fa2_handle)
+
+    loaded_fa2 = QwenImageTransformer2DModel.from_pretrained(
+        ckpt_dir,
+        ops_implementation={"attn_implementation": "veomni_flash_attention_2"},
+    )
+    assert loaded_fa2.config.ops_config.attn_implementation == "veomni_flash_attention_2"
+    for block in loaded_fa2.transformer_blocks:
+        assert block.attn.processor.veomni_attn.impl == "veomni_flash_attention_2"
+        assert block.attn.processor.veomni_attn_masked is sdpa_handle
+        assert block.attn.processor.config._attn_implementation == "veomni_flash_attention_2"
+
+    loaded_kwarg = QwenImageTransformer2DModel.from_pretrained(
+        ckpt_dir,
+        attn_implementation="veomni_flash_attention_2",
+    )
+    assert loaded_kwarg.config.ops_config.attn_implementation == "veomni_flash_attention_2"
+    assert loaded_kwarg.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_flash_attention_2"
+
+    loaded_sdpa = QwenImageTransformer2DModel.from_pretrained(
+        ckpt_dir,
+        ops_implementation=_sdpa_ops_config(),
+    )
+    assert loaded_sdpa.config.ops_config.attn_implementation == "sdpa"
+    for block in loaded_sdpa.transformer_blocks:
+        assert block.attn.processor.veomni_attn.impl == "sdpa"
+        assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
+        assert block.attn.processor.config._attn_implementation == "sdpa"
+
+    loaded_dict_sdpa = QwenImageTransformer2DModel.from_pretrained(
+        ckpt_dir,
+        ops_implementation={"attn_implementation": "sdpa"},
+    )
+    assert loaded_dict_sdpa.config.ops_config.attn_implementation == "veomni_sdpa"
+    for block in loaded_dict_sdpa.transformer_blocks:
+        assert block.attn.processor.veomni_attn is sdpa_handle
+        assert block.attn.processor.veomni_attn_masked is sdpa_handle
+        assert block.attn.processor.config._attn_implementation == "veomni_sdpa"
+
+
 def _tiny_attn(*, heads: int, dim_head: int) -> SimpleNamespace:
     from torch import nn
 

@@ -18,7 +18,7 @@ Regen command:
 patchgen veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 Reuses the GPU structural patches. ``VeomniOp`` reads NPU impl names from
-the installed ops config. No local ``triton_bmm`` on NPU.
+``config.ops_config``. No local ``triton_bmm`` on NPU.
 """
 
 from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (

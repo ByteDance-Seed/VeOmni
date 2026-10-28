@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for installed ops-config resolution."""
+"""CPU tests for ``VeOmniPretrainedConfig`` and ``OpsImplementationConfig`` resolution."""
 
 from __future__ import annotations
 

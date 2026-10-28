@@ -65,9 +65,10 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     models do, which is the point -- the alternative is a list of model names in the
     generic builder, and a list is a thing the next model has to be remembered into.
 
-    What a config cannot see on its own is the rest of the run, so the convention is
-    that the hook reads whatever singletons it needs (the installed ops config,
-    the parallel state) and takes no arguments. Kept as a plain ``getattr`` for the
+    A config already holds its own ``self.ops_config``, and for any run-wide state
+    it cannot see on its own (such as the parallel state) the convention is that
+    the hook reads ``self.ops_config`` and the parallel state directly and takes
+    no arguments. Kept as a plain ``getattr`` for the
     same reason: a config that has nothing to refuse should not have to say so.
 
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation

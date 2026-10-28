@@ -16,7 +16,8 @@
 
 Handle snapshots in ``test_auto_registry.py`` stay, but they do not execute
 ``forward``. These cases construct two models under different ops configs,
-poison the global config, then run text / vision / condition / DiT forwards.
+mutate ``config.ops_implementation`` afterwards, then run text / vision /
+condition / DiT forwards.
 """
 
 from __future__ import annotations

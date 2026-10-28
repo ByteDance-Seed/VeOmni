@@ -678,17 +678,32 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
+        ops_implementation = kwargs.pop("ops_implementation", None)
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        provided_config = kwargs.pop("config", None)
         diffusers_model = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
         diffusers_model.__class__ = cls
 
         valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
         diffusers_cfg = dict(diffusers_model.config)
-        veomni_cfg = cls.config_class(**{k: v for k, v in diffusers_cfg.items() if k in valid_keys})
+        if isinstance(provided_config, cls.config_class):
+            veomni_cfg = copy.deepcopy(provided_config)
+        else:
+            cfg_kwargs = {k: v for k, v in diffusers_cfg.items() if k in valid_keys}
+            if "attn_implementation" in diffusers_cfg:
+                cfg_kwargs["attn_implementation"] = diffusers_cfg["attn_implementation"]
+            if "ops_implementation" in diffusers_cfg:
+                cfg_kwargs["ops_implementation"] = diffusers_cfg["ops_implementation"]
+            veomni_cfg = cls.config_class(**cfg_kwargs)
+        if ops_implementation is not None:
+            veomni_cfg._set_ops_implementation(ops_implementation)
+        if attn_implementation is not None:
+            veomni_cfg._attn_implementation = attn_implementation
         diffusers_model.config = veomni_cfg
         diffusers_model.config.tie_word_embeddings = False
 
         # __init__ is bypassed by from_pretrained, so install the SP processor here too.
-        sp_processor = QwenImageSPAttnProcessor()
+        sp_processor = QwenImageSPAttnProcessor(veomni_cfg)
         for block in diffusers_model.transformer_blocks:
             block.attn.set_processor(sp_processor)
         return diffusers_model

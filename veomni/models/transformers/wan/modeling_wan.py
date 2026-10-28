@@ -147,7 +147,7 @@ class RMSNorm(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    """``attention`` / ``standard``. Impl from the installed ops config.
+    """``attention`` / ``standard``. Impl from ``config.ops_config``.
 
     ``WanModel`` is not on the HuggingFace attention-interface path, so
     ``config._attn_implementation`` must stay ``eager``. ``sageattention``

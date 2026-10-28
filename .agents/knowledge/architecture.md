@@ -191,11 +191,11 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. `models.build_foundation_model()` installs the supplied ops selection.
+1. `models.build_foundation_model()` binds the supplied `ops_implementation` onto the model `PretrainedConfig` (`config.ops_config`).
 2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Construct instance-local `VeomniOp` handles from the installed selection.
+5. Construct instance-local `VeomniOp` handles from `self.config.ops_config`.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 

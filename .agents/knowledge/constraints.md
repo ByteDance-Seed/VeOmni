@@ -235,7 +235,7 @@ Core files:
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
 25. **Kernel handles belong to model instances**
-   - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
+   - Modeling classes construct `VeomniOp` handles from `self.config.ops_config` and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
 
 26. **DCP full resume skips HF weight materialization**
