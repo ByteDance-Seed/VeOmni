@@ -87,10 +87,9 @@ training and distributed inference).
 **List `InferenceMixin` before `PretrainedOmniModule`.** `PretrainedOmniModule`
 provides default no-op `reset_local_inference_state` /
 `reset_global_inference_state` / `finalize` methods for modules without
-inference state, so placing `InferenceMixin` (or `SimpleArGenerationMixin` from
-`modules/base/llm_packing.py`) first in the base list ensures the module's
-implementations take precedence in the MRO, and `XxxAccelerated(VeOmniMixin, Xxx)`
-inherits them from `Xxx`.
+inference state, so placing `InferenceMixin` first in the base list ensures the
+module's implementations take precedence in the MRO, and
+`XxxAccelerated(VeOmniMixin, Xxx)` inherits them from `Xxx`.
 
 Training-graph hooks on the accelerated class, all optional with safe defaults:
 
@@ -100,7 +99,6 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
-| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, before the lr scheduler is built and a checkpoint is loaded |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |
@@ -117,9 +115,11 @@ Native hooks in `modeling.py`, used during inference with no VeOmni graph:
 CPU input preparation is a separate picklable worker class, not a mixin: a
 native class points `preprocessor_class` at a
 [Module CPU Preprocessor](../mixins/module_preprocessor.md)
-(`ModulePreprocessorBase`, run by `OmniProcessor` in DataLoader workers for
-worker-side CPU input preparation and FSDP batch anchors). Optional capabilities
-on the model itself are mixins on the accelerated class, each with its own page:
+(`ModulePreprocessorBase`, run per sample by `OmniProcessor` in `seedomni_transform`
+during training for worker-side CPU input preparation, `_omni_token_len` tagging,
+and FSDP dummy anchors, and once per request with `inference=True` before the
+generation FSM during inference). Optional capabilities on the model itself are
+mixins on the accelerated class, each with its own page:
 [Metric Meter](../mixins/metric_meter.md) (per-module tokens and theoretical
 FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on) and
 [Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder
@@ -162,9 +162,10 @@ Modules select items by `type`, `role`, and `meta` tags (for example `_img_tag`
 combinations. The on-disk schema and transform are in
 [Data Format](../usage/data_format.md).
 
-An `is_dummy=True` item is a zero-tensor placeholder added on a micro-batch that
-lacks a modality. It keeps the `role` and tags of the items it stands in for so
-the encoder processes real and placeholder rows with one filter, and the
+An `is_dummy=True` item is a zero-tensor placeholder appended per sample during
+dataset-stage CPU preparation (`seedomni_transform` via `OmniProcessor`) when a
+sample lacks a modality. It keeps the `role` and tags of the items it stands in
+for so the encoder processes real and placeholder rows with one filter, and the
 backbone folds a `+ value.mean() * 0.0` anchor to keep FSDP gradient reductions
 aligned across ranks.
 
@@ -213,15 +214,18 @@ flowchart LR
     VD --> E
 ```
 
-What each node does to the shared carrier:
+Before the GPU graph runs, `seedomni_transform` executes `OmniProcessor` per
+sample in DataLoader workers to apply the chat template, tokenize `text` items
+(populating `meta.labels` and `meta._omni_token_len`), normalize/patchify media,
+and append per-sample `is_dummy=True` placeholders for any missing modality.
+What each node then does to the shared carrier in the GPU training graph:
 
-1. **`janus_siglip`** replaces user `image` items' pixels with SigLIP patch
-   embeddings.
+1. **`janus_siglip`** replaces user `image` items' normalized pixels with SigLIP
+   patch embeddings.
 2. **`janus_vqvae.encode`** replaces assistant `image` items with VQ embeddings
    and stores `meta.janus_vqvae_labels`.
-3. **`janus_text_encoder.encode`** applies the Janus chat template to `text`
-   items, tokenizes, runs the word-token embedding (`wte`) and stores
-   `meta.labels`.
+3. **`janus_text_encoder.encode`** embeds the pre-tokenized `text` items through
+   the word-token embedding (`wte`).
 4. **`janus_llama`** concatenates every non-dummy item's embedding into one
    packed `bs=1` sequence, runs the LLaMA backbone (no `wte`, no `lm_head`) and
    writes the hidden state back onto each item's `value`.
@@ -247,10 +251,11 @@ total_loss = sum(self._losses.values())
 ```
 
 **Dummy forward (training):** to keep FSDP collectives aligned across ranks,
-every active training node runs on every micro-batch; when a modality is absent,
-the encoder runs `dummy_inputs()` and appends an `is_dummy=True` item that the
-backbone anchors (§2.2). During inference, modules may `return {}` to skip an
-edge.
+every active training node runs on every micro-batch; when a sample lacks a
+modality, its dataset-stage CPU preprocessor appends a per-sample
+`is_dummy=True` placeholder (or the module falls back to `dummy_inputs()`) so
+the encoder still executes forward and the backbone anchors the dummy output
+(§2.2). During inference, modules may `return {}` to skip an edge.
 
 With Ulysses enabled, each module slices the replicated sample inside its own
 `pre_forward` and all-gathers in its `post_forward`; see

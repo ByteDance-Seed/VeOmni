@@ -28,7 +28,7 @@
 #    - init_modification: Qwen3OmniMoeVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3OmniMoeVisionAttention.forward
-#      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
+#      Route packed cu_seqlens through the local attention VeomniOp
 #    - method_override: Qwen3OmniMoeVisionEncoder.forward
 #      SP-slice pos/rotary, extend cu_seqlens for SP pad tail, return BaseModelOutputWithDeepstackFeatures
 #    - method_override: Qwen3OmniMoeVisionEncoder.dummy_forward
@@ -76,7 +76,7 @@
 #    - init_modification: Qwen3OmniMoeAudioAttention
 #      Bind instance-local attention VeomniOp
 #    - method_override: Qwen3OmniMoeAudioAttention.forward
-#      Always call the local attention VeomniOp
+#      Route packed cu_seqlens through the local attention VeomniOp
 #    - init_modification: Qwen3OmniMoeThinkerTextAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
@@ -127,7 +127,6 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     TransformersKwargs,
     accepts_precomputed_kwargs,
-    is_flash_attention_requested,
     maybe_autocast,
     merge_with_config_defaults,
 )
@@ -141,7 +140,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice, unpad_tensor
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -688,6 +687,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length, _ = hidden_states.size()
@@ -700,45 +700,23 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
-        if is_flash_attention_requested(self.config):
+        if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
@@ -1129,47 +1107,24 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
         # --- Patch.1 ---
-        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-            if max_seqlen is None:
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
         # --- Patch.1 ---
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -1809,6 +1764,13 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=self.veomni_attn.impl,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -1818,7 +1780,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **kwargs,
+            **attn_kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

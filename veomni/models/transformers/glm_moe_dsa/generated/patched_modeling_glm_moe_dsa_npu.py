@@ -650,18 +650,16 @@ class GlmMoeDsaExperts(nn.Module):
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
-                top_k_weights.to(hidden_states.dtype),
+                top_k_weights,
                 self.gate_up_proj,
                 self.down_proj,
                 self.act_fn,
                 self.num_experts,
             )
         unused = self.gate_up_proj.new_empty(0)
-        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
-        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            routing_weights,
+            top_k_weights,
             top_k_index,
             unused,
             unused,

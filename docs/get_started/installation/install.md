@@ -25,11 +25,17 @@ source .venv/bin/activate
 ```
 
 `gpu` is a single full superset: cu130 torch, FA2 (cp311/cp312 prebuilt
-wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, diffusion / audio /
+wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, DeepGEMM, diffusion / audio /
 video / LoRA deps, and `megatron-energon` for the
 optional energon dataset format. See
 [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
 for the full list.
+
+DeepGEMM wheels cover Python 3.11/3.12 on Linux x86_64/aarch64 and require
+glibc >=2.38 plus a compatible libstdc++ (Ubuntu 24.04 / NGC 25.11).
+FP8 MoE remains opt-in with `moe_implementation: deepgemm_fp8` and requires
+Hopper SM90 or Blackwell SM100. Runtime GEMM JIT still needs NVCC and a C++20
+compiler; see [FP8 MoE training](../../design/deepgemm_fp8_moe.md).
 
 ### Optional MagiAttention extra
 
@@ -59,7 +65,10 @@ FlexAttention instead; its FA4 backend is included in the `gpu` extra.
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-pip3 install -e .[gpu]
+pip3 install -e .[gpu] \
+  --find-links https://verl-project.github.io/verl-wheelhouse/cu130/torch2.11/simple/deep-gemm/
 ```
 
-Add MagiAttention with `pip3 install -e ".[gpu,magi]"`.
+Pip does not read `[tool.uv.sources]`; the wheelhouse link supplies the pinned
+DeepGEMM wheel for the matching torch 2.11 / CUDA 13 environment.
+To include MagiAttention, use `.[gpu,magi]` in the same command.

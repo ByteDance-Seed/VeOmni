@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint import layout
 from veomni.models.checkpoint import ModelCheckpointManager
 from veomni.models.seed_omni.utils.conversation import ConversationItem
@@ -23,6 +24,9 @@ from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
 )
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):

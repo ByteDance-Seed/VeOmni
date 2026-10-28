@@ -464,6 +464,9 @@ class EPQuackGroupGemm(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # Drop context references so last-use deletions release storage.
+        # PyTorch keeps these tensors when retain_graph=True.
+        ctx.maybe_clear_saved_tensors()
         swiglu_limit = ctx.swiglu_limit
 
         cu_seqlens_m = cumsum_to_cu_seqlens(cumsum)
@@ -484,10 +487,11 @@ class EPQuackGroupGemm(torch.autograd.Function):
         # gate gradients
         grad_fc1_2_output = fc1_1_activation * grad_fc1_result
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        del fc1_1_activation
+        del fc1_1_activation, fc1_2_output, grad_fc1_result
 
         if swiglu_limit is not None:
             grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+        del mask_fc1_2
 
         # dgrad fc1_2
         grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m, tuned=False)
@@ -500,8 +504,10 @@ class EPQuackGroupGemm(torch.autograd.Function):
 
         # silu backward
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        del fc1_1_output, grad_fc1_1_activation
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+        del mask_fc1_1
 
         # dgrad fc1_1
         grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m, tuned=False)
@@ -593,6 +599,9 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # Drop context references so last-use deletions release storage.
+        # PyTorch keeps these tensors when retain_graph=True.
+        ctx.maybe_clear_saved_tensors()
         swiglu_limit = ctx.swiglu_limit
 
         cu_seqlens_m = cumsum_to_cu_seqlens(cumsum)
@@ -613,14 +622,15 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
         # gate gradients
         grad_fc1_2_output = fc1_1_activation * grad_fc1_result
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        del fc1_1_activation, fc1_2_output
+        del fc1_1_activation, fc1_2_output, grad_fc1_result
 
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        del fc1_1_output
+        del fc1_1_output, grad_fc1_1_activation
 
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
             grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+        del mask_fc1_1, mask_fc1_2
 
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
@@ -702,6 +712,7 @@ def quack_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
 
+        del expert_mask
         cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
         if fc1_1_2_weight is not None:
@@ -722,6 +733,7 @@ def quack_gemm_fused_moe_forward(
                 swiglu_limit,
             )
 
+        del permute_tokens
         final_hidden_states = tokens_post_all2all(
             expert_outputs=final_permute_tokens,
             routing_weights=routing_weights,

@@ -32,6 +32,15 @@ from the test's launch plan. See
 [Registering Tests in CI](../../../docs/testing.md#registering-tests-in-ci) for
 the manifest example, registration rules and collection check command.
 
+The `qwen38-channel_loss_callback-unit` selection is present in both
+`suites/gpu.json` and `suites/npu.json`. It collects
+`tests/trainer/test_channel_loss_callback.py` for the detached channel-loss
+callback, packed-source alignment, and local SP/Gloo checks. The existing
+`tests/ops` selection also collects chunk-loss observer/offload tests. Consult
+the individual case plans, skip conditions, and job logs for the hardware
+actually exercised; inclusion in an accelerator suite alone does not prove a
+native device run.
+
 ## Launch plans
 
 An unmarked case defaults to one card of the selected accelerator backend, or
@@ -76,9 +85,25 @@ the next dispatch check pauses admission of later accelerator batches until
 the head fits. CPU work has its own concurrency limit. Each batch has an
 isolated working directory and cache. Temporary directories use short paths
 under `/tmp` so DataLoader Unix socket names stay within the platform limit;
-they are cleaned up after the batch, or retained with failure artifacts. Rendezvous ports
-come from the shared launch helpers and a locked registry that prevents
-reuse by pending launches. Visibility is set before importing torch,
+they are cleaned up after the batch, or retained with failure artifacts.
+Distributed spawn helpers create a parent-owned TCPStore on port zero and
+keep it listening through worker execution and cleanup after spawn returns.
+Partial startup failures inside `mp.spawn` rely on the runner's enclosing
+process-scope cleanup. Every rank,
+including rank zero, connects to that Store rather than rebinding a probed
+port. Single-node torchrun commands use `--standalone`; their agents own the
+rendezvous and bootstrap Stores. CI keeps agent Store sharing enabled with
+`TORCH_DISABLE_SHARE_RDZV_TCP_STORE=0`.
+
+The legacy `find_free_port()` registry still prevents duplicate numbers among
+cooperating callers in one run, including default worker environments and
+remaining in-process env:// fixtures. It does not reserve an OS socket or
+coordinate other runs. New distributed launchers must use a live Store or
+standalone agent instead of probing and closing a socket before startup.
+Spawn endpoint ready/closed events include case ID, launch ID, owner PID and
+port in each batch's `.rendezvous.jsonl` artifact. This fixes rendezvous
+allocation races; Gloo/NCCL/HCCL transport sockets have their own lifecycles.
+Visibility is set before importing torch,
 and launch validation checks nproc and child device assignments against the
 case plan and lease. Every distributed launch starts fresh workers.
 
@@ -103,6 +128,18 @@ CPU optimizer defaults use Torch's original capability helper during the same
 scope, so torch_npu's foreach policy does not initialize a hidden device.
 Explicit optimizer options are preserved, and the vendor helper is restored
 when the case ends.
+For CPU cases, the worker also temporarily restores Torch's multi-worker
+DataLoader iterator constructor from the loaded torch_npu module. The vendor
+wrapper queries NPU affinity even for CPU data. Its original patch is restored
+after teardown or failure; accelerator cases keep the vendor constructor.
+The same CPU scope disables NPU backend registration by the loaded vendor
+Inductor registry, restoring its previous policy afterward. CPU graphs still
+compile with Inductor; accelerator cases keep normal NPU registration.
+CPU cases initialize a missing built-in CPU device-op override as well. This
+handles Torch 2.10's partially populated registry after importing torch_npu,
+while preserving existing CPU and vendor overrides. Setup is also covered by
+the restoration scope: partial setup failures restore every state already
+changed. Missing vendor isolation interfaces fail explicitly before test execution.
 
 ## Results and local commands
 
@@ -117,10 +154,15 @@ launches, source fingerprints and the suite's elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
 including `durations.json`, are reporting artifacts and are not scheduling inputs.
 
+Manifest selection numbers run consecutively from one across each file,
+including both unit and e2e entries. Keep the existing order when renumbering.
+The GPU manifest has unit entries 01–58 and e2e entries 59–61. The NPU
+manifest has unit entries 01–39 and e2e entries 40–41.
 Foreground case statuses use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`
-(or `[e2e-57-case-0001]` and `[devices=cpu]`). The entry ID comes from the
-manifest: `09-unit` becomes `unit-09`, `npu-e2e-01` becomes `e2e-01`, and
-`ci-unit` becomes `unit-ci`. Each case gets a one-based, four-digit index within
+(or `[e2e-59-case-0001]` and `[devices=cpu]`). The entry ID comes from the
+manifest: `09-unit` becomes `unit-09`, `npu-e2e-40` becomes `e2e-40`, and
+the GPU CI planner selection `55-unit` becomes `unit-55`. Each case gets a
+one-based, four-digit index within
 its entry's collected inventory, including parameterized cases. This index is
 independent of batching, card-count sorting and parallel completion order.
 All batches from one entry share its entry ID; no batch number is shown.
@@ -140,7 +182,7 @@ entry `display_id`; aggregated `cases.json` carries each case's full
 [unit-09][START][devices=cpu] tests/foo/test_bar.py (cases=2)
 [unit-09-case-0001][RUN][devices=cpu] tests/foo/test_bar.py::test_a
 [unit-09-case-0001][PASSED (12/4508)][devices=cpu] tests/foo/test_bar.py::test_a
-[e2e-57-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
+[e2e-59-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
     ... traceback ...
 ```
 
@@ -181,7 +223,7 @@ text-only fixtures use vocabularies of 4096. Qwen3-MoE retains four MoE
 layers for the LoRA per-layer EP slicing assertions. Vision/audio widths are matched to
 the text connectors. Existing numerical tolerances and checkpoint/optimizer
 round-trip assertions are unchanged. GPU and NPU e2e suites each include one
-Wan alignment invocation. Qwen3-MoE EP1/4/8 saveload cases check HF export
+Wan alignment invocation. Qwen3-MoE EP1/2/4 saveload cases on four cards check HF export
 alongside DCP/optimizer restoration and independent CLI DCP-to-HF verification.
 
 Fused checkpoint formats also require distinguishable weight layouts: for
@@ -202,7 +244,7 @@ projection deliberately raises instead of guessing whether to transpose it.
 | `pytest_plugin.py` | Case inventory, launch validation and pytest results |
 | `runtime/devices.py` | GPU/NPU probing and child visibility |
 | `runtime/workers.py` | Workspaces, interruptible thread pools, subprocess timeouts and scoped cleanup |
-| `runtime/ports.py` | Run-scoped rendezvous port allocation |
+| `runtime/ports.py` | Live spawn rendezvous servers and legacy cooperative port allocation |
 | `suites/gpu.json`, `suites/npu.json` | Unit/e2e selections and environment settings |
 
 CPU scheduler tests live in `tests/ci/` and are selected by both manifests.
