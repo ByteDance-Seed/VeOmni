@@ -59,6 +59,70 @@ finally:
     importlib.util.find_spec = _real_find_spec  # type: ignore[assignment]
 
 
+def _run_basic_observation(computer):
+    return computer.compute_side_channel(
+        logits=torch.randn(1, 2, 4),
+        labels=torch.tensor([[1, 2]]),
+        vocab_size=4,
+        hidden_states=None,
+        weights=None,
+    )
+
+
+def _source_a_observation():
+    return [
+        {
+            "source_id": "source-a",
+            "loss_sum": torch.tensor(2.0),
+            "token_count": torch.tensor(1),
+            "sample_count": torch.tensor(1),
+            "input_token_count": torch.tensor(2),
+        }
+    ]
+
+
+def _channel_test_trainer(cfg):
+    return SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)),
+        device=torch.device("cpu"),
+        step_train_metrics={},
+        step_env_metrics={},
+    )
+
+
+def _init_gloo_group(rank, world_size, init_file):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+
+
+def _channel_dpo_two_pair_batch(trainer):
+    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
+    trainer.sp_enabled = False
+    return {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
+        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
+        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
+        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
+            {
+                "source_ids": [3, 4],
+                "source_cu": [0, 4, 8],
+                "input_mask": torch.ones(8, dtype=torch.bool),
+                "tail": 0,
+                "sp_size": 1,
+                "sp_rank": 0,
+            }
+        ),
+        "ds_idx": torch.tensor([3, 4]),
+        "source_name": ["train/a", "train/b"],
+    }
+
+
 def _legacy_computer(*args, **kwargs):
     """Exercise the internal legacy aggregation helpers without a producer."""
     computer = ChannelLossComputer(*args, **kwargs)
@@ -1109,13 +1173,7 @@ def test_channel_loss_sp_capture_reuses_snapshot():
     with computer.capture():
         assert computer._capture_topology["sp_rank"] == 0
         parallel_state.sp_rank = 7
-        computer.compute_side_channel(
-            logits=torch.randn(1, 2, 4),
-            labels=torch.tensor([[1, 2]]),
-            vocab_size=4,
-            hidden_states=None,
-            weights=None,
-        )
+        _run_basic_observation(computer)
         assert computer._pending_observations[0]["segments"][0]["sp_rank"] == 0
 
     assert computer.strict_observation_errors == []
@@ -1270,13 +1328,7 @@ def test_channel_loss_failed_sp_payload_exchange_aborts_unsafe_process_group(mon
     monkeypatch.setattr(channel_loss_module.dist, "all_gather_object", exchange)
     with pytest.raises(ChannelLossCollectiveError, match="SP observation exchange failed"):
         with computer.capture():
-            computer.compute_side_channel(
-                logits=torch.randn(1, 2, 4),
-                labels=torch.tensor([[1, 2]]),
-                vocab_size=4,
-                hidden_states=None,
-                weights=None,
-            )
+            _run_basic_observation(computer)
     assert calls == [None, group]
 
 
@@ -1330,13 +1382,7 @@ def test_channel_loss_releases_observer_cache_after_side_channel(monkeypatch):
 
     monkeypatch.setattr(computer, "_compute_channel_loss", compute)
     monkeypatch.setattr(channel_loss_module, "_release_observer_cache", release)
-    computer.compute_side_channel(
-        logits=torch.randn(1, 2, 4),
-        labels=torch.tensor([[1, 2]]),
-        vocab_size=4,
-        hidden_states=None,
-        weights=None,
-    )
+    _run_basic_observation(computer)
 
     assert events == ["compute", "release"]
 
@@ -1387,15 +1433,7 @@ def test_channel_loss_cleanup_failure_does_not_abort_observation(monkeypatch):
     computer = _legacy_computer()
     computer.release_cache = True
     computer._source_ids = ["source-a"]
-    observed = [
-        {
-            "source_id": "source-a",
-            "loss_sum": torch.tensor(2.0),
-            "token_count": torch.tensor(1),
-            "sample_count": torch.tensor(1),
-            "input_token_count": torch.tensor(2),
-        }
-    ]
+    observed = _source_a_observation()
     monkeypatch.setattr(computer, "_compute_channel_loss", lambda **kwargs: observed)
     monkeypatch.setattr(
         channel_loss_module,
@@ -1403,13 +1441,7 @@ def test_channel_loss_cleanup_failure_does_not_abort_observation(monkeypatch):
         lambda device: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
     )
 
-    computer.compute_side_channel(
-        logits=torch.randn(1, 2, 4),
-        labels=torch.tensor([[1, 2]]),
-        vocab_size=4,
-        hidden_states=None,
-        weights=None,
-    )
+    _run_basic_observation(computer)
 
     assert computer._result == observed
 
@@ -1430,13 +1462,7 @@ def test_channel_loss_cleanup_failure_preserves_strict_metadata_error(monkeypatc
     )
 
     with pytest.raises(ChannelLossMetadataError, match="metadata failed"):
-        computer.compute_side_channel(
-            logits=torch.randn(1, 2, 4),
-            labels=torch.tensor([[1, 2]]),
-            vocab_size=4,
-            hidden_states=None,
-            weights=None,
-        )
+        _run_basic_observation(computer)
 
     assert computer._result is None
     assert computer.strict_observation_errors
@@ -1449,15 +1475,7 @@ def test_channel_loss_multiple_objectives_count_primary_data_once(monkeypatch):
     computer._position_ids = torch.tensor([[0, 1]])
     results = iter(
         [
-            [
-                {
-                    "source_id": "source-a",
-                    "loss_sum": torch.tensor(2.0),
-                    "token_count": torch.tensor(1),
-                    "sample_count": torch.tensor(1),
-                    "input_token_count": torch.tensor(2),
-                }
-            ],
+            _source_a_observation(),
             [
                 {
                     "source_id": "source-a",
@@ -1472,13 +1490,7 @@ def test_channel_loss_multiple_objectives_count_primary_data_once(monkeypatch):
     monkeypatch.setattr(computer, "_compute_channel_loss", lambda **kwargs: next(results))
     with computer.capture():
         for _ in range(2):
-            computer.compute_side_channel(
-                logits=torch.randn(1, 2, 4),
-                labels=torch.tensor([[1, 2]]),
-                vocab_size=4,
-                hidden_states=None,
-                weights=None,
-            )
+            _run_basic_observation(computer)
     computer.after_micro_step()
 
     loss_sum, token_count = computer.step_totals["source-a"]
@@ -1733,15 +1745,7 @@ def test_channel_loss_strict_success_plus_failure_discards_partial_evidence(monk
     computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["source-a"]
-    successful = [
-        {
-            "source_id": "source-a",
-            "loss_sum": torch.tensor(2.0),
-            "token_count": torch.tensor(1),
-            "sample_count": torch.tensor(1),
-            "input_token_count": torch.tensor(2),
-        }
-    ]
+    successful = _source_a_observation()
     calls = 0
 
     def observe(**kwargs):
@@ -1755,13 +1759,7 @@ def test_channel_loss_strict_success_plus_failure_discards_partial_evidence(monk
     with pytest.raises(ChannelLossMetadataError, match="second observation failed"):
         with computer.capture():
             for _ in range(2):
-                computer.compute_side_channel(
-                    logits=torch.randn(1, 2, 4),
-                    labels=torch.tensor([[1, 2]]),
-                    vocab_size=4,
-                    hidden_states=None,
-                    weights=None,
-                )
+                _run_basic_observation(computer)
 
     assert computer._result is None
     assert computer._micro_step_observation_count == 0
@@ -1772,15 +1770,7 @@ def test_channel_loss_strict_failure_blocks_later_capture_evidence(monkeypatch):
     computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["source-a"]
-    successful = [
-        {
-            "source_id": "source-a",
-            "loss_sum": torch.tensor(2.0),
-            "token_count": torch.tensor(1),
-            "sample_count": torch.tensor(1),
-            "input_token_count": torch.tensor(2),
-        }
-    ]
+    successful = _source_a_observation()
     outcomes = iter([successful, RuntimeError("middle capture failed"), successful])
 
     def observe(**kwargs):
@@ -1793,13 +1783,7 @@ def test_channel_loss_strict_failure_blocks_later_capture_evidence(monkeypatch):
     with pytest.raises(ChannelLossMetadataError, match="middle capture failed"):
         for _ in range(3):
             with computer.capture():
-                computer.compute_side_channel(
-                    logits=torch.randn(1, 2, 4),
-                    labels=torch.tensor([[1, 2]]),
-                    vocab_size=4,
-                    hidden_states=None,
-                    weights=None,
-                )
+                _run_basic_observation(computer)
 
     assert computer._result is None
     assert computer._micro_step_observation_count == 0
@@ -2203,26 +2187,7 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch, compact):
     base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
         base, micro_batches=micro_batches, **kwargs
     )
-    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
-    trainer.sp_enabled = False
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
-        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
-        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
-        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
-            {
-                "source_ids": [3, 4],
-                "source_cu": [0, 4, 8],
-                "input_mask": torch.ones(8, dtype=torch.bool),
-                "tail": 0,
-                "sp_size": 1,
-                "sp_rank": 0,
-            }
-        ),
-        "ds_idx": torch.tensor([3, 4]),
-        "source_name": ["train/a", "train/b"],
-    }
+    micro_batch = _channel_dpo_two_pair_batch(trainer)
 
     try:
         base.channel_loss_callback.computer.install(policy_model)
@@ -2303,26 +2268,7 @@ def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_t
     trainer.base = base
     trainer.policy_model = policy_model
     trainer.reference_model = reference_model
-    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
-    trainer.sp_enabled = False
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
-        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
-        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
-        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
-            {
-                "source_ids": [3, 4],
-                "source_cu": [0, 4, 8],
-                "input_mask": torch.ones(8, dtype=torch.bool),
-                "tail": 0,
-                "sp_size": 1,
-                "sp_rank": 0,
-            }
-        ),
-        "ds_idx": torch.tensor([3, 4]),
-        "source_name": ["train/a", "train/b"],
-    }
+    micro_batch = _channel_dpo_two_pair_batch(trainer)
 
     try:
         base.channel_loss_callback.computer.install(policy_model)
@@ -2693,12 +2639,7 @@ def test_channel_loss_callback_updates_trainer_metrics():
 
 def test_channel_loss_callback_reduces_compact_totals_and_syncs_names(monkeypatch):
     cfg = ChannelLossConfig(enable=True, interval=1)
-    trainer = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)),
-        device=torch.device("cpu"),
-        step_train_metrics={},
-        step_env_metrics={},
-    )
+    trainer = _channel_test_trainer(cfg)
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.source_names = {0: "source/a"}
@@ -2738,12 +2679,7 @@ def test_channel_loss_callback_reduces_compact_totals_and_syncs_names(monkeypatc
 
 def test_channel_loss_callback_strict_rejects_cross_rank_name_mismatch(monkeypatch):
     cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
-    trainer = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)),
-        device=torch.device("cpu"),
-        step_train_metrics={},
-        step_env_metrics={},
-    )
+    trainer = _channel_test_trainer(cfg)
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.source_names = {0: "source-a"}
@@ -2766,12 +2702,7 @@ def test_channel_loss_callback_strict_rejects_cross_rank_name_mismatch(monkeypat
 
 def _strict_reduction_callback(*, source_name="source-a", with_totals=True):
     cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
-    trainer = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)),
-        device=torch.device("cpu"),
-        step_train_metrics={},
-        step_env_metrics={},
-    )
+    trainer = _channel_test_trainer(cfg)
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.source_names = {0: source_name}
@@ -3024,13 +2955,7 @@ def test_strict_observer_failure_prevents_real_train_step_optimizer_update(monke
     def forward_backward_step(micro_batch):
         with computer.capture():
             loss = weight * 2
-            computer.compute_side_channel(
-                logits=torch.randn(1, 2, 4),
-                labels=torch.tensor([[1, 2]]),
-                vocab_size=4,
-                hidden_states=None,
-                weights=None,
-            )
+            _run_basic_observation(computer)
         loss.backward()
         return loss, {}, {}
 
@@ -3098,12 +3023,7 @@ def test_strict_missing_primary_labels_prevents_train_step_optimizer_update(monk
 
 def test_channel_loss_callback_strict_syncs_missing_observation_before_group_collectives(monkeypatch):
     cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
-    trainer = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)),
-        device=torch.device("cpu"),
-        step_train_metrics={},
-        step_env_metrics={},
-    )
+    trainer = _channel_test_trainer(cfg)
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.step_totals = {0: (torch.tensor(1.0), torch.tensor(1))}
@@ -3141,13 +3061,7 @@ def _observe_real_sp_channel_loss(computer):
 
 def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
     try:
-        torch.distributed.init_process_group(
-            "gloo",
-            init_method=f"file://{init_file}",
-            rank=rank,
-            world_size=world_size,
-            timeout=timedelta(seconds=60),
-        )
+        _init_gloo_group(rank, world_size, init_file)
         parallel_state = _test_parallel_state(
             sp_enabled=True,
             sp_group=torch.distributed.group.WORLD,
@@ -3282,13 +3196,7 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
 
 def _gloo_two_stripe_worker(rank, world_size, init_file, result_queue):
     try:
-        torch.distributed.init_process_group(
-            "gloo",
-            init_method=f"file://{init_file}",
-            rank=rank,
-            world_size=world_size,
-            timeout=timedelta(seconds=60),
-        )
+        _init_gloo_group(rank, world_size, init_file)
         stripe_groups = [
             torch.distributed.new_group(ranks=[0, 1]),
             torch.distributed.new_group(ranks=[2, 3]),
@@ -3339,13 +3247,7 @@ def _gloo_two_stripe_worker(rank, world_size, init_file, result_queue):
 
 def _gloo_packed_channel_parity_worker(rank, world_size, init_file, result_queue):
     try:
-        torch.distributed.init_process_group(
-            "gloo",
-            init_method=f"file://{init_file}",
-            rank=rank,
-            world_size=world_size,
-            timeout=timedelta(seconds=60),
-        )
+        _init_gloo_group(rank, world_size, init_file)
         state = _test_parallel_state(
             sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
         )
@@ -3413,13 +3315,7 @@ def _gloo_packed_channel_parity_worker(rank, world_size, init_file, result_queue
 
 def _gloo_dpo_mtp_channel_worker(rank, world_size, init_file, result_queue):
     try:
-        torch.distributed.init_process_group(
-            "gloo",
-            init_method=f"file://{init_file}",
-            rank=rank,
-            world_size=world_size,
-            timeout=timedelta(seconds=60),
-        )
+        _init_gloo_group(rank, world_size, init_file)
         parallel = _test_parallel_state(
             sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
         )
