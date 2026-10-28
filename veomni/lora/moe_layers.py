@@ -168,6 +168,8 @@ def _moe_lora_op(base_layer: nn.Module, variant: str):
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
+    if getattr(base_op, "variant", None) == "swiglu_oai":
+        variant += "_swiglu_oai"
     if impl == "deepgemm_fp8":
         raise ValueError(
             "moe_implementation='deepgemm_fp8' does not support MoE-LoRA on expert weights. "
@@ -179,13 +181,41 @@ def _moe_lora_op(base_layer: nn.Module, variant: str):
     return VeomniOp("moe_experts_lora", variant, impl)
 
 
+def _forward_base_experts(layer, hidden_states, top_k_index, top_k_weights):
+    """Bypass adapter tensors through the original base-model operator."""
+    if layer._base_moe is None:
+        raise NotImplementedError("Expert adapter bypass requires a base VeomniOp handle")
+    gate_up = layer.gate_up_proj.base_layer.weight
+    down = layer.down_proj.base_layer.weight
+    unused = gate_up.new_empty(0)
+    return layer._base_moe(
+        hidden_states,
+        top_k_weights,
+        top_k_index,
+        unused,
+        unused,
+        down,
+        gate_up,
+        num_experts=layer.num_experts,
+        **layer._activation_kwargs,
+    )
+
+
 def _validate_silu_act_fn(base_layer: nn.Module) -> None:
-    """Raise unless ``base_layer.act_fn`` is SiLU; every ``moe_experts_lora`` impl hard-codes SwiGLU."""
-    act_fn = base_layer.act_fn
+    """Validate SiLU or explicitly selected SwiGLU-OAI before taking parameter ownership."""
+    if getattr(getattr(base_layer, "veomni_moe", None), "variant", None) == "swiglu_oai":
+        for attr in ("swiglu_alpha", "swiglu_limit"):
+            value = getattr(base_layer, attr, None)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"SwiGLU-OAI experts require a positive finite {attr}")
+        return
+    if getattr(base_layer, "limit", None) is not None or getattr(base_layer, "swiglu_limit", None) is not None:
+        raise ValueError("Clamped standard experts require a dedicated LoRA activation variant")
+    act_fn = getattr(base_layer, "act_fn", None)
     if act_fn is F.silu or isinstance(act_fn, (nn.SiLU, SiLUActivation)):
         return
     raise ValueError(
-        f"VeOmni MoE-LoRA only supports SiLU experts; {type(base_layer).__name__} uses {type(act_fn).__name__}."
+        f"VeOmni MoE-LoRA only supports SiLU or explicit SwiGLU-OAI experts; {type(base_layer).__name__} uses {type(act_fn).__name__}."
     )
 
 
@@ -425,6 +455,8 @@ class LoraSharedExperts(nn.Module):
         _validate_fused_layout(base_layer)
         _validate_silu_act_fn(base_layer)
         self.veomni_moe_lora = _moe_lora_op(base_layer, "shared")
+        self._base_moe = getattr(base_layer, "veomni_moe", None)
+        self.disable_adapters = False
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -436,7 +468,12 @@ class LoraSharedExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = base_layer.act_fn
+        self.act_fn = getattr(base_layer, "act_fn", None)
+        self._activation_kwargs = (
+            {"swiglu_alpha": base_layer.swiglu_alpha, "swiglu_limit": base_layer.swiglu_limit}
+            if self.veomni_moe_lora.variant.endswith("_swiglu_oai")
+            else {}
+        )
 
         # Steal the base experts' Parameters / Buffers, then re-register
         # the Parameters under per-spec sub-modules at the PEFT-aligned
@@ -706,6 +743,8 @@ class LoraSharedExperts(nn.Module):
         # the lazy install at first forward rather than in ``__init__``.
         self._ensure_ep_grad_sync_hooks()
 
+        if self.disable_adapters:
+            return _forward_base_experts(self, hidden_states, top_k_index, top_k_weights)
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
@@ -729,6 +768,7 @@ class LoraSharedExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
+            **self._activation_kwargs,
         )
 
     def extra_repr(self) -> str:
@@ -830,6 +870,8 @@ class LoraIndependentExperts(nn.Module):
         _validate_fused_layout(base_layer)
         _validate_silu_act_fn(base_layer)
         self.veomni_moe_lora = _moe_lora_op(base_layer, "independent")
+        self._base_moe = getattr(base_layer, "veomni_moe", None)
+        self.disable_adapters = False
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -839,7 +881,12 @@ class LoraIndependentExperts(nn.Module):
         self.num_experts = base_layer.num_experts
         self.hidden_dim = base_layer.hidden_dim
         self.intermediate_dim = base_layer.intermediate_dim
-        self.act_fn = base_layer.act_fn
+        self.act_fn = getattr(base_layer, "act_fn", None)
+        self._activation_kwargs = (
+            {"swiglu_alpha": base_layer.swiglu_alpha, "swiglu_limit": base_layer.swiglu_limit}
+            if self.veomni_moe_lora.variant.endswith("_swiglu_oai")
+            else {}
+        )
 
         # Steal base experts' Parameters / Buffers — see
         # LoraSharedExperts.__init__ for the per-spec sub-module layout
@@ -1005,6 +1052,8 @@ class LoraIndependentExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
+        if self.disable_adapters:
+            return _forward_base_experts(self, hidden_states, top_k_index, top_k_weights)
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
@@ -1028,6 +1077,7 @@ class LoraIndependentExperts(nn.Module):
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
+            **self._activation_kwargs,
         )
 
     def extra_repr(self) -> str:

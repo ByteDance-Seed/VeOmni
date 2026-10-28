@@ -26,6 +26,7 @@ from torch import Tensor
 
 from ...platform import NVIDIA_SM70_PLUS, ROCM_GPU, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
+from . import swiglu_oai
 from .independent import eager as independent_eager
 from .independent import npu as independent_npu
 from .shared import eager as shared_eager
@@ -166,5 +167,43 @@ register_op(
     "fused_npu",
     description="torch_npu routed MoE experts with independent per-expert LoRA weights",
     wrapper=independent_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+)
+
+
+register_op(
+    "moe_experts_lora",
+    "shared_swiglu_oai",
+    "eager",
+    description="SwiGLU-OAI routed experts with shared LoRA adapters",
+    wrapper=swiglu_oai.shared_eager_wrapper,
+)
+
+
+register_op(
+    "moe_experts_lora",
+    "shared_swiglu_oai",
+    "fused_npu",
+    description="SwiGLU-OAI routed experts with shared LoRA adapters",
+    wrapper=swiglu_oai.shared_npu_wrapper,
+    requirement=NpuKernelRequirement(),
+)
+
+
+register_op(
+    "moe_experts_lora",
+    "independent_swiglu_oai",
+    "eager",
+    description="SwiGLU-OAI routed experts with independent LoRA adapters",
+    wrapper=swiglu_oai.independent_eager_wrapper,
+)
+
+
+register_op(
+    "moe_experts_lora",
+    "independent_swiglu_oai",
+    "fused_npu",
+    description="SwiGLU-OAI routed experts with independent LoRA adapters",
+    wrapper=swiglu_oai.independent_npu_wrapper,
     requirement=NpuKernelRequirement(),
 )

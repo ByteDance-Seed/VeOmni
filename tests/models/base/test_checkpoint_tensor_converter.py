@@ -51,6 +51,11 @@ from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
     GlmMoeDsaCheckpointTensorConverter,
     create_glm_moe_dsa_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.minimax_m3_vl.checkpoint_tensor_converter import (
+    MiniMaxM3VLCheckpointTensorConverter,
+    convert_minimax_m3_vl_fqn_to_index_mapping,
+    create_minimax_m3_vl_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -2090,3 +2095,97 @@ class TestQwen3OmniMoeConverterIntegration:
         assert down_res is not None and torch.equal(down_res.tensor, down)
         # Nothing was buffered.
         assert converter.finalize() == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for MiniMaxM3VLCheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+class TestMiniMaxM3VLConverter:
+    def test_dense_and_projector_renaming(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        tensor = torch.ones(3, 4)
+        assert converter.convert("language_model.model.embed_tokens.weight", tensor).name == (
+            "model.language_model.embed_tokens.weight"
+        )
+        assert converter.convert("patch_merge_mlp.linear_1.weight", tensor).name == (
+            "model.multi_modal_projector.merge_linear_1.weight"
+        )
+
+    def test_dense_gate_up_merge_and_expert_stacking(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        gate = torch.ones(3, 4)
+        up = torch.full((3, 4), 2.0)
+        assert converter.convert("language_model.model.layers.0.mlp.gate_proj.weight", gate) is None
+        merged = converter.convert("language_model.model.layers.0.mlp.up_proj.weight", up)
+        assert merged.name == "model.language_model.layers.0.mlp.gate_up_proj.weight"
+        assert torch.equal(merged.tensor, torch.cat([gate, up], dim=0))
+
+        for expert, value in enumerate((1.0, 2.0)):
+            assert (
+                converter.convert(
+                    f"language_model.model.layers.1.block_sparse_moe.experts.{expert}.w1.weight",
+                    torch.full((3, 4), value),
+                )
+                is None
+            )
+        for expert, value in enumerate((3.0, 4.0)):
+            result = converter.convert(
+                f"language_model.model.layers.1.block_sparse_moe.experts.{expert}.w3.weight",
+                torch.full((3, 4), value),
+            )
+        assert result.name == "model.language_model.layers.1.mlp.experts.gate_up_proj"
+        assert result.tensor.shape == (2, 6, 4)
+
+    def test_factory_and_incomplete_checkpoint(self):
+        model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_local_experts=3)))
+        assert create_minimax_m3_vl_checkpoint_tensor_converter(model).num_experts == 3
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        converter.convert("language_model.model.layers.0.mlp.gate_proj.weight", torch.ones(3, 4))
+        with pytest.raises(RuntimeError, match="incomplete checkpoint"):
+            converter.finalize()
+
+    def test_fqn_index_mapping_merges_layouts(self):
+        mapping = {
+            "language_model.model.layers.0.mlp.gate_proj.weight": 2,
+            "language_model.model.layers.0.mlp.up_proj.weight": 3,
+            "language_model.model.layers.0.mlp.down_proj.weight": 4,
+            "patch_merge_mlp.linear_2.weight": 8,
+        }
+        converted = convert_minimax_m3_vl_fqn_to_index_mapping(mapping)
+        assert converted["model.language_model.layers.0.mlp.gate_up_proj.weight"] == 2
+        assert converted["model.language_model.layers.0.mlp.down_proj.weight"] == 4
+        assert converted["model.multi_modal_projector.merge_linear_2.weight"] == 8
+
+    def test_public_checkpoint_index_maps_onto_every_model_parameter(self):
+        """Every key of the public MiniMaxAI/MiniMax-M3 index must reach a model key, and vice versa.
+
+        A model key that no converted name reaches is silently randomly
+        initialised by the loader, so the mapping is checked against the real
+        checkpoint layout: ``index_key_templates.json`` is the public
+        ``model.safetensors.index.json`` with layer / expert ids folded into
+        ``{layer}`` / ``{expert}`` placeholders.
+        """
+        import json
+
+        from veomni.models.registry import get_model_class, get_model_config
+
+        fixture = Path(__file__).resolve().parents[2] / "toy_config" / "minimax_m3_vl_public_layout"
+        layout = json.loads((fixture / "index_key_templates.json").read_text())
+        public_keys = []
+        for template, layer_ranges in layout["templates"].items():
+            layers = (
+                [layer for start, end in layer_ranges for layer in range(start, end + 1)] if layer_ranges else [None]
+            )
+            experts = range(layout["num_experts"]) if "{expert}" in template else [None]
+            public_keys.extend(template.format(layer=layer, expert=expert) for layer in layers for expert in experts)
+
+        config = get_model_config(str(fixture))
+        with torch.device("meta"):
+            model = get_model_class(config)._from_config(config)
+
+        converted = set(convert_minimax_m3_vl_fqn_to_index_mapping(dict.fromkeys(public_keys, 0)))
+        model_keys = set(model.state_dict())
+        assert sorted(model_keys - converted) == []
+        assert sorted(converted - model_keys) == []

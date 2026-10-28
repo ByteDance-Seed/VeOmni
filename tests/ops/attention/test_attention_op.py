@@ -264,6 +264,38 @@ def test_ulysses_helpers_reject_nondivisible_key_value_heads():
         ulysses_backend.prepare_ulysses_qkv(query, key, value, group=object(), ulysses_size=4)
 
 
+@pytest.mark.parametrize(("key_value_head_count", "ulysses_size"), [(1, 4), (2, 4), (4, 2), (4, 4)])
+def test_kv_head_exchange_keeps_per_kv_group_tensors_aligned_with_key(monkeypatch, key_value_head_count, ulysses_size):
+    """A per-KV-group tensor exchanged on its own lands on the same KV group as K on every rank."""
+    query_head_count = 8
+    for rank in range(ulysses_size):
+
+        def fake_gather_seq(tensor, *, seq_dim, head_dim, group, rank=rank):
+            local_heads = tensor.shape[head_dim] // ulysses_size
+            return tensor.narrow(head_dim, rank * local_heads, local_heads)
+
+        monkeypatch.setattr(ulysses_backend, "gather_seq_scatter_heads", fake_gather_seq)
+        query = torch.randn(1, 5, query_head_count, 8)
+        # Encode each head's global KV-group id so alignment is checkable after the exchange.
+        key = torch.arange(key_value_head_count, dtype=torch.float32).view(1, 1, -1, 1).expand(1, 5, -1, 8)
+        per_group = key.clone()
+
+        local_query, local_key, _, _ = ulysses_backend.prepare_ulysses_qkv(
+            query, key, key, group=object(), ulysses_size=ulysses_size
+        )
+        local_per_group = ulysses_backend.gather_seq_scatter_kv_heads(
+            per_group, group=object(), ulysses_size=ulysses_size
+        )
+
+        torch.testing.assert_close(local_per_group, local_key)
+        # The rank's contiguous query heads map onto exactly the KV groups it received.
+        local_query_heads = torch.arange(rank * local_query.shape[2], (rank + 1) * local_query.shape[2])
+        query_groups = local_query_heads // (query_head_count // key_value_head_count)
+        local_groups = local_key[0, 0, :, 0].long()
+        n_rep = local_query.shape[2] // local_key.shape[2]
+        torch.testing.assert_close(local_groups.repeat_interleave(n_rep), query_groups)
+
+
 def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
     monkeypatch.setattr(ulysses_backend.dist, "get_rank", lambda group: 1)
     sliced = ulysses_backend.slice_ulysses_head_auxiliary(

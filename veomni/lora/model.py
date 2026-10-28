@@ -27,6 +27,7 @@ the ``requires_grad`` policy, and PEFT-format save/load.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch.nn as nn
@@ -130,6 +131,30 @@ class VeOmniLoraModel(nn.Module):
 
     def get_base_model(self) -> nn.Module:
         return self.base_model.model
+
+    @contextmanager
+    def disable_adapter(self):
+        """Bypass dense and native expert adapters for reference-policy inference.
+
+        Restore each layer's prior state after nested use or exceptions. Expert
+        wrappers use the base operator directly, without reading adapter tensors.
+        """
+        from .layers import LoraLinear
+        from .moe_layers import is_lora_moe_experts
+
+        layers = [module for module in self.modules() if isinstance(module, LoraLinear) or is_lora_moe_experts(module)]
+        if any(is_lora_moe_experts(layer) and layer._base_moe is None for layer in layers):
+            raise NotImplementedError("Expert adapter bypass requires base VeomniOp handles")
+        if any(getattr(layer, "merged", False) for layer in layers):
+            raise ValueError("disable_adapter() requires unmerged LoRA layers.")
+        previous = [layer.disable_adapters for layer in layers]
+        try:
+            for layer in layers:
+                layer.disable_adapters = True
+            yield
+        finally:
+            for layer, disabled in zip(layers, previous):
+                layer.disable_adapters = disabled
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.base_model(*args, **kwargs)

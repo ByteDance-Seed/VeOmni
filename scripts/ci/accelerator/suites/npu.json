@@ -418,5 +418,15 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
+  },
+  {
+    "name": "native-dense-lora-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_native.py"
+    ]
   }
 ]

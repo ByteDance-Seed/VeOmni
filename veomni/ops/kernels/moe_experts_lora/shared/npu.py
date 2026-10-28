@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -82,6 +84,7 @@ def _npu_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    activation: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """NPU non-EP fused MoE + shared LoRA."""
     from ..helper import npu_non_ep_forward
@@ -106,6 +109,7 @@ def _npu_fused_lora_moe_forward(
         fc2_weight,
         gate_up,
         down,
+        activation=activation,
     )
 
 
@@ -126,6 +130,7 @@ def _npu_ep_fused_lora_moe_forward(
     lora_scale_up: float,
     lora_scale_down: float,
     ep_group: dist.ProcessGroup | None = None,
+    activation: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """NPU EP fused MoE + shared LoRA."""
     from ..helper import npu_ep_forward
@@ -150,6 +155,7 @@ def _npu_ep_fused_lora_moe_forward(
         fc2_weight,
         gate_up,
         down,
+        activation=activation,
         ep_group=ep_group,
     )
 
@@ -170,6 +176,7 @@ def npu_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    activation: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """NPU shared-LoRA fused MoE. Branches on EP from parallel state."""
     from .....distributed.parallel_state import get_parallel_state
@@ -190,6 +197,7 @@ def npu_fused_lora_moe_forward(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        activation=activation,
     )
     if get_parallel_state().ep_enabled:
         return _npu_ep_fused_lora_moe_forward(ep_group=get_parallel_state().ep_group, **kwargs)
@@ -213,6 +221,7 @@ def wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    activation: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Shared NPU fused LoRA MoE."""
     return npu_fused_lora_moe_forward(
@@ -231,4 +240,5 @@ def wrapper(
         lora_scale_gate=lora_scale_gate,
         lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
+        activation=activation,
     )

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -40,6 +42,7 @@ def wrapper(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
+    activation: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Routed SwiGLU with a per-expert LoRA pair per logical spec."""
     scale_down = hidden_states.new_tensor(lora_scale_down)
@@ -52,7 +55,7 @@ def wrapper(
         up_hidden = F.linear(current_state, lora_a_up[expert_idx])
         gate = torch.addmm(gate, gate_hidden, lora_b_gate[expert_idx].T, alpha=lora_scale_gate)
         up = torch.addmm(up, up_hidden, lora_b_up[expert_idx].T, alpha=lora_scale_up)
-        mid = F.silu(gate) * up
+        mid = F.silu(gate) * up if activation is None else activation(torch.cat([gate, up], dim=-1))
         lora_x_down = F.linear(F.linear(mid, lora_a_down[expert_idx]), lora_b_down[expert_idx]) * scale_down
         current_hidden_states = F.linear(mid, fc2_weight[expert_idx]) + lora_x_down
         current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
