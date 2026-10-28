@@ -7,10 +7,14 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import parse_args
 from veomni.data import build_data_transform
 from veomni.models.auto import build_config
 from veomni.trainer.dit_trainer import VeOmniDiTArguments
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 ROOT = Path(__file__).resolve().parents[2]

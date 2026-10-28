@@ -27,6 +27,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import flex_visible, materialize_magi_mask
 from veomni.ops.install import _VEOMNI_HF_PATCHES
 from veomni.ops.kernels.attention import ulysses as ulysses_mask
@@ -43,6 +44,9 @@ from veomni.ops.mask import (
     sdpa_attention_mask_builder,
     sliding_window_mask,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_flash_shapes_are_none():

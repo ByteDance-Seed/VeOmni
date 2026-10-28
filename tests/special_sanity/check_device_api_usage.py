@@ -48,6 +48,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
     "veomni/ops/kernels/attention/standard/magi/",
+    # DeepGEMM is CUDA-only: these files select the SM90/SM100 recipe and
+    # establish operand-device contexts for its device-bound JIT kernels.
+    "veomni/ops/kernels/moe_experts/standard/deepgemm.py",
+    "veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py",
     # Kernel tests intentionally select and probe hardware-specific backends.
     "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",
@@ -55,6 +59,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # CPU-only scheduler tests use literal CUDA/NPU backend names as fixtures
     # to validate device leases and launch plans without accessing hardware.
     "tests/ci/test_accelerator.py",
+    # EP option tests use literal backend names to verify cross-device rejection.
+    "tests/ci/test_ep_hccl_options.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on

@@ -32,6 +32,7 @@ from veomni.ops.install import _VEOMNI_HF_PATCHES, apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
+from veomni.ops.platform import ROCM_GPU, GpuKernelRequirement
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -54,6 +55,7 @@ _STANDARD_IMPLS = (
     "veomni_flash_attention_3",
     "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
+    "veomni_flash_attention_aiter",
     "veomni_flex_attention",
     "veomni_magi_attention",
     "veomni_sage_attention",
@@ -107,6 +109,20 @@ def test_veomni_hf_patches_pair_attention_and_mask_without_overwriting_stock():
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["sdpa"] is hf_sdpa_attention_forward
     assert "veomni_flash_attention_2" in OP_REGISTRY.list_registered("attention", "standard")
+
+
+def test_aiter_row_is_rocm_only_and_requires_aiter():
+    entries = [
+        entry
+        for entry in OP_REGISTRY.list_entries("attention", "standard")
+        if entry.impl == "veomni_flash_attention_aiter"
+    ]
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert isinstance(entry.requirement, GpuKernelRequirement)
+    assert entry.requirement.platforms == (ROCM_GPU,)
+    assert entry.requires == ("aiter",)
 
 
 @pytest.mark.parametrize("impl", ("flex_attention", "magi_attention"))
