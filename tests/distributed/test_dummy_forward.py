@@ -21,9 +21,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
-from veomni.utils.device import empty_cache, get_device_type
+from veomni.utils.device import empty_cache, get_device_type, get_torch_device
 
 
 _TEXT_SEQ_LEN = 64
@@ -265,7 +264,30 @@ def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
     )
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def _cpu_vision_plan(_context):
+    from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+    return LaunchSpec(device="cpu")
+
+
+def _accelerator_vision_plan(_context):
+    from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+    return LaunchSpec(nproc=2, device="accelerator")
+
+
+def _vision_runner_has_two_accelerators():
+    try:
+        from scripts.ci.accelerator.launch_plan import runner_device_count
+    except ModuleNotFoundError as error:
+        if error.name not in {"scripts.ci.accelerator", "scripts.ci.accelerator.launch_plan"}:
+            raise
+        device = get_torch_device()
+        return get_device_type() != "cpu" and device.is_available() and device.device_count() >= 2
+    return runner_device_count() >= 2
+
+
+@pytest.mark.launch_plan(provider=_cpu_vision_plan)
 @pytest.mark.parametrize("family", ["qwen3_vl", "qwen4_exp"])
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
 def test_vlm_dummy_vision_input_construction(family, backend):
@@ -280,7 +302,7 @@ def test_vlm_dummy_vision_input_construction(family, backend):
     assert "VLM_DUMMY_INPUT_CASES_OK=6" in result.stdout
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=_cpu_vision_plan)
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.parametrize("attention", ["eager", "veomni_sdpa", "veomni_flash_attention_2"])
 def test_qwen4_exp_vision_forward_contract(backend, attention):
@@ -346,17 +368,14 @@ def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
         clear_parallel_state()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="accelerator"))
+@pytest.mark.launch_plan(provider=_accelerator_vision_plan)
+@pytest.mark.skipif(not _vision_runner_has_two_accelerators(), reason="requires two accelerators")
 @pytest.mark.parametrize(
     "attention,parallel_mode", [("eager", "cp"), ("eager", "ulysses"), ("veomni_sdpa", "ulysses")]
 )
 def test_qwen4_exp_vision_real_image_sp_rejects_non_flash_attention(attention, parallel_mode):
-    from scripts.ci.accelerator.launch_plan import runner_device_count
-
     from ..tools.launch_utils import torchrun
 
-    if runner_device_count() < 2:
-        pytest.skip("requires two accelerators")
     if get_device_type() == "npu" and parallel_mode == "cp":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_vision_real_image_sp_non_fa_worker, 2, attention, parallel_mode)
