@@ -177,6 +177,9 @@ _FA3_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
 _FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
 )
+_AITER_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(ROCM_GPU,)), ("aiter",)),
+)
 _FLEX_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_GPU,)), ()),
 )
@@ -266,6 +269,11 @@ _register_attention(
     "veomni_flash_attention_4",
     "VeOmni FlashAttention 4 adapter through Transformers",
     rows=_FA4_ROWS,
+)
+_register_attention(
+    "veomni_flash_attention_aiter",
+    "VeOmni AITER FlashAttention adapter for AMD ROCm",
+    rows=_AITER_ROWS,
 )
 _register_attention(
     "veomni_flex_attention",

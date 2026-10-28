@@ -152,11 +152,11 @@ janus_text_encoder:
     extra_parallel_placement_innermost: [false]
 ```
 
-Sequence parallelism is set once for the whole job with
-`--model.accelerator.ulysses_size N`. What a module may choose, what the job
-shares, and why SP is uniform across the graph are covered in
+All distributed modules share one `dp_size` (and therefore one unified
+`sp_size = cp_size * ulysses_size`), while each module may choose Ulysses SP or
+Context Parallelism; see
 [Per-Module Parallelism](../distributed/per_module_parallelism.md) and
-[Sequence Parallelism](../distributed/sequence_parallel.md). Keep
+[Sequence & Context Parallelism](../distributed/sequence_parallel.md). Keep
 `TORCH_DISTRIBUTED_DEBUG` unset (or `OFF`) on FSDP2 runs so coalesced
 all-gather remains available for tied heads.
 

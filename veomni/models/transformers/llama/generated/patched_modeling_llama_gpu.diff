@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,70 +1,95 @@
+@@ -1,70 +1,96 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -98,6 +98,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
++from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 +from veomni.ops import VeomniOp
 +from veomni.ops.config import resolve_op_impl
 +from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -135,7 +136,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -127,42 +152,15 @@
+@@ -127,42 +153,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -183,7 +184,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +168,20 @@
+@@ -170,10 +169,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -206,7 +207,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,10 +221,16 @@
+@@ -213,10 +222,16 @@
      return attn_output, attn_weights
 
 
@@ -224,7 +225,7 @@
      def __init__(self, config: LlamaConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -239,6 +253,9 @@
+@@ -239,6 +254,9 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -234,7 +235,7 @@
 
      def forward(
          self,
-@@ -256,16 +273,12 @@
+@@ -256,16 +274,19 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -249,11 +250,27 @@
 -        )
 -
 -        attn_output, attn_weights = attention_interface(
++        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
++            kwargs,
++            impl=self.veomni_attn.impl,
++            attention_mask=attention_mask,
++            hidden_states=hidden_states,
++        )
++
 +        attn_output, attn_weights = self.veomni_attn(
              self,
              query_states,
              key_states,
-@@ -417,6 +430,12 @@
+@@ -273,7 +294,7 @@
+             attention_mask,
+             dropout=0.0 if not self.training else self.attention_dropout,
+             scaling=self.scaling,
+-            **kwargs,
++            **attn_kwargs,
+         )
+
+         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+@@ -417,6 +438,12 @@
          )
 
 
@@ -266,7 +283,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +448,9 @@
+@@ -429,8 +456,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -278,7 +295,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +464,110 @@
+@@ -444,55 +472,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
