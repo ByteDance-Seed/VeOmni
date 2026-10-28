@@ -264,14 +264,37 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
         assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
         assert block.attn.processor.config._attn_implementation == "sdpa"
 
-    # 2. Passing config=... participates in actual model construction (e.g. zero_cond_t=True).
-    override_cfg = _tiny_config(zero_cond_t=True)
-    loaded_with_cfg = QwenImageTransformer2DModel.from_pretrained(ckpt_dir, config=override_cfg)
-    assert loaded_with_cfg.config.zero_cond_t is True
-    assert loaded_with_cfg.zero_cond_t is True
-    assert all(block.zero_cond_t is True for block in loaded_with_cfg.transformer_blocks)
-    assert loaded_with_cfg.config.ops_config.attn_implementation == "eager"
-    assert loaded_with_cfg.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+    # 2. Passing config=... (instance or Mapping) participates in actual model construction (e.g. zero_cond_t=True)
+    # and defers validation until ops_implementation overrides are applied across devices.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    gpu_cfg = _tiny_config(
+        zero_cond_t=True,
+        ops_implementation={"rms_norm_implementation": "liger_kernel", "attn_implementation": "eager"},
+    )
+    gpu_cfg_dict = gpu_cfg.to_dict()
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
+    for cfg_arg in (gpu_cfg, gpu_cfg_dict):
+        with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+            QwenImageTransformer2DModel.from_pretrained(ckpt_dir, config=cfg_arg)
+
+        loaded_with_cfg = QwenImageTransformer2DModel.from_pretrained(
+            ckpt_dir,
+            config=cfg_arg,
+            ops_implementation={"rms_norm_implementation": "torch_npu"},
+        )
+        assert loaded_with_cfg.config.zero_cond_t is True
+        assert loaded_with_cfg.zero_cond_t is True
+        assert all(block.zero_cond_t is True for block in loaded_with_cfg.transformer_blocks)
+        assert loaded_with_cfg.config.ops_config.rms_norm_implementation == "torch_npu"
+        assert loaded_with_cfg.config.ops_config.attn_implementation == "eager"
+        assert loaded_with_cfg.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
 
     # 3. Explicit ops_implementation / attn_implementation overrides bind to both config and processor.
     # Ensure VeomniOp can resolve veomni_flash_attention_2 even on CPU-only test runners.

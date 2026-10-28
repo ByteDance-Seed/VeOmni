@@ -683,12 +683,24 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         attn_implementation = kwargs.pop("attn_implementation", None)
         provided_config = kwargs.pop("config", None)
 
+        override_kwargs: dict[str, Any] = {}
+        if ops_implementation is not None:
+            override_kwargs["ops_implementation"] = ops_implementation
+        if attn_implementation is not None:
+            override_kwargs["attn_implementation"] = attn_implementation
+
         veomni_cfg = None
         if provided_config is not None:
             if isinstance(provided_config, cls.config_class):
                 veomni_cfg = copy.deepcopy(provided_config)
+                if attn_implementation is not None:
+                    veomni_cfg._attn_implementation = attn_implementation
+                veomni_cfg._set_ops_implementation(
+                    ops_implementation if ops_implementation is not None else {},
+                    _validate_tree=True,
+                )
             elif isinstance(provided_config, Mapping):
-                veomni_cfg = cls.config_class(**provided_config)
+                veomni_cfg = cls.config_class.from_dict(dict(provided_config), **override_kwargs)
             else:
                 raise TypeError(
                     f"config must be a {cls.config_class.__name__} or Mapping, got {type(provided_config).__name__}."
@@ -707,16 +719,12 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
                 cfg_kwargs["attn_implementation"] = diffusers_cfg["attn_implementation"]
             if "ops_implementation" in diffusers_cfg:
                 cfg_kwargs["ops_implementation"] = diffusers_cfg["ops_implementation"]
-            veomni_cfg = cls.config_class(**cfg_kwargs)
+            veomni_cfg = cls.config_class.from_dict(cfg_kwargs, **override_kwargs)
         else:
             for k in valid_keys:
                 if k in diffusers_cfg:
                     setattr(veomni_cfg, k, diffusers_cfg[k])
 
-        if ops_implementation is not None:
-            veomni_cfg._set_ops_implementation(ops_implementation)
-        if attn_implementation is not None:
-            veomni_cfg._attn_implementation = attn_implementation
         if (
             "attn_implementation" not in veomni_cfg.ops_implementation
             and getattr(veomni_cfg, "_attn_implementation_internal", None) is None
