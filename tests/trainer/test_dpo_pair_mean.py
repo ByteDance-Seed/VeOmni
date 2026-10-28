@@ -522,7 +522,7 @@ def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch):
     assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
 
 
-def _distributed_worker(rank, world_size, scenario, native_npu, endpoint):
+def _init_test_group(rank, world_size, native_npu, endpoint):
     if native_npu:
         import torch_npu  # noqa: F401
 
@@ -535,6 +535,11 @@ def _distributed_worker(rank, world_size, scenario, native_npu, endpoint):
         world_size=world_size,
         timeout=timedelta(seconds=120),
     )
+    return device
+
+
+def _distributed_worker(rank, world_size, scenario, native_npu, endpoint):
+    device = _init_test_group(rank, world_size, native_npu, endpoint)
     try:
         if scenario == "dp2_sp2":
             groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
@@ -579,18 +584,7 @@ def _provenance_dp_sp_worker(rank, world_size, native_npu, endpoint):
         def encode(self, text, add_special_tokens=True):
             return [ord(value) for value in text]
 
-    if native_npu:
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(rank)
-    device = f"npu:{rank}" if native_npu else "cpu"
-    dist.init_process_group(
-        "hccl" if native_npu else "gloo",
-        store=endpoint.connect(),
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=120),
-    )
+    device = _init_test_group(rank, world_size, native_npu, endpoint)
     try:
         groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
         dp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
@@ -641,18 +635,7 @@ def test_native_hccl_provenance_dp_sp_pair_weighting():
 def _fsdp_worker(rank, world_size, hsdp, sp, native_npu, endpoint):
     from torch.distributed.device_mesh import init_device_mesh
 
-    if native_npu:
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(rank)
-    device = f"npu:{rank}" if native_npu else "cpu"
-    dist.init_process_group(
-        "hccl" if native_npu else "gloo",
-        store=endpoint.connect(),
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=120),
-    )
+    device = _init_test_group(rank, world_size, native_npu, endpoint)
     try:
         shape = (2, world_size // 2) if hsdp else (world_size,)
         names = ("replicate", "shard") if hsdp else ("shard",)

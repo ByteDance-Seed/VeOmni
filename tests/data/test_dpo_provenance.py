@@ -16,10 +16,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import veomni.data.data_collator as collator_module
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_collator import MainCollator
 from veomni.data.data_transform import process_dpo_example
 from veomni.data.dpo_collator import DPOProvenanceCollator
+from veomni.trainer.dpo_provenance import next_dpo_microbatches
 from veomni.utils.dpo_provenance import (
     DPO_APPROVED_KEY,
     DPO_FEATURE_KEY,
@@ -485,9 +487,7 @@ def test_conversation_pair_rejects_different_truncated_contexts():
 def test_feature_content_mutation_and_old_metadata_are_rejected(monkeypatch):
     from dataclasses import replace
 
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 0)
     feature["input_ids"][0] += 1
     result = DPOProvenanceCollator(MainCollator())([feature])
@@ -502,9 +502,7 @@ def test_feature_content_mutation_and_old_metadata_are_rejected(monkeypatch):
 def test_collator_rejects_even_signed_pre_shifted_labels(monkeypatch):
     from dataclasses import replace
 
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 0)
     feature["labels"][1] = feature["input_ids"][2]
     feature[DPO_FEATURE_KEY] = replace(
@@ -635,9 +633,7 @@ def _collator_with_source_keys(keys):
 @pytest.mark.parametrize("sp_enabled,rank", [(False, 0), (True, 0), (True, 1)])
 @pytest.mark.parametrize("pad_to_length", [0, 8])
 def test_builtin_segments_are_proven_with_single_token_and_tail(monkeypatch, sp_enabled, rank, pad_to_length):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state(sp_enabled, rank))
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state(sp_enabled, rank))
     feature = _feature("abc", "d", 5)
     batch = DPOProvenanceCollator(MainCollator(pad_to_length=pad_to_length))([feature])
     proof = batch[DPO_PROOF_KEY]
@@ -648,9 +644,7 @@ def test_builtin_segments_are_proven_with_single_token_and_tail(monkeypatch, sp_
 
 
 def test_unknown_or_inconsistent_feature_never_creates_proof(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 5)
     legacy = {k: v for k, v in feature.items() if k != DPO_FEATURE_KEY}
     batch = DPOProvenanceCollator(MainCollator())([feature, legacy])
@@ -660,9 +654,7 @@ def test_unknown_or_inconsistent_feature_never_creates_proof(monkeypatch):
 
 @pytest.mark.parametrize("case", ["missing_first", "missing_second", "missing_all", "invalid_id"])
 def test_multisource_requires_one_ordered_id_per_feature(monkeypatch, case):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     features = [_feature("abc", "de", 1), _feature("fgh", "ijk", 2)]
     if case in ("missing_first", "missing_all"):
         features[0].pop("ds_idx")
@@ -676,9 +668,7 @@ def test_multisource_requires_one_ordered_id_per_feature(monkeypatch, case):
 
 @pytest.mark.parametrize("masked_value", [0, 2])
 def test_non_all_ones_attention_mask_is_not_approved(monkeypatch, masked_value):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 0)
     feature["attention_mask"][0] = masked_value
     batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([feature])
@@ -687,9 +677,7 @@ def test_non_all_ones_attention_mask_is_not_approved(monkeypatch, masked_value):
 
 @pytest.mark.parametrize("key", ["input_ids", "labels", "position_ids"])
 def test_noninteger_token_or_position_tensor_is_not_approved(monkeypatch, key):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 0)
     feature[key] = feature[key].float()
     batch = DPOProvenanceCollator(MainCollator())([feature])
@@ -698,9 +686,7 @@ def test_noninteger_token_or_position_tensor_is_not_approved(monkeypatch, key):
 
 @pytest.mark.parametrize("key,value", [("input_ids", -1), ("labels", -2), ("position_ids", -1)])
 def test_invalid_negative_token_or_position_is_not_approved(monkeypatch, key, value):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 0)
     feature[key][-1] = value
     batch = DPOProvenanceCollator(MainCollator())([feature])
@@ -708,9 +694,7 @@ def test_invalid_negative_token_or_position_is_not_approved(monkeypatch, key, va
 
 
 def test_collator_does_not_mutate_input_labels(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     features = [_feature("abc", "de", 0), _feature("fgh", "ijk", 1)]
     labels_before = [feature["labels"].clone() for feature in features]
     batch = DPOProvenanceCollator(MainCollator())(features)
@@ -721,11 +705,8 @@ def test_collator_does_not_mutate_input_labels(monkeypatch):
 
 @pytest.mark.parametrize("key", [DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY])
 def test_reserved_provenance_keys_cannot_be_overwritten(monkeypatch, key):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     feature = _feature("abc", "d", 0)
     feature[key] = torch.tensor([314159])
     with pytest.raises(ValueError, match="reserved"):
@@ -741,9 +722,7 @@ def test_reserved_provenance_keys_cannot_be_overwritten(monkeypatch, key):
 
 
 def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 5)
     feature.pop(DPO_FEATURE_KEY)
     batch = DPOProvenanceCollator(MainCollator())([feature])
@@ -765,12 +744,9 @@ def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
     ],
 )
 def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, changed):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
-    if changed == "channel_provenance" and not hasattr(m, "CHANNEL_LOSS_PROVENANCE"):
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
+    if changed == "channel_provenance" and not hasattr(collator_module, "CHANNEL_LOSS_PROVENANCE"):
         pytest.skip("channel-loss integration is not present")
     batch = DPOProvenanceCollator(_collator_with_source_keys(("ds_idx",)), require_ds_idx=True)(
         [_feature("abc", "de", 0)]
@@ -782,7 +758,7 @@ def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, cha
     elif changed == "source_range":
         batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([_feature("abc", "de", 42)])
     elif changed == "channel_provenance":
-        batch[m.CHANNEL_LOSS_PROVENANCE]["input_mask"][0] = 0
+        batch[collator_module.CHANNEL_LOSS_PROVENANCE]["input_mask"][0] = 0
     elif changed == "cu_k":
         batch["cu_seq_lens_k"] = torch.tensor([0, 5])
     elif changed == "linear_cu":
@@ -801,11 +777,8 @@ def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, cha
 def test_preflight_rejects_token_ids_outside_vocabulary(monkeypatch, key):
     from dataclasses import replace
 
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     feature = _feature("abc", "de", 0)
     if key == "labels":
         feature["labels"][-1] = 100
@@ -825,11 +798,8 @@ def test_preflight_rejects_token_ids_outside_vocabulary(monkeypatch, key):
 
 
 def test_preflight_rejects_negative_collator_padding(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     collator = MainCollator(data_collate_info={"input_ids": (-1, True, -1, 1)}, pad_to_length=8)
     batch = DPOProvenanceCollator(collator)([_feature("abc", "def", 0)])
     with pytest.raises(RuntimeError, match="custom token packing or label padding"):
@@ -837,18 +807,14 @@ def test_preflight_rejects_negative_collator_padding(monkeypatch):
 
 
 def test_nonstandard_sp_attention_mask_slicing_is_not_approved(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state(sp_enabled=True))
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state(sp_enabled=True))
     collator = MainCollator(data_collate_info={"attention_mask": (-1, True, 1, 1)})
     batch = DPOProvenanceCollator(collator)([_feature("abc", "def", 0)])
     assert isinstance(batch[DPO_PROOF_KEY], DPOInvalidProof)
 
 
 def test_modified_packing_configuration_is_rejected(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     collator = MainCollator()
     collator.preforward_pipeline[1].collate_infos = dict(collator.collate_infos)
     with pytest.raises(ValueError, match="standard packing configuration"):
@@ -869,11 +835,8 @@ def test_modified_sequence_parallel_topology_is_rejected(monkeypatch, attribute)
 
 
 def test_preflight_rejects_source_name_not_matching_catalog(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     feature = _feature("abc", "def", 0)
     feature["source_name"] = "wrong-source"
     batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([feature])
@@ -884,10 +847,8 @@ def test_preflight_rejects_source_name_not_matching_catalog(monkeypatch):
 
 
 def test_preflight_rejects_consistently_wrong_gdn_metadata(monkeypatch):
-    import veomni.data.data_collator as m
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     collator = MainCollator()
 
     def corrupt_metadata(batch):
@@ -900,11 +861,10 @@ def test_preflight_rejects_consistently_wrong_gdn_metadata(monkeypatch):
 
 
 def test_out_of_range_source_rejects_train_step_before_optimizer(monkeypatch):
-    import veomni.data.data_collator as m
     import veomni.trainer.text_dpo_trainer as dpo
 
     parallel = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: parallel)
     batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([_feature("abc", "de", 42)])
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
     trainer.base = SimpleNamespace(
@@ -930,9 +890,7 @@ def test_out_of_range_source_rejects_train_step_before_optimizer(monkeypatch):
 
 @pytest.mark.parametrize("sp_enabled", [False, True])
 def test_classification_collator_never_creates_proof(monkeypatch, sp_enabled):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state(sp_enabled))
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state(sp_enabled))
     feature = _feature("abc", "def", 5)
     batch = DPOProvenanceCollator(MainCollator(seq_classification=True))([feature])
     assert isinstance(batch[DPO_PROOF_KEY], DPOInvalidProof)
@@ -940,9 +898,7 @@ def test_classification_collator_never_creates_proof(monkeypatch, sp_enabled):
 
 @pytest.mark.parametrize("field", ["labels", "position_ids", "attention_mask"])
 def test_inconsistent_input_lengths_never_create_proof(monkeypatch, field):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 5)
     feature[field] = torch.cat([feature[field], feature[field][-1:]])
     batch = DPOProvenanceCollator(MainCollator())([feature])
@@ -951,9 +907,7 @@ def test_inconsistent_input_lengths_never_create_proof(monkeypatch, field):
 
 @pytest.mark.parametrize("record_provenance", [False, True])
 def test_truncated_plaintext_prompt_rejects_lost_completions(monkeypatch, record_provenance):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     with pytest.raises(ValueError, match="no scoreable completion tokens"):
         process_dpo_example(
             {"prompt": "abcde", "chosen": "f", "rejected": "g"},
@@ -1221,9 +1175,7 @@ def test_slow_tokenizer_with_automatic_trailing_eos_keeps_completion():
 def test_source_ignored_labels_and_collator_tail_stay_distinct(monkeypatch):
     from dataclasses import replace
 
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 5)
     # Actual tokens may have ignored labels; that does not make them padding.
     feature["labels"][-3] = -100
@@ -1242,11 +1194,8 @@ def test_source_ignored_labels_and_collator_tail_stay_distinct(monkeypatch):
 
 
 def test_dpo_single_token_segment_without_context_rejected_before_forward(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     features = [_feature("abc", "def", 1), _feature("g", "h", 2)]
     batch = DPOProvenanceCollator(MainCollator(pad_to_length=10))(features)
     with pytest.raises((ValueError, RuntimeError), match="causal prediction target"):
@@ -1254,11 +1203,8 @@ def test_dpo_single_token_segment_without_context_rejected_before_forward(monkey
 
 
 def test_dpo_single_token_completion_with_context_remains_valid(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     feature = process_dpo_example(
         {"prompt": "x", "chosen": "a", "rejected": "b"}, tokenizer=Tokenizer(), record_segment_provenance=True
     )[0]
@@ -1268,12 +1214,10 @@ def test_dpo_single_token_completion_with_context_remains_valid(monkeypatch):
 
 
 def test_dpo_short_pair_and_collator_tail_preserve_loss_gradients(monkeypatch):
-    import veomni.data.data_collator as m
     import veomni.trainer.text_dpo_trainer as dpo
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     monkeypatch.setattr(dpo, "get_parallel_state", lambda: state)
     features = [_feature("abc", "def", 1), _feature("gh", "ij", 2)]
     batch = DPOProvenanceCollator(MainCollator(pad_to_length=12))(features)
@@ -1302,7 +1246,7 @@ def test_dpo_short_pair_and_collator_tail_preserve_loss_gradients(monkeypatch):
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(dpo_config=SimpleNamespace(average_log_prob=False, explicit_segment_provenance=True))
     )
-    trainer.post_forward = m.PostCollator()
+    trainer.post_forward = collator_module.PostCollator()
     model = Model()
     chosen, rejected = trainer.concatenated_forward(model, approved)
     loss, _, _ = trainer.dpo_loss(chosen, rejected, torch.zeros_like(chosen), torch.zeros_like(rejected), beta=0.1)
@@ -1320,13 +1264,11 @@ def test_dpo_short_pair_and_collator_tail_preserve_loss_gradients(monkeypatch):
 
 
 def test_chunk_logprobs_matches_independent_dense_dpo_reference(monkeypatch):
-    import veomni.data.data_collator as m
     import veomni.models.loss_utils.chunk_logprobs as chunk
     import veomni.trainer.text_dpo_trainer as dpo
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     monkeypatch.setattr(dpo, "get_parallel_state", lambda: state)
     monkeypatch.setattr(chunk, "get_parallel_state", lambda: state)
     features = [_feature("abc", "def", 1), _feature("gh", "ij", 2)]
@@ -1360,7 +1302,7 @@ def test_chunk_logprobs_matches_independent_dense_dpo_reference(monkeypatch):
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(dpo_config=SimpleNamespace(average_log_prob=False, explicit_segment_provenance=True))
     )
-    trainer.post_forward = m.PostCollator()
+    trainer.post_forward = collator_module.PostCollator()
     chosen, rejected = trainer.concatenated_forward(model, approved)
     loss = -F.logsigmoid(0.1 * (chosen - rejected)).mean()
     loss.backward()
@@ -1386,11 +1328,10 @@ def test_chunk_logprobs_matches_independent_dense_dpo_reference(monkeypatch):
 
 
 def test_direct_forward_requires_preflight_before_model_execution(monkeypatch):
-    import veomni.data.data_collator as m
     import veomni.trainer.text_dpo_trainer as dpo
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "d", 1)])
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
     trainer.base = SimpleNamespace(
@@ -1404,18 +1345,15 @@ def test_direct_forward_requires_preflight_before_model_execution(monkeypatch):
 
 @pytest.mark.parametrize("mutated", [False, True])
 def test_post_callback_preflight_allows_metadata_removal_but_rejects_tensor_mutation(monkeypatch, mutated):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(_collator_with_source_keys(("ds_idx",)), require_ds_idx=True)(
         [_feature("abc", "de", 0)]
     )
     next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, source_count=lambda: 1, vocab_size=lambda: 16)
     batch.pop("ds_idx")
-    if hasattr(m, "CHANNEL_LOSS_PROVENANCE"):
-        batch.pop(m.CHANNEL_LOSS_PROVENANCE)
+    if hasattr(collator_module, "CHANNEL_LOSS_PROVENANCE"):
+        batch.pop(collator_module.CHANNEL_LOSS_PROVENANCE)
     if mutated:
         batch["labels"][0, 1] = 8
         with pytest.raises(RuntimeError, match="changed during a callback"):
@@ -1441,11 +1379,8 @@ def test_post_callback_preflight_allows_metadata_removal_but_rejects_tensor_muta
 
 @pytest.mark.parametrize("operation", ["add", "change"])
 def test_post_callback_preflight_rejects_metadata_addition_or_mutation(monkeypatch, operation):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 0)])
     next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)
     if operation == "add":
@@ -1464,10 +1399,8 @@ def test_post_callback_preflight_rejects_metadata_addition_or_mutation(monkeypat
 
 
 def test_sp_input_evidence_covers_additional_feature_metadata(monkeypatch):
-    import veomni.data.data_collator as m
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     collator = DPOProvenanceCollator(MainCollator())
     first, second = _feature("abc", "d", 0), _feature("abc", "d", 0)
     first["cur_token_num"], second["cur_token_num"] = 1, 2
@@ -1478,20 +1411,15 @@ def test_sp_input_evidence_covers_additional_feature_metadata(monkeypatch):
 
 @pytest.mark.parametrize("key", ["input_ids", "labels", "cu_seq_lens_q"])
 def test_configured_source_keys_cannot_hide_model_inputs(monkeypatch, key):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _state())
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     collator = DPOProvenanceCollator(_collator_with_source_keys((key,)))
     with pytest.raises(ValueError, match="source metadata keys must not overlap model inputs"):
         collator([_feature("abc", "d", 0)])
 
 
 def test_post_callback_preflight_rejects_removed_or_reordered_microbatch(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
-
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     collator = DPOProvenanceCollator(MainCollator())
     first, second = collator([_feature("abc", "de", 0)]), collator([_feature("ab", "de", 1)])
     batches = next_dpo_microbatches(iter([[first, second]]), state, state, global_step=1)
@@ -1504,11 +1432,10 @@ def test_post_callback_preflight_rejects_removed_or_reordered_microbatch(monkeyp
 
 
 def test_step_begin_callback_failure_does_not_update_optimizer(monkeypatch):
-    import veomni.data.data_collator as m
     import veomni.trainer.text_dpo_trainer as dpo
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 0)])
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
     trainer.base = SimpleNamespace(
@@ -1527,7 +1454,7 @@ def test_step_begin_callback_failure_does_not_update_optimizer(monkeypatch):
         lr_scheduler=MagicMock(),
     )
     trainer.reference_model = SimpleNamespace(parallel_state=state)
-    trainer.post_forward = m.PostCollator()
+    trainer.post_forward = collator_module.PostCollator()
     with pytest.raises(ValueError, match="injected callback failure"):
         trainer.train_step(iter([[batch]]))
     trainer.policy_model.optimizer.step.assert_not_called()
@@ -1550,11 +1477,10 @@ def test_shared_meter_ignores_proof_when_opt_in_is_disabled():
 def test_world_packet_is_bounded_independently_of_microbatch_count(monkeypatch):
     import pickle
 
-    import veomni.data.data_collator as m
     import veomni.trainer.dpo_provenance as protocol
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 1)])
     original = protocol._validate_packets
     packets = []
@@ -1643,12 +1569,10 @@ def test_large_sequence_parallel_group_uses_bounded_descriptors():
 
 
 def test_dpo_multisource_counts_features_not_attention_segments(monkeypatch):
-    import veomni.data.data_collator as m
-    from veomni.trainer.dpo_provenance import next_dpo_microbatches
     from veomni.utils import helper
 
     state = _state()
-    monkeypatch.setattr(m, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 0), _feature("fghi", "jk", 1)])
     approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
 
