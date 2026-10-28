@@ -397,8 +397,6 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend
     next_dk = None
     next_dv = None
     next_kv = None
-    dk_buffer = None
-    dv_buffer = None
 
     dq_b = torch.empty_like(q)
     dk_b = torch.empty_like(k)
@@ -468,7 +466,6 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend
                 dq[:, block:] += dq_b[:, :block]
 
             d_kv_comm.wait()
-            dk_buffer, dv_buffer = dk, dv
             dk, dv = next_dk, next_dv
 
             if step <= rank:
@@ -483,10 +480,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend
             k, v = next_kv[0], next_kv[1]
 
         d_kv = torch.stack([dk, dv]).contiguous()
-        recv_buf = None
-        if dk_buffer is not None:
-            recv_buf = torch.stack([dk_buffer, dv_buffer]).contiguous()
-        recv = d_kv_comm.send_recv(d_kv, recv_buf)
+        recv = d_kv_comm.send_recv(d_kv)
         d_kv_comm.commit()
         next_dk, next_dv = recv[0], recv[1]
 
@@ -753,8 +747,6 @@ def _zigzag_ring_varlen_backward(
     next_dk = None
     next_dv = None
     next_kv = None
-    dk_buffer_prev = None
-    dv_buffer_prev = None
 
     dq_b = torch.empty_like(q)
     dk_b = torch.empty_like(k)
@@ -833,7 +825,6 @@ def _zigzag_ring_varlen_backward(
                 dq[half1] += dq_b[:block]
 
             d_kv_comm.wait()
-            dk_buffer_prev, dv_buffer_prev = dk, dv
             dk, dv = next_dk, next_dv
 
             if step <= rank:
@@ -848,10 +839,7 @@ def _zigzag_ring_varlen_backward(
             k, v = next_kv[0], next_kv[1]
 
         d_kv = torch.stack([dk, dv]).contiguous()
-        recv_buf = None
-        if dk_buffer_prev is not None:
-            recv_buf = torch.stack([dk_buffer_prev, dv_buffer_prev]).contiguous()
-        recv = d_kv_comm.send_recv(d_kv, recv_buf)
+        recv = d_kv_comm.send_recv(d_kv)
         d_kv_comm.commit()
         next_dk, next_dv = recv[0], recv[1]
 
