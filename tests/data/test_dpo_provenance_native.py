@@ -8,6 +8,7 @@
 
 """Native four-NPU gate for DPO provenance and HCCL object collectives."""
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import torchrun
+from tests.tools.launch_utils import spawn_with_rendezvous, torchrun
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.dpo_provenance import DPO_APPROVED_KEY, DPO_PROOF_KEY, DPOInvalidProof
 
@@ -28,9 +29,26 @@ class _Tokenizer:
         return [ord(char) for char in text]
 
 
+def _native_feature(text):
+    from veomni.data.data_transform import process_dpo_example
+
+    return process_dpo_example(
+        {"prompt": "p", "chosen": text, "rejected": "d"},
+        tokenizer=_Tokenizer(),
+        record_segment_provenance=True,
+    )[0]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_native_provenance_fixture_has_shared_masked_context():
+    sample = _native_feature("abc")
+    assert sample["input_ids"].tolist() == [ord(c) for c in "pabcpd"]
+    assert sample["labels"].tolist() == [-100, ord("a"), ord("b"), ord("c"), -100, ord("d")]
+    assert sample["position_ids"].tolist() == [0, 1, 2, 3, 0, 1]
+
+
 def _native_provenance_hccl(require_hccl=False):
     import veomni.data.data_collator as data_collator
-    from veomni.data.data_transform import process_dpo_example
     from veomni.data.dpo_collator import DPOProvenanceCollator
     from veomni.trainer.dpo_provenance import next_dpo_microbatches
 
@@ -44,9 +62,7 @@ def _native_provenance_hccl(require_hccl=False):
     data_collator.get_parallel_state = lambda: state
 
     def feature(text):
-        out = process_dpo_example(
-            {"chosen": text, "rejected": "d"}, tokenizer=_Tokenizer(), record_segment_provenance=True
-        )[0]
+        out = _native_feature(text)
         out["ds_idx"] = group_id
         return out
 
@@ -163,6 +179,22 @@ def _native_provenance_hccl(require_hccl=False):
         statuses = [None] * world
         dist.all_gather_object(statuses, result)
         assert statuses == ["approved" if scenario == "consistent" else "error"] * world, (scenario, statuses)
+
+
+def _gloo_provenance_worker(rank, world_size, endpoint):
+    dist.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
+    )
+    try:
+        assert dist.get_backend() == "gloo"
+        _native_provenance_hccl()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_dpo_provenance_gloo():
+    spawn_with_rendezvous(_gloo_provenance_worker, args=(4,), nprocs=4)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=4))
