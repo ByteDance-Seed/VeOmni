@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import math
 
-import torch
 from torch import Tensor
 
+from ..moe_experts.shared.swiglu import swiglu_oai
 from .independent import eager as independent_eager
 from .independent import npu as independent_npu
 from .shared import eager as shared_eager
@@ -39,7 +39,7 @@ def _activation(alpha: float, limit: float):
         gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-        return (gate * torch.sigmoid(gate * alpha)) * (up + 1.0)
+        return swiglu_oai(gate, up, alpha)
 
     return activate
 

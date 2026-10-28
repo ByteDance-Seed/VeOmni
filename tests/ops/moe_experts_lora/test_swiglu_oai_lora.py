@@ -1,15 +1,25 @@
-# Copyright 2026 verl contributors
-# Licensed under the Apache License, Version 2.0.
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CPU oracle and CPU-emulated NPU composition; these do not validate NPU kernels."""
 
 import ast
 import importlib
 import importlib.util
 import logging
-import math
 import sys
 import types
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,11 +54,14 @@ def kernels(monkeypatch):
         ".ops.kernels.moe_experts",
         ".ops.kernels.moe_experts.standard",
         ".distributed",
+        ".utils",
+        ".ops.kernels.moe_experts.shared",
     ]
     for suffix in parents:
         package = types.ModuleType(_PREFIX + suffix)
         package.__path__ = [str(_ROOT / "veomni" / suffix.lstrip(".").replace(".", "/"))]
         monkeypatch.setitem(sys.modules, package.__name__, package)
+    sys.modules[_PREFIX + ".utils"].logging = SimpleNamespace(get_logger=logging.getLogger)
     state = types.ModuleType(_PREFIX + ".distributed.parallel_state")
     state.get_parallel_state = lambda: SimpleNamespace(ep_enabled=False)
     monkeypatch.setitem(sys.modules, state.__name__, state)
@@ -168,111 +181,126 @@ def test_invalid_activation_attributes_fail_explicitly(kernels, alpha, limit):
         kernels._activation(alpha, limit)
 
 
-def test_native_wrapper_accepts_explicit_oai_without_an_act_fn():
-    path = _ROOT / "veomni/lora/moe_layers.py"
-    node = next(
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.FunctionDef) and node.name == "_validate_silu_act_fn"
+@pytest.fixture
+def runtime(kernels, monkeypatch):
+    """Load real registry and LoRA classes while isolating optional package startup."""
+    import transformers.utils
+    import transformers.utils.import_utils
+
+    # A package-install probe must not initialize optional CANN libraries for
+    # this explicitly CPU-only launch plan.
+    monkeypatch.setattr(transformers.utils, "is_torch_npu_available", lambda: False)
+    monkeypatch.setattr(transformers.utils.import_utils, "is_torch_npu_available", lambda: False)
+    for suffix in (".lora", ".utils", ".ops.kernels.moe_experts.swiglu_oai"):
+        package = types.ModuleType(_PREFIX + suffix)
+        package.__path__ = [str(_ROOT / "veomni" / suffix.lstrip(".").replace(".", "/"))]
+        monkeypatch.setitem(sys.modules, package.__name__, package)
+    sys.modules[_PREFIX + ".utils"].logging = SimpleNamespace(get_logger=logging.getLogger)
+    registry = importlib.import_module(_PREFIX + ".ops.registry")
+    ops = sys.modules[_PREFIX + ".ops"]
+    ops.OP_REGISTRY, ops.VeomniOp = registry.OP_REGISTRY, registry.VeomniOp
+    monkeypatch.setitem(sys.modules, "veomni.ops", ops)
+    name = _PREFIX + ".ops.kernels.moe_experts_lora"
+    spec = importlib.util.spec_from_file_location(name, _ROOT / "veomni/ops/kernels/moe_experts_lora/__init__.py")
+    family = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, family)
+    spec.loader.exec_module(family)
+    base_eager = importlib.import_module(_PREFIX + ".ops.kernels.moe_experts.swiglu_oai.eager")
+    registry.register_op(
+        "moe_experts", "swiglu_oai", "eager", description="MiniMax dependency eager", wrapper=base_eager.wrapper
     )
-    scope = dict(nn=torch.nn, F=F, math=math, SiLUActivation=torch.nn.SiLU)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
-    expert = SimpleNamespace(veomni_moe=SimpleNamespace(variant="swiglu_oai"), swiglu_alpha=1.702, swiglu_limit=7.0)
-    scope["_validate_silu_act_fn"](expert)
+    standard_eager = importlib.import_module(_PREFIX + ".ops.kernels.moe_experts.standard.eager")
+    registry.register_op(
+        "moe_experts", "standard", "eager", description="Standard dependency eager", wrapper=standard_eager.wrapper
+    )
+    layers = importlib.import_module(_PREFIX + ".lora.moe_layers")
+
+    return SimpleNamespace(registry=registry, layers=layers)
+
+
+def make_experts(runtime, dtype=torch.float32):
+    """Minimal base module with real operator dispatch and expert parameter layout."""
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts, self.hidden_dim, self.intermediate_dim = 3, 4, 3
+            self.swiglu_alpha, self.swiglu_limit = 1.702, 1.0
+            self.gate_up_proj = torch.nn.Parameter(torch.randn(3, 6, 4, dtype=dtype))
+            self.down_proj = torch.nn.Parameter(torch.randn(3, 4, 3, dtype=dtype))
+            self.veomni_moe = runtime.registry.VeomniOp("moe_experts", "swiglu_oai", "eager")
+
+    return Experts()
+
+
+def test_native_wrapper_accepts_explicit_oai_without_an_act_fn(runtime):
+    expert = make_experts(runtime)
+    runtime.layers.LoraIndependentExperts(expert, r=2, lora_alpha=4)
+    expert = make_experts(runtime)
     expert.swiglu_limit = float("nan")
     with pytest.raises(ValueError, match="swiglu_limit"):
-        scope["_validate_silu_act_fn"](expert)
+        runtime.layers.LoraIndependentExperts(expert, r=2, lora_alpha=4)
 
 
-def test_expert_reference_bypass_never_reads_adapter_weights():
-    path = _ROOT / "veomni/lora/moe_layers.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    helper = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_forward_base_experts"
-    )
-    wrapper = next(
-        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LoraIndependentExperts"
-    )
-    forward = next(node for node in wrapper.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
-    scope = dict(torch=torch, get_parallel_state=lambda: SimpleNamespace(ep_enabled=False))
-    exec(compile(ast.Module(body=[helper, forward], type_ignores=[]), str(path), "exec"), scope)
-    calls = []
-    base_gate_up = torch.randn(3, 6, 4)
-    base_down = torch.randn(3, 4, 3)
-    hidden = torch.randn(2, 4)
-    weights = torch.randn(2, 2)
-    selected = torch.tensor([[0, 1], [1, 0]])
-
-    def base(*args, **kwargs):
-        calls.append((args, kwargs))
-        return hidden
-
-    layer = SimpleNamespace(
-        disable_adapters=True,
-        _base_moe=base,
+@pytest.mark.parametrize("layout", ["shared", "independent"])
+def test_expert_reference_bypass_never_reads_adapter_weights(runtime, monkeypatch, layout):
+    base = make_experts(runtime)
+    cls = runtime.layers.LoraSharedExperts if layout == "shared" else runtime.layers.LoraIndependentExperts
+    hidden, routing, selected = tensors(layout, torch.float32)[:3]
+    unused = hidden.new_empty(0)
+    expected = base.veomni_moe(
+        hidden,
+        routing,
+        selected,
+        unused,
+        unused,
+        base.down_proj,
+        base.gate_up_proj,
         num_experts=3,
-        gate_up_proj=SimpleNamespace(base_layer=SimpleNamespace(weight=base_gate_up)),
-        down_proj=SimpleNamespace(base_layer=SimpleNamespace(weight=base_down)),
-        _activation_kwargs=dict(swiglu_alpha=1.702, swiglu_limit=7.0),
+        swiglu_alpha=1.702,
+        swiglu_limit=1.0,
     )
-    assert scope["forward"](layer, hidden, selected, weights) is hidden
-    args, kwargs = calls[0]
-    assert args[0] is hidden and args[1] is weights and args[2] is selected
-    assert args[5] is base_down and args[6] is base_gate_up
-    assert kwargs == dict(num_experts=3, swiglu_alpha=1.702, swiglu_limit=7.0)
+    layer = cls(base, r=2, lora_alpha=4)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Adapter weights must not be read in reference inference")
+
+    monkeypatch.setattr(layer, "get_lora_A_weight", forbidden)
+    monkeypatch.setattr(layer, "get_lora_B_weight", forbidden)
+    layer.disable_adapters = True
+    torch.testing.assert_close(layer(hidden, selected, routing), expected, rtol=0, atol=0)
 
 
-def test_expert_disable_context_restores_nested_and_exception_states():
-    path = _ROOT / "veomni/lora/model.py"
-    cls = next(
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.ClassDef) and node.name == "VeOmniLoraModel"
-    )
-    node = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "disable_adapter")
-    node.body = [statement for statement in node.body if not isinstance(statement, ast.ImportFrom)]
-
-    class Dense:
-        def __init__(self):
-            self.disable_adapters = True
-            self.merged = False
-
-    class Expert:
-        def __init__(self):
-            self.disable_adapters = False
-            self._base_moe = object()
-
-    scope = dict(contextmanager=contextmanager, LoraLinear=Dense, is_lora_moe_experts=lambda x: isinstance(x, Expert))
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
-    dense, expert = Dense(), Expert()
-    model = SimpleNamespace(modules=lambda: [dense, expert])
+def test_expert_disable_context_restores_nested_and_exception_states(runtime):
+    model_module = importlib.import_module(_PREFIX + ".lora.model")
+    layers = importlib.import_module(_PREFIX + ".lora.layers")
+    config = importlib.import_module(_PREFIX + ".lora.config")
+    dense = layers.LoraLinear(torch.nn.Linear(4, 4), adapter_name="default", r=2, lora_alpha=4)
+    dense.disable_adapters = True
+    expert = runtime.layers.LoraIndependentExperts(make_experts(runtime), r=2, lora_alpha=4)
+    base = torch.nn.ModuleDict({"dense": dense, "expert": expert})
+    model = model_module.VeOmniLoraModel(base, config.VeOmniLoraConfig(target_modules=["dense"]), inject=False)
     with pytest.raises(RuntimeError, match="inside"):
-        with scope["disable_adapter"](model):
+        with model.disable_adapter():
             assert dense.disable_adapters and expert.disable_adapters
-            with scope["disable_adapter"](model):
+            with model.disable_adapter():
                 assert expert.disable_adapters
             assert expert.disable_adapters
             raise RuntimeError("inside")
     assert dense.disable_adapters and not expert.disable_adapters
     expert._base_moe = None
     with pytest.raises(NotImplementedError, match="base VeomniOp"):
-        with scope["disable_adapter"](model):
+        with model.disable_adapter():
             pytest.fail("Unsupported experts must fail before the context starts")
     assert dense.disable_adapters and not expert.disable_adapters
 
 
-def test_clamped_standard_experts_are_rejected_before_wrapping():
-    path = _ROOT / "veomni/lora/moe_layers.py"
-    node = next(
-        n
-        for n in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(n, ast.FunctionDef) and n.name == "_validate_silu_act_fn"
-    )
-    scope = dict(nn=torch.nn, F=F, math=math, SiLUActivation=torch.nn.SiLU)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
-    expert = SimpleNamespace(veomni_moe=SimpleNamespace(variant="standard"), act_fn=F.silu, limit=1.0)
+def test_clamped_standard_experts_are_rejected_before_wrapping(runtime):
+    expert = make_experts(runtime)
+    expert.veomni_moe = runtime.registry.VeomniOp("moe_experts", "standard", "eager")
+    expert.act_fn, expert.limit = F.silu, 1.0
     with pytest.raises(ValueError, match="Clamped standard"):
-        scope["_validate_silu_act_fn"](expert)
+        runtime.layers.LoraIndependentExperts(expert, r=2, lora_alpha=4)
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
@@ -350,51 +378,15 @@ def test_preserve_frozen_dtype_requires_active_compute_dtype(enable, param_dtype
 
 @pytest.mark.parametrize("layout", ["shared", "independent"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_real_registry_and_expert_wrapper_reference_parity(kernels, monkeypatch, layout, dtype):
+def test_real_registry_and_expert_wrapper_reference_parity(runtime, layout, dtype):
     """Real registry, family registration, constructors and kernels; CPU, EP disabled.
 
     Only package startup/logging and distributed state are isolated. The base
     eager operator is the unchanged dependency from MiniMax model PR #1315.
     This does not import the complete generated multimodal model or run NPU.
     """
-    import transformers.utils
-    import transformers.utils.import_utils
-
-    # A package-install probe must not initialize optional CANN libraries for
-    # this explicitly CPU-only launch plan.
-    monkeypatch.setattr(transformers.utils, "is_torch_npu_available", lambda: False)
-    monkeypatch.setattr(transformers.utils.import_utils, "is_torch_npu_available", lambda: False)
-    for suffix in (".lora", ".utils", ".ops.kernels.moe_experts.swiglu_oai"):
-        package = types.ModuleType(_PREFIX + suffix)
-        package.__path__ = [str(_ROOT / "veomni" / suffix.lstrip(".").replace(".", "/"))]
-        monkeypatch.setitem(sys.modules, package.__name__, package)
-    sys.modules[_PREFIX + ".utils"].logging = SimpleNamespace(get_logger=logging.getLogger)
-    registry = importlib.import_module(_PREFIX + ".ops.registry")
-    ops = sys.modules[_PREFIX + ".ops"]
-    ops.OP_REGISTRY, ops.VeomniOp = registry.OP_REGISTRY, registry.VeomniOp
-    monkeypatch.setitem(sys.modules, "veomni.ops", ops)
-    name = _PREFIX + ".ops.kernels.moe_experts_lora"
-    spec = importlib.util.spec_from_file_location(name, _ROOT / "veomni/ops/kernels/moe_experts_lora/__init__.py")
-    family = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, family)
-    spec.loader.exec_module(family)
-    base_eager = importlib.import_module(_PREFIX + ".ops.kernels.moe_experts.swiglu_oai.eager")
-    registry.register_op(
-        "moe_experts", "swiglu_oai", "eager", description="MiniMax dependency eager", wrapper=base_eager.wrapper
-    )
-    layers = importlib.import_module(_PREFIX + ".lora.moe_layers")
-
-    class Experts(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.num_experts, self.hidden_dim, self.intermediate_dim = 3, 4, 3
-            self.swiglu_alpha, self.swiglu_limit = 1.702, 1.0
-            self.gate_up_proj = torch.nn.Parameter(torch.randn(3, 6, 4, dtype=dtype))
-            self.down_proj = torch.nn.Parameter(torch.randn(3, 4, 3, dtype=dtype))
-            self.veomni_moe = registry.VeomniOp("moe_experts", "swiglu_oai", "eager")
-
     torch.manual_seed(1702)
-    base = Experts()
+    base = make_experts(runtime, dtype)
     hidden = torch.randn(5, 4, dtype=dtype)
     selected = torch.tensor([[0, 1], [1, 0], [2, 1], [0, 2], [1, 2]])
     routing = torch.softmax(torch.randn(5, 2, dtype=dtype), dim=-1)
@@ -411,9 +403,10 @@ def test_real_registry_and_expert_wrapper_reference_parity(kernels, monkeypatch,
         swiglu_alpha=1.702,
         swiglu_limit=1.0,
     )
-    cls = layers.LoraSharedExperts if layout == "shared" else layers.LoraIndependentExperts
+    cls = runtime.layers.LoraSharedExperts if layout == "shared" else runtime.layers.LoraIndependentExperts
     wrapped = cls(base, r=2, lora_alpha=4)
     assert wrapped.veomni_moe_lora.variant == layout + "_swiglu_oai"
+    torch.testing.assert_close(wrapped(hidden, selected, routing), expected, rtol=0, atol=0)
     for logical in ("gate_proj", "up_proj", "down_proj"):
         torch.nn.init.normal_(wrapped.get_lora_B_weight(logical), std=0.1)
     adapted = wrapped(hidden, selected, routing)
