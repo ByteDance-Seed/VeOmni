@@ -17,21 +17,21 @@ If a field is not in this table, it is not an op-selection knob.
 
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
@@ -64,6 +64,16 @@ other `fused_*` group-gemm backends. The
 `rms_norm_implementation: torch_npu` to `eager`, while the weighted variants keep
 their `torch_npu` rows. Any other variant without a row for the selected value
 fails at model build and lists the registered implementations.
+
+**MLU `liger_kernel` rows require the Cambricon liger build.** `rms_norm`,
+`rope`, `swiglu_mlp`, and `cross_entropy_loss` register `liger_kernel`
+rows for the `mlu` device that reuse the CUDA adapters — the
+Cambricon fork keeps the upstream `liger_kernel.ops.*` API over MLU backends.
+These rows use `MluKernelRequirement` for device matching and declare
+`requires=("liger_kernel",)`. The registry additionally checks the
+fork's `__mlu_version__` marker (`is_liger_kernel_mlu_available()`), so
+upstream GPU liger installed on an MLU host neither becomes the unset-field
+default nor passes an explicit selection.
 
 The general per-op fields are typed as plain `str` (not `Literal`), so
 third-party backends can call `register_op(...)` without modifying
@@ -143,6 +153,7 @@ model:
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
 | `flash_attention_4` | Flash Attention v4 | Yes after rewrite | `flash-attn.cute` |
 | `flex_attention` | PyTorch FlexAttention | Yes after rewrite | NVIDIA GPU; native `BlockMask`; SM90+ uses FA4 when available, otherwise Triton |
+| `aiter` | AMD AITER FMHA-v3 | Yes after rewrite | AMD ROCm; `aiter` |
 | `magi_attention` | MagiAttention FFA | Yes after rewrite | `--extra magi`; NVIDIA SM100+; model-provided `MagiAttentionMask` |
 | `sage_attention` | SageAttention | Yes after rewrite | `sageattention` |
 | `native-sparse` | Sparse attention | No | — |
@@ -156,6 +167,7 @@ public values to VeOmni adapters:
 | `flash_attention_3` | `veomni_flash_attention_3` |
 | `flash_attention_4` | `veomni_flash_attention_4` |
 | `flex_attention` | `veomni_flex_attention` |
+| `aiter` | `veomni_flash_attention_aiter` |
 | `magi_attention` | `veomni_magi_attention` |
 | `sage_attention` | `veomni_sage_attention` |
 | `sdpa` | `veomni_sdpa` |
@@ -166,6 +178,12 @@ builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
 `VeomniOp("attention", "standard", config._attn_implementation)` in
 `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
 that handle. The registered row looks up the same Transformers interface.
+
+The AITER adapter requires `MODELING_BACKEND=veomni`. Its row has an explicit
+ROCm-only GPU requirement and does not resolve on NVIDIA, Ascend, or MLU. Both
+`aiter` and its normalized
+`veomni_flash_attention_aiter` name are rejected on Ascend before Transformers
+can select its NPU attention path.
 
 `eager` resolves the modeling file's own `eager_attention_forward`, as in
 Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so
@@ -239,6 +257,10 @@ implementation is provided by the `tile-kernels` package.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
 
+On AMD ROCm GPUs, `dsa_attention_implementation: triton` selects the same
+DeepSeek-V4 sparse MQA contract. The indexer and mHC remain independent;
+the optional indexer-loss teacher still requires both TileLang selections.
+
 The same three fields select `cann` on Ascend, which requires
 `cann_ops_transformer`:
 
@@ -275,7 +297,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + CUDA |
+| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + CUDA/MLU |
 | `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
 | `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
 
@@ -497,9 +519,9 @@ separate `ModuleList` fork. LoRA experts follow the wrapped module's
 unavailable on the device.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
-SM90+ `tilelang` and Ascend `cann` indexer and attention implementations. Its MoE path
-uses the independent `moe_implementation` selection and therefore defaults to
-`fused_triton` on GPU.
+SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
+ROCm `triton` attention. Its MoE path uses the independent
+`moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to the local `VeomniOp` and forwards `swiglu_limit` so every
 supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.

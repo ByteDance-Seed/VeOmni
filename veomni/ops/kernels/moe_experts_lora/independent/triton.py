@@ -768,6 +768,7 @@ def group_gemm_fused_independent_lora_moe_forward(
           with :class:`EPMergedFc1IndependentLoRAGroupGemm` (mirrors the
           non-LoRA EP fused path).
     """
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import dispatch_to_ep_class
 

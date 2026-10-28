@@ -164,6 +164,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
 
 @pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
+    """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -176,6 +177,7 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     captured = {}
 
     def record(*args, **kwargs):
+        """Record positional and keyword arguments passed to ``veomni_moe``."""
         captured["args"] = args
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
@@ -186,8 +188,8 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     kwargs = captured["kwargs"]
 
     assert args[0] is hidden_states
-    expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
-    torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
+    assert args[1] is top_k_weights
+    torch.testing.assert_close(args[1], top_k_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert args[3].numel() == 0
     assert args[4].numel() == 0
@@ -237,14 +239,11 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     grad = torch.randn_like(x) * 0.1
     y = experts(x, indices, routing)
     actual = (y, *torch.autograd.grad(y, (x, routing, experts.gate_up_proj, experts.down_proj), grad))
-    xr, rr, w1, w2 = [
+    xr, rr, w1, w2 = (
         t.detach().clone().requires_grad_() for t in (x, routing, experts.gate_up_proj, experts.down_proj)
-    ]
-    gate, up = w1.chunk(2, dim=1)
-    # The current model casts router scores for every fused expert backend.
-    yr = standard_ep_reference(
-        xr, rr.to(xr.dtype), indices, gate, up, w2, num_experts=config.num_local_experts, swiglu_limit=10.0
     )
+    gate, up = w1.chunk(2, dim=1)
+    yr = standard_ep_reference(xr, rr, indices, gate, up, w2, num_experts=config.num_local_experts, swiglu_limit=10.0)
     expected = (yr, *torch.autograd.grad(yr, (xr, rr, w1, w2), grad))
     for result, reference in zip(actual, expected):
         assert torch.isfinite(result).all()

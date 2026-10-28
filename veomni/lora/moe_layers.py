@@ -700,6 +700,7 @@ class LoraSharedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with shared LoRA adapters through ``veomni_moe_lora``."""
         # Lazy-install cross-EP gradient sync on shared LoRA params (idempotent).
         # Must run after FSDP wrapping has converted params to DTensors, hence
         # the lazy install at first forward rather than in ``__init__``.
@@ -714,7 +715,7 @@ class LoraSharedExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
@@ -1003,6 +1004,7 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
@@ -1012,7 +1014,7 @@ class LoraIndependentExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
