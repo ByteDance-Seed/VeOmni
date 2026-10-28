@@ -87,6 +87,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Shard
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -262,6 +263,23 @@ class _Qwen4ExpScaleGradient(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         return grad_output / ctx.divisor, None
+
+
+class _Qwen4ExpAttachZeroWeightGrad(torch.autograd.Function):
+    """Connect a globally active lookup shard without changing its output."""
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # Only metadata is required in backward; saving the parameter would
+        # make activation-offload hooks copy the complete PLE shard.
+        ctx.weight_shape = weight.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.weight_device = weight.device
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
 
 
 def qwen4_exp_mm_token_type_ids(input_ids, config):
@@ -1704,9 +1722,38 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # nonzero-synced the match count to the host once per shard per lookup,
         # serialising the host against the device on the PLE hot path. ---
         order = torch.argsort(shard_ids, stable=True)
-        shard_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding)).tolist()
+        local_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding))
+        persistent_weight = first_embedding.weight
+        persistent_2d = (
+            isinstance(persistent_weight, DTensor)
+            and persistent_weight.device_mesh.mesh_dim_names == ("ple_fsdp", "ple")
+            and len(persistent_weight.placements) == 2
+            and isinstance(persistent_weight.placements[0], Shard)
+            and persistent_weight.placements[0].dim == 1
+            and isinstance(persistent_weight.placements[1], Shard)
+            and persistent_weight.placements[1].dim == 0
+        )
+        state = get_parallel_state() if persistent_2d else None
+        attach_zero_grad = bool(
+            state is not None
+            and state.extra_parallel_sizes.get("ple", 1) > 1
+            and torch.is_grad_enabled()
+            and any(embedding.weight.requires_grad for embedding in self.ngram_embedding.values())
+        )
+        global_counts = None
+        if attach_zero_grad:
+            group = state.extra_parallel_flat_group("ple")
+            if not dist.is_initialized() or group is None:
+                raise RuntimeError("Trainable persistent PLE lookup requires its initialized process group.")
+            global_counts = local_counts.clone()
+            dist.all_reduce(global_counts, group=group)
+            shard_counts, global_counts = torch.stack((local_counts, global_counts)).tolist()
+        else:
+            shard_counts = local_counts.tolist()
         shard_start = 0
-        for embedding, shard_count in zip(self.ngram_embedding.values(), shard_counts, strict=True):
+        for shard_index, (embedding, shard_count) in enumerate(
+            zip(self.ngram_embedding.values(), shard_counts, strict=True)
+        ):
             shard_end = shard_start + shard_count
             if shard_end > shard_start:
                 positions = order[shard_start:shard_end]
@@ -1715,6 +1762,9 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
                     weight = weight.to_local()
                 values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
                 output = output.index_copy(0, positions, values)
+            elif attach_zero_grad and embedding.weight.requires_grad and global_counts[shard_index] > 0:
+                weight = embedding.weight.to_local()
+                output = _Qwen4ExpAttachZeroWeightGrad.apply(output, weight)
             shard_start = shard_end
         # --- Patch.7 ---
         return output
