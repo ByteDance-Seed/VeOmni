@@ -6,7 +6,7 @@ afterwards. It is a marker: mixing it in is what makes a module cacheable, and
 it declares no method.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L20)
-- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L701)
+- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L702)
 - Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L216)
 
 ## Why cache a module's encoder
@@ -70,7 +70,7 @@ tasks:
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its offline-embedding method. |
 | `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | Built on meta, never loaded, and frozen; the graph calls its offline-training method. |
 
-`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L822)) rejects
+`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L823)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
