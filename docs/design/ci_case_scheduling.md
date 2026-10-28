@@ -209,7 +209,7 @@ phase or worker stops new dispatches and cancels running peers in the same
 suite/job. Wait for owned process cleanup, then return failure. `--keep-going`
 continues all cases and batches without cancelling peers.
 If owned processes survive cleanup, stop admission and cancel running peers
-even with `--keep-going`; the affected device lease must not be reused.
+even with `--keep-going`; the affected worker process scope cannot be safely reused.
 
 On Ctrl-C, collection and scheduling cancel their owned subprocess scopes before
 waiting for thread-pool callbacks. Workers then use the existing bounded
