@@ -276,15 +276,23 @@ def _accelerator_vision_plan(_context):
     return LaunchSpec(nproc=2, device="accelerator")
 
 
-def _vision_runner_has_two_accelerators():
+def _single_accelerator_vision_plan(_context):
+    from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+    return LaunchSpec(device="accelerator")
+
+
+def _vision_runner_has_accelerators(count):
+    if get_device_type() == "mlu":
+        return False
     try:
         from scripts.ci.accelerator.launch_plan import runner_device_count
     except ModuleNotFoundError as error:
         if error.name not in {"scripts.ci.accelerator", "scripts.ci.accelerator.launch_plan"}:
             raise
         device = get_torch_device()
-        return get_device_type() != "cpu" and device.is_available() and device.device_count() >= 2
-    return runner_device_count() >= 2
+        return get_device_type() != "cpu" and device.is_available() and device.device_count() >= count
+    return runner_device_count() >= count
 
 
 @pytest.mark.launch_plan(provider=_cpu_vision_plan)
@@ -369,7 +377,7 @@ def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
 
 
 @pytest.mark.launch_plan(provider=_accelerator_vision_plan)
-@pytest.mark.skipif(not _vision_runner_has_two_accelerators(), reason="requires two accelerators")
+@pytest.mark.skipif(not _vision_runner_has_accelerators(2), reason="requires two accelerators")
 @pytest.mark.parametrize(
     "attention,parallel_mode", [("eager", "cp"), ("eager", "ulysses"), ("veomni_sdpa", "ulysses")]
 )
@@ -379,6 +387,27 @@ def test_qwen4_exp_vision_real_image_sp_rejects_non_flash_attention(attention, p
     if get_device_type() == "npu" and parallel_mode == "cp":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_vision_real_image_sp_non_fa_worker, 2, attention, parallel_mode)
+
+
+@pytest.mark.launch_plan(provider=_single_accelerator_vision_plan)
+@pytest.mark.skipif(not _vision_runner_has_accelerators(1), reason="requires a supported accelerator")
+def test_qwen4_exp_vision_flash_adapter_binding():
+    from transformers import Qwen4ExpConfig
+
+    backend = "npu" if get_device_type() == "npu" else "gpu"
+    if backend == "gpu":
+        from veomni.ops.registry import OP_REGISTRY
+
+        if "veomni_flash_attention_2" not in OP_REGISTRY.list_available("attention", "standard"):
+            pytest.skip("FlashAttention 2 is unavailable on this GPU")
+    module = importlib.import_module(
+        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
+    )
+    config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
+    config._attn_implementation = "veomni_flash_attention_2"
+    vision = module.Qwen4ExpVisionModel(config)
+    assert len(vision.blocks) > 0
+    assert all(block.attn.veomni_attn.impl == "veomni_flash_attention_2" for block in vision.blocks)
 
 
 def _vision_parallel_state(sp_size, sp_rank):
