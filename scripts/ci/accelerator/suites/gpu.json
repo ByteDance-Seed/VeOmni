@@ -10,6 +10,15 @@
     ]
   },
   {
+    "name": "qwen38-channel_loss_callback-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_channel_loss_callback.py"
+    ]
+  },
+  {
     "name": "02-unit",
     "suite": "unit",
     "conditional": false,

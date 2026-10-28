@@ -32,6 +32,15 @@ from the test's launch plan. See
 [Registering Tests in CI](../../../docs/testing.md#registering-tests-in-ci) for
 the manifest example, registration rules and collection check command.
 
+The `qwen38-channel_loss_callback-unit` selection is present in both
+`suites/gpu.json` and `suites/npu.json`. It collects
+`tests/trainer/test_channel_loss_callback.py` for the detached channel-loss
+callback, packed-source alignment, and local SP/Gloo checks. The existing
+`tests/ops` selection also collects chunk-loss observer/offload tests. Consult
+the individual case plans, skip conditions, and job logs for the hardware
+actually exercised; inclusion in an accelerator suite alone does not prove a
+native device run.
+
 ## Launch plans
 
 An unmarked case defaults to one card of the selected accelerator backend, or
