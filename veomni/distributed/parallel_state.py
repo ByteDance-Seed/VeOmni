@@ -92,6 +92,9 @@ class ParallelState:
         if self.ulysses_size < 1:
             raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
+        if self.cp_size > 1 and self.async_enabled:
+            raise NotImplementedError("Context parallelism cannot be combined with async Ulysses yet.")
+
         if self.cp_layout not in ("contiguous", "zigzag"):
             raise ValueError(f"Unsupported cp_layout: {self.cp_layout!r}.")
         if self.cp_size > 1 and self.ulysses_size > 1 and self.cp_layout != "zigzag":

@@ -487,7 +487,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 
 Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
 layout preserves DeepSeek V4's model-specific CP and does not allow combining
-CP with Ulysses. USP requires `MODELING_BACKEND=veomni`. This release enables
+CP with Ulysses. CP cannot be combined with `model.accelerator.enable_async: true`;
+async Ulysses and Ring are not integrated yet. USP requires `MODELING_BACKEND=veomni`. This release enables
 USP for Qwen3 causal text training with
 VeOmni FlashAttention 2 or 4 (`Qwen3ForCausalLM` only). RL/DPO, sequence
 classification, multimodal packing, sliding-window attention,

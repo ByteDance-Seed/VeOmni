@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
+USP_CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"qwen3"})
+_USP_ATTN_BACKENDS = frozenset({"veomni_flash_attention_2", "veomni_flash_attention_4"})
 
 _VEOMNI_SP_ATTN = (
     "veomni_flex_attention",
@@ -97,11 +99,7 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
         if get_env("MODELING_BACKEND") != "veomni":
             raise NotImplementedError("USP requires MODELING_BACKEND=veomni for its attention and shifted loss.")
         implementation = attn_implementation or getattr(config, "_attn_implementation", None)
-        supported_backends = {
-            "veomni_flash_attention_2",
-            "veomni_flash_attention_4",
-        }
-        if config.model_type != "qwen3" or implementation not in supported_backends:
+        if config.model_type not in USP_CONTEXT_PARALLEL_MODEL_TYPES or implementation not in _USP_ATTN_BACKENDS:
             raise NotImplementedError(
                 "USP zigzag CP currently supports Qwen3 with VeOmni FlashAttention 2 or 4 only. "
                 "Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
