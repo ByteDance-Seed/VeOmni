@@ -19,7 +19,14 @@ inclusive, symmetric window on both sides of each token; document boundaries
 still apply. FlashAttention 2/3/4 and the FA2/FA3 Hub variants retain their
 native metadata path: the attention adapter receives the module's causal
 setting, sliding window and cumulative sequence lengths. No custom mask
-predicate is sent to Flash. Packed Flash inputs must be padding-free: `None`
+predicate is sent to Flash. The pinned HF native Flash conversion uses radius
+`W - 1`, whereas eager/SDPA/Flex include distance `W`, where `W` is the effective
+`text_config.sliding_window` after Gemma's bidirectional config conversion.
+For example, a configured window of 32 becomes effective `W=17`: dense/Flex
+include a token 17 positions away, while native Flash uses `(16, 16)` and
+excludes it. Cross-backend numerical references must account for this boundary.
+This integration retains each pinned HF backend's behavior.
+Packed Flash inputs must be padding-free: `None`
 and all-valid 2D masks are accepted, but masks containing padding raise an
 error because HF unpadding would replace the supplied document boundaries.
 Unpacked Flash inputs retain normal padding-mask handling.
@@ -52,6 +59,7 @@ channel-loss interception, audio visibility and dummy graph participation:
 
 ```bash
 pytest tests/models/test_gemma4.py -q
+pytest tests/models/test_gemma4_numerics.py -q
 pytest tests/models/base/test_auto_registry.py -k gemma4 -q
 ```
 
@@ -59,8 +67,11 @@ CPU backend-dispatch tests exercise the real HF/VeOmni Flash adapters up to a
 stubbed kernel boundary, checking causal/window and varlen argument forwarding.
 Additional cases run the HF varlen dispatcher with stubbed vendor functions to
 check that supplied document offsets reach the selected kernel unchanged.
-They do not execute FlashAttention kernels or establish numerical/gradient
-parity on GPU. Real FA2/FA3/FA4 forward/backward validation remains pending.
+They do not execute FlashAttention kernels. The companion numerical suite runs
+real FA2 and Triton Flex checks on one CUDA GPU when their dependencies are
+available. It compares all model gradients to HF using the same backend and
+tests four attention calls sharing two K/V leaf pairs against an independent
+FP32 attention reference. FA3/FA4 require separate eligible-hardware validation.
 
 Actual asymmetric BF16 FSDP2 validation requires two CUDA GPUs:
 
@@ -69,5 +80,94 @@ pytest tests/distributed/test_dummy_forward.py -k gemma4 -q
 ```
 
 The three cases cover image versus text, video/audio versus text, and split
-modalities across ranks. They skip on CPU. Local checks do not establish
+modalities across ranks. They skip on CPU. Numerical tests alone do not establish
 collective correctness or full-checkpoint memory requirements.
+
+### Numerical reference procedure
+
+Match visibility before comparing floating-point results. Use the independent
+packed dense-mask reference for the selected backend's causal/window contract;
+the CPU and CUDA endpoint tests isolate a single nonzero value exactly on the
+bidirectional window boundary.
+
+For full-model comparisons, initialize one master state and copy its weights
+and buffers into HF and VeOmni. Preserve tied embeddings, inputs, labels,
+position IDs, document offsets, precision, KV sharing and kernel options. A seed
+alone does not make independently initialized BF16 and FP16 weights identical.
+The committed GPU regressions use native HF with the same backend as reference,
+rather than imposing one global per-parameter tolerance across different
+low-precision kernels in an untrained four-layer stress model.
+Real-kernel cases clear the compiler cache before and after each case and reject
+the unfused-Flex warning. Shape variants in preceding tests can exhaust Dynamo's
+recompile budget and change the arithmetic path. FA2 model controls use
+`deterministic=True` so atomic backward reductions do not confound comparisons.
+
+The test-only FP32 attention oracle explicitly promotes Q/K/V inside a MATH
+context before casting the output back to the requested model precision. An
+outer `sdpa_kernel(MATH)` around a VeOmni model is insufficient: masked
+`veomni_sdpa` calls install their own efficient/MATH backend context. The oracle
+bypasses that adapter. FP32 attention inside a low-precision model and an
+entirely FP32 model are separate controls.
+
+To investigate the historical nine standalone comparisons on one CUDA GPU:
+
+```bash
+OMP_NUM_THREADS=1 TORCHINDUCTOR_COMPILE_THREADS=2 \
+  python -m tests.tools.diagnose_gemma4_numerics --output-dir /tmp/gemma4-numerics
+```
+
+The diagnostic saves every original fixture, retains the original strict output
+and gradient assertions as reported metrics, and compares each case to native
+HF, FP32 attention and full FP32 model controls. It replays all four attention
+calls with shared K/V leaves and fixed upstream gradients. A separate
+test-local intervention preserves real-kernel forward outputs exactly while
+recomputing only attention VJPs in FP32, separating forward-trajectory and
+backward arithmetic effects. These references and interventions do not alter
+production modeling or attention implementations.
+
+### A100 numerical diagnostic (2026-10-29)
+
+On A100 SM80 with PyTorch 2.11.0+cu130, Transformers 5.16.1 and FA2 2.8.4,
+all nine frozen fixtures matched native HF with the same backend: logits,
+loss and every parameter gradient were bitwise equal. The isolated diagnostic
+below retains the old cross-backend comparison as a reported metric; it does
+not declare those comparisons passing or increase their 8% gradient threshold.
+The model has four layers, two shared K/V pairs, hidden size 64, head dimension
+256, Gemma attention scaling 1, and two packed documents.
+
+| Dtype / backend | Visibility / length | Max logit difference vs low-precision SDPA | Worst parameter gradient relative L2 vs SDPA | Worst parameter gradient relative L2 with fixed forward and FP32 attention VJP |
+| --- | --- | ---: | ---: | ---: |
+| BF16 / Flex | causal / 128 | 0 | 1.87% | 2.58% |
+| BF16 / Flex | causal / 512 | 0.149414 | 37.13% | 2.63% |
+| BF16 / Flex | bidirectional / 128 | 0.011719 | 6.98% | 2.13% |
+| BF16 / Flex | bidirectional / 512 | 0.087891 | 37.46% | 2.25% |
+| BF16 / FA2 | causal / 128 | 0.044922 | 94.24% | 1.55% |
+| BF16 / FA2 | causal / 512 | 0.099396 | 44.81% | 2.23% |
+| BF16 / FA2 | bidirectional / 128 | 0.906250 | 210.75% | 1.81% |
+| BF16 / FA2 | bidirectional / 512 | 0.816406 | 178.27% | 1.83% |
+| FP16 / FA2 | causal / 512 | 0.014206 | 10.51% | 0.62% |
+
+The two bidirectional FA2 comparisons use different visibility contracts:
+the old SDPA reference includes the window endpoint that native Flash excludes.
+Correcting visibility is necessary, but low-precision arithmetic differences
+remain; matching masks alone does not establish cross-backend gradient parity.
+
+For the remaining cases, same-backend HF equality and fixed-forward VJP controls
+localize the large cross-backend gradient differences primarily to differing
+forward trajectories amplified by this untrained low-precision model. Replaying
+all four captured attention calls with shared K/V and identical upstream
+gradients gave worst joint-gradient relative L2 of 0.31–0.74% against FP32 math.
+The FP16 case reproduces the 10.51% layer-norm difference, while its fixed-forward
+VJP control is 0.62%. Fully FP32 attention and fully FP32 models follow different
+trajectories too; neither is an exact low-precision whole-model oracle.
+
+The original standalone file also ran twelve wide-head variants before the
+model cases and hit Dynamo's recompile limit, executing unfused Flex math.
+With the same frozen causal-length-128 fixture, this warmup reproduced the
+original maximum logit difference of 0.113769; clearing compiler state restored
+the cold-run logits and every parameter gradient bitwise.
+Consequently its four Flex failures cannot be treated as isolated compiled
+Triton measurements. The committed regressions isolate compiler state, test
+backend-specific visibility, and check native-HF model parity separately from
+FP32 attention accuracy. These controls do not establish arbitrary cross-backend
+BF16 equivalence, pretrained-model convergence, or FA3/FA4 correctness.
