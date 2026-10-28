@@ -116,6 +116,9 @@ class ChatTemplate(ABC):
 
 @CHAT_TEMPLATE_REGISTRY.register("default")
 class DefaultTemplate(ChatTemplate):
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.default.v1"
+
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
@@ -145,6 +148,9 @@ class DefaultTemplate(ChatTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("tokenizer")
 class TokenizerTemplate(ChatTemplate):
     """Use a prefix-stable native chat template with assistant-only labels."""
+
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.tokenizer.v1"
 
     def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
         """Validate that adding a message preserved the previously rendered prefix."""
@@ -198,6 +204,9 @@ class TokenizerTemplate(ChatTemplate):
 class GptOssTokenizerTemplate(TokenizerTemplate):
     """GPT-OSS native template with its terminal assistant-token rewrite."""
 
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.gpt_oss.v1"
+
     def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
         super().__init__(tokenizer_or_processor)
         tokenizer = self.tokenizer
@@ -231,6 +240,9 @@ class GptOssTokenizerTemplate(TokenizerTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("llama2")
 class Llama2Template(ChatTemplate):
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.llama2.v1"
+
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
@@ -282,6 +294,9 @@ class Llama2Template(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.chatml.v1"
+
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
@@ -326,7 +341,8 @@ class MTPLabelMixin:
 
 @CHAT_TEMPLATE_REGISTRY.register("qwen3_5")
 class Qwen3_5ChatTemplate(MTPLabelMixin, ChatmlTemplate):
-    pass
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.qwen3_5.v1"
 
 
 class MultimodalChatTemplate(ChatTemplate):

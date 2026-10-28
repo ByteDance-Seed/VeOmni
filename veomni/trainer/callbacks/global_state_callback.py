@@ -36,6 +36,7 @@ export and the tokenizer/config sidecars are scheduled by
 On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
+import copy
 import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -102,8 +103,12 @@ class GlobalStateCallback(Callback):
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
         dcp_due = self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0
         hf_due = self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
-        if dcp_due or hf_due:
-            if state.global_step != self._last_saved_step:
+        dpo_saved_this_step = (
+            callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
+            and state.global_step == self._last_saved_step
+        )
+        if dcp_due or hf_due or dpo_saved_this_step:
+            if state.global_step != self._last_saved_step or dpo_saved_this_step:
                 self.save_global_state(state)
             else:
                 logger.info_rank0(
@@ -122,7 +127,20 @@ class GlobalStateCallback(Callback):
                 )
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
-        if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
+        is_dpo = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
+        pending_cursor = getattr(self.trainer, "_dpo_pending_loader_state", None) if is_dpo else None
+        pending_epoch = getattr(self.trainer, "_dpo_pending_epoch_end", None) if is_dpo else None
+        if pending_epoch is not None and pending_cursor is not None:
+            # The old cursor still describes the buffered tail of this epoch.
+            # Reading the fresh next-epoch loader here may start workers and
+            # prefetch using the old sampler epoch before set_epoch runs.
+            train_dataloader_state = pending_cursor
+        elif is_dpo and getattr(self, "_dpo_finished_cursor", None) is not None:
+            # A completed run exported into a different output directory has
+            # no new iterator. Keep the saved cursor rather than initializing
+            # a fresh loader and overwriting the final recovery position.
+            train_dataloader_state = self._dpo_finished_cursor
+        elif hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
             train_dataloader_state = self.trainer.data_iterator.state_dict()
         elif self.trainer.train_dataloader is not None:
             train_dataloader_state = self.trainer.train_dataloader.state_dict()
@@ -136,7 +154,7 @@ class GlobalStateCallback(Callback):
         offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
         offline_cache_writer_state = offline_cache_writer.state_dict() if offline_cache_writer is not None else None
 
-        return {
+        result = {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
             "environ_meter": self.trainer.environ_meter.state_dict(),
@@ -145,6 +163,17 @@ class GlobalStateCallback(Callback):
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
+        dpo_protocol = getattr(type(self.trainer), "dpo_provenance_checkpoint_state", None)
+        if callable(dpo_protocol):
+            dpo_protocol_state = dpo_protocol(self.trainer)
+            if dpo_protocol_state is not None:
+                result["dpo_provenance_protocol"] = dpo_protocol_state
+                result["dpo_position"] = {
+                    "epoch": state.epoch,
+                    "step_in_epoch": self.trainer._dpo_epoch_step,
+                    "epoch_complete": self.trainer._dpo_epoch_complete,
+                }
+        return result
 
     def save_global_state(self, state: TrainerState) -> None:
         """Clear the step's manifest, write this rank's cursor files, write it back.
@@ -262,6 +291,45 @@ class GlobalStateCallback(Callback):
                 from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
 
                 legacy_state = apply_legacy_global_state(load_path, self.rank)
+            loaded_state = current_state if current_state is not None else legacy_state
+            validator = getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None)
+            if callable(validator):
+                validator(
+                    self.trainer, loaded_state.get("dpo_provenance_protocol") if loaded_state is not None else None
+                )
+                if (
+                    loaded_state is None
+                    or not isinstance(loaded_state.get("train_dataloader"), dict)
+                    or not loaded_state["train_dataloader"]
+                ):
+                    raise ValueError(
+                        "DPO checkpoint recovery requires the rank-local dataloader cursor; "
+                        "start from weights only or restore the complete trainer state"
+                    )
+                if type(loaded_state.get("global_step")) is not int or loaded_state["global_step"] < 0:
+                    raise ValueError("DPO checkpoint recovery requires a valid nonnegative global_step")
+                position = loaded_state.get("dpo_position")
+                if (
+                    type(position) is not dict
+                    or set(position) != {"epoch", "step_in_epoch", "epoch_complete"}
+                    or type(position["epoch"]) is not int
+                    or not 0 <= position["epoch"] < args.train.num_train_epochs
+                    or type(position["step_in_epoch"]) is not int
+                    or not 0 <= position["step_in_epoch"] <= args.train_steps
+                    or type(position["epoch_complete"]) is not bool
+                    or position["step_in_epoch"] > loaded_state["global_step"]
+                ):
+                    raise ValueError("DPO checkpoint recovery requires a valid epoch position")
+                from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+                if self.trainer.train_dataloader is None:
+                    raise ValueError("DPO checkpoint recovery requires an initialized dataloader")
+                if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
+                    cursor = loaded_state["train_dataloader"]
+                    if "_veomni_resume_phase" not in cursor:
+                        raise ValueError("DPO dynamic loader cursor predates the exact-resume phase protocol")
+                    if cursor.get("num_micro_batch") != self.trainer.train_dataloader.num_micro_batch:
+                        raise ValueError("DPO dynamic loader microbatch geometry differs from the checkpoint")
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
@@ -280,33 +348,96 @@ class GlobalStateCallback(Callback):
             return None
 
         global_state = current_state if current_state is not None else legacy_state
-        self.trainer.state.global_step = global_state["global_step"]
-        self._restore_position(global_state)
+        dpo_recovery = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
+        if dpo_recovery and dist.is_initialized():
+            steps = [None] * dist.get_world_size()
+            position = global_state["dpo_position"]
+            local_position = (
+                global_state["global_step"],
+                position["epoch"],
+                position["step_in_epoch"],
+                position["epoch_complete"],
+            )
+            dist.all_gather_object(steps, local_position)
+            if len(set(steps)) != 1:
+                raise ValueError(f"DPO checkpoint position differs across ranks: {steps}")
+        restore_error = None
+        try:
+            self.trainer.state.global_step = global_state["global_step"]
+            self._restore_position(global_state)
+            if dpo_recovery:
+                position = global_state["dpo_position"]
+                self.trainer.state.epoch = position["epoch"]
+                self.trainer._dpo_epoch_step = position["step_in_epoch"]
+                self.trainer._dpo_epoch_complete = position["epoch_complete"]
+                self.trainer._dpo_pending_loader_state = (
+                    global_state["train_dataloader"]
+                    if getattr(self.trainer, "_dpo_pending_epoch_end", None) is not None
+                    else None
+                )
+                self._dpo_finished_cursor = (
+                    global_state["train_dataloader"]
+                    if self.trainer.start_epoch >= args.train.num_train_epochs
+                    else None
+                )
+                save_path = getattr(args.train.checkpoint, "save_path", None)
+                save_step_path = layout.step_dir(save_path, global_state["global_step"]) if save_path else None
+                self._last_saved_step = (
+                    global_state["global_step"]
+                    if save_step_path and os.path.normpath(save_step_path) == os.path.normpath(load_path)
+                    else -1
+                )
+            # A cursor belongs to the saved epoch. At an epoch boundary it
+            # must not be applied to the new epoch's freshly seeded sampler:
+            # StatefulDataLoader would otherwise skip or replay samples.
+            dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]
 
-        channel_loss_state = global_state.get("channel_loss_callback")
-        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
-        if channel_loss_state is not None and channel_loss_callback is not None:
-            channel_loss_callback.load_state_dict(channel_loss_state)
+            channel_loss_state = global_state.get("channel_loss_callback")
+            channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+            if channel_loss_state is not None and channel_loss_callback is not None:
+                channel_loss_callback.load_state_dict(channel_loss_state)
 
-        offline_cache_writer_state = global_state.get("offline_cache_writer")
-        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
-        if offline_cache_writer_state is not None and offline_cache_writer is not None:
-            offline_cache_writer.load_state_dict(offline_cache_writer_state)
+            offline_cache_writer_state = global_state.get("offline_cache_writer")
+            offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+            if offline_cache_writer_state is not None and offline_cache_writer is not None:
+                offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
-        if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
-            self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
+            if dpo_new_epoch and isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
+                self.trainer.train_dataloader.load_next_epoch_buffer(global_state["train_dataloader"])
+            if (
+                not dpo_new_epoch
+                and self.trainer.train_dataloader is not None
+                and global_state.get("train_dataloader") is not None
+            ):
+                cursor = global_state["train_dataloader"]
+                # DynamicBatchSizeDataLoader copies its input itself. Avoid a
+                # redundant full buffer copy while preserving the saved cursor
+                # for the second, post-validation restore.
+                needs_copy = dpo_recovery and not isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader)
+                self.trainer.train_dataloader.load_state_dict(copy.deepcopy(cursor) if needs_copy else cursor)
+                if dpo_recovery:
+                    # Some loaders only validate their cursor lazily in __iter__.
+                    # Reapply the saved cursor so validation consumes no training samples.
+                    iter(self.trainer.train_dataloader)
+                    self.trainer.train_dataloader.load_state_dict(cursor)
 
-        # OmniTrainer checkpoints written before it had a meter store None here.
-        if global_state.get("environ_meter") is not None:
-            self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
-        rng_state = global_state.get("torch_rng_state")
-        if rng_state is not None:
-            torch.set_rng_state(rng_state)
-        # ``.get`` keeps checkpoints written before these fields existed loadable;
-        # the device namespace may also not support RNG state at all.
-        set_device_rng_state(global_state.get("device_rng_state"))
-        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
-            iter(self.trainer.train_dataloader)
+            # OmniTrainer checkpoints written before it had a meter store None here.
+            if global_state.get("environ_meter") is not None:
+                self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+            rng_state = global_state.get("torch_rng_state")
+            if rng_state is not None:
+                torch.set_rng_state(rng_state)
+            # ``.get`` keeps checkpoints written before these fields existed loadable;
+            # the device namespace may also not support RNG state at all.
+            set_device_rng_state(global_state.get("device_rng_state"))
+            if self.trainer.start_step == 0 and not dpo_new_epoch and self.trainer.train_dataloader is not None:
+                iter(self.trainer.train_dataloader)
+        except Exception as exc:  # noqa: BLE001 - coordinate rank-local DPO restoration failures
+            restore_error = exc
+        if dpo_recovery:
+            raise_if_any_rank_failed(restore_error, "restoring the DPO trainer state")
+        elif restore_error is not None:
+            raise restore_error
 
         logger.info_rank0(
             f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "
@@ -316,6 +447,17 @@ class GlobalStateCallback(Callback):
 
     def _restore_position(self, global_state: Dict[str, Any]) -> None:
         args: "VeOmniArguments" = self.trainer.args
+        if callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None)):
+            position = global_state["dpo_position"]
+            epoch, step = position["epoch"], position["step_in_epoch"]
+            self.trainer._dpo_pending_epoch_end = None
+            if step == args.train_steps and not position["epoch_complete"]:
+                self.trainer._dpo_pending_epoch_end = (epoch, step)
+            if position["epoch_complete"] or step == args.train_steps:
+                epoch, step = epoch + 1, 0
+            self.trainer.start_epoch = epoch
+            self.trainer.start_step = step
+            return
         global_step = global_state["global_step"]
         self.trainer.start_epoch = global_step // args.train_steps
         self.trainer.start_step = global_step % args.train_steps
