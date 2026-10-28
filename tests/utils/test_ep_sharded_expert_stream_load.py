@@ -34,6 +34,7 @@ from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
 import veomni.models.checkpoint.weights as checkpoint_weights
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
@@ -203,6 +204,60 @@ def test_per_expert_mtp_experts_stream_into_the_local_fused_slice(monkeypatch, t
 
     read_experts = {int(key.split(".")[5]) for key in read_keys if key.startswith("mtp.")}
     assert read_experts == set(local)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ep_stream_read_cache_advice_keeps_loaded_experts(monkeypatch, tmp_path):
+    monkeypatch.setenv("VEOMNI_HF_DROP_READ_CACHE", "1")
+    state = _write_checkpoint(tmp_path)
+    source = tmp_path / "model.safetensors"
+    source_bytes = source.read_bytes()
+    calls = []
+    monkeypatch.setattr(checkpoint_weights.os, "posix_fadvise", lambda *args: calls.append(args))
+    model = _meta_model()
+
+    _load_as_rank(monkeypatch, tmp_path, 0, model)
+
+    assert len(calls) == 1
+    assert source.read_bytes() == source_bytes
+    local = NUM_EXPERTS // EP_SIZE
+    torch.testing.assert_close(
+        model.model.layers[0].mlp.experts.gate_up_proj.data,
+        state["model.layers.0.mlp.experts.gate_up_proj"][:local],
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ep_advice_uses_indexed_shards_when_single_file_also_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("VEOMNI_HF_DROP_READ_CACHE", "1")
+    state = _write_checkpoint(tmp_path)
+    single = tmp_path / "model.safetensors"
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    single.rename(shard)
+    save_file({"decoy": torch.ones(1)}, str(single))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": shard.stat().st_size}, "weight_map": dict.fromkeys(state, shard.name)})
+    )
+    advised = []
+    monkeypatch.setattr(
+        checkpoint_weights.os,
+        "posix_fadvise",
+        lambda fd, *args: advised.append(Path(checkpoint_weights.os.readlink(f"/proc/self/fd/{fd}")).name),
+    )
+    model = _meta_model()
+
+    _load_as_rank(monkeypatch, tmp_path, 0, model)
+
+    assert advised == [shard.name]
+    local = NUM_EXPERTS // EP_SIZE
+    torch.testing.assert_close(
+        model.model.layers[0].mlp.experts.gate_up_proj.data,
+        state["model.layers.0.mlp.experts.gate_up_proj"][:local],
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_a_fusion_converter_without_expert_streaming_still_bails(monkeypatch, tmp_path):

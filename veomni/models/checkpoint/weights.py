@@ -18,16 +18,19 @@ Public entry points cover meta-device construction, safetensors / bin load,
 ExtraParallel slice streaming, rank-0 broadcast, and sharded save.
 """
 
+import gc
 import itertools
 import json
 import math
 import os
 import re
+import stat
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
@@ -156,6 +159,122 @@ def init_empty_weights():
         nn.Module.register_parameter = old_register_parameter
 
 
+def _release_hf_read_cache(paths):
+    """Optionally advise the OS that completed checkpoint reads can be evicted.
+
+    This is a hint only: it neither changes the files nor prevents future
+    reads. Each reader advises after it has finished loading so a slower rank
+    can still reread a page and release it when its own load completes.
+    """
+    enabled = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1")
+    result = {"enabled": enabled == "1", "attempted": 0, "succeeded": 0, "failed": 0}
+    if enabled == "0":
+        return result
+    paths = {os.fspath(path) for path in paths}
+    if not callable(getattr(os, "posix_fadvise", None)) or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        logger.warning("HF read cache advice is unavailable on this platform")
+        result["failed"] = len(paths)
+        return result
+
+    for path in sorted(paths):
+        result["attempted"] += 1
+        fd = None
+        error = None
+        try:
+            # Opening read-only also permits ordinary Hugging Face cache
+            # symlinks; fadvise never writes to the source checkpoint.
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("checkpoint shard is not a regular file")
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            error = exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    # A failed close must not be retried: the fd number may
+                    # already have been released and reused by another thread.
+                    error = error or exc
+        if error is None:
+            result["succeeded"] += 1
+        else:
+            result["failed"] += 1
+            if result["failed"] == 1:
+                logger.warning("HF read cache advice failed; checkpoint data remains intact: %s", error)
+    logger.info_rank0("HF read cache advice: %s", result)
+    return result
+
+
+_RESOLVED_BASE_CHECKPOINT_PATHS = ContextVar("veomni_resolved_base_checkpoint_paths", default=None)
+
+
+def _capture_hf_checkpoint_paths(mode):
+    """Capture the exact paths returned by a loader's first base resolver."""
+
+    def decorate(resolver):
+        @wraps(resolver)
+        def wrapped(*args, **kwargs):
+            resolved = resolver(*args, **kwargs)
+            capture = _RESOLVED_BASE_CHECKPOINT_PATHS.get()
+            if capture is not None and capture["mode"] == mode and capture["paths"] is None:
+                if mode == "ep":
+                    capture["paths"] = tuple(resolved[1].values())
+                else:
+                    capture["paths"] = tuple(iterator.filepath for iterator in resolved)
+            return resolved
+
+        return wrapped
+
+    return decorate
+
+
+def _advise_after_hf_load(mode):
+    """Apply optional read-cache advice only after the loader's frame exits."""
+
+    def decorate(loader):
+        @wraps(loader)
+        def wrapped(model, weights_path, *args, **kwargs):
+            enabled = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
+            if enabled not in ("0", "1"):
+                raise ValueError("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1")
+            if enabled == "0":
+                return loader(model, weights_path, *args, **kwargs)
+            distributed = dist.is_available() and dist.is_initialized()
+            capture = {"mode": "ep" if mode == "ep" else "standard", "paths": None}
+            token = _RESOLVED_BASE_CHECKPOINT_PATHS.set(capture)
+            try:
+                result = loader(model, weights_path, *args, **kwargs)
+            finally:
+                _RESOLVED_BASE_CHECKPOINT_PATHS.reset(token)
+            # The non-distributed broadcast path delegates to the decorated
+            # ordinary loader, which already performs the advice.
+            if mode == "broadcast" and not distributed:
+                return result
+            if mode == "broadcast" and dist.get_rank() != 0:
+                return result
+            try:
+                # Source tensor/slice references in the loader frame must be
+                # gone before DONTNEED can evict their mmap-backed pages.
+                gc.collect()
+                if capture["paths"] is None:
+                    logger.warning("No resolved HF base shards were recorded for cache advice")
+                    return result
+                _release_hf_read_cache(capture["paths"])
+            except Exception as error:
+                # Advice is optional and must not turn a completed load into a
+                # rank-local failure that strands distributed peers.
+                logger.warning("Unable to release completed HF read cache: %s", error)
+            return result
+
+        return wrapped
+
+    return decorate
+
+
 @dataclass
 class StateDictIterator:
     filepath: str
@@ -216,6 +335,7 @@ def _skip_without_loading_fn(
     return skip_key
 
 
+@_capture_hf_checkpoint_paths("standard")
 def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
@@ -425,6 +545,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
 
 
 @torch.no_grad()
+@_advise_after_hf_load("standard")
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
@@ -520,6 +641,7 @@ def load_model_weights(
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
+@_capture_hf_checkpoint_paths("ep")
 def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Resolve a (sharded) safetensors checkpoint for per-key streaming reads.
 
@@ -675,6 +797,7 @@ def _read_persistent_extra_parallel_slice(
 
 
 @torch.no_grad()
+@_advise_after_hf_load("ep")
 def load_model_weights_ep_sharded(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
@@ -1228,6 +1351,7 @@ def _stream_lora_adapter_ep_sharded(
 
 
 @torch.no_grad()
+@_advise_after_hf_load("broadcast")
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,

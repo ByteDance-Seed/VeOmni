@@ -37,3 +37,16 @@ until its scalar precision and distributed coverage have been validated.
 The extra unsharded parameter payload for the 36-by-48 Qwen4-Exp GDN scalar
 pairs is 6,912 bytes relative to BF16. This excludes FSDP communication and
 allocator overhead, which require hardware measurement.
+
+## Optional HF read-cache advice
+
+Set `VEOMNI_HF_DROP_READ_CACHE=1` to request release of clean source-weight
+pages after a successful HF checkpoint load. The default is `0` (disabled).
+The ordinary and EP-streaming loaders request advice on each reader; the
+rank-0 broadcast loader requests it on rank 0. The request uses read-only
+file descriptors and does not change weights, optimizer state or precision.
+
+This is a best-effort OS/filesystem hint: it may be ignored, and rereading
+evicted weights can increase I/O. Advice failures are logged and training
+continues. It covers the base HF checkpoint shards, not LoRA adapter files
+or distributed checkpoint output.
