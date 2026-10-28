@@ -521,7 +521,11 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 
     import veomni.models  # noqa: F401
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.seed_omni.modeling_omni import OmniModel
     from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 
     # 1. Export configs on simulated GPU host with GPU-only liger_kernel.
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
@@ -549,6 +553,21 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
         ops_implementation={"rms_norm_implementation": "liger_kernel"},
     ).save_pretrained(module_dir)
 
+    omni_dir = tmp_path / "omni_composed_gpu"
+    omni_cfg = OmniConfig(
+        _module_entries={"fake_module_a": {"model_path": "fake_module_a"}},
+        training_graphs={"default": [{"from": "fake_module_a", "to": "end"}]},
+        generation_graphs={},
+    )
+    OmniModel(
+        omni_cfg,
+        {
+            "fake_module_a": FakeModuleA(
+                FakeModuleAConfig(hidden_size=8, ops_implementation={"rms_norm_implementation": "liger_kernel"})
+            )
+        },
+    ).save_pretrained(omni_dir, save_module_weights=False)
+
     # 2. Switch host to simulated Ascend NPU.
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
@@ -560,6 +579,10 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
         Qwen3VLConfig.from_pretrained(vl_dir)
     with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
         FakeModuleAConfig.from_pretrained(module_dir)
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        OmniModuleConfig.from_pretrained(module_dir)
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        OmniConfig.from_pretrained(omni_dir)
 
     # With a valid NPU override, the override is applied before hardware validation.
     llama_npu = LlamaConfig.from_pretrained(
@@ -583,3 +606,21 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
         ops_implementation={"rms_norm_implementation": "torch_npu"},
     )
     assert mod_npu.ops_config.rms_norm_implementation == "torch_npu"
+
+    mod_base_npu = OmniModuleConfig.from_pretrained(
+        module_dir,
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
+    )
+    assert mod_base_npu.ops_config.rms_norm_implementation == "torch_npu"
+
+    omni_npu = OmniConfig.from_pretrained(
+        omni_dir,
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
+    )
+    assert omni_npu._module_configs["fake_module_a"].ops_config.rms_norm_implementation == "torch_npu"
+
+    omni_slot_npu = OmniConfig.from_pretrained(
+        omni_dir,
+        **{"fake_module_a.rms_norm_implementation": "torch_npu"},
+    )
+    assert omni_slot_npu._module_configs["fake_module_a"].ops_config.rms_norm_implementation == "torch_npu"

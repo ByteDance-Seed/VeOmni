@@ -105,8 +105,13 @@ def read_model_type(model_path: str) -> str:
     if model_type in config_keys:
         # Validate the config can be re-read by the registered subclass so
         # downstream `from_pretrained` doesn't hit a surprise schema gap.
+        # Defer op hardware/combination validation here because caller/composed
+        # ops_implementation overrides are applied after model_type probing.
+        from ...configuration_base import _defer_ops_validation
+
         cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(model_path)
+        with _defer_ops_validation():
+            cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
             f"Module model_type {model_type!r} (from {model_path}) is not registered in "

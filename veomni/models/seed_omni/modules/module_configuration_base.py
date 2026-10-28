@@ -123,12 +123,12 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
         entry_ops = kwargs.pop("ops_implementation", None)
         base_ops = kwargs.pop("base_ops_implementation", None)
 
-        if cls is OmniModuleConfig:
-            from . import OMNI_MODEL_REGISTRY, read_model_type
-
-            cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
-
         with _defer_ops_validation():
+            if cls is OmniModuleConfig:
+                from . import OMNI_MODEL_REGISTRY, read_model_type
+
+                cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
+
             hf_config = super().from_pretrained(
                 pretrained_model_name_or_path,
                 cache_dir=cache_dir,
