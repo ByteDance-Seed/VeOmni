@@ -501,7 +501,7 @@ def get_length_by_labels_fn(sample: Any) -> int:
     return get_length_fn(sample)
 
 
-def get_length_fn_by_count_mode(count_mode: str):
+def get_length_fn_by_count_mode(count_mode: str, *, cp_size: int = 1, cp_layout: str = "contiguous"):
     """Return the per-sample length callable selected by ``count_mode``.
 
     - ``"total"``: count all tokens via :func:`get_length_fn` (legacy behavior; matches
@@ -509,8 +509,13 @@ def get_length_fn_by_count_mode(count_mode: str):
     - ``"effective"``: count only tokens with ``labels != IGNORE_INDEX``. A separate
       physical-token cap should still be enforced by dynamic batching to avoid
       unbounded prompt-heavy micro batches.
+
+    Explicit CP topology aligns total/physical lengths with packed USP padding.
+    Effective lengths remain supervised-token counts. Defaults require no parallel state.
     """
     if count_mode == "total":
+        if cp_size > 1 and cp_layout == "zigzag":
+            return partial(get_aligned_length, alignment=2 * cp_size, get_length_fn=get_length_fn)
         return get_length_fn
     if count_mode == "effective":
         return get_length_by_labels_fn

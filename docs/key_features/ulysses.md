@@ -452,7 +452,10 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   Dynamic batching budgets these aligned physical lengths, and fixed/SP tail
   padding is coalesced into one aligned segment. The lower-level USP reorder
   helpers still validate the invariant and reject manually constructed
-  unaligned batches.
+  unaligned batches. Dynamic batching selects both its logical and physical
+  counters via `get_length_fn_by_count_mode(count_mode, cp_size=..., cp_layout=...)`.
+  The explicit topology aligns `total` counts while leaving `effective` counts
+  unchanged; callers without topology retain the original counting behavior.
 - **Flash-attention backend**: Ring uses the implementation selected by
   `model.ops_implementation.attn_implementation`. FA2 and FA4 are detected
   independently, so installing both does not override an explicit FA4 choice.
