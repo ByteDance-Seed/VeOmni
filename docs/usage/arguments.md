@@ -556,6 +556,17 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
 adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
+Source-aligned capture requires the standard `ForCausalLMLoss` and a standard
+cross-entropy implementation. A custom loss may declare
+`__veomni_channel_loss_contract__ = "outer_causal_ce_v1"` only if its per-token
+CE, target masking, and token order are exactly those of the outer arguments,
+including when capture falls back to detached recomputation. Otherwise channel
+observation is skipped, or fails in strict mode; the training loss is unchanged.
+For an opted-in custom loss, metrics are always recomputed from the outer
+arguments: an incidental chunk-loss invocation may not be its actual objective.
+Use the canonical loss argument names (including `ignore_index`); nonempty
+anonymous `*args` and unknown parameter names make binding ambiguous and cause
+observation to be skipped or to fail in strict mode.
 Sampled steps also report per-source `samples`, `input_tokens`, `label_tokens`,
 and `label_tokens_per_sample`. Physical-data counters use the primary labels once;
 auxiliary objectives do not add extra samples or input tokens. Channel CE continues

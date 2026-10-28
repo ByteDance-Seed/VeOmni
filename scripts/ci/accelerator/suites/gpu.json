@@ -49,6 +49,16 @@
     ]
   },
   {
+    "name": "04b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_flux_ulysses_padding.py"
+    ]
+  },
+  {
     "name": "05-unit",
     "suite": "unit",
     "conditional": false,
@@ -56,6 +66,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_wan_self_attn_ulysses.py"
+    ]
+  },
+  {
+    "name": "05b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
     ]
   },
   {

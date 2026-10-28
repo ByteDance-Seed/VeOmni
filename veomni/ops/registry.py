@@ -176,6 +176,9 @@ class OpEntry:
             raise ValueError("do not pass wrapper with raw math")
         if self.wrapper is None:
             self.wrapper = _make_autograd_fn(self.forward, self.backward)
+            self._generated_wrapper = self.wrapper
+            self._generated_forward = self.forward
+            self._generated_backward = self.backward
 
 
 def _entry_device(entry: OpEntry) -> str:

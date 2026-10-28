@@ -152,6 +152,8 @@ def forward(
     # ContextVar.get cannot be traced by Dynamo. A compiled op therefore uses
     # the unchanged training path; the trainer can recompute detached metrics.
     capture = None if torch.compiler.is_compiling() else _CAPTURE.get()
+    if capture is not None:
+        capture["op_calls"] = capture.get("op_calls", 0) + 1
     token_chunks = [] if capture is not None else None
 
     def observe(logits: Tensor, chunk_labels: Tensor) -> None:

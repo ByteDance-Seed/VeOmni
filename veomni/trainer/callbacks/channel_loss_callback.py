@@ -29,6 +29,7 @@ from collections import defaultdict
 from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import partial
 from numbers import Integral
 from threading import local
 from typing import TYPE_CHECKING, Any, Callable
@@ -86,6 +87,10 @@ def capture_chunk_loss_per_token(
         chunk_loss._CAPTURE.reset(token)
         _CHUNK_LOSS_CAPTURE.value = previous
         if completed:
+            if capture.get("op_calls", 0) > 1:
+                capture["error"] = "multiple chunk-loss observations in one causal-loss call"
+            elif capture.get("error") and capture.get("op_calls", 0) != 1:
+                capture["error"] = "chunk-loss observation failed without a verifiable single op"
             if capture.get("error"):
                 if on_error is None:
                     raise RuntimeError(capture["error"])
@@ -858,20 +863,115 @@ class ChannelLossComputer:
         assert self._original_loss_fn is not None
         if not self._source_ids or self._dpo_segments or not self.capture_active:
             return self._original_loss_fn(*args, **kwargs)
+        from ...models.loss_utils.cross_entropy_loss import ForCausalLMLoss
+        from ...ops import VeomniOp
+        from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss, eager, liger_kernel
+
+        original_loss, effective_args, effective_kwargs = _unpack_partial_loss(self._original_loss_fn, args, kwargs)
+        # Custom loss functions may opt in only when their token CE and token
+        # order are exactly the causal CE defined by the outer loss arguments.
+        try:
+            custom_contract = any(
+                getattr(fn, "__veomni_channel_loss_contract__", None) == "outer_causal_ce_v1"
+                for fn in (self._original_loss_fn, original_loss)
+            )
+            if custom_contract:
+                custom_signature = inspect.signature(original_loss)
+                custom_bound = custom_signature.bind_partial(*effective_args, **effective_kwargs)
+                canonical = {
+                    "logits",
+                    "labels",
+                    "vocab_size",
+                    "num_items_in_batch",
+                    "ignore_index",
+                    "shift_labels",
+                    "hidden_states",
+                    "weights",
+                    "logits_bias",
+                    "logits_bias_weight",
+                    "loss_reduction_group",
+                    "op",
+                }
+                for name, parameter in custom_signature.parameters.items():
+                    if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                        custom_contract &= not bool(custom_bound.arguments.get(name))
+                    elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                        custom_contract &= not bool(set(custom_bound.arguments.get(name, {})) - canonical)
+                    elif name not in canonical:
+                        custom_contract = False
+        except Exception:  # Observer inspection must not affect the training loss.
+            custom_contract = False
+        proven_loss = custom_contract
+        if original_loss is ForCausalLMLoss:
+            try:
+                bound = inspect.signature(original_loss).bind_partial(*effective_args, **effective_kwargs)
+                bound.apply_defaults()
+                op = bound.arguments.get("op")
+                if op is None and not bound.arguments.get("kwargs", {}).get("return_log_probs", False):
+                    impl = (
+                        "chunk_loss" if bound.arguments.get("kwargs", {}).get("logits_bias") is not None else "eager"
+                    )
+                    op = VeomniOp("cross_entropy_loss", "standard", impl)
+                builtin = {"eager": eager, "chunk_loss": chunk_loss, "liger_kernel": liger_kernel}.get(
+                    getattr(op, "impl", None)
+                )
+                proven_loss = (
+                    type(op) is VeomniOp
+                    and op.op == "cross_entropy_loss"
+                    and op.variant == "standard"
+                    and builtin is not None
+                    and op.entry.forward is builtin.forward
+                    and op.entry.backward is builtin.backward
+                    and op.entry._generated_forward is builtin.forward
+                    and op.entry._generated_backward is builtin.backward
+                    and op.entry.wrapper is op.entry._generated_wrapper
+                    and not bound.arguments.get("kwargs", {}).get("return_log_probs", False)
+                )
+            except Exception:  # Observer lookup must never replace the training loss failure.
+                proven_loss = False
         reused = []
         errors = []
         with capture_chunk_loss_per_token(reused.append, on_error=errors.append):
             main_loss = self._original_loss_fn(*args, **kwargs)
-        if errors:
+        if custom_contract and original_loss is not ForCausalLMLoss:
+            # A custom loss may invoke unrelated chunk ops, including compiled
+            # ones that are invisible to capture. Use its declared outer-CE
+            # contract instead of assuming an observed op is the objective.
+            reused.clear()
+            errors.clear()
+        if self._require_source_provenance and not proven_loss:
             self._observation_attempt_count += 1
-            self._capture_errors.extend(("generic", error) for error in errors)
+            self._capture_errors.append(("metadata", "custom causal loss cannot prove source-aligned token losses"))
             return main_loss
+        if errors:
+            ambiguous = any(
+                error
+                in (
+                    "multiple chunk-loss observations in one causal-loss call",
+                    "chunk-loss observation failed without a verifiable single op",
+                )
+                for error in errors
+            )
+            if ambiguous or not proven_loss or not self._require_source_provenance:
+                self._observation_attempt_count += 1
+                self._capture_errors.extend(("generic", error) for error in errors)
+                return main_loss
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            logger.warning(
+                f"Channel loss: rank {rank} chunk observation failed; recomputing detached metrics: {errors[0][:256]}"
+            )
+            reused.clear()
         if len(reused) > 1:
             self._observation_attempt_count += 1
             self._capture_errors.append(("generic", "multiple chunk-loss observations in one causal loss call"))
             return main_loss
 
-        call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
+        try:
+            call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
+        except Exception as exc:  # Coordinate observer errors, preserving the already-computed training loss.
+            self._observation_attempt_count += 1
+            self._capture_errors.append(("generic", f"cannot inspect loss arguments: {exc}"))
+            return main_loss
         logits = call_args.get("logits")
         labels = call_args.get("labels")
         if labels is None:
@@ -2582,7 +2682,7 @@ def _supported_observer_kwargs(method: Callable[..., Any], extras: dict[str, Any
     """Pass extensions accepted by old or user-overridden observer signatures."""
     try:
         parameters = inspect.signature(method).parameters
-    except (TypeError, ValueError):
+    except Exception:  # Unsupported signatures are not a training failure.
         return {}
     return {
         name: value
@@ -2592,11 +2692,22 @@ def _supported_observer_kwargs(method: Callable[..., Any], extras: dict[str, Any
     }
 
 
+def _unpack_partial_loss(
+    loss_fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]]:
+    while isinstance(loss_fn, partial):
+        args = loss_fn.args + args
+        kwargs = {**(loss_fn.keywords or {}), **kwargs}
+        loss_fn = loss_fn.func
+    return loss_fn, args, kwargs
+
+
 def _bind_loss_call_args(
     loss_fn: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> dict[str, Any]:
+    loss_fn, args, kwargs = _unpack_partial_loss(loss_fn, args, kwargs)
     try:
         signature = inspect.signature(loss_fn)
         bound = signature.bind_partial(*args, **kwargs)
@@ -2610,9 +2721,6 @@ def _bind_loss_call_args(
             elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
                 bound_args.pop(name, None)
 
-        has_varargs = any(
-            parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()
-        )
         positional_names = [
             parameter.name
             for parameter in signature.parameters.values()
@@ -2626,17 +2734,13 @@ def _bind_loss_call_args(
             "logits_bias_weight",
         }
         for index, (key, value) in enumerate(zip(_LOSS_CALL_POSITIONAL_KEYS, args)):
-            if (
-                key in signature.parameters
-                or (has_varargs and index >= len(positional_names))
-                or (index < 3 and index < len(positional_names) and positional_names[index] not in known_names)
+            if key in signature.parameters or (
+                index < 3 and index < len(positional_names) and positional_names[index] not in known_names
             ):
                 bound_args.setdefault(key, value)
         return bound_args
-    except (TypeError, ValueError):
-        bound_args = dict(zip(_LOSS_CALL_POSITIONAL_KEYS, args))
-        bound_args.update(kwargs)
-        return bound_args
+    except Exception as exc:
+        raise ChannelLossMetadataError("cannot bind loss arguments") from exc
 
 
 def _validate_source_provenance(
