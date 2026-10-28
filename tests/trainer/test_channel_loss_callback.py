@@ -115,34 +115,6 @@ def _expected_segment(logits, labels, start, end):
     return losses[start : end + 1][valid].sum().item(), valid.sum().item()
 
 
-def _test_parallel_state(
-    *,
-    sp_enabled=False,
-    sp_group=None,
-    sp_size=1,
-    sp_rank=0,
-    dp_size=1,
-    dp_group=None,
-):
-    return SimpleNamespace(
-        sp_enabled=sp_enabled,
-        sp_group=sp_group,
-        sp_size=sp_size,
-        sp_rank=sp_rank,
-        dp_size=dp_size,
-        dp_group=dp_group,
-    )
-
-
-def _install_test_parallel_state(monkeypatch, parallel_state=None):
-    parallel_state = parallel_state or _test_parallel_state()
-    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: parallel_state)
-    monkeypatch.setattr(channel_loss_module, "get_parallel_state", lambda: parallel_state)
-    monkeypatch.setitem(parallel_state_module._PARALLEL_STATE_REGISTRY, "base", parallel_state)
-    monkeypatch.setattr(callback_base_module, "get_parallel_state", lambda: parallel_state)
-    return parallel_state
-
-
 def test_channel_loss_uses_shift_labels_when_sequence_parallel_is_on():
     torch.manual_seed(2)
     logits = torch.randn(1, 3, 8)
@@ -379,75 +351,6 @@ def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
         computer.uninstall()
 
 
-@pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
-@pytest.mark.parametrize("bias_kind", ["full", "factored"])
-@pytest.mark.parametrize("explicit_shift", [False, True])
-@pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_channel_loss_preserves_full_and_factored_bias(
-    monkeypatch, implementation, bias_kind, explicit_shift, strict, dtype
-):
-    from veomni.models.loss_utils import ForCausalLMLoss
-    from veomni.ops import VeomniOp
-
-    _install_test_parallel_state(monkeypatch)
-    monkeypatch.setattr(ChannelLossComputer, "EAGER_CHUNK_SIZE", 3)
-    model = torch.nn.Module()
-    model.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", implementation))
-    torch.manual_seed(125)
-    hidden = torch.randn(2, 7, 3, dtype=dtype, requires_grad=True)
-    weight = torch.randn(7, 3, dtype=dtype, requires_grad=True)
-    bias = torch.randn(2, 7, 2 if bias_kind == "factored" else 7, dtype=dtype, requires_grad=True)
-    tensors = [hidden, weight, bias]
-    if bias_kind == "factored":
-        tensors.append(torch.randn(7, 2, dtype=dtype, requires_grad=True))
-    labels = torch.arange(14).reshape(2, 7) % 7
-    labels[:, 3] = IGNORE_INDEX
-    targets = labels if explicit_shift else F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:].contiguous()
-    kwargs = dict(labels=labels, vocab_size=7, chunk_size=3)
-    if explicit_shift:
-        kwargs["shift_labels"] = targets
-
-    def compute(inputs):
-        return model.loss_function(
-            **kwargs,
-            hidden_states=inputs[0],
-            weights=inputs[1],
-            logits_bias=inputs[2],
-            logits_bias_weight=inputs[3] if bias_kind == "factored" else None,
-        )[0]
-
-    reference_inputs = [t.detach().clone().requires_grad_() for t in tensors]
-    reference = compute(reference_inputs)
-    reference.backward()
-    computer = _legacy_computer()
-    computer.strict = strict
-    computer._source_ids = ["first", "second"]
-    computer._position_ids = torch.arange(7).expand(2, -1)
-    try:
-        computer.install(model)
-        with computer.capture():
-            actual = compute(tensors)
-        actual.backward()
-    finally:
-        computer.uninstall()
-
-    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    for tensor, expected in zip(tensors, reference_inputs, strict=True):
-        torch.testing.assert_close(tensor.grad, expected.grad, rtol=0, atol=0)
-    logits = F.linear(hidden.detach(), weight.detach()).float()
-    bias_logits = F.linear(bias.detach(), tensors[3].detach()) if bias_kind == "factored" else bias.detach()
-    per_token = F.cross_entropy(
-        (logits + bias_logits.float()).reshape(-1, 7), targets.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
-    ).reshape(2, 7)
-    assert not computer.strict_observation_errors
-    assert [entry["source_id"] for entry in computer._result] == ["first", "second"]
-    for row, entry in enumerate(computer._result):
-        torch.testing.assert_close(entry["loss_sum"], per_token[row].sum(), rtol=1e-6, atol=1e-6)
-        assert entry["token_count"].item() == targets[row].ne(IGNORE_INDEX).sum().item()
-
-
 @pytest.mark.parametrize("bias_kind", ["full", "factored"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_channel_loss_rejects_unsupported_bias_without_false_metrics(monkeypatch, bias_kind):
@@ -480,54 +383,6 @@ def test_channel_loss_rejects_unsupported_bias_without_false_metrics(monkeypatch
     finally:
         computer.uninstall()
     assert not computer._result
-
-
-def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
-    from veomni.models.loss_utils import ForCausalLMLoss
-    from veomni.ops import VeomniOp
-
-    _install_test_parallel_state(monkeypatch)
-
-    class DummyModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
-
-    model = DummyModel()
-    torch.manual_seed(7)
-    hidden = torch.randn(1, 17, 4, requires_grad=True)
-    weight = torch.randn(7, 4, requires_grad=True)
-    labels = torch.arange(17).unsqueeze(0) % 7
-    ref_hidden, ref_weight = (t.detach().clone().requires_grad_() for t in (hidden, weight))
-    kwargs = dict(logits=None, labels=labels, vocab_size=7, chunk_size=8)
-    reference, _, _ = model.loss_function(**kwargs, hidden_states=ref_hidden, weights=ref_weight)
-    reference.backward()
-    computer = _legacy_computer()
-    computer._source_ids = ["source"]
-    computer._position_ids = torch.arange(17).unsqueeze(0)
-    projections = []
-    original_linear = F.linear
-
-    def linear(x, w, bias=None):
-        projections.append(tuple(x.shape))
-        return original_linear(x, w, bias)
-
-    monkeypatch.setattr(F, "linear", linear)
-    try:
-        computer.install(model)
-        with computer.capture():
-            actual, _, _ = model.loss_function(**kwargs, hidden_states=hidden, weights=weight)
-        actual.backward()
-    finally:
-        computer.uninstall()
-    assert projections == [(8, 4), (8, 4), (1, 4)]
-    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0, atol=0)
-    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=0, atol=0)
-    assert computer._result[0]["token_count"].item() == 16
-    assert computer._result[0]["loss_sum"].item() == pytest.approx(actual.item() * 16, rel=1e-6)
-    assert computer._result[0]["sample_count"].item() == 1
-    assert computer._result[0]["input_token_count"].item() == 17
 
 
 @pytest.mark.parametrize("capture_count", [0, 2])
@@ -2283,6 +2138,123 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     assert base.channel_loss_callback.computer._source_ids == []
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_dpo_channel_loss_emits_policy_totals(monkeypatch, compact):
+    _stub_parallel_state(monkeypatch)
+
+    class DpoLossModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.loss_calls = 0
+            self.parallel_state = object()
+
+        def loss_function(self, logits, labels, vocab_size, **kwargs):
+            self.loss_calls += 1
+            return logits.sum() * 0
+
+        def forward(self, labels=None, **kwargs):
+            seq_len = labels.size(-1) if labels is not None else 8
+            logits = torch.randn(1, seq_len, 8)
+            if labels is not None:
+                self.loss_function(
+                    logits=logits[:, :4] if compact else logits,
+                    labels=labels[:, :4] if compact else labels,
+                    vocab_size=8,
+                )
+            if compact:
+                rows = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3])
+                log_probs = -torch.arange(1, 5, dtype=torch.float32).index_select(0, rows).unsqueeze(0) / 10
+            else:
+                log_probs = -torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10
+            log_probs = self.scale * log_probs
+            return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=log_probs))
+
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    state = TrainerState(global_step=1)
+    policy_model = DpoLossModel()
+    reference_model = DpoLossModel()
+    base = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
+            dpo_config=SimpleNamespace(
+                beta=0.1,
+                label_smoothing=0.0,
+                loss_type="sigmoid",
+                reference_free=False,
+                average_log_prob=False,
+            ),
+        ),
+        state=state,
+        model=policy_model,
+        model_fwd_context=nullcontext(),
+        model_bwd_context=nullcontext(),
+        preforward=lambda micro_batch: micro_batch,
+    )
+    base.channel_loss_callback = ChannelLossCallback(base)
+    trainer = object.__new__(TextDPOTrainer)
+    trainer.base = base
+    trainer.policy_model = policy_model
+    trainer.reference_model = reference_model
+    trainer.state = state
+    trainer.channel_loss_callback = base.channel_loss_callback
+    base._callbacks = [base.channel_loss_callback]
+    base._get_registered_channel_loss_callback = lambda: base.channel_loss_callback
+    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
+        base, micro_batches=micro_batches, **kwargs
+    )
+    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
+    trainer.sp_enabled = False
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
+        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
+        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
+        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
+            {
+                "source_ids": [3, 4],
+                "source_cu": [0, 4, 8],
+                "input_mask": torch.ones(8, dtype=torch.bool),
+                "tail": 0,
+                "sp_size": 1,
+                "sp_rank": 0,
+            }
+        ),
+        "ds_idx": torch.tensor([3, 4]),
+        "source_name": ["train/a", "train/b"],
+    }
+
+    try:
+        base.channel_loss_callback.computer.install(policy_model)
+        TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
+        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 4]]
+        loss, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+
+        assert policy_model.loss_calls == 1
+        assert reference_model.loss_calls == 1
+        assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
+        assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
+        assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[3][0], torch.tensor(0.2 if compact else 0.4)
+        )
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[4][0], torch.tensor(0.6 if compact else 1.2)
+        )
+        assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
+        assert policy_model.scale.grad is not None
+        assert reference_model.scale.grad is None
+        observed_grad = policy_model.scale.grad.detach().clone()
+        policy_model.scale.grad = None
+        base.channel_loss_callback.computer.uninstall()
+        trainer.channel_loss_callback = None
+        baseline, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+        torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+        torch.testing.assert_close(observed_grad, policy_model.scale.grad, rtol=0, atol=0)
+    finally:
+        base.channel_loss_callback.computer.uninstall()
+
+
 def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_totals(monkeypatch):
     _install_test_parallel_state(monkeypatch)
 
@@ -2925,6 +2897,45 @@ def test_channel_loss_callback_strict_requires_source_id():
     callback = ChannelLossCallback(trainer)
     with pytest.raises(ValueError, match="no configured source ID"):
         callback.on_step_begin(TrainerState(global_step=1), micro_batches=[{"input_ids": torch.tensor([[1]])}])
+
+
+def _test_parallel_state(
+    *,
+    sp_enabled=False,
+    sp_group=None,
+    sp_size=1,
+    sp_rank=0,
+    dp_size=1,
+    dp_group=None,
+):
+    return SimpleNamespace(
+        sp_enabled=sp_enabled,
+        sp_group=sp_group,
+        sp_size=sp_size,
+        sp_rank=sp_rank,
+        dp_size=dp_size,
+        dp_group=dp_group,
+    )
+
+
+def _install_test_parallel_state(monkeypatch, parallel_state=None):
+    parallel_state = parallel_state or _test_parallel_state()
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(channel_loss_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setitem(parallel_state_module._PARALLEL_STATE_REGISTRY, "base", parallel_state)
+    monkeypatch.setattr(callback_base_module, "get_parallel_state", lambda: parallel_state)
+    return parallel_state
+
+
+def _single_source_provenance():
+    return {
+        "source_ids": ["source"],
+        "source_cu": [0, 3],
+        "input_mask": torch.ones(3, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
 
 
 def test_channel_loss_callback_strict_syncs_missing_source_id_globally(monkeypatch):
@@ -3695,38 +3706,6 @@ def test_chunk_observer_with_offload_hooks_preserves_loss_and_gradients(monkeypa
         torch.testing.assert_close(observed[0], expected_tokens)
 
 
-def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch):
-    from veomni.models.loss_utils import ForCausalLMLoss
-    from veomni.ops import VeomniOp
-
-    _install_test_parallel_state(monkeypatch)
-
-    class Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
-
-    model = Model()
-    computer = _legacy_computer()
-    computer.strict = True
-    computer._source_ids = ["shift-only"]
-    computer._position_ids = torch.arange(7).unsqueeze(0)
-    hidden = torch.randn(1, 7, 4, requires_grad=True)
-    weight = torch.randn(11, 4, requires_grad=True)
-    targets = torch.tensor([[1, 2, 3, -100, 5, 6, 7]])
-    try:
-        computer.install(model)
-        with computer.capture():
-            loss, _, _ = model.loss_function(hidden_states=hidden, weights=weight, shift_labels=targets)
-        loss.backward()
-        assert computer._result[0]["token_count"].item() == 6
-        assert not computer.strict_observation_errors
-        assert torch.isfinite(hidden.grad).all() and torch.isfinite(weight.grad).all()
-        assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
-    finally:
-        computer.uninstall()
-
-
 def _channel_features():
     return [
         {
@@ -3920,123 +3899,6 @@ def test_channel_loss_diagnostic_snapshot_failure_preserves_collation(monkeypatc
             torch.testing.assert_close(observed[key], baseline[key], rtol=0, atol=0)
         else:
             assert observed[key] == baseline[key]
-
-
-@pytest.mark.parametrize("compact", [False, True])
-def test_dpo_channel_loss_emits_policy_totals(monkeypatch, compact):
-    _stub_parallel_state(monkeypatch)
-
-    class DpoLossModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = torch.nn.Parameter(torch.tensor(1.0))
-            self.loss_calls = 0
-            self.parallel_state = object()
-
-        def loss_function(self, logits, labels, vocab_size, **kwargs):
-            self.loss_calls += 1
-            return logits.sum() * 0
-
-        def forward(self, labels=None, **kwargs):
-            seq_len = labels.size(-1) if labels is not None else 8
-            logits = torch.randn(1, seq_len, 8)
-            if labels is not None:
-                self.loss_function(
-                    logits=logits[:, :4] if compact else logits,
-                    labels=labels[:, :4] if compact else labels,
-                    vocab_size=8,
-                )
-            if compact:
-                rows = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3])
-                log_probs = -torch.arange(1, 5, dtype=torch.float32).index_select(0, rows).unsqueeze(0) / 10
-            else:
-                log_probs = -torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10
-            log_probs = self.scale * log_probs
-            return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=log_probs))
-
-    cfg = ChannelLossConfig(enable=True, interval=1)
-    state = TrainerState(global_step=1)
-    policy_model = DpoLossModel()
-    reference_model = DpoLossModel()
-    base = SimpleNamespace(
-        args=SimpleNamespace(
-            train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
-            dpo_config=SimpleNamespace(
-                beta=0.1,
-                label_smoothing=0.0,
-                loss_type="sigmoid",
-                reference_free=False,
-                average_log_prob=False,
-            ),
-        ),
-        state=state,
-        model=policy_model,
-        model_fwd_context=nullcontext(),
-        model_bwd_context=nullcontext(),
-        preforward=lambda micro_batch: micro_batch,
-    )
-    base.channel_loss_callback = ChannelLossCallback(base)
-    trainer = object.__new__(TextDPOTrainer)
-    trainer.base = base
-    trainer.policy_model = policy_model
-    trainer.reference_model = reference_model
-    trainer.state = state
-    trainer.channel_loss_callback = base.channel_loss_callback
-    base._callbacks = [base.channel_loss_callback]
-    base._get_registered_channel_loss_callback = lambda: base.channel_loss_callback
-    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
-        base, micro_batches=micro_batches, **kwargs
-    )
-    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
-    trainer.sp_enabled = False
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
-        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
-        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
-        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
-            {
-                "source_ids": [3, 4],
-                "source_cu": [0, 4, 8],
-                "input_mask": torch.ones(8, dtype=torch.bool),
-                "tail": 0,
-                "sp_size": 1,
-                "sp_rank": 0,
-            }
-        ),
-        "ds_idx": torch.tensor([3, 4]),
-        "source_name": ["train/a", "train/b"],
-    }
-
-    try:
-        base.channel_loss_callback.computer.install(policy_model)
-        TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 4]]
-        loss, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
-
-        assert policy_model.loss_calls == 1
-        assert reference_model.loss_calls == 1
-        assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
-        assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
-        assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
-        torch.testing.assert_close(
-            base.channel_loss_callback.computer.step_totals[3][0], torch.tensor(0.2 if compact else 0.4)
-        )
-        torch.testing.assert_close(
-            base.channel_loss_callback.computer.step_totals[4][0], torch.tensor(0.6 if compact else 1.2)
-        )
-        assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
-        assert policy_model.scale.grad is not None
-        assert reference_model.scale.grad is None
-        observed_grad = policy_model.scale.grad.detach().clone()
-        policy_model.scale.grad = None
-        base.channel_loss_callback.computer.uninstall()
-        trainer.channel_loss_callback = None
-        baseline, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
-        torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
-        torch.testing.assert_close(observed_grad, policy_model.scale.grad, rtol=0, atol=0)
-    finally:
-        base.channel_loss_callback.computer.uninstall()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -5007,46 +4869,6 @@ def test_dpo_half_precision_log_probs_accumulate_in_fp32(dtype):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_compiled_chunk_loss_falls_back_to_detached_source_observation():
-    from veomni.ops import resolve_op
-
-    hidden = torch.randn(1, 4, 3)
-    weight = torch.randn(7, 3)
-    labels = torch.tensor([[0, 1, 2, 3]])
-    shift = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
-    op = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
-    compiled = torch.compile(op, backend="eager", fullgraph=True)
-    with torch.no_grad():
-        reference = op(hidden, shift, weight, chunk_size=3)
-        # Compile while unsampled, then enable observation on the same graph.
-        torch.testing.assert_close(compiled(hidden, shift, weight, chunk_size=3), reference)
-
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
-    computer._source_ids = ["source"]
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 4],
-        "input_mask": torch.ones(4, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
-
-    def model_loss(logits, labels, vocab_size, hidden_states, weights):
-        shifted = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
-        return compiled(hidden_states, shifted, weights, chunk_size=3)
-
-    model_loss.__veomni_channel_loss_contract__ = "outer_causal_ce_v1"
-    computer._original_loss_fn = model_loss
-    with torch.no_grad(), computer.capture():
-        actual = computer._wrapped_loss_fn(None, labels, 7, hidden, weight)
-    torch.testing.assert_close(actual, reference)
-    expected = F.cross_entropy(F.linear(hidden, weight).reshape(-1, 7), shift.reshape(-1), reduction="none")
-    torch.testing.assert_close(computer._result[0]["loss_sum"], expected.sum())
-    assert computer._result[0]["token_count"].item() == 3
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_compiled_custom_loss_without_input_contract_skips_channel_observation():
     from veomni.ops import resolve_op
 
@@ -5169,6 +4991,17 @@ def test_channel_loss_preserves_legacy_observer_overrides(override):
     loss.backward()
     assert calls == ["side" if override == "compute_side_channel" else "compute"]
     torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_loss_call_binding_does_not_treat_weight_as_ignore_index():
+    def loss_fn(logits, labels, vocab_size, hidden_states, weights, *args):
+        pass
+
+    values = (torch.zeros(2), torch.ones(2), 3, torch.ones(2, 4), torch.ones(3, 4))
+    bound = channel_loss_module._bind_loss_call_args(loss_fn, values, {})
+    assert bound["weights"] is values[-1]
+    assert "ignore_index" not in bound
 
 
 @pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
@@ -5365,14 +5198,7 @@ def test_legacy_observer_without_bias_keeps_source_metrics(override):
     computer.strict = True
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     logits = torch.randn(1, 3, 4, requires_grad=True)
     labels = torch.tensor([[0, 1, 2]])
     computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
@@ -5557,15 +5383,6 @@ def test_gloo_one_rank_custom_chunk_capture_failure_skips_synchronously():
     spawn_with_rendezvous(_gloo_chunk_capture_failure_worker, args=(2,), nprocs=2)
 
 
-def test_positional_only_bias_is_not_claimed_as_supported():
-    def observer(logits_bias=None, /, **kwargs):
-        pass
-
-    bias = torch.ones(1)
-    supported = channel_loss_module._supported_observer_kwargs(observer, {"logits_bias": bias, "defer_sp": True})
-    assert "logits_bias" not in supported and "defer_sp" not in supported
-
-
 @pytest.mark.parametrize("strict", [False, True])
 def test_dpo_observer_detach_error_is_coordinated(strict):
     class BadLogProbs:
@@ -5596,14 +5413,7 @@ def test_chunk_capture_error_recomputes_metrics_and_preserves_previous_result(mo
     computer = ChannelLossComputer(parallel_state=state)
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     computer._result = [{"source_id": "stale"}]
 
     original_ce = F.cross_entropy
@@ -5647,14 +5457,7 @@ def test_ambiguous_multiple_chunk_observations_are_not_recomputed(strict):
     computer.strict = strict
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
 
     def loss_fn(logits, labels, vocab_size):
         chunk_loss._CAPTURE.get().update(op_calls=2, error="observer failed")
@@ -5712,14 +5515,7 @@ def test_custom_transformed_chunk_loss_does_not_report_outer_ce(monkeypatch, str
     computer.strict = strict
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
 
     def loss_fn(hidden_states, labels, weights):
@@ -5759,14 +5555,7 @@ def test_official_loss_with_custom_chunk_op_is_not_a_proven_fallback(monkeypatch
     computer.strict = strict
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     real_op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
 
     class CustomOp:
@@ -5806,14 +5595,7 @@ def test_return_log_probs_is_not_treated_as_causal_ce(monkeypatch, prebound):
     computer = ChannelLossComputer(parallel_state=state)
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     computer._original_loss_fn = partial(ForCausalLMLoss, return_log_probs=True) if prebound else ForCausalLMLoss
     hidden = torch.randn(1, 3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)
@@ -5837,14 +5619,7 @@ def test_prebound_logits_bias_is_used_for_chunk_fallback(monkeypatch):
     computer.strict = True
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     hidden = torch.randn(1, 3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)
     bias = torch.randn(1, 3, 5, requires_grad=True)
@@ -5885,14 +5660,7 @@ def test_standard_liger_handle_keeps_channel_loss_observation(monkeypatch):
     computer.strict = True
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     # Exercise the framework handle contract on CPU; actual Liger numerical
     # behavior must be validated on the backend that provides the kernel.
     handle = object.__new__(VeomniOp)
@@ -5927,14 +5695,7 @@ def test_device_override_of_standard_ce_is_not_treated_as_builtin(monkeypatch):
     computer = ChannelLossComputer(parallel_state=state)
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     handle = object.__new__(VeomniOp)
     handle.op, handle.variant, handle.impl = "cross_entropy_loss", "standard", "eager"
 
@@ -5966,14 +5727,7 @@ def test_mutated_standard_ce_wrapper_is_not_trusted(monkeypatch):
     computer = ChannelLossComputer(parallel_state=state)
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     handle = VeomniOp("cross_entropy_loss", "standard", "eager")
     monkeypatch.setattr(
         handle.entry,
@@ -5998,14 +5752,7 @@ def test_custom_partial_contract_rejects_ambiguous_anonymous_args(monkeypatch, a
     computer.strict = False
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
 
     def custom_ce(logits, labels, vocab_size, *extra):
         del vocab_size, extra
@@ -6043,14 +5790,7 @@ def test_custom_loss_uninspectable_signature_keeps_training_in_non_strict_mode(m
     computer = ChannelLossComputer(parallel_state=_install_test_parallel_state(monkeypatch))
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     computer._original_loss_fn = Loss()
     logits = torch.randn(1, 3, 4, requires_grad=True)
     labels = torch.tensor([[2, 0, 1]])
@@ -6091,14 +5831,7 @@ def test_custom_loss_ambiguous_observer_keeps_training_in_non_strict_mode(monkey
     computer = ChannelLossComputer(parallel_state=_install_test_parallel_state(monkeypatch))
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 3],
-        "input_mask": torch.ones(3, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
+    computer._source_provenance = _single_source_provenance()
     computer._original_loss_fn = obj
     logits = torch.randn(1, 3, 4, requires_grad=True)
     labels = torch.tensor([[2, 0, 1]])
@@ -6109,17 +5842,6 @@ def test_custom_loss_ambiguous_observer_keeps_training_in_non_strict_mode(monkey
     loss.backward()
     assert computer._result is None
     assert logits.grad is not None
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_loss_call_binding_does_not_treat_weight_as_ignore_index():
-    def loss_fn(logits, labels, vocab_size, hidden_states, weights, *args):
-        pass
-
-    values = (torch.zeros(2), torch.ones(2), 3, torch.ones(2, 4), torch.ones(3, 4))
-    bound = channel_loss_module._bind_loss_call_args(loss_fn, values, {})
-    assert bound["weights"] is values[-1]
-    assert "ignore_index" not in bound
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -6168,6 +5890,15 @@ def test_legacy_compute_exception_respects_strict_mode(strict):
         loss.backward()
         torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
     assert computer._result is None
+
+
+def test_positional_only_bias_is_not_claimed_as_supported():
+    def observer(logits_bias=None, /, **kwargs):
+        pass
+
+    bias = torch.ones(1)
+    supported = channel_loss_module._supported_observer_kwargs(observer, {"logits_bias": bias, "defer_sp": True})
+    assert "logits_bias" not in supported and "defer_sp" not in supported
 
 
 def _gloo_chunk_capture_fallback_worker(rank, world_size, fail_rank, endpoint):
@@ -6238,6 +5969,195 @@ def _gloo_chunk_capture_fallback_worker(rank, world_size, fail_rank, endpoint):
 @pytest.mark.parametrize("fail_rank", [0, 1])
 def test_gloo_chunk_capture_fallback_keeps_ranks_in_same_collective(fail_rank):
     spawn_with_rendezvous(_gloo_chunk_capture_fallback_worker, args=(2, fail_rank), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_compiled_chunk_loss_falls_back_to_detached_source_observation():
+    from veomni.ops import resolve_op
+
+    hidden = torch.randn(1, 4, 3)
+    weight = torch.randn(7, 3)
+    labels = torch.tensor([[0, 1, 2, 3]])
+    shift = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    op = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
+    compiled = torch.compile(op, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        reference = op(hidden, shift, weight, chunk_size=3)
+        # Compile while unsampled, then enable observation on the same graph.
+        torch.testing.assert_close(compiled(hidden, shift, weight, chunk_size=3), reference)
+
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 4],
+        "input_mask": torch.ones(4, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+
+    def model_loss(logits, labels, vocab_size, hidden_states, weights):
+        shifted = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+        return compiled(hidden_states, shifted, weights, chunk_size=3)
+
+    model_loss.__veomni_channel_loss_contract__ = "outer_causal_ce_v1"
+    computer._original_loss_fn = model_loss
+    with torch.no_grad(), computer.capture():
+        actual = computer._wrapped_loss_fn(None, labels, 7, hidden, weight)
+    torch.testing.assert_close(actual, reference)
+    expected = F.cross_entropy(F.linear(hidden, weight).reshape(-1, 7), shift.reshape(-1), reduction="none")
+    torch.testing.assert_close(computer._result[0]["loss_sum"], expected.sum())
+    assert computer._result[0]["token_count"].item() == 3
+
+
+@pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("explicit_shift", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_preserves_full_and_factored_bias(
+    monkeypatch, implementation, bias_kind, explicit_shift, strict, dtype
+):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+    monkeypatch.setattr(ChannelLossComputer, "EAGER_CHUNK_SIZE", 3)
+    model = torch.nn.Module()
+    model.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", implementation))
+    torch.manual_seed(125)
+    hidden = torch.randn(2, 7, 3, dtype=dtype, requires_grad=True)
+    weight = torch.randn(7, 3, dtype=dtype, requires_grad=True)
+    bias = torch.randn(2, 7, 2 if bias_kind == "factored" else 7, dtype=dtype, requires_grad=True)
+    tensors = [hidden, weight, bias]
+    if bias_kind == "factored":
+        tensors.append(torch.randn(7, 2, dtype=dtype, requires_grad=True))
+    labels = torch.arange(14).reshape(2, 7) % 7
+    labels[:, 3] = IGNORE_INDEX
+    targets = labels if explicit_shift else F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:].contiguous()
+    kwargs = dict(labels=labels, vocab_size=7, chunk_size=3)
+    if explicit_shift:
+        kwargs["shift_labels"] = targets
+
+    def compute(inputs):
+        return model.loss_function(
+            **kwargs,
+            hidden_states=inputs[0],
+            weights=inputs[1],
+            logits_bias=inputs[2],
+            logits_bias_weight=inputs[3] if bias_kind == "factored" else None,
+        )[0]
+
+    reference_inputs = [t.detach().clone().requires_grad_() for t in tensors]
+    reference = compute(reference_inputs)
+    reference.backward()
+    computer = _legacy_computer()
+    computer.strict = strict
+    computer._source_ids = ["first", "second"]
+    computer._position_ids = torch.arange(7).expand(2, -1)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual = compute(tensors)
+        actual.backward()
+    finally:
+        computer.uninstall()
+
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for tensor, expected in zip(tensors, reference_inputs, strict=True):
+        torch.testing.assert_close(tensor.grad, expected.grad, rtol=0, atol=0)
+    logits = F.linear(hidden.detach(), weight.detach()).float()
+    bias_logits = F.linear(bias.detach(), tensors[3].detach()) if bias_kind == "factored" else bias.detach()
+    per_token = F.cross_entropy(
+        (logits + bias_logits.float()).reshape(-1, 7), targets.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
+    ).reshape(2, 7)
+    assert not computer.strict_observation_errors
+    assert [entry["source_id"] for entry in computer._result] == ["first", "second"]
+    for row, entry in enumerate(computer._result):
+        torch.testing.assert_close(entry["loss_sum"], per_token[row].sum(), rtol=1e-6, atol=1e-6)
+        assert entry["token_count"].item() == targets[row].ne(IGNORE_INDEX).sum().item()
+
+
+def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
+
+    model = DummyModel()
+    torch.manual_seed(7)
+    hidden = torch.randn(1, 17, 4, requires_grad=True)
+    weight = torch.randn(7, 4, requires_grad=True)
+    labels = torch.arange(17).unsqueeze(0) % 7
+    ref_hidden, ref_weight = (t.detach().clone().requires_grad_() for t in (hidden, weight))
+    kwargs = dict(logits=None, labels=labels, vocab_size=7, chunk_size=8)
+    reference, _, _ = model.loss_function(**kwargs, hidden_states=ref_hidden, weights=ref_weight)
+    reference.backward()
+    computer = _legacy_computer()
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(17).unsqueeze(0)
+    projections = []
+    original_linear = F.linear
+
+    def linear(x, w, bias=None):
+        projections.append(tuple(x.shape))
+        return original_linear(x, w, bias)
+
+    monkeypatch.setattr(F, "linear", linear)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual, _, _ = model.loss_function(**kwargs, hidden_states=hidden, weights=weight)
+        actual.backward()
+    finally:
+        computer.uninstall()
+    assert projections == [(8, 4), (8, 4), (1, 4)]
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=0, atol=0)
+    assert computer._result[0]["token_count"].item() == 16
+    assert computer._result[0]["loss_sum"].item() == pytest.approx(actual.item() * 16, rel=1e-6)
+    assert computer._result[0]["sample_count"].item() == 1
+    assert computer._result[0]["input_token_count"].item() == 17
+
+
+def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
+
+    model = Model()
+    computer = _legacy_computer()
+    computer.strict = True
+    computer._source_ids = ["shift-only"]
+    computer._position_ids = torch.arange(7).unsqueeze(0)
+    hidden = torch.randn(1, 7, 4, requires_grad=True)
+    weight = torch.randn(11, 4, requires_grad=True)
+    targets = torch.tensor([[1, 2, 3, -100, 5, 6, 7]])
+    try:
+        computer.install(model)
+        with computer.capture():
+            loss, _, _ = model.loss_function(hidden_states=hidden, weights=weight, shift_labels=targets)
+        loss.backward()
+        assert computer._result[0]["token_count"].item() == 6
+        assert not computer.strict_observation_errors
+        assert torch.isfinite(hidden.grad).all() and torch.isfinite(weight.grad).all()
+        assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
+    finally:
+        computer.uninstall()
 
 
 def _gloo_real_sp_chunk_fallback_worker(rank, world_size, endpoint):

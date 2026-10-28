@@ -593,7 +593,10 @@ alignment metadata after the common step lifecycle. In DPO training, only the po
 reference-model forward is excluded, the chosen/rejected segments use their
 preference pair's source metadata, and `samples` counts the pair once. DPO
 segment-tail masking follows the objective; SP/CP layouts without provable tail
-positions are skipped (or rejected in strict mode). If distinct source names sanitize to
+positions are skipped (or rejected in strict mode). The source observer alone
+does not fix the existing DPO multisource dataloader's pair-versus-segment token
+accounting; use the separate DPO provenance and pair-normalization fix before
+using multisource DPO. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
@@ -1047,11 +1050,6 @@ derived argument groups below.
 
 `dpo_config.*` — Direct Preference Optimization hyperparameters.
 
-`dpo_config.explicit_segment_provenance` (experimental, default `false`) uses
-built-in DPO segment metadata to disambiguate one-token segments from padding.
-See the [DPO guide](../examples/qwen3_dpo.md#experimental-explicit-segment-provenance)
-for supported inputs, rank agreement, and checkpoint restrictions.
-
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | beta | `float` | `0.1` | KL penalty coefficient. Controls deviation from the reference model. |
@@ -1060,7 +1058,5 @@ for supported inputs, rank agreement, and checkpoint restrictions.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
-| explicit_segment_provenance | `bool` | `False` | Experimental packed-segment provenance and rank agreement; validate on the target hardware. |
-| allow_legacy_data_resume | `bool` | `False` | Explicitly permit non-exact legacy DPO data resume only when provenance is disabled. |
 
 The frozen reference always copies `model`. A custom `reference_model` config is not supported.

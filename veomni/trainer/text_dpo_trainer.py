@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
 from ..data.data_collator import PostCollator
-from ..data.dpo_collator import DPOProvenanceCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -34,16 +33,7 @@ from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
-from ..utils.dpo_provenance import (
-    DPO_APPROVED_KEY,
-    DPO_CALLBACK_METADATA_KEYS,
-    DPO_POSTCHECK_KEY,
-    DPO_PROOF_KEY,
-    DPOInvalidProof,
-    DPOPackedProof,
-)
 from .base import BaseTrainer, VeOmniIter
-from .dpo_provenance import next_dpo_microbatches
 
 
 logger = logging.get_logger(__name__)
@@ -129,14 +119,6 @@ class DPOConfig:
     refer_model_precision: Literal["float32", "bfloat16"] = field(
         default="bfloat16",
         metadata={"help": "Precision of the reference model."},
-    )
-    explicit_segment_provenance: bool = field(
-        default=False,
-        metadata={"help": "Experimental DPO packed-segment proof and rank agreement; requires native validation."},
-    )
-    allow_legacy_data_resume: bool = field(
-        default=False,
-        metadata={"help": "Allow non-exact resume from unversioned DPO data when provenance is disabled."},
     )
 
 
@@ -233,10 +215,6 @@ class TextDPOTrainer:
             self._build_data_transform()
             self.base._build_dataset()
             self.base._build_collate_fn()
-            if args.dpo_config.explicit_segment_provenance:
-                self.base.collate_fn = DPOProvenanceCollator(
-                    self.base.collate_fn, require_ds_idx=args.data.enable_multisource
-                )
             self.base._build_dataloader()
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
@@ -270,62 +248,15 @@ class TextDPOTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
-        provenance_options = {"record_segment_provenance": True} if args.dpo_config.explicit_segment_provenance else {}
         self.base.data_transform = build_data_transform(
             "dpo",
             tokenizer=self.policy_model.tokenizer,
             chat_template=self.policy_model.chat_template,
             max_seq_len=args.data.max_seq_len,
-            **provenance_options,
         )
 
     def _build_postforward(self):
         self.post_forward = PostCollator()
-
-    def _dpo_vocabulary_size(self) -> int:
-        config = self.policy_model.model_config
-        get_text_config = getattr(config, "get_text_config", None)
-        text_config = get_text_config() if callable(get_text_config) else getattr(config, "text_config", config)
-        vocab_size = getattr(text_config, "vocab_size", None)
-        if type(vocab_size) is not int or vocab_size <= 0:
-            raise ValueError("DPO provenance requires a valid model vocabulary size")
-        return vocab_size
-
-    def dpo_provenance_checkpoint_state(self) -> dict[str, Any]:
-        return {
-            "version": 2,
-            "enabled": self.base.args.dpo_config.explicit_segment_provenance,
-            "plaintext_transform_version": 1,
-        }
-
-    def validate_dpo_provenance_checkpoint(self, saved: Any) -> None:
-        current = self.dpo_provenance_checkpoint_state()
-        if saved is None:
-            if not current["enabled"] and self.base.args.dpo_config.allow_legacy_data_resume:
-                logger.warning_rank0(
-                    "Allowing non-exact legacy DPO resume: buffered labels, new plaintext labels, optimizer, "
-                    "and scheduler state may not correspond to the same data semantics."
-                )
-                return
-            raise ValueError(
-                "legacy DPO trainer state has no data-semantics version; start from weights only, "
-                "or explicitly enable allow_legacy_data_resume with provenance disabled"
-            )
-        if (
-            type(saved) is not dict
-            or set(saved) != {"version", "enabled", "plaintext_transform_version"}
-            or type(saved["version"]) is not int
-            or saved["version"] != 2
-            or type(saved["enabled"]) is not bool
-            or type(saved["plaintext_transform_version"]) is not int
-            or saved["plaintext_transform_version"] != 1
-        ):
-            raise ValueError("Unsupported DPO data-semantics checkpoint protocol")
-        if current != saved:
-            raise ValueError(
-                "DPO provenance mode must match the saved trainer state; "
-                "resume with the same mode or start with weights only"
-            )
 
     def _build_policy_model_runtime(self) -> VeOmniModelRuntime:
         """Build the trainable policy under ParallelState ``"policy"``."""
@@ -348,7 +279,13 @@ class TextDPOTrainer:
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
-        self.base.on_step_begin(micro_batches=micro_batches, channel_loss_source_repeat=2)
+        callback = getattr(self.base, "channel_loss_callback", None)
+        repeat_key = (
+            "channel_loss_source_repeat"
+            if callback is not None and hasattr(callback.computer, "observe_dpo_log_probs")
+            else "source_repeat"
+        )
+        self.base.on_step_begin(micro_batches=micro_batches, **{repeat_key: 2})
 
     @staticmethod
     def dpo_loss(
@@ -408,29 +345,12 @@ class TextDPOTrainer:
         Returns:
             (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
-        provenance_enabled = getattr(self.base.args.dpo_config, "explicit_segment_provenance", False)
-        approved = micro_batch.get(DPO_APPROVED_KEY) if provenance_enabled else None
-        if provenance_enabled and (
-            not isinstance(approved, DPOPackedProof) or micro_batch.get(DPO_POSTCHECK_KEY) != approved
-        ):
-            raise RuntimeError("DPO provenance must be approved before and after callbacks before model forward")
-        model_inputs = {
-            k: v
-            for k, v in micro_batch.items()
-            if k not in _NON_MODEL_KEYS
-            and not (provenance_enabled and k in DPO_CALLBACK_METADATA_KEYS | set(approved.source_keys))
-            and not (
-                provenance_enabled
-                and k in (DPO_APPROVED_KEY, DPO_POSTCHECK_KEY, DPO_PROOF_KEY)
-                and isinstance(v, (DPOPackedProof, DPOInvalidProof))
-            )
-        }
+        model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
-        if channel_loss_callback is not None:
-            channel_loss_callback.computer.observe_dpo_log_probs(
-                outputs.fused_linear_aux.log_probs, micro_batch["labels"], micro_batch.get("cu_seq_lens_q")
-            )
+        observe = getattr(getattr(channel_loss_callback, "computer", None), "observe_dpo_log_probs", None)
+        if observe is not None:
+            observe(outputs.fused_linear_aux.log_probs, micro_batch["labels"], micro_batch.get("cu_seq_lens_q"))
 
         # ``outputs.fused_linear_aux.log_probs`` is shape [1, packed_L]
         # (actual log-probabilities; sign already flipped). PostCollator
@@ -439,25 +359,12 @@ class TextDPOTrainer:
         # Caller must enter this model's ``use_parallel_state`` so forward and
         # SP gathers resolve the correct groups.
         log_probs_packed = outputs.fused_linear_aux.log_probs.squeeze(0)  # [packed_L]
-        seq_lens = (
-            list(approved.segment_lengths)
-            if isinstance(approved, DPOPackedProof)
-            else self.post_forward.compute_seqlens_func(micro_batch)
-        )
+        seq_lens = self.post_forward.compute_seqlens_func(micro_batch)
         sp_enabled = get_parallel_state().sp_enabled
         if sp_enabled:
             sp_group = get_parallel_state().sp_group
             log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=sp_group)
             log_probs_packed = log_probs_packed[: sum(seq_lens)]
-        elif isinstance(approved, DPOPackedProof):
-            valid_length = sum(seq_lens)
-            labels = micro_batch["labels"].reshape(-1)
-            if (
-                log_probs_packed.numel() != valid_length + approved.collator_tail
-                or labels.numel() != log_probs_packed.numel()
-            ):
-                raise ValueError("DPO proof disagrees with model log-probs or collator padding")
-            log_probs_packed = log_probs_packed[:valid_length]
         log_probs_list = list(log_probs_packed.split(seq_lens, dim=0))
 
         # Build per-segment label targets aligned to the kernel's per-token
@@ -488,7 +395,12 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        channel_loss_callback = BaseTrainer._get_registered_channel_loss_callback(self.base)
+        get_registered = getattr(BaseTrainer, "_get_registered_channel_loss_callback", None)
+        channel_loss_callback = (
+            get_registered(self.base)
+            if get_registered is not None
+            else getattr(self.base, "channel_loss_callback", None)
+        )
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
@@ -551,40 +463,10 @@ class TextDPOTrainer:
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         self.state.global_step += 1
 
-        if self.base.args.dpo_config.explicit_segment_provenance:
-            micro_batches = next_dpo_microbatches(
-                data_iterator,
-                self.policy_model.parallel_state,
-                self.reference_model.parallel_state,
-                self.state.global_step,
-                self.state.epoch,
-                source_catalog=lambda: (
-                    tuple(self.environ_meter.multisource_tracker.names)
-                    if self.base.args.data.enable_multisource
-                    else None
-                ),
-                vocab_size=self._dpo_vocabulary_size,
-            )
-        else:
-            micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        expected_proofs = (
-            tuple(batch[DPO_APPROVED_KEY] for batch in micro_batches)
-            if self.base.args.dpo_config.explicit_segment_provenance
-            else None
-        )
         self.base._reset_async_activation_offload_if_enabled(self.policy_model)
         self.on_step_begin(micro_batches=micro_batches)
-        if self.base.args.dpo_config.explicit_segment_provenance:
-            next_dpo_microbatches(
-                iter([micro_batches]),
-                self.policy_model.parallel_state,
-                self.reference_model.parallel_state,
-                self.state.global_step,
-                self.state.epoch,
-                after_callbacks=True,
-                expected_proofs=expected_proofs,
-            )
 
         self.base.sync_before_train_step()
 

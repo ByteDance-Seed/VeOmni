@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.dpo_provenance import DPO_FEATURE_KEY, DPOFeatureSegments
 from veomni.utils.registry import Registry
 
 
@@ -134,128 +133,12 @@ def process_conversation_example(
     return [tokenized_example]
 
 
-def _dpo_plaintext_completion_start(tokenizer: Any, prompt: str, full_text: str, token_ids: list[int]) -> int:
-    """Locate scoreable completion tokens without supervising prompt-only BPE merges."""
-    if not prompt:
-        return 0
-    if full_text == prompt:
-        raise ValueError("DPO prompt leaves no scoreable completion tokens; shorten it or increase max_seq_len")
-    encoded = None
-    if callable(tokenizer):
-        try:
-            encoded = tokenizer(
-                full_text, add_special_tokens=True, return_offsets_mapping=True, return_special_tokens_mask=True
-            )
-        except TypeError:
-            try:
-                encoded = tokenizer(full_text, add_special_tokens=True, return_offsets_mapping=True)
-            except (AttributeError, NotImplementedError, TypeError):
-                pass
-        except (AttributeError, NotImplementedError):
-            pass
-    if encoded is not None and "offset_mapping" in encoded and "input_ids" in encoded:
-        encoded_ids = encoded["input_ids"]
-        offsets = encoded["offset_mapping"]
-        special_mask = encoded.get("special_tokens_mask")
-        if isinstance(encoded_ids, torch.Tensor):
-            encoded_ids = encoded_ids.tolist()
-        if isinstance(offsets, torch.Tensor):
-            offsets = offsets.tolist()
-        if isinstance(special_mask, torch.Tensor):
-            special_mask = special_mask.tolist()
-        if list(encoded_ids[: len(token_ids)]) != list(token_ids) or len(offsets) < len(token_ids):
-            raise ValueError("DPO tokenizer offsets do not match its encoded token IDs")
-        if special_mask is not None and (
-            len(special_mask) < len(token_ids) or any(flag not in (0, 1) for flag in special_mask[: len(token_ids)])
-        ):
-            raise ValueError("DPO tokenizer returned a malformed special-token mask")
-        first, scoreable, previous_end = None, False, 0
-        for index, pair in enumerate(offsets[: len(token_ids)]):
-            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-                raise ValueError("DPO tokenizer returned malformed character offsets")
-            start, end = pair
-            if type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(full_text):
-                raise ValueError("DPO tokenizer returned invalid character offsets")
-            if special_mask is not None and special_mask[index]:
-                continue
-            if start == end:
-                if special_mask is None:
-                    raise ValueError("DPO zero-width token requires a special-token mask")
-                if start == len(prompt):
-                    raise ValueError("DPO zero-width token lies at the prompt boundary; use untrimmed offsets")
-            if end < previous_end:
-                raise ValueError("DPO tokenizer returned unordered character offsets")
-            previous_end = end
-            if end > len(prompt):
-                first = index if first is None else first
-                scoreable = scoreable or index > 0
-            elif first is not None:
-                raise ValueError("DPO tokenizer returned prompt tokens after the completion boundary")
-        if first is None or not scoreable:
-            raise ValueError("DPO prompt leaves no scoreable completion tokens; shorten it or increase max_seq_len")
-        return first
-
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
-    prefix = list(prompt_ids)
-    # Remove structurally appended suffix tokens before comparing prefixes. A
-    # completion may itself begin with EOS, so even an apparent exact prefix
-    # containing the automatically appended EOS would mask a real target.
-    get_special_mask = getattr(tokenizer, "get_special_tokens_mask", None)
-    special_mask = []
-    if callable(get_special_mask):
-        try:
-            raw_prompt = tokenizer.encode(prompt, add_special_tokens=False)
-            special_mask = list(get_special_mask(raw_prompt, already_has_special_tokens=False))
-        except (TypeError, NotImplementedError):
-            special_mask = []
-    structural_mask_valid = (
-        bool(special_mask)
-        and len(special_mask) == len(prefix)
-        and all(flag in (0, 1) for flag in special_mask)
-        and [token for token, flag in zip(prefix, special_mask) if flag == 0] == list(raw_prompt)
-    )
-    if structural_mask_valid:
-        if 0 not in special_mask:
-            raise ValueError("DPO prompt boundary requires tokenizer offset mapping; use a fast tokenizer")
-        while special_mask and special_mask[-1] == 1:
-            special_mask.pop()
-            prefix.pop()
-    elif prefix and prefix[-1] in set(getattr(tokenizer, "all_special_ids", ()) or ()):
-        # Without structural evidence, a trailing special token could be
-        # literal prompt text or an automatically appended token.
-        raise ValueError("DPO prompt boundary requires tokenizer offset mapping; use a fast tokenizer")
-    if len(token_ids) <= len(prefix) and list(token_ids) == prefix[: len(token_ids)]:
-        raise ValueError("DPO prompt leaves no scoreable completion tokens; shorten it or increase max_seq_len")
-    if not prefix or prefix != list(token_ids[: len(prefix)]):
-        raise ValueError("DPO prompt boundary requires tokenizer offset mapping; use a fast tokenizer")
-    if structural_mask_valid:
-        try:
-            raw_full = tokenizer.encode(full_text, add_special_tokens=False)
-            full_ids = tokenizer.encode(full_text, add_special_tokens=True)
-            full_mask = list(get_special_mask(raw_full, already_has_special_tokens=False))
-        except (TypeError, NotImplementedError) as exc:
-            raise ValueError("DPO prompt boundary requires tokenizer offset mapping; use a fast tokenizer") from exc
-        if (
-            len(full_mask) != len(full_ids)
-            or any(flag not in (0, 1) for flag in full_mask)
-            or [token for token, flag in zip(full_ids, full_mask) if flag == 0] != list(raw_full)
-            or list(full_ids[: len(token_ids)]) != list(token_ids)
-        ):
-            raise ValueError("DPO prompt boundary requires tokenizer offset mapping; use a fast tokenizer")
-        if not any(full_mask[index] == 0 for index in range(max(len(prefix), 1), len(token_ids))):
-            raise ValueError("DPO prompt leaves no scoreable completion tokens; shorten it or increase max_seq_len")
-    if len(token_ids) <= max(len(prefix), 1):
-        raise ValueError("DPO prompt leaves no scoreable completion tokens; shorten it or increase max_seq_len")
-    return len(prefix)
-
-
 @DATA_TRANSFORM_REGISTRY.register("dpo")
 def process_dpo_example(
     example: Dict[str, Any],
     chat_template: "ChatTemplate" = None,
     tokenizer: "PreTrainedTokenizer" = None,
     max_seq_len: int = 2048,
-    record_segment_provenance: bool = False,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
     """Process a DPO preference pair into a single flat sample.
@@ -289,18 +172,18 @@ def process_dpo_example(
 
         chosen_ids = tokenizer.encode(chosen_text, add_special_tokens=True)[:max_seq_len]
         rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
-        chosen_prompt_len = _dpo_plaintext_completion_start(tokenizer, prompt, chosen_text, chosen_ids)
-        rejected_prompt_len = _dpo_plaintext_completion_start(tokenizer, prompt, rejected_text, rejected_ids)
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True) if prompt else []
+        prompt_len = len(prompt_ids)
 
         chosen_tok = {
             "input_ids": chosen_ids,
             "attention_mask": [1] * len(chosen_ids),
-            "labels": [IGNORE_INDEX] * chosen_prompt_len + chosen_ids[chosen_prompt_len:],
+            "labels": [IGNORE_INDEX] * prompt_len + chosen_ids[prompt_len:],
         }
         rejected_tok = {
             "input_ids": rejected_ids,
             "attention_mask": [1] * len(rejected_ids),
-            "labels": [IGNORE_INDEX] * rejected_prompt_len + rejected_ids[rejected_prompt_len:],
+            "labels": [IGNORE_INDEX] * prompt_len + rejected_ids[prompt_len:],
         }
 
     def _to_tensor(v):
@@ -319,8 +202,6 @@ def process_dpo_example(
         "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
         "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
     }
-    if record_segment_provenance:
-        result[DPO_FEATURE_KEY] = DPOFeatureSegments(c_len, r_len)
     return [result]
 
 
