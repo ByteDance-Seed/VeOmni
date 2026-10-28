@@ -65,6 +65,18 @@ def _build_model(ops_cfg=None):
         )
 
 
+@pytest.fixture
+def dense_packed_debug(monkeypatch):
+    """Explicitly opt into the documented dense-attention packed debug path.
+
+    The packed forward rejects the dense eager/sdpa attention when packed
+    varlen metadata is present; these tests deliberately exercise the
+    packing machinery through the debug-only dense path because no varlen
+    attention kernel runs on CPU.
+    """
+    monkeypatch.setenv("K3_ALLOW_DENSE_PACKED", "1")
+
+
 def _packed_batch(model):
     """One packed row of two samples with a mid-sample image.
 
@@ -146,7 +158,7 @@ def test_merge_drops_labels_sitting_on_placeholder_slots():
     assert 103 not in merged_labels.tolist()[0]
 
 
-def test_packed_forward_publishes_varlen_metadata():
+def test_packed_forward_publishes_varlen_metadata(dense_packed_debug):
     model = _build_model()
     model.eval()
     input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values = _packed_batch(model)
@@ -178,7 +190,42 @@ def test_packed_forward_publishes_varlen_metadata():
     assert torch.equal(recorded["position_ids"], expected_pos)
 
 
-def test_packed_forward_honors_collator_all_ones_flag():
+def test_packed_forward_rejects_dense_attention():
+    model = _build_model()
+    model.eval()
+    input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values = _packed_batch(model)
+
+    # The packed forward rebuilds the varlen metadata from the packed batch
+    # and must reject the dense eager attention instead of silently leaking
+    # across packed samples (K3_ALLOW_DENSE_PACKED is unset here).
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="cannot run packed batches"):
+            model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                grid_thws=grid_thws,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                use_cache=False,
+            )
+
+
+def test_kda_rejects_cached_single_token_decode():
+    model = _build_model()
+    model.eval()
+    attn = model.language_model.model.layers[0].self_attn
+    hidden = torch.randn(1, 1, model.config.text_config.hidden_size)
+
+    # Cached single-token decode selects the fused_recurrent KDA branch,
+    # which is a stub in this build: it must be rejected up front instead of
+    # crashing inside the kernel shim mid-forward.
+    with torch.no_grad():
+        with pytest.raises(NotImplementedError, match="cached single-token generation"):
+            attn(hidden_states=hidden, cache_params=object())
+
+
+def test_packed_forward_honors_collator_all_ones_flag(dense_packed_debug):
     """The collator precomputes the all-ones check host-side and publishes it
     as ``attention_mask_is_all_ones``; when present it gates the packed-varlen
     rebuild without the device-side ``.all()`` sync and is authoritative over
@@ -222,7 +269,7 @@ def test_packed_forward_honors_collator_all_ones_flag():
     assert "cu_seq_lens_q" not in recorded
 
 
-def test_text_only_forward_forwards_collator_kwargs():
+def test_text_only_forward_forwards_collator_kwargs(dense_packed_debug):
     """Text-only batches keep the collator's cu_seq_lens (no expansion ran)."""
     model = _build_model()
     model.eval()
@@ -256,7 +303,7 @@ def test_text_only_forward_forwards_collator_kwargs():
     assert recorded["max_length_q"] == 4
 
 
-def test_packed_forward_coalesces_collator_tail_pads():
+def test_packed_forward_coalesces_collator_tail_pads(dense_packed_debug):
     """Tail pads (SP / pad-to-length) arrive as per-token ``position_ids == 0``
     boundaries; the rebuilt cu_seq_lens must coalesce them into one segment
     exactly like the collator does, using the collator's published
@@ -470,7 +517,7 @@ def _sp2_worker(rank, rendezvous, result_dir, seed):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=_SP2_NPROC))
-def test_sp2_packed_forward_matches_single_rank(tmp_path):
+def test_sp2_packed_forward_matches_single_rank(tmp_path, dense_packed_debug):
     """End-to-end SP(2) forward/backward over an odd merged row.
 
     The regression this pins: a merged length that is odd makes

@@ -95,6 +95,7 @@ Patches (skeleton):
     (unexpanded, still-valid) kwargs the same way for text-only batches.
 """
 
+import os
 from functools import partial
 from math import sqrt
 
@@ -1004,6 +1005,26 @@ def kimi_k3_for_conditional_generation_forward_patched(
             _linear_cu = kwargs.get("cu_seq_lens_q")
         if _linear_cu is not None:
             fa_kwargs["cu_seqlens"] = _linear_cu
+
+    # Packed varlen metadata is only honored by the varlen attention
+    # implementations: the dense eager/sdpa MLA path would run one causal
+    # mask across the whole merged row and leak across packed samples
+    # (eager/sdpa stay available for non-packed batches). Reject the
+    # combination instead of silently corrupting the packed batch;
+    # K3_ALLOW_DENSE_PACKED=1 re-enables the documented debug-only dense
+    # path (used by the CPU packing tests, where no varlen kernel runs).
+    if fa_kwargs.get("cu_seq_lens_q") is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
+        _attn_impl = getattr(self.config, "_attn_implementation", None)
+        if _attn_impl is None:
+            _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
+        if _attn_impl in ("eager", "sdpa"):
+            raise ValueError(
+                f"attention_implementation={_attn_impl!r} cannot run packed batches: the dense "
+                f"causal mask does not isolate packed samples (cu_seq_lens_q varlen metadata "
+                f"is present). Use a varlen implementation (flash_attention_2 / "
+                f"veomni_flash_attention_2), disable dynamic packing, or set "
+                f"K3_ALLOW_DENSE_PACKED=1 for the documented debug-only dense path."
+            )
 
     # Modification (SP): slice the merged embeds / labels back to
     # the local shard and hand the LM a full-sequence cache_position so

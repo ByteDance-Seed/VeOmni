@@ -59,7 +59,7 @@ from .configuration_kimi_k3 import KimiK3Config, KimiLinearConfig
 # `.kda_fallback` (pure PyTorch, MindSpeed-derived; `fla` is GPU-only and absent
 # from the NPU image). patchgen hoists conditional imports to the module top
 # level, so a try/except fla import cannot survive codegen. NPU kernels
-# will replace these via OpSlot dispatch instead.
+# will replace these via VeomniOp dispatch instead.
 from .kda_fallback import (
     FusedRMSNormGated,
     ShortConvolution,
@@ -825,6 +825,17 @@ class KimiDeltaAttention(nn.Module):
         use_cache = cache_params is not None
         batch_size, q_len, _ = hidden_states.shape
         mode = "fused_recurrent" if use_cache and q_len == 1 else self.mode
+        if mode == "fused_recurrent":
+            # The ``fused_recurrent_kda`` binding in this build is the eager
+            # fallback stub (no recurrent implementation is vendored and no op
+            # variant is registered): reject the cached-decode request here
+            # instead of crashing from inside the kernel shim mid-forward.
+            # No-cache generation (prefill) keeps the chunk path below.
+            raise NotImplementedError(
+                "cached single-token generation is not supported in this build: only the "
+                "chunk KDA path has an implementation (fused_recurrent_kda is a stub). "
+                "Run generation without cache or prefill in chunk mode."
+            )
         if self.training:
             assert mode == "chunk", "Only chunk mode is supported in training."
 

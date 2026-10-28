@@ -126,8 +126,10 @@ class FusedRMSNormGated(nn.Module):
 
 def fused_recurrent_kda(*args, **kwargs):
     raise NotImplementedError(
-        "fused_recurrent_kda eager fallback is not implemented; it is only used on the "
-        "single-token decode path. Use chunk mode (training) or install fla."
+        "fused_recurrent_kda has no implementation in this build: the eager recurrent "
+        "fallback is deliberately unimplemented and no op variant is registered, so "
+        "cached single-token generation is rejected at KimiDeltaAttention.forward. "
+        "Use the chunk path (training / no-cache prefill)."
     )
 
 
