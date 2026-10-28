@@ -247,11 +247,33 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     from veomni.ops import VeomniOp
 
     config = _tiny_config()
-    config._set_ops_implementation(_sdpa_ops_config())
     model = QwenImageTransformer2DModel(config)
+    assert model.config._attn_implementation == "eager"
+    assert model.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+    assert model.zero_cond_t is False
     ckpt_dir = tmp_path / "qwen_image_ckpt"
     model.save_pretrained(ckpt_dir)
 
+    # 1. Bare from_pretrained(ckpt_dir) with no overrides resolves default SDPA (matching bare __init__).
+    bare_model = QwenImageTransformer2DModel(model.config_class(**config.to_diffuser_dict()))
+    loaded_default = QwenImageTransformer2DModel.from_pretrained(ckpt_dir)
+    assert loaded_default.config._attn_implementation == bare_model.config._attn_implementation == "sdpa"
+    assert loaded_default.config.ops_config.attn_implementation == "sdpa"
+    for block in loaded_default.transformer_blocks:
+        assert block.attn.processor.veomni_attn.impl == "sdpa"
+        assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
+        assert block.attn.processor.config._attn_implementation == "sdpa"
+
+    # 2. Passing config=... participates in actual model construction (e.g. zero_cond_t=True).
+    override_cfg = _tiny_config(zero_cond_t=True)
+    loaded_with_cfg = QwenImageTransformer2DModel.from_pretrained(ckpt_dir, config=override_cfg)
+    assert loaded_with_cfg.config.zero_cond_t is True
+    assert loaded_with_cfg.zero_cond_t is True
+    assert all(block.zero_cond_t is True for block in loaded_with_cfg.transformer_blocks)
+    assert loaded_with_cfg.config.ops_config.attn_implementation == "eager"
+    assert loaded_with_cfg.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+
+    # 3. Explicit ops_implementation / attn_implementation overrides bind to both config and processor.
     # Ensure VeomniOp can resolve veomni_flash_attention_2 even on CPU-only test runners.
     fa2_handle = SimpleNamespace(op="attention", variant="standard", impl="veomni_flash_attention_2")
     sdpa_handle = VeomniOp("attention", "standard", "veomni_sdpa")

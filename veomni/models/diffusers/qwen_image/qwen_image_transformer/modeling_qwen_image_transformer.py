@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import prod
 from types import SimpleNamespace
@@ -681,24 +682,49 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         ops_implementation = kwargs.pop("ops_implementation", None)
         attn_implementation = kwargs.pop("attn_implementation", None)
         provided_config = kwargs.pop("config", None)
-        diffusers_model = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
+
+        veomni_cfg = None
+        if provided_config is not None:
+            if isinstance(provided_config, cls.config_class):
+                veomni_cfg = copy.deepcopy(provided_config)
+            elif isinstance(provided_config, Mapping):
+                veomni_cfg = cls.config_class(**provided_config)
+            else:
+                raise TypeError(
+                    f"config must be a {cls.config_class.__name__} or Mapping, got {type(provided_config).__name__}."
+                )
+            kwargs = {**veomni_cfg.to_diffuser_dict(), **kwargs}
+
+        loaded = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
+        diffusers_model = loaded[0] if isinstance(loaded, tuple) else loaded
         diffusers_model.__class__ = cls
 
         valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
         diffusers_cfg = dict(diffusers_model.config)
-        if isinstance(provided_config, cls.config_class):
-            veomni_cfg = copy.deepcopy(provided_config)
-        else:
+        if veomni_cfg is None:
             cfg_kwargs = {k: v for k, v in diffusers_cfg.items() if k in valid_keys}
             if "attn_implementation" in diffusers_cfg:
                 cfg_kwargs["attn_implementation"] = diffusers_cfg["attn_implementation"]
             if "ops_implementation" in diffusers_cfg:
                 cfg_kwargs["ops_implementation"] = diffusers_cfg["ops_implementation"]
             veomni_cfg = cls.config_class(**cfg_kwargs)
+        else:
+            for k in valid_keys:
+                if k in diffusers_cfg:
+                    setattr(veomni_cfg, k, diffusers_cfg[k])
+
         if ops_implementation is not None:
             veomni_cfg._set_ops_implementation(ops_implementation)
         if attn_implementation is not None:
             veomni_cfg._attn_implementation = attn_implementation
+        if (
+            "attn_implementation" not in veomni_cfg.ops_implementation
+            and getattr(veomni_cfg, "_attn_implementation_internal", None) is None
+        ):
+            veomni_cfg._attn_implementation_internal = diffusers_model._check_and_adjust_attn_implementation(
+                veomni_cfg._attn_implementation,
+                is_init_check=True,
+            )
         diffusers_model.config = veomni_cfg
         diffusers_model.config.tie_word_embeddings = False
 
@@ -706,4 +732,4 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         sp_processor = QwenImageSPAttnProcessor(veomni_cfg)
         for block in diffusers_model.transformer_blocks:
             block.attn.set_processor(sp_processor)
-        return diffusers_model
+        return loaded
