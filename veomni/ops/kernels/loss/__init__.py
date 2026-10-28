@@ -30,7 +30,7 @@ PyTorch ``eager``, GPU ``flash_attn`` Triton cross-entropy, and Ascend NPU
 top-k distillation autograd Functions live in ``token_logprobs/chunked.py``.
 """
 
-from ...platform import GpuKernelRequirement, NpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .cross_entropy_loss.standard import chunk_loss as ce_chunk
 from .cross_entropy_loss.standard import eager as ce_eager
@@ -43,6 +43,7 @@ from .token_logprobs.standard import torch_npu as tlp_torch_npu
 
 
 _GPU = GpuKernelRequirement()
+_MLU = MluKernelRequirement()
 _NPU = NpuKernelRequirement()
 
 
@@ -84,6 +85,18 @@ register_op(
     ce_liger.backward,
     description="Liger Kernel token-level cross-entropy loss",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "cross_entropy_loss",
+    "standard",
+    "liger_kernel",
+    ce_liger.forward,
+    ce_liger.backward,
+    description="Liger Kernel token-level cross-entropy loss",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )

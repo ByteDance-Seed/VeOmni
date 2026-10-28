@@ -13,6 +13,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
+
 
 _real_find_spec = importlib.util.find_spec
 
@@ -25,6 +28,7 @@ def _find_spec_without_torch_npu(name: str, package: str | None = None) -> Modul
 
 importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignment]
 try:
+    import veomni.distributed.parallel_state as parallel_state_module
     import veomni.trainer.callbacks.base as callback_base_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig
@@ -1246,3 +1250,431 @@ def test_channel_loss_callback_strict_requires_source_id():
     callback = ChannelLossCallback(trainer)
     with pytest.raises(ValueError, match="no configured source ID"):
         callback.on_step_begin(TrainerState(global_step=1), micro_batches=[{"input_ids": torch.tensor([[1]])}])
+
+
+def _test_parallel_state():
+    return SimpleNamespace(sp_enabled=False, sp_group=None, sp_size=1, sp_rank=0, dp_size=1, dp_group=None)
+
+
+def _install_test_parallel_state(monkeypatch):
+    state = _test_parallel_state()
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(channel_loss_module, "get_parallel_state", lambda: state)
+    monkeypatch.setitem(parallel_state_module._PARALLEL_STATE_REGISTRY, "base", state)
+    monkeypatch.setattr(callback_base_module, "get_parallel_state", lambda: state)
+    return state
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_capture_error_recomputes_metrics_and_replaces_previous_result():
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(3).unsqueeze(0)
+    computer._result = [{"source_id": "stale"}]
+
+    def loss_fn(logits, labels, vocab_size):
+        chunk_loss._CAPTURE.get()["error"] = "observer failed"
+        return logits.square().sum()
+
+    computer._original_loss_fn = loss_fn
+    labels = torch.tensor([[0, 1, 2]])
+    logits = torch.randn(1, 3, 4, requires_grad=True)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(logits, labels, 4)
+    loss.backward()
+    assert computer._result[0]["source_id"] == "source"
+    assert computer._result[0]["token_count"].item() == 2
+    torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+def test_channel_loss_preserves_legacy_observer_overrides(override):
+    calls = []
+
+    def side_channel(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append("side")
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        calls.append("compute")
+        return []
+
+    method = side_channel if override == "compute_side_channel" else compute
+    custom_computer = type("LegacyComputer", (ChannelLossComputer,), {override: method})
+    computer = custom_computer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    loss.backward()
+    assert calls == ["side" if override == "compute_side_channel" else "compute"]
+    torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+
+
+def test_loss_call_binding_does_not_treat_weight_as_ignore_index():
+    def loss_fn(logits, labels, vocab_size, hidden_states, weights, *args):
+        pass
+
+    values = (torch.zeros(2), torch.ones(2), 3, torch.ones(2, 4), torch.ones(3, 4))
+    bound = channel_loss_module._bind_loss_call_args(loss_fn, values, {})
+    assert bound["weights"] is values[-1]
+    assert "ignore_index" not in bound
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_legacy_observer_exception_keeps_upstream_propagation(strict):
+    class LegacyComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100
+        ):
+            raise RuntimeError("observer only")
+
+    computer = LegacyComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with pytest.raises(RuntimeError, match="observer only"), computer.capture():
+        computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    assert computer._result is None
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("variadic", [False, True])
+def test_legacy_observer_without_bias_support_never_reports_unbiased_metrics(override, bias_kind, strict, variadic):
+    calls = []
+
+    def side(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append(1)
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        calls.append(1)
+        return []
+
+    def side_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100, **kwargs
+    ):
+        calls.append(1)
+
+    def compute_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index, **kwargs
+    ):
+        calls.append(1)
+        return []
+
+    methods = {
+        "compute_side_channel": side_variadic if variadic else side,
+        "_compute_channel_loss": compute_variadic if variadic else compute,
+    }
+    legacy = type("LegacyComputer", (ChannelLossComputer,), {override: methods[override]})
+    computer = legacy(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(3).unsqueeze(0)
+    hidden = torch.randn(1, 3, 2, requires_grad=True)
+    weight = torch.randn(4, 2)
+    bias = torch.randn(1, 3, 4 if bias_kind == "full" else 2)
+    bias_weight = torch.randn(4, 2) if bias_kind == "factored" else None
+
+    def loss_fn(hidden_states, labels, weights, logits_bias=None, logits_bias_weight=None):
+        scores = F.linear(hidden_states, weights)
+        scores = scores + (
+            F.linear(logits_bias, logits_bias_weight) if logits_bias_weight is not None else logits_bias
+        )
+        return scores.square().sum()
+
+    computer._original_loss_fn = loss_fn
+    labels = torch.tensor([[0, 1, 2]])
+    with pytest.raises(ChannelLossMetadataError, match="logits bias") if strict else nullcontext():
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(hidden, labels, weight, logits_bias=bias, logits_bias_weight=bias_weight)
+    if not strict:
+        loss.backward()
+        assert torch.isfinite(hidden.grad).all()
+    assert not calls and computer._result is None
+
+
+def test_modern_observer_override_receives_supported_bias():
+    seen = []
+
+    class ModernComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self,
+            logits,
+            labels,
+            vocab_size,
+            hidden_states,
+            weights,
+            shift_labels=None,
+            ignore_index=-100,
+            logits_bias=None,
+            logits_bias_weight=None,
+        ):
+            seen.append((logits_bias, logits_bias_weight))
+
+    computer = ModernComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size, logits_bias=None: logits.square().sum()
+    bias = torch.randn(1, 2, 3)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(
+            torch.ones(1, 2, 3, requires_grad=True), torch.tensor([[0, 1]]), 3, logits_bias=bias
+        )
+    loss.backward()
+    assert seen == [(bias, None)]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_legacy_compute_exception_respects_strict_mode(strict):
+    class LegacyComputer(ChannelLossComputer):
+        def _compute_channel_loss(
+            self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index
+        ):
+            raise RuntimeError("legacy compute failed")
+
+    computer = LegacyComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with pytest.raises(RuntimeError, match="legacy compute failed") if strict else nullcontext():
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    if not strict:
+        loss.backward()
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    assert computer._result is None
+
+
+def test_positional_only_bias_is_not_claimed_as_supported():
+    def observer(logits_bias=None, /, **kwargs):
+        pass
+
+    bias = torch.ones(1)
+    supported = channel_loss_module._supported_observer_kwargs(observer, {"logits_bias": bias, "defer_sp": True})
+    assert "logits_bias" not in supported and "defer_sp" not in supported
+
+
+def _gloo_chunk_capture_fallback_worker(rank, world_size, endpoint):
+    from datetime import timedelta
+
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    torch.distributed.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        state = SimpleNamespace(sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size)
+        computer = ChannelLossComputer(parallel_state=state)
+        computer._source_ids = ["source"]
+        computer._position_ids = torch.tensor([[rank * 2, rank * 2 + 1]])
+        labels = torch.tensor([[0, 1]]) if rank == 0 else torch.tensor([[2, IGNORE_INDEX]])
+        logits = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4).requires_grad_()
+
+        def loss_fn(logits, labels, vocab_size):
+            capture = chunk_loss._CAPTURE.get()
+            if rank == 0:
+                capture["error"] = "observer failed"
+            else:
+                capture["per_token"] = F.cross_entropy(
+                    logits.detach().reshape(-1, vocab_size),
+                    labels.reshape(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction="none",
+                ).reshape_as(labels)
+            return logits.square().sum()
+
+        computer._original_loss_fn = loss_fn
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits, labels, 4)
+        loss.backward()
+        assert computer._result[0]["token_count"].item() == 3
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_gloo_chunk_capture_fallback_keeps_ranks_in_same_collective():
+    spawn_with_rendezvous(_gloo_chunk_capture_fallback_worker, args=(2,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_compiled_chunk_loss_falls_back_to_detached_source_observation():
+    from veomni.ops import resolve_op
+
+    hidden = torch.randn(1, 4, 3)
+    weight = torch.randn(7, 3)
+    labels = torch.tensor([[0, 1, 2, 3]])
+    shift = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    op = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
+    compiled = torch.compile(op, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        reference = op(hidden, shift, weight, chunk_size=3)
+        # Compile while unsampled, then enable observation on the same graph.
+        torch.testing.assert_close(compiled(hidden, shift, weight, chunk_size=3), reference)
+
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(4).unsqueeze(0)
+
+    def model_loss(logits, labels, vocab_size, hidden_states, weights):
+        shifted = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+        return compiled(hidden_states, shifted, weights, chunk_size=3)
+
+    computer._original_loss_fn = model_loss
+    with torch.no_grad(), computer.capture():
+        actual = computer._wrapped_loss_fn(None, labels, 7, hidden, weight)
+    torch.testing.assert_close(actual, reference)
+    expected = F.cross_entropy(F.linear(hidden, weight).reshape(-1, 7), shift.reshape(-1), reduction="none")
+    torch.testing.assert_close(computer._result[0]["loss_sum"], expected.sum())
+    assert computer._result[0]["token_count"].item() == 3
+
+
+@pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("explicit_shift", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_preserves_full_and_factored_bias(
+    monkeypatch, implementation, bias_kind, explicit_shift, strict, dtype
+):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+    monkeypatch.setattr(ChannelLossComputer, "EAGER_CHUNK_SIZE", 3)
+    model = torch.nn.Module()
+    model.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", implementation))
+    torch.manual_seed(125)
+    hidden = torch.randn(2, 7, 3, dtype=dtype, requires_grad=True)
+    weight = torch.randn(7, 3, dtype=dtype, requires_grad=True)
+    bias = torch.randn(2, 7, 2 if bias_kind == "factored" else 7, dtype=dtype, requires_grad=True)
+    tensors = [hidden, weight, bias]
+    if bias_kind == "factored":
+        tensors.append(torch.randn(7, 2, dtype=dtype, requires_grad=True))
+    labels = torch.arange(14).reshape(2, 7) % 7
+    labels[:, 3] = IGNORE_INDEX
+    targets = labels if explicit_shift else F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:].contiguous()
+    kwargs = dict(labels=labels, vocab_size=7, chunk_size=3)
+    if explicit_shift:
+        kwargs["shift_labels"] = targets
+
+    def compute(inputs):
+        return model.loss_function(
+            **kwargs,
+            hidden_states=inputs[0],
+            weights=inputs[1],
+            logits_bias=inputs[2],
+            logits_bias_weight=inputs[3] if bias_kind == "factored" else None,
+        )[0]
+
+    reference_inputs = [t.detach().clone().requires_grad_() for t in tensors]
+    reference = compute(reference_inputs)
+    reference.backward()
+    computer = ChannelLossComputer()
+    computer.strict = strict
+    computer._source_ids = ["first", "second"]
+    computer._position_ids = torch.arange(7).expand(2, -1)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual = compute(tensors)
+        actual.backward()
+    finally:
+        computer.uninstall()
+
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for tensor, expected in zip(tensors, reference_inputs, strict=True):
+        torch.testing.assert_close(tensor.grad, expected.grad, rtol=0, atol=0)
+    logits = F.linear(hidden.detach(), weight.detach()).float()
+    bias_logits = F.linear(bias.detach(), tensors[3].detach()) if bias_kind == "factored" else bias.detach()
+    per_token = F.cross_entropy(
+        (logits + bias_logits.float()).reshape(-1, 7), targets.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
+    ).reshape(2, 7)
+    assert [entry["source_id"] for entry in computer._result] == ["first", "second"]
+    for row, entry in enumerate(computer._result):
+        torch.testing.assert_close(entry["loss_sum"], per_token[row].sum(), rtol=1e-6, atol=1e-6)
+        assert entry["token_count"].item() == targets[row].ne(IGNORE_INDEX).sum().item()
+
+
+def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
+
+    model = DummyModel()
+    torch.manual_seed(7)
+    hidden = torch.randn(1, 17, 4, requires_grad=True)
+    weight = torch.randn(7, 4, requires_grad=True)
+    labels = torch.arange(17).unsqueeze(0) % 7
+    ref_hidden, ref_weight = (t.detach().clone().requires_grad_() for t in (hidden, weight))
+    kwargs = dict(logits=None, labels=labels, vocab_size=7, chunk_size=8)
+    reference, _, _ = model.loss_function(**kwargs, hidden_states=ref_hidden, weights=ref_weight)
+    reference.backward()
+    computer = ChannelLossComputer()
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(17).unsqueeze(0)
+    projections = []
+    original_linear = F.linear
+
+    def linear(x, w, bias=None):
+        projections.append(tuple(x.shape))
+        return original_linear(x, w, bias)
+
+    monkeypatch.setattr(F, "linear", linear)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual, _, _ = model.loss_function(**kwargs, hidden_states=hidden, weights=weight)
+        actual.backward()
+    finally:
+        computer.uninstall()
+    assert projections == [(8, 4), (8, 4), (1, 4)]
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=0, atol=0)
+    assert computer._result[0]["token_count"].item() == 16
+    assert computer._result[0]["loss_sum"].item() == pytest.approx(actual.item() * 16, rel=1e-6)
+
+
+def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
+
+    model = Model()
+    computer = ChannelLossComputer()
+    computer.strict = True
+    computer._source_ids = ["shift-only"]
+    computer._position_ids = torch.arange(7).unsqueeze(0)
+    hidden = torch.randn(1, 7, 4, requires_grad=True)
+    weight = torch.randn(11, 4, requires_grad=True)
+    targets = torch.tensor([[1, 2, 3, -100, 5, 6, 7]])
+    try:
+        computer.install(model)
+        with computer.capture():
+            loss, _, _ = model.loss_function(hidden_states=hidden, weights=weight, shift_labels=targets)
+        loss.backward()
+        assert computer._result[0]["token_count"].item() == 6
+        assert torch.isfinite(hidden.grad).all() and torch.isfinite(weight.grad).all()
+        assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
+    finally:
+        computer.uninstall()

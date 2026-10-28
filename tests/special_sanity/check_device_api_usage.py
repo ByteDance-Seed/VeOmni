@@ -59,6 +59,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # CPU-only scheduler tests use literal CUDA/NPU backend names as fixtures
     # to validate device leases and launch plans without accessing hardware.
     "tests/ci/test_accelerator.py",
+    # EP option tests use literal backend names to verify cross-device rejection.
+    "tests/ci/test_ep_hccl_options.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on

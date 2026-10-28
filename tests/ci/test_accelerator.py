@@ -93,7 +93,7 @@ def test_e2e_alignment_preserves_fused_moe_training_paths(backend):
 
     caps = RunnerCapabilities(backend, tuple("01234567"))
     for model_name in ("gpt_oss", "qwen3_moe"):
-        options = dict(is_moe=True, model_name=model_name, min_sp_size=2 if model_name == "gpt_oss" else None)
+        options = dict(is_moe=True, model_name=model_name)
         commands = prepare_exec_cmd(
             ["train_text_test"],
             config_path="config",
@@ -103,9 +103,10 @@ def test_e2e_alignment_preserves_fused_moe_training_paths(backend):
             **options,
         )
         modes = {(cmd["parallel_config"].sp_size, cmd["parallel_config"].ep_size): cmd["nproc"] for _, cmd in commands}
-        assert modes[(2, 1)] == modes[(2, 2)] == (4 if model_name == "gpt_oss" else 8)
-        if model_name == "qwen3_moe":
-            assert modes[(1, 1)] == modes[(1, 2)] == 4
+        if model_name == "gpt_oss":
+            assert modes == {(1, 1): 4, (2, 1): 4, (2, 2): 4}
+        else:
+            assert modes == {(1, 1): 4, (1, 2): 4, (2, 1): 8, (2, 2): 8}
         plan = alignment_plan(caps, **options)
         assert plan.cards(caps) == max(modes.values())
         assert all(len(group) == 1 for group in plan.groups)
@@ -174,9 +175,10 @@ def test_gpt_oss_parallel_uses_fa4_and_quack():
         is_moe=True,
     )
 
-    assert command_list
-    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
-    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
+    assert [
+        (cmd_kwargs["parallel_config"].sp_size, cmd_kwargs["parallel_config"].ep_size)
+        for _, cmd_kwargs in command_list
+    ] == [(1, 1), (2, 1), (2, 2)]
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
