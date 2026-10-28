@@ -593,7 +593,7 @@ def test_file_mode_serializes_both_checkpoint_writers(tmp_path, monkeypatch):
     calls = []
 
     def capture_save(*, state_dict, storage_writer, **kwargs):
-        calls.append((next(iter(state_dict)), storage_writer.thread_count))
+        calls.append((next(iter(state_dict)), storage_writer.thread_count, storage_writer.release_page_cache))
 
     monkeypatch.setattr(checkpoint_module.dcp, "save", capture_save)
     DistributedCheckpointer.save(
@@ -601,7 +601,7 @@ def test_file_mode_serializes_both_checkpoint_writers(tmp_path, monkeypatch):
         {"model": model, "optimizer": optimizer},
         parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
-    assert calls == [("model", 1), ("optimizer", 1)]
+    assert calls == [("model", 1, True), ("optimizer", 1, True)]
 
 
 def test_file_mode_model_write_error_does_not_publish_checkpoint(tmp_path, monkeypatch):
@@ -623,6 +623,35 @@ def test_file_mode_model_write_error_does_not_publish_checkpoint(tmp_path, monke
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not (destination / "model" / "ckpt" / ".metadata").exists()
+    assert not (destination / "checkpoint_manifest.json").exists()
+
+
+def test_file_mode_optimizer_cache_io_error_removes_model_marker(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    from veomni.checkpoint.bounded_writer import BoundedFileSystemWriter
+
+    model = make_model()
+    optimizer = build(model, str(tmp_path))
+    destination = tmp_path / "checkpoint"
+    original = BoundedFileSystemWriter._advise_closed_file
+
+    def fail_optimizer(self, path):
+        if Path(path).parent.name == "optimizer":
+            raise OSError("injected optimizer cache-advice I/O failure")
+        return original(self, path)
+
+    monkeypatch.setattr(BoundedFileSystemWriter, "_advise_closed_file", fail_optimizer)
+    with pytest.raises(CheckpointException, match="injected optimizer cache-advice I/O failure"):
+        DistributedCheckpointer.save(
+            str(destination),
+            {"model": model, "optimizer": optimizer},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+        )
+    assert not (destination / "model" / "ckpt" / ".metadata").exists()
+    assert not (destination / "model" / "optimizer" / ".metadata").exists()
     assert not (destination / "checkpoint_manifest.json").exists()
 
 
@@ -649,6 +678,7 @@ def test_standard_adam_async_path_runs_both_save_slots(tmp_path, monkeypatch):
     )
     assert len(calls) == 2
     assert {tuple(call["state_dict"]) for call in calls} == {("model",), ("optimizer",)}
+    assert all(type(call["storage_writer"]) is checkpoint_module.FileSystemWriter for call in calls)
 
 
 def test_standard_sync_save_keeps_original_barrier(monkeypatch):

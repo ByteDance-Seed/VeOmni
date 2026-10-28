@@ -3,8 +3,11 @@
 
 """Bound the tensor payload in each serial DCP filesystem write."""
 
+import errno
 import gc
+import logging
 import math
+import os
 import queue
 from collections import Counter
 
@@ -12,6 +15,9 @@ import torch
 from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX
 from torch.distributed.checkpoint.planner import WriteItemType
+
+
+logger = logging.getLogger(__name__)
 
 
 def _buckets(items, max_bytes):
@@ -59,12 +65,16 @@ class BoundedFileSystemWriter(FileSystemWriter):
     planner and metadata retain the exact tensor values and offsets. Existing
     checkpoints are not overwritten by default. As with FileSystemWriter,
     ``sync_files=False`` does not guarantee durability across a host crash.
+    ``release_page_cache`` optionally advises the OS to evict clean pages of
+    each successfully closed shard; it does not change checkpoint contents,
+    explicitly fsync, or guarantee dirty-page writeback or eviction.
     """
 
-    def __init__(self, path, *, max_bytes=256 * 1024**2, sync_files=False, overwrite=False):
+    def __init__(self, path, *, max_bytes=256 * 1024**2, sync_files=False, overwrite=False, release_page_cache=False):
         if max_bytes <= 0:
             raise ValueError("DCP file bucket size must be positive")
         self.max_bucket_bytes = max_bytes
+        self.release_page_cache = release_page_cache
         super().__init__(
             path,
             single_file_per_rank=True,
@@ -73,6 +83,36 @@ class BoundedFileSystemWriter(FileSystemWriter):
             per_thread_copy_ahead=0,
             overwrite=overwrite,
         )
+
+    def _advise_closed_file(self, path):
+        """Release clean cache pages only after the filesystem writer closes a shard."""
+        if not self.release_page_cache:
+            return
+        if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+            self.release_page_cache = False
+            logger.warning("DCP page-cache advice is unavailable on this platform")
+            return
+        unsupported = {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EACCES, errno.EPERM}
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            unavailable = unsupported | {errno.EMFILE, errno.ENFILE, errno.ENOMEM}
+            if error.errno not in unavailable:
+                raise
+            self.release_page_cache = False
+            logger.warning("DCP page-cache advice cannot reopen a shard on this filesystem: %s", error)
+            return
+        try:
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError as error:
+                if error.errno not in unsupported:
+                    raise
+                self.release_page_cache = False
+                logger.warning("DCP page-cache advice is unsupported by this filesystem: %s", error)
+        finally:
+            os.close(fd)
 
     def write_data(self, plan, planner):
         prefix = getattr(plan.storage_data, "prefix", None)
@@ -83,8 +123,9 @@ class BoundedFileSystemWriter(FileSystemWriter):
         results = []
         for index, bucket in enumerate(_buckets(plan.items, self.max_bucket_bytes)):
             file_name = f"{prefix}{index}{DEFAULT_SUFFIX}"
+            file_path = self.fs.concat_path(self.path, file_name)
             file_queue = queue.Queue()
-            file_queue.put((self.fs.concat_path(self.path, file_name), file_name, bucket))
+            file_queue.put((file_path, file_name, bucket))
             try:
                 # FileSystemWriter is synchronous with thread_count=1.  Let
                 # its complete write frame (including the tensor dictionary)
@@ -98,6 +139,7 @@ class BoundedFileSystemWriter(FileSystemWriter):
                     item.index for item in bucket
                 ):
                     raise RuntimeError(f"Incomplete DCP write for {file_name}")
+                self._advise_closed_file(file_path)
                 results.extend(file_results)
             finally:
                 gc.collect()

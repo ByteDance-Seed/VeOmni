@@ -2429,7 +2429,10 @@ class DistributedCheckpointer(CheckpointerBase):
                         if type(writer) is not FileSystemWriter:
                             raise TypeError("File-backed checkpoint requires the standard filesystem writer")
                         writer = BoundedFileSystemWriter(
-                            writer.path, sync_files=writer.sync_files, overwrite=writer.overwrite
+                            writer.path,
+                            sync_files=writer.sync_files,
+                            overwrite=writer.overwrite,
+                            release_page_cache=True,
                         )
                     if slot == WEIGHTS_DIRNAME:
                         slot_state = {
