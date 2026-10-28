@@ -19,6 +19,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 @pytest.mark.parametrize("impl", ["eager", "sdpa"])
 def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):
@@ -255,3 +260,55 @@ def test_drop_packed_attention_metadata_keeps_keys_for_flash():
 
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32)}
     assert drop_packed_attention_metadata(kwargs, impl="flash_attention_2") is kwargs
+
+
+def test_prepare_dense_attention_inputs_with_ulysses_uses_post_ulysses_lengths_without_double_expansion(monkeypatch):
+    """Under Ulysses SP, rank-local hidden_states (4 tokens) with a global 8x8 mask or 2D mask
+    must resolve to the post-Ulysses 8x8 mask without raising or double-expanding to 16x16."""
+    from types import SimpleNamespace
+
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+    from veomni.ops.kernels.attention import ulysses as ulysses_mod
+
+    monkeypatch.setattr(ulysses_mod, "get_parallel_state", lambda: SimpleNamespace(ulysses_size=2))
+    local_hidden = torch.randn(1, 4, 8)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    # Case 1: existing 4D global mask (1, 1, 8, 8) built from create_causal_mask / packed_causal_mask
+    query = torch.arange(8)[:, None]
+    key = torch.arange(8)[None, :]
+    existing_4d = (key <= query).view(1, 1, 8, 8).clone()
+    existing_4d[..., :, 7] = False  # last token padded
+    filtered_4d, mask_4d = prepare_dense_attention_inputs(
+        {"cu_seq_lens_q": cu_seqlens},
+        impl="veomni_sdpa",
+        attention_mask=existing_4d,
+        hidden_states=local_hidden,
+    )
+    assert "cu_seq_lens_q" not in filtered_4d
+    assert mask_4d is not None and mask_4d.shape == (1, 1, 8, 8)
+    assert not _mask_kept(mask_4d, 3, 0)  # sample 1 isolated from sample 0
+    assert _mask_kept(mask_4d, 4, 3)  # within sample 1 allowed
+    assert not _mask_kept(mask_4d, 7, 7)  # padding preserved
+
+    # Case 2: 2D full-sequence padding mask (1, 8)
+    padding_2d = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long)
+    _, mask_2d = prepare_dense_attention_inputs(
+        {"cu_seq_lens_q": cu_seqlens},
+        impl="veomni_sdpa",
+        attention_mask=padding_2d,
+        hidden_states=local_hidden,
+    )
+    assert mask_2d is not None and mask_2d.shape == (1, 1, 8, 8)
+    torch.testing.assert_close(mask_2d, mask_4d)
+
+    # Case 3: skip_ulysses=True keeps local 4x4 dimensions
+    local_cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    _, mask_skip = prepare_dense_attention_inputs(
+        {"cu_seq_lens_q": local_cu, "skip_ulysses": True},
+        impl="veomni_sdpa",
+        attention_mask=None,
+        hidden_states=local_hidden,
+    )
+    assert mask_skip is not None and mask_skip.shape == (1, 1, 4, 4)
+    assert not _mask_kept(mask_skip, 2, 0)

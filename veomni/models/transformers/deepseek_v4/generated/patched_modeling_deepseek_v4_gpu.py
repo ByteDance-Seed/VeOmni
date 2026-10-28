@@ -49,8 +49,10 @@
 #      Packed compressor path + Ulysses SP for DeepSeek-V4 sparse attention
 #    - function_replacement: eager_attention_forward
 #      Always call the local dsa_attention deepseek_v4 VeomniOp
+#    - method_override: DeepseekV4Model.__init__
+#      Build DSpark MTP draft stages when configured
 #    - method_override: DeepseekV4Model.forward
-#      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
+#      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch, and DSpark MTP stages
 #    - class_replacement: DeepseekV4Experts
 #      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV4SparseMoeBlock.__init__
@@ -66,7 +68,7 @@
 #    - method_override: DeepseekV4ForCausalLM.__init__
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#      Always call ForCausalLMLoss, DSpark MTP loss, and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
 #      Register DeepseekV4 expert parallel plan for v5 generated modeling
 #
@@ -112,6 +114,7 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.transformers.deepseek_v4.dspark import build_dspark_blocks
 from veomni.models.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,
     _indexer_loss_enabled,
@@ -955,20 +958,23 @@ class DeepseekV4Indexer(nn.Module):
         query_range_ends = None if packed_ranges is None else packed_ranges[1]
         # A local query row ``i`` is global row ``query_offset + i``; off the context
         # parallel path ``query_offset`` is zero and this is the arange it always was.
+        # Only the CANN indexer kernel switches layout when ``query_range_starts`` is
+        # ``None``; ``eager`` and ``tilelang`` always construct causal ranges when none
+        # are passed, so computing them directly from ``position_ids`` avoids a
+        # data-dependent ``torch.equal`` check (host sync + ``torch.compile`` graph break).
         if query_range_starts is None:
-            canonical_positions = (
-                (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
-            )
-            if not torch.equal(position_ids, canonical_positions):
+            if cp_enabled or getattr(self.veomni_dsa_indexer, "impl", None) != "cann":
                 query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
                 query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
-        # Either sequence-parallel mode has to spell out each query's visible
-        # compressed interval, because the kernel's default derives it from the
-        # query's *row*, which is no longer its position.
-        if cp_enabled and query_range_starts is None:
-            query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-            query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32) + query_offset
-            query_range_ends = (query_positions + 1) // self.compress_rate
+            else:
+                canonical_positions = (
+                    (torch.arange(seq_len, device=position_ids.device) + query_offset)
+                    .unsqueeze(0)
+                    .expand_as(position_ids)
+                )
+                if not torch.equal(position_ids, canonical_positions):
+                    query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                    query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
         # Ulysses partitions the full-sequence queries here and stitches the
         # selection back together below; CP received them already partitioned and
         # wants the result per shard, so both halves fall away together. One flag
@@ -1799,7 +1805,7 @@ class DeepseekV4Experts(nn.Module):
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
-                top_k_weights.to(hidden_states.dtype),
+                top_k_weights,
                 gate_up_proj,
                 down_proj,
                 self.act_fn,
@@ -1807,11 +1813,9 @@ class DeepseekV4Experts(nn.Module):
                 swiglu_limit=self.limit,
             )
         unused = gate_up_proj.new_empty(0)
-        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
-        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            routing_weights,
+            top_k_weights,
             top_k_index,
             unused,
             unused,
@@ -2123,31 +2127,14 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV4Model
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 @auto_docstring
 class DeepseekV4Model(DeepseekV4PreTrainedModel):
-    def __init__(self, config: DeepseekV4Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        self.gradient_checkpointing = False
-        self.hc_head = DeepseekV4HyperHead(config)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
     # ================================================================
-    # Patch: DeepseekV4Model.forward
+    # Patch: DeepseekV4Model.__init__ & DeepseekV4Model.forward
     # 1. Prefer collator-provided packed_sequence_slices; derive them from
     #    cu_seq_lens_q only when that host metadata is missing.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
@@ -2156,7 +2143,38 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     #    Build the sliding-window mask and packed compression metadata on the full
     #    sequence length so attention matches non-SP semantics after the all-gather
     #    inside ``DeepseekV4Attention``.
+    # 4. Build and run DSpark MTP draft stages when configured.
     # ================================================================
+    def __init__(self, config: "DeepseekV4Config"):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.mtp = build_dspark_blocks(
+            config,
+            attention_cls=DeepseekV4Attention,
+            moe_cls=DeepseekV4SparseMoeBlock,
+            rms_norm_cls=DeepseekV4RMSNorm,
+            hyper_connection_cls=DeepseekV4HyperConnection,
+            hyper_head_cls=DeepseekV4HyperHead,
+        )
+        if getattr(config, "freeze_mtp", False) or getattr(config, "mtp_loss_coef", 1.0) <= 0:
+            self.mtp.requires_grad_(False)
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+        self.gradient_checkpointing = False
+        self.hc_head = DeepseekV4HyperHead(config)
+        if len(self.mtp) > 0:
+            self._no_split_modules = ["DeepseekV4DecoderLayer", "DeepseekV4DSparkBlock"]
+            self._keys_to_ignore_on_load_unexpected = []
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -2172,6 +2190,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithIndexerKL:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        return_mtp_outputs = bool(kwargs.pop("return_mtp_outputs", False))
         # Stateless prefill/training must keep the cache absent: the TileLang
         # Lightning Indexer dispatch is intentionally cache-free, and creating a
         # DynamicCache here would silently force its eager decode fallback even
@@ -2294,6 +2313,18 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
 
+        run_mtp = len(self.mtp) > 0 and return_mtp_outputs
+        if run_mtp:
+            target_ids = getattr(self.config, "dspark_target_layer_ids", None)
+            if not target_ids:
+                target_ids = list(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
+            draft_target_ids = list(target_ids)
+            draft_target_set = set(draft_target_ids)
+        else:
+            draft_target_ids = []
+            draft_target_set = set()
+        draft_inputs: dict[int, torch.Tensor] = {}
+
         indexer_kl_total = None
         indexer_uniform_total = None
         indexer_kl_layers = 0
@@ -2334,6 +2365,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 indexer_kl_layers += 1
             else:
                 hidden_states = layer_output
+            if run_mtp and layer.layer_idx in draft_target_set:
+                draft_inputs[layer.layer_idx] = hidden_states.mean(dim=2)
 
         # A model configured for the loss whose ``layer_types`` has no CSA entry would
         # otherwise accept the flag and train nothing.
@@ -2346,6 +2379,41 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             )
 
         hidden_states = self.norm(self.hc_head(hidden_states))
+
+        mtp_hidden_states = None
+        mtp_markov_embed = None
+        mtp_markov_head_weight = None
+        if run_mtp:
+            if any(idx not in draft_inputs for idx in draft_target_ids):
+                raise RuntimeError(
+                    f"DSpark MTP is active but target layers {draft_target_ids} were not all collected "
+                    f"(collected {sorted(draft_inputs)})."
+                )
+            draft_hiddens = [draft_inputs[idx] for idx in draft_target_ids]
+            mtp_streams = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            mtp_main: torch.Tensor | list[torch.Tensor] = torch.cat(draft_hiddens, dim=-1)
+            if mask_free_sparse:
+                mtp_attention_mask = None
+            elif isinstance(attention_mask, dict):
+                mtp_attention_mask = next(iter(attention_mask.values()))
+            else:
+                mtp_attention_mask = attention_mask
+            if mtp_attention_mask is not None and mtp_attention_mask.ndim == 4 and "packed_sequence_slices" in kwargs:
+                mtp_attention_mask = isolate_packed_causal_mask_(
+                    mtp_attention_mask.clone(), kwargs["packed_sequence_slices"]
+                )
+            last_stage = len(self.mtp) - 1
+            for stage_idx, stage in enumerate(self.mtp):
+                mtp_streams, mtp_main, mtp_hidden_states, mtp_markov_embed, mtp_markov_head_weight = stage(
+                    mtp_streams,
+                    position_embeddings,
+                    position_ids,
+                    mtp_main,
+                    full_position_ids if sp_enabled else None,
+                    input_ids if stage_idx == last_stage else None,
+                    mtp_attention_mask,
+                )
+
         return MoeModelOutputWithIndexerKL(
             last_hidden_state=hidden_states,
             past_key_values=return_cache,
@@ -2355,6 +2423,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             if indexer_kl_total is not None
             else None,
             indexer_kl_layers=indexer_kl_layers if indexer_kl_total is not None else None,
+            mtp_hidden_states=mtp_hidden_states,
+            mtp_markov_embed=mtp_markov_embed,
+            mtp_markov_head_weight=mtp_markov_head_weight,
         )
 
 
@@ -2460,6 +2531,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             resolve_op_impl("load_balancing_loss_implementation"),
         )
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+        if len(self.model.mtp) > 0:
+            self._no_split_modules = ["DeepseekV4DecoderLayer", "DeepseekV4DSparkBlock"]
+            self._keys_to_ignore_on_load_unexpected = []
         self.post_init()
 
     @can_return_tuple
@@ -2480,6 +2554,17 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        mtp_loss_coef = getattr(self.config, "mtp_loss_coef", 1.0)
+        if (
+            "return_mtp_outputs" not in kwargs
+            and labels is not None
+            and not kwargs.get("return_log_probs", False)
+            and len(self.model.mtp) > 0
+            and mtp_loss_coef > 0
+            and not getattr(self.config, "freeze_mtp", False)
+            and any(p.requires_grad for p in self.model.mtp.parameters())
+        ):
+            kwargs = {**kwargs, "return_mtp_outputs": True}
 
         outputs: MoeModelOutputWithIndexerKL = self.model(
             input_ids=input_ids,
@@ -2512,13 +2597,27 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             logits = self.lm_head(hidden_states)
 
         aux_loss = None
-        if output_router_logits:
-            aux_loss = self.load_balancing_loss(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
+        if output_router_logits and outputs.router_logits:
+            num_backbone_routed = sum(1 for layer_type in self.config.mlp_layer_types if layer_type == "moe")
+            backbone_router_logits = outputs.router_logits[:num_backbone_routed]
+            mtp_router_logits = outputs.router_logits[num_backbone_routed:]
+            if backbone_router_logits:
+                aux_loss = self.load_balancing_loss(
+                    backbone_router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
+            if mtp_router_logits:
+                mtp_num_experts = getattr(self.config, "dspark_n_routed_experts", None) or self.num_experts
+                mtp_top_k = getattr(self.config, "dspark_num_experts_per_tok", None) or self.num_experts_per_tok
+                mtp_aux_loss = self.load_balancing_loss(
+                    mtp_router_logits,
+                    mtp_num_experts,
+                    mtp_top_k,
+                    attention_mask,
+                )
+                aux_loss = mtp_aux_loss if aux_loss is None else aux_loss + mtp_aux_loss
             if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
@@ -2550,9 +2649,95 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 "indexer_kl_captured": 1.0
                 - indexer_kl_metric / indexer_uniform_metric.clamp_min(torch.finfo(torch.float32).tiny),
             }
-            if labels is not None:
+            if loss is not None:
                 aux_metrics["lm_loss_before_indexer_kl"] = loss.detach()
                 loss = loss + self.config.dsa_indexer_loss_coef * indexer_kl.to(loss.device)
+
+        if loss is not None and outputs.mtp_hidden_states is not None and mtp_loss_coef > 0:
+            has_factored_markov = outputs.mtp_markov_embed is not None and outputs.mtp_markov_head_weight is not None
+            if not has_factored_markov and outputs.mtp_markov_bias is None:
+                raise RuntimeError(
+                    "DeepseekV4Model returned mtp_hidden_states without Markov residual inputs; "
+                    "DSpark MTP training requires input_ids to compute the Markov residual."
+                )
+            ignore_index = kwargs.get("ignore_index", -100)
+            mtp_hidden_states = outputs.mtp_hidden_states[:, slice_indices, :]
+            if has_factored_markov:
+                mtp_logits_bias = outputs.mtp_markov_embed[:, slice_indices, :]
+                mtp_logits_bias_weight = outputs.mtp_markov_head_weight
+            else:
+                mtp_logits_bias = outputs.mtp_markov_bias[:, slice_indices, :]
+                mtp_logits_bias_weight = None
+            sp_enabled = get_parallel_state().sp_enabled
+            raw_shift_labels = kwargs.get("shift_labels")
+            derived_from_labels = raw_shift_labels is None and not sp_enabled
+            if raw_shift_labels is not None:
+                mtp_shift_labels = raw_shift_labels
+                slice_mtp_labels = mtp_shift_labels.shape[-1] != mtp_hidden_states.shape[1]
+            elif sp_enabled:
+                mtp_shift_labels = labels
+                slice_mtp_labels = True
+            else:
+                mtp_shift_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+                slice_mtp_labels = True
+            if slice_mtp_labels:
+                mtp_shift_labels = mtp_shift_labels[..., slice_indices]
+
+            seq_len_for_pos = (
+                input_ids.shape[-1]
+                if input_ids is not None
+                else (labels.shape[-1] if labels is not None else outputs.mtp_hidden_states.shape[1])
+            )
+            if position_ids is None:
+                mtp_pos_ids = torch.arange(seq_len_for_pos, device=mtp_shift_labels.device).unsqueeze(0)
+            else:
+                mtp_pos_ids = position_ids.to(device=mtp_shift_labels.device)
+            mtp_pos_ids = mtp_pos_ids[:, slice_indices]
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                valid_tokens = attention_mask.to(device=mtp_shift_labels.device, dtype=torch.bool)
+                has_prev_valid = F.pad(valid_tokens[:, :-1], (1, 0), value=False)
+                valid_mtp_pos = valid_tokens & has_prev_valid
+                if derived_from_labels:
+                    has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
+                    valid_mtp_pos = valid_mtp_pos & has_next_valid
+                if sp_enabled and valid_mtp_pos.shape[1] != outputs.mtp_hidden_states.shape[1]:
+                    parallel_state = get_parallel_state()
+                    sp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else parallel_state.ulysses_rank
+                    local_len = outputs.mtp_hidden_states.shape[1]
+                    valid_mtp_pos = valid_mtp_pos.narrow(1, sp_rank * local_len, local_len)
+                valid_mtp_pos = valid_mtp_pos[:, slice_indices]
+                mtp_shift_labels = mtp_shift_labels.masked_fill(~valid_mtp_pos, ignore_index)
+            mtp_shift_labels = mtp_shift_labels.masked_fill(mtp_pos_ids == 0, ignore_index)
+            mtp_ce_op = self.veomni_ce if getattr(self.veomni_ce, "impl", None) in ("chunk_loss", "eager") else None
+            mtp_loss, _, _ = ForCausalLMLoss(
+                logits=None,
+                labels=None,
+                shift_labels=mtp_shift_labels,
+                vocab_size=self.config.vocab_size,
+                num_items_in_batch=kwargs.get("num_items_in_batch"),
+                hidden_states=mtp_hidden_states,
+                weights=self.lm_head.weight,
+                logits_bias=mtp_logits_bias,
+                logits_bias_weight=mtp_logits_bias_weight,
+                chunk_size=2048,
+                ignore_index=ignore_index,
+                loss_reduction_group=kwargs.get("loss_reduction_group"),
+                op=mtp_ce_op,
+            )
+            loss = loss + mtp_loss_coef * mtp_loss.to(loss.device)
+            if aux_metrics is None:
+                aux_metrics = {}
+            aux_metrics["mtp_loss"] = mtp_loss.detach()
+        elif (
+            loss is not None
+            and self.training
+            and torch.is_grad_enabled()
+            and len(self.model.mtp) > 0
+            and not any(hasattr(p, "to_local") for p in self.model.mtp.parameters())
+            and any(p.requires_grad for p in self.model.mtp.parameters())
+        ):
+            mtp_zero = sum((p.sum() * 0.0 for p in self.model.mtp.parameters() if p.requires_grad), loss.new_zeros(()))
+            loss = loss + mtp_zero.to(device=loss.device, dtype=loss.dtype)
 
         return MoeCausalLMOutputWithLogProbs(
             loss=loss,

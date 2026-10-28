@@ -14,7 +14,13 @@
 
 """Every unit answers ``config_path``, so the loader never asks what it holds."""
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import ModelArguments
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class TestWhereTheLoaderReadsTheConfigFrom:

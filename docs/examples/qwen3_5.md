@@ -110,6 +110,23 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
+### FlashQLA GatedDeltaNet backend on Hopper/Blackwell GPUs
+
+On SM90-SM100 NVIDIA GPUs where `flash_qla` is installed, you can select the FlashQLA
+`chunk_gated_delta_rule` backend:
+
+```yaml
+model:
+  ops_implementation:
+    chunk_gated_delta_rule_implementation: flash_qla
+```
+
+When `chunk_gated_delta_rule_implementation: flash_qla` is active (and not in recurrent cache
+decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
+(`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
+copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`, `fla_npu`) and recurrent
+decode paths keep the expanded Q/K layout.
+
 ## Start training on NPU
 
 Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three
@@ -170,6 +187,16 @@ model:
 Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
 `Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
 
+These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
+configured output-gate activation: selecting AscendC does not change sigmoid
+to SiLU. On Ascend910B, the v26.6.0 `RecomputeWUFwd` kernel accepts value-head
+widths 128 or 256; a 64-wide toy input fails native tiling before it exercises
+the GDN math. The NPU parity test uses a supported 128-wide AscendC input and
+checks both ordinary sequences and packed samples whose boundaries are not
+multiples of the recurrent chunk size. The vendored convolution also selects
+a smaller channel tile for head shards such as Qwen4-Exp U8CP2's 640 channels,
+preserving the existing 32-channel alignment and UB budget.
+
 The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
 bundle `fla_npu`:
 
@@ -197,6 +224,12 @@ pip list | grep fla_npu   # verify it is installed
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
 the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
 
+The native convolution qualification uses independent FP64 segment references
+computed from the exact BF16-rounded inputs and upstream gradient. Using separate
+BF16 reference convolutions rounds each segment's shared-weight gradient before
+addition; cancellation can make that reference less accurate than the fused
+FP32 reduction. The output and gradient tolerances are unchanged.
+
 ### Qwen3.5-9B VL Training
 
 There is no dedicated dense NPU config; reuse the GPU one and set the GatedDeltaNet kernels on the
@@ -217,7 +250,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --train.max_steps 20
 ```
 
-Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not installed.
+Set `chunk_gated_delta_rule_implementation` to `triton` if `fla_npu` is not installed.
 
 ### Qwen3.5 MoE 35B VL Training
 

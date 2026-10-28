@@ -124,15 +124,22 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: Add tests in `tests/models/` to verify:
-   - Model loads correctly via `veomni.models.auto`
-   - Forward pass produces correct output shape
-   - Model patch applies without errors
-   Check `.agents/knowledge/testing.md` and the owning workflow so a new test is actually collected in CI.
+2. **Model tests**: follow
+   [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).
+   Add the canonical tiny-config factory, registry/build case, eager family
+   forward/backward parity, and reference coverage for one supported
+   accelerator training configuration. Shape checks and a successful import
+   do not establish model parity. Distinct optimized operator implementations
+   need their own numerical/backward coverage under `tests/ops/`.
 
-3. **E2e tests** (if feasible): add a `pytest.param` to
-   `tests/e2e/test_e2e_parallel.py` using the toy config, rather than a new
-   e2e file.
+3. **E2E tests**: extend the matching family table in
+   `tests/e2e/test_e2e_parallel.py`. Use the SOP's default four-process matrix:
+   dense `(SP1, EP1)` / `(SP2, EP1)`, ordinary MoE `(SP1, EP1)` / `(SP2, EP2)`.
+   Add modes only for a justified implementation/topology representative.
+   Document unsupported SP/EP and any smoke-only gap. Alignment must compare
+   loss and grad norm; process success alone is smoke coverage. Check
+   `.agents/knowledge/testing.md` for launch plans and GPU/NPU manifest
+   collection, and record actual hardware execution and skips.
 
 4. Run `make quality` and `pytest tests/models/`.
 

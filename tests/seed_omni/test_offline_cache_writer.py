@@ -25,9 +25,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from datasets import load_dataset
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter, _first_rank_of_its_dp_rank
+
+
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_seedomni_cached_transform_unpickles_conversation_list() -> None:
@@ -222,10 +230,13 @@ def _sp_pair_rank_main(rank: int, rendezvous: str, cache_dir: str, out_dir: str)
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
 def test_sp_peers_write_one_copy_of_their_batch(tmp_path) -> None:
     """Two SP pairs: ranks 0/1 share dp_rank 0 and ranks 2/3 share dp_rank 1."""
     cache_dir = tmp_path / "cache"
-    mp.spawn(_sp_pair_rank_main, args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)), nprocs=4)
+    mp.spawn(
+        _sp_pair_rank_main, args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)), nprocs=_CI_CPU_4.nproc
+    )
 
     writes = [json.loads((tmp_path / f"rank{rank}.json").read_text())["writes"] for rank in range(4)]
     assert writes == [True, False, True, False]
@@ -266,12 +277,13 @@ def _existing_shard_check_rank_main(rank: int, rendezvous: str, cache_dir: str, 
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_existing_shard_check_agrees_across_ranks_before_any_flush(tmp_path) -> None:
     cache_dir = tmp_path / "cache"
     mp.spawn(
         _existing_shard_check_rank_main,
         args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)),
-        nprocs=2,
+        nprocs=_CI_CPU_2.nproc,
     )
     for rank in range(2):
         payload = json.loads((tmp_path / f"rank{rank}.json").read_text())
@@ -308,6 +320,7 @@ def _existing_shard_reject_rank_main(rank: int, rendezvous: str, cache_dirs: lis
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_existing_shard_check_fails_on_every_rank_together(tmp_path) -> None:
     """A shard only rank 0 can see must still fail rank 1, not leave it waiting."""
     cache_dirs = [tmp_path / "cache_rank0", tmp_path / "cache_rank1"]
@@ -318,7 +331,7 @@ def test_existing_shard_check_fails_on_every_rank_together(tmp_path) -> None:
     mp.spawn(
         _existing_shard_reject_rank_main,
         args=(str(tmp_path / "rendezvous"), [str(d) for d in cache_dirs], str(tmp_path)),
-        nprocs=2,
+        nprocs=_CI_CPU_2.nproc,
     )
     for rank in range(2):
         payload = json.loads((tmp_path / f"rank{rank}.json").read_text())

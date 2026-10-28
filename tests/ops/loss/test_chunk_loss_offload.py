@@ -1,37 +1,56 @@
 """Exercise the registered chunk CE under production offload/checkpoint hooks."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.offloading import OffloadPolicy, build_activation_offloading_context
 from veomni.ops import VeomniOp
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss as chunk_loss_impl
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
-DEVICES = ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU"))]
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
+    pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU")),
+]
+
+
+@contextmanager
+def _capture_chunk_tokens(target):
+    capture = {}
+    token = chunk_loss_impl._CAPTURE.set(capture)
+    try:
+        yield
+        assert "error" not in capture, capture.get("error")
+        assert isinstance(capture.get("per_token"), torch.Tensor)
+        target.append(capture["per_token"])
+    finally:
+        chunk_loss_impl._CAPTURE.reset(token)
 
 
 @pytest.fixture(autouse=True)
 def _deterministic_reductions(device):
-    """Bitwise offload parity requires repeatable device reductions."""
+    """Keep bitwise comparisons independent of parallel reduction scheduling."""
     enabled = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     num_threads = torch.get_num_threads()
     try:
-        # Avoid first-call parallel CPU math noise in the bitwise reference.
         if device == "cpu":
             torch.set_num_threads(1)
-        torch.use_deterministic_algorithms(True, warn_only=False)
+        if device in {"cpu", "npu"}:
+            torch.use_deterministic_algorithms(True, warn_only=False)
         yield
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
         torch.set_num_threads(num_threads)
 
 
-def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
+def _run(device, dtype, *, offload, recompute, frozen, all_ignored, bias_kind=None, observed=None):
     torch.manual_seed(127)
     hidden = torch.randn(2, 23, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "hidden")
     weight = torch.randn(137, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "weight")
@@ -39,6 +58,12 @@ def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
     labels[:, 1:8] = -100
     if all_ignored:
         labels.fill_(-100)
+    bias = bias_weight = None
+    if bias_kind is not None:
+        bias = torch.randn(2, 23, 4 if bias_kind == "factored" else 137, device=device, dtype=dtype)
+        bias.requires_grad_()
+        if bias_kind == "factored":
+            bias_weight = torch.randn(137, 4, device=device, dtype=dtype).requires_grad_()
     op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
     # Even the last (2 x 3) token chunk is eligible for the >1 KiB offload policy.
     assert 2 * 3 * weight.size(0) * torch.float32.itemsize > 1024
@@ -67,22 +92,31 @@ def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
 
             context.pack_hook, context.unpack_hook = pack, unpack
 
-    def body(x, head):
-        return op(x.sin(), labels, head, chunk_size=5)
+    def body(x, head, bias, bias_weight):
+        return op(x.sin(), labels, head, bias, bias_weight, chunk_size=5)
 
-    with contexts[0]:
-        loss = checkpoint(body, hidden, weight, use_reentrant=False) if recompute else body(hidden, weight)
+    capture = _capture_chunk_tokens(observed) if observed is not None else nullcontext()
+    with capture, contexts[0]:
+        inputs = (hidden, weight, bias, bias_weight)
+        loss = checkpoint(body, *inputs, use_reentrant=False) if recompute else body(*inputs)
     with contexts[1]:
         loss.backward()
     if offload:
         assert offloaded and restored
-        assert all(len(shape) < 2 or shape[-1] != 137 for shape, _ in offloaded), (
-            "Transient vocabulary logits escaped the chunk"
-        )
-        if device == "npu":
-            assert any(source == "npu" for _, source in offloaded)
-            assert "npu" in restored
-    return loss.detach(), hidden.grad, weight.grad
+        assert all(
+            len(shape) < 2 or shape[-1] != 137 or (bias_kind == "full" and shape == tuple(bias.shape))
+            for shape, _ in offloaded
+        ), "Transient vocabulary logits escaped the chunk"
+        if device != "cpu":
+            assert any(source == device for _, source in offloaded)
+            assert device in restored
+    return (
+        loss.detach(),
+        hidden.grad,
+        weight.grad,
+        bias.grad if bias is not None else None,
+        bias_weight.grad if bias_weight is not None else None,
+    )
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -99,3 +133,28 @@ def test_registered_chunk_loss_offload_preserves_loss_and_gradients(device, dtyp
         else:
             assert torch.isfinite(value).all()
             torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(device="cpu" if context.params["device"] == "cpu" else "accelerator")
+)
+def test_chunk_observer_bias_offload_parity(device, dtype, recompute, bias_kind):
+    """Keep loss, all gradients and observations exact with native bias/offload."""
+    kwargs = dict(recompute=recompute, frozen=None, all_ignored=False, bias_kind=bias_kind)
+    expected = _run(device, dtype, offload=False, **kwargs)
+    reference_tokens, actual_tokens = [], []
+    observed = _run(device, dtype, offload=False, observed=reference_tokens, **kwargs)
+    actual = _run(device, dtype, offload=True, observed=actual_tokens, **kwargs)
+    for result in (observed, actual):
+        for value, reference in zip(result, expected, strict=True):
+            if reference is None:
+                assert value is None
+            else:
+                assert torch.isfinite(value).all()
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    assert len(reference_tokens) == len(actual_tokens) == 1
+    torch.testing.assert_close(actual_tokens[0], reference_tokens[0], rtol=0, atol=0)
