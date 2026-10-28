@@ -196,11 +196,11 @@ def test_qat_is_off_until_asked_for(modeling):
 def test_qat_resolves_from_the_installed_ops_config(monkeypatch):
     from tests.models.tiny_configs import tiny_deepseek_v4_config
 
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     monkeypatch.setattr("torch.version.hip", None)
 
     config = tiny_deepseek_v4_config()

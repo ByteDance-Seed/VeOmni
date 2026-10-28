@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .models.configuration_base import apply_pretrained_config_ops_patch
 from .ops import apply_ops_patch
 from .utils.env import format_envs
 from .utils.logging import get_logger
 
+
+apply_pretrained_config_ops_patch()
 
 logger = get_logger(__name__)
 

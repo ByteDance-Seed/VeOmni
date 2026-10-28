@@ -299,8 +299,7 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     # 3. When both ops_implementation and explicit attn_implementation are passed at load time,
     # explicit attn_implementation wins (verified BEFORE mocking FA2 so FA2 would fail on CPU).
     for cfg_arg in (None, gpu_cfg, gpu_cfg_dict):
-        both_kwargs = {" config": cfg_arg} if cfg_arg is not None else {}
-        both_kwargs = {k.strip(): v for k, v in both_kwargs.items()}
+        both_kwargs = {"config": cfg_arg} if cfg_arg is not None else {}
         loaded_both = QwenImageTransformer2DModel.from_pretrained(
             ckpt_dir,
             ops_implementation={"attn_implementation": "veomni_flash_attention_2"},

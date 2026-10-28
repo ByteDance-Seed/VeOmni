@@ -269,3 +269,19 @@ def test_wan_mixed_sp_async_is_rejected_under_ulysses(monkeypatch):
     model.blocks[1].self_attn.sp_async = True
     with pytest.raises(ValueError, match="same SelfAttention.sp_async mode"):
         model(**_wan_inputs(in_dim=4, text_len=8, text_dim=16))
+
+
+def test_wan_preserves_explicit_attn_when_ops_implementation_is_sparse():
+    from veomni.models.transformers.wan.modeling_wan import WanModel
+
+    config = _tiny_config(
+        attn_implementation="sdpa",
+        ops_implementation={
+            "rms_norm_implementation": "eager",
+            "rotary_pos_emb_implementation": "eager",
+        },
+    )
+    model = WanModel(config)
+    assert model.config._attn_implementation == "eager"
+    assert model.config.ops_config.attn_implementation == "sdpa"
+    assert model.blocks[0].self_attn.attn.veomni_attn.impl == "sdpa"
