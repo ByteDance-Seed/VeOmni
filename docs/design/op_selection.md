@@ -17,7 +17,7 @@ If a field is not in this table, it is not an op-selection knob.
 
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
@@ -39,9 +39,9 @@ rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
 It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
 backend requires `qat_implementation: none` because it already quantizes
 the expert GEMM operands. Conflicting selections raise at config-parse time.
-Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
-changing the process-global ops config later does not retarget an existing
-instance.
+Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`
+from `config.ops_config.qat_implementation`; mutating `config.ops_implementation`
+later does not retarget an existing instance.
 
 **The seven general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
@@ -605,7 +605,7 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `VeomniOp("attention", "standard", config._attn_implementation)` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
+| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
 | **Config** | `OpsImplementationConfig.attn_implementation` | `config._attn_implementation` (set via `AutoModel.from_pretrained(attn_implementation=...)`) |
 | **SP rewrite** | `__post_init__` rewrites `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `sage_attention`, and `sdpa` to `veomni_*` | No SP support — upstream Transformers does not handle Ulysses SP |
 | **Compatibility** | VeOmni registers into the **same** `ALL_ATTENTION_FUNCTIONS` registry that Transformers uses, so the two are compatible by design |
@@ -731,7 +731,7 @@ currently exist in the `kernels-community` hub.
 | RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
 | RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
 | SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
-| Attention | Instance-local `VeomniOp("attention", "standard", config._attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
+| Attention | Instance-local `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | Instance-local `VeomniOp("moe_experts", ...)` | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses registered fused rows; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
 | MoE aux loss | Instance-local eager/Triton `VeomniOp` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |

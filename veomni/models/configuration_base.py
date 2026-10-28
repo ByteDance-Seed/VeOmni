@@ -192,19 +192,28 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         from ..arguments import OpsImplementationConfig
 
         replace_all = isinstance(ops_implementation, (OpsImplementationConfig, SimpleNamespace))
+        validated: dict[str, Any] = {}
         if isinstance(ops_implementation, OpsImplementationConfig):
             self.ops_implementation = ops_implementation.to_dict()
         elif isinstance(ops_implementation, SimpleNamespace):
             self.ops_implementation = {k: v for k, v in vars(ops_implementation).items() if v is not None}
         elif ops_implementation is None or isinstance(ops_implementation, Mapping):
-            self.ops_implementation = OpsImplementationConfig.validate_and_extract_dict(ops_implementation)
+            validated = OpsImplementationConfig.validate_and_extract_dict(ops_implementation)
+            if _is_post_init:
+                self.ops_implementation = validated
+            else:
+                own = dict(getattr(self, "ops_implementation", None) or {})
+                self.ops_implementation = {**own, **validated}
         else:
             raise ValueError(
                 f"ops_implementation must be a dict or OpsImplementationConfig, got {type(ops_implementation).__name__}."
             )
 
-        if "attn_implementation" in self.ops_implementation:
-            self._attn_implementation_internal = self.ops_implementation["attn_implementation"]
+        if _is_post_init or replace_all:
+            if "attn_implementation" in self.ops_implementation:
+                self._attn_implementation_internal = self.ops_implementation["attn_implementation"]
+        elif "attn_implementation" in validated:
+            self._attn_implementation_internal = validated["attn_implementation"]
 
         for key in self.sub_configs:
             subconfig = getattr(self, key, None)
@@ -219,9 +228,8 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                     sub_own["attn_implementation"] = sub_attn
                 merged = {**self.ops_implementation, **sub_own}
                 subconfig._set_ops_implementation(merged, _is_post_init=True)
-            elif self.ops_implementation:
-                sub_own = dict(getattr(subconfig, "ops_implementation", None) or {})
-                subconfig._set_ops_implementation({**sub_own, **self.ops_implementation})
+            elif validated:
+                subconfig._set_ops_implementation(validated)
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs: Any):
@@ -229,11 +237,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         result = _orig_from_dict(cls, config_dict, **kwargs)
         if ops_implementation is not None:
             config = result[0] if isinstance(result, tuple) else result
-            if isinstance(ops_implementation, Mapping):
-                own = dict(getattr(config, "ops_implementation", None) or {})
-                config._set_ops_implementation({**own, **dict(ops_implementation)})
-            else:
-                config._set_ops_implementation(ops_implementation)
+            config._set_ops_implementation(ops_implementation)
         return result
 
     def to_diff_dict(self) -> dict[str, Any]:

@@ -193,8 +193,15 @@ def test_qat_is_off_until_asked_for(modeling):
     assert not modeling._qat_is_fp8_blockwise("none")
 
 
-def test_qat_resolves_from_the_installed_ops_config():
+def test_qat_resolves_from_the_installed_ops_config(monkeypatch):
     from tests.models.tiny_configs import tiny_deepseek_v4_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
 
     config = tiny_deepseek_v4_config()
     config._set_ops_implementation({"qat_implementation": "fp8_blockwise"})

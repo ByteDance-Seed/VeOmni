@@ -399,3 +399,60 @@ def test_nested_attn_implementation_mapping_overrides_grandchild():
     assert cfg_subtree.thinker_config.text_config.ops_config.attn_implementation == "eager"
     assert cfg_subtree.thinker_config.vision_config._attn_implementation == "eager"
     assert cfg_subtree.thinker_config.vision_config.ops_config.attn_implementation == "eager"
+
+
+def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch):
+    """Sparse ops_implementation overrides on from_pretrained only propagate caller-specified keys."""
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    import veomni.models  # noqa: F401
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+
+    vl_dir = tmp_path / "qwen3_vl"
+    vl_cfg = Qwen3VLConfig(
+        ops_implementation={"attn_implementation": "sdpa", "rms_norm_implementation": "eager"},
+        vision_config={"ops_implementation": {"attn_implementation": "eager"}},
+    )
+    vl_cfg.save_pretrained(vl_dir)
+
+    # Empty override dict must leave sub-config choices untouched.
+    reloaded_empty = Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={})
+    assert reloaded_empty.text_config._attn_implementation == "veomni_sdpa"
+    assert reloaded_empty.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded_empty.vision_config._attn_implementation == "eager"
+    assert reloaded_empty.vision_config.ops_config.attn_implementation == "eager"
+
+    # Overriding only rms_norm_implementation must propagate RMSNorm without clobbering vision's attention.
+    reloaded_rms = Qwen3VLConfig.from_pretrained(
+        vl_dir,
+        ops_implementation={"rms_norm_implementation": "liger_kernel"},
+    )
+    assert reloaded_rms.ops_config.rms_norm_implementation == "liger_kernel"
+    assert reloaded_rms.text_config.ops_config.rms_norm_implementation == "liger_kernel"
+    assert reloaded_rms.vision_config.ops_config.rms_norm_implementation == "liger_kernel"
+    assert reloaded_rms.text_config._attn_implementation == "veomni_sdpa"
+    assert reloaded_rms.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded_rms.vision_config._attn_implementation == "eager"
+    assert reloaded_rms.vision_config.ops_config.attn_implementation == "eager"
+
+    # Three-level config (root -> thinker_config -> text_config) preserves grandchild attention under sparse override.
+    omni_dir = tmp_path / "qwen3_omni"
+    omni_cfg = Qwen3OmniMoeConfig(
+        ops_implementation={"attn_implementation": "sdpa", "rms_norm_implementation": "eager"},
+        thinker_config={"text_config": {"ops_implementation": {"attn_implementation": "eager"}}},
+    )
+    omni_cfg.save_pretrained(omni_dir)
+
+    omni_reloaded = Qwen3OmniMoeConfig.from_pretrained(
+        omni_dir,
+        ops_implementation={"rms_norm_implementation": "liger_kernel"},
+    )
+    assert omni_reloaded.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert omni_reloaded.thinker_config.vision_config.ops_config.rms_norm_implementation == "liger_kernel"
+    assert omni_reloaded.thinker_config.text_config._attn_implementation == "eager"
+    assert omni_reloaded.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert omni_reloaded.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"

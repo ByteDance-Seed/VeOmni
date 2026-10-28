@@ -181,8 +181,7 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
             current = dict(getattr(self, "processor_config", None) or {})
             self.processor_config = {**current, **deepcopy(processor_config)}
         if base_ops or entry_ops:
-            own = dict(getattr(self, "ops_implementation", None) or {})
-            self._set_ops_implementation({**own, **(base_ops or {}), **(entry_ops or {})})
+            self._set_ops_implementation({**(base_ops or {}), **(entry_ops or {})})
 
 
 __all__ = [
