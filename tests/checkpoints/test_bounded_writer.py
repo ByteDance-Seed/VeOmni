@@ -16,7 +16,8 @@ from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.planner import WriteItemType
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, RunnerCapabilities
+from scripts.ci.accelerator.runtime.devices import child_environment
 from veomni.checkpoint.bounded_writer import BoundedFileSystemWriter, _buckets
 
 
@@ -290,8 +291,9 @@ def test_missing_cache_advice_api_logs_once_and_preserves_checkpoint(tmp_path, m
 
 
 @pytest.mark.parametrize("mode", ["roundtrip", "fail"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_two_rank_gloo_advice_roundtrip_and_failure_propagation(tmp_path, mode):
-    env = os.environ.copy()
+    env = child_environment(RunnerCapabilities("cpu"), (), cpu=True)
     env.update(TORCH_DEVICE_BACKEND_AUTOLOAD="0", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
     worker = Path(__file__).with_name("bounded_writer_gloo_worker.py")
     result = subprocess.run(

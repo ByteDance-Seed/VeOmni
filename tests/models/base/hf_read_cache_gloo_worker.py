@@ -17,6 +17,8 @@ def main():
     dist.init_process_group("gloo")
     try:
         rank = dist.get_rank()
+        if os.getenv("VEOMNI_TEST_INVALID_CACHE_RANK") == str(rank):
+            os.environ["VEOMNI_HF_DROP_READ_CACHE"] = "invalid"
         weights.get_parallel_state = lambda: SimpleNamespace(global_rank=rank)
         # This test exercises real Gloo collectives with CPU parameters even
         # when its host also has CUDA/NPU devices.

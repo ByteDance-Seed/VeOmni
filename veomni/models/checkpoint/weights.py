@@ -159,6 +159,17 @@ def init_empty_weights():
         nn.Module.register_parameter = old_register_parameter
 
 
+def _hf_read_cache_advice_enabled():
+    value = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
+    if value not in ("0", "1"):
+        # This is a best-effort memory hint, and individual loaders can run on
+        # only a subset of ranks. A local error here can strand peers in a model
+        # broadcast, so disable the hint rather than diverge on a typo.
+        logger.warning("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1; disabling read-cache advice")
+        return False
+    return value == "1"
+
+
 def _release_hf_read_cache(paths):
     """Optionally advise the OS that completed checkpoint reads can be evicted.
 
@@ -166,11 +177,9 @@ def _release_hf_read_cache(paths):
     reads. Each reader advises after it has finished loading so a slower rank
     can still reread a page and release it when its own load completes.
     """
-    enabled = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
-    if enabled not in ("0", "1"):
-        raise ValueError("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1")
-    result = {"enabled": enabled == "1", "attempted": 0, "succeeded": 0, "failed": 0}
-    if enabled == "0":
+    enabled = _hf_read_cache_advice_enabled()
+    result = {"enabled": enabled, "attempted": 0, "succeeded": 0, "failed": 0}
+    if not enabled:
         return result
     paths = {os.fspath(path) for path in paths}
     if not callable(getattr(os, "posix_fadvise", None)) or not hasattr(os, "POSIX_FADV_DONTNEED"):
@@ -238,10 +247,7 @@ def _advise_after_hf_load(mode):
     def decorate(loader):
         @wraps(loader)
         def wrapped(model, weights_path, *args, **kwargs):
-            enabled = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
-            if enabled not in ("0", "1"):
-                raise ValueError("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1")
-            if enabled == "0":
+            if not _hf_read_cache_advice_enabled():
                 return loader(model, weights_path, *args, **kwargs)
             distributed = dist.is_available() and dist.is_initialized()
             capture = {"mode": "ep" if mode == "ep" else "standard", "paths": None}

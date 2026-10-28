@@ -71,10 +71,9 @@ def test_hf_read_cache_advice_failure_does_not_modify_source(monkeypatch, tmp_pa
     assert source.read_bytes() == b"original"
 
 
-def test_hf_read_cache_invalid_option_fails(monkeypatch):
+def test_hf_read_cache_invalid_option_disables_advice(monkeypatch):
     monkeypatch.setenv("VEOMNI_HF_DROP_READ_CACHE", "unknown")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
-        weights._release_hf_read_cache([])
+    assert weights._release_hf_read_cache([]) == {"enabled": False, "attempted": 0, "succeeded": 0, "failed": 0}
 
 
 def test_hf_read_cache_close_failure_is_best_effort(monkeypatch, tmp_path):
@@ -144,8 +143,11 @@ def test_rank0_broadcast_releases_only_on_the_reader(monkeypatch, tmp_path, rank
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX file advice")
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_rank0_broadcast_gloo_preserves_weights_and_advises_once(monkeypatch, tmp_path):
+@pytest.mark.parametrize("invalid_rank", [None, 0, 1])
+def test_rank0_broadcast_gloo_preserves_weights_and_advises_once(monkeypatch, tmp_path, invalid_rank):
     monkeypatch.setenv("VEOMNI_HF_DROP_READ_CACHE", "1")
+    if invalid_rank is not None:
+        monkeypatch.setenv("VEOMNI_TEST_INVALID_CACHE_RANK", str(invalid_rank))
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     original = torch.nn.Linear(4, 4)
@@ -174,7 +176,7 @@ def test_rank0_broadcast_gloo_preserves_weights_and_advises_once(monkeypatch, tm
     )
     rows = json.loads(output.read_text())
     assert rows == [
-        {"rank": 0, "equal": True, "paths": [str(source.resolve())]},
+        {"rank": 0, "equal": True, "paths": [] if invalid_rank == 0 else [str(source.resolve())]},
         {"rank": 1, "equal": True, "paths": []},
     ]
     assert source.read_bytes() == source_bytes
