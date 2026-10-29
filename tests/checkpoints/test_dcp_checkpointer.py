@@ -79,7 +79,10 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
 
         checkpoint_dir = tmp_path / "ckpt"
         dcp.save(
-            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
+            {
+                "model": ModelState(source_model),
+                "optimizer": OptimizerState(source_model, source_optimizer, coordinated_group_validation=True),
+            },
             checkpoint_id=str(checkpoint_dir),
         )
         dist.barrier()
@@ -88,7 +91,9 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
         dcp.load(
             {
                 "model": ModelState(target_model),
-                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
+                "optimizer": OptimizerState(
+                    target_model, target_optimizer, load=True, coordinated_group_validation=True
+                ),
             },
             checkpoint_id=str(checkpoint_dir),
         )

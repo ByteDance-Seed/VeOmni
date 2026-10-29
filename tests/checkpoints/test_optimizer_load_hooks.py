@@ -142,7 +142,10 @@ def _distributed_load_hook_worker(rank, rendezvous, path):
         model, _, _, optimizer = make()
         model(torch.ones(2, 2)).sum().backward()
         optimizer.step()
-        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=ps)}, checkpoint_id=path)
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=ps, coordinated_group_validation=True)},
+            checkpoint_id=path,
+        )
         target_model, first, second, target = make()
         seen_first, seen_second = [], []
 

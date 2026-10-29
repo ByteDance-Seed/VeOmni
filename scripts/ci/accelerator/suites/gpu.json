@@ -668,7 +668,8 @@
     "args": [
       "-s",
       "-x",
-      "tests/optim/test_qwen38_muon.py"
+      "tests/optim/test_qwen38_muon.py",
+      "tests/optim/test_qwen38_muon_dormant_checkpoint.py"
     ]
   },
   {

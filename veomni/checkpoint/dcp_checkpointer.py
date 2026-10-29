@@ -322,6 +322,280 @@ def _abort_file_backed_optimizers(optimizer):
             abort()
 
 
+def _persistent_optimizer_rows(model, optimizer):
+    """Describe persistent extra-parallel optimizer steps before serialization.
+
+    A scalar Adam step is replicated in DCP, even when its parameter is
+    owner-sharded.  Do not silently save distinct owner-local steps as one.
+    """
+    specs = getattr(model, "_fqn2spec_info", None) or {}
+    persistent = {name for name, spec in specs.items() if getattr(spec, "persistent_fsdp_shard_dim", None) is not None}
+    names = {id(param): name for name, param in model.named_parameters() if name in persistent}
+    rows = {}
+    for leaf in _iter_optimizer_leaves(optimizer):
+        for group in leaf.param_groups:
+            for param in group["params"]:
+                name = names.get(id(param))
+                if name is None:
+                    continue
+                if name in rows:
+                    raise RuntimeError(f"Duplicate optimizer parameter for persistent shard {name}")
+                if not param.requires_grad:
+                    raise RuntimeError(
+                        f"Cannot checkpoint frozen persistent optimizer parameter {name}; rebuild the optimizer"
+                    )
+                layout = json.loads(group.get("qwen38_ple_step_layout", "null"))
+                owner_grid = (
+                    group.get("qwen38_ple_lookup") is True
+                    and getattr(leaf, "requires_exact_recipe", False)
+                    and isinstance(param, DTensor)
+                    and layout == ["owner-grid-v1", param.device_mesh.mesh.tolist()]
+                )
+                if any(
+                    getattr(leaf, key, None)
+                    for key in ("_optimizer_state_dict_pre_hooks", "_optimizer_state_dict_post_hooks")
+                ):
+                    raise RuntimeError("Persistent-shard optimizer checkpoints do not support state-dict hooks")
+                if owner_grid:
+                    rows[name] = ("owner-grid", True, None)
+                    continue
+                state = leaf.state.get(param, {})
+                local = param.to_local() if isinstance(param, DTensor) else param
+                if not state and (local.numel() or not leaf.state):
+                    raise RuntimeError(
+                        f"Saving an uninitialized persistent optimizer state for {name} is unsupported; "
+                        "save after all owners have state or use a lazy-state-aware optimizer"
+                    )
+                signature = None
+                if state:
+                    step = state.get("step")
+                    if torch.is_tensor(step) and step.ndim == 0:
+                        if isinstance(step, DTensor):
+                            raise RuntimeError(f"Persistent-shard optimizer scalar step is distributed for {name}")
+                        value, dtype = float(step.item()), str(step.dtype)
+                    elif type(step) in (int, float):
+                        value, dtype = float(step), type(step).__qualname__
+                    else:
+                        raise RuntimeError(f"Persistent-shard optimizer step is not a scalar for {name}")
+                    if not math.isfinite(value) or value < 0 or not value.is_integer():
+                        raise RuntimeError(f"Persistent-shard optimizer step is invalid for {name}")
+                    fields = tuple(
+                        (key, str(item.dtype) if torch.is_tensor(item) else type(item).__qualname__)
+                        for key, item in sorted(state.items())
+                    )
+                    signature = (fields, dtype, value)
+                rows[name] = ("scalar", bool(local.numel()), signature)
+    return rows
+
+
+def _checkpoint_group_has_complete_replica(mesh, placements, ranks):
+    """Whether the group covers every distinct shard, across any replicas."""
+    grid = mesh.mesh
+    if len(placements) != grid.ndim:
+        raise RuntimeError("Checkpoint mesh placements do not match mesh dimensionality")
+    flat_ranks = grid.reshape(-1).tolist()
+    if set(flat_ranks).issubset(ranks):
+        return True
+    shard_axes = [axis for axis, placement in enumerate(placements) if not isinstance(placement, Replicate)]
+    strides = [math.prod(grid.shape[axis + 1 :]) for axis in range(grid.ndim)]
+    covered = {
+        tuple((index // strides[axis]) % grid.shape[axis] for axis in shard_axes)
+        for index, rank in enumerate(flat_ranks)
+        if rank in ranks
+    }
+    return len(covered) == math.prod(grid.shape[axis] for axis in shard_axes)
+
+
+def _validate_persistent_optimizer_ownership(model, optimizer, group=None, *, coordinated=False, check_coverage=True):
+    """Check frozen targets and ensure the DCP group covers each persistent mesh."""
+    error = None
+    try:
+        specs = getattr(model, "_fqn2spec_info", None) or {}
+        persistent = {
+            name for name, spec in specs.items() if getattr(spec, "persistent_fsdp_shard_dim", None) is not None
+        }
+        names = {id(param): name for name, param in model.named_parameters() if name in specs}
+        params = [
+            param
+            for leaf in _iter_optimizer_leaves(optimizer)
+            for param_group in leaf.param_groups
+            for param in param_group["params"]
+            if id(param) in names
+        ]
+        if dist.is_initialized() and group is not None and not coordinated:
+            raise RuntimeError("Optimizer checkpoints with an explicit group require coordinated DCP validation")
+        if (
+            dist.is_initialized()
+            and dist.get_world_size() > 1
+            and not coordinated
+            and any(names[id(param)] in persistent for param in params)
+        ):
+            raise RuntimeError("Persistent optimizer checkpoints require coordinated DCP validation")
+        ranks = None
+        if dist.is_initialized():
+            ranks = set(range(dist.get_world_size())) if group is None else set(dist.get_process_group_ranks(group))
+        coverage = {}
+        for param in params:
+            name = names[id(param)]
+            if name in persistent and not param.requires_grad:
+                raise RuntimeError(
+                    f"Cannot checkpoint frozen persistent optimizer parameter {name}; rebuild the optimizer"
+                )
+            if ranks is not None and check_coverage:
+                spec = specs[name]
+                mesh = (
+                    getattr(spec, "para_fsdp_mesh", None)
+                    if isinstance(getattr(spec, "placement", None), Shard)
+                    else None
+                )
+                if mesh is not None:
+                    # ParallelPlan uses (... replica, FSDP, ExtraParallel).
+                    placements = [Replicate()] * max(0, mesh.ndim - 2) + [Shard(0)] * min(2, mesh.ndim)
+                elif isinstance(param, DTensor):
+                    mesh, placements = param.device_mesh, param.placements
+                else:
+                    continue
+                key = (id(mesh), tuple(isinstance(placement, Replicate) for placement in placements))
+                if key not in coverage:
+                    coverage[key] = _checkpoint_group_has_complete_replica(mesh, placements, ranks)
+                if not coverage[key]:
+                    raise RuntimeError(f"DCP group does not cover extra-parallel parameter owners for {name}")
+    except BaseException as exc:
+        error = exc
+    if coordinated:
+        raise_if_any_rank_failed(error, "validating persistent optimizer ownership", group=group)
+    elif error is not None:
+        raise error
+
+
+def _validate_persistent_optimizer_steps(model, optimizer, group=None, *, coordinated=False):
+    """Guard scalar owner steps without introducing implicit process groups."""
+    rows, error = {}, None
+    try:
+        rows = _persistent_optimizer_rows(model, optimizer)
+        if not coordinated and rows and dist.is_initialized() and dist.get_world_size() > 1:
+            raise RuntimeError(
+                "Saving persistent-shard optimizer steps requires coordinated DCP validation; "
+                "use DistributedCheckpointer or explicitly supply the DCP process group"
+            )
+    except BaseException as exc:
+        error = exc
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1 or not coordinated:
+        if error is not None:
+            raise error
+        return rows
+    raise_if_any_rank_failed(error, "inspecting persistent optimizer checkpoint steps", group=group)
+    gathered = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, rows, group=group)
+    if any(set(entry) != set(rows) for entry in gathered):
+        raise RuntimeError("Persistent optimizer checkpoint parameter inventory differs across ranks")
+    for name in rows:
+        entries = [entry[name] for entry in gathered]
+        if any(entry[0] != entries[0][0] for entry in entries):
+            raise RuntimeError(f"Persistent optimizer step layouts differ across ranks for {name}")
+        if entries[0][0] == "owner-grid":
+            continue
+        contributors = [entry[2] for entry in entries if entry[1]]
+        writers = [entry[2] for entry in entries if entry[2] is not None]
+        if (
+            (contributors and any(value != contributors[0] for value in contributors[1:]))
+            or (writers and any(value != writers[0] for value in writers[1:]))
+            or (writers and contributors and contributors[0] is None)
+        ):
+            raise RuntimeError(
+                f"DCP cannot preserve different persistent owner optimizer states/steps for {name}; "
+                "a shard-aware step representation is required"
+            )
+    return rows
+
+
+def _verify_serialized_persistent_steps(model, rows, state_dict):
+    """Check the actual serialized representation, not just its recipe marker."""
+    if not rows:
+        return
+    params = dict(model.named_parameters())
+    nested_state = state_dict.get("state", {})
+    for name, (kind, _active, signature) in rows.items():
+        step = state_dict.get(f"state.{name}.step")
+        if step is None and name in nested_state:
+            step = nested_state[name].get("step")
+        if kind == "owner-grid":
+            param = params[name]
+            shape = tuple(param.device_mesh.mesh.shape)
+            if not (
+                isinstance(step, DTensor)
+                and tuple(step.shape) == shape
+                and tuple(step.placements) == tuple(Shard(axis) for axis in range(len(shape)))
+                and torch.equal(step.device_mesh.mesh, param.device_mesh.mesh)
+            ):
+                raise RuntimeError(f"Persistent optimizer step for {name} is not saved with its owner grid")
+        elif signature is None:
+            if step is not None:
+                raise RuntimeError(f"Saving created synthetic persistent optimizer state for {name}")
+        else:
+            _fields, dtype, value = signature
+            if torch.is_tensor(step) and not isinstance(step, DTensor) and step.ndim == 0:
+                actual = (str(step.dtype), float(step.item()))
+            elif type(step) in (int, float):
+                actual = (type(step).__qualname__, float(step))
+            else:
+                raise RuntimeError(f"Saved persistent optimizer step is not a scalar for {name}")
+            if actual != (dtype, value):
+                raise RuntimeError(f"Persistent optimizer step changed during checkpoint serialization for {name}")
+
+
+def _validate_exact_optimizer_ownership(optimizer, group=None, *, coordinated=False, check_coverage=True):
+    """Reject frozen restore targets and incomplete distributed owner groups."""
+    error = None
+    try:
+        leaves = [leaf for leaf in _iter_optimizer_leaves(optimizer) if getattr(leaf, "requires_exact_recipe", False)]
+        if dist.is_initialized() and dist.get_world_size() > 1 and not coordinated and leaves:
+            raise RuntimeError("Distributed Muon checkpoints require coordinated DCP validation")
+        ranks = None
+        if dist.is_initialized():
+            ranks = set(range(dist.get_world_size())) if group is None else set(dist.get_process_group_ranks(group))
+        coverage = {}
+        for leaf in leaves:
+            for param_group in leaf.param_groups:
+                for param in param_group["params"]:
+                    if not param.requires_grad:
+                        raise RuntimeError("Cannot checkpoint frozen Muon optimizer parameters; rebuild the optimizer")
+                    if ranks is not None and check_coverage and isinstance(param, DTensor):
+                        key = (id(param.device_mesh), tuple(isinstance(p, Replicate) for p in param.placements))
+                        if key not in coverage:
+                            coverage[key] = _checkpoint_group_has_complete_replica(
+                                param.device_mesh, param.placements, ranks
+                            )
+                        if not coverage[key]:
+                            raise RuntimeError("DCP group does not cover Muon optimizer parameter owners")
+    except BaseException as exc:
+        error = exc
+    if coordinated:
+        raise_if_any_rank_failed(error, "validating Muon optimizer ownership", group=group)
+    elif error is not None:
+        raise error
+
+
+def _validate_trainable_optimizer_owners(optimizer, group=None, *, coordinated=False):
+    if dist.is_initialized() and dist.get_world_size() > 1 and not coordinated:
+        return
+    error = None
+    try:
+        if any(
+            not param.requires_grad
+            for leaf in _iter_optimizer_leaves(optimizer)
+            for param_group in leaf.param_groups
+            for param in param_group["params"]
+        ):
+            raise RuntimeError("Cannot checkpoint frozen optimizer parameters; rebuild the optimizer")
+    except BaseException as exc:
+        error = exc
+    if coordinated:
+        raise_if_any_rank_failed(error, "validating trainable optimizer ownership", group=group)
+    elif error is not None:
+        raise error
+
+
 def _validate_nonple_save_state(model, optimizer, group=None, *, require_step=False):
     """Fail closed if non-PLE shards cannot share a faithful DCP state."""
     if not dist.is_initialized():
@@ -337,18 +611,26 @@ def _validate_nonple_save_state(model, optimizer, group=None, *, require_step=Fa
                 if not param_group["params"]:
                     raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
                 if param_group.get("qwen38_ple_lookup"):
+                    if any(not param.requires_grad for param in param_group["params"]):
+                        raise RuntimeError("Cannot checkpoint frozen PLE optimizer parameters; rebuild the optimizer")
                     layout = json.loads(param_group.get("qwen38_ple_step_layout", "null"))
                     if not getattr(leaf, "requires_exact_recipe", False) or not (
                         isinstance(layout, list) and len(layout) == 2 and layout[0] == "owner-grid-v1"
                     ):
                         raise RuntimeError("Unrecognized PLE checkpoint owner-step layout")
-                    continue
-                for param in param_group["params"]:
-                    if not param.requires_grad:
+                    if all(
+                        isinstance(param, DTensor) and layout[1] == param.device_mesh.mesh.tolist()
+                        for param in param_group["params"]
+                    ):
                         continue
+                for param in param_group["params"]:
                     name = names.get(id(param))
                     if name is None or name in local_rows:
                         raise RuntimeError("Cannot identify a unique non-PLE checkpoint optimizer parameter")
+                    if not param.requires_grad:
+                        raise RuntimeError(
+                            f"Cannot checkpoint frozen optimizer parameter {name}; rebuild the optimizer"
+                        )
                     local_param = param.to_local() if isinstance(param, DTensor) else param
                     value = leaf.state.get(param, {})
                     if value:
@@ -1383,6 +1665,10 @@ class OptimizerState(Stateful):
     incoming state before load hooks, preserving lazy initialization and the
     user hook contract for the parameter's first actual update.
 
+    Persistent scalar-owner saves reject uninitialized owners or differing
+    owner states. Coordinated saves and loads reject frozen optimizer-owned
+    parameters; persistent and exact-recipe restore targets must be trainable.
+
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
     cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
     validates model-key completeness from checkpoint metadata before loading a
@@ -1397,6 +1683,11 @@ class OptimizerState(Stateful):
             entries.  When ``False`` (the save path), the returned dict is
             sparse, preserving parameter groups while avoiding synthetic
             optimizer state for unused parameters (e.g. unused MoE experts).
+        coordinated_group_validation: every rank in the DCP group must call the
+            wrapper collectively. Required for distributed optimizer saves and
+            loads, unless ``coordinated`` provides equivalent group handling.
+        coordinated_group: the same group passed to ``dcp.save`` or ``dcp.load``;
+            ``None`` denotes the default world group.
 
     Precision-sensitive optimizers opt out of partial state restoration of an
     existing but incomplete state. A parameter with no saved state at all keeps
@@ -1431,9 +1722,27 @@ class OptimizerState(Stateful):
         self._coordinate_state_dict = False
 
     def state_dict(self):
+        coordinated = self._coordinated or self._coordinated_group_validation
+        if dist.is_initialized() and dist.get_world_size() > 1 and not coordinated:
+            raise RuntimeError("Distributed optimizer checkpoints require coordinated DCP validation")
+        _validate_persistent_optimizer_ownership(
+            self.model, self.optimizer, self._coordinated_group, coordinated=coordinated, check_coverage=not self._load
+        )
+        _validate_exact_optimizer_ownership(
+            self.optimizer, self._coordinated_group, coordinated=coordinated, check_coverage=not self._load
+        )
+        _validate_trainable_optimizer_owners(self.optimizer, self._coordinated_group, coordinated=coordinated)
         if not self._coordinated:
             if not self._coordinated_group_validation:
-                return self._state_dict_impl()
+                rows = (
+                    _validate_persistent_optimizer_steps(self.model, self.optimizer, self._coordinated_group)
+                    if not self._load
+                    else {}
+                )
+                result = self._state_dict_impl()
+                if not self._load:
+                    _verify_serialized_persistent_steps(self.model, rows, result)
+                return result
             from torch.distributed.fsdp import FullyShardedDataParallel
 
             if any(isinstance(module, FullyShardedDataParallel) for module in self.model.modules()):
@@ -1456,13 +1765,19 @@ class OptimizerState(Stateful):
                 raise_if_any_rank_failed(error, "preparing optimizer checkpoint state", group=self._coordinated_group)
                 self._agree_parameter_uniqueness()
                 self._agree_external_optimizer_hooks()
+                persistent_rows = {}
                 if not self._load:
                     _validate_nonple_save_state(self.model, self.optimizer, group=self._coordinated_group)
+                    persistent_rows = _validate_persistent_optimizer_steps(
+                        self.model, self.optimizer, self._coordinated_group, coordinated=True
+                    )
                 self._prime_checkpoint_meshes()
                 result, error = None, None
                 try:
                     self._coordinate_state_dict = True
                     result = self._state_dict_impl()
+                    if not self._load:
+                        _verify_serialized_persistent_steps(self.model, persistent_rows, result)
                 except BaseException as exc:
                     error = exc
                 finally:
@@ -1474,7 +1789,12 @@ class OptimizerState(Stateful):
                 return result
         self._coordinated_file_mode = _agree_file_backed_mode(self.optimizer, group=self._coordinated_group)
         if not self._coordinated_file_mode:
-            return self._state_dict_impl()
+            self._coordinated = False
+            self._coordinated_group_validation = True
+            try:
+                return self.state_dict()
+            finally:
+                self._coordinated = True
         from torch.distributed.fsdp import FullyShardedDataParallel
 
         unsupported = self.parallel_state.dp_mode not in ("fsdp2", "ddp") or any(
@@ -1500,11 +1820,18 @@ class OptimizerState(Stateful):
             raise_if_any_rank_failed(error, "preparing optimizer checkpoint state", group=self._coordinated_group)
             self._agree_parameter_uniqueness()
             self._agree_external_optimizer_hooks()
+            persistent_rows = {}
+            if not self._load:
+                persistent_rows = _validate_persistent_optimizer_steps(
+                    self.model, self.optimizer, self._coordinated_group, coordinated=True
+                )
             self._prime_checkpoint_meshes()
             result, error = None, None
             try:
                 self._coordinate_state_dict = True
                 result = self._state_dict_impl()
+                if not self._load:
+                    _verify_serialized_persistent_steps(self.model, persistent_rows, result)
             except BaseException as exc:
                 error = exc
             finally:

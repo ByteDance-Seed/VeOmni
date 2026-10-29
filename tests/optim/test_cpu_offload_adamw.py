@@ -637,12 +637,18 @@ def _rank_sparse_optimizer_worker(rank, rendezvous, checkpoint_dir):
             optimizer.step()
             optimizer.zero_grad()
         state = SimpleNamespace(dp_mode="ddp")
-        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        # Construct a legacy inconsistent checkpoint to exercise load rejection.
+        legacy_state = OptimizerState(model, optimizer, parallel_state=state)._state_dict_impl()
+        dcp.save({"optimizer": legacy_state}, checkpoint_id=checkpoint_dir)
         target_model = torch.nn.Linear(1, 1, bias=False)
         target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
         with pytest.raises(CheckpointException, match="rank-local lazy state cannot be reconstructed"):
             dcp.load(
-                {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+                {
+                    "optimizer": OptimizerState(
+                        target_model, target, parallel_state=state, load=True, coordinated_group_validation=True
+                    )
+                },
                 checkpoint_id=checkpoint_dir,
                 planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
             )
@@ -674,7 +680,10 @@ def _rank_partial_optimizer_guard_worker(rank, rendezvous, checkpoint_dir):
         optimizer.step()
         optimizer.zero_grad()
         state = SimpleNamespace(dp_mode="ddp")
-        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=state, coordinated_group_validation=True)},
+            checkpoint_id=checkpoint_dir,
+        )
         target_model = torch.nn.Linear(1, 1)
         target = torch.optim.AdamW(target_model.parameters(), lr=0.01)
         if rank == 0:
@@ -683,7 +692,11 @@ def _rank_partial_optimizer_guard_worker(rank, rendezvous, checkpoint_dir):
             target.zero_grad()
         with pytest.raises(CheckpointException, match="no target placeholder"):
             dcp.load(
-                {"optimizer": OptimizerState(target_model, target, parallel_state=state, load=True)},
+                {
+                    "optimizer": OptimizerState(
+                        target_model, target, parallel_state=state, load=True, coordinated_group_validation=True
+                    )
+                },
                 checkpoint_id=checkpoint_dir,
                 planner=_ModelStrictLoadPlanner(strict_model=False, optimizer=target),
             )
@@ -718,7 +731,10 @@ def _rank_group_mismatch_guard_worker(rank, rendezvous, checkpoint_dir):
         optimizer.step()
         optimizer.zero_grad()
         state = SimpleNamespace(dp_mode="ddp")
-        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=state, coordinated_group_validation=True)},
+            checkpoint_id=checkpoint_dir,
+        )
         target_model = torch.nn.Linear(1, 1)
         target_groups = (
             [{"params": [target_model.weight, target_model.bias]}]
@@ -775,7 +791,10 @@ def _rank_state_dict_error_worker(rank, rendezvous, checkpoint_dir, phase):
             param.grad = torch.ones_like(param)
         optimizer.step()
         state = SimpleNamespace(dp_mode="ddp")
-        dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=state)}, checkpoint_id=checkpoint_dir)
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=state, coordinated_group_validation=True)},
+            checkpoint_id=checkpoint_dir,
+        )
         target_model = torch.nn.Linear(1, 1)
         target = torch.optim.AdamW(target_model.parameters())
         if rank == 0:
@@ -977,7 +996,7 @@ def _rank_extra_parallel_drop_error_worker(rank, rendezvous, checkpoint_dir, pha
             param.grad = torch.ones_like(param)
         optimizer.step()
         state = SimpleNamespace(dp_mode="fsdp2")
-        source = OptimizerState(model, optimizer, parallel_state=state)
+        source = OptimizerState(model, optimizer, parallel_state=state, coordinated_group_validation=True)
         source.get_state_dict_with_extra_parallel_dim_preprocess = lambda value, action: value
         dcp.save({"optimizer": source}, checkpoint_id=checkpoint_dir)
 
@@ -1673,7 +1692,11 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
             {key: value for key, value in group.items() if key != "params"} for group in source_child.param_groups
         ]
         dcp.save(
-            {"optimizer": OptimizerState(model, source, parallel_state=parallel_state)},
+            {
+                "optimizer": OptimizerState(
+                    model, source, parallel_state=parallel_state, coordinated_group_validation=True
+                )
+            },
             checkpoint_id=checkpoint,
         )
         dist.barrier()
@@ -1683,7 +1706,11 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
         target_model._fqn2spec_info = model._fqn2spec_info
         target_child, target = make_optimizer(target_model)
         dcp.load(
-            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            {
+                "optimizer": OptimizerState(
+                    target_model, target, parallel_state=parallel_state, load=True, coordinated_group_validation=True
+                )
+            },
             checkpoint_id=checkpoint,
             planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
         )

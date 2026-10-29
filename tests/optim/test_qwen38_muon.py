@@ -493,7 +493,9 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
             dcp.save(
                 {
                     "model": ModelState(model, parallel_state=ps),
-                    "optimizer": OptimizerState(model, optimizer, parallel_state=ps),
+                    "optimizer": OptimizerState(
+                        model, optimizer, parallel_state=ps, coordinated_group_validation=True
+                    ),
                 },
                 storage_writer=_cpu_dcp_writer(path),
             )
@@ -518,7 +520,9 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
             dcp.load(
                 {
                     "model": ModelState(model, parallel_state=ps),
-                    "optimizer": OptimizerState(model, optimizer, parallel_state=ps, load=True),
+                    "optimizer": OptimizerState(
+                        model, optimizer, parallel_state=ps, load=True, coordinated_group_validation=True
+                    ),
                 },
                 checkpoint_id=path,
                 planner=_ModelStrictLoadPlanner(True, True, True, optimizer=optimizer),
