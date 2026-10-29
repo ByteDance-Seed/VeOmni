@@ -37,7 +37,7 @@ def select_cpu_offload_groups(model, groups, patterns):
                 raise ValueError("Optimizer parameter is absent from model.named_parameters()")
             matches = [bool(expression.search(name)) for expression in expressions]
             for index, matched in enumerate(matches):
-                hits[index] += int(matched)
+                hits[index] += int(matched and param.requires_grad)
             (selected if any(matches) else resident).append(param)
         for params, offload in ((selected, True), (resident, False)):
             if params:
