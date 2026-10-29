@@ -455,12 +455,12 @@ def _dpo_objective_parameters(config: Any) -> dict[str, Any]:
     if result["refer_model_precision"] not in ("float32", "bfloat16"):
         raise ValueError("DPO refer_model_precision must be 'float32' or 'bfloat16'")
     fingerprint = result["audited_unpadded_tokenizer_sha256"]
-    if fingerprint is not None and (
-        type(fingerprint) is not str
-        or len(fingerprint) != 64
-        or any(ch not in "0123456789abcdef" for ch in fingerprint)
-    ):
-        raise ValueError("DPO audited_unpadded_tokenizer_sha256 must be a lowercase SHA-256 digest")
+    if fingerprint is not None:
+        digest = fingerprint.removeprefix("v2:") if type(fingerprint) is str else ""
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError(
+                "DPO audited_unpadded_tokenizer_sha256 must be a lowercase SHA-256 digest, optionally v2:"
+            )
     return result
 
 
@@ -526,7 +526,7 @@ class DPOConfig:
     )
     audited_unpadded_tokenizer_sha256: Optional[str] = field(
         default=None,
-        metadata={"help": "Fingerprint of a fast tokenizer explicitly audited to emit unpadded DPO sequences."},
+        metadata={"help": "Audited unpadded fast-tokenizer fingerprint; v2: prefix selects path-independent format."},
     )
 
 

@@ -173,6 +173,16 @@ tokenizer = loaded.tokenizer if isinstance(loaded, ProcessorMixin) else loaded
 print(dpo_tokenizer_fingerprint(tokenizer))
 ```
 
+For a new audit that must work when identical tokenizer files are loaded from
+different directories, use `dpo_tokenizer_fingerprint(tokenizer, portable=True)`
+and supply the full `v2:`-prefixed result as
+`audited_unpadded_tokenizer_sha256`. The portable fingerprint omits only the
+known loading-path fields; it still binds the serialized backend and other
+tokenizer settings. The default produces the original path-sensitive fingerprint
+to preserve existing attestations and checkpoints. Switching an existing DPO
+checkpoint to `v2:` requires a separately validated migration and re-audit;
+it is not an implicit resume conversion.
+
 The fingerprint binds the class, serialized backend, special tokens, padding
 settings, and native chat template. Transient backend padding/truncation state
 that Transformers resets on each call is normalized before hashing; DPO uses

@@ -265,7 +265,8 @@ def dpo_tokenizer_contract_identity(tokenizer: Any, audited_sha256: str | None) 
     if type(tokenizer).__dict__.get("dpo_unpadded_output_contract") is True:
         return dpo_declared_producer_identity(tokenizer, "tokenizer")
     if type(tokenizer) in (PreTrainedTokenizerFast, Qwen2Tokenizer, LlamaTokenizer, GPT2Tokenizer):
-        actual = dpo_tokenizer_fingerprint(tokenizer)
+        portable = isinstance(audited_sha256, str) and audited_sha256.startswith("v2:")
+        actual = dpo_tokenizer_fingerprint(tokenizer, portable=portable)
         if type(audited_sha256) is str and actual == audited_sha256:
             return actual
     raise ValueError(

@@ -210,6 +210,45 @@ def test_checkpoint_mode_contract(current, saved, allow_legacy, allow_legacy_obj
         trainer.validate_dpo_provenance_checkpoint(saved)
 
 
+def test_portable_fingerprint_checkpoint_recovery_across_tokenizer_directories(tmp_path):
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from veomni.utils.dpo_provenance import dpo_tokenizer_fingerprint
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=BackendTokenizer(WordLevel({"[UNK]": 0, "a": 1}, unk_token="[UNK]")), unk_token="[UNK]"
+    )
+    roots = [tmp_path / "one", tmp_path / "two"]
+    for root in roots:
+        tokenizer.save_pretrained(root)
+    first, second = [PreTrainedTokenizerFast.from_pretrained(root) for root in roots]
+    fingerprint = dpo_tokenizer_fingerprint(first, portable=True)
+    trainer = _trainer(True)
+    trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = fingerprint
+    trainer._dpo_objective_parameters = _dpo_objective_parameters(trainer.base.args.dpo_config)
+    trainer.policy_model.tokenizer = first
+    trainer._dpo_producer_identity = dpo_producer_identity(first, None, fingerprint)
+    saved = trainer.dpo_provenance_checkpoint_state()
+    trainer.policy_model.tokenizer = second
+    trainer.validate_dpo_provenance_checkpoint(saved)
+    second.add_tokens(["changed"])
+    with pytest.raises(ValueError):
+        trainer.validate_dpo_provenance_checkpoint(saved)
+
+
+def test_checkpoint_rejects_implicit_legacy_to_portable_fingerprint_migration():
+    trainer = _trainer(True)
+    trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = "a" * 64
+    trainer._dpo_objective_parameters = _dpo_objective_parameters(trainer.base.args.dpo_config)
+    saved = trainer.dpo_provenance_checkpoint_state()
+    trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = "v2:" + "a" * 64
+    trainer._dpo_objective_parameters = _dpo_objective_parameters(trainer.base.args.dpo_config)
+    with pytest.raises(ValueError, match="provenance mode"):
+        trainer.validate_dpo_provenance_checkpoint(saved)
+
+
 def test_checkpoint_rejects_a_different_audited_tokenizer():
     trainer = _trainer(True)
     trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = "a" * 64
@@ -219,6 +258,21 @@ def test_checkpoint_rejects_a_different_audited_tokenizer():
     trainer._dpo_objective_parameters = _dpo_objective_parameters(trainer.base.args.dpo_config)
     with pytest.raises(ValueError, match="provenance mode"):
         trainer.validate_dpo_provenance_checkpoint(saved)
+
+
+@pytest.mark.parametrize("fingerprint", ["a" * 64, "v2:" + "b" * 64])
+def test_dpo_config_accepts_versioned_and_legacy_audit(fingerprint):
+    trainer = _trainer(True)
+    trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = fingerprint
+    assert _dpo_objective_parameters(trainer.base.args.dpo_config)["audited_unpadded_tokenizer_sha256"] == fingerprint
+
+
+@pytest.mark.parametrize("fingerprint", ["v2:" + "A" * 64, "v2:" + "a" * 63, "v2:v2:" + "a" * 64, 42])
+def test_dpo_config_rejects_malformed_versioned_audit(fingerprint):
+    trainer = _trainer(True)
+    trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = fingerprint
+    with pytest.raises(ValueError, match="lowercase SHA-256 digest"):
+        _dpo_objective_parameters(trainer.base.args.dpo_config)
 
 
 @pytest.mark.parametrize(

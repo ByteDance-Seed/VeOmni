@@ -116,6 +116,80 @@ def test_untrusted_hf_subclass_cannot_inherit_tokenizer_contract():
         )
 
 
+def test_portable_tokenizer_fingerprint_keeps_legacy_contract_and_checks_content():
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from veomni.data.data_transform import dpo_tokenizer_contract_identity
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=BackendTokenizer(WordLevel({"[UNK]": 0, "a": 1}, unk_token="[UNK]")), unk_token="[UNK]"
+    )
+    other = copy.deepcopy(tokenizer)
+    tokenizer.init_kwargs.update(name_or_path="/first", vocab_file="/first/vocab.json")
+    other.init_kwargs.update(name_or_path="/second", vocab_file="/second/vocab.json")
+
+    legacy = dpo_tokenizer_fingerprint(tokenizer)
+    portable = dpo_tokenizer_fingerprint(tokenizer, portable=True)
+    assert legacy != dpo_tokenizer_fingerprint(other)
+    assert portable.startswith("v2:")
+    assert portable == dpo_tokenizer_fingerprint(other, portable=True)
+    assert dpo_tokenizer_contract_identity(tokenizer, legacy) == legacy
+    assert dpo_tokenizer_contract_identity(other, portable) == portable
+    with pytest.raises(ValueError, match="tokenizer must declare"):
+        dpo_tokenizer_contract_identity(other, legacy)
+
+    other.init_kwargs["add_prefix_space"] = True
+    assert dpo_tokenizer_fingerprint(other, portable=True) != portable
+    other.init_kwargs.pop("add_prefix_space")
+    other.add_tokens(["new-token"])
+    assert dpo_tokenizer_fingerprint(other, portable=True) != portable
+
+
+def test_portable_tokenizer_fingerprint_accepts_identical_files_in_different_roots(tmp_path):
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from veomni.data.data_transform import dpo_producer_identity
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=BackendTokenizer(WordLevel({"[UNK]": 0, "a": 1}, unk_token="[UNK]")), unk_token="[UNK]"
+    )
+    roots = [tmp_path / "one", tmp_path / "two"]
+    for root in roots:
+        tokenizer.save_pretrained(root)
+    first, second = [PreTrainedTokenizerFast.from_pretrained(root) for root in roots]
+    assert dpo_tokenizer_fingerprint(first) != dpo_tokenizer_fingerprint(second)
+    portable = dpo_tokenizer_fingerprint(first, portable=True)
+    assert portable == dpo_tokenizer_fingerprint(second, portable=True)
+    assert dpo_producer_identity(first, None, portable) == dpo_producer_identity(second, None, portable)
+
+
+def test_portable_fingerprint_produces_dpo_segment_proof():
+    from tokenizers import Tokenizer as BackendTokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from veomni.utils.dpo_provenance import DPO_FEATURE_KEY
+
+    backend = BackendTokenizer(WordLevel({"[UNK]": 0, "a": 1, "b": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    fingerprint = dpo_tokenizer_fingerprint(tokenizer, portable=True)
+    feature = process_dpo_example(
+        {"prompt": "a ", "chosen": "a", "rejected": "b"},
+        tokenizer=tokenizer,
+        record_segment_provenance=True,
+        audited_unpadded_tokenizer_sha256=fingerprint,
+    )[0]
+    assert feature["input_ids"].tolist() == [1, 1, 1, 2]
+    assert feature["labels"].tolist() == [-100, 1, -100, 2]
+    assert feature[DPO_FEATURE_KEY]
+
+
 def test_fast_tokenizer_requires_fingerprint_of_its_audited_backend():
     from tokenizers import Tokenizer as BackendTokenizer
     from tokenizers.models import WordLevel

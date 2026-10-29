@@ -115,7 +115,7 @@ def _live_producer_methods(producer: Any) -> dict[str, str]:
     return methods
 
 
-def dpo_tokenizer_fingerprint(tokenizer: Any) -> str:
+def dpo_tokenizer_fingerprint(tokenizer: Any, *, portable: bool = False) -> str:
     """Bind an audited fast-tokenizer contract to its backend and chat settings.
 
     This digest identifies a configuration; it does not prove that the
@@ -131,13 +131,17 @@ def dpo_tokenizer_fingerprint(tokenizer: Any) -> str:
     # Transformers resets these transient runtime settings on each encode.
     # The DPO producer requests single-sequence encoding with no padding.
     backend_config = _stable_tokenizer_backend(backend.to_str())
+    init_kwargs = getattr(tokenizer, "init_kwargs", None)
+    if portable:
+        path_keys = {"name_or_path", "vocab_file", "merges_file", "tokenizer_file", "chat_template_file"}
+        init_kwargs = {key: value for key, value in (init_kwargs or {}).items() if key not in path_keys}
     identity = {
         "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
         "live_methods": _live_producer_methods(tokenizer),
         "transformers_version": version("transformers"),
         "tokenizers_version": version("tokenizers"),
         "chat_template": getattr(tokenizer, "chat_template", None),
-        "init_kwargs": getattr(tokenizer, "init_kwargs", None),
+        "init_kwargs": init_kwargs,
         "special_tokens_map": getattr(tokenizer, "special_tokens_map", None),
         "padding_side": getattr(tokenizer, "padding_side", None),
         "truncation_side": getattr(tokenizer, "truncation_side", None),
@@ -153,7 +157,7 @@ def dpo_tokenizer_fingerprint(tokenizer: Any) -> str:
     digest = hashlib.sha256(data)
     digest.update(b"\0")
     digest.update(backend_config.encode("utf-8"))
-    return digest.hexdigest()
+    return f"v2:{digest.hexdigest()}" if portable else digest.hexdigest()
 
 
 def dpo_declared_producer_identity(producer: Any, kind: str) -> str:
