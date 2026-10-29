@@ -41,9 +41,12 @@ to `type: muon` and do not change this recipe. `lr`, `betas`, weight decay and
 scheduler fields still apply. Muon and AdamW share the configured SFT LR; the
 recipe does not import the pretraining LR from the paper.
 
-CUDA configurations using PyTorch's newer `fp32_precision` API are not
-supported by this candidate's legacy TF32 context. Native Ascend uses
-`allow_hf32` and is outside that CUDA limitation.
+On CUDA, this candidate preserves inherited default/`ieee` matmul precision
+while disabling down-conversion for Muon. PyTorch's new-API TF32 setting and
+legacy `medium` precision cannot yet be safely restored by this scope; use an
+explicit `torch.backends.cuda.matmul.fp32_precision = "ieee"` setting in a
+fresh process without legacy precision/`allow_tf32` settings for Muon until
+those modes are supported. Ascend uses its separate `allow_hf32` path.
 
 ## Offload and distributed semantics
 

@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -342,6 +343,28 @@ def test_receipt_includes_muon_states(capsys):
     )
     assert receipt["initialized"] == receipt["configured"] == 1
     assert sum(receipt["state_bytes"].values()) == 8 * 5 * 4 * 3
+
+
+@pytest.mark.parametrize("parent", ["none", "ieee"])
+def test_strict_cuda_precision_scope_preserves_inheritance(parent):
+    code = """
+import torch
+from veomni.optim.qwen38_muon import _strict_matmul
+torch.backends.fp32_precision = PARENT
+with _strict_matmul('cuda'):
+    assert torch.backends.cuda.matmul.fp32_precision == 'ieee'
+torch.backends.fp32_precision = 'tf32'
+assert torch.backends.cuda.matmul.fp32_precision == 'tf32'
+""".replace("PARENT", repr(parent))
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+def test_strict_cuda_precision_scope_restores_legacy_tf32(monkeypatch):
+    backend = types.SimpleNamespace(allow_tf32=True)
+    monkeypatch.setattr(torch.backends.cuda, "matmul", backend)
+    with module._strict_matmul("cuda"):
+        assert backend.allow_tf32 is False
+    assert backend.allow_tf32 is True
 
 
 def test_polar_disables_ambient_autocast():
