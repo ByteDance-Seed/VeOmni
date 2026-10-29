@@ -46,34 +46,10 @@ scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
 that workflow. CPU tests checking device-name forwarding should use a mock
 backend sentinel when no real hardware API is involved.
 CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
-`cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
-fall back to the registered NPU and AMP capability queries can initialize a
-hidden device. Preserve this scope across fixture setup and teardown as well
-as the test body; accelerator plans and full-visibility collection stay unchanged.
-During that scope, optimizer foreach-capability queries use the canonical
-`torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
-alias with a device-name lookup that initializes NPU even for CPU parameters.
-Restore the prior alias on exit, preserving explicit foreach/fused options.
-The restoration scope includes setup itself, so partial initialization failures
-also undo changes already applied. Unsupported vendor isolation interfaces
-raise an explicit error before the test runs.
-torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
-with unconditional NPU synchronization/affinity calls, even for CPU datasets.
-CPU-planned cases temporarily use the vendor module's saved Torch constructor
-and restore the patch after teardown or failure. Only replace the known vendor
-wrapper; preserve unrelated constructor patches and all accelerator plans.
-The vendor Inductor wrapper also registers its NPU backend before compiling
-CPU graphs. CPU cases temporarily disable that registration through the loaded
-vendor registry and restore its prior disabled state after teardown or failure.
-Keep real CPU Inductor compilation and gradient checks enabled; do not replace
-compiled-mask coverage with eager execution to avoid hidden-device queries.
-CPU cases must also register Torch's built-in CPU device-op overrides when
-missing. torch_npu populates the override registry at import; Torch 2.10 then
-skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
-keys, so testing only that version misses the NPU CI failure. Preserve existing
-CPU/vendor entries and validate the pinned Torch version's startup state.
-A synthetic registered backend alone misses vendor monkeypatches: exercise
-the pinned wheel's optimizer patch in CPU isolation audits too.
+`cpu`, restore Torch's query-free optimizer foreach helper, register the built-in
+CPU device-op overrides when `torch_npu` left them out, and bypass `torch_npu`'s
+DataLoader affinity and Inductor NPU registration hooks while devices are hidden,
+restoring the prior settings afterward.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
@@ -142,11 +118,6 @@ Consequences that cut both ways:
 The accelerator runner cancels running peers on the first failure by default;
 `--keep-going` continues all cases. Foreground logs must identify case progress,
 the original failure and cancelled peers without conflating their outcomes.
-Accelerator runner thread pools must cancel owned worker scopes before waiting
-for callbacks on interruption. Preserve scoped process cleanup and failure
-artifacts; do not terminate unrelated device users or rely on the batch timeout.
-Use future completion to prove callbacks drained: an interrupted `Thread.join`
-can report a stopped thread before its callback finishes cleanup.
 
 ## What the NPU job can actually run
 
@@ -157,7 +128,7 @@ kernel dependencies land differently, and each decides what a test can reach:
 | Package | Where it is | What it gates |
 |---------|-------------|---------------|
 | `triton-ascend` | installed by an explicit workflow step after the sync (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does not) | the vendored Ascend Triton kernels — `causal_conv1d` and `chunk_gated_delta_rule` `triton`, MoE clamped SwiGLU |
-| `fla_npu` | explicitly installed from the CI image into the workspace by `scripts/ci/install_image_fla_npu.py`, with matched TorchNPU post version | native packed `fla_npu` / `fla_npu_reuse` parity and checkpoint tests; missing dependencies fail under `VEOMNI_REQUIRE_ASCENDC_TESTS=1` |
+| `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
 | `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
 
 The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`

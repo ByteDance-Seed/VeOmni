@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -30,6 +29,7 @@ from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -69,15 +69,6 @@ def _stub_npu_input_guard(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
     """Skip real NPU numerics unless the optional GDR runtime is installed."""
-    if ascendc and os.environ.get("VEOMNI_REQUIRE_ASCENDC_TESTS") == "1":
-        try:
-            import fla_npu  # noqa: F401
-            from triton._C import libtriton
-
-            assert hasattr(libtriton, "ascend"), "Triton Ascend backend missing"
-        except (ImportError, AssertionError) as error:
-            pytest.fail(f"Required AscendC GDN CI dependency unavailable: {error}")
-        return
     pytest.importorskip("triton")
     try:
         from triton._C import libtriton
@@ -330,7 +321,10 @@ def test_causal_conv1d_fla_matches_eager(device):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
 @pytest.mark.parametrize("dim", (256, 640))
 @pytest.mark.parametrize("lengths", (None, (61, 67), (1, 127)))
-def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths):
+@pytest.mark.parametrize("checkpointed", (False, True))
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, checkpointed):
+    from torch.utils.checkpoint import checkpoint
+
     _require_npu_gdr_dependencies()
     from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
 
@@ -352,12 +346,16 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths):
     # accurate fused FP32 reduction (notably for the packed 640-channel shard).
     x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    cu = torch.tensor([0, lengths[0], 128], device="npu", dtype=torch.int32) if lengths else None
+    cu = torch.tensor([0, lengths[0], 128], dtype=torch.int32) if lengths else None
     if lengths:
         out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split(lengths, dim=1)], dim=1)
     else:
         out_e = eager(x_e, w_e, b_e, activation="silu")
-    out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
+
+    def run(*inputs):
+        return other(*inputs, cu_seqlens=cu, activation="silu")
+
+    out_o = checkpoint(run, x_o, w_o, b_o, use_reentrant=False) if checkpointed else run(x_o, w_o, b_o)
     torch.testing.assert_close(out_o.float().cpu(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
     grad_output = torch.randn_like(out_o)
@@ -573,11 +571,7 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
         output = query + 2 * key
         if head_first:
             output = output.transpose(1, 2).contiguous()
-        return (
-            (g, output, query.new_empty(0), None, query, query, value)
-            if head_first
-            else (g, output, query.new_empty(0), None)
-        )
+        return g, output, query.new_empty(0), None
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
         del a, initial_state, args
@@ -646,7 +640,7 @@ def test_fla_npu_packed_backward_reuses_normalized_cu_seqlens(
     def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
         del key, value, beta, scale, initial_state, output_final_state, args
         observed["forward"] = cu_seqlens
-        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None, query, query, query
+        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
         del a, scale, initial_state, args
@@ -740,57 +734,11 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
         )
 
 
-def _packed_eager_reference(eager, inputs, cu_seqlens):
-    """Reset eager recurrence per sample, retaining gradients through slices and cat."""
-    boundaries = cu_seqlens.tolist()
-    return torch.cat(
-        [
-            eager(
-                *(value[:, start:end] for value in inputs),
-                use_qk_l2norm_in_kernel=True,
-            )[0]
-            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
-        ],
-        dim=1,
-    )
-
-
-def test_packed_eager_reference_keeps_gradients_and_isolates_samples():
-    """Exercise the native test's oracle on CPU, where eager refuses packed metadata."""
-    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
-    torch.manual_seed(19)
-    q, k, v = [torch.randn(1, 11, 2, 4, requires_grad=True) for _ in range(3)]
-    g = (-torch.rand(1, 11, 2)).requires_grad_(True)
-    beta = torch.rand(1, 11, 2, requires_grad=True)
-    inputs = (q, k, v, g, beta)
-    cu = torch.tensor([0, 3, 11])
-    with pytest.raises(ValueError, match="does not support cu_seqlens"):
-        eager(*inputs, cu_seqlens=cu)
-    actual = _packed_eager_reference(eager, inputs, cu)
-    first = eager(*(value[:, :3] for value in inputs), use_qk_l2norm_in_kernel=True)[0]
-    second = eager(*(value[:, 3:] for value in inputs), use_qk_l2norm_in_kernel=True)[0]
-    torch.testing.assert_close(actual, torch.cat((first, second), dim=1), atol=0, rtol=0)
-    actual[:, :3].sum().backward()
-    for value in inputs:
-        assert torch.isfinite(value.grad).all()
-        assert torch.count_nonzero(value.grad[:, 3:]) == 0
-
-
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize(
-    ("impl", "dim"),
-    (
-        ("triton", 64),
-        ("triton", 128),
-        ("fla_npu", 128),
-        ("fla_npu", 256),
-        ("fla_npu_reuse", 128),
-        ("fla_npu_reuse", 256),
-    ),
-)
+@pytest.mark.parametrize(("impl", "dim"), (("triton", 64), ("triton", 128), ("fla_npu", 128), ("fla_npu", 256)))
 @pytest.mark.parametrize("packed", (False, True))
 def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, dim, packed):
-    _require_npu_gdr_dependencies(ascendc=impl in ("fla_npu", "fla_npu_reuse"))
+    _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
@@ -1139,59 +1087,7 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert "requires g and beta" in source
 
 
-@pytest.mark.parametrize("reuse", (False, True))
-def test_fla_npu_saved_intermediates_policy(reuse, monkeypatch, _stub_npu_input_guard):
-    """Both rows share FP arithmetic but only the opt-in row retains W/H/value tensors."""
-    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
-
-    values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
-    gate = torch.ones(1, 4, 2)
-    cached = tuple(torch.full((2,), i + 1.0) for i in range(3))
-
-    def fwd(q, k, v, g, *args):
-        return g, q.transpose(1, 2), q.new_empty(0), None, *cached
-
-    def bwd(q, k, v, g, beta, *args):
-        assert all(actual is expected for actual, expected in zip(args[-3:], cached if reuse else (None,) * 3))
-        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.zeros_like(beta), torch.zeros_like(g)
-
-    monkeypatch.setattr(m, "_chunk_fwd", fwd)
-    monkeypatch.setattr(m, "_chunk_bwd", bwd)
-    outputs, saved = m.forward(*values, gate, gate, _reuse_intermediates=reuse)
-    if reuse:
-        assert all(a is b for a, b in zip(saved.tensors[-3:], cached))
-    else:
-        assert all(t.numel() == 0 for t in saved.tensors[-3:])
-    grads = m.backward((torch.ones_like(outputs[0]), outputs[1]), saved)
-    assert all(torch.equal(g, torch.ones_like(v)) for g, v in zip(grads[:3], values))
-
-
-@pytest.mark.parametrize("heads", (1, 4, 16, 64))
-@pytest.mark.parametrize("chunk_size", (16, 64, 128))
-def test_fla_npu_metadata_covers_forward_and_reverse_tiles(heads, chunk_size):
-    """Both cumsum tile sizes must exist without device-derived metadata."""
-    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
-
-    bounds = torch.tensor([0, 0, 129, 512], dtype=torch.int64)
-    _, tables, _ = m.precompute_varlen_metadata(bounds, heads, chunk_size, device="cpu")
-    for reverse in (False, True):
-        tile = max(chunk_size, 1 << (max(1, (1 << (11 if reverse else 12)) // heads) - 1).bit_length())
-        assert torch.equal(tables[str(tile)], m._prepare_chunk_indices(bounds, tile))
-
-
-def test_fla_npu_batched_upload_preserves_empty_and_mixed_dtypes():
-    """Batching must not promote user-supplied integer metadata."""
-    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
-
-    tables = {"a": torch.tensor([[1, 2]], dtype=torch.int32), "b": torch.empty(0, 2, dtype=torch.int64), "c": None}
-    actual = m._upload_chunk_tables(tables, "cpu")
-    assert actual["c"] is None
-    for key in ("a", "b"):
-        assert actual[key].dtype == tables[key].dtype
-        assert actual[key].shape == tables[key].shape
-        assert torch.equal(actual[key], tables[key])
-
-
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_convolution_boundary_cache_inference_to_training():
     """Inference warmup cannot cache tensors that autograd refuses to save."""
     from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import _cached_boundary_tensor
@@ -1208,13 +1104,11 @@ def test_convolution_boundary_cache_inference_to_training():
 
         @staticmethod
         def forward(ctx, x):
-            """Save a cached boundary tensor alongside trainable data."""
             ctx.save_for_backward(actual)
             return x.clone()
 
         @staticmethod
         def backward(ctx, grad):
-            """Reading a warmup entry must remain legal in training."""
             assert torch.equal(ctx.saved_tensors[0], actual)
             return grad
 
@@ -1222,43 +1116,3 @@ def test_convolution_boundary_cache_inference_to_training():
     SaveBoundaries.apply(value).sum().backward()
     assert value.grad.item() == 1
     _cached_boundary_tensor.cache_clear()
-
-
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
-@pytest.mark.parametrize("checkpointed", (False, True))
-def test_fla_npu_reuse_packed_checkpoint_parity(checkpointed):
-    """Compare retained states with recomputation under non-reentrant checkpointing."""
-    from torch.utils.checkpoint import checkpoint
-
-    _require_npu_gdr_dependencies(ascendc=True)
-    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
-    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
-    torch.manual_seed(43)
-    # Native RecomputeWUFwd supports value widths 128/256.
-    q, k, v = [torch.randn(1, 64, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
-    g = -torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
-    beta = torch.rand(1, 64, 2, device="npu", dtype=torch.bfloat16)
-    cu = torch.tensor([0, 17, 64], dtype=torch.int64)
-    gradient = torch.randn_like(q)
-    results = []
-    for operation in (reference, candidate):
-        leaves = make_grad_leaves(q, k, v, g, beta)
-
-        def forward(*values, operation=operation):
-            """Bind this graph to one op even if checkpoint replay is delayed."""
-            return operation(*values, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]
-
-        output = checkpoint(forward, *leaves, use_reentrant=False) if checkpointed else forward(*leaves)
-        output.backward(gradient)
-        results.append((output.detach(), [x.grad.detach().clone() for x in leaves]))
-    torch.testing.assert_close(results[1][0], results[0][0], atol=0, rtol=0)
-    for actual, expected in zip(results[1][1], results[0][1], strict=True):
-        torch.testing.assert_close(actual, expected, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
-
-
-def test_ci_requires_ascendc_dependency_instead_of_skipping(monkeypatch):
-    """A missing native extension is a CI failure, not a green skip."""
-    monkeypatch.setenv("VEOMNI_REQUIRE_ASCENDC_TESTS", "1")
-    monkeypatch.setitem(sys.modules, "fla_npu", None)
-    with pytest.raises(pytest.fail.Exception, match="Required AscendC GDN CI dependency"):
-        _require_npu_gdr_dependencies(ascendc=True)

@@ -47,7 +47,6 @@ class _Meta:
     cu_seqlens_list: list[int] | None
     chunk_indices: dict[str, Tensor | None] | None
     chunk_indices_list: dict[str, list[int] | None] | None
-    reuse_intermediates: bool
 
 
 def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
@@ -149,16 +148,10 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def _cumsum_block_t(g: Tensor, chunk_size: int, *, reverse: bool = False) -> int:
+def _cumsum_block_t(g: Tensor, chunk_size: int) -> int:
     """Choose the sequence tile used by the cumulative-sum kernel."""
     heads = int(g.shape[-1])
-    return _cumsum_block_size(heads, chunk_size, reverse=reverse)
-
-
-def _cumsum_block_size(num_heads: int, chunk_size: int, *, reverse: bool) -> int:
-    """Match the vendored scalar cumsum's forward/reverse tiling exactly."""
-    budget = 1 << (11 if reverse else 12)
-    return max(int(chunk_size), _next_power_of_2(budget // max(1, int(num_heads))))
+    return _next_power_of_2((1 << 17) // max(1, heads * int(chunk_size)))
 
 
 def _ensure_varlen_metadata(
@@ -179,23 +172,11 @@ def _ensure_varlen_metadata(
     required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES)
     required_sizes.add(int(chunk_size))
     required_sizes.add(_cumsum_block_t(g, chunk_size))
-    required_sizes.add(_cumsum_block_t(g, chunk_size, reverse=True))
-
-    # Build integer tables from the already materialized host boundaries, not
-    # through device repeat_interleave/.tolist()/.item() for every tile size.
-    # The same table objects survive in SavedState metadata for backward.
-    missing_tensors = {str(size) for size in required_sizes if tensor_indices.get(str(size)) is None}
-    if missing_tensors:
-        host_boundaries = torch.tensor(cu_seqlens_list, dtype=torch.int64, device="cpu")
-        host_tables = {
-            str(size): _prepare_chunk_indices(host_boundaries, size)
-            for size in sorted(required_sizes)
-            if str(size) in missing_tensors
-        }
-        tensor_indices.update(_upload_chunk_tables(host_tables, g.device))
 
     for size in required_sizes:
         key = str(size)
+        if key not in tensor_indices or tensor_indices[key] is None:
+            tensor_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
         if key not in list_indices or list_indices[key] is None:
             list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
     return cu_seqlens, cu_seqlens_list, tensor_indices, list_indices
@@ -216,11 +197,8 @@ def precompute_varlen_metadata(
         cu_seqlens = cu_seqlens.cpu()
     cu_seqlens_list = _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
-    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {
-        int(chunk_size),
-        _cumsum_block_size(num_heads, chunk_size, reverse=False),
-        _cumsum_block_size(num_heads, chunk_size, reverse=True),
-    }
+    cumsum_block_size = _next_power_of_2((1 << 17) // max(1, int(num_heads) * int(chunk_size)))
+    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {int(chunk_size), cumsum_block_size}
     chunk_indices: dict[str, Tensor | None] = {}
     chunk_indices_list: dict[str, list[int] | None] = {}
     for size in required_sizes:
@@ -228,24 +206,8 @@ def precompute_varlen_metadata(
         chunk_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
         chunk_indices_list[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
     if device is not None:
-        chunk_indices = _upload_chunk_tables(chunk_indices, device)
+        chunk_indices = {k: v.to(device=device) if v is not None else None for k, v in chunk_indices.items()}
     return cu_seqlens_list, chunk_indices, chunk_indices_list
-
-
-def _upload_chunk_tables(tables: dict[str, Tensor | None], device: torch.device | str) -> dict[str, Tensor | None]:
-    """Upload all integer indices together, preserving contiguous [rows, 2] views."""
-    present = [(key, tensor) for key, tensor in tables.items() if tensor is not None]
-    if not present:
-        return dict(tables)
-    result = dict(tables)
-    for dtype in dict.fromkeys(tensor.dtype for _, tensor in present):
-        group = [(key, tensor) for key, tensor in present if tensor.dtype == dtype]
-        flat = torch.cat([tensor.reshape(-1) for _, tensor in group]).to(device=device)
-        offset = 0
-        for key, tensor in group:
-            result[key] = flat[offset : offset + tensor.numel()].view_as(tensor)
-            offset += tensor.numel()
-    return result
 
 
 def _chunk_tensor(
@@ -302,8 +264,8 @@ def _chunk_fwd(
     chunk_indices: dict[str, Tensor | None] | None,
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor, Tensor, Tensor]:
-    """Return W/H/v_new through SavedState tensors for GC-aware reuse."""
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Run the AscendC forward stages and return backward intermediates."""
     _ensure_fla_npu_registered()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
@@ -315,13 +277,7 @@ def _chunk_fwd(
     else:
         from ...vendor.triton.solve_tril import solve_tril
 
-    g = chunk_local_cumsum(
-        g,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_tensor(chunk_indices, _cumsum_block_t(g, chunk_size)),
-        head_first=False,
-    )
+    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
     a = chunk_scaled_dot_kkt_fwd(
         k=k,
         g=g,
@@ -339,12 +295,7 @@ def _chunk_fwd(
             output_dtype=k.dtype,
         )
     else:
-        a = solve_tril(
-            A=a,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
-            output_dtype=k.dtype,
-        )
+        a = solve_tril(A=a, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
 
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
@@ -392,7 +343,7 @@ def _chunk_fwd(
     )
     g = g.transpose(1, 2).contiguous()
     output = output.transpose(1, 2).contiguous()
-    return g, output, a, final_state, w, h, v_new
+    return g, output, a, final_state
 
 
 def _chunk_bwd(
@@ -410,9 +361,6 @@ def _chunk_bwd(
     chunk_indices: dict[str, Tensor | None] | None,
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
-    w: Tensor | None = None,
-    h: Tensor | None = None,
-    v_new: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run the AscendC backward stages for the chunked recurrence."""
     _ensure_fla_npu_registered()
@@ -421,34 +369,33 @@ def _chunk_bwd(
 
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    if w is None:
-        w, u = torch.ops.npu.npu_recompute_w_u_fwd(
-            k,
-            v,
-            beta,
-            a,
-            chunk_size,
-            g=g,
-            gk=None,
-            cu_seqlens=cu_seqlens_list,
-            chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        )
-        h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
-            k,
-            w,
-            u,
-            g=g,
-            gk=None,
-            initial_state=initial_state,
-            output_final_state=False,
-            chunk_size=chunk_size,
-            save_new_value=True,
-            cu_seqlens=cu_seqlens_list,
-            chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-            use_exp2=False,
-            transpose_state_layout=False,
-        )
+    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        a,
+        chunk_size,
+        g=g,
+        gk=None,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+    )
     grad_output = grad_output.transpose(1, 2).contiguous()
+    h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
+        k,
+        w,
+        u,
+        g=g,
+        gk=None,
+        initial_state=initial_state,
+        output_final_state=False,
+        chunk_size=chunk_size,
+        save_new_value=True,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+        use_exp2=False,
+        transpose_state_layout=False,
+    )
     grad_v = torch.ops.npu.npu_chunk_bwd_dv_local(
         q,
         k,
@@ -533,7 +480,6 @@ def _chunk_bwd(
         chunk_size=chunk_size,
         reverse=True,
         cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_tensor(chunk_indices, _cumsum_block_t(grad_g, chunk_size, reverse=True)),
         head_first=False,
     )
     return grad_q, grad_k, grad_v, grad_beta, grad_g
@@ -555,7 +501,6 @@ def forward(
     chunk_indices: object = None,
     chunk_indices_list: object = None,
     scale: float | None = None,
-    _reuse_intermediates: bool = False,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """AscendC fused chunk gated delta rule. Layout is FLA ``[B, T, H, D]``.
 
@@ -645,7 +590,7 @@ def forward(
     if scale is None:
         scale = key_h.shape[-1] ** -0.5
     guarded_fwd = input_guard(_chunk_fwd)
-    g_cum, output, a, final_state, w, h, v_new = guarded_fwd(
+    g_cum, output, a, final_state = guarded_fwd(
         query_h,
         key_h,
         value_h,
@@ -663,8 +608,6 @@ def forward(
     if final_state is None:
         final_state = output.new_empty(0)
     saved_cu_seqlens = cu_opt if cu_opt is not None else cu_seqlens
-    if not _reuse_intermediates:
-        w, h, v_new = unused_like(query_h), unused_like(query_h), unused_like(query_h)
     return (output.to(query_h.dtype), final_state), SavedState(
         (
             query_h,
@@ -677,9 +620,6 @@ def forward(
             saved_cu_seqlens,
             query_inv_norm,
             key_inv_norm,
-            w,
-            h,
-            v_new,
         ),
         _Meta(
             scale,
@@ -691,7 +631,6 @@ def forward(
             cu_seqlens_list,
             chunk_indices,
             chunk_indices_list,
-            _reuse_intermediates,
         ),
     )
 
@@ -717,9 +656,6 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         cu_seqlens,
         query_inv_norm,
         key_inv_norm,
-        w,
-        h,
-        v_new,
     ) = saved.tensors
     do, _dht = grad_output
     initial_opt = initial_state if meta.has_initial_state else None
@@ -741,9 +677,6 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         meta.chunk_indices,
         meta.chunk_indices_list,
         meta.chunk_size,
-        w if meta.reuse_intermediates else None,
-        h if meta.reuse_intermediates else None,
-        v_new if meta.reuse_intermediates else None,
     )
     if meta.use_qk_l2norm:
         grad_q_h = _l2norm_bwd(query_h, query_inv_norm, grad_q_h)

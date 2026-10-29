@@ -42,7 +42,6 @@ from .causal_conv1d.standard import triton as conv_triton
 from .chunk_gated_delta_rule.standard import eager as chunk_eager
 from .chunk_gated_delta_rule.standard import fla as chunk_fla
 from .chunk_gated_delta_rule.standard import fla_npu as chunk_fla_npu
-from .chunk_gated_delta_rule.standard import fla_npu_reuse as chunk_fla_npu_reuse
 from .chunk_gated_delta_rule.standard import flash_qla as chunk_flash_qla
 from .chunk_gated_delta_rule.standard import triton as chunk_triton
 from .rms_norm_gated.standard import eager as rms_eager
@@ -216,17 +215,6 @@ register_op(
     chunk_fla_npu.forward,
     chunk_fla_npu.backward,
     description="AscendC chunked gated delta rule with variable-length support",
-    requirement=NpuKernelRequirement(),
-    requires=("fla_npu", "triton"),
-)
-
-register_op(
-    "chunk_gated_delta_rule",
-    "standard",
-    "fla_npu_reuse",
-    chunk_fla_npu_reuse.forward,
-    chunk_fla_npu_reuse.backward,
-    description="AscendC GDN with saved W/H/value intermediates (more activation memory)",
     requirement=NpuKernelRequirement(),
     requires=("fla_npu", "triton"),
 )

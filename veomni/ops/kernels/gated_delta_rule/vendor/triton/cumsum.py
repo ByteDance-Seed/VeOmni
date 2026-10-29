@@ -74,8 +74,7 @@ def chunk_local_cumsum_scalar(
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
-    output_dtype: Optional[torch.dtype] = torch.float,
-    chunk_indices: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = torch.float
 ) -> torch.Tensor:
 
     B, T, H = g.shape
@@ -90,8 +89,7 @@ def chunk_local_cumsum_scalar(
     # 2. UB estimation varies directly with H.
     # 3. BT in reverse mode is smaller than in forward mode.
     BT = max(chunk_size, triton.next_power_of_2((1 << 11 if reverse else 1 << 12) // H))
-    if cu_seqlens is not None and chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B)
@@ -120,7 +118,6 @@ def chunk_local_cumsum(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
-    chunk_indices: Optional[torch.Tensor] = None,
     **kwargs
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -136,8 +133,7 @@ def chunk_local_cumsum(
             scale=scale,
             cu_seqlens=cu_seqlens,
             head_first=head_first,
-            output_dtype=output_dtype,
-            chunk_indices=chunk_indices,
+            output_dtype=output_dtype
         )
     else:
         raise ValueError(

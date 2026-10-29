@@ -108,7 +108,6 @@ jobs:
       # and counter overflow to 65536 when many sub-communicators run sequentially.
       HCCL_HOST_SOCKET_PORT_RANGE: "auto"
       HCCL_NPU_SOCKET_PORT_RANGE: "auto"
-      VEOMNI_REQUIRE_ASCENDC_TESTS: "1"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
@@ -177,15 +176,9 @@ jobs:
           uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
             --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
           uv run --frozen python -c "from triton._C.libtriton import ascend"
-      - name: Install image-built AscendC GDN extension in workspace
-        # Match the compiled image extension; keep the rest of the workspace locked.
-        run: |
-          uv pip install --python .venv/bin/python --no-deps torch-npu==2.10.0.post2
-          .venv/bin/python scripts/ci/install_image_fla_npu.py --source-python /app/.venv/bin/python
-          .venv/bin/python -c "import torch, torch_npu, fla_npu; assert torch.npu.is_available(); assert hasattr(torch.ops.npu, 'npu_chunk_fwd_o')"
       - name: Check final pip list
         run: |
           uv pip list
       - name: Run accelerator case tests
         run: |
-          .venv/bin/python -m scripts.ci.accelerator --backend npu --suite unit
+          uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit

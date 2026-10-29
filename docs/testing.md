@@ -759,22 +759,3 @@ The following redundancies have been addressed:
 - **`tests/e2e/test_e2e_training.py`** uses real model weights and `exec_scripts.py`,
   while `test_e2e_parallel.py` uses toy configs and `prepare_exec_cmd`. These serve
   different purposes (smoke test vs equivalence) but the naming doesn't reflect this.
-
-### AscendC GDN in NPU CI
-
-The CI image builds `fla_npu` and its AscendC OPP libraries, but a fresh workspace
-`uv sync` omits that optional distribution. Both NPU workflows install the image's
-matching `torch-npu==2.10.0.post2`, then copy only the compiled `fla_npu` package and
-its dist-info into the workspace with `scripts/ci/install_image_fla_npu.py`.
-The helper rejects Python, machine, Torch or TorchNPU mismatches and does not add
-the image site-packages to PYTHONPATH. CANN/OPP libraries remain those of the image.
-A startup import/device check fails if the extension is unusable. After this
-explicit CI overlay, the workflows use `.venv/bin/python` directly; another
-`uv run` synchronization could restore the lockfile TorchNPU version. The case
-runner starts subprocesses with that same interpreter.
-
-`VEOMNI_REQUIRE_ASCENDC_TESTS=1` makes missing AscendC dependencies fail the GDN
-native tests in CI. Local CPU collection still skips native numerical tests.
-The reuse row is tested on packed boundaries against the recomputing row, both
-with and without non-reentrant activation checkpointing. CPU/mock checks and
-successful test collection do not constitute native NPU parity evidence.
