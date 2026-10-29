@@ -31,7 +31,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
 | `model/**/lr_scheduler.pt` | `lr_scheduler.state_dict()`. | Rank 0 |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
-| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
+| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`; DPO runs also include `dpo_provenance_protocol` and `dpo_position`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
@@ -44,6 +44,11 @@ nothing else. The two exports are inference artifacts that resume never reads.
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
+
+DPO's `dpo_provenance_protocol` records the producer contract, objective and
+recovery geometry; `dpo_position` contains `epoch`, `step_in_epoch` and
+`epoch_complete`. Resume requires both fields and matching positions across
+ranks; missing or incompatible state is rejected before training continues.
 
 Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
 a batch was yielded. Older cursors lack that phase and may resume with a
