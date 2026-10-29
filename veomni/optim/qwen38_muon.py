@@ -343,9 +343,12 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         )
         self._state_receipt_emitted = True
 
-    def load_state_dict(self, state_dict):
+    def _prepare_load_state_dict(self, state_dict):
         state_dict = {**state_dict, "state": dict(state_dict["state"])}
-        lazy = []
+        user_pre_hook = any(
+            not getattr(hook, "_veomni_internal_dcp_filter", False)
+            for hook in self._optimizer_load_state_dict_pre_hooks.values()
+        )
         for saved, current in zip(state_dict["param_groups"], self.param_groups, strict=True):
             if current.get("qwen38_ple_lookup"):
                 if (
@@ -375,17 +378,17 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                     scalar = _local(step).detach().cpu().reshape(()).clone()
                     if not torch.isfinite(scalar) or scalar < 0 or scalar != scalar.floor():
                         raise RuntimeError("Invalid PLE optimizer step")
-                    if scalar.item() == 0:
+                    # A user pre-hook may change state values or aliasing;
+                    # retain step-zero state so none of its effects are lost.
+                    # Internal DCP cleanup hooks alone preserve lazy allocation.
+                    if scalar.item() == 0 and not user_pre_hook:
                         state_dict["state"].pop(key)
-                        lazy.append(p)
                     else:
                         state_dict["state"][key] = {**entry, "step": scalar}
             for key in ("qwen38_recipe", "qwen38_plan", "muon_momentum"):
                 if saved.get(key) != current[key]:
                     raise RuntimeError(f"Muon resume recipe mismatch: {key}; AdamW migration is not implicit")
-        super().load_state_dict(state_dict)
-        for p in lazy:
-            self.state.pop(p, None)
+        return state_dict
 
     @torch.no_grad()
     def step(self, closure=None):

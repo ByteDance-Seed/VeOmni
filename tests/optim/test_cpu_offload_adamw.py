@@ -297,6 +297,91 @@ def test_dcp_drops_wholly_absent_optimizer_state_after_resume(tmp_path):
     assert target_optimizer.state[target_model.weight]["step"].item() == 2
 
 
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+def test_dcp_load_hooks_observe_saved_state_and_keep_their_changes(tmp_path, empty, multi):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    source_model = torch.nn.Linear(1, 1).bfloat16()
+    source = CPUOffloadAdamW(source_model.parameters(), lr=0.001)
+    if not empty:
+        source_model.weight.grad = torch.ones_like(source_model.weight)
+        source.step()
+    source_container = MultiOptimizer(source_model, {"all": source}, ["all"]) if multi else source
+    parallel = SimpleNamespace(dp_mode="ddp")
+    if empty and not multi:
+        # Exercise an explicitly empty checkpoint without asking Torch DCP's
+        # state-dict producer to synthesize optimizer state for every parameter.
+        saved = source.state_dict()
+        saved["param_groups"][0]["params"] = ["weight", "bias"]
+        saved[_ZERO_OPTIMIZER_STATE_MARKER] = True
+    else:
+        saved = OptimizerState(source_model, source_container, parallel_state=parallel)
+    dcp.save({"optimizer": saved}, checkpoint_id=tmp_path)
+
+    target_model = torch.nn.Linear(1, 1).bfloat16()
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    target_container = MultiOptimizer(target_model, {"all": target}, ["all"]) if multi else target
+    get_optimizer_state_dict(target_model, target)
+    events = []
+
+    def before_load(optimizer, incoming):
+        assert set(incoming["state"]) == (set() if empty else {"weight"})
+        events.append("before")
+
+    def after_load(optimizer):
+        assert target_model.bias not in optimizer.state
+        optimizer.state[target_model.bias] = {
+            "step": torch.tensor(7.0),
+            "master_weight": target_model.bias.detach().float().clone(),
+            "exp_avg": torch.full_like(target_model.bias, 0.75, dtype=torch.float32),
+            "exp_avg_sq": torch.zeros_like(target_model.bias, dtype=torch.float32),
+        }
+        events.append("after")
+
+    target.register_load_state_dict_pre_hook(before_load)
+    target.register_load_state_dict_post_hook(after_load)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target_container, parallel_state=parallel, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target_container),
+    )
+    assert events == ["before", "after"]
+    assert target.state[target_model.bias]["step"].item() == 7
+    assert target.state[target_model.bias]["exp_avg"].item() == 0.75
+
+
+def test_state_receipt_ignores_unassigned_metadata_after_resume():
+    param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    source = CPUOffloadAdamW([param])
+    param.grad = torch.ones_like(param)
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["custom_metadata"] = {"value": 1}
+    clone = torch.nn.Parameter(param.detach().clone())
+    target = CPUOffloadAdamW([clone])
+    target.load_state_dict(saved)
+    clone.grad = torch.ones_like(clone)
+    target.step()
+    assert target.state["custom_metadata"] == {"value": 1}
+    model = torch.nn.Module()
+    model.register_parameter("weight", clone)
+    with pytest.raises(RuntimeError, match="DCP cannot serialize non-parameter optimizer state"):
+        OptimizerState(model, target, parallel_state=SimpleNamespace(dp_mode="ddp")).state_dict()
+
+    called = []
+
+    def save_metadata_separately(optimizer):
+        called.append(optimizer.state.pop("custom_metadata"))
+
+    target.register_state_dict_pre_hook(save_metadata_separately)
+    exported = OptimizerState(model, target, parallel_state=SimpleNamespace(dp_mode="ddp")).state_dict()
+    assert called == [{"value": 1}]
+    assert "weight" in exported["state"]
+
+
 def test_dcp_drops_wholly_absent_state_from_ddp_wrapped_model(tmp_path):
     import torch.distributed as dist
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict

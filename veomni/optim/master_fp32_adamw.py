@@ -91,6 +91,7 @@ class MasterFP32AdamW(Optimizer):
             result = hook(self, state_dict)
             if result is not None:
                 state_dict = result
+        state_dict = self._prepare_load_state_dict(state_dict)
 
         groups = self.param_groups
         saved_groups = copy.deepcopy(state_dict["param_groups"])
@@ -125,6 +126,10 @@ class MasterFP32AdamW(Optimizer):
         self.__setstate__({"state": restored, "param_groups": saved_groups})
         for hook in self._optimizer_load_state_dict_post_hooks.values():
             hook(self)
+
+    def _prepare_load_state_dict(self, state_dict):
+        """Normalize subclass-specific checkpoint entries after user pre-hooks."""
+        return state_dict
 
     def _restore_parameter_state(self, param, saved, group):
         """Validate and place one entry between the shared pre/post load hooks."""
