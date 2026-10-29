@@ -35,6 +35,8 @@ _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 def test_seedomni_cached_transform_unpickles_conversation_list() -> None:
     conversation = [

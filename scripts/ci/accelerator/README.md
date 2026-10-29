@@ -32,6 +32,15 @@ from the test's launch plan. See
 [Registering Tests in CI](../../../docs/testing.md#registering-tests-in-ci) for
 the manifest example, registration rules and collection check command.
 
+The `qwen38-channel_loss_callback-unit` selection is present in both
+`suites/gpu.json` and `suites/npu.json`. It collects
+`tests/trainer/test_channel_loss_callback.py` for the detached channel-loss
+callback, packed-source alignment, and local SP/Gloo checks. The existing
+`tests/ops` selection also collects chunk-loss observer/offload tests. Consult
+the individual case plans, skip conditions, and job logs for the hardware
+actually exercised; inclusion in an accelerator suite alone does not prove a
+native device run.
+
 ## Launch plans
 
 An unmarked case defaults to one card of the selected accelerator backend, or
@@ -91,9 +100,6 @@ cooperating callers in one run, including default worker environments and
 remaining in-process env:// fixtures. It does not reserve an OS socket or
 coordinate other runs. New distributed launchers must use a live Store or
 standalone agent instead of probing and closing a socket before startup.
-Spawn endpoint ready/closed events include case ID, launch ID, owner PID and
-port in each batch's `.rendezvous.jsonl` artifact. This fixes rendezvous
-allocation races; Gloo/NCCL/HCCL transport sockets have their own lifecycles.
 Visibility is set before importing torch,
 and launch validation checks nproc and child device assignments against the
 case plan and lease. Every distributed launch starts fresh workers.
@@ -108,8 +114,8 @@ other running batches in this suite/job. The runner waits for bounded process
 cleanup before exiting with failure. It does not wait for those tests to finish.
 `--keep-going` records failures and attempts all cases/batches without cancelling
 peers. Failure to drain owned processes always stops admission and cancels
-running peers, even with `--keep-going`, because the affected device lease
-cannot be safely reused. `--serial` uses the same failure policy with one batch at a time.
+running peers, even with `--keep-going`, because the affected worker process
+scope cannot be safely reused. `--serial` uses the same failure policy with one batch at a time.
 CPU BLAS and compiler threads are bounded.
 Explicit CPU cases also scope checkpoint's fallback device to CPU through
 fixture setup, execution and teardown, restoring the previous value afterward.
@@ -119,6 +125,16 @@ CPU optimizer defaults use Torch's original capability helper during the same
 scope, so torch_npu's foreach policy does not initialize a hidden device.
 Explicit optimizer options are preserved, and the vendor helper is restored
 when the case ends.
+For CPU cases, the worker also temporarily restores Torch's multi-worker
+DataLoader iterator constructor from the loaded torch_npu module. The vendor
+wrapper queries NPU affinity even for CPU data. Its original patch is restored
+after teardown or failure; accelerator cases keep the vendor constructor.
+The same CPU scope disables NPU backend registration by the loaded vendor
+Inductor registry, restoring its previous policy afterward. CPU graphs still
+compile with Inductor; accelerator cases keep normal NPU registration.
+CPU cases initialize a missing built-in CPU device-op override as well. This
+handles Torch 2.10's partially populated registry after importing torch_npu,
+while preserving existing CPU and vendor overrides.
 
 ## Results and local commands
 
@@ -128,15 +144,20 @@ console log; they do not upload the output directory as a GitHub artifact.
 Full result files are available in the job workspace while it exists.
 Use a fresh `--output-dir` for each local measurement.
 Result files include full case inventory, resolved plans, batches, device
-assignments, per-case timings/outcomes, logs, JUnit XML, observed distributed
-launches, source fingerprints and the suite's elapsed wall time. Sum of batch
+assignments, per-case timings/outcomes, logs, JUnit XML, and the suite's
+elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
 including `durations.json`, are reporting artifacts and are not scheduling inputs.
 
+Manifest selection numbers run consecutively from one across each file,
+including both unit and e2e entries. Keep the existing order when renumbering.
+The GPU manifest has unit entries 01–58 and e2e entries 59–61. The NPU
+manifest has unit entries 01–39 and e2e entries 40–41.
 Foreground case statuses use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`
-(or `[e2e-57-case-0001]` and `[devices=cpu]`). The entry ID comes from the
-manifest: `09-unit` becomes `unit-09`, `npu-e2e-01` becomes `e2e-01`, and
-`ci-unit` becomes `unit-ci`. Each case gets a one-based, four-digit index within
+(or `[e2e-59-case-0001]` and `[devices=cpu]`). The entry ID comes from the
+manifest: `09-unit` becomes `unit-09`, `npu-e2e-40` becomes `e2e-40`, and
+the GPU CI planner selection `55-unit` becomes `unit-55`. Each case gets a
+one-based, four-digit index within
 its entry's collected inventory, including parameterized cases. This index is
 independent of batching, card-count sorting and parallel completion order.
 All batches from one entry share its entry ID; no batch number is shown.
@@ -156,7 +177,7 @@ entry `display_id`; aggregated `cases.json` carries each case's full
 [unit-09][START][devices=cpu] tests/foo/test_bar.py (cases=2)
 [unit-09-case-0001][RUN][devices=cpu] tests/foo/test_bar.py::test_a
 [unit-09-case-0001][PASSED (12/4508)][devices=cpu] tests/foo/test_bar.py::test_a
-[e2e-57-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
+[e2e-59-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
     ... traceback ...
 ```
 
@@ -164,9 +185,9 @@ Failures print the node ID and pytest traceback summary (up to 200 lines),
 followed by the complete failed worker's combined stdout/stderr. GitHub Actions
 places this output in a collapsible group labelled with the manifest entry ID;
 local runs print it inline. This preserves training-rank tracebacks and torchrun
-errors that precede pytest's outer `CalledProcessError`. Logs are streamed in
-bounded chunks after worker cleanup; successful batches keep compact progress
-output. GitHub Actions also receives an error annotation. Cancelled
+errors that precede pytest's outer `CalledProcessError`. The full worker log is
+read and written in one call after worker cleanup; successful batches keep
+compact progress output. GitHub Actions also receives an error annotation. Cancelled
 batches are labelled separately from failed tests. The final summary reports
 outcomes, failed/cancelled batches, batches never started and the first failure.
 
@@ -197,7 +218,7 @@ text-only fixtures use vocabularies of 4096. Qwen3-MoE retains four MoE
 layers for the LoRA per-layer EP slicing assertions. Vision/audio widths are matched to
 the text connectors. Existing numerical tolerances and checkpoint/optimizer
 round-trip assertions are unchanged. GPU and NPU e2e suites each include one
-Wan alignment invocation. Qwen3-MoE EP1/4/8 saveload cases check HF export
+Wan alignment invocation. Qwen3-MoE EP1/2/4 saveload cases on four cards check HF export
 alongside DCP/optimizer restoration and independent CLI DCP-to-HF verification.
 
 Fused checkpoint formats also require distinguishable weight layouts: for

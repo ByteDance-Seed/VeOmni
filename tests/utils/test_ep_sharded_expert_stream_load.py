@@ -45,6 +45,9 @@ from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter impor
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 NUM_EXPERTS, HIDDEN, INTERMEDIATE, EP_SIZE = 4, 3, 2, 2
 PER_EXPERT = "mtp.layers.0.mlp.experts.{expert}.{proj}.weight"
 

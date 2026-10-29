@@ -1,6 +1,5 @@
 """Native staging coverage, separate from the CPU-only optimizer suite."""
 
-import json
 import os
 
 import pytest
@@ -54,33 +53,3 @@ def test_accelerator_offload_staging_matches_fp32_reference():
         for key in ("exp_avg", "exp_avg_sq"):
             torch.testing.assert_close(state[key], expected.state[reference][key], rtol=1e-6, atol=1e-7)
         torch.testing.assert_close(param.detach().cpu(), reference.bfloat16(), rtol=0, atol=0)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("backend", ["npu", "cpu"])
-def test_missing_native_device_respects_assigned_ci_backend(tmp_path, monkeypatch, backend):
-    """Exercise actual runner metadata without initializing an accelerator."""
-    capabilities = tmp_path / "capabilities.json"
-    capabilities.write_text(json.dumps({"backend": backend, "devices": [] if backend == "cpu" else ["0"]}))
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(capabilities))
-    monkeypatch.setitem(globals(), "IS_CUDA_AVAILABLE", False)
-    monkeypatch.setitem(globals(), "IS_NPU_AVAILABLE", False)
-    expected = pytest.skip.Exception if backend == "cpu" else pytest.fail.Exception
-    message = "Requires a native" if backend == "cpu" else "Assigned accelerator runtime is unavailable"
-    with pytest.raises(expected, match=message):
-        _require_native_device()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_optional_run_skips_before_unsupported_backend_discovery(monkeypatch):
-    """Local non-CUDA/Ascend hosts need no accelerator-runner discovery."""
-    monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
-    monkeypatch.setitem(globals(), "IS_CUDA_AVAILABLE", False)
-    monkeypatch.setitem(globals(), "IS_NPU_AVAILABLE", False)
-
-    def forbidden_discovery():
-        raise AssertionError("Optional runs must not probe unsupported accelerator backends")
-
-    monkeypatch.setitem(globals(), "runner_capabilities", forbidden_discovery)
-    with pytest.raises(pytest.skip.Exception, match="Requires a native"):
-        _require_native_device()

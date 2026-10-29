@@ -59,7 +59,9 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
-def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+def _to_empty_preserving_nonpersistent_buffers(
+    model: nn.Module, device: str, preserve_persistent_buffers: bool = False
+) -> None:
     """Materialize parameters without discarding config-derived buffers.
 
     ``init_empty_weights()`` patches ``register_parameter`` only, so a
@@ -71,11 +73,14 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
     per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
     tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
-    them. Persistent buffers are left to whichever loader runs next.
+    them. Persistent buffers are preserved for random initialization and left
+    to the loader during checkpoint recovery. Shared registration aliases follow
+    ``to_empty`` semantics and are not reconstructed by this helper.
     """
     buffers = []
     for module in model.modules():
-        for name in module._non_persistent_buffers_set:
+        names = module._buffers.keys() if preserve_persistent_buffers else module._non_persistent_buffers_set
+        for name in names:
             buffer = module._buffers.get(name)
             if buffer is None:
                 continue
@@ -85,7 +90,7 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
                 # No model does this today; say so rather than let ``to_empty()``
                 # leave uninitialized memory behind unannounced.
                 logger.warning_rank0(
-                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                    f"Buffer {name!r} on {type(module).__name__} is on meta and cannot be "
                     "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
                 )
                 continue
@@ -209,7 +214,9 @@ def _materialize_and_load_weights(
         # Preserve non-persistent buffers on the random-init path too: HF's
         # ``_init_weights`` recomputes only rope tables shaped the way it expects,
         # so the rest would train on whatever ``to_empty()`` left behind.
-        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        _to_empty_preserving_nonpersistent_buffers(
+            model, materialize_device, preserve_persistent_buffers=not should_skip_hf_weight_load
+        )
         _reset_hf_initialized_flag(model)
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
