@@ -1,6 +1,5 @@
 """Foreground case progress and failure diagnostics for concurrent batches."""
 
-import codecs
 import json
 import os
 import sys
@@ -41,18 +40,7 @@ def print_failure_log(path, *, label):
     title = f"{label}: full worker output ({path})"
     print(f"::group::{title}" if grouped else f"--- {title} ---", flush=True)
     try:
-        with path.open("rb") as handle:
-            # A cleanup failure can leave a writer alive. Read the existing
-            # bytes only, without following that writer or loading the whole log.
-            remaining = os.fstat(handle.fileno()).st_size
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            while remaining:
-                chunk = handle.read(min(65536, remaining))
-                if not chunk:
-                    break
-                sys.stdout.write(decoder.decode(chunk))
-                remaining -= len(chunk)
-            sys.stdout.write(decoder.decode(b"", final=True))
+        sys.stdout.write(path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         print(f"Could not read worker log: {exc}", flush=True)
     finally:

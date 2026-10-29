@@ -200,18 +200,16 @@ or the accelerator runtime. Its default env:// port uses the legacy run-scoped
 locked registry, which prevents cooperative reuse but does not hold an OS
 reservation. Distributed spawn launches instead own a live TCPStore from
 allocation through worker cleanup; standalone torchrun agents bind their own
-Stores atomically on port zero. Spawn lifecycle events are retained in each
-batch's `.rendezvous.jsonl` with the owner PID, case, launch ID and endpoint.
+Stores atomically on port zero.
 Common launchers validate actual `nproc`, node count, and child device visibility
-against the plan and lease. Compare observed launch arguments with the baseline
-to verify backend and parallel-topology coverage. Release resources only after scoped
+against the plan and lease. Release resources only after scoped
 cleanup of the launcher's process group and tracked descendants, including
 when its group leader has already exited. By default the first failed pytest
 phase or worker stops new dispatches and cancels running peers in the same
 suite/job. Wait for owned process cleanup, then return failure. `--keep-going`
 continues all cases and batches without cancelling peers.
 If owned processes survive cleanup, stop admission and cancel running peers
-even with `--keep-going`; the affected device lease must not be reused.
+even with `--keep-going`; the affected worker process scope cannot be safely reused.
 
 On Ctrl-C, collection and scheduling cancel their owned subprocess scopes before
 waiting for thread-pool callbacks. Workers then use the existing bounded
@@ -235,7 +233,7 @@ Failure output includes the node ID and pytest traceback summary, followed by
 the failed worker's complete combined stdout/stderr. Actions groups this output
 under the manifest entry ID so training-rank tracebacks remain accessible when
 pytest reports an outer subprocess error. Local runs print the same output
-inline. Stream the existing log in bounded chunks after worker cleanup, while
+inline. Read and write the full worker log in one call after worker cleanup, while
 successful batches retain compact progress output.
 Cancelled batches are distinguished from test failures, and the original
 failure remains the final error even if a cancelled peer exits first. Preserve
@@ -309,7 +307,7 @@ remain part of test collection.
 - Exercise defaults, parameterized plans, CPU workers, sequential/concurrent
   case peaks, mismatches, starvation prevention, fixture isolation, and cleanup.
 - Run the full unit/e2e selections, including conditional coverage. Preserve
-  per-case timings, actual wall time, device assignments, logs/JUnit, source
-  fingerprints, and cache/environment limits.
+  per-case timings, actual wall time, device assignments, logs/JUnit, and
+  cache/environment limits.
 - Run serial and concurrent GPU/NPU adapter checks on their respective hardware;
   record any NPU validation gap explicitly.
