@@ -29,5 +29,3 @@ pre-hook, including the ordinary DCP cleanup hook, zero-step PLE stays lazy as
 before.
 
 Same-dimension ExtraParallel/FSDP checkpoints carry an explicit EP-outer layout marker in model and optimizer state. Older unversioned layouts require an explicit migration and are rejected before tensor reads, even during partial/optimizer-only restore. The marker is not a model weight and is excluded from HF export.
-
-CPU optimizer receipts use framework logging. DCP's synthetic zero-learning-rate state initialization does not consume the one-shot receipt; it is emitted once updates use a nonzero learning rate.

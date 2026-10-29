@@ -209,6 +209,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         self, *args, momentum=0.95, max_matrix_parameter_numel=134217728, max_logical_matrix_numel=33554432, **kwargs
     ):
         super().__init__(*args, **kwargs)
+        self._state_receipt_emitted = False
         if self.resident_moment_dtype != torch.float32 or self.cpu_moment_dtype != torch.float32:
             raise ValueError("Qwen3.8 Muon requires FP32 master and all optimizer states")
         if not 0 <= momentum < 1:
@@ -311,15 +312,6 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                         state["step"] = self._ple_step_tensor(p, state["step"])
                         result["state"][key] = state
             return result
-
-    def _emit_state_receipt(self):
-        # CPUOffloadAdamW.step runs only the pure Adam groups. Emit after *all*
-        # mixed groups have initialized and updated instead.
-        return
-
-    def _emit_step_timing(self):
-        # Parent timing covers only fallback groups, not this full optimizer.
-        return
 
     def _emit_complete_receipt(self):
         if self._state_receipt_emitted:

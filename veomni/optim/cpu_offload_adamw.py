@@ -6,19 +6,12 @@ selected groups' master weights and moments live on pageable CPU memory.
 Transfers use one bounded BF16/FP32 staging buffer, never a full master copy.
 """
 
-import json
 import math
 import re
-import time
 
 import torch
 
-from veomni.utils.logging import get_logger
-
 from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
-
-
-logger = get_logger(__name__)
 
 
 def select_cpu_offload_groups(model, groups, patterns):
@@ -100,7 +93,6 @@ class CPUOffloadAdamW(FullFP32AdamW):
             if policy:
                 self._offloaded.update(id(param) for param in group["params"])
         self._staging = {}
-        self._state_receipt_emitted = False
 
     def _state_dtype(self, param, name):
         if name == "master_weight":
@@ -128,43 +120,6 @@ class CPUOffloadAdamW(FullFP32AdamW):
             # FP32 moments to the compute dtype or doubling device storage.
             state[name] = tensor.detach().to(device=target)
         return state
-
-    def _emit_state_receipt(self):
-        if self._state_receipt_emitted or not any(group["lr"] != 0 for group in self.param_groups):
-            return
-        parameter_states = [
-            state for group in self.param_groups for param in group["params"] if (state := self.state.get(param))
-        ]
-        entries = {}
-        for state in parameter_states:
-            for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                tensor = _local(state[name])
-                identity = (name, str(tensor.dtype), str(tensor.device))
-                entry = entries.setdefault(
-                    identity, dict(state=name, dtype=str(tensor.dtype), device=str(tensor.device), numel=0, bytes=0)
-                )
-                entry["numel"] += tensor.numel()
-                entry["bytes"] += tensor.numel() * tensor.element_size()
-        if not entries:
-            return
-        payload = dict(
-            optimizer="CPUOffloadAdamW",
-            scope="this_optimizer_actual_initialized_states_only",
-            initialized_parameter_tensors=len(parameter_states),
-            configured_parameter_tensors=sum(len(group["params"]) for group in self.param_groups),
-            configured_offloaded_parameter_tensors=len(self._offloaded),
-            learning_rates=[group["lr"] for group in self.param_groups],
-            optimizer_step_seconds=self.last_step_seconds,
-            timing_scope="this_suboptimizer_current_rank_device_synchronized",
-            rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-            cpu_state_bytes=sum(item["bytes"] for item in entries.values() if item["device"].startswith("cpu")),
-            accelerator_state_bytes=sum(
-                item["bytes"] for item in entries.values() if not item["device"].startswith("cpu")
-            ),
-            local_state=list(entries.values()),
-        )
-        logger.info("OPTIMIZER_STATE_RECEIPT " + json.dumps(payload, sort_keys=True))
-        self._state_receipt_emitted = True
 
     def _buffer(self, tensor, size):
         key = (tensor.device, tensor.dtype)
@@ -197,7 +152,6 @@ class CPUOffloadAdamW(FullFP32AdamW):
         }
         for device in sorted(devices, key=str):
             self._synchronize(device)
-        started = time.perf_counter()
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             for param in group["params"]:
@@ -261,12 +215,4 @@ class CPUOffloadAdamW(FullFP32AdamW):
                         w[section].copy_(effective)
         for device in sorted(devices, key=str):
             self._synchronize(device)
-        self.last_step_seconds = time.perf_counter() - started
-        self._emit_state_receipt()
-        if any(group["lr"] != 0 for group in self.param_groups):
-            self._emit_step_timing()
         return loss
-
-    def _emit_step_timing(self):
-        if self._offloaded and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
-            logger.info("CPU_OPTIMIZER_STEP global_rank0_suboptimizer_seconds=%.6f", self.last_step_seconds)
