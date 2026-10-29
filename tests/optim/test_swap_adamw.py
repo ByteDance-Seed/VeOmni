@@ -359,6 +359,57 @@ def test_maximize_matches_torch(cpu_mesh):
         torch.testing.assert_close(swapped.to_local(), ref.detach(), atol=1e-6, rtol=1e-6)
 
 
+def test_fused_amsgrad_maximize_matches_torch(cpu_mesh):
+    """The fused path must wire ``amsgrad``/``maximize`` and the third moment.
+
+    ``_fused_adamw_bucket`` builds the ``max_exp_avg_sq`` list and forwards both
+    flags; the other fused tests keep the defaults, so a mis-wired flag would
+    surface only on device. The CPU fused kernel takes the same call contract.
+    """
+    torch.manual_seed(9)
+    shape = (6, 4)
+    init = torch.randn(shape)
+
+    ref = nn.Parameter(init.clone())
+    swapped = _swap_param(init, cpu_mesh)
+
+    ref_opt = torch.optim.AdamW(
+        [ref],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.1,
+        amsgrad=True,
+        maximize=True,
+        foreach=False,
+    )
+    swap_opt = SwapAdamW(
+        [{"params": [swapped], "weight_decay": 0.1, "maximize": True}],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        amsgrad=True,
+        pin_memory=False,
+    )
+    swap_opt._use_fused = True
+
+    for _ in range(3):
+        grad = torch.randn(shape)
+        ref.grad = grad.clone()
+        swapped.grad = _partition(grad.clone(), cpu_mesh)
+        ref_opt.step()
+        swap_opt.step()
+
+        torch.testing.assert_close(swapped.to_local(), ref.detach(), atol=1e-6, rtol=1e-6)
+        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            torch.testing.assert_close(
+                swap_opt._host_states[swapped][key],
+                ref_opt.state[ref][key],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+
+
 def test_param_groups_and_missing_grad(cpu_mesh):
     torch.manual_seed(4)
     init_a = torch.randn(4, 2)
