@@ -89,11 +89,12 @@ def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch
         model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
         output = model.dummy_forward().pooler_output
         assert torch.isfinite(output).all()
-        (output.float().mean() * 0.0).backward()
+        output.float().square().mean().backward()
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, name
                 assert torch.isfinite(param.grad).all(), name
+        assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
 
 
 @pytest.mark.parametrize("attention", ["eager", "veomni_sdpa"])
@@ -150,11 +151,12 @@ def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
             model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
             output = model.dummy_forward().pooler_output
             assert torch.isfinite(output).all()
-            (output.float().mean() * 0.0).backward()
+            output.float().square().mean().backward()
             for name, param in model.named_parameters():
                 if param.requires_grad:
                     assert param.grad is not None, name
                     assert torch.isfinite(param.grad).all(), name
+            assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
     finally:
         dist.destroy_process_group()
 
