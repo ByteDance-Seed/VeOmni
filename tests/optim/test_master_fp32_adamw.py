@@ -2,7 +2,9 @@ import copy
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 spec = importlib.util.spec_from_file_location(
@@ -10,6 +12,87 @@ spec = importlib.util.spec_from_file_location(
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+@pytest.mark.parametrize("optimizer_class", [module.MasterFP32AdamW, module.FullFP32AdamW])
+def test_resume_preserves_state_without_bf16_temporary_copies(optimizer_class):
+    class BF16CopyCounter(TorchDispatchMode):
+        def __init__(self):
+            self.copied_elements = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            if func is torch.ops.aten._to_copy.default and args[0].dtype == torch.float32:
+                if result.dtype == torch.bfloat16 and result.numel() > 1:
+                    self.copied_elements += result.numel()
+            return result
+
+    param = torch.nn.Parameter(torch.linspace(-1, 1, 257).bfloat16())
+    dormant = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+    original = optimizer_class([param, dormant], lr=1e-4)
+    param.grad = torch.linspace(-0.1, 0.1, 257).bfloat16()
+    original.step()
+    checkpoint = copy.deepcopy(original.state_dict())
+
+    restored_param = torch.nn.Parameter(param.detach().clone())
+    restored_dormant = torch.nn.Parameter(dormant.detach().clone())
+    resumed = optimizer_class([restored_param, restored_dormant], lr=3e-4)
+    with BF16CopyCounter() as copies:
+        resumed.load_state_dict(checkpoint)
+
+    assert copies.copied_elements == 0
+    assert resumed.param_groups[0]["lr"] == original.param_groups[0]["lr"]
+    assert restored_dormant not in resumed.state
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[restored_param][name], original.state[param][name], rtol=0, atol=0)
+
+    next_grad = torch.linspace(0.1, -0.1, 257).bfloat16()
+    param.grad = next_grad
+    restored_param.grad = next_grad.clone()
+    original.step()
+    resumed.step()
+    torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[restored_param][name], original.state[param][name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("optimizer_class", [module.MasterFP32AdamW, module.FullFP32AdamW])
+def test_resume_honors_load_hooks_and_unassigned_state(optimizer_class):
+    param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    source = optimizer_class([param], lr=1e-4)
+    param.grad = torch.arange(4).bfloat16()
+    source.step()
+    checkpoint = copy.deepcopy(source.state_dict())
+    checkpoint["state"]["global_metadata"] = {"version": 7}
+
+    target = torch.nn.Parameter(param.detach().clone())
+    resumed = optimizer_class([target], lr=3e-4)
+    events = []
+
+    def before_load(optimizer, incoming):
+        events.append("before")
+        assert optimizer is resumed
+        key = incoming["param_groups"][0]["params"][0]
+        assert incoming["state"][key]["master_weight"].dtype == torch.float32
+        replacement = copy.deepcopy(incoming)
+        replacement["param_groups"][0]["lr"] = 0.002
+        replacement["state"][key]["exp_avg"].add_(1)
+        return replacement
+
+    def after_load(optimizer):
+        events.append("after")
+        assert optimizer.state[target]["master_weight"].dtype == torch.float32
+        assert optimizer.state["global_metadata"] == {"version": 7}
+        optimizer.param_groups[0]["post_load_seen"] = True
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(checkpoint)
+
+    assert events == ["before", "after"]
+    assert resumed.param_groups[0]["lr"] == 0.002
+    assert resumed.param_groups[0]["post_load_seen"]
+    torch.testing.assert_close(resumed.state[target]["exp_avg"], source.state[param]["exp_avg"] + 1, rtol=0, atol=0)
 
 
 def test_master_updates_and_reload():
