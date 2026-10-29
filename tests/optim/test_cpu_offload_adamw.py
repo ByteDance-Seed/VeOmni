@@ -549,6 +549,57 @@ def _extra_parallel_resume_worker(rank, world, rendezvous, hsdp=False):
         dist.destroy_process_group()
 
 
+def _subgroup_mesh_worker(rank, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
+    from veomni.checkpoint.dcp_checkpointer import _extra_parallel_first_mesh
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=8, timeout=timedelta(seconds=20)
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("replicate", "fsdp", "ep"))
+        replacement = [None, None, None]
+        for axis in range(3):
+            for first in range(2):
+                for second in range(2):
+                    if axis == 0:
+                        ranks = [replica * 4 + first * 2 + second for replica in range(2)]
+                    elif axis == 1:
+                        ranks = [first * 4 + shard * 2 + second for shard in range(2)]
+                    else:
+                        ranks = [first * 4 + second * 2 + expert for expert in range(2)]
+                    group = dist.new_group(ranks)
+                    if rank in ranks:
+                        replacement[axis] = group
+        alternate = DeviceMesh.from_group(replacement, "cpu", mesh=mesh.mesh, mesh_dim_names=mesh.mesh_dim_names)
+        # Only the first complete HSDP replica constructs the reordered view.
+        # Its process groups already exist; no world-wide collective may occur.
+        if rank < 4:
+            for source in (mesh, alternate):
+                reordered = _extra_parallel_first_mesh(source)
+                assert _extra_parallel_first_mesh(source) is reordered
+                assert reordered.mesh_dim_names == ("replicate", "ep", "fsdp")
+                assert torch.equal(reordered.mesh, source.mesh.permute(0, 2, 1))
+                for new_dim, old_dim in enumerate((0, 2, 1)):
+                    assert reordered.get_group(new_dim) is source.get_group(old_dim)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=8, device="cpu"))
+def test_hsdp_subgroup_reordered_mesh_reuses_existing_groups(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _subgroup_mesh_worker, args=(str(tmp_path / "rdzv-subgroup"),), nprocs=8, join=True, start_method="fork"
+    )
+
+
 @pytest.mark.parametrize("hsdp", [False, True])
 @pytest.mark.launch_plan(provider=lambda context: _extra_parallel_launch(context.params["hsdp"]))
 def test_extra_parallel_fsdp_state_resume_restores_parameter_mesh(tmp_path, hsdp):
