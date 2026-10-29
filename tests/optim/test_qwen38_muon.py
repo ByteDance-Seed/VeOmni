@@ -603,3 +603,306 @@ def test_qwen38_recipe_rejects_dynamic_parameter_group():
     lookup = torch.nn.Parameter(torch.ones(2, 2))
     with pytest.raises(RuntimeError, match="complete parameter recipe"):
         optimizer.add_param_group({"params": [lookup], "qwen38_ple_lookup": True, "weight_decay": 0.2})
+
+
+def test_ple_load_hooks_receive_saved_state_before_lazy_normalization():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+
+    def build():
+        groups = module.add_qwen38_plans(
+            model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+        )
+        return module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    source = build()
+    saved = copy.deepcopy(source.state_dict())
+    key = saved["param_groups"][0]["params"][0]
+    assert saved["state"][key]["step"].item() == 0
+    target = model.ngram_embedding.weight
+    lazy = build()
+    lazy.load_state_dict(copy.deepcopy(saved))
+    assert target not in lazy.state
+
+    observed = []
+    read_only = build()
+    read_only.register_load_state_dict_pre_hook(
+        lambda optimizer, incoming: observed.append(incoming["state"][key]["step"])
+    )
+    read_only.load_state_dict(copy.deepcopy(saved))
+    assert observed[0].item() == 0
+    assert read_only.state[target]["step"].item() == 0
+
+    resumed = build()
+    events = []
+
+    def before_load(optimizer, incoming):
+        assert optimizer is resumed
+        assert incoming["state"][key]["step"].item() == 0
+        incoming["state"][key]["exp_avg"].fill_(0.5)
+        events.append("before")
+
+    def after_load(optimizer):
+        assert optimizer.state[target]["step"].item() == 0
+        torch.testing.assert_close(
+            optimizer.state[target]["exp_avg"], torch.full_like(target, 0.5, dtype=torch.float32)
+        )
+        events.append("after")
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(saved)
+    assert events == ["before", "after"]
+    target.grad = torch.zeros_like(target)
+    resumed.step()
+    torch.testing.assert_close(resumed.state[target]["exp_avg"], torch.full_like(target, 0.45, dtype=torch.float32))
+
+
+def test_muon_state_dict_preserves_unassigned_falsey_and_tensor_metadata():
+    parameter = torch.nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+    optimizer = make_optimizer(parameter, [("muon", 0, 4)])
+    optimizer.state["zero"] = 0
+    optimizer.state["empty"] = {}
+    optimizer.state["tensor"] = torch.tensor([1, 2])
+    saved = optimizer.state_dict()
+    assert saved["state"]["zero"] == 0
+    assert saved["state"]["empty"] == {}
+    assert torch.equal(saved["state"]["tensor"], torch.tensor([1, 2]))
+
+
+def test_ple_zero_step_pre_hook_master_update_is_preserved():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4, chunk_size=2)
+    saved = copy.deepcopy(source.state_dict())
+    target = model.ngram_embedding.weight
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4, chunk_size=2)
+
+    def modify_master(optimizer, incoming):
+        key = incoming["param_groups"][0]["params"][0]
+        incoming["state"][key]["master_weight"][-1, -1].add_(1e-6)
+
+    resumed.register_load_state_dict_pre_hook(modify_master)
+    resumed.load_state_dict(saved)
+    expected = target.detach().float()
+    expected[-1, -1] += 1e-6
+    torch.testing.assert_close(resumed.state[target]["master_weight"], expected, rtol=0, atol=0)
+
+
+def test_ple_zero_step_pre_hook_step_dtype_is_preserved():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    target = model.ngram_embedding.weight
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    def modify_step(optimizer, incoming):
+        key = incoming["param_groups"][0]["params"][0]
+        incoming["state"][key]["step"] = incoming["state"][key]["step"].double()
+
+    resumed.register_load_state_dict_pre_hook(modify_step)
+    resumed.load_state_dict(saved)
+    assert resumed.state[target]["step"].dtype == torch.float64
+
+
+def test_ple_pre_hook_can_migrate_unreadable_step():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    key = saved["param_groups"][0]["params"][0]
+    saved["state"][key]["step"] = torch.empty((), device="meta")
+    target = model.ngram_embedding.weight
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    def migrate(optimizer, incoming):
+        incoming["state"][key]["step"] = torch.tensor(0.0)
+
+    resumed.register_load_state_dict_pre_hook(migrate)
+    resumed.load_state_dict(saved)
+    assert resumed.state[target]["step"].item() == 0
+
+
+def test_ple_pre_hook_can_repair_parameter_groups():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    damaged = {**saved, "param_groups": []}
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    resumed.register_load_state_dict_pre_hook(lambda optimizer, incoming: copy.deepcopy(saved))
+    resumed.load_state_dict(damaged)
+    assert resumed.state[model.ngram_embedding.weight]["step"].item() == 0
+
+
+def test_ple_zero_step_pre_hook_stride_change_is_preserved():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(1, 2, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    def change_stride(optimizer, incoming):
+        key = incoming["param_groups"][0]["params"][0]
+        master = incoming["state"][key]["master_weight"]
+        incoming["state"][key]["master_weight"] = master.as_strided(master.shape, (99, 1))
+
+    resumed.register_load_state_dict_pre_hook(change_stride)
+    resumed.load_state_dict(saved)
+    assert resumed.state[model.ngram_embedding.weight]["master_weight"].stride() == (99, 1)
+
+
+def test_ple_zero_step_pre_hook_state_alias_is_preserved():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(2, 2, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    def alias_state(optimizer, incoming):
+        key = incoming["param_groups"][0]["params"][0]
+        entry = incoming["state"][key]
+        entry["exp_avg_sq"] = entry["exp_avg"]
+
+    resumed.register_load_state_dict_pre_hook(alias_state)
+    resumed.load_state_dict(saved)
+    state = resumed.state[model.ngram_embedding.weight]
+    assert state["exp_avg"].untyped_storage().data_ptr() == state["exp_avg_sq"].untyped_storage().data_ptr()
+
+
+def test_ple_read_only_hook_retains_saved_zero_step_state():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    source = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = copy.deepcopy(source.state_dict())
+    target = model.ngram_embedding.weight
+    resumed = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    resumed.register_load_state_dict_pre_hook(lambda optimizer, incoming: None)
+    with torch.no_grad():
+        target.fill_(3.0)
+    resumed.load_state_dict(saved)
+    saved_master = resumed.state[target]["master_weight"].clone()
+    with torch.no_grad():
+        target.fill_(7.0)
+    target.grad = torch.zeros_like(target)
+    resumed.step()
+    torch.testing.assert_close(resumed.state[target]["master_weight"], saved_master, rtol=0, atol=0)
+
+
+def test_dcp_internal_filter_does_not_materialize_lazy_ple(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import torch.distributed.checkpoint as dcp
+
+    from veomni.checkpoint import dcp_checkpointer as checkpoint
+
+    def build():
+        model = torch.nn.Module()
+        model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+        model.embed_tokens = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+        model.lm_head = torch.nn.Linear(4, 7, bias=False, dtype=torch.bfloat16)
+        groups = module.add_qwen38_plans(
+            model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+        )
+        return model, module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    source_model, source = build()
+    source_model.lm_head.weight.grad = torch.ones_like(source_model.lm_head.weight)
+    source.step()
+    parallel = types.SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": checkpoint.OptimizerState(source_model, source, parallel_state=parallel)}, checkpoint_id=tmp_path
+    )
+    target_model, target = build()
+    seen = []
+    install = checkpoint._filter_synthetic_optimizer_state_on_load
+
+    @contextmanager
+    def record_install(model, optimizer):
+        with install(model, optimizer):
+            seen.append(
+                sum(
+                    getattr(hook, "_veomni_internal_dcp_filter", False)
+                    for hook in optimizer._optimizer_load_state_dict_pre_hooks.values()
+                )
+            )
+            yield
+
+    monkeypatch.setattr(checkpoint, "_filter_synthetic_optimizer_state_on_load", record_install)
+    dcp.load(
+        {"optimizer": checkpoint.OptimizerState(target_model, target, parallel_state=parallel, load=True)},
+        checkpoint_id=tmp_path,
+        planner=checkpoint._ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+    )
+    assert seen == [1]
+    assert target_model.ngram_embedding.weight not in target.state
+    assert target_model.embed_tokens.weight not in target.state
+    assert target_model.lm_head.weight in target.state
+
+
+def test_resume_hooks_preserve_moments_and_next_mixed_update():
+    param = torch.nn.Parameter(torch.arange(12).reshape(4, 3).bfloat16() / 16)
+    plan = [("muon", 0, 2), ("adamw", 2, 4)]
+    source = make_optimizer(param, plan)
+    param.grad = torch.arange(12).reshape(4, 3).bfloat16() / 32
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["global_metadata"] = {"version": 7}
+    key = saved["param_groups"][0]["params"][0]
+    target = torch.nn.Parameter(param.detach().clone())
+    resumed = make_optimizer(target, plan)
+    events = []
+
+    def before_load(optimizer, incoming):
+        events.append("before")
+        assert optimizer is resumed
+        assert incoming["state"][key]["exp_avg"].dtype == torch.float32
+        replacement = copy.deepcopy(incoming)
+        replacement["state"][key]["exp_avg"].add_(0.125)
+        return replacement
+
+    def after_load(optimizer):
+        events.append("after")
+        assert optimizer.state["global_metadata"] == {"version": 7}
+        state = optimizer.state[target]
+        assert set(state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
+        state["exp_avg"].add_(0.25)
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(saved)
+    assert events == ["before", "after"]
+
+    expected = copy.deepcopy(saved)
+    expected["state"][key]["exp_avg"].add_(0.125).add_(0.25)
+    reference_param = torch.nn.Parameter(param.detach().clone())
+    reference = make_optimizer(reference_param, plan)
+    reference.load_state_dict(expected)
+    for parameter, optimizer in ((target, resumed), (reference_param, reference)):
+        parameter.grad = torch.arange(12).reshape(4, 3).flip(0).bfloat16() / 32
+        optimizer.step()
+    torch.testing.assert_close(target, reference_param, rtol=0, atol=0)
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[target][name], reference.state[reference_param][name], rtol=0, atol=0)

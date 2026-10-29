@@ -2218,3 +2218,147 @@ def test_versioned_extra_parallel_checkpoint_exports_only_model_tensors(tmp_path
     exported = module._process_shard(plan, str(tmp_path))
     assert set(exported) == {"weight"}
     torch.testing.assert_close(exported["weight"], weights, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("moment_dtype", [torch.float32, torch.bfloat16])
+def test_resume_hooks_see_complete_state_and_preserve_their_changes(offload, moment_dtype):
+    def make(param):
+        return CPUOffloadAdamW(
+            [{"params": [param], "cpu_offload": offload}],
+            lr=0.001,
+            resident_moment_dtype=moment_dtype,
+            cpu_moment_dtype=moment_dtype,
+        )
+
+    param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    source = make(param)
+    param.grad = torch.arange(4).bfloat16()
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["global_metadata"] = {"version": 7}
+    key = saved["param_groups"][0]["params"][0]
+    target = torch.nn.Parameter(param.detach().clone())
+    resumed = make(target)
+    events = []
+
+    def before_load(optimizer, incoming):
+        events.append("before")
+        assert optimizer is resumed
+        assert incoming["state"][key]["master_weight"].dtype == torch.float32
+        replacement = copy.deepcopy(incoming)
+        replacement["param_groups"][0]["lr"] = 0.002
+        replacement["state"][key]["exp_avg"].add_(0.125)
+        return replacement
+
+    def after_load(optimizer):
+        events.append("after")
+        assert optimizer.state["global_metadata"] == {"version": 7}
+        state = optimizer.state[target]
+        assert set(state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
+        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == moment_dtype
+        state["exp_avg"].add_(0.25)
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(saved)
+    assert events == ["before", "after"]
+    assert resumed.param_groups[0]["lr"] == 0.002
+
+    expected = copy.deepcopy(saved)
+    expected["param_groups"][0]["lr"] = 0.002
+    expected["state"][key]["exp_avg"].add_(0.125).add_(0.25)
+    reference_param = torch.nn.Parameter(param.detach().clone())
+    reference = make(reference_param)
+    reference.load_state_dict(expected)
+    for parameter, optimizer in ((target, resumed), (reference_param, reference)):
+        parameter.grad = torch.arange(4).flip(0).bfloat16()
+        optimizer.step()
+    torch.testing.assert_close(target, reference_param, rtol=0, atol=0)
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[target][name], reference.state[reference_param][name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+def test_dcp_load_hooks_observe_saved_state_and_keep_their_changes(tmp_path, empty, multi):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    source_model = torch.nn.Linear(1, 1).bfloat16()
+    source = CPUOffloadAdamW(source_model.parameters(), lr=0.001)
+    if not empty:
+        source_model.weight.grad = torch.ones_like(source_model.weight)
+        source.step()
+    source_container = MultiOptimizer(source_model, {"all": source}, ["all"]) if multi else source
+    parallel = SimpleNamespace(dp_mode="ddp")
+    if empty and not multi:
+        # Exercise an explicitly empty checkpoint without asking Torch DCP's
+        # state-dict producer to synthesize optimizer state for every parameter.
+        saved = source.state_dict()
+        saved["param_groups"][0]["params"] = ["weight", "bias"]
+        saved[_ZERO_OPTIMIZER_STATE_MARKER] = True
+    else:
+        saved = OptimizerState(source_model, source_container, parallel_state=parallel)
+    dcp.save({"optimizer": saved}, checkpoint_id=tmp_path)
+
+    target_model = torch.nn.Linear(1, 1).bfloat16()
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    target_container = MultiOptimizer(target_model, {"all": target}, ["all"]) if multi else target
+    get_optimizer_state_dict(target_model, target)
+    events = []
+
+    def before_load(optimizer, incoming):
+        assert set(incoming["state"]) == (set() if empty else {"weight"})
+        events.append("before")
+
+    def after_load(optimizer):
+        assert target_model.bias not in optimizer.state
+        optimizer.state[target_model.bias] = {
+            "step": torch.tensor(7.0),
+            "master_weight": target_model.bias.detach().float().clone(),
+            "exp_avg": torch.full_like(target_model.bias, 0.75, dtype=torch.float32),
+            "exp_avg_sq": torch.zeros_like(target_model.bias, dtype=torch.float32),
+        }
+        events.append("after")
+
+    target.register_load_state_dict_pre_hook(before_load)
+    target.register_load_state_dict_post_hook(after_load)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target_container, parallel_state=parallel, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target_container),
+    )
+    assert events == ["before", "after"]
+    assert target.state[target_model.bias]["step"].item() == 7
+    assert target.state[target_model.bias]["exp_avg"].item() == 0.75
+
+
+def test_state_receipt_ignores_unassigned_metadata_after_resume():
+    param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    source = CPUOffloadAdamW([param])
+    param.grad = torch.ones_like(param)
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["custom_metadata"] = {"value": 1}
+    clone = torch.nn.Parameter(param.detach().clone())
+    target = CPUOffloadAdamW([clone])
+    target.load_state_dict(saved)
+    clone.grad = torch.ones_like(clone)
+    target.step()
+    assert target.state["custom_metadata"] == {"value": 1}
+    model = torch.nn.Module()
+    model.register_parameter("weight", clone)
+    with pytest.raises(RuntimeError, match="DCP cannot serialize non-parameter optimizer state"):
+        OptimizerState(model, target, parallel_state=SimpleNamespace(dp_mode="ddp")).state_dict()
+
+    called = []
+
+    def save_metadata_separately(optimizer):
+        called.append(optimizer.state.pop("custom_metadata"))
+
+    target.register_state_dict_pre_hook(save_metadata_separately)
+    exported = OptimizerState(model, target, parallel_state=SimpleNamespace(dp_mode="ddp")).state_dict()
+    assert called == [{"value": 1}]
+    assert "weight" in exported["state"]

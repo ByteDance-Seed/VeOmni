@@ -140,10 +140,11 @@ class CPUOffloadAdamW(FullFP32AdamW):
     def _emit_state_receipt(self):
         if self._state_receipt_emitted or not any(group["lr"] != 0 for group in self.param_groups):
             return
+        parameter_states = [
+            state for group in self.param_groups for param in group["params"] if (state := self.state.get(param))
+        ]
         entries = {}
-        for state in self.state.values():
-            if not state:
-                continue
+        for state in parameter_states:
             for name in ("master_weight", "exp_avg", "exp_avg_sq"):
                 tensor = _local(state[name])
                 identity = (name, str(tensor.dtype), str(tensor.device))
@@ -157,7 +158,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
         payload = dict(
             optimizer="CPUOffloadAdamW",
             scope="this_optimizer_actual_initialized_states_only",
-            initialized_parameter_tensors=sum(bool(state) for state in self.state.values()),
+            initialized_parameter_tensors=len(parameter_states),
             configured_parameter_tensors=sum(len(group["params"]) for group in self.param_groups),
             configured_offloaded_parameter_tensors=len(self._offloaded),
             learning_rates=[group["lr"] for group in self.param_groups],

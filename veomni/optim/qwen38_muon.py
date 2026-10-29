@@ -496,7 +496,12 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                         result["state"][key] = state
             # The temporary empty sentinel is not optimizer state and must not
             # mask a truly zero-state checkpoint.
-            result["state"] = {key: value for key, value in result["state"].items() if value}
+            assigned = {key for group in result["param_groups"] for key in group["params"]}
+            result["state"] = {
+                key: value
+                for key, value in result["state"].items()
+                if key not in assigned or not (isinstance(value, dict) and not value)
+            }
             return result
 
     def _emit_state_receipt(self):
@@ -511,8 +516,11 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
     def _emit_complete_receipt(self):
         if self._state_receipt_emitted:
             return
+        parameter_states = [
+            state for group in self.param_groups for param in group["params"] if (state := self.state.get(param))
+        ]
         entries = {}
-        for state in self.state.values():
+        for state in parameter_states:
             for key in ("master_weight", "exp_avg", "exp_avg_sq"):
                 if key not in state:
                     continue
@@ -524,7 +532,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             + json.dumps(
                 dict(
                     recipe=RECIPE,
-                    initialized=len(self.state),
+                    initialized=len(parameter_states),
                     configured=len(self.param_groups),
                     state_bytes=entries,
                     muon_second_moment="omitted_for_pure_experts",
@@ -550,6 +558,10 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             raise
 
     def _load_state_dict_impl(self, state_dict):
+        user_pre_hook = any(
+            not getattr(hook, "_veomni_internal_dcp_filter", False)
+            for hook in self._optimizer_load_state_dict_pre_hooks.values()
+        )
         lazy = []
 
         def prepare(_optimizer, incoming):
@@ -592,7 +604,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                         scalar = _local(step).detach().cpu().reshape(()).clone()
                         if not torch.isfinite(scalar) or scalar < 0 or scalar != scalar.floor():
                             raise RuntimeError("Invalid PLE optimizer step")
-                        if scalar.item() == 0:
+                        if scalar.item() == 0 and not user_pre_hook:
                             incoming["state"].pop(key)
                             lazy.append(p)
                         else:

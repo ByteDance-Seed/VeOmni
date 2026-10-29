@@ -882,6 +882,17 @@ def _drop_absent_optimizer_state(model, optimizer) -> None:
         logger.info_rank0("DCP resume dropped %d wholly absent optimizer state entr(ies)", dropped)
 
 
+def _validate_dcp_optimizer_state_keys(optimizer):
+    """DCP's optimizer FQN mapper supports only parameter-owned state."""
+    for leaf in _iter_optimizer_leaves(optimizer):
+        parameter_ids = {id(param) for group in leaf.param_groups for param in group["params"]}
+        has_state_hooks = getattr(leaf, "_optimizer_state_dict_pre_hooks", None) or getattr(
+            leaf, "_optimizer_state_dict_post_hooks", None
+        )
+        if not has_state_hooks and any(id(key) not in parameter_ids for key in leaf.state):
+            raise RuntimeError("DCP cannot serialize non-parameter optimizer state; remove or save it separately")
+
+
 @contextmanager
 def _filter_synthetic_optimizer_state_on_load(model, optimizer):
     """Hide DCP-created placeholder entries before user load hooks run.
@@ -943,6 +954,7 @@ def _filter_synthetic_optimizer_state_on_load(model, optimizer):
                     invoked.add(id(current))
                     return result
 
+                filter_state._veomni_internal_dcp_filter = True
                 handles.append(leaf.register_load_state_dict_pre_hook(filter_state, prepend=True))
         yield
         if invoked != expected:
@@ -1855,6 +1867,7 @@ class OptimizerState(Stateful):
         error = None
         try:
             _validate_unique_optimizer_parameters(self.optimizer)
+            _validate_dcp_optimizer_state_keys(self.optimizer)
             for leaf in _iter_optimizer_leaves(self.optimizer):
                 if any(not group["params"] for group in leaf.param_groups):
                     raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
@@ -1897,6 +1910,7 @@ class OptimizerState(Stateful):
     def _state_dict_impl(self):
         if not self._coordinate_state_dict:
             _validate_unique_optimizer_parameters(self.optimizer)
+            _validate_dcp_optimizer_state_keys(self.optimizer)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"

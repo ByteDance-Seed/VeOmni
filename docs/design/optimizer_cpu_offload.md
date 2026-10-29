@@ -6,11 +6,28 @@ For CPU offload, `cpu_offload_param_patterns` selects parameters by full paramet
 
 DCP load preserves offloaded CPU storage instead of temporarily materializing the optimizer on the accelerator. Precision-sensitive restores reject dtype changes and incomplete optimizer fields, including partially missing states for unused parameters. Such checkpoints need an explicit migration; silent initialization from pre-load compute weights is unsafe.
 
+Optimizer load pre-hooks receive the complete saved state. Post-hooks run only after validated tensors are installed, so their moment changes survive into the next update without casting FP32 states through the compute dtype.
+
 CPU tests cover FP32 reference updates, cold optimizer-state restoration, missing-field rejection and precision migration rejection. Accelerator transfers, DTensor layouts and multi-rank DCP cold resume still require native qualification on each hardware profile.
 
 Resume validates saved tensor shapes and dtypes before DCP reads. Use a fresh optimizer when resuming. The loader prepares target placeholders, then removes those for parameters whose saved state is wholly absent. A partially initialized target optimizer is rejected if its existing state cannot represent the saved state. Partial ordinary AdamW state remains supported. Validation itself allocates no additional master or moment tensors.
 
 Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors. A zero-step sparse `MultiOptimizer` checkpoint carries an exclusive marker and restores lazy state. A marker combined with tensor state is rejected; marker-less checkpoints with no optimizer state remain rejected because they are indistinguishable from lost state.
+
+Qwen3.8 Muon keeps a zero-step PLE placeholder if a user registers an optimizer
+load pre-hook: the hook can change tensors or their aliasing, so discarding it
+could silently lose the hook's updates. This can retain FP32 master, first and
+second moments (12 bytes per local element) on the configured CPU or device
+after restore and during subsequent training. In this case the restored master
+is authoritative: later direct edits to model weights must also update the
+master or the next optimizer step can overwrite them. With no user load
+pre-hook, including the ordinary DCP cleanup hook, zero-step PLE stays lazy as
+before.
+
+Multi-rank coordinated DCP in this profile rejects external optimizer
+state-dict hooks to prevent rank-asymmetric collectives. The hook behavior
+above applies to direct or supported single-process restores; see the
+optimizer checkpointing constraints in `docs/usage/basic_modules.md`.
 
 Same-dimension ExtraParallel/FSDP checkpoints carry an explicit EP-outer layout marker in model and optimizer state. Older unversioned layouts require an explicit migration and are rejected before tensor reads, even during partial/optimizer-only restore. The marker is not a model weight and is excluded from HF export.
 

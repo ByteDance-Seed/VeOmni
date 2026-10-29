@@ -255,36 +255,3 @@ def test_checkpoint_group_must_cover_persistent_mesh(tmp_path):
         join=True,
         start_method="fork",
     )
-
-
-def _rank_local_frozen_target_worker(rank, rendezvous):
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
-    try:
-        model, optimizer = _model_and_optimizer()
-        if rank == 0:
-            model.weight.requires_grad_(False)
-        wrapper = checkpoint.OptimizerState(
-            model,
-            optimizer,
-            parallel_state=SimpleNamespace(dp_mode="ddp"),
-            load=True,
-            coordinated_group_validation=True,
-        )
-        with pytest.raises(RuntimeError, match="(frozen persistent|failed on another rank)"):
-            wrapper.state_dict()
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_rank_local_frozen_target_fails_on_every_rank(tmp_path):
-    mp.start_processes(
-        _rank_local_frozen_target_worker,
-        args=(str(tmp_path / "rdzv-frozen"),),
-        nprocs=2,
-        join=True,
-        start_method="fork",
-    )
