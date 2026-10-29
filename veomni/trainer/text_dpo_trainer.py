@@ -48,6 +48,7 @@ from ..utils.dpo_provenance import (
     DPOPackedProof,
 )
 from .base import BaseTrainer, VeOmniIter
+from .callbacks.channel_loss_callback import _validate_segment_count
 from .dpo_provenance import next_dpo_microbatches
 
 
@@ -623,12 +624,8 @@ class TextDPOTrainer:
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         config_error = None
         try:
-            from .callbacks.channel_loss_callback import ChannelLossComputer
-
             if args.dpo_config.explicit_segment_provenance is not True:
                 raise ValueError("DPO pair-weighted training requires explicit_segment_provenance=true")
-            if args.train.channel_loss.enable and not hasattr(ChannelLossComputer, "observe_dpo_log_probs"):
-                raise ValueError("DPO channel-loss metrics require the per-source channel-loss integration")
             if args.model.accelerator.tp_size != 1 or args.model.accelerator.pp_size != 1:
                 raise ValueError("DPO pair-weighted training currently requires tp_size=pp_size=1")
             self._dpo_objective_parameters = _dpo_objective_parameters(args.dpo_config)
@@ -646,7 +643,13 @@ class TextDPOTrainer:
             self.base._build_collate_fn()
             if args.dpo_config.explicit_segment_provenance:
                 self.base.collate_fn = DPOProvenanceCollator(
-                    self.base.collate_fn, require_ds_idx=args.data.enable_multisource
+                    self.base.collate_fn,
+                    require_ds_idx=args.data.enable_multisource,
+                    source_keys=(
+                        tuple(args.train.channel_loss.source_id_keys + args.train.channel_loss.source_name_keys)
+                        if args.train.channel_loss.enable
+                        else ()
+                    ),
                 )
             self.base._build_dataloader()
             from ..data.dynamic_batching import DynamicBatchSizeDataLoader
@@ -827,13 +830,7 @@ class TextDPOTrainer:
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
-        callback = getattr(self.base, "channel_loss_callback", None)
-        repeat_key = (
-            "channel_loss_source_repeat"
-            if callback is not None and hasattr(callback.computer, "observe_dpo_log_probs")
-            else "source_repeat"
-        )
-        self.base.on_step_begin(micro_batches=micro_batches, **{repeat_key: 2})
+        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
 
     @staticmethod
     def dpo_loss(
@@ -913,11 +910,6 @@ class TextDPOTrainer:
             )
         }
         outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
-        channel_loss_callback = getattr(self, "channel_loss_callback", None)
-        observe = getattr(getattr(channel_loss_callback, "computer", None), "observe_dpo_log_probs", None)
-        if observe is not None:
-            observe(outputs.fused_linear_aux.log_probs, micro_batch["labels"], micro_batch.get("cu_seq_lens_q"))
-
         # ``outputs.fused_linear_aux.log_probs`` is shape [1, packed_L]
         # (actual log-probabilities; sign already flipped). PostCollator
         # only knows about ``outputs.logits``, so we replicate its
@@ -970,18 +962,44 @@ class TextDPOTrainer:
                 logp = (per_token_logps * loss_mask).sum()
             all_logps.append(logp)
 
+        self._record_policy_channel_loss(model, log_probs_list, labels_list)
         all_logps_t = torch.stack(all_logps)
         return all_logps_t[0::2], all_logps_t[1::2]
+
+    @torch.no_grad()
+    def _record_policy_channel_loss(self, model, log_probs_list, labels_list):
+        """Observe existing policy NLL using the objective's gathered, masked segments.
+
+        Every SP rank already has these segments. The common callback reduces
+        their detached source totals over DP; no observer SP gather is needed.
+        Its source_repeat=2 turns chosen/rejected segment counts into pair counts.
+        """
+        callback = getattr(self.base, "channel_loss_callback", None)
+        if callback is None or not callback._collect_step or model is not self.policy_model:
+            return
+        computer = callback.computer
+        if not computer._source_ids or not _validate_segment_count(
+            len(labels_list), len(computer._source_ids), computer.strict, "DPO segment count"
+        ):
+            return
+        computer._result = []
+        for source_id, log_probs, labels in zip(computer._source_ids, log_probs_list, labels_list, strict=True):
+            valid = labels != IGNORE_INDEX
+            count = valid.sum()
+            computer._result.append(
+                dict(
+                    source_id=source_id,
+                    loss_sum=-(log_probs.detach().float() * valid).sum(),
+                    token_count=count,
+                    sample_count=torch.ones_like(count),
+                    input_token_count=count.new_tensor(labels.numel()),
+                )
+            )
 
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor], *, pair_normalization: float | None = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        get_registered = getattr(BaseTrainer, "_get_registered_channel_loss_callback", None)
-        channel_loss_callback = (
-            get_registered(self.base)
-            if get_registered is not None
-            else getattr(self.base, "channel_loss_callback", None)
-        )
+        channel_loss_callback = getattr(self.base, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
@@ -998,14 +1016,10 @@ class TextDPOTrainer:
             with torch.no_grad(), use_parallel_state(self.reference_model.parallel_state):
                 ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-            channel_forward_context = (
-                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
-            )
             with (
                 use_parallel_state(self.policy_model.parallel_state),
                 self.base.model_fwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
-                channel_forward_context,
             ):
                 policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy_model, micro_batch)
 

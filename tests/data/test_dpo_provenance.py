@@ -55,6 +55,26 @@ def test_dpo_training_requires_provenance_by_default(monkeypatch):
         dpo.TextDPOTrainer(args)
 
 
+def test_dpo_channel_loss_configuration_reaches_model_build(monkeypatch):
+    from unittest.mock import Mock
+
+    import veomni.trainer.text_dpo_trainer as dpo
+
+    monkeypatch.setattr(dpo.BaseTrainer, "_setup", lambda *_: "cpu")
+    monkeypatch.setattr(dpo, "_dpo_objective_parameters", lambda _: {})
+    monkeypatch.setattr(dpo, "_dpo_recovery_geometry", lambda _: {})
+    build = Mock(side_effect=RuntimeError("model build reached"))
+    monkeypatch.setattr(dpo.TextDPOTrainer, "_build_policy_model_runtime", build)
+    args = SimpleNamespace(
+        dpo_config=SimpleNamespace(explicit_segment_provenance=True),
+        train=SimpleNamespace(channel_loss=SimpleNamespace(enable=True)),
+        model=SimpleNamespace(accelerator=SimpleNamespace(tp_size=1, pp_size=1)),
+    )
+    with pytest.raises(RuntimeError, match="model build reached"):
+        dpo.TextDPOTrainer(args)
+    build.assert_called_once()
+
+
 def test_unknown_tokenizer_is_rejected_when_provenance_is_required():
     class UnknownTokenizer:
         def encode(self, text, add_special_tokens=True):
@@ -619,17 +639,6 @@ def _feature(chosen, rejected, source):
     return feature
 
 
-def _collator_with_source_keys(keys):
-    """Exercise source-key validation with and without the optional observer."""
-    import veomni.data.data_collator as module
-
-    if hasattr(module, "CHANNEL_LOSS_PROVENANCE"):
-        return MainCollator(channel_loss_source_id_keys=keys)
-    collator = MainCollator()
-    collator.channel_loss_source_id_keys = keys
-    return collator
-
-
 @pytest.mark.parametrize("sp_enabled,rank", [(False, 0), (True, 0), (True, 1)])
 @pytest.mark.parametrize("pad_to_length", [0, 8])
 def test_builtin_segments_are_proven_with_single_token_and_tail(monkeypatch, sp_enabled, rank, pad_to_length):
@@ -735,7 +744,6 @@ def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
         "labels",
         "source_id",
         "source_range",
-        "channel_provenance",
         "cu_k",
         "linear_cu",
         "slices",
@@ -746,19 +754,13 @@ def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
 def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, changed):
     state = _state()
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    if changed == "channel_provenance" and not hasattr(collator_module, "CHANNEL_LOSS_PROVENANCE"):
-        pytest.skip("channel-loss integration is not present")
-    batch = DPOProvenanceCollator(_collator_with_source_keys(("ds_idx",)), require_ds_idx=True)(
-        [_feature("abc", "de", 0)]
-    )
+    batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([_feature("abc", "de", 0)])
     if changed == "labels":
         batch["labels"] = torch.cat([batch["labels"], batch["labels"][:, -1:]], dim=-1)
     elif changed == "source_id":
         batch["ds_idx"][0] = 2
     elif changed == "source_range":
         batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([_feature("abc", "de", 42)])
-    elif changed == "channel_provenance":
-        batch[collator_module.CHANNEL_LOSS_PROVENANCE]["input_mask"][0] = 0
     elif changed == "cu_k":
         batch["cu_seq_lens_k"] = torch.tensor([0, 5])
     elif changed == "linear_cu":
@@ -1347,13 +1349,9 @@ def test_direct_forward_requires_preflight_before_model_execution(monkeypatch):
 def test_post_callback_preflight_allows_metadata_removal_but_rejects_tensor_mutation(monkeypatch, mutated):
     state = _state()
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(_collator_with_source_keys(("ds_idx",)), require_ds_idx=True)(
-        [_feature("abc", "de", 0)]
-    )
+    batch = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)([_feature("abc", "de", 0)])
     next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, source_count=lambda: 1, vocab_size=lambda: 16)
     batch.pop("ds_idx")
-    if hasattr(collator_module, "CHANNEL_LOSS_PROVENANCE"):
-        batch.pop(collator_module.CHANNEL_LOSS_PROVENANCE)
     if mutated:
         batch["labels"][0, 1] = 8
         with pytest.raises(RuntimeError, match="changed during a callback"):
@@ -1412,9 +1410,32 @@ def test_sp_input_evidence_covers_additional_feature_metadata(monkeypatch):
 @pytest.mark.parametrize("key", ["input_ids", "labels", "cu_seq_lens_q"])
 def test_configured_source_keys_cannot_hide_model_inputs(monkeypatch, key):
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
-    collator = DPOProvenanceCollator(_collator_with_source_keys((key,)))
+    collator = DPOProvenanceCollator(MainCollator(), source_keys=(key,))
     with pytest.raises(ValueError, match="source metadata keys must not overlap model inputs"):
         collator([_feature("abc", "d", 0)])
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_dpo_owned_source_keys_preserve_callback_alignment(monkeypatch, remove):
+    state = _state()
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
+    feature = _feature("abc", "de", 0)
+    feature.update(channel_id="alias-a", channel_name="source-a")
+    batch = DPOProvenanceCollator(MainCollator(), source_keys=("channel_id", "channel_name"))([feature])
+    next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)
+    expected = (batch[DPO_APPROVED_KEY],)
+    if remove:
+        batch.pop("channel_id")
+        batch.pop("channel_name")
+        next_dpo_microbatches(
+            iter([[batch]]), state, state, global_step=1, after_callbacks=True, expected_proofs=expected
+        )
+    else:
+        batch["channel_id"] = ["different"]
+        with pytest.raises(RuntimeError, match="metadata was added or changed"):
+            next_dpo_microbatches(
+                iter([[batch]]), state, state, global_step=1, after_callbacks=True, expected_proofs=expected
+            )
 
 
 def test_post_callback_preflight_rejects_removed_or_reordered_microbatch(monkeypatch):

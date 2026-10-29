@@ -24,9 +24,7 @@ DPO_FEATURE_KEY = "_veomni_dpo_feature_segments"
 DPO_PROOF_KEY = "_veomni_dpo_packed_proof"
 DPO_APPROVED_KEY = "_veomni_dpo_approved_proof"
 DPO_POSTCHECK_KEY = "_veomni_dpo_post_callback_proof"
-DPO_CALLBACK_METADATA_KEYS = frozenset(
-    {"ds_idx", "source_name", "cur_token_num", "_veomni_channel_loss_source_provenance"}
-)
+DPO_CALLBACK_METADATA_KEYS = frozenset({"ds_idx", "source_name", "cur_token_num"})
 
 _DPO_PRODUCER_METHODS = (
     "encode",
@@ -274,7 +272,7 @@ def packed_batch_digest(
     update(source_keys)
     ignored = {DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY}
     if after_callbacks:
-        ignored.update(("ds_idx", "source_name", "cur_token_num", "_veomni_channel_loss_source_provenance"))
+        ignored.update(DPO_CALLBACK_METADATA_KEYS)
         ignored.update(source_keys)
     for key in sorted(batch):
         if key in ignored or (include_keys is not None and key not in include_keys):

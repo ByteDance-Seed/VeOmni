@@ -81,6 +81,7 @@ class DPOProvenanceCollator:
 
     collator: Any
     require_ds_idx: bool = False
+    source_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         state = collator_module.get_parallel_state()
@@ -134,11 +135,7 @@ class DPOProvenanceCollator:
             batch[DPO_PROOF_KEY] = DPOInvalidProof("DPO feature provenance is missing")
             return batch
         can_prove = all(known)
-        source_keys = tuple(
-            dict.fromkeys(
-                ("ds_idx", "source_name", *(getattr(self.collator, "channel_loss_source_id_keys", ()) or ()))
-            )
-        )
+        source_keys = tuple(dict.fromkeys(("ds_idx", "source_name", *self.source_keys)))
         model_keys = {
             "input_ids",
             "labels",
@@ -181,9 +178,7 @@ class DPOProvenanceCollator:
         if can_prove:
             for feature, item in zip(clean, metadata):
                 ids = feature.get("input_ids")
-                source_valid, source = _source_id(
-                    feature, tuple(getattr(self.collator, "channel_loss_source_id_keys", ()) or ())
-                )
+                source_valid, source = _source_id(feature, self.source_keys)
                 if (
                     not isinstance(ids, torch.Tensor)
                     or ids.ndim != 1

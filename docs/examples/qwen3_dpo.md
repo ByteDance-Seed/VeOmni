@@ -134,9 +134,17 @@ validated migration. The legacy resume flags cannot bypass this gate.
 ## Experimental: explicit segment provenance
 
 Per-source channel-loss metrics are optional. DPO training with
-`train.channel_loss.enable: true` additionally requires the per-source observer
-integration that accepts expanded DPO log-probabilities; without that
-integration the trainer rejects the configuration before training.
+`train.channel_loss.enable: true` reuses the existing policy log-probabilities
+and completion masks. It reports token-weighted policy NLL over chosen and
+rejected completions, not the pair-level DPO objective or reference-model NLL.
+The common callback retains its sampling and source-name behavior. With the
+compact per-source data metrics enabled, a sample is one preference pair;
+input tokens count both physical segments and exclude collator padding.
+These detached metrics require no additional model forward or SP gather and
+do not change the loss, gradients, or optimizer update.
+The trainer passes configured source ID/name aliases to the DPO wrapper's
+`source_keys`; direct `DPOProvenanceCollator` callers should do the same for
+custom aliases. The ordinary packing collator needs no channel-loss settings.
 
 `dpo_config.explicit_segment_provenance: true` is the default and is required
 for DPO training. It retains the physical

@@ -490,7 +490,8 @@ def test_legacy_callback_can_replace_valid_batches_before_weighting(monkeypatch)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch):
+@pytest.mark.parametrize("channel_loss", [False, True])
+def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, channel_loss):
     import veomni.data.data_collator as collator_module
 
     class Tokenizer:
@@ -506,20 +507,26 @@ def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch):
     trainer.base.args.dpo_config.explicit_segment_provenance = True
     trainer.base.args.data = SimpleNamespace(enable_multisource=False)
     trainer.policy_model.model_config = SimpleNamespace(vocab_size=256)
+    callback = _attach_channel_callback(trainer, metrics, channel_loss)
     collator = DPOProvenanceCollator(MainCollator(pad_to_length=24))
 
     def feature(coefficient):
-        return process_dpo_example(
+        result = process_dpo_example(
             {"chosen": "!" + chr(ord("A") + coefficient) + "x", "rejected": "!Ax"},
             tokenizer=Tokenizer(),
             record_segment_provenance=True,
         )[0]
+        result.update(ds_idx=0, source_name="source-0")
+        return result
 
     batches = [collator([feature(1)]), collator([feature(3), feature(3), feature(3)])]
     trainer.train_step(iter([batches]))
     expected_loss, expected_grad, _ = _expected([1, 3, 3, 3])
     torch.testing.assert_close(trainer.policy_model.optimizer.gradient, expected_grad, rtol=1e-6, atol=1e-7)
     assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
+    if channel_loss:
+        assert callback.computer.step_totals[0][1].item() == 16
+        assert "channel_loss/source-i-0__source-0" in trainer.step_env_metrics
 
 
 def _init_test_group(rank, world_size, native_npu, endpoint):
@@ -572,6 +579,90 @@ def _distributed_worker(rank, world_size, scenario, native_npu, endpoint):
 @pytest.mark.parametrize(("world_size", "scenario"), [(2, "dp2"), (4, "dp2_sp2")])
 def test_distributed_unequal_pair_counts_match_global_reference(world_size, scenario):
     spawn_with_rendezvous(_distributed_worker, args=(world_size, scenario, False), nprocs=world_size)
+
+
+def _attach_channel_callback(trainer, metrics, enabled):
+    from veomni.arguments.arguments_types import ChannelLossConfig
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.callbacks.channel_loss_callback import ChannelLossCallback
+
+    trainer.base.args.train.channel_loss = ChannelLossConfig(enable=enabled, interval=1, strict=True)
+    callback = trainer.base.channel_loss_callback = ChannelLossCallback(trainer)
+    trainer.base._callbacks = [callback]
+    trainer.base.on_step_begin = lambda **kwargs: BaseTrainer.on_step_begin(trainer.base, **kwargs)
+
+    def finish(**kwargs):
+        metrics.update(kwargs)
+        callback.on_step_end(trainer.state, **kwargs)
+
+    trainer.base.on_step_end = finish
+    return callback
+
+
+def _channel_loss_worker(rank, world_size, parallel_options, native_npu, endpoint):
+    from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
+
+    device = _init_test_group(rank, world_size, native_npu, endpoint)
+    try:
+        _init_parallel_state(
+            dp_mode="ddp",
+            device_type="npu" if native_npu else "cpu",
+            **parallel_options,
+        )
+        state = get_parallel_state()
+        results = []
+        groups = [[1], [2]] if state.dp_rank == 0 else [[3, 3], [4, 4, 4]]
+        expected_loss, expected_grad, _ = _expected([1, 2, 3, 3, 4, 4, 4])
+        for enabled in (False, True):
+            trainer, metrics = _build_trainer(state, distributed=True, device=device)
+            _attach_channel_callback(trainer, metrics, enabled)
+            _replace_with_adamw(trainer)
+            gradients = []
+            trainer.policy_model.optimizer.register_step_pre_hook(
+                lambda *_, target=trainer.policy_model.module.weight, captured=gradients: captured.append(
+                    target.grad.detach().clone()
+                )
+            )
+            batches = [_microbatch(group, state.sp_size, state.sp_rank) for group in groups]
+            for batch, group in zip(batches, groups, strict=True):
+                batch["ds_idx"] = torch.full((len(group),), state.dp_rank)
+                batch["source_name"] = [f"source-{state.dp_rank}"] * len(group)
+            trainer.train_step(iter([batches]))
+            torch.testing.assert_close(gradients[0].cpu(), expected_grad, rtol=1e-6, atol=1e-7)
+            assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
+            weight = trainer.policy_model.module.weight
+            results.append(
+                (
+                    metrics["loss"],
+                    gradients[0],
+                    weight.detach().clone(),
+                    {k: v.clone() for k, v in trainer.policy_model.optimizer.state[weight].items()},
+                )
+            )
+            if enabled:
+                for source, nll, tokens in ((0, 2.1, 4), (1, 12.6, 10)):
+                    key = f"channel_loss/source-i-{source}__source-{source}"
+                    assert trainer.step_env_metrics[key] == pytest.approx(nll / tokens, abs=1e-6)
+        assert results[0][0] == results[1][0]
+        for before, after in zip(results[0][1:3], results[1][1:3], strict=True):
+            torch.testing.assert_close(before, after, rtol=0, atol=0)
+        for key in results[0][3]:
+            torch.testing.assert_close(results[0][3][key], results[1][3][key], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(device="cpu", nproc=context.params["world_size"]))
+@pytest.mark.parametrize("world_size,ulysses,cp", [(2, 1, 1), (4, 2, 1), (4, 1, 2), (8, 1, 4)])
+def test_dpo_channel_loss_preserves_distributed_update(world_size, ulysses, cp):
+    options = dict(dp_size=2, ulysses_size=ulysses, cp_size=cp)
+    spawn_with_rendezvous(_channel_loss_worker, args=(world_size, options, False), nprocs=world_size)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=8))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE or runner_device_count() < 8, reason="requires eight Ascend NPUs and HCCL")
+def test_native_hccl_dpo_channel_loss_preserves_dp_cp_update():
+    spawn_with_rendezvous(_channel_loss_worker, args=(8, dict(dp_size=2, cp_size=4), True), nprocs=8)
 
 
 def _provenance_dp_sp_worker(rank, world_size, native_npu, endpoint):

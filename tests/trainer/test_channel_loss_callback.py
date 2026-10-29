@@ -827,7 +827,8 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     assert trainer.model.weight.grad.item() == 2.0
 
 
-def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_channel_loss_does_not_capture_causal_loss_calls(monkeypatch):
     _stub_parallel_state(monkeypatch)
     cfg = ChannelLossConfig(enable=True, interval=1)
     state = TrainerState(global_step=1)
@@ -889,14 +890,15 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     assert preforward_seen["metadata"]
     assert forward_calls == [
         {"model": reference_model, "capture_active": False, "has_metadata": False},
-        {"model": policy_model, "capture_active": True, "has_metadata": False},
+        {"model": policy_model, "capture_active": False, "has_metadata": False},
     ]
     assert base.channel_loss_callback.computer._micro_step == 1
     assert base.channel_loss_callback.computer._source_ids == []
 
 
-def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
+def _run_dpo_channel_loss(monkeypatch, *, enabled, average_log_prob, tail):
     _stub_parallel_state(monkeypatch)
+    torch.manual_seed(17)
 
     class DpoLossModel(torch.nn.Module):
         def __init__(self):
@@ -910,17 +912,15 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
             return logits.sum() * 0
 
         def forward(self, labels=None, **kwargs):
-            seq_len = labels.size(-1) if labels is not None else 8
-            logits = torch.randn(1, seq_len, 8)
-            if labels is not None:
-                self.loss_function(logits=logits, labels=labels, vocab_size=8)
+            seq_len = labels.size(-1)
+            logits = torch.randn(1, seq_len, 16)
+            self.loss_function(logits=logits, labels=labels, vocab_size=16)
             log_probs = self.scale * (-torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10)
             return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=log_probs))
 
-    cfg = ChannelLossConfig(enable=True, interval=1)
+    cfg = ChannelLossConfig(enable=enabled, interval=1)
     state = TrainerState(global_step=1)
-    policy_model = DpoLossModel()
-    reference_model = DpoLossModel()
+    policy_model, reference_model = DpoLossModel(), DpoLossModel()
     base = SimpleNamespace(
         args=SimpleNamespace(
             train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
@@ -929,7 +929,7 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
                 label_smoothing=0.0,
                 loss_type="sigmoid",
                 reference_free=False,
-                average_log_prob=False,
+                average_log_prob=average_log_prob,
             ),
         ),
         state=state,
@@ -938,43 +938,75 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
         model_bwd_context=nullcontext(),
         preforward=lambda micro_batch: micro_batch,
     )
-    base.channel_loss_callback = ChannelLossCallback(base)
+    callback = base.channel_loss_callback = ChannelLossCallback(base)
     trainer = object.__new__(TextDPOTrainer)
-    trainer.base = base
-    trainer.policy_model = policy_model
-    trainer.reference_model = reference_model
-    trainer.state = state
-    trainer.channel_loss_callback = base.channel_loss_callback
-    base._callbacks = [base.channel_loss_callback]
-    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
-        base, micro_batches=micro_batches, **kwargs
-    )
-    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
+    trainer.base, trainer.policy_model, trainer.reference_model = base, policy_model, reference_model
+    base._callbacks = [callback]
+    base.on_step_begin = lambda **kwargs: BaseTrainer.on_step_begin(base, **kwargs)
+    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda _: [3, 2, 4, 3])
     trainer.sp_enabled = False
     micro_batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
-        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "input_ids": torch.arange(1, 13).unsqueeze(0),
+        "labels": torch.tensor([[-100, 2, 3, -100, 5, -100, -100, 8, 9, -100, 11, 12]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2, 3, 0, 1, 2]]),
         "ds_idx": torch.tensor([3, 4]),
         "source_name": ["train/a", "train/b"],
+        "tail_padding_length": tail,
     }
+    for key, value in (("input_ids", 0), ("labels", IGNORE_INDEX), ("position_ids", 0)):
+        micro_batch[key] = F.pad(micro_batch[key], (0, tail), value=value)
+    observed = []
+    after_micro_step = callback.computer.after_micro_step
 
+    def record_results():
+        observed.extend(callback.computer._result or [])
+        after_micro_step()
+
+    monkeypatch.setattr(callback.computer, "after_micro_step", record_results)
     try:
-        base.channel_loss_callback.computer.install(policy_model)
+        callback.computer.install(policy_model)
         TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
-        TextDPOTrainer.forward_backward_step(trainer, micro_batch)
-
-        assert policy_model.loss_calls == 1
-        assert reference_model.loss_calls == 1
-        assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
-        assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
-        assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
-        assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
-        assert policy_model.scale.grad is not None
+        loss, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+        gradient = policy_model.scale.grad.detach().clone()
+        torch.optim.AdamW(policy_model.parameters(), lr=0.01).step()
+        callback.on_step_end(state, loss=loss, loss_dict={}, grad_norm=None)
+        assert policy_model.loss_calls == reference_model.loss_calls == 1
         assert reference_model.scale.grad is None
+        return dict(
+            loss=loss.detach(),
+            gradient=gradient,
+            weight=policy_model.scale.detach().clone(),
+            callback=callback,
+            observed=observed,
+            rng=torch.get_rng_state(),
+        )
     finally:
-        base.channel_loss_callback.computer.uninstall()
+        callback.computer.uninstall()
+
+
+@pytest.mark.parametrize("average_log_prob", [False, True])
+@pytest.mark.parametrize("tail", [0, 4])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_channel_loss_emits_policy_totals(monkeypatch, average_log_prob, tail):
+    runs = [
+        _run_dpo_channel_loss(monkeypatch, enabled=enabled, average_log_prob=average_log_prob, tail=tail)
+        for enabled in (False, True)
+    ]
+    for key in ("loss", "gradient", "weight", "rng"):
+        torch.testing.assert_close(runs[0][key], runs[1][key], rtol=0, atol=0)
+    assert not runs[0]["callback"].computer.step_totals
+    callback = runs[1]["callback"]
+    assert callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
+    for source, nll, tokens in ((3, 0.7, 3), (4, 3.6, 4)):
+        loss_sum, count = callback.computer.step_totals[source]
+        torch.testing.assert_close(loss_sum, torch.tensor(nll))
+        assert count.item() == tokens
+    assert callback.computer.source_names == {3: "train/a", 4: "train/b"}
+    assert [int(item["input_token_count"]) for item in runs[1]["observed"]] == [3, 2, 4, 3]
+    assert [int(item["sample_count"]) for item in runs[1]["observed"]] == [1, 1, 1, 1]
+    assert all(not item["loss_sum"].requires_grad for item in runs[1]["observed"])
+    torch.testing.assert_close(runs[1]["loss"], torch.tensor(math.log(2)))
+    torch.testing.assert_close(runs[1]["gradient"], torch.tensor(-0.01375 if average_log_prob else -0.0175))
 
 
 def test_dit_rejects_channel_loss_before_initialization():
