@@ -116,20 +116,7 @@ class MasterFP32AdamW(Optimizer):
             if param is None:
                 restored[key] = saved
                 continue
-            saved = dict(saved)
-            if saved and set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
-                raise RuntimeError("Legacy AdamW checkpoint requires explicit migration")
-            for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                if name in saved:
-                    expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
-                    tensor = _align_state_to_parameter(saved[name], param)
-                    if tensor.dtype != expected_dtype or tensor.shape != param.shape:
-                        raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
-                    saved[name] = tensor.to(device=param.device)
-            group = group_by_id[key]
-            if saved and torch.is_tensor(saved["step"]) and (group.get("capturable") or group.get("fused")):
-                saved["step"] = saved["step"].to(dtype=torch.float32, device=param.device)
-            restored[param] = saved
+            restored[param] = self._restore_parameter_state(param, dict(saved), group_by_id[key])
 
         for group, saved in zip(groups, saved_groups, strict=True):
             saved["params"] = group["params"]
@@ -138,6 +125,21 @@ class MasterFP32AdamW(Optimizer):
         self.__setstate__({"state": restored, "param_groups": saved_groups})
         for hook in self._optimizer_load_state_dict_post_hooks.values():
             hook(self)
+
+    def _restore_parameter_state(self, param, saved, group):
+        """Validate and place one entry between the shared pre/post load hooks."""
+        if saved and set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
+            raise RuntimeError("Legacy AdamW checkpoint requires explicit migration")
+        for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+            if name in saved:
+                expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
+                tensor = _align_state_to_parameter(saved[name], param)
+                if tensor.dtype != expected_dtype or tensor.shape != param.shape:
+                    raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
+                saved[name] = tensor.to(device=param.device)
+        if saved and torch.is_tensor(saved["step"]) and (group.get("capturable") or group.get("fused")):
+            saved["step"] = saved["step"].to(dtype=torch.float32, device=param.device)
+        return saved
 
     @torch.no_grad()
     def step(self, closure=None):

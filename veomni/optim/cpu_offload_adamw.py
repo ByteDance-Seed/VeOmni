@@ -12,7 +12,6 @@ import re
 import time
 
 import torch
-from torch.optim import Optimizer
 
 from veomni.utils.logging import get_logger
 
@@ -108,41 +107,27 @@ class CPUOffloadAdamW(FullFP32AdamW):
             return torch.float32
         return self.cpu_moment_dtype if id(param) in self._offloaded else self.resident_moment_dtype
 
-    def load_state_dict(self, state_dict):
-        restored = []
-        for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            for key, param in zip(saved_group["params"], group["params"], strict=True):
-                saved = state_dict["state"].get(key, {})
-                if saved:
-                    if set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
-                        raise RuntimeError("CPU offload requires complete master_weight/exp_avg/exp_avg_sq/step state")
-                    for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                        expected_dtype = self._state_dtype(param, name)
-                        if saved[name].dtype != expected_dtype:
-                            raise RuntimeError(
-                                f"Optimizer checkpoint dtype mismatch for {name}: saved={saved[name].dtype}, "
-                                f"configured={expected_dtype}; explicit precision migration is required"
-                            )
-                        saved[name] = _align_state_to_parameter(saved[name], param)
-                        if tuple(saved[name].shape) != tuple(param.shape):
-                            raise RuntimeError(f"Shape mismatch for optimizer state {name}")
-                restored.append((param, saved, id(param) in self._offloaded))
-        # PyTorch's normal loader casts all states to the compute parameter's
-        # dtype/device. Even restoring afterwards transiently allocates the full
-        # optimizer on the accelerator. Load group metadata without any tensors.
-        Optimizer.load_state_dict(self, {**state_dict, "state": {}})
-        for param, saved, offload in restored:
-            if not saved:
-                continue
-            target = torch.device("cpu") if offload else param.device
-            state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
-            for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                tensor = saved[name]
-                # Reuse DCP's already correctly placed buffers. Cloning every
-                # resident state here would transiently double accelerator
-                # optimizer memory during resume.
-                state[name] = tensor.detach().to(device=target, dtype=self._state_dtype(param, name))
-            self.state[param] = state
+    def _restore_parameter_state(self, param, saved, group):
+        if not saved:
+            return saved
+        if set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
+            raise RuntimeError("CPU offload requires complete master_weight/exp_avg/exp_avg_sq/step state")
+        target = torch.device("cpu") if id(param) in self._offloaded else param.device
+        state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
+        for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+            expected_dtype = self._state_dtype(param, name)
+            if saved[name].dtype != expected_dtype:
+                raise RuntimeError(
+                    f"Optimizer checkpoint dtype mismatch for {name}: saved={saved[name].dtype}, "
+                    f"configured={expected_dtype}; explicit precision migration is required"
+                )
+            tensor = _align_state_to_parameter(saved[name], param)
+            if tuple(tensor.shape) != tuple(param.shape):
+                raise RuntimeError(f"Shape mismatch for optimizer state {name}")
+            # Reuse correctly placed DCP buffers without transiently casting
+            # FP32 moments to the compute dtype or doubling device storage.
+            state[name] = tensor.detach().to(device=target)
+        return state
 
     def _emit_state_receipt(self):
         if self._state_receipt_emitted or not any(group["lr"] != 0 for group in self.param_groups):
