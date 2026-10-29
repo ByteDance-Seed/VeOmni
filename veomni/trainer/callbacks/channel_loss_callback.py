@@ -3004,71 +3004,44 @@ def _filter_surplus_tail_padding_segments(
     attention_mask_flat: torch.Tensor | None,
     ignore_index: int,
 ) -> list[tuple[int, int, int]]:
-    surplus = len(segments) - source_count
-    if surplus <= 0:
-        return segments
-
-    indexed_by_batch: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
-    for segment_idx, (batch_idx, start, end) in enumerate(segments):
-        indexed_by_batch[batch_idx].append((segment_idx, start, end))
-
-    candidates_by_batch: dict[int, list[tuple[bool, int]]] = defaultdict(list)
-    for batch_idx, row_segments in indexed_by_batch.items():
-        for segment_idx, start, end in reversed(row_segments):
-            mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
-            if not _is_padding_only_segment(
-                labels_slice=labels_flat[start : end + 1],
-                positions_slice=positions_flat[start : end + 1] if positions_flat is not None else None,
-                attention_mask_slice=mask_slice,
-                ignore_index=ignore_index,
-            ):
-                break
-            candidates_by_batch[batch_idx].append((_has_explicit_padding_mask(mask_slice), segment_idx))
-
-    selected = _select_unambiguous_tail_candidates(candidates_by_batch, surplus)
-    if selected is None:
-        return segments
-    removed = set(selected)
-    return [segment for segment_idx, segment in enumerate(segments) if segment_idx not in removed]
+    """Drop trailing padding-only segments until segment count matches ``source_count``."""
+    while len(segments) > source_count:
+        _, start, end = segments[-1]
+        mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
+        if not _is_padding_only_segment(
+            labels_slice=labels_flat[start : end + 1],
+            positions_slice=positions_flat[start : end + 1] if positions_flat is not None else None,
+            attention_mask_slice=mask_slice,
+            ignore_index=ignore_index,
+        ):
+            break
+        segments.pop()
+    return segments
 
 
 def _filter_surplus_tail_padding_sp_segments(
     segments: list[dict[str, Any]],
     source_count: int,
 ) -> list[dict[str, Any]]:
+    """Drop trailing padding-only SP logical segments until start count matches ``source_count``."""
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
         return segments
 
-    indexed_by_batch: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    logical_segments: list[list[int]] = []
     for segment_idx, segment in enumerate(segments):
-        indexed_by_batch[int(segment.get("batch_idx", 0))].append((segment_idx, segment))
+        if segment["is_start"]:
+            logical_segments.append([])
+        if logical_segments:
+            logical_segments[-1].append(segment_idx)
 
-    candidates_by_batch: dict[int, list[tuple[bool, list[int]]]] = defaultdict(list)
-    for batch_idx, row_partials in indexed_by_batch.items():
-        logical_segments: list[list[tuple[int, dict[str, Any]]]] = []
-        for segment_idx, segment in row_partials:
-            if segment["is_start"]:
-                logical_segments.append([])
-            if logical_segments:
-                logical_segments[-1].append((segment_idx, segment))
-
-        for logical_segment in reversed(logical_segments):
-            if not logical_segment or not all(partial.get("is_padding_only", False) for _, partial in logical_segment):
-                break
-            candidates_by_batch[batch_idx].append(
-                (
-                    all(partial.get("has_explicit_padding_mask", False) for _, partial in logical_segment),
-                    [segment_idx for segment_idx, _ in logical_segment],
-                )
-            )
-
-    selected = _select_unambiguous_tail_candidates(candidates_by_batch, surplus)
-    if selected is None:
-        return segments
     removed: set[int] = set()
-    for segment_indices in selected:
-        removed.update(segment_indices)
+    remaining = surplus
+    for logical_segment in reversed(logical_segments):
+        if remaining == 0 or not all(segments[idx].get("is_padding_only", False) for idx in logical_segment):
+            break
+        removed.update(logical_segment)
+        remaining -= 1
     return [segment for segment_idx, segment in enumerate(segments) if segment_idx not in removed]
 
 
@@ -3078,6 +3051,7 @@ def _is_padding_only_segment(
     attention_mask_slice: torch.Tensor | None,
     ignore_index: int,
 ) -> bool:
+    """Return whether a segment contains only ignored labels and padding positions/mask."""
     if labels_slice.numel() == 0 or labels_slice.ne(ignore_index).any().item():
         return False
 
@@ -3089,56 +3063,6 @@ def _is_padding_only_segment(
         return bool(positions_slice.eq(0).all().item())
 
     return False
-
-
-def _has_explicit_padding_mask(attention_mask_slice: torch.Tensor | None) -> bool:
-    return bool(
-        attention_mask_slice is not None
-        and attention_mask_slice.numel() > 0
-        and not attention_mask_slice.to(torch.bool).any().item()
-    )
-
-
-def _select_unambiguous_tail_candidates(
-    candidates_by_batch: dict[int, list[tuple[bool, Any]]],
-    surplus: int,
-) -> list[Any] | None:
-    # Each layer stores compact backpointers instead of copying payload prefixes.
-    batch_ids = sorted(candidates_by_batch)
-    states: dict[int, tuple[int, bool]] = {0: (0, True)}
-    layers: list[dict[int, tuple[int, bool, int, int]]] = []
-    for batch_idx in batch_ids:
-        row_candidates = candidates_by_batch[batch_idx]
-        explicit_prefix = [0]
-        for has_explicit_mask, _ in row_candidates:
-            explicit_prefix.append(explicit_prefix[-1] + int(has_explicit_mask))
-
-        next_layer: dict[int, tuple[int, bool, int, int]] = {}
-        for removed_count, (score, is_unique) in states.items():
-            for row_removed in range(len(row_candidates) + 1):
-                new_count = removed_count + row_removed
-                if new_count > surplus:
-                    break
-                candidate_score = score + explicit_prefix[row_removed]
-                existing = next_layer.get(new_count)
-                if existing is None or candidate_score > existing[0]:
-                    next_layer[new_count] = (candidate_score, is_unique, removed_count, row_removed)
-                elif candidate_score == existing[0]:
-                    next_layer[new_count] = (existing[0], False, existing[2], existing[3])
-        layers.append(next_layer)
-        states = {removed_count: (entry[0], entry[1]) for removed_count, entry in next_layer.items()}
-
-    best = states.get(surplus)
-    if best is None or not best[1]:
-        return None
-
-    selected: list[Any] = []
-    removed_count = surplus
-    for batch_idx, layer in zip(reversed(batch_ids), reversed(layers)):
-        _, _, previous_count, row_removed = layer[removed_count]
-        selected.extend(payload for _, payload in candidates_by_batch[batch_idx][:row_removed])
-        removed_count = previous_count
-    return selected
 
 
 def _validate_segment_count(segment_count: int, source_count: int, strict: bool, context: str) -> bool:
