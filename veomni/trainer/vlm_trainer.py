@@ -202,7 +202,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if id(param) in visual_param_ids or (visual is None and "visual" in name):
+                if id(param) in visual_param_ids or (visual is None and ("visual" in name or "vision_tower" in name)):
                     vit_params.append(param)
                 else:
                     other_params.append(param)

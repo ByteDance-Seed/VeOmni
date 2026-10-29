@@ -119,6 +119,11 @@ Core entry points:
 8c. **Differentiable SP collectives must remain in every rank's autograd graph**
    - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
 
+8d. **A shared MoE load-balancing loss is valid only when it matches the model's router semantics**
+   - Do not attach the Switch-style `load_balancing_loss_func` merely because a model exposes raw router logits. That loss applies `softmax(router_logits)` and performs its own top-k selection.
+   - Routers such as MiniMax M3 instead select experts from `sigmoid(router_logits) + e_score_correction_bias`, then derive expert weights from the unbiased sigmoid scores. A softmax-based auxiliary loss can therefore optimize a different expert assignment from the one executed by the model.
+   - For these models, leave router-logit capture and the generic auxiliary loss disabled until a model-specific balancing algorithm, statistics scope, and distributed update rule are verified against the model's training recipe.
+
 ## Data Pipeline
 
 Core files:
@@ -167,8 +172,9 @@ Core files:
 ### Multimodal Data
 
 15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/` + `veomni/data/data_transform.py`)**
-    - The two orchestrators differ in where tokenization and label masking happen — do not assume a single shared order.
+    - The orchestrators differ in where tokenization and label masking happen — do not assume a single shared order.
       - `process_sample_qwen_vl()`: `conv_preprocess()` → `fetch_images` / `fetch_videos_metadata` → `processor.image_processor` / `processor.video_processor` for pixel features only → `chat_template.encode_messages()`, which does **both** tokenization and label masking.
+      - `process_sample_minimax_m3_vl()`: shares the image/video loading of `process_sample_qwen_vl()` (`_prepare_vlm_media_inputs`, which also calls `processor.video_processor` with metadata), then `MiniMaxM3VLChatTemplate` renders the checkpoint's native template through `processor.apply_chat_template`, tokenizes the text and masks labels turn by turn.
       - `process_sample_qwen_omni()`: takes no chat template. `conv_preprocess()` → `fetch_images/videos/audios` → `processor(text=..., images=..., videos=..., audios=...)` for tokenization → labels masked inline by a user/assistant token scan.
     - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
     - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.

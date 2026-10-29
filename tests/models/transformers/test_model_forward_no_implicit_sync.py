@@ -135,6 +135,7 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
     "qwen3_vl_moe-fa2-fused": "fused_triton",
     "qwen3_omni_moe-fa2-fused": "fused_triton",
+    "minimax_m3_vl-fa2-fused": "fused_triton",
 }
 
 
@@ -301,6 +302,9 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # MiniMax's collator hook supplies image/video grid lists, so the patched
+    # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
+    "minimax_m3_vl-fa2-fused": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -326,6 +330,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2-fused",
 }
 
 

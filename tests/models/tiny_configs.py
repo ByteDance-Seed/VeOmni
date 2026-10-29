@@ -231,6 +231,54 @@ def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> Pr
     return LlamaConfig(**kwargs)
 
 
+def tiny_minimax_m3_vl_config(architecture: str = "MiniMaxM3SparseForConditionalGeneration") -> PretrainedConfig:
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import (
+        MiniMaxM3VLConfig,
+        MiniMaxM3VLTextConfig,
+        MiniMaxM3VLVisionConfig,
+    )
+
+    text = MiniMaxM3VLTextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=16,
+        dense_intermediate_size=64,
+        shared_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        index_n_heads=1,
+        index_head_dim=8,
+        head_dim=8,
+        rotary_dim=8,
+        num_local_experts=4,
+        num_experts_per_tok=1,
+        layer_types=["minimax_m3_sparse", "full_attention"],
+        mlp_layer_types=["sparse", "dense"],
+        max_position_embeddings=64,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    vision = MiniMaxM3VLVisionConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_channels=3,
+        patch_size=14,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+    )
+    return MiniMaxM3VLConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        image_token_index=IMAGE_TOKEN_ID,
+        video_token_index=VIDEO_TOKEN_ID,
+        projector_hidden_size=32,
+        architectures=[architecture],
+    )
+
+
 def tiny_movqgan_config(architecture: str = "MoVQGAN") -> PretrainedConfig:
     from veomni.models.transformers.movqgan.configuration_movqgan import MoVQGANConfig
 
