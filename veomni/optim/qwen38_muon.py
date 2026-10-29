@@ -315,8 +315,11 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
     def _emit_complete_receipt(self):
         if self._state_receipt_emitted:
             return
+        parameter_states = [
+            state for group in self.param_groups for param in group["params"] if (state := self.state.get(param))
+        ]
         entries = {}
-        for state in self.state.values():
+        for state in parameter_states:
             for key in ("master_weight", "exp_avg", "exp_avg_sq"):
                 if key not in state:
                     continue
@@ -328,7 +331,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             + json.dumps(
                 dict(
                     recipe=RECIPE,
-                    initialized=len(self.state),
+                    initialized=len(parameter_states),
                     configured=len(self.param_groups),
                     state_bytes=entries,
                     muon_second_moment="unused_zero_DCP_compatibility",

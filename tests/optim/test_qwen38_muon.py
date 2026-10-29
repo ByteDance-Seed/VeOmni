@@ -114,6 +114,52 @@ def test_adam_fallback_matches_existing_fp32_optimizer():
         torch.testing.assert_close(opt.state[p]["master_weight"], r, atol=1e-7, rtol=1e-6)
 
 
+def test_resume_hooks_preserve_moments_and_next_mixed_update():
+    param = torch.nn.Parameter(torch.arange(12).reshape(4, 3).bfloat16() / 16)
+    plan = [("muon", 0, 2), ("adamw", 2, 4)]
+    source = make_optimizer(param, plan)
+    param.grad = torch.arange(12).reshape(4, 3).bfloat16() / 32
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["global_metadata"] = {"version": 7}
+    key = saved["param_groups"][0]["params"][0]
+    target = torch.nn.Parameter(param.detach().clone())
+    resumed = make_optimizer(target, plan)
+    events = []
+
+    def before_load(optimizer, incoming):
+        events.append("before")
+        assert optimizer is resumed
+        assert incoming["state"][key]["exp_avg"].dtype == torch.float32
+        replacement = copy.deepcopy(incoming)
+        replacement["state"][key]["exp_avg"].add_(0.125)
+        return replacement
+
+    def after_load(optimizer):
+        events.append("after")
+        assert optimizer.state["global_metadata"] == {"version": 7}
+        state = optimizer.state[target]
+        assert set(state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
+        state["exp_avg"].add_(0.25)
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(saved)
+    assert events == ["before", "after"]
+
+    expected = copy.deepcopy(saved)
+    expected["state"][key]["exp_avg"].add_(0.125).add_(0.25)
+    reference_param = torch.nn.Parameter(param.detach().clone())
+    reference = make_optimizer(reference_param, plan)
+    reference.load_state_dict(expected)
+    for parameter, optimizer in ((target, resumed), (reference_param, reference)):
+        parameter.grad = torch.arange(12).reshape(4, 3).flip(0).bfloat16() / 32
+        optimizer.step()
+    torch.testing.assert_close(target, reference_param, rtol=0, atol=0)
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[target][name], reference.state[reference_param][name], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_trainable_ple_lookup_matches_fp32_adam_and_resumes(dtype):
     torch.manual_seed(14)

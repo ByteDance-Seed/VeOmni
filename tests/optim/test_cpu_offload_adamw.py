@@ -53,6 +53,65 @@ def test_cpu_update_and_cold_resume_match_fp32_reference(offload):
         torch.testing.assert_close(resumed.state[clone][name], opt.state[p][name], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("moment_dtype", [torch.float32, torch.bfloat16])
+def test_resume_hooks_see_complete_state_and_preserve_their_changes(offload, moment_dtype):
+    def make(param):
+        return CPUOffloadAdamW(
+            [{"params": [param], "cpu_offload": offload}],
+            lr=0.001,
+            resident_moment_dtype=moment_dtype,
+            cpu_moment_dtype=moment_dtype,
+        )
+
+    param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    source = make(param)
+    param.grad = torch.arange(4).bfloat16()
+    source.step()
+    saved = copy.deepcopy(source.state_dict())
+    saved["state"]["global_metadata"] = {"version": 7}
+    key = saved["param_groups"][0]["params"][0]
+    target = torch.nn.Parameter(param.detach().clone())
+    resumed = make(target)
+    events = []
+
+    def before_load(optimizer, incoming):
+        events.append("before")
+        assert optimizer is resumed
+        assert incoming["state"][key]["master_weight"].dtype == torch.float32
+        replacement = copy.deepcopy(incoming)
+        replacement["param_groups"][0]["lr"] = 0.002
+        replacement["state"][key]["exp_avg"].add_(0.125)
+        return replacement
+
+    def after_load(optimizer):
+        events.append("after")
+        assert optimizer.state["global_metadata"] == {"version": 7}
+        state = optimizer.state[target]
+        assert set(state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
+        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == moment_dtype
+        state["exp_avg"].add_(0.25)
+
+    resumed.register_load_state_dict_pre_hook(before_load)
+    resumed.register_load_state_dict_post_hook(after_load)
+    resumed.load_state_dict(saved)
+    assert events == ["before", "after"]
+    assert resumed.param_groups[0]["lr"] == 0.002
+
+    expected = copy.deepcopy(saved)
+    expected["param_groups"][0]["lr"] = 0.002
+    expected["state"][key]["exp_avg"].add_(0.125).add_(0.25)
+    reference_param = torch.nn.Parameter(param.detach().clone())
+    reference = make(reference_param)
+    reference.load_state_dict(expected)
+    for parameter, optimizer in ((target, resumed), (reference_param, reference)):
+        parameter.grad = torch.arange(4).flip(0).bfloat16()
+        optimizer.step()
+    torch.testing.assert_close(target, reference_param, rtol=0, atol=0)
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(resumed.state[target][name], reference.state[reference_param][name], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("missing", ["master_weight", "exp_avg", "exp_avg_sq", "step", "all"])
 def test_dcp_rejects_missing_master_optimizer_state(tmp_path, missing):
     fields = {
