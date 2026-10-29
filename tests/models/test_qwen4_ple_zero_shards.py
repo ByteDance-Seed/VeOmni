@@ -17,6 +17,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 
 def _model_module(backend):
@@ -37,13 +38,13 @@ def _configure_cpu_worker():
     assert DefaultDeviceType.get_device_type() == "cpu"
 
 
-def _worker(rank, rendezvous, dtype, backend):
+def _worker(rank, rendezvous, dtype, backend, world_size):
     _configure_cpu_worker()
     model_module = _model_module(backend)
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (1, 2), mesh_dim_names=("ple_fsdp", "ple"))
+        mesh = init_device_mesh("cpu", (world_size // 2, 2), mesh_dim_names=("ple_fsdp", "ple"))
         state = SimpleNamespace(
             extra_parallel_sizes={"ple": 2}, extra_parallel_flat_group=lambda name: dist.group.WORLD
         )
@@ -56,7 +57,8 @@ def _worker(rank, rendezvous, dtype, backend):
                 values = torch.arange(16, dtype=torch.float32).reshape(4, 4).add_(100 * index).to(dtype)
                 table.weight = torch.nn.Parameter(distribute_tensor(values, mesh, [Shard(1), Shard(0)]))
             fixture = SimpleNamespace(ngram_embedding=tables)
-            shard_ids = torch.tensor([rank, rank])
+            shard = rank % 2
+            shard_ids = torch.tensor([shard, shard])
             row_ids = torch.tensor([0, 1])
             anchor = torch.ones((), requires_grad=True)
 
@@ -67,7 +69,7 @@ def _worker(rank, rendezvous, dtype, backend):
                 output = run(anchor)
             else:
                 output = checkpoint(run, anchor, use_reentrant=mode == "reentrant")
-            expected = tables[f"shard_{rank}"].weight.to_local().detach()[row_ids]
+            expected = tables[f"shard_{shard}"].weight.to_local().detach()[row_ids]
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
             output.sum().backward()
             for index, table in enumerate(tables.values()):
@@ -78,7 +80,7 @@ def _worker(rank, rendezvous, dtype, backend):
                 assert grad is not None
                 expected_grad = (
                     torch.ones_like(table.weight.to_local())
-                    if index == rank
+                    if index == shard
                     else torch.zeros_like(table.weight.to_local())
                 )
                 torch.testing.assert_close(grad.to_local(), expected_grad, rtol=0, atol=0)
@@ -93,7 +95,9 @@ def test_trainable_ple_empty_shards_preserve_outputs_and_gradients_under_checkpo
     tmp_path, monkeypatch, dtype, backend
 ):
     _isolate_cpu_spawn(monkeypatch)
-    mp.spawn(_worker, args=(str(tmp_path / "gloo"), dtype, backend), nprocs=_CI_CPU_2.nproc, join=True)
+    mp.spawn(
+        _worker, args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_2.nproc), nprocs=_CI_CPU_2.nproc, join=True
+    )
 
 
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
@@ -111,19 +115,21 @@ def test_ple_empty_identity_does_not_save_weight_as_activation(backend):
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight), rtol=0, atol=0)
 
 
-def _distributed_lookup_worker(rank, rendezvous, dtype, backend):
+def _distributed_lookup_worker(rank, rendezvous, dtype, backend, world_size):
     _configure_cpu_worker()
     model_module = _model_module(backend)
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (1, 2), mesh_dim_names=("ple_fsdp", "ple"))
+        mesh = init_device_mesh("cpu", (world_size // 2, 2), mesh_dim_names=("ple_fsdp", "ple"))
         state = SimpleNamespace(
             extra_parallel_sizes={"ple": 2},
             extra_parallel_flat_group=lambda name: dist.group.WORLD,
             extra_parallel_fsdp_device_mesh={"ple": mesh},
-            extra_parallel_2d_rank_table=lambda name: ((0, 1),),
-            extra_parallel_gradient_divide_factor=lambda name: 2,
+            extra_parallel_2d_rank_table=lambda name: tuple(
+                tuple(2 * column + row for row in range(2)) for column in range(world_size // 2)
+            ),
+            extra_parallel_gradient_divide_factor=lambda name: world_size,
         )
         model_module.get_parallel_state = lambda: state
         for mode in ("plain", "non_reentrant", "reentrant"):
@@ -138,14 +144,15 @@ def _distributed_lookup_worker(rank, rendezvous, dtype, backend):
             fixture._distributed_lookup = MethodType(
                 model_module.Qwen4ExpTextNGramEmbedding._distributed_lookup, fixture
             )
-            shard_ids, row_ids = torch.tensor([rank, rank]), torch.tensor([0, 1])
+            shard = rank % 2
+            shard_ids, row_ids = torch.tensor([shard, shard]), torch.tensor([0, 1])
             anchor = torch.ones((), requires_grad=True)
 
             def run(a, fixture=fixture, shard_ids=shard_ids, row_ids=row_ids):
                 return fixture._distributed_lookup(shard_ids, row_ids) + a * 0
 
             output = run(anchor) if mode == "plain" else checkpoint(run, anchor, use_reentrant=mode == "reentrant")
-            expected = torch.arange(16, dtype=torch.float32).reshape(4, 4)[:2].add_(100 * rank).to(dtype)
+            expected = torch.arange(16, dtype=torch.float32).reshape(4, 4)[:2].add_(100 * shard).to(dtype)
             torch.testing.assert_close(output.detach(), expected, rtol=0, atol=0)
             output.sum().backward()
             for index, table in enumerate(tables.values()):
@@ -153,7 +160,7 @@ def _distributed_lookup_worker(rank, rendezvous, dtype, backend):
                     assert table.weight.grad is None
                 else:
                     assert table.weight.grad is not None
-                    expected_grad = torch.full_like(table.weight.to_local(), 0.5 if rank == 0 else 0.0)
+                    expected_grad = torch.full_like(table.weight.to_local(), 0.5 if rank % 2 == 0 else 0.0)
                     torch.testing.assert_close(table.weight.grad.to_local(), expected_grad, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
@@ -165,5 +172,31 @@ def _distributed_lookup_worker(rank, rendezvous, dtype, backend):
 def test_distributed_ple_empty_owner_under_checkpoint(tmp_path, monkeypatch, dtype, backend):
     _isolate_cpu_spawn(monkeypatch)
     mp.spawn(
-        _distributed_lookup_worker, args=(str(tmp_path / "gloo"), dtype, backend), nprocs=_CI_CPU_2.nproc, join=True
+        _distributed_lookup_worker,
+        args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_2.nproc),
+        nprocs=_CI_CPU_2.nproc,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
+def test_trainable_ple_column_shards_with_empty_requests(tmp_path, monkeypatch, dtype, backend):
+    _isolate_cpu_spawn(monkeypatch)
+    mp.spawn(
+        _worker, args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_4.nproc), nprocs=_CI_CPU_4.nproc, join=True
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
+def test_distributed_ple_column_shards_with_empty_owner(tmp_path, monkeypatch, dtype, backend):
+    _isolate_cpu_spawn(monkeypatch)
+    mp.spawn(
+        _distributed_lookup_worker,
+        args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_4.nproc),
+        nprocs=_CI_CPU_4.nproc,
+        join=True,
     )
