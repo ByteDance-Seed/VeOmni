@@ -185,6 +185,7 @@ def prepare_exec_cmd(
     max_ep_size: int | None = None,
     min_sp_size: int | None = None,
 ) -> list[tuple[str, dict]]:
+    """Build the training launch command for the selected model, topology and test configuration."""
     launches = parallel_launches(
         is_moe,
         max_sp_size,
@@ -213,7 +214,7 @@ def prepare_exec_cmd(
             )
             if model_name == "wan_t2v":
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
-            elif model_name == "deepseek_v4":
+            elif model_name in ("deepseek_v4", "minimax_m3_vl"):
                 # fused_triton MoE needs bf16/fp16 activations; the toy
                 # checkpoint is materialized in float32.
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)

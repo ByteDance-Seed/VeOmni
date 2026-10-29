@@ -85,9 +85,12 @@ two-axis rule above:
 
 The allowlist is keyed by ``(generated-file, function qualname)``: each
 sync warning's line number is resolved to its enclosing function via AST,
-so a ``make patchgen`` that shifts lines does **not** rot the gate. Dead
-allowlist entries (a function that no longer issues a sync) still fail
-the test, so a landed fix can't silently leave a stale entry behind.
+so a ``make patchgen`` that shifts lines does **not** rot the gate.
+MiniMax's public-entry exception is additionally scoped to the AST span
+of its missing-varlen branch, and a separate packed invocation has no
+public-entry exception. Dead allowlist entries (a function or branch that
+no longer issues a sync) still fail the test, so a landed fix can't silently
+leave a stale entry behind.
 """
 
 import ast
@@ -100,6 +103,7 @@ from functools import lru_cache
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.transformers._forward_cases import (
     DTYPE_MAP as _DTYPE_MAP,
 )
@@ -122,7 +126,6 @@ from tests.models.transformers._forward_cases import (
 from tests.models.transformers._forward_cases import (
     release_device_memory as _release,
 )
-from tests.tools.training_utils import make_eager_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, synchronize
 
 
@@ -135,6 +138,7 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
     "qwen3_vl_moe-fa2-fused": "fused_triton",
     "qwen3_omni_moe-fa2-fused": "fused_triton",
+    "minimax_m3_vl-fa2-fused": "fused_triton",
 }
 
 
@@ -152,7 +156,7 @@ def _scope_deterministic_backend_flags():
 # the fused expert op; the three fused cases above cover that path.
 
 # Acknowledged sync sites in generated/. Keyed by ``ForwardCase.case_id``;
-# value maps ``(basename, lineno)`` -> one-line reason.
+# value maps ``(basename, qualname)`` -> one-line reason.
 #
 # Reasons MUST start with one of the category tags below — see the
 # module docstring's "principle" section for the two-axis triage. The
@@ -301,6 +305,18 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # MiniMax's collator hook supplies image/video grid lists, so the patched
+    # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
+    "minimax_m3_vl-fa2-fused": {
+        ("patched_modeling_minimax_m3_vl_gpu.py", "MiniMaxM3VL3DRotaryEmbedding.forward"): (
+            "algorithm-essential: host-built vision coordinates `.to(device)` H2D copy; "
+            "over-reported by torch sync-debug mode."
+        ),
+        ("patched_modeling_minimax_m3_vl_gpu.py", "MiniMaxM3VLTextModel.forward[unpacked-fallback]"): (
+            "public-entry-fallback: validate an explicit mask is all ones and build one-segment cu_seq_lens "
+            "only when the caller passes no varlen kwargs; packed training skips the mask reduction."
+        ),
+    },
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -326,6 +342,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2-fused",
 }
 
 
@@ -388,9 +405,33 @@ def _sync_site_key(filename: str, lineno: int) -> tuple[str, str] | None:
         return None
     qualname = _enclosing_qualname(filename, lineno)
     if "/generated/" in rel:
+        if (
+            os.path.basename(rel) == "patched_modeling_minimax_m3_vl_gpu.py"
+            and qualname == "MiniMaxM3VLTextModel.forward"
+        ):
+            fallback_span = _minimax_unpacked_fallback_span(filename)
+            if fallback_span is not None and fallback_span[0] <= lineno <= fallback_span[1]:
+                qualname += "[unpacked-fallback]"
         return (os.path.basename(rel), qualname)
     if rel.startswith("veomni/models/") or rel.startswith("veomni/ops/"):
         return (rel, qualname)
+    return None
+
+
+@lru_cache(maxsize=None)
+def _minimax_unpacked_fallback_span(path: str) -> tuple[int, int] | None:
+    """Find only the no-varlen branch; other text-forward syncs stay forbidden."""
+    with open(path, encoding="utf-8") as source:
+        tree = ast.parse(source.read(), filename=path)
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name != "MiniMaxM3VLTextModel":
+            continue
+        for method in cls.body:
+            if not isinstance(method, ast.FunctionDef) or method.name != "forward":
+                continue
+            for node in ast.walk(method):
+                if isinstance(node, ast.If) and ast.unparse(node.test) == "kwargs.get('cu_seq_lens_q') is None":
+                    return node.body[0].lineno, node.body[-1].end_lineno
     return None
 
 
@@ -494,6 +535,63 @@ def test_sync_site_key_watches_first_party_models_and_ops(tmp_path):
     assert _sync_site_key("/usr/lib/python/torch/cuda.py", 1) is None
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_sync_allowlist_rejects_sync_outside_unpacked_fallback(tmp_path):
+    """A sync in the same forward's packed path must not inherit the fallback exemption."""
+    generated = tmp_path / "veomni" / "models" / "transformers" / "minimax_m3_vl" / "generated"
+    generated.mkdir(parents=True)
+    path = generated / "patched_modeling_minimax_m3_vl_gpu.py"
+    path.write_text(
+        "class MiniMaxM3VLTextModel:\n"
+        "    def forward(self, **kwargs):\n"
+        "        if kwargs.get('cu_seq_lens_q') is None:\n"
+        "            fallback_sync = mask.all().item()\n"
+        "        packed_sync = mask.all().item()\n",
+        encoding="utf-8",
+    )
+    fallback_key = _sync_site_key(str(path), 4)
+    packed_key = _sync_site_key(str(path), 5)
+    allowed = _ALLOWED_SYNCS["minimax_m3_vl-fa2-fused"]
+    assert fallback_key in allowed
+    assert packed_key not in allowed
+    assert fallback_key != packed_key
+
+
+def _with_minimax_packed_metadata(input_ids: torch.Tensor, forward_kwargs: dict) -> dict:
+    """Add two host-described packed segments before CUDA sync capture begins."""
+    length = input_ids.shape[1]
+    assert input_ids.shape[0] == 1 and length >= 2
+    split = length // 2
+    cu_seq_lens = torch.tensor([0, split, length], dtype=torch.int32, device=input_ids.device)
+    position_ids = torch.cat(
+        (torch.arange(split, device=input_ids.device), torch.arange(length - split, device=input_ids.device))
+    ).unsqueeze(0)
+    return {
+        **forward_kwargs,
+        "position_ids": position_ids,
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "max_length_q": max(split, length - split),
+        "max_length_k": max(split, length - split),
+    }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("length", [7, 32])
+def test_minimax_sync_packed_metadata_preserves_media_and_resets_positions(length):
+    """Packed fixtures carry two real boundaries without duplicating visual inputs."""
+    input_ids = torch.arange(length).unsqueeze(0)
+    pixels = torch.randn(4, 12)
+    kwargs = _with_minimax_packed_metadata(input_ids, {"pixel_values": pixels})
+    split = length // 2
+    assert kwargs["pixel_values"] is pixels
+    assert kwargs["cu_seq_lens_q"].tolist() == [0, split, length]
+    assert kwargs["cu_seq_lens_k"].tolist() == [0, split, length]
+    assert kwargs["cu_seq_lens_q"].dtype == torch.int32
+    assert kwargs["position_ids"].tolist() == [list(range(split)) + list(range(length - split))]
+    assert kwargs["max_length_q"] == kwargs["max_length_k"] == length - split
+
+
 # NCCL bootstrap env so this module is runnable on its own. The fixture below
 # no-ops if a process group is already initialised.
 os.environ.setdefault("RANK", "0")
@@ -532,6 +630,7 @@ def _single_rank_process_group():
 
 def _build_veomni_model(case, config):
     """Random-init VeOmni model — we only need forward to run, not match HF."""
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models import build_foundation_model
 
     ops_implementation = make_eager_ops_config(
@@ -550,8 +649,17 @@ def _build_veomni_model(case, config):
     ).eval()
 
 
-@pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
-def test_no_implicit_sync_in_generated_forward(case):
+_SYNC_INVOCATIONS = [(case, False) for case in CASES] + [
+    (case, True) for case in CASES if case.case_id == "minimax_m3_vl-fa2-fused"
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "packed"),
+    _SYNC_INVOCATIONS,
+    ids=[case.case_id + ("-packed" if packed else "") for case, packed in _SYNC_INVOCATIONS],
+)
+def test_no_implicit_sync_in_generated_forward(case, packed):
     """No implicit CUDA sync should originate from first-party VeOmni code during forward."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
@@ -571,6 +679,8 @@ def test_no_implicit_sync_in_generated_forward(case):
     dtype = _DTYPE_MAP[case.dtype]
     config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    if packed:
+        fwd_kwargs = _with_minimax_packed_metadata(input_ids, fwd_kwargs)
 
     model = _build_veomni_model(case, config)
     target = _forward_target(model, case)
@@ -616,6 +726,8 @@ def test_no_implicit_sync_in_generated_forward(case):
     _release()
 
     allowed = _ALLOWED_SYNCS.get(case.case_id, {})
+    if packed:
+        allowed = {key: reason for key, reason in allowed.items() if not reason.startswith("public-entry-fallback:")}
 
     # Resolve each watched sync warning to the *qualified name* of the
     # function it fired in. generated/ keys stay ``(basename, qualname)``;

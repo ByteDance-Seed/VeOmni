@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU single-process tests for the VeOmni-native dense LoRA stack (Phase 1).
+"""Single-process tests for the VeOmni-native dense LoRA stack (Phase 1).
 
-No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercises:
+The CPU cases require no distributed / GPU / HF-model build; a tiny ``nn.Module`` exercises:
 
 * ``VeOmniLoraConfig`` YAML <-> config <-> ``adapter_config.json`` round-trips.
 * Dense injection: PEFT-identical FQNs, trainable-only-LoRA, no-op-at-init.
@@ -24,6 +24,7 @@ No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercise
 
 ``test_peft_bidirectional_interop`` additionally asserts cross-compatibility
 with stock ``peft`` when it is installed (dev/test-only dependency).
+The adapter-bypass regression also runs on the runner-selected accelerator.
 """
 
 from __future__ import annotations
@@ -35,11 +36,15 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tests.tools.training_utils import unbuilt_runtime
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
+from veomni.utils.device import get_device_type
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 torch.manual_seed(0)
@@ -142,6 +147,8 @@ def test_only_lora_trainable():
 
 
 def test_model_runtime_rejects_lora_without_trainable_adapters():
+    from tests.tools.training_utils import unbuilt_runtime
+
     runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]}))
     runtime.model = Toy()
 
@@ -151,6 +158,8 @@ def test_model_runtime_rejects_lora_without_trainable_adapters():
 
 @pytest.mark.parametrize("is_trainable", [True, False])
 def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
+    from tests.tools.training_utils import unbuilt_runtime
+
     VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))
     runtime = unbuilt_runtime(
         SimpleNamespace(lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable})
@@ -303,3 +312,46 @@ def test_peft_bidirectional_interop(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize(
+    "device_kind",
+    [
+        pytest.param("cpu", id="cpu"),
+        pytest.param(
+            "accelerator", id="accelerator", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+        ),
+    ],
+)
+def test_disable_adapter_restores_nested_context_after_exception(device_kind):
+    """Reference inference bypasses nonzero adapters without changing weights."""
+    device = "cpu" if device_kind == "cpu" else get_device_type()
+    if device_kind == "accelerator" and device == "cpu":
+        pytest.skip("Adapter bypass accelerator coverage requires an available accelerator")
+    base = Toy().to(device)
+    reference = copy.deepcopy(base)
+    model = VeOmniLoraModel(base, _base_config()).to(device)
+    _randomize_lora_b(model)
+    x = torch.randn(3, 32, device=device)
+    adapted = model(x).detach().clone()
+    expected = reference(x).detach()
+    assert not torch.equal(adapted, expected)
+    with pytest.raises(RuntimeError, match="test exception"):
+        with model.disable_adapter():
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            with model.disable_adapter():
+                torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            raise RuntimeError("test exception")
+    torch.testing.assert_close(model(x), adapted, rtol=0, atol=0)
+
+
+def test_disable_adapter_rejects_merged_layers_before_changing_flags():
+    """Verify that merged adapters are rejected without changing any layer disable flags."""
+    model = VeOmniLoraModel(Toy(), _base_config())
+    layers = [m for m in model.modules() if isinstance(m, LoraLinear)]
+    layers[-1].merge()
+    with pytest.raises(ValueError, match="unmerged"):
+        with model.disable_adapter():
+            pytest.fail("Merged weights cannot provide the base-policy reference")
+    assert all(not layer.disable_adapters for layer in layers)

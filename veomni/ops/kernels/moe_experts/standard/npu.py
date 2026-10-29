@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ..shared.swiglu import swiglu_oai
 
 
 class GmmFunction(torch.autograd.Function):
@@ -126,6 +127,18 @@ def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
     return _clamped_swiglu(x, swiglu_limit)
 
 
+def _apply_moe_activation(x: torch.Tensor, swiglu_limit: float | None, swiglu_alpha: float | None) -> torch.Tensor:
+    """Standard (optionally clamped) SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set."""
+    if swiglu_alpha is None:
+        return _swiglu(x, swiglu_limit)
+    gate, up = x.chunk(2, dim=-1)
+    # Same contract as the Triton path: ``swiglu_limit=None`` disables the clamp.
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return swiglu_oai(gate, up, swiglu_alpha)
+
+
 def _npu_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -136,6 +149,7 @@ def _npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
 
@@ -152,7 +166,7 @@ def _npu_fused_moe_forward(
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _apply_moe_activation(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
     # NPU unpermute applies routing after fc2. Equivalent for a biasless down
     # projection; bf16 rounding can differ from the pre-fc2 fused order.
@@ -171,6 +185,7 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: dist.ProcessGroup | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
@@ -193,7 +208,7 @@ def npu_ep_fused_moe_forward(
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _apply_moe_activation(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     hidden_states = npu_group_gemm(
         intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
     )
@@ -330,8 +345,9 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    swiglu_alpha: float | None = None,
 ):
-    """NPU fused MoE entry. Branches on EP."""
+    """NPU fused MoE entry. Branches on EP; ``swiglu_alpha`` selects the SwiGLU-OAI activation."""
     # Router scores stay float32. Cast before the fused scale so the NPU GEMM
     # does not see an fp32 activation against bf16 weights.
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
@@ -352,6 +368,7 @@ def npu_fused_moe_forward(
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
         )
     else:
         final_hidden_states = _npu_fused_moe_forward(
@@ -364,6 +381,7 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
         )
     return final_hidden_states
 

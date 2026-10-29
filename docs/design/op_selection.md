@@ -22,6 +22,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| MiniMax sparse attention | — (no config field until a kernel backend exists) | `eager` | `"eager"` | Model `__init__` via two instance-local `VeomniOp`s (`indexer`, `attention`) of op `minimax_sparse_attention`, on sparse layers only (dense layers bind the standard `attention` op from `attn_implementation`); the eager attention runs `torch_npu.npu_fusion_attention` on NPU tensors |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -575,6 +576,12 @@ separate `ModuleList` fork. LoRA experts follow the wrapped module's
 `veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
 unavailable on the device.
 
+MiniMax M3 experts use the `swiglu_oai` variant, which registers `eager`,
+`fused_triton` and `fused_npu` only. It shares the standard merged-fc1 Triton
+and NPU paths (including EP) with a `swiglu_alpha` argument that replaces SiLU
+with the clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation; selecting
+an implementation without a row, such as `fused_quack`, fails at model build.
+
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
 ROCm `triton` attention. Its MoE path uses the independent
@@ -837,3 +844,38 @@ Temporary packing storage trades memory traffic for fewer collective launches.
 `tests/models/test_qwen4_exp_gdn_exchange.py` covers exact CPU/Gloo permutations,
 projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
 CPU tests do not establish native throughput or numerical acceptance.
+
+
+## SwiGLU OAI expert LoRA selection
+
+Native MoE LoRA recognizes a base operator with `variant="swiglu_oai"` and
+selects `shared_swiglu_oai` or `independent_swiglu_oai` in `moe_experts_lora`.
+Both expose eager and NPU implementations. The model supplies positive finite
+`swiglu_alpha` and `swiglu_limit`; unsupported activations still fail before
+the wrapper takes ownership of parameters. No generated model file is edited.
+
+The NPU variants reuse the standard expert dispatch, grouped GEMMs and combine
+operations, with the configured clamped activation after gate/up adapter deltas.
+CPU-emulated composition tests cover the tensor math and gradients; real NPU
+and EP execution remain separate validation requirements.
+
+`VeOmniLoraModel.disable_adapter()` also covers native experts that expose a
+base `VeomniOp` handle. Expert forward then calls that handle with the original
+base weights and activation attributes and does not read adapter tensors.
+The context preserves prior disable states across nesting and exceptions.
+An expert without a base operator fails before any adapter state changes.
+
+
+The base `moe_experts/swiglu_oai` row serves MiniMax M3.1-Flash experts.
+Clamped standard experts are explicitly rejected until their adapter activation
+has a matching implementation, preventing an incorrect unclamped reference.
+
+For large frozen-base adapters, `build_parallelize_model(..., is_peft_model=True,
+preserve_frozen_dtype=True)` keeps caller-selected base and buffer dtypes while
+upcasting trainable floating parameters to FP32. This opt-in does not choose
+which base weights need FP32; the caller must prepare that policy before sharding.
+This policy requires FSDP2 with enabled mixed precision and a non-None
+`param_dtype`: its parameter casting supplies
+matching compute dtypes. DDP and unsharded execution are rejected because the
+frozen BF16 base and FP32 adapters otherwise have incompatible input dtypes.
+The default remains whole-model FP32 conversion under mixed precision.

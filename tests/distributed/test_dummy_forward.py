@@ -136,6 +136,10 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 # ---------------------------------------------------------------------------
 
 
+# MiniMax M3 VL attention passes no mask, so packed media and samples need a varlen backend.
+_OPS_OVERRIDES = {"minimax_m3_vl": {"attn_implementation": "flash_attention_2"}}
+
+
 def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
     from veomni.distributed.parallel_state import _init_parallel_state
@@ -159,7 +163,7 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
         weights_path=None,
         torch_dtype="float32",
         init_device="meta",
-        ops_implementation=make_eager_ops_config(),
+        ops_implementation=make_eager_ops_config(**_OPS_OVERRIDES.get(model_type, {})),
     )
     model.train()
 
@@ -217,6 +221,12 @@ _vlm_cases = [
         "./tests/toy_config/qwen3vlmoe_toy",
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_moe",
+    ),
+    pytest.param(
+        "minimax_m3_vl",
+        "./tests/toy_config/minimax_m3_vl_toy",
+        partial(_vlm_batch, patch_size=14),
+        id="minimax_m3_vl",
     ),
 ]
 

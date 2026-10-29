@@ -51,6 +51,7 @@ class LoraLayer:
         self.lora_alpha: dict[str, int] = {}
         self.use_rslora: dict[str, bool] = {}
         self._merged_adapters: list[str] = []
+        self.disable_adapters = False
 
     @property
     def merged(self) -> bool:
@@ -140,8 +141,9 @@ class LoraLinear(nn.Module, LoraLayer):
         )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Apply the active dense adapter unless disabled or merged, preserving the base result dtype."""
         result = self.base_layer(x, *args, **kwargs)
-        if self.merged:
+        if self.merged or self.disable_adapters:
             return result
         adapter = self.active_adapter
         if adapter not in self.lora_A:

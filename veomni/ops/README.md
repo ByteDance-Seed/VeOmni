@@ -48,7 +48,7 @@ when the selected implementation runs.
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss`, `swiglu_oai` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant (`swiglu_oai`: `eager`, `fused_triton`, `fused_npu`) |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
@@ -57,6 +57,7 @@ when the selected implementation runs.
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
+| `minimax_sparse_attention` | `indexer`, `attention` | `eager` (Ascend NPU tensors run the masked softmax through `torch_npu.npu_fusion_attention`) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -87,6 +88,18 @@ atomic scatter, at the cost of sorting and a partial-gradient workspace.
 aligned), builds a local boolean mask via `int8` scatter, and calls
 `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad` without forward
 replay.
+
+MiniMax M3 `minimax_sparse_attention` takes packed TND tensors with the
+standard varlen `cu_seqlens` / `max_seqlen` metadata. `indexer` selects
+`[T, G, topk]` key blocks per query and KV group (`-1` marks an unused slot);
+`attention` applies them with token-level causality inside each block. Only
+sparse layers call it; dense MiniMax layers use the standard `attention` family
+selected by `attn_implementation`. It has no config field yet:
+the model resolves the default row, and a kernel backend adds its rows (and a
+`minimax_sparse_attention_implementation` field once there is a choice). MoE
+`swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
+`(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused
+Triton and NPU paths, including EP.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
@@ -313,3 +326,19 @@ The packed width retains the key/value head ratio. Peer packets are padded to
 same permutation without rescaling. Output exchange, recurrence and packed
 boundaries are unchanged, and existing head-divisibility requirements remain.
 No `OpsImplementationConfig` flag is needed for this layout optimization.
+
+
+### SwiGLU-OAI expert LoRA
+
+`moe_experts_lora` exposes `shared_swiglu_oai` and `independent_swiglu_oai`
+with `eager` and `fused_npu` implementations. Tensor arguments use the same
+layouts as their standard counterparts. The positive finite scalar attributes
+`swiglu_alpha` and `swiglu_limit` come from the model configuration. They apply
+`clamp(gate, max=limit) * sigmoid(alpha * clamp(gate, max=limit)) *
+(clamp(up, -limit, limit) + 1)` after adding the gate/up adapter deltas.
+
+Native expert LoRA selects these rows only for a base expert module whose
+`veomni_moe.variant` is explicitly `swiglu_oai`; unsupported activations still
+fail before the wrapper takes parameter ownership. The NPU path retains the
+existing EP dispatch/combine and grouped GEMMs. Eager remains EP1 only.
+This extension does not add a Triton backend or establish NPU parity by itself.

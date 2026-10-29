@@ -1004,6 +1004,27 @@ def parallelize_model_ddp(
     )
 
 
+def _validate_preserve_frozen_dtype(enabled, is_peft_model, parallel_state, mixed_precision):
+    """Require a boolean flag, PEFT and active FSDP2 mixed-precision casting before preserving frozen dtypes."""
+    if not isinstance(enabled, bool):
+        raise TypeError("preserve_frozen_dtype must be a bool")
+    if enabled and not is_peft_model:
+        raise ValueError("preserve_frozen_dtype requires is_peft_model=True")
+    if enabled and (not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2"):
+        raise ValueError("preserve_frozen_dtype requires FSDP2 mixed-precision parameter casting")
+    if enabled and (not mixed_precision.enable or mixed_precision.param_dtype is None):
+        raise ValueError("preserve_frozen_dtype requires enabled mixed precision and a non-None param_dtype")
+
+
+def _upcast_trainable_parameters(model):
+    """Preserve frozen storage and parameter identity before FSDP materialization."""
+    for parameter in model.parameters():
+        if parameter.requires_grad and parameter.is_floating_point():
+            parameter.data = parameter.data.float()
+            if parameter.grad is not None:
+                parameter.grad.data = parameter.grad.data.float()
+
+
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -1016,6 +1037,7 @@ def build_parallelize_model(
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    preserve_frozen_dtype: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1026,12 +1048,20 @@ def build_parallelize_model(
             model (SeedOmni ``fsdp_scope='model'``). The single-model trainers
             pass ``args.model.model_path``; per-module SeedOmni wrap passes that
             module's path; the composed wrap passes one path per child.
+        preserve_frozen_dtype: Opt-in FSDP2 PEFT policy: retain caller-selected frozen
+            parameter/buffer dtypes and upcast only trainable floating parameters
+            to FP32 before sharding. Requires ``is_peft_model=True`` and enabled
+            mixed precision with a non-None ``param_dtype``. The default
+            retains the existing whole-model FP32 conversion.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
         recompute_policy: Per-block recomputation strategy, bound after HF has
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+    _validate_preserve_frozen_dtype(
+        preserve_frozen_dtype, kwargs.get("is_peft_model", False), parallel_state, mixed_precision
+    )
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
@@ -1043,8 +1073,11 @@ def build_parallelize_model(
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
-    if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
-        model = model.float()
+    if mixed_precision.enable:  # FP32 optimizer storage; optionally retain frozen base storage.
+        if preserve_frozen_dtype:
+            _upcast_trainable_parameters(model)
+        else:
+            model = model.float()
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
