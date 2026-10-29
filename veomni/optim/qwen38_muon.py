@@ -47,11 +47,20 @@ def _strict_matmul(device_type):
     if device_type == "npu":
         backend, option = torch.npu.matmul, "allow_hf32"
     elif device_type == "cuda":
-        backend, option = torch.backends.cuda.matmul, "allow_tf32"
+        backend = torch.backends.cuda.matmul
+        precision = getattr(backend, "fp32_precision", None)
+        if precision == "ieee":
+            # Avoid pinning an explicit override when this value is inherited.
+            backend = None
+        elif precision == "none":
+            # Restoring "none" keeps future parent precision changes visible.
+            option = "fp32_precision"
+        else:
+            option = "allow_tf32"
     previous = getattr(backend, option) if backend is not None else None
     try:
         if backend is not None:
-            setattr(backend, option, False)
+            setattr(backend, option, "ieee" if option == "fp32_precision" else False)
         with torch.autocast(device_type=device_type, enabled=False):
             yield
     finally:
