@@ -283,7 +283,6 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
-            collect_token_accounting=True,
         )
 
     def on_train_begin(self):

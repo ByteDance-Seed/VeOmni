@@ -38,6 +38,7 @@ from transformers import set_seed as set_seed_func
 
 from ..distributed.parallel_state import get_parallel_state
 from . import logging
+from .constants import IGNORE_INDEX
 from .count_flops import VeomniFlopsCounter
 from .device import (
     IS_CUDA_AVAILABLE,
@@ -49,12 +50,6 @@ from .device import (
 from .dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
 from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
-from .token_accounting import (
-    TokenAccounting,
-    metrics_from_totals,
-    pop_token_accounting,
-    sum_accountings,
-)
 
 
 try:
@@ -94,26 +89,14 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 
 
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    if "linear_attn_cu_seq_lens_q" in micro_batch:
-        # This metadata remains global when an attention backend replaces
-        # cu_seq_lens_q with sequence-parallel local boundaries.
-        tail_padding_length = int(micro_batch.get("tail_padding_length", 0) or 0)
-        seqlens = valid_seqlens_from_cu_seqlens(
-            micro_batch["linear_attn_cu_seq_lens_q"],
-            tail_padding_length=tail_padding_length,
-        )
-        return seqlens.tolist()
-
     if "cu_seq_lens_q" in micro_batch:
-        # Packed micro batch. Under CP/Ulysses this may be rank-local. Do not
-        # multiply each document fragment by sp_size: boundaries need not
-        # align across ranks, and the FLOPs estimator squares these lengths.
+        # packed micro batch
         tail_padding_length = micro_batch.get("tail_padding_length")
         seqlens = valid_seqlens_from_cu_seqlens(
             micro_batch["cu_seq_lens_q"],
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
-        )
-        return seqlens.tolist()
+        ).tolist()
+        return seqlens
 
     elif "attention_mask" in micro_batch:
         # unpacked sample
@@ -227,23 +210,6 @@ def compute_device_memory_metrics() -> Dict[str, Any]:
     }
 
 
-def _safe_token_accounting_metrics(
-    totals: TokenAccounting,
-    *,
-    delta_time: float,
-) -> tuple[Dict[str, float], bool]:
-    """Validate observability counters without making training fail closed."""
-    try:
-        totals.validate_training_step()
-    except ValueError as exc:
-        logger.warning_rank0(
-            "Token accounting validation failed; keeping the training step alive and suppressing derived metrics: %s",
-            exc,
-        )
-        return {}, False
-    return metrics_from_totals(totals, delta_time=delta_time), True
-
-
 class EnvironMeter:
     """
     Computes the metrics about the training efficiency.
@@ -281,9 +247,8 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
-        self.batch_token_accountings: List[TokenAccounting] = []
-        self.batch_accounting_expected = 0
-        self.batch_accounting_observed = 0
+        self._batch_token_stats = []
+        self._batch_token_stats_complete = True
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -323,22 +288,82 @@ class EnvironMeter:
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
         if getattr(self.config, "condition_model_type", None) is None:  # hf model
-            samples = micro_batch if isinstance(micro_batch, List) else [micro_batch]
-            for sample in samples:
-                self.batch_accounting_expected += 1
-                accounting = pop_token_accounting(sample)
-                if accounting is not None:
-                    self.batch_token_accountings.append(accounting)
-                    self.batch_accounting_observed += 1
-                self.batch_seqlens.extend(_compute_seqlens(sample))
-                self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
+            if isinstance(micro_batch, List):
+                for sample in micro_batch:
+                    self.batch_seqlens.extend(_compute_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
+                    self._record_token_stats(sample)
+                    if self.enable_multisource:
+                        self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+            else:
+                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch, self.config))
+                self._record_token_stats(micro_batch)
                 if self.enable_multisource:
-                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:  # dit diffusers model
-            samples = micro_batch if isinstance(micro_batch, List) else [micro_batch]
-            for sample in samples:
-                pop_token_accounting(sample)
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
+
+    def _record_token_stats(self, batch):
+        """Meter standard packed batches without changing existing data-cursor accounting.
+
+        Physical counts the padded SP window, aligned removes the known tail,
+        and source counts valid global sequence lengths. ``loss_tokens`` is
+        the generic shifted-label count; it is not an objective-specific loss
+        denominator and is not comparable across SP for unshifted objectives.
+        Ambiguous metadata is omitted from the new metrics.
+        """
+        ids, labels = batch.get("input_ids"), batch.get("labels")
+        if (
+            not isinstance(ids, torch.Tensor)
+            or not isinstance(labels, torch.Tensor)
+            or ids.ndim == 0
+            or labels.ndim == 0
+            or ids.shape != labels.shape
+        ):
+            self._batch_token_stats_complete = False
+            return
+        sp_enabled = getattr(self.parallel_state, "sp_enabled", False)
+        if sp_enabled and "linear_attn_cu_seq_lens_q" not in batch:
+            # A rank-local boundary list cannot prove a global token count.
+            self._batch_token_stats_complete = False
+            return
+        sp_size = self.parallel_state.sp_size if sp_enabled else 1
+        capacity = ids.numel() * sp_size
+        has_boundaries = "linear_attn_cu_seq_lens_q" in batch or "cu_seq_lens_q" in batch
+        if has_boundaries:
+            cu = batch.get("linear_attn_cu_seq_lens_q", batch.get("cu_seq_lens_q"))
+            trusted_lengths = (
+                isinstance(cu, torch.Tensor)
+                and cu.ndim == 1
+                and cu.numel() >= 2
+                and int(cu[0]) == 0
+                and int(cu[-1]) == capacity
+                and ("packed_sequence_slices" in batch or batch.get("tail_padding_length") is not None)
+            )
+        else:
+            mask = batch.get("attention_mask")
+            trusted_lengths = not sp_enabled and isinstance(mask, torch.Tensor) and mask.shape == ids.shape
+        if not trusted_lengths:
+            self._batch_token_stats_complete = False
+            return
+        tail = int(batch.get("tail_padding_length", 0) or 0)
+        if tail < 0 or tail > capacity:
+            self._batch_token_stats_complete = False
+            return
+        if has_boundaries and tail and not bool((cu == capacity - tail).any().item()):
+            self._batch_token_stats_complete = False
+            return
+        source = (
+            int(valid_seqlens_from_cu_seqlens(cu, tail_padding_length=tail).sum().item())
+            if has_boundaries
+            else int(mask.sum().item())
+        )
+        # SP collators already shift labels before slicing. This is a generic
+        # shifted-label count, not an objective-specific loss denominator.
+        shifted = labels if sp_enabled else labels[..., 1:]
+        loss_tokens = int((shifted != IGNORE_INDEX).sum().item())
+        self._batch_token_stats.append((capacity, capacity - tail, loss_tokens, source))
 
     def step(
         self,
@@ -384,39 +409,6 @@ class EnvironMeter:
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 
-        local_hook = int(
-            self.batch_accounting_expected > 0 and self.batch_accounting_observed == self.batch_accounting_expected
-        )
-        local_accounting = sum_accountings(self.batch_token_accountings)
-        accounting_values = torch.tensor(
-            (
-                local_accounting.physical_window_tokens,
-                local_accounting.aligned_compute_tokens,
-                local_accounting.source_input_tokens,
-                local_accounting.loss_tokens,
-                local_accounting.num_documents,
-                local_accounting.sum_document_len_squared,
-                local_hook,
-            ),
-            dtype=torch.int64,
-            device=get_device_type(),
-        )
-        (
-            physical_window_tokens,
-            aligned_compute_tokens,
-            source_input_tokens,
-            loss_tokens,
-            num_documents,
-            sum_document_len_squared,
-            hook_ranks,
-        ) = all_reduce(accounting_values, op="sum", group=self.parallel_state.dp_group)
-        max_document_length = all_reduce(
-            torch.tensor(local_accounting.max_document_length, dtype=torch.int64, device=get_device_type()),
-            op="max",
-            group=self.parallel_state.dp_group,
-        )
-        expected_hook_ranks = dist.get_world_size(group=self.parallel_state.dp_group)
-
         metrics = {
             "flops_achieved(T)": flops_achieved,
             "flops_promised(T)": flops_promised,
@@ -427,28 +419,51 @@ class EnvironMeter:
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
             "consumed_chunk_num": self.consume_chunks,
-            "token_accounting/collator_hook_ranks": float(hook_ranks),
-            "token_accounting/expected_dp_ranks": float(expected_hook_ranks),
         }
         metrics.update(compute_device_memory_metrics())
-        if int(hook_ranks) == expected_hook_ranks and expected_hook_ranks > 0:
-            totals = TokenAccounting(
-                physical_window_tokens=int(physical_window_tokens),
-                aligned_compute_tokens=int(aligned_compute_tokens),
-                source_input_tokens=int(source_input_tokens),
-                loss_tokens=int(loss_tokens),
-                num_documents=int(num_documents),
-                max_document_length=int(max_document_length),
-                sum_document_len_squared=int(sum_document_len_squared),
+        stats = self._batch_token_stats
+        local_loss = sum(item[2] for item in stats)
+        complete = int(bool(stats) and self._batch_token_stats_complete)
+        sp_enabled = getattr(self.parallel_state, "sp_enabled", False)
+        sp_size = self.parallel_state.sp_size if sp_enabled else 1
+        if sp_enabled:
+            local_loss, complete = all_reduce(
+                torch.tensor([local_loss, complete], dtype=torch.int64, device=get_device_type()),
+                op="sum",
+                group=self.parallel_state.sp_group,
             )
-            token_metrics, accounting_valid = _safe_token_accounting_metrics(totals, delta_time=delta_time)
-            if accounting_valid:
-                metrics.update(token_metrics)
-                metrics["token_accounting/collator_accounting_hook"] = 1.0
-            else:
-                metrics["token_accounting/collator_accounting_hook"] = 0.0
-        else:
-            metrics["token_accounting/collator_accounting_hook"] = 0.0
+        capacity, aligned, loss_tokens, complete_ranks, source_tokens = all_reduce(
+            torch.tensor(
+                [
+                    sum(item[0] for item in stats),
+                    sum(item[1] for item in stats),
+                    local_loss,
+                    complete,
+                    sum(item[3] for item in stats),
+                ],
+                dtype=torch.int64,
+                device=get_device_type(),
+            ),
+            op="sum",
+            group=self.parallel_state.dp_group,
+        )
+        if complete_ranks and complete_ranks == sp_size * dist.get_world_size(group=self.parallel_state.dp_group):
+            metrics.update(
+                {
+                    "token_accounting/physical_window_tokens": capacity,
+                    "token_accounting/aligned_compute_tokens": aligned,
+                    "token_accounting/source_input_tokens": source_tokens,
+                    "token_accounting/loss_tokens": loss_tokens,
+                    "token_accounting/source_fill": source_tokens / capacity if capacity else 0.0,
+                    "token_accounting/aligned_compute_fill": aligned / capacity if capacity else 0.0,
+                    "token_accounting/loss_density": loss_tokens / source_tokens if source_tokens else 0.0,
+                    "token_accounting/loss_fill": loss_tokens / capacity if capacity else 0.0,
+                    "token_accounting/capacity_tokens_per_second(M)": capacity / delta_time / 1e6,
+                    "token_accounting/aligned_compute_tokens_per_second(M)": aligned / delta_time / 1e6,
+                    "token_accounting/source_tokens_per_second(M)": source_tokens / delta_time / 1e6,
+                    "token_accounting/loss_tokens_per_second(M)": loss_tokens / delta_time / 1e6,
+                }
+            )
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
@@ -462,9 +477,8 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
-        self.batch_token_accountings = []
-        self.batch_accounting_expected = 0
-        self.batch_accounting_observed = 0
+        self._batch_token_stats = []
+        self._batch_token_stats_complete = True
 
         return metrics
 

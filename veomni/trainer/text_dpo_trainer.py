@@ -214,7 +214,7 @@ class TextDPOTrainer:
         with use_parallel_state(self.policy_model.parallel_state):
             self._build_data_transform()
             self.base._build_dataset()
-            self.base._build_collate_fn(per_segment_loss_accounting=True)
+            self.base._build_collate_fn()
             self.base._build_dataloader()
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)

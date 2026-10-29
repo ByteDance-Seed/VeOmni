@@ -151,33 +151,6 @@ VeOmni includes several built-in callbacks:
 - **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's `model/lr_scheduler.pt`. Runs last, and writes the step's `checkpoint_manifest.json`.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
-`EnvironMeterCallback` also reports topology-invariant packed-token metrics
-under `token_accounting/*`. The counters are captured before sequence-parallel
-slicing and reduced only across data-parallel ranks:
-
-- `physical_window_tokens`: padded window capacity.
-- `aligned_compute_tokens`: compute tokens after alignment, excluding known tail padding.
-- `source_input_tokens`: input document tokens before alignment and padding.
-- `loss_tokens`: labels that are not `IGNORE_INDEX`.
-- `source_fill`, `aligned_compute_fill`, and the corresponding
-  `*_tokens_per_second(M)` metrics.
-
-This distinction is important when a sequence-parallel attention backend uses
-rank-local `cu_seq_lens_q`; kernel-local boundaries are not a valid source-token
-throughput counter. When only rank-local `cu_seq_lens_q` is available under
-CP/Ulysses, the legacy FLOPs meter leaves those boundaries unchanged; it does
-not multiply each document by the SP degree. The collator counters above remain
-the authoritative global token totals.
-
-Dataloader collators built by the standard text and VLM trainers enable the
-accounting sidecar; standalone `MainCollator` callers get model-ready inputs
-by default. Custom trainer collators can opt in with
-`collect_token_accounting=True` and must pass the sidecar to the meter.
-DPO token counts exclude targets crossing packed chosen/rejected boundaries,
-matching the objective's per-segment mask. RL trainers pack after the meter's
-input callback, so their collator accounting is currently unavailable and the
-derived `token_accounting/*` metrics are suppressed rather than estimated.
-
 On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks
@@ -240,3 +213,19 @@ class Arguments(VeOmniArguments):
 ```
 
 By following this pattern, you can leverage the robust infrastructure of `BaseTrainer` while tailoring the training process to your specific model and data requirements.
+
+### Token accounting diagnostics
+
+When the batch contains sufficient global length and padding metadata,
+`EnvironMeter` reports `token_accounting/*` diagnostics. The physical count is
+the SP-padded input window, the aligned count removes its known tail padding,
+and the source count uses valid global sequence lengths. Ambiguous batches omit
+these metrics. Existing `consume_tokens` and multi-source dataloader accounting
+retain their previous behavior and can therefore differ from the new source
+count.
+
+`loss_tokens` is a generic shifted-label count, not an objective-specific loss
+denominator. In particular, do not compare it across SP configurations for
+objectives whose collator does not shift labels, or treat it as the exact DPO,
+classification, or MTP target count. Token throughput uses the step timer,
+which starts after meter input collection and does not include its overhead.

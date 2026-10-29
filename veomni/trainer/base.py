@@ -70,7 +70,6 @@ from ..utils.device import (
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
-from ..utils.token_accounting import TOKEN_ACCOUNTING_KEY
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
@@ -447,14 +446,12 @@ class BaseTrainer(Stateful, ABC):
         args.compute_train_steps(dataset_length)
         self.train_steps = args.train_steps
 
-    def _build_collate_fn(self, *, per_segment_loss_accounting: bool = False):
+    def _build_collate_fn(self):
         seq_classification = self.args.data.data_type == "classification"
         pad_to_length = self.args.train.pad_to_length
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
-            per_segment_loss_accounting=per_segment_loss_accounting,
-            collect_token_accounting=True,
         )
 
     def _build_dataloader(self):
@@ -618,9 +615,7 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        # The meter normally consumes this sidecar before forward. Collators
-        # invoked later (e.g. RL) must not leak it into the model's kwargs.
-        micro_batch = {k: _to_device(v) for k, v in micro_batch.items() if k != TOKEN_ACCOUNTING_KEY}
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
