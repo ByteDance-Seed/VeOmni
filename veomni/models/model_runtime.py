@@ -350,6 +350,28 @@ class VeOmniModelRuntime:
         """
         offload_config = self.args.accelerator.offload_config
         if offload_config.enable_async_activation:
+            if getattr(offload_config, "activation_offload_backend", "direct") == "bounded":
+                from ..distributed.bounded_activation_offload import StagingConfig, apply_bounded_activation_offload
+
+                gc = self.args.accelerator.gradient_checkpointing
+                if not gc.enable or gc.enable_reentrant:
+                    raise ValueError("Bounded activation staging requires nonreentrant gradient checkpointing")
+                if gc.recompute_layers != -1:
+                    raise ValueError(
+                        "Bounded activation staging requires recompute_layers=-1; "
+                        "partial or disabled recomputation cannot guarantee every selected boundary"
+                    )
+                apply_bounded_activation_offload(
+                    self.model,
+                    offload_config.activation_offload_modules,
+                    StagingConfig(
+                        buffer_bytes=offload_config.activation_offload_staging_buffer_mib * 1024**2,
+                        pageable_limit_bytes=int(offload_config.activation_offload_pageable_limit_gb * 1024**3),
+                        prefetch_depth=offload_config.activation_offload_prefetch_depth,
+                        pipeline_transfers=offload_config.activation_offload_pipeline_transfers,
+                    ),
+                )
+                return
             from ..distributed.async_offload import apply_async_activation_offload
 
             apply_async_activation_offload(

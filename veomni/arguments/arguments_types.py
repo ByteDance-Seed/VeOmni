@@ -749,8 +749,41 @@ class OffloadConfig:
             )
         },
     )
+    activation_offload_backend: str = field(
+        default="direct",
+        metadata={"help": "Async activation backend: direct pinned snapshots or bounded pinned staging."},
+    )
+    activation_offload_staging_buffer_mib: int = field(
+        default=192,
+        metadata={"help": "Size in MiB of each of the four fixed pinned buffers in the bounded backend."},
+    )
+    activation_offload_pageable_limit_gb: float = field(
+        default=8.0,
+        metadata={"help": "Maximum live pageable activation snapshot bytes per manager, in GiB."},
+    )
+    activation_offload_prefetch_depth: int = field(
+        default=1,
+        metadata={"help": "Reverse checkpoint prefetch depth: 0 or 1. Demand always has a reserved credit."},
+    )
+    activation_offload_pipeline_transfers: bool = field(
+        default=False,
+        metadata={"help": "Pipeline bounded transfer submission and completion with the same fixed buffers."},
+    )
 
     def __post_init__(self):
+        if self.activation_offload_backend not in ("direct", "bounded"):
+            raise ValueError("activation_offload_backend must be direct or bounded")
+        if self.activation_offload_pipeline_transfers and self.activation_offload_backend != "bounded":
+            raise ValueError("Pipelined staging requires the bounded activation backend")
+        if self.activation_offload_backend == "bounded":
+            if not self.enable_async_activation or not self.activation_offload_modules:
+                raise ValueError("Bounded activation offload requires async mode and explicit target modules")
+            if self.activation_offload_staging_buffer_mib <= 0 or self.activation_offload_prefetch_depth not in (0, 1):
+                raise ValueError("Invalid bounded staging capacity or prefetch depth")
+            if not math.isfinite(self.activation_offload_pageable_limit_gb) or (
+                self.activation_offload_pageable_limit_gb * 1024 < self.activation_offload_staging_buffer_mib
+            ):
+                raise ValueError("The finite pageable budget must fit at least one staging buffer")
         if self.enable_activation and self.enable_async_activation:
             raise ValueError(
                 "enable_activation and enable_async_activation are mutually exclusive; "

@@ -643,5 +643,15 @@
       "-x",
       "tests/models/test_omni_fsdp.py"
     ]
+  },
+  {
+    "name": "gpu-bounded-activation-offload-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_bounded_activation_offload.py"
+    ]
   }
 ]

@@ -437,5 +437,15 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
+  },
+  {
+    "name": "npu-bounded-activation-offload-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_bounded_activation_offload.py"
+    ]
   }
 ]
