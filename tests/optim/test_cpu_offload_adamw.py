@@ -69,6 +69,7 @@ def test_resume_hooks_see_complete_state_and_preserve_their_changes(offload, mom
     param.grad = torch.arange(4).bfloat16()
     source.step()
     saved = copy.deepcopy(source.state_dict())
+    saved["state"]["global_metadata"] = {"version": 7}
     key = saved["param_groups"][0]["params"][0]
     target = torch.nn.Parameter(param.detach().clone())
     resumed = make(target)
@@ -85,6 +86,7 @@ def test_resume_hooks_see_complete_state_and_preserve_their_changes(offload, mom
 
     def after_load(optimizer):
         events.append("after")
+        assert optimizer.state["global_metadata"] == {"version": 7}
         state = optimizer.state[target]
         assert set(state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
         assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == moment_dtype
