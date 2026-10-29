@@ -2,24 +2,34 @@
 
 Supported in this correctness stage:
 
-- GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism and
-  `cp_size=1` for short-sequence validation.
+- GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism, plus
+  GPU context parallelism (`cp_size > 1`).
 - GatedDeltaNet sequence-to-head all-to-all using the existing Qwen3.5
-  causal-conv and gated-delta kernels.
+  causal-conv and gated-delta kernels over the active SP/CP group.
 - VisionModel follows Qwen3.5's SP path: each rank runs patch embedding and
-  merger on its local visual-token shard, vision attention performs Ulysses
-  sequence/head exchange, and only the merged features are gathered for the
-  global placeholder scatter.
-- Global QSA selection plus main-attention Q/K/V Ulysses exchange. The
-  `qsa_attention_implementation=eager` path uses local block pooling, compact
-  global token indices, and a Transformers-compatible dense PyTorch attention
-  reference after the Ulysses exchange. `qsa_attention_implementation=tilelang`
-  instead runs the gather-based TileLang sparse-attention kernel
-  (`veomni/ops/kernels/qwen4_exp/`, bf16, NVIDIA CUDA) on the same post-exchange
-  layout, so the kernel itself carries no sequence-parallel logic.
-  Explicit cu-seqlens isolate packed samples consistently for SP=1 and SP>1.
+  merger on its local visual-token shard, vision attention scopes `use_parallel_state`
+  to a temporary Ulysses SP state so standard attention performs sequence/head
+  exchange over the active SP/CP group, and only the merged features are
+  gathered for the global placeholder scatter.
+- CP-style QSA selection plus main-attention KV all-gather. The indexer uses
+  local block pooling, compressed-row all-gather, and local queries to return
+  local `[B, S_local, K]` compact global token indices; `Qwen4ExpTextAttention`
+  keeps `query_states` local (`[B, H_q, S_local, D]`) with all query heads intact
+  and all-gathers only `key_states` and `value_states` (`[B, H_kv, S_global, D]`).
+  `qsa_attention_implementation=eager` expands compact indices to a local-query
+  `[B, 1, S_local, S_global]` mask, while `qsa_attention_implementation=tilelang`
+  runs the gather-based TileLang sparse-attention kernel
+  (`veomni/ops/kernels/qsa_attention/`, bf16, NVIDIA CUDA) directly on the local
+  query shard and all-gathered KV with full GQA head grouping preserved.
+  Explicit cu-seqlens isolate packed samples consistently for SP/CP=1 and SP/CP>1.
 - PLE n-gram token halos and differentiable dilated-convolution halos across
-  Ulysses shard boundaries.
+  Ulysses or context-parallel shard boundaries, while persistent PLE table
+  routing remains on the independent `ple_fsdp × ple` mesh. Packed metadata is
+  computed once per model forward; n-gram histories reset at local sample
+  offsets, and convolution correction is bounded to the first
+  `(kernel_size - 1) * dilation` outputs of each sample in fixed-size chunks.
+  Interior tokens retain the original convolution and SP halo, with no added
+  collective or checkpoint parameter.
 - VeOmni fused cross-entropy and fused MoE dispatch, with sequence-local router
   logits and padding masks for auxiliary load-balancing loss.
 - Concurrent PLE and MoE expert parallelism: PLE tables use the persistent
@@ -50,19 +60,22 @@ parallel path are documented in
 
 Known limitations:
 
-- Context parallelism, cache prefill/decode, HSDP replicas of persistent PLE,
-  and hybrid CP × Ulysses remain unsupported.
+- Cache prefill/decode, HSDP replicas of persistent PLE, NPU context
+  parallelism, and hybrid CP × Ulysses remain unsupported.
 - The default `eager` QSA backend expands compact indices to a dense mask and
-  materializes the quadratic attention-score tensor, matching the native
-  Transformers reference shape. Use `qsa_attention_implementation=tilelang`
-  (NVIDIA CUDA, bf16) for the 16K performance gate; the TileLang backend covers
-  training forward/backward only and raises on KV-cache or additive-mask
-  layouts. Nonzero attention dropout falls back to eager QSA and therefore
-  loses the sparse kernel's memory advantage.
-- Ulysses GatedDeltaNet requires non-eager, varlen-capable causal-conv and
-  chunk gated-delta-rule kernels. Head counts must be divisible by the
-  Ulysses size; QSA KV heads may instead divide the Ulysses size (MQA/GQA
-  replication case).
+  materializes the `[B, H_q, S_local, S_global]` attention-score tensor. Use
+  `qsa_attention_implementation=tilelang` (NVIDIA CUDA, bf16) for the 16K
+  performance gate; the TileLang backend covers training forward/backward only
+  and raises on KV-cache or additive-mask layouts. Nonzero attention dropout
+  falls back to eager QSA and therefore loses the sparse kernel's memory
+  advantage.
+- Ulysses/CP GatedDeltaNet requires non-eager, varlen-capable causal-conv and
+  chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
+  the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
+  constraint because it keeps all query heads local and all-gathers only KV.
+  When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
+  preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
+  FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.
@@ -72,6 +85,21 @@ Known limitations:
 - The real checkpoint schema and shard reads plus two-process lookup/backward
   semantics are validated without materializing the 95 GiB table. A real
   multi-node load-and-train smoke run remains the final deployment gate.
+
+## Compact QSA indexing on Ascend
+
+The indexer uses INT8 for NPU visibility gathers (the resulting mask is still
+boolean) and bounded INT32 position arithmetic. Top-k scores and floating
+attention arithmetic are unchanged. Positions including compression padding
+must fit INT32, matching the output-index contract.
+
+A two-entry host-only LRU caches immutable block metadata keyed by the complete
+packed boundaries, compression ratio, local shard length and SP rank/group size.
+Blocks are bucketed by owner in one pass, and counts stay on the host. One model
+forward prepares the device metadata before the decoder loop and reuses it across
+QSA layers and checkpoint recomputation. Only rank-local query segment maps are
+materialized. Device tensors are not cached across forwards; direct indexer
+calls prepare their own metadata through the same validated path.
 
 ## Two-device pipeline regression
 

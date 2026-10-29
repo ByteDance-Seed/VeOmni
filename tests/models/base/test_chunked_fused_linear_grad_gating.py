@@ -19,6 +19,10 @@ import torch
 
 import veomni.models.loss_utils.chunk_logprobs as cl
 import veomni.models.loss_utils.chunk_topk_distill as ctkd
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _FakePS:
@@ -27,12 +31,13 @@ class _FakePS:
 
 @pytest.fixture(autouse=True)
 def _use_cpu_compatible_path(monkeypatch):
-    monkeypatch.setattr(cl, "_FA_CE_AVAILABLE", False)
+    """Stub parallel state so chunked fused-linear functions run without distributed init."""
     monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS())
     monkeypatch.setattr(ctkd, "get_parallel_state", lambda: _FakePS())
 
 
 def _make_non_contiguous_hidden(batch_size: int, seq_len: int, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create a non-contiguous hidden tensor whose ``reshape`` forces a copy."""
     leaf = torch.randn(batch_size, seq_len, hidden_size, requires_grad=True)
     hidden = (leaf * 1.0).permute(1, 0, 2).contiguous().permute(1, 0, 2)
     assert not hidden.is_contiguous()
@@ -42,6 +47,7 @@ def _make_non_contiguous_hidden(batch_size: int, seq_len: int, hidden_size: int)
 
 @pytest.mark.parametrize("weight_requires_grad", [True, False], ids=["trainable_weight", "frozen_weight"])
 def test_chunk_logprobs_non_contiguous_hidden_preserves_trunk_gradient(weight_requires_grad):
+    """Verify non-contiguous hidden_states preserve trunk gradients in chunk_logprobs_function."""
     torch.manual_seed(0)
     batch_size, seq_len, hidden_size, vocab_size = 2, 8, 4, 16
     hidden_leaf, hidden = _make_non_contiguous_hidden(batch_size, seq_len, hidden_size)
@@ -65,6 +71,7 @@ def test_chunk_logprobs_non_contiguous_hidden_preserves_trunk_gradient(weight_re
 
 @pytest.mark.parametrize("weight_requires_grad", [True, False], ids=["trainable_weight", "frozen_weight"])
 def test_chunk_topk_distill_non_contiguous_hidden_preserves_trunk_gradient(weight_requires_grad):
+    """Verify non-contiguous hidden_states preserve trunk gradients in chunk_topk_distill_function."""
     torch.manual_seed(0)
     batch_size, seq_len, hidden_size, vocab_size, topk = 2, 8, 4, 16, 3
     hidden_leaf, hidden = _make_non_contiguous_hidden(batch_size, seq_len, hidden_size)

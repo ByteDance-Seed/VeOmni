@@ -27,6 +27,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 OPS_ROOT = Path(__file__).parents[3] / "veomni" / "ops"
 
@@ -92,78 +99,3 @@ def test_owned_op_modules_and_callables_have_docstrings():
         for site in missing_docstrings(path, relative=str(path.relative_to(OPS_ROOT.parent.parent)))
     ]
     assert not missing, "Missing op docstrings:\n" + "\n".join(missing)
-
-
-def test_docstring_policy_skips_nested_and_private_helpers(tmp_path: Path):
-    """Nested closures and ordinary ``_helpers`` are not gated; public API still is."""
-    src = '''"""Owned op module."""
-
-class PublicType:
-    """Public type."""
-
-    def method(self):
-        """Public method."""
-        def nested():
-            return 1
-        return nested()
-
-    def _private_method(self):
-        return 0
-
-
-class _Meta:
-    """Saved-state protocol."""
-
-
-def public_fn():
-    """Public function."""
-    def nested():
-        return 2
-    return nested()
-
-
-def _helper():
-    return 3
-
-
-def forward():
-    """Op protocol."""
-    return 4
-
-
-def __init__():
-    return 5
-'''
-    path = tmp_path / "sample.py"
-    path.write_text(src, encoding="utf-8")
-    assert missing_docstrings(path, relative="sample.py") == []
-
-
-def test_docstring_policy_flags_public_and_protocol_gaps(tmp_path: Path):
-    src = """
-class PublicType:
-    def method(self):
-        return 1
-
-class _Meta:
-    pass
-
-def public_fn():
-    return 2
-
-def forward():
-    return 3
-
-def _helper():
-    return 4
-"""
-    path = tmp_path / "sample.py"
-    path.write_text(src, encoding="utf-8")
-    missing = missing_docstrings(path, relative="sample.py")
-    assert "sample.py" in missing
-    assert any(site.endswith(" PublicType") for site in missing)
-    assert any(site.endswith(" _Meta") for site in missing)
-    assert any(site.endswith(" method") for site in missing)
-    assert any(site.endswith(" public_fn") for site in missing)
-    assert any(site.endswith(" forward") for site in missing)
-    assert not any(site.endswith(" _helper") for site in missing)

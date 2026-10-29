@@ -31,7 +31,11 @@ def preprocess(
     ep_size = ep_group.size()
     num_local_experts = num_experts // ep_size
     rank = dist.get_rank(ep_group)
-    num_local_tokens_per_expert = expert_mask.sum(dim=(1, 2))
+    # ``token_pre_all2all`` folds top-k slots with ``expert_mask.sum(dim=1)`` and
+    # ``permute`` dispatches one row per non-zero ``(expert, token)`` entry while
+    # ``unpermute`` sums repeated slot weights via ``weights_idx``. Count unique
+    # tokens per expert so duplicate top-k/hash slots do not overstate split sizes.
+    num_local_tokens_per_expert = expert_mask.any(dim=1).sum(dim=1)
 
     # [ep_size] represent the number of sum tokens in each rank
     input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
@@ -144,9 +148,11 @@ def dispatch_to_ep_class(
         num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
         ep_group=ep_state.ep_group,
     )
+    del expert_mask
     cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
     final_permute_tokens = ep_class.apply(permute_tokens, cumsum, *ep_class_args)
+    del permute_tokens
 
     return tokens_post_all2all(
         expert_outputs=final_permute_tokens,

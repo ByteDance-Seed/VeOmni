@@ -318,34 +318,39 @@ def test_causal_conv1d_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
-def test_causal_conv1d_npu_matches_eager_forward_and_backward():
+@pytest.mark.parametrize("dim", (256, 640))
+@pytest.mark.parametrize("packed", (False, True))
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     _require_npu_gdr_dependencies()
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
-
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
-    # Forward tiles the channel axis at 256 when there is no initial state.
-    batch, seq, dim, kernel = 2, 64, 256, 4
+    # 640 channels reproduces Qwen4-Exp's real U8CP2 GDN head shard.
+    batch, seq, kernel = (1, 128, 4) if packed else (2, 64, 4)
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
 
-    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
+    # Independent segments must accumulate their shared-parameter gradients in
+    # high precision. Separate BF16 conv calls round each partial before adding,
+    # which can lose small cancellation residuals and falsely reject a more
+    # accurate fused FP32 reduction (notably for the packed 640-channel shard).
+    x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    out_e = eager(x_e, w_e, b_e, activation="silu")
-    out_o = other(x_o, w_o, b_o, activation="silu")
-    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
+    if packed:
+        out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split((61, 67), dim=1)], dim=1)
+    else:
+        out_e = eager(x_e, w_e, b_e, activation="silu")
+    out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
+    torch.testing.assert_close(out_o.float().cpu(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
-    grad_output = torch.randn_like(out_e)
-    out_e.backward(grad_output)
+    grad_output = torch.randn_like(out_o)
+    out_e.backward(grad_output.cpu().double())
     out_o.backward(grad_output)
     for actual, expected in zip((x_o, w_o, b_o), (x_e, w_e, b_e), strict=True):
         torch.testing.assert_close(
-            actual.grad.float(),
+            actual.grad.float().cpu(),
             expected.grad.float(),
             atol=GDN_FUSED_GRAD_ATOL,
             rtol=GDN_FUSED_GRAD_RTOL,
@@ -356,11 +361,6 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
 def test_causal_conv1d_npu_accepts_cpu_cu_seqlens():
     """NPU fusion attention leaves ``cu_seqlens`` on CPU; the Triton adapter moves it."""
     _require_npu_gdr_dependencies()
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
-
     fn = resolve_op("causal_conv1d", "standard", "triton").wrapper
     batch, seq, dim, kernel = 1, 64, 256, 4
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
@@ -386,10 +386,6 @@ def test_causal_conv1d_npu_short_segment_packed_matches_unpacked():
         causal_conv1d_bwd_impl,
         causal_conv1d_fwd_impl,
     )
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
 
     def run(x, weight, initial_state, cu_seqlens=None):
         y, _ = causal_conv1d_fwd_impl(
@@ -718,15 +714,18 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
 @pytest.mark.parametrize(
-    ("impl", "seq", "dim", "repeats"),
+    ("impl", "seq", "dim", "repeats", "packed"),
     (
-        pytest.param("triton", 64, 64, 1, id="triton-small-head"),
-        pytest.param("triton", 77, 128, 3, id="triton-repeated-partial-chunk"),
-        pytest.param("fla_npu", 64, 128, 1, id="fla-npu-supported-head"),
+        pytest.param("triton", 64, 64, 1, False, id="triton-small-head"),
+        pytest.param("triton", 77, 128, 3, False, id="triton-repeated-partial-chunk"),
+        pytest.param("triton", 128, 64, 1, True, id="triton-packed-small-head"),
+        pytest.param("triton", 128, 128, 1, True, id="triton-packed"),
+        pytest.param("fla_npu", 64, 128, 1, False, id="fla-npu-supported-head"),
+        pytest.param("fla_npu", 128, 128, 1, True, id="fla-npu-packed"),
     ),
 )
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats):
-    """Cover small heads, repeated partial-chunk backwards, and the AscendC contract."""
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats, packed):
+    """Cover small heads, packed inputs, repeated backwards, and the AscendC contract."""
     _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
@@ -737,13 +736,19 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
-
+    lengths = (61, 67) if packed else (seq,)
+    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
     grad_output = torch.randn_like(v)
+
     for _ in range(repeats):
         q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
         q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-        out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-        out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+        # Independent eager calls reset recurrent state at packed boundaries.
+        segments = [tensor.split(lengths, dim=1) for tensor in (q_e, k_e, v_e, g_e, b_e)]
+        out_e = torch.cat(
+            [eager(*inputs, use_qk_l2norm_in_kernel=True)[0] for inputs in zip(*segments, strict=True)], dim=1
+        )
+        out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
         assert torch.isfinite(out_o).all()
         torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
@@ -792,35 +797,90 @@ def test_chunk_gated_delta_rule_npu_accepts_cpu_cu_seqlens():
     not is_nvidia_cuda_available(min_cc=90, max_cc=100),
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
-def test_chunk_gated_delta_rule_flash_qla_matches_eager():
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+def test_chunk_gated_delta_rule_flash_qla_matches_eager(group_size: int):
     pytest.importorskip("flash_qla")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", "flash_qla").wrapper
-    torch.manual_seed(2)
-    batch, seq, heads, dim = 1, 32, 2, 128
-    q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
-    beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(0)
+    cu_seqlens = torch.tensor([0, 19, 64], device="cuda", dtype=torch.int32)
+    num_k_heads = 2
+    num_v_heads = num_k_heads * group_size
+    head_dim = 128
+    q_base = torch.randn(1, 64, num_k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_base = torch.randn(1, 64, num_k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v_base = torch.randn(1, 64, num_v_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    g_base = -torch.rand(1, 64, num_v_heads, device="cuda", dtype=torch.float32)
+    beta_base = torch.sigmoid(torch.randn(1, 64, num_v_heads, device="cuda", dtype=torch.bfloat16))
+    h0_base = torch.randn(2, num_v_heads, head_dim, head_dim, device="cuda", dtype=torch.float32) * 0.1
+    grad_out = torch.randn(1, 64, num_v_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    grad_state = torch.randn(2, num_v_heads, head_dim, head_dim, device="cuda", dtype=torch.float32)
 
-    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    # FlashQLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
-    assert torch.allclose(out_e, out_o, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    def run_eager_reference():
+        q, k, v, g, beta, h0 = make_grad_leaves(q_base, k_base, v_base, g_base, beta_base, h0_base)
+        q_in = q.repeat_interleave(group_size, dim=2) if group_size > 1 else q
+        k_in = k.repeat_interleave(group_size, dim=2) if group_size > 1 else k
+        bounds = cu_seqlens.tolist()
+        seg_outs = []
+        seg_states = []
+        for seg_idx, (start, end) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            seg_out, seg_state = eager(
+                q_in[:, start:end],
+                k_in[:, start:end],
+                v[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                h0[seg_idx : seg_idx + 1],
+                None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            seg_outs.append(seg_out)
+            seg_states.append(seg_state)
+        out = torch.cat(seg_outs, dim=1)
+        final_state = torch.cat(seg_states, dim=0)
+        loss = (out * grad_out).sum() + (final_state.float() * grad_state).sum()
+        loss.backward()
+        return out, final_state, (q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad)
 
-    go = torch.randn_like(out_e)
-    out_e.backward(go)
-    out_o.backward(go)
-    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+    def run_case(wrapper, *, expand_qk: bool):
+        q, k, v, g, beta, h0 = make_grad_leaves(q_base, k_base, v_base, g_base, beta_base, h0_base)
+        q_in = q.repeat_interleave(group_size, dim=2) if expand_qk and group_size > 1 else q
+        k_in = k.repeat_interleave(group_size, dim=2) if expand_qk and group_size > 1 else k
+        out, final_state = wrapper(
+            q_in,
+            k_in,
+            v,
+            g,
+            beta,
+            h0,
+            cu_seqlens,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        loss = (out * grad_out).sum() + (final_state.float() * grad_state).sum()
+        loss.backward()
+        return out, final_state, (q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad)
+
+    ref_out, ref_state, ref_grads = run_eager_reference()
+    grouped_out, grouped_state, grouped_grads = run_case(other, expand_qk=False)
+
+    torch.testing.assert_close(grouped_out, ref_out, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    torch.testing.assert_close(grouped_state.float(), ref_state.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    for actual_grad, expected_grad in zip(grouped_grads, ref_grads, strict=True):
         torch.testing.assert_close(
-            actual.grad,
-            expected.grad,
+            actual_grad.float(),
+            expected_grad.float(),
             atol=GDN_CHUNK_GRAD_ATOL,
             rtol=GDN_CHUNK_GRAD_RTOL,
         )
+
+    if group_size > 1:
+        expanded_out, expanded_state, expanded_grads = run_case(other, expand_qk=True)
+        torch.testing.assert_close(grouped_out, expanded_out, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(grouped_state, expanded_state, atol=1e-3, rtol=1e-3)
+        for actual_grad, expected_grad in zip(grouped_grads, expanded_grads, strict=True):
+            torch.testing.assert_close(actual_grad.float(), expected_grad.float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(

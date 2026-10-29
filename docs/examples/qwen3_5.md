@@ -110,6 +110,23 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
+### FlashQLA GatedDeltaNet backend on Hopper/Blackwell GPUs
+
+On SM90-SM100 NVIDIA GPUs where `flash_qla` is installed, you can select the FlashQLA
+`chunk_gated_delta_rule` backend:
+
+```yaml
+model:
+  ops_implementation:
+    chunk_gated_delta_rule_implementation: flash_qla
+```
+
+When `chunk_gated_delta_rule_implementation: flash_qla` is active (and not in recurrent cache
+decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
+(`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
+copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`, `fla_npu`) and recurrent
+decode paths keep the expanded Q/K layout.
+
 ## Start training on NPU
 
 Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three
@@ -142,9 +159,9 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35:** the vendored `causal_conv1d` runs on arch35 NPUs (`Ascend910_95` /
-> `Ascend950`); the old `is_arch35()` guard that raised `NotImplementedError` is gone.
-> Validated on `Ascend910B2C` and A5 (`Ascend950DT`).
+> **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
+> `Ascend910_95` / `Ascend950` has been removed. Forward and backward parity on
+> arch35 should be verified on the target hardware and software stack.
 
 ### `fla_npu` — AscendC fused backend (`chunk_gated_delta_rule` only)
 
@@ -167,8 +184,16 @@ model:
 `fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the A2
 (`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
-chunk_size=64 contract both paths share. arch35 (`Ascend910_95` / `Ascend950`) runs end-to-end:
-the vendored `causal_conv1d` no longer refuses it (see above).
+chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
+arch35 (`Ascend910_95` / `Ascend950`); end-to-end arch35 validation remains necessary (see above).
+
+These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
+configured output-gate activation: selecting AscendC does not change sigmoid
+to SiLU. The NPU parity test covers ordinary sequences and packed samples with
+boundaries that are not multiples of the recurrent chunk size. The vendored
+convolution also selects a smaller channel tile for head shards such as
+Qwen4-Exp U8CP2's 640 channels, preserving the existing 32-channel alignment
+and UB budget.
 
 The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags)
 bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
@@ -224,6 +249,12 @@ If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation:
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle
 (pointing back to the install step or to `triton` / `eager`).
 
+The native convolution qualification uses independent FP64 segment references
+computed from the exact BF16-rounded inputs and upstream gradient. Using separate
+BF16 reference convolutions rounds each segment's shared-weight gradient before
+addition; cancellation can make that reference less accurate than the fused
+FP32 reduction. The output and gradient tolerances are unchanged.
+
 ### Qwen3.5-9B VL Training
 
 There is no dedicated dense NPU config; reuse the GPU one and set the GatedDeltaNet kernels on the
@@ -244,7 +275,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --train.max_steps 20
 ```
 
-Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not installed.
+Set `chunk_gated_delta_rule_implementation` to `triton` if `fla_npu` is not installed.
 
 ### Qwen3.5 MoE 35B VL Training
 
@@ -279,6 +310,39 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_m
 `muon_expert_zero_comm: true` selects whole-expert `Shard(0)` when the
 EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
 a warning and falls back to the communication path.
+
+## Shared-prefix training
+
+In GRPO-style RL each prompt is sampled `n` times and the `n` rollouts are trained as `n` packed
+`prompt + response` sequences, so the prompt is computed `n` times. With shared-prefix training the
+text backbone computes each prompt once per micro-batch: GatedDeltaNet layers fork the recurrent
+state at the end of the prompt, softmax-attention layers reuse the prompt's keys and values, and the
+LM head scores each shared position once. Outputs and gradients match packed training to within the
+difference that re-batching the same sequences produces by itself.
+
+The work drops from `n * (P + R)` tokens to `P + n * R`, and on Qwen3.5-4B about 84% of that ratio is
+realised. Long prompts gain most; under roughly 1k prompt tokens there is little to save.
+
+It is a field on the **model config**, off by default, and it needs a non-eager linear-attention
+backend: `triton` on Ascend, `fla` on GPU.
+
+```json
+{ "text_config": { "shared_prefix_training": true } }
+```
+
+Set it in the `config.json` of the model directory the trainer loads. Nothing else changes: detection
+is internal to the patched modeling, so a trainer driving VeOmni needs no flag of its own and no
+adapter code. When nothing in a micro-batch shares a prefix, or the batch carries image or video
+inputs, the ordinary packed path runs unchanged.
+
+What the caller has to get right is that a micro-batch holds **whole rollout groups**, i.e. a
+multiple of `n` sequences, with no reordering between packing and the forward. A group split across
+micro-batches is still correct, only slower, since just the rollouts that land together share work.
+With `verl` (`model_engine=veomni`) that means the legacy trainer with group-aware batch balancing,
+`use_dynamic_bsz` off, and `ppo_micro_batch_size_per_gpu` a multiple of `rollout.n`; the config field
+travels through `actor_rollout_ref.model.hf_config_path`, which is why no verl-side change is needed.
+
+Current limits: text-only prompts; dense Qwen3.5; no Ulysses SP, MTP or KV cache (each raises).
 
 ## Ulysses Sequence Parallelism
 

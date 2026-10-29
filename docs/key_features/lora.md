@@ -393,14 +393,18 @@ Each MoE-LoRA wrapper follows the `moe_implementation` its wrapped experts modul
 | `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
 | `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
 | `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
+| `deepgemm_fp8` | not supported (raises) | not supported (raises) | No FP8 MoE-LoRA implementation; rejected at wrap time. |
 
 The fused GPU path lives in `veomni/ops/kernels/moe_experts_lora/` and reuses the same
 `group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
 inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
 `VeomniOp("moe_experts_lora", variant, impl)` from the wrapped experts'
-`veomni_moe.impl`. Any other impl (for example `fused_quack`, or `fused_triton`
-on MLU) has no available LoRA row and uses `eager`. MoE-LoRA requires SiLU
-experts and rejects other activations at wrap time.
+`veomni_moe.impl`. If no LoRA row is available (for example `fused_quack`, or
+`fused_triton` on MLU), the wrapper uses `eager`. The exception is
+`deepgemm_fp8`: both shared and independent wrappers reject it before moving
+the base parameters, to avoid silently changing precision. This restriction
+only applies to LoRA targeting expert weights; dense-module LoRA is unaffected.
+MoE-LoRA requires SiLU experts and rejects other activations at wrap time.
 
 ### 5.4 Expert Parallelism (EP)
 
@@ -630,6 +634,8 @@ sets `ep_size: 8` and additionally LoRA-wraps DeepSeek's MLA projections
 
 For a Qwen3.5-MoE LoRA configuration, see
 [`configs/text/qwen3_5_moe_lora.yaml`](../../configs/text/qwen3_5_moe_lora.yaml).
+For the Qwen3.5-MoE-35B Ascend NPU and H200 commands, backend matrix, validation
+method, and measured results, see [Qwen3.5](../examples/qwen3_5.md).
 
 ---
 

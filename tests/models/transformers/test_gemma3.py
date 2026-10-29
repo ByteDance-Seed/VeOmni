@@ -149,7 +149,7 @@ def test_gemma3_packed_dense_matches_independent_samples(impl):
     torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch):
+def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch, available_nvidia_ops):
     captured = []
 
     def fake_flex(module, query, key, value, attention_mask, *, sliding_window=None, **kwargs):
@@ -279,7 +279,7 @@ def test_gemma3_packed_flex_matches_independent_samples_on_cuda():
         assert gradient.abs().max() > 0
 
 
-def test_gemma3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch):
+def test_gemma3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch, available_nvidia_ops):
     from veomni.ops.kernels.attention import ulysses
 
     captured = []

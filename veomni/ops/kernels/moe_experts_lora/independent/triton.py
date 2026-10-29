@@ -219,11 +219,11 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
 
-        fc1_weighted_output = fc1_activation * scattered_gate_weight  # [T, I]
-
-        # Base fc2 (group-gemm): [T, H]
+        # Base fc2 (group-gemm): [T, H]. Keep fc2 and down-LoRA unweighted so
+        # non-EP matches EP's post-fc2 routing-weight order and zero-init
+        # ``lora_b_down`` preserves the base fused MoE output exactly.
         fc2_output = group_gemm_same_nk(
-            a=fc1_weighted_output,
+            a=fc1_activation,
             b=fc2_weight,
             cumsum_M=cumsum_t,
             max_M=max_t,
@@ -233,7 +233,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
 
         # LoRA fc2 delta on down (per-expert).
         tmp_down = group_gemm_same_nk(
-            a=fc1_weighted_output,
+            a=fc1_activation,
             b=lora_a_down,  # [E, r, I] → N=r, K=I
             cumsum_M=cumsum_t,
             max_M=max_t,
@@ -248,8 +248,9 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         )  # [T, H]
         lora_delta_down = lora_delta_down * lora_scale_down
         fc2_output = fc2_output + lora_delta_down
+        weighted_fc2_output = fc2_output * scattered_gate_weight
 
-        expert_output = moe_gather(fc2_output, scatter_index)
+        expert_output = moe_gather(weighted_fc2_output, scatter_index)
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -268,7 +269,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             lora_a_gate,
             lora_b_gate,
             lora_a_up,
@@ -297,7 +298,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             lora_a_gate,
             lora_b_gate,
             lora_a_up,
@@ -315,14 +316,18 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
-        # MoE step 10: undo gather → grad on per-(token,slot) fc2 output.
-        grad_fc2_output = moe_scatter(grad_output, scatter_index)  # [T, H]
-        max_t = grad_fc2_output.shape[0]
+        # MoE step 10: undo gather → grad on per-(token,slot) weighted fc2 output.
+        grad_unweighted_output = moe_scatter(grad_output, scatter_index)  # [T, H]
+        max_t = grad_unweighted_output.shape[0]
+        grad_fc2_output = grad_unweighted_output * scattered_gate_weight
+        grad_scattered_gate_weight = torch.sum(fc2_output * grad_unweighted_output, dim=-1)
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
+        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
         # ---- LoRA fc2 backward (per-expert closed form). ----------------
-        grad_lora_a_down, grad_lora_b_down, grad_fc1_weighted_output_lora = _per_expert_lora_half_backward(
+        grad_lora_a_down, grad_lora_b_down, grad_fc1_activation_lora = _per_expert_lora_half_backward(
             grad_delta=grad_fc2_output,
-            inp=fc1_weighted_output,
+            inp=fc1_activation,
             tmp=tmp_down,
             lora_a=lora_a_down,
             lora_b=lora_b_down,
@@ -331,15 +336,15 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             scale=scale_down,
         )
 
-        # MoE step 9 (base) — dgrad of fc2 wrt fc1_weighted_output.
-        grad_fc1_weighted_output = group_gemm_same_nk(
+        # MoE step 9 (base) — dgrad of fc2 wrt fc1_activation.
+        grad_fc1_activation = group_gemm_same_nk(
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=False,
         )  # [T, I]
-        grad_fc1_weighted_output = grad_fc1_weighted_output + grad_fc1_weighted_output_lora
+        grad_fc1_activation = grad_fc1_activation + grad_fc1_activation_lora
 
         # MoE step 9 (base) — wgrad of fc2.
         grad_fc2_weight = None
@@ -347,19 +352,13 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             grad_fc2_weight = torch.empty_like(fc2_weight)
             group_gemm_same_mn(
                 a=grad_fc2_output,
-                b=fc1_weighted_output,
+                b=fc1_activation,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
                 max_K=max_t,
                 transpose_a=True,
                 transpose_b=False,
             )
-
-        # MoE step 8: split routing-weight scale through fc1_weighted_output = fc1_activation * sgw.
-        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
-        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
-        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
-        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
         # MoE step 7: chain through silu(gate) * up.
         # Recompute silu output to save memory (matches existing function).
@@ -769,6 +768,7 @@ def group_gemm_fused_independent_lora_moe_forward(
           with :class:`EPMergedFc1IndependentLoRAGroupGemm` (mirrors the
           non-LoRA EP fused path).
     """
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import dispatch_to_ep_class
 
