@@ -480,6 +480,8 @@ def save_lora_adapter_with_dcp(
                     lora_state[name],
                     spec.para_fsdp_mesh,
                     spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                    ep_shard_dim=spec.placement.dim,
+                    fsdp_shard_dim=spec.fsdp_shard_dim,
                     global_shape=spec.global_shape,
                 )
 
