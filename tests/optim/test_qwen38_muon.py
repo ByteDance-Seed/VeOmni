@@ -462,7 +462,9 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
             dcp.save(
                 {
                     "model": ModelState(model, parallel_state=ps),
-                    "optimizer": OptimizerState(model, optimizer, parallel_state=ps),
+                    "optimizer": OptimizerState(
+                        model, optimizer, parallel_state=ps, coordinated_group_validation=True
+                    ),
                 },
                 checkpoint_id=path,
             )

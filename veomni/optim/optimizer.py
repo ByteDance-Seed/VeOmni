@@ -260,12 +260,46 @@ class AnyPrecisionAdamW(Optimizer):
 
 
 def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
-    """Let optimizers prepare exact lazy-state buffers before PyTorch's getter."""
+    """Keep exact-recipe lazy state untouched while saving its parameter groups."""
+    exact_lazy = getattr(optimizer, "requires_exact_recipe", False) and getattr(
+        optimizer, "requires_exact_state_dtypes", False
+    )
+    if exact_lazy and any(not group["params"] for group in optimizer.param_groups):
+        raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
     prepare = getattr(optimizer, "checkpoint_state", None)
     with prepare(load=for_load) if prepare is not None else nullcontext():
-        return get_optimizer_state_dict(
-            model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
-        )
+        # PyTorch initializes a wholly empty optimizer by calling step(). A
+        # temporary empty entry makes its getter serialize parameter groups
+        # without performing that update or materializing optimizer state.
+        sentinel = None
+        placeholder = None
+        sentinel_hook = None
+        sentinel_hook_called = False
+        if not for_load and not optimizer.state and exact_lazy:
+            sentinel = next((p for group in optimizer.param_groups for p in group["params"]), None)
+            if sentinel is not None:
+                placeholder = {}
+                optimizer.state[sentinel] = placeholder
+
+                def remove_sentinel(optim):
+                    nonlocal sentinel_hook_called
+                    sentinel_hook_called = True
+                    if optim.state.get(sentinel) is placeholder and not placeholder:
+                        optim.state.pop(sentinel, None)
+
+                sentinel_hook = optimizer.register_state_dict_pre_hook(remove_sentinel, prepend=True)
+        try:
+            result = get_optimizer_state_dict(
+                model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+            )
+            if sentinel_hook is not None and not sentinel_hook_called:
+                raise RuntimeError("Optimizer state_dict did not run registered pre-hooks during checkpoint save")
+        finally:
+            if sentinel_hook is not None:
+                sentinel_hook.remove()
+            if sentinel is not None and optimizer.state.get(sentinel) is placeholder and not placeholder:
+                optimizer.state.pop(sentinel, None)
+        return result
 
 
 class MultiOptimizer(Optimizer, Stateful):
@@ -324,16 +358,20 @@ class MultiOptimizer(Optimizer, Stateful):
     ) -> Dict[str, Any]:
         """Return a flattened optimizer state dict without materializing state.
 
-        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
-        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
-        call ``_init_optim_state`` and synthesize default state for every
-        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
-        this rank), bloating the checkpoint.
+        Exact-recipe optimizers retain nonempty parameter groups even when
+        their state is lazy. The flattened representation cannot encode a
+        group with no parameters.
         """
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            if not opt.state and not getattr(opt, "checkpoint_save_requires_state", False):
+            if (
+                not opt.state
+                and not getattr(opt, "checkpoint_save_requires_state", False)
+                and not (
+                    getattr(opt, "requires_exact_recipe", False) and getattr(opt, "requires_exact_state_dtypes", False)
+                )
+            ):
                 continue
             sd = optimizer_state_dict_for_checkpoint(self.model, opt, flatten=True)
             overlap = set(merged.keys()) & set(sd.keys())
