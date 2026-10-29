@@ -19,6 +19,23 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 logger = helper.create_logger(__name__)
 
 
+def test_compute_gemma3_image_seqlens_from_pixel_values():
+    config = SimpleNamespace(model_type="gemma3", vision_config=SimpleNamespace(patch_size=14))
+    micro_batch = {"pixel_values": torch.empty(2, 3, 896, 896)}
+
+    assert helper._compute_image_seqlens(micro_batch, config) == [4096, 4096]
+
+
+def test_compute_image_seqlens_prefers_grid_metadata():
+    config = SimpleNamespace(model_type="gemma3", vision_config=SimpleNamespace(patch_size=14))
+    micro_batch = {
+        "image_grid_thw": torch.tensor([[1, 12, 10], [2, 8, 8]]),
+        "pixel_values": torch.empty(2, 3, 896, 896),
+    }
+
+    assert helper._compute_image_seqlens(micro_batch, config) == [120, 64, 64]
+
+
 def test_environ_meter_passes_supported_lora_config(monkeypatch):
     calls = []
 

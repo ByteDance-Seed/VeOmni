@@ -25,6 +25,8 @@ from veomni.utils.omni_helper import OmniEnvironMeter
 
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 class MeteredModule(MetricMeterMixin):
     """Minimal metered module: two tokens-worth of FLOPs per token."""

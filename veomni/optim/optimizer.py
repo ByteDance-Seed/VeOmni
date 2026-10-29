@@ -154,36 +154,6 @@ def filter_empty_param_groups(
     return non_empty
 
 
-def restore_optimizer_param_group_defaults(optimizer: Any) -> None:
-    """Re-apply optimizer defaults to param groups after DCP load.
-
-    Recurses into containers of optimizers so the safety net reaches every real
-    optimizer regardless of how it was passed:
-
-    * a plain ``dict`` of optimizers (the form PyTorch DCP APIs natively accept),
-    * a ``MultiOptimizer`` (ExtraParallel+FSDP2 / Muon), which has no top-level
-      ``defaults``/``param_groups`` and wraps sub-optimizers in ``optimizers_dict``.
-    """
-    if isinstance(optimizer, dict):
-        for sub_optimizer in optimizer.values():
-            restore_optimizer_param_group_defaults(sub_optimizer)
-        return
-
-    sub_optimizers = getattr(optimizer, "optimizers_dict", None)
-    if sub_optimizers is not None:
-        for sub_optimizer in sub_optimizers.values():
-            restore_optimizer_param_group_defaults(sub_optimizer)
-        return
-
-    defaults = getattr(optimizer, "defaults", None)
-    param_groups = getattr(optimizer, "param_groups", None)
-    if not defaults or not param_groups:
-        return
-    for group in param_groups:
-        for key, value in defaults.items():
-            group.setdefault(key, value)
-
-
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
     def __init__(

@@ -50,6 +50,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -129,6 +130,10 @@ config.add_import(
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
 )
 
 
@@ -910,6 +915,12 @@ def qwen3_vl_text_attention_forward_patched(
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     attention_interface = self.veomni_attn
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=attention_interface.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
 
     attn_output, attn_weights = attention_interface(
         self,
@@ -919,7 +930,7 @@ def qwen3_vl_text_attention_forward_patched(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        **kwargs,
+        **attn_kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

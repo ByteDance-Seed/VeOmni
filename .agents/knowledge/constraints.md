@@ -226,6 +226,7 @@ Core files:
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU and MLU compatibility.
+   - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 ## Trainer Extensions
 
@@ -252,9 +253,7 @@ Core files:
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
-    - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
-    - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
-    - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+    - `_Gather.backward` uses out-of-place NCCL reduce-scatter (`reduce_scatter_tensor` for equal shards, `reduce_scatter` for uneven shards) into a freshly allocated local `grad_input` buffer, and clones `grad_output` (`grad_output.clone(memory_format=torch.contiguous_format)`) before running an in-place `dist.all_reduce` on other backends (`_GatherConcatSP.backward` likewise clones before `dist.all_reduce`). Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients across layouts for `_Gather`.
 
 29. **Saved RoPE table metadata must stay stable across checkpoint recomputation**
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
