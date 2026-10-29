@@ -223,6 +223,16 @@ separately to handle an early end of a finite dataset. Duplicated padding
 microbatches are rejected rather than counted as extra preference pairs.
 Main-process dynamic batching rejects unexpected early exhaustion instead of
 silently restarting the dataset and repeating samples.
+With `train.dyn_bsz=True`, `data.train_size` is an estimated global token budget
+used to derive the configured epoch length, not a count of available batches. Do not
+overstate the tokens available after filtering and dataset sharding; also verify
+that each rank can actually produce the configured number of optimizer steps
+with the chosen batch, sequence length, warmup, and packing settings. A token
+count alone does not guarantee this. If the source and buffer are exhausted
+before that length, training raises an error rather than replaying data. With
+`drop_last=False`, a final step that would require synthetic padding is also
+rejected. Adjust the budget or batching configuration to fit the available data;
+`train.max_steps` can cap steps per epoch for debugging.
 The mapping distributed sampler may repeat individual samples to make shards
 even when dataset size is not divisible by the data-parallel size; the pair mean
 weights each presented pair, including those sampler repetitions. For strict
