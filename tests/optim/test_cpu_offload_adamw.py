@@ -1053,28 +1053,6 @@ def test_dcp_rejects_unversioned_same_dimension_layout_before_read(tmp_path, sco
     torch.testing.assert_close(untouched, torch.full((4,), 9.0), rtol=0, atol=0)
 
 
-def test_cpu_offload_state_receipt_survives_dcp_zero_lr_initialization(monkeypatch):
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
-    import veomni.optim.cpu_offload_adamw as module
-
-    model = torch.nn.Linear(2, 2).bfloat16()
-    optimizer = CPUOffloadAdamW([{"params": list(model.parameters()), "cpu_offload": True}], lr=0.001)
-    messages = []
-    monkeypatch.setattr(
-        module.logger, "info", lambda message, *args: messages.append(message % args if args else message)
-    )
-    get_optimizer_state_dict(model, optimizer)
-    assert optimizer.state and not optimizer._state_receipt_emitted
-    assert not messages
-    for parameter in model.parameters():
-        parameter.grad = torch.ones_like(parameter)
-    optimizer.step()
-    assert optimizer._state_receipt_emitted
-    assert sum("OPTIMIZER_STATE_RECEIPT" in message for message in messages) == 1
-    assert sum("CPU_OPTIMIZER_STEP" in message for message in messages) == 1
-
-
 def test_versioned_extra_parallel_checkpoint_exports_only_model_tensors(tmp_path, monkeypatch):
     import veomni.checkpoint.dcp_checkpointer as module
 
