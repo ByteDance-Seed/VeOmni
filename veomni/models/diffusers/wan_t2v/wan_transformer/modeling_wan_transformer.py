@@ -497,10 +497,12 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     _no_split_modules = ["WanTransformerBlock"]
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
         # Remove VeOmni-specific kwargs before passing to the diffusers init.
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _WanTransformer3DModel.__init__(self, **config.to_diffuser_dict())
         self.config: WanTransformer3DModelConfig = config

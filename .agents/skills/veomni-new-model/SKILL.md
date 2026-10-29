@@ -87,6 +87,9 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
    `as_veomni_config(config)` explicitly; native HF classes have no `ops_config`.
    Read `docs/design/module_config.md`. Never patch HF config base methods or
    maintain a separate attention field beside `ops_implementation`.
+   Handwritten Diffusers constructors that accept `attn_implementation` must
+   apply it to the config before HF initialization and kernel binding; preserve
+   existing choices when it is omitted or `None`.
 
 6. **Patch patterns** — follow existing models:
    - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.

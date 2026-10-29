@@ -116,12 +116,14 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
         ``base_ops_implementation`` is the composed model's default, passed in
         separately because an entry does not carry it. Per field, lowest to
         highest: what this file loaded, then ``base_ops_implementation``, then
-        the entry's ``ops_implementation``.
+        the entry's ``ops_implementation``. An explicit standalone
+        ``attn_implementation`` ranks above all of those layers.
         """
         model_config = kwargs.pop("model_config", None)
         processor_config = kwargs.pop("processor_config", None)
         entry_ops = kwargs.pop("ops_implementation", None)
         base_ops = kwargs.pop("base_ops_implementation", None)
+        attention = kwargs.pop("attn_implementation", None)
 
         with _defer_ops_validation():
             if cls is OmniModuleConfig:
@@ -143,13 +145,14 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
                 f"Module config loaded from {pretrained_model_name_or_path} is a "
                 f"{type(hf_config).__name__}, not a OmniModuleConfig."
             )
-        hf_config._apply_composed_overwrites(
-            model_config=model_config,
-            processor_config=processor_config,
-            ops_implementation=entry_ops,
-            base_ops_implementation=base_ops,
-            validate_ops=True,
-        )
+        with _defer_ops_validation():
+            hf_config._apply_composed_overwrites(
+                model_config=model_config,
+                processor_config=processor_config,
+                ops_implementation=entry_ops,
+                base_ops_implementation=base_ops,
+            )
+        hf_config._apply_ops_overrides(attn_implementation=attention)
         return hf_config
 
     def _apply_composed_overwrites(

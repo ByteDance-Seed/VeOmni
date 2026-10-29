@@ -38,6 +38,12 @@ FAKE_B = "fake_module_b"
 HIDDEN_SIZE = 8
 
 
+@pytest.fixture(autouse=True)
+def veomni_modeling_backend(monkeypatch):
+    """The fake-module registry and normalized attention assertions use VeOmni loading."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+
 def _chain_edges() -> list[dict]:
     return [{"from": FAKE_A, "to": FAKE_B}, {"from": FAKE_B, "to": "end"}]
 
@@ -995,3 +1001,43 @@ def test_omni_typed_ops_preserve_composed_merge_precedence(tmp_path, entry):
     assert loaded._module_configs[FAKE_B].ops_config.rms_norm_implementation == "eager"
     loaded.save_pretrained(tmp_path / "resaved")
     assert OmniConfig.from_pretrained(tmp_path / "resaved").ops_implementation == loaded.ops_implementation
+
+
+@pytest.mark.parametrize("entry", ["module_base", "direct", "builder"])
+@pytest.mark.parametrize("typed", [False, True], ids=["mapping", "typed"])
+@pytest.mark.parametrize(
+    ("entry_attention", "attention_kwargs", "expected_attention"),
+    [
+        pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="explicit-wins"),
+        pytest.param("eager", {}, "eager", id="preserve-omitted"),
+        pytest.param("eager", {"attn_implementation": None}, "eager", id="preserve-none"),
+    ],
+)
+def test_standalone_module_attention_applies_after_composed_ops(
+    tmp_path, entry, typed, entry_attention, attention_kwargs, expected_attention
+):
+    """Explicit standalone attention ranks above entry/root ops before final validation."""
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models import build_config
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+
+    FakeModuleAConfig(ops_implementation={"attn_implementation": "eager"}).save_pretrained(tmp_path)
+    selection = make_eager_ops_config()
+    selection.attn_implementation = entry_attention
+    loader = {
+        "module_base": OmniModuleConfig.from_pretrained,
+        "direct": FakeModuleAConfig.from_pretrained,
+        "builder": build_config,
+    }[entry]
+    loaded = loader(
+        tmp_path,
+        base_ops_implementation={"attn_implementation": "flash_attention_3", "rms_norm_implementation": "eager"},
+        ops_implementation=selection if typed else selection.to_dict(),
+        **attention_kwargs,
+    )
+    assert isinstance(loaded, FakeModuleAConfig)
+    assert loaded._attn_implementation == loaded.ops_config.attn_implementation == expected_attention
+    assert loaded.ops_config.rms_norm_implementation == "eager"
+    loaded.save_pretrained(tmp_path / "resaved")
+    saved = json.loads((tmp_path / "resaved" / "config.json").read_text())
+    assert saved["ops_implementation"]["attn_implementation"] == expected_attention

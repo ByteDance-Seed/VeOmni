@@ -479,10 +479,12 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     _supports_flash_attn = True
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         if hasattr(self, "_internal_dict"):
             del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _QwenImageTransformer2DModel.__init__(self, **config.to_diffuser_dict())
         self.config: QwenImageTransformer2DModelConfig = config

@@ -636,6 +636,57 @@ _MODEL_CASES = (
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize(
+    "model_case",
+    [
+        case
+        for case in _MODEL_CASES
+        if case.model_type in {"WanTransformer3DModel", "LTXVideoTransformerModel", "QwenImageTransformer2DModel"}
+    ],
+    ids=lambda case: case.model_type,
+)
+@pytest.mark.parametrize(
+    ("initial_attention", "constructor_kwargs", "expected_attention"),
+    [
+        pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-flash-sdpa"),
+        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-flash-eager"),
+        pytest.param("sdpa", {}, "sdpa", id="preserve-omitted"),
+        pytest.param("sdpa", {"attn_implementation": None}, "sdpa", id="preserve-none"),
+        pytest.param("sdpa", {"attn_implementation": "not_a_backend"}, None, id="reject-invalid"),
+    ],
+)
+def test_diffusers_constructor_attention_override_precedes_hf_init(
+    monkeypatch, model_case, initial_attention, constructor_kwargs, expected_attention
+):
+    """Constructor choices must reach HF checks and the same bound attention handle."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = model_case.config_factory(model_case.architectures[0])
+    config._set_ops_implementation(eager_ops_config())
+    # Simulate a saved flash selection without requiring its package on this CPU worker.
+    config._attn_implementation = initial_attention
+    previous_ops = dict(config.ops_implementation)
+    model_cls = get_model_class(config)
+    if expected_attention is None:
+        with pytest.raises(ValueError, match="not_a_backend"):
+            model_cls(config, **constructor_kwargs)
+        return
+
+    model = model_cls(config, **constructor_kwargs)
+    assert model.config is config
+    assert {key: value for key, value in config.ops_implementation.items() if key != "attn_implementation"} == {
+        key: value for key, value in previous_ops.items() if key != "attn_implementation"
+    }
+    if constructor_kwargs.get("attn_implementation") is None:
+        assert config.ops_implementation == previous_ops
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected_attention
+    assert "_attn_implementation_internal" not in vars(config)
+    attention_path = model_case.isolation_op_path or "blocks.0.attn1.processor.veomni_attn"
+    assert attrgetter(attention_path)(model).impl == (
+        "veomni_sdpa" if expected_attention == "eager" else expected_attention
+    )
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_get_model_class_unknown_type_raises():
     with pytest.raises(RuntimeError, match="unregistered_test_model.*not registered in veomni.models"):
         get_model_class(_UnregisteredConfig())

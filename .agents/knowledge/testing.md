@@ -92,6 +92,8 @@ CPU workers in NPU environments without `flash_attn`.
 The model-test autouse fixture rejects FlashAttention preloading for CPU launch
 plans and CPU-only hosts, even when the package is installed. It guards both
 HF's lazy entry and VeOmni's loader so process caches cannot hide a dependency.
+Local MLU hosts bypass this CI-specific fixture before plan resolution, since
+the CUDA/NPU scheduler does not support MLU; normal MLU model tests still run.
 Explicit availability-only mocks may replace the HF entry; real accelerator
 plans keep normal loading. Composite eager fixtures must set the root policy
 before constructing either reference or candidate, so otherwise unset
@@ -102,6 +104,11 @@ Standalone MLP/expert/attention fixtures and benchmarks must adapt native HF
 configs before passing them to patched leaf classes. Run the whole model suite without fail-fast
 when changing shared config semantics, then exercise FP32 distributed model
 comparisons with explicit config-owned SDPA.
+Tests asserting VeOmni kernel aliases or using the composed module registry must
+scope `MODELING_BACKEND=veomni` with a restoring fixture; they must not inherit
+the caller's backend or a previous test's environment. For handwritten Diffusers
+constructors, cover explicit attention overrides before HF initialization, plus
+omitted/None preservation and invalid selections; check the bound handles too.
 Plain-tensor checkpoint exports
 must not query an accelerator's current device; resolve the staging device only
 when a DTensor actually needs materialization. CPU-planned workers hide devices,

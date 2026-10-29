@@ -479,6 +479,8 @@ class YourTransformerConfig(VeOmniPretrainedConfig):
 
 Inherit from **both** `PreTrainedModel` (transformers) **and** the diffusers
 model. Call them in the right order and resolve the config-dict conflict.
+Apply an explicit constructor attention override to the config before HF checks
+it or the model binds kernels. Omitted or `None` overrides preserve saved choices.
 
 ```python
 from diffusers import YourDiffusersTransformerModel as _YourDiffusersModel
@@ -490,10 +492,12 @@ class YourTransformerModel(PreTrainedModel, _YourDiffusersModel):
     supports_gradient_checkpointing = True
 
     def __init__(self, config: YourTransformerConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         # diffusers stores model state in _internal_dict; remove the transformers one.
         del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _YourDiffusersModel.__init__(self, **config.to_diffuser_dict())
         self.config: YourTransformerConfig = config

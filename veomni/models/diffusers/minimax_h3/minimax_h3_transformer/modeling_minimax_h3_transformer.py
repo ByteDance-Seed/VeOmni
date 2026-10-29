@@ -19,7 +19,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.core import bind_minimax_attention
+from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
@@ -64,7 +64,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     _checkpoint_conversion_mapping = {"^": "dit."}
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
-        # Packed attention validates and binds its backend on the first forward.
+        # Attention validates and binds its backend on the first forward.
         return attn_implementation
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
@@ -222,7 +222,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             with torch.no_grad():
                 negative_predictions = self.forward(**negative_inputs).predictions
 
-        if self._packed_attn_implementation in _PACKED_FLASH_BACKENDS:
+        if is_flash_attn_impl(self._packed_attn_implementation or ""):
             self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(

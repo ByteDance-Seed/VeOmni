@@ -53,6 +53,16 @@ before sidecars load. They accept dictionaries and typed
 `OpsImplementationConfig` selections. Typed selections contribute every
 non-`None` value from `to_dict()`, including dataclass defaults; unspecified
 fields remain in that layer. Module entry choices still override root choices.
+Standalone `OmniModuleConfig.from_pretrained` applies an explicit
+`attn_implementation` after the file, root-default, and entry ops layers, then
+validates the final selection. Composed loading passes root defaults separately,
+so module entry choices retain their precedence over those defaults.
+
+The handwritten Wan T2V, LTX, and Qwen-Image transformer constructors also accept
+`attn_implementation`. They write a non-`None` override to the owning config
+before HF initialization checks the backend and before attention handles bind.
+An omitted argument or `None` preserves the config's existing selection; other
+ops remain unchanged. The override uses the same config state as normal loading.
 
 Validation runs after load overrides, so a checkpoint saved with device-specific
 ops can be loaded on another device by replacing those selections. Changing
@@ -67,6 +77,9 @@ custom packed-attention dispatcher also overrides the HF check: it validates
 and binds FlashAttention on the first forward through
 `_load_packed_attention_kernel`, preserving deferred loading even when HF
 reads a canonical flash selection during construction.
+Unsupported MiniMax flash selections, including FA4, fail before DiT execution
+for scalar, singleton-list, and packed inputs; serial execution does not fall
+back to SDPA while the config advertises another backend.
 HF mask builders still read the canonical attention selection at
 forward time, so keep it consistent with the constructed attention handle.
 

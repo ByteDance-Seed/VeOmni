@@ -235,9 +235,11 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     }
 
     def __init__(self, config: LTXVideoTransformerModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
