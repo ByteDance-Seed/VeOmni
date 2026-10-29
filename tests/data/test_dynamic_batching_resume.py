@@ -107,7 +107,7 @@ def test_uninterrupted_warmup_batch_sequence_is_unchanged():
 
 
 @pytest.mark.parametrize("dpo_recovery", [False, True])
-def test_restore_copies_tensor_buffer_only_for_dpo(dpo_recovery):
+def test_restore_copies_tensor_buffer(dpo_recovery):
     original = _loader()
     next(iter(original))
     state = original.state_dict()
@@ -119,8 +119,31 @@ def test_restore_copies_tensor_buffer_only_for_dpo(dpo_recovery):
     resumed.load_state_dict(state)
 
     assert torch.equal(resumed.payload_marker, marker)
-    assert (resumed.payload_marker.data_ptr() != marker.data_ptr()) is dpo_recovery
+    assert resumed.payload_marker.data_ptr() != marker.data_ptr()
     assert state["_veomni_resume_phase"] == "after_yield"
+
+
+def test_regular_restore_does_not_mutate_a_reusable_checkpoint_buffer():
+    def make_loader():
+        return DynamicBatchSizeDataLoader(
+            _StatefulSamples(),
+            TextBatchingStrategy(token_micro_bsz=1, buffer_size=3),
+            num_micro_batch=1,
+            length=10,
+        )
+
+    original = make_loader()
+    next(iter(original))
+    state = original.state_dict()
+    expected = [sample["id"] for sample in next(original)[0]]
+
+    resumed_once = make_loader()
+    resumed_once.load_state_dict(state)
+    assert [sample["id"] for sample in next(iter(resumed_once))[0]] == expected
+
+    resumed_again = make_loader()
+    resumed_again.load_state_dict(state)
+    assert [sample["id"] for sample in next(iter(resumed_again))[0]] == expected
 
 
 class _FiniteSamples(_StatefulSamples):

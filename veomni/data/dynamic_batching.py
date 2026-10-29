@@ -434,9 +434,9 @@ class DynamicBatchSizeDataLoader:
         return copy.deepcopy(state)
 
     def load_state_dict(self, state: Dict[str, Any]):
-        # DPO validates and restores the saved cursor twice. Other trainers
-        # should not duplicate a potentially large sample buffer on resume.
-        state = copy.deepcopy(state) if getattr(self, "_dpo_disallow_implicit_restart", False) else state.copy()
+        # The resumed loader mutates its batching buffer; isolate the saved
+        # cursor so it can be safely reused by another restore.
+        state = copy.deepcopy(state)
         self._checkpoint_phase = state.pop("_veomni_resume_phase", None)
         if self._checkpoint_phase is None:
             logger.warning("Legacy dynamic loader cursor lacks its post-yield phase; exact resume is not guaranteed.")

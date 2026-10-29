@@ -45,6 +45,19 @@ nothing else. The two exports are inference artifacts that resume never reads.
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
 
+Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
+a batch was yielded. Older cursors lack that phase and may resume with a
+different next batch; exact continuation from them requires an independently
+verified migration. Worker-mode dynamic batching uses a separate cursor path.
+On restore, the loader deep-copies the saved cursor so consuming buffered
+samples cannot mutate the checkpoint state. Budget for one additional copy of
+the buffered samples in host memory per rank during restore; long-context and
+multimodal buffers can make that copy substantial.
+With background prefetch enabled, exact resume of `drop_last=False` flush
+batches assumes consumers do not mutate yielded microbatches; prefetch can
+snapshot the cursor before such a mutation. Validate the loader and prefetch
+configuration used by a training profile.
+
 Three splits in the tree above are deliberate:
 
 - **`loader/` and `extra_state/` are per rank** because their contents are.
