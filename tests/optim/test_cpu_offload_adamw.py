@@ -16,7 +16,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _requires_exact_optimizer_recipe,
     _requires_exact_optimizer_state_dtypes,
 )
-from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
+from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW, select_cpu_offload_groups
 from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 
 
@@ -26,6 +26,19 @@ _CI_LAYOUT_LAUNCH = LaunchSpec(nproc=4, device="cpu")
 
 def _extra_parallel_launch(hsdp):
     return LaunchSpec(nproc=8 if hsdp else 4, device="cpu")
+
+
+def test_cpu_offload_pattern_requires_a_trainable_match():
+    model = torch.nn.Linear(4, 3)
+    model.weight.requires_grad_(False)
+    groups = [{"params": list(model.parameters())}]
+    with pytest.raises(ValueError, match="no trainable parameters"):
+        select_cpu_offload_groups(model, groups, ["weight"])
+    selected = select_cpu_offload_groups(model, groups, ["bias"])
+    assert selected[0]["cpu_offload"] and selected[0]["params"] == [model.bias]
+    assert not selected[1]["cpu_offload"] and selected[1]["params"] == [model.weight]
+    both = select_cpu_offload_groups(model, groups, ["weight|bias"])
+    assert both[0]["cpu_offload"] and both[0]["params"] == [model.weight, model.bias]
 
 
 @pytest.mark.parametrize("offload", [False, True])
