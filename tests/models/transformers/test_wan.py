@@ -95,7 +95,7 @@ def test_wan_fa3_constructs_generic_flash_attention_3(available_nvidia_ops):
     model = _build_ours(_tiny_config(), fa3_cfg)
     handle = model.blocks[0].self_attn.attn.veomni_attn
     assert handle.op == "attention"
-    assert handle.impl == "flash_attention_3"
+    assert handle.impl == "veomni_flash_attention_3"
 
 
 def test_wan_fa3_finite_last_loss_quantizes(monkeypatch, available_nvidia_ops):

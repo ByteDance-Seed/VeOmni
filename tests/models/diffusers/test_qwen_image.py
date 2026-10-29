@@ -65,7 +65,7 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
     config._set_ops_implementation(_sdpa_ops_config())
     ours = get_model_class(config)(config)
     processor = ours.transformer_blocks[0].attn.processor
-    assert processor.veomni_attn.impl == "sdpa"
+    assert processor.veomni_attn.impl == "veomni_sdpa"
     assert processor.veomni_attn_masked is processor.veomni_attn
     ours.load_state_dict(official.state_dict())
     samples = [
@@ -339,11 +339,11 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
         ckpt_dir,
         ops_implementation=_sdpa_ops_config(),
     )
-    assert loaded_sdpa.config.ops_config.attn_implementation == "sdpa"
+    assert loaded_sdpa.config.ops_config.attn_implementation == "veomni_sdpa"
     for block in loaded_sdpa.transformer_blocks:
-        assert block.attn.processor.veomni_attn.impl == "sdpa"
+        assert block.attn.processor.veomni_attn.impl == "veomni_sdpa"
         assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
-        assert block.attn.processor.config._attn_implementation == "sdpa"
+        assert block.attn.processor.config._attn_implementation == "veomni_sdpa"
 
     loaded_dict_sdpa = QwenImageTransformer2DModel.from_pretrained(
         ckpt_dir,

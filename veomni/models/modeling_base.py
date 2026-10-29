@@ -16,7 +16,7 @@
 
 from transformers import PreTrainedModel
 
-from .configuration_base import VeOmniPretrainedConfig, as_veomni_config, get_veomni_config_class
+from .configuration_base import as_veomni_config, get_veomni_config_class
 
 
 class VeOmniPreTrainedModel(PreTrainedModel):
@@ -28,6 +28,4 @@ class VeOmniPreTrainedModel(PreTrainedModel):
             cls.config_class = get_veomni_config_class(cls.config_class)
 
     def __init__(self, config, *args, **kwargs):
-        super().__init__(
-            as_veomni_config(config, validate=not isinstance(config, VeOmniPretrainedConfig)), *args, **kwargs
-        )
+        super().__init__(as_veomni_config(config), *args, **kwargs)

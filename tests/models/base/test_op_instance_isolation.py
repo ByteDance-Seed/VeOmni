@@ -49,7 +49,9 @@ from veomni.ops import VeomniOp
 
 @pytest.mark.parametrize("impl", ["torch_npu", "npu"])
 @pytest.mark.parametrize("family", ["flux", "ltx2_3", "deepseek_v4"])
-def test_unweighted_rms_norm_rejects_explicit_npu_backend(family, impl):
+def test_unweighted_rms_norm_rejects_explicit_npu_backend(monkeypatch, family, impl):
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     cfg = eager_ops_config()
     cfg.rms_norm_implementation = impl
     if family == "flux":
@@ -73,6 +75,7 @@ def test_unweighted_rms_norm_rejects_explicit_npu_backend(family, impl):
         model_cfg._set_ops_implementation(cfg)
         build = partial(DeepseekV4UnweightedRMSNorm, config=model_cfg)
     assert cfg.rms_norm_implementation == impl
+    assert model_cfg.ops_config.rms_norm_implementation == "torch_npu"
     with pytest.raises(KeyError, match="Unknown op 'rms_norm' variant='unweighted'"):
         build()
 
@@ -186,7 +189,7 @@ def test_qwen2_text_forward_keeps_construction_impls():
         attn_paths=("model.layers.0.self_attn.veomni_attn",),
         sticky_paths=("model.layers.0.self_attn.veomni_rope",),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -210,7 +213,7 @@ def test_qwen2_vl_vision_forward_keeps_construction_impls():
             "model.visual.blocks.0.attn.veomni_attn",
         ),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -231,7 +234,7 @@ def test_wan_condition_forward_keeps_construction_impls():
         attn_paths=("blocks.0.self_attn.attn.veomni_attn",),
         sticky_paths=("blocks.0.self_attn.veomni_rope",),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -240,8 +243,7 @@ def test_wan_condition_forward_keeps_construction_impls():
 def test_flux_forward_keeps_construction_impls():
     from veomni.models.transformers.flux.modeling_flux import FluxModel
 
-    # These families have no local eager_attention_forward. Isolate the two
-    # CPU-runnable SDPA rows instead of eager vs sdpa.
+    # This family has no local eager_attention_forward; eager delegates to SDPA.
     config = tiny_flux_config()
     inputs = {
         "hidden_states": torch.randn(2, 4, 4, 6),
@@ -255,7 +257,7 @@ def test_flux_forward_keeps_construction_impls():
         build=lambda: FluxModel(config),
         run=lambda model: model(**inputs),
         attn_paths=("blocks.0.attn.veomni_attn", "single_blocks.0.veomni_attn"),
-        eager_cfg=_attn_cfg("sdpa"),
+        eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
@@ -291,7 +293,7 @@ def test_ltx_forward_keeps_construction_impls(monkeypatch):
         build=build,
         run=run,
         attn_paths=("transformer_blocks.0.attn1.attention_function.veomni_attn",),
-        eager_cfg=_attn_cfg("sdpa"),
+        eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
@@ -333,7 +335,7 @@ def test_minimax_h3_forward_keeps_construction_impls():
         ).predictions[0],
         attn_paths=("dit.blocks.0.attn.veomni_attn",),
         sticky_paths=("dit.blocks.0.attn.veomni_rope",),
-        eager_cfg=_attn_cfg("sdpa"),
+        eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
@@ -357,7 +359,7 @@ def test_qwen_image_forward_keeps_construction_impls():
         build=lambda: QwenImageTransformer2DModel(config),
         run=lambda model: model(**inputs, return_dict=False)[0],
         attn_paths=("transformer_blocks.0.attn.processor.veomni_attn",),
-        eager_cfg=_attn_cfg("sdpa"),
+        eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
@@ -378,7 +380,7 @@ def test_qwen3_moe_text_forward_keeps_construction_impls():
             "model.layers.0.mlp.experts.veomni_moe",
         ),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -398,7 +400,7 @@ def test_glm_moe_dsa_forward_keeps_construction_impls():
             "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
         ),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -415,7 +417,7 @@ def test_gemma3_text_forward_keeps_construction_impls():
         attn_paths=("model.layers.0.self_attn.veomni_attn",),
         sticky_paths=("model.layers.0.self_attn.veomni_rope",),
         eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("sdpa"),
+        alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
@@ -435,7 +437,7 @@ def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model
     other_config._set_ops_implementation(sdpa_cfg)
     other_model = Gemma3ForCausalLM(other_config).eval()
     assert model.model.layers[0].self_attn.veomni_attn.impl == "eager"
-    assert other_model.model.layers[0].self_attn.veomni_attn.impl == "sdpa"
+    assert other_model.model.layers[0].self_attn.veomni_attn.impl == "veomni_sdpa"
     with torch.no_grad():
         logits = model(input_ids=input_ids, use_cache=False).logits
         mutated_logits = model(input_ids=mutated, use_cache=False).logits
@@ -467,7 +469,7 @@ def test_deepseek_v3_rope_keeps_construction_impl():
     assert model.model.rotary_emb.veomni_rope_use_triton is False
     with torch.no_grad():
         reference = model(input_ids=input_ids, use_cache=False).logits
-        config._set_ops_implementation(poison)
+        config.ops_implementation.update(vars(poison))
         isolated = model(input_ids=input_ids, use_cache=False).logits
         assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
         assert model.model.rotary_emb.veomni_rope_use_triton is False
@@ -496,7 +498,7 @@ def test_deepseek_v4_rope_keeps_construction_impl():
     assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
     with torch.no_grad():
         reference = model(input_ids=input_ids, use_cache=False).logits
-        config._set_ops_implementation(poison)
+        config.ops_implementation.update(vars(poison))
         isolated = model(input_ids=input_ids, use_cache=False).logits
         assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
     torch.testing.assert_close(isolated, reference)

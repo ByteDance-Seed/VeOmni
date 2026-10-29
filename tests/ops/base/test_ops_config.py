@@ -42,11 +42,13 @@ def test_unset_field_uses_registry_variant_default(monkeypatch):
 
 
 @pytest.mark.parametrize("impl", ["torch_npu", "npu"])
-def test_unweighted_rms_norm_rejects_unregistered_backend(impl):
+def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
     from veomni.arguments import OpsImplementationConfig
     from veomni.ops import VeomniOp
 
-    cfg = OpsImplementationConfig.from_dict({"rms_norm_implementation": impl}, validate=False)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    cfg = OpsImplementationConfig(rms_norm_implementation=impl)
     with pytest.raises(KeyError, match="Unknown op 'rms_norm' variant='unweighted'"):
         VeomniOp("rms_norm", "unweighted", cfg.rms_norm_implementation)
 
@@ -750,11 +752,13 @@ def test_omni_config_uses_module_config_base_and_preserves_root_ops():
 
 
 @pytest.mark.parametrize("adaptation", ["factory", "in_place"])
-def test_remote_config_export_preserves_native_source_and_reload_target(tmp_path, adaptation):
+@pytest.mark.parametrize("typed_override", [False, True])
+def test_remote_config_export_preserves_native_source_and_reload_target(tmp_path, adaptation, typed_override):
     import json
 
     from transformers import AutoConfig
 
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models import build_config
     from veomni.models.configuration_base import VeOmniPretrainedConfig, as_veomni_config
 
@@ -793,7 +797,133 @@ def test_remote_config_export_preserves_native_source_and_reload_target(tmp_path
     assert isinstance(config, VeOmniPretrainedConfig)
     plain = AutoConfig.from_pretrained(exported, trust_remote_code=True, local_files_only=True)
     assert not isinstance(plain, VeOmniPretrainedConfig)
-    restored = build_config(exported, trust_remote_code=True, local_files_only=True)
+    overrides = {"ops_implementation": make_eager_ops_config()} if typed_override else {}
+    restored = build_config(exported, trust_remote_code=True, local_files_only=True, **overrides)
     assert isinstance(restored, VeOmniPretrainedConfig)
     assert restored.hidden_size == 8
     assert restored.ops_config.attn_implementation == "eager"
+
+
+@pytest.mark.parametrize("child_as_instance", [False, True])
+def test_typed_parent_preserves_explicit_child_ops(child_as_instance):
+    from transformers import Qwen3VLConfig, Qwen3VLVisionConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+
+    child = {"ops_implementation": {"attn_implementation": "eager"}}
+    if child_as_instance:
+        child = get_veomni_config_class(Qwen3VLVisionConfig)(**child)
+    config = get_veomni_config_class(Qwen3VLConfig)(
+        vision_config=child, ops_implementation=make_eager_ops_config(attn_implementation="sdpa")
+    )
+    assert config.ops_config.attn_implementation == "veomni_sdpa"
+    assert config.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert config.vision_config.ops_config.attn_implementation == "eager"
+
+
+def test_child_default_reset_survives_save_and_reload(tmp_path):
+    from transformers import Qwen3VLConfig
+
+    Config = get_veomni_config_class(Qwen3VLConfig)
+    config = Config(ops_implementation={"attn_implementation": "eager"})
+    config.vision_config._attn_implementation = None
+    expected = config.vision_config.ops_config.attn_implementation
+    assert expected != config.ops_config.attn_implementation
+    config.save_pretrained(tmp_path)
+    restored = Config.from_pretrained(tmp_path)
+    assert restored.ops_config.attn_implementation == "eager"
+    assert restored.text_config.ops_config.attn_implementation == "eager"
+    assert restored.vision_config.ops_config.attn_implementation == expected
+
+
+@pytest.mark.parametrize("entrypoint", ["class", "builder"])
+def test_native_child_load_override_receives_ops(tmp_path, entrypoint):
+    from transformers import Qwen3VLConfig, Qwen3VLVisionConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models import build_config
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+
+    Config = get_veomni_config_class(Qwen3VLConfig)
+    Config().save_pretrained(tmp_path)
+    child = Qwen3VLVisionConfig(depth=1, hidden_size=32, num_heads=4)
+    load = Config.from_pretrained if entrypoint == "class" else build_config
+    config = load(tmp_path, vision_config=child, ops_implementation=make_eager_ops_config())
+    assert isinstance(config.vision_config, VeOmniPretrainedConfig)
+    assert config.vision_config.depth == 1
+    assert config.vision_config.ops_config.attn_implementation == "eager"
+    assert config.vision_config.ops_config.rotary_pos_emb_vision_implementation == "eager"
+
+
+def test_ops_config_cache_refreshes_after_dictionary_updates(tmp_path):
+    import json
+
+    from transformers import LlamaConfig
+
+    Config = get_veomni_config_class(LlamaConfig)
+    config = Config(ops_implementation={"attn_implementation": "eager"})
+    initial = config.ops_config
+    assert config.ops_config is initial
+    config.ops_implementation["attn_implementation"] = "veomni_sdpa"
+    updated = config.ops_config
+    assert updated is not initial
+    assert config.ops_config is updated
+    assert updated.attn_implementation == "veomni_sdpa"
+    config.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert "_ops_config_cache" not in saved
+    assert Config.from_pretrained(tmp_path).ops_config.attn_implementation == updated.attn_implementation
+
+
+@pytest.mark.parametrize("family", ["llama", "flux", "ltx2_3"])
+def test_direct_model_validates_final_ops_before_hf_initialization(monkeypatch, family):
+    from tests.models.tiny_configs import tiny_flux_config, tiny_llama_config, tiny_ltx2_3_config
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXVideoTransformerModel
+    from veomni.models.transformers.flux.modeling_flux import FluxModel
+    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    def forbid_preload(*args, **kwargs):
+        pytest.fail("Invalid final selections must fail before HF preloads attention")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_preload)
+    make_config, model_class = {
+        "llama": (tiny_llama_config, LlamaForCausalLM),
+        "flux": (tiny_flux_config, FluxModel),
+        "ltx2_3": (tiny_ltx2_3_config, LTXVideoTransformerModel),
+    }[family]
+    config = make_config()
+    # Construction stages selections; the model boundary validates the final dictionary.
+    config.ops_implementation = {
+        **make_eager_ops_config().to_dict(),
+        "attn_implementation": "flash_attention_2_hub",
+    }
+    with pytest.raises(ValueError, match="not supported on Ascend NPU"):
+        model_class(config)
+
+
+@pytest.mark.parametrize("entrypoint", ["constructor", "ops_override", "attention_override", "dict_update"])
+def test_config_normalizes_deprecated_attention_aliases(tmp_path, entrypoint):
+    from transformers import LlamaConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+
+    Config = get_veomni_config_class(LlamaConfig)
+    legacy = "veomni_flash_attention_2_with_sp"
+    values = {**make_eager_ops_config().to_dict(), "attn_implementation": legacy}
+    if entrypoint == "constructor":
+        config = Config(ops_implementation=values)
+    else:
+        config = Config(ops_implementation=make_eager_ops_config())
+        config.save_pretrained(tmp_path)
+        if entrypoint == "ops_override":
+            config = Config.from_pretrained(tmp_path, ops_implementation=values)
+        elif entrypoint == "attention_override":
+            config = Config.from_pretrained(tmp_path, attn_implementation=legacy)
+        else:
+            config.ops_implementation["attn_implementation"] = legacy
+    assert config.ops_config.attn_implementation == "veomni_flash_attention_2"
+    assert config._attn_implementation == "veomni_flash_attention_2"

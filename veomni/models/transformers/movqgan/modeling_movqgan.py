@@ -17,7 +17,8 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .configuration_movqgan import MoVQGANConfig
 

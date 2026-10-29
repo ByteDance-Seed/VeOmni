@@ -36,7 +36,7 @@ def restore_modeling_backend():
     assignment mid-test (it has to outlive the model build inside the same test),
     which otherwise persists for the whole pytest process. Every later test module
     then reads the last case's backend — and under ``hf`` the veomni-only config
-    normalization (``flex_attention`` -> ``veomni_flex_attention_with_sp``) stops
+    normalization (``flex_attention`` -> ``veomni_flex_attention``) stops
     happening, so unrelated suites fail only when run after this directory.
     """
     previous = os.environ.get("MODELING_BACKEND")
@@ -94,6 +94,8 @@ def available_nvidia_ops(monkeypatch):
     """Make static NVIDIA/package gates pass without executing a GPU kernel."""
     previous_handles = dict(VeomniOp._intern)
     VeomniOp._intern.clear()
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     monkeypatch.setattr(op_registry, "get_device_type", lambda: GpuKernelRequirement.device)
     monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
     monkeypatch.setattr(op_registry, "is_package_available", lambda _package: True)

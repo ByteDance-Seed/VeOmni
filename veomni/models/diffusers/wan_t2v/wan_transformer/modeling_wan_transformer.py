@@ -15,9 +15,9 @@ from diffusers.models.transformers.transformer_wan import (
     _get_added_kv_projections,
     _get_qkv_projections,
 )
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
 
 from .....distributed.parallel_state import get_parallel_state

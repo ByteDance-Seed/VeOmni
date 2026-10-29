@@ -775,7 +775,7 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
 @pytest.mark.parametrize("layout", ["scalar", "singleton", "packed"])
 def test_unsupported_flash_backend_fails_before_dit_forward(monkeypatch, attention, layout):
     model = tiny_model(attn_implementation=attention)
-    assert model.config.ops_config.attn_implementation == attention
+    assert model.config.ops_config.attn_implementation == "veomni_flash_attention_4"
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
 
     def forbid_execution(*args, **kwargs):

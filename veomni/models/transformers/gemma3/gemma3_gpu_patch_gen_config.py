@@ -105,12 +105,13 @@ def gemma3_textmodel_forward_patched(
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
         # Mask builders must follow this instance's attention impl.
-        attn_impl = self.config.ops_config.attn_implementation
         for layer in self.layers[: self.config.num_hidden_layers]:
             handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
             if handle is not None:
                 attn_impl = handle.impl
                 break
+        else:
+            attn_impl = self.config.ops_config.attn_implementation
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
         if cu_seq_lens_q is not None:
             impl = attn_impl

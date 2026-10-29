@@ -100,18 +100,7 @@ def read_model_type(model_path: str) -> str:
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
     # decide registration explicitly.
-    config_keys = set(OMNI_CONFIG_REGISTRY.valid_keys())
     model_keys = set(OMNI_MODEL_REGISTRY.valid_keys())
-    if model_type in config_keys:
-        # Validate the config can be re-read by the registered subclass so
-        # downstream `from_pretrained` doesn't hit a surprise schema gap.
-        # Defer op hardware/combination validation here because caller/composed
-        # ops_implementation overrides are applied after model_type probing.
-        from ...configuration_base import _defer_ops_validation
-
-        cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        with _defer_ops_validation():
-            cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
             f"Module model_type {model_type!r} (from {model_path}) is not registered in "

@@ -113,7 +113,7 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
     torch.manual_seed(1)
     reference = _build_model()
     ours = _build_model()
-    assert ours.dit.blocks[0].attn.veomni_attn.impl == "sdpa"
+    assert ours.dit.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
     ours.load_state_dict(reference.state_dict())
     inputs = _minimax_h3_inputs(cond_rows)
     ours_inputs = {

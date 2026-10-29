@@ -17,8 +17,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
 from functools import cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -28,19 +26,6 @@ from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
-
-
-_DEFER_OPS_VALIDATION: ContextVar[bool] = ContextVar("_DEFER_OPS_VALIDATION", default=False)
-
-
-@contextmanager
-def _defer_ops_validation():
-    """Validate a loaded config only after all caller overrides have been applied."""
-    token = _DEFER_OPS_VALIDATION.set(True)
-    try:
-        yield
-    finally:
-        _DEFER_OPS_VALIDATION.reset(token)
 
 
 def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) -> None:
@@ -61,6 +46,14 @@ def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) ->
                     sub_dict["ops_implementation"] = sub_diff
                 else:
                     sub_dict.pop("ops_implementation", None)
+        # A missing child key means its device default, not the parent's choice.
+        resets = {
+            key: None
+            for key, value in parent_ops.items()
+            if value is not None and key not in sub_cfg.ops_implementation
+        }
+        if resets:
+            sub_dict.setdefault("ops_implementation", {}).update(resets)
 
 
 class VeOmniPretrainedConfig(PretrainedConfig):
@@ -89,20 +82,29 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                 _restore_selections(child, selections[key])
         if isinstance(attention, str):
             self.ops_implementation["attn_implementation"] = _normalize_attention(attention)
-        self._set_ops_implementation(ops, _is_post_init=True)
+        self._set_ops_implementation(ops, _is_post_init=True, _validate=False)
         if isinstance(attention, Mapping):
             self._attn_implementation = attention
 
     @property
     def ops_config(self) -> OpsImplementationConfig:
-        """Resolve defaults without repeating hardware validation during model construction."""
-        from ..arguments import OpsImplementationConfig
-
-        return OpsImplementationConfig.from_dict(self.ops_implementation, validate=False)
+        """Return the normally constructed ops instance, refreshing it after dict updates."""
+        cached = vars(self).get("_ops_config_cache")
+        if cached is None or cached[0] != self.ops_implementation:
+            selections, resolved = _resolve_ops(self.ops_implementation)
+            self.ops_implementation.update(selections)
+            self._ops_config_cache = (dict(self.ops_implementation), resolved)
+        return self._ops_config_cache[1]
 
     @property
     def _attn_implementation(self) -> str | None:
-        return self.ops_config.attn_implementation
+        from ..arguments import OpsImplementationConfig
+
+        selected = self.ops_implementation.get("attn_implementation")
+        if selected is not None:
+            return selected
+        default = OpsImplementationConfig.__dataclass_fields__["attn_implementation"].default
+        return OpsImplementationConfig.normalize_attention_backend(default)
 
     @_attn_implementation.setter
     def _attn_implementation(self, value: str | Mapping[str, Any] | None) -> None:
@@ -151,6 +153,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         *,
         _is_post_init: bool = False,
         _validate_tree: bool = False,
+        _validate: bool = True,
     ) -> None:
         from ..arguments import OpsImplementationConfig
 
@@ -163,47 +166,52 @@ class VeOmniPretrainedConfig(PretrainedConfig):
             override = dict(ops_implementation or {})
         else:
             raise ValueError("ops_implementation must be a dict or OpsImplementationConfig.")
-        validate = not _DEFER_OPS_VALIDATION.get() and not isinstance(ops_implementation, SimpleNamespace)
         pending = []
 
         def collect(config, incoming):
-            merged = dict(incoming) if replace else {**config.ops_implementation, **incoming}
-            proposed = (
-                OpsImplementationConfig.validate_and_extract_dict(merged)
-                if validate
-                else {k: v for k, v in merged.items() if v is not None}
-            )
+            merged = dict(incoming) if replace and not _is_post_init else {**config.ops_implementation, **incoming}
+            proposed = dict(merged)
+            if proposed.get("attn_implementation") is not None:
+                proposed["attn_implementation"] = OpsImplementationConfig.normalize_attention_backend(
+                    proposed["attn_implementation"]
+                )
             pending.append((config, proposed))
             for key in config.sub_configs:
                 child = getattr(config, key, None)
                 if not isinstance(child, VeOmniPretrainedConfig):
                     continue
-                if _is_post_init and not replace:
+                if _is_post_init:
                     collect(child, {**proposed, **child.ops_implementation})
                 elif replace or incoming or _validate_tree:
                     collect(child, incoming)
 
         # Validate the whole proposed tree before modifying any instance.
         collect(self, override)
-        for config, proposed in pending:
+        resolved = (
+            [_resolve_ops(proposed) for _, proposed in pending] if _validate else [(p, None) for _, p in pending]
+        )
+        for (config, _), (proposed, ops_config) in zip(pending, resolved):
             config.ops_implementation = proposed
+            config.__dict__.pop("_ops_config_cache", None)
+            if ops_config is not None:
+                config._ops_config_cache = (dict(proposed), ops_config)
 
     def _apply_ops_overrides(
         self,
         *,
         ops_implementation: dict[str, Any] | OpsImplementationConfig | Any | None = None,
         attn_implementation: str | dict[str, Any] | None = None,
+        _validate: bool = True,
     ) -> None:
         """Apply load-time overrides atomically; explicit attention ranks highest."""
         import copy
 
         candidate = copy.deepcopy(self)
-        with _defer_ops_validation():
-            if ops_implementation is not None:
-                candidate._set_ops_implementation(ops_implementation)
-            if attn_implementation is not None:
-                candidate._attn_implementation = attn_implementation
-        if not _DEFER_OPS_VALIDATION.get() and not isinstance(ops_implementation, SimpleNamespace):
+        if ops_implementation is not None:
+            candidate._set_ops_implementation(ops_implementation, _validate=False)
+        if attn_implementation is not None:
+            candidate._attn_implementation = attn_implementation
+        if _validate:
             candidate._set_ops_implementation({}, _validate_tree=True)
         # Preserve HF's explicit attention spelling after validation.
         if attn_implementation is not None:
@@ -211,6 +219,11 @@ class VeOmniPretrainedConfig(PretrainedConfig):
 
         def apply(config, source):
             config.ops_implementation = dict(source.ops_implementation)
+            config.__dict__.pop("_ops_config_cache", None)
+            if "_ops_config_cache" in vars(source):
+                resolved = source._ops_config_cache[1]
+                resolved.attn_implementation = source._attn_implementation
+                config._ops_config_cache = (dict(config.ops_implementation), resolved)
             for key in config.sub_configs:
                 child, proposed = getattr(config, key, None), getattr(source, key, None)
                 if isinstance(child, VeOmniPretrainedConfig) and isinstance(proposed, VeOmniPretrainedConfig):
@@ -220,13 +233,21 @@ class VeOmniPretrainedConfig(PretrainedConfig):
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs: Any):
+        validate = kwargs.pop("_validate_ops", True)
         ops = kwargs.pop("ops_implementation", None)
         attention = kwargs.pop("attn_implementation", None)
-        with _defer_ops_validation():
-            result = super().from_dict(dict(config_dict), **kwargs)
+        result = super().from_dict(dict(config_dict), **kwargs)
         config = result[0] if isinstance(result, tuple) else result
-        config._apply_ops_overrides(ops_implementation=ops, attn_implementation=attention)
+        as_veomni_config(config, validate=False)
+        config._set_ops_implementation(None, _is_post_init=True, _validate=False)
+        config._apply_ops_overrides(ops_implementation=ops, attn_implementation=attention, _validate=validate)
         return result
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize selections and schema fields without the resolved runtime cache."""
+        output = super().to_dict()
+        output.pop("_ops_config_cache", None)
+        return output
 
     def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
         """Export remote config code from its native schema rather than the adapter."""
@@ -248,6 +269,19 @@ def _ops_dict(value):
     if isinstance(value, SimpleNamespace):
         return {key: selection for key, selection in vars(value).items() if selection is not None}
     return dict(value or {})
+
+
+def _resolve_ops(selections):
+    """Validate final selections through the standard ops dataclass constructor."""
+    from ..arguments import OpsImplementationConfig
+
+    resolved = OpsImplementationConfig(**{key: value for key, value in selections.items() if value is not None})
+    # Explicit HF attention spellings retain their original dispatch semantics.
+    if selections.get("attn_implementation") is not None:
+        resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(
+            selections["attn_implementation"], veomni_names=False
+        )
+    return {key: getattr(resolved, key) if value is not None else None for key, value in selections.items()}, resolved
 
 
 def _capture_selections(source):
@@ -282,7 +316,7 @@ def _restore_selections(config, saved):
 def _normalize_attention(value: str) -> str:
     from ..arguments import OpsImplementationConfig
 
-    return OpsImplementationConfig.normalize_hub_attention_backend(value)
+    return OpsImplementationConfig.normalize_attention_backend(value, veomni_names=False)
 
 
 @cache
@@ -335,10 +369,13 @@ def as_veomni_config(config: PretrainedConfig, *, validate: bool = True) -> VeOm
         if isinstance(child, PretrainedConfig):
             as_veomni_config(child, validate=False)
     if native:
-        with _defer_ops_validation():
-            config._set_ops_implementation(None, _is_post_init=True)
+        config._set_ops_implementation(None, _is_post_init=True, _validate=False)
     if validate:
-        config._set_ops_implementation({}, _validate_tree=True)
+        _ = config.ops_config
+        for key in config.sub_configs:
+            child = getattr(config, key, None)
+            if isinstance(child, VeOmniPretrainedConfig):
+                as_veomni_config(child)
     return config
 
 
@@ -354,6 +391,7 @@ def as_hf_config(config: PretrainedConfig) -> PretrainedConfig:
     def restore(node):
         native_class = type(node).__dict__.get("_hf_config_class")
         attention = node._attn_implementation
+        node.__dict__.pop("_ops_config_cache", None)
         if native_class is not None:
             node.__class__ = native_class
             node._attn_implementation_internal = attention

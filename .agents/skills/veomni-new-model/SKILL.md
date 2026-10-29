@@ -82,7 +82,8 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
    (use `get_veomni_config_class(HFConfig)` when extending an HF schema). Generated
    specs drop the HF `PreTrainedModel` import and import
    `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
-   This adapts direct model inputs and the model's `config_class`, recursively.
+   Handwritten models use the same base. It adapts direct model inputs and the
+   model's `config_class` recursively, validating final ops before HF initialization.
    Standalone attention/MLP tests must use `get_veomni_config_class(HFConfig)` or
    `as_veomni_config(config)` explicitly; native HF classes have no `ops_config`.
    Read `docs/design/module_config.md`. Never patch HF config base methods or

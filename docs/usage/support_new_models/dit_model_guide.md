@@ -55,8 +55,10 @@ inference without any VeOmni code**.
 At runtime VeOmni uses a **VeOmni config** (a `VeOmniPretrainedConfig` subclass) that
 holds both the diffusers model parameters and VeOmni-specific fields such as
 `model_type`, `condition_model_type`, and `ops_implementation` (exposed as `config.ops_config`).  
-On disk, only a **pure diffusers config** is ever written — those VeOmni fields
-are never serialized to `config.json`.
+On disk, write a **diffusers-compatible config** plus sparse `ops_implementation`
+metadata so VeOmni can restore kernel selections. Runtime fields such as
+`model_type` and `condition_model_type` are omitted; the resolved `ops_config`
+cache is never serialized. Native diffusers loaders ignore the extra ops metadata.
 
 ```
 On disk (diffusers format)          In memory (VeOmni)
@@ -275,7 +277,7 @@ the diffusers `__init__` runs.
 | Config in memory | `VeOmniPretrainedConfig` subclass holding both diffusers params and VeOmni fields |
 | Weight key names | Unchanged — no layer renaming, weights are identical to diffusers |
 | Saving | Temporarily swaps config to `to_diffuser_dict()`, delegates to `_DiffusersModel.save_pretrained`, then restores |
-| Saved `config.json` | Pure diffusers format (`_class_name`, `_diffusers_version`, no VeOmni fields) |
+| Saved `config.json` | Diffusers-compatible fields (`_class_name`, `_diffusers_version`) plus persisted `ops_implementation`; no runtime config fields or resolved cache |
 | Saved `model.safetensors` | Identical format to original diffusers checkpoint |
 | Diffusers inference | Load saved ckpt directly with `WanTransformer3DModel.from_pretrained` or swap into any diffusers pipeline — no VeOmni required |
 | SP forward patch | Applied to the **base diffusers class** (not VeOmni subclass) so both code paths benefit |
@@ -477,15 +479,17 @@ class YourTransformerConfig(VeOmniPretrainedConfig):
 
 ## Step 6: Transformer Model — Class and Init
 
-Inherit from **both** `PreTrainedModel` (transformers) **and** the diffusers
-model. Call them in the right order and resolve the config-dict conflict.
+Inherit from **both** `VeOmniPreTrainedModel` (the HF model subclass) **and** the
+diffusers model. The VeOmni base validates final ops before HF initialization.
+Call them in the right order and resolve the config-dict conflict.
 Apply an explicit constructor attention override to the config before HF checks
 it or the model binds kernels. Omitted or `None` overrides preserve saved choices.
 
 ```python
 from diffusers import YourDiffusersTransformerModel as _YourDiffusersModel
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 class YourTransformerModel(PreTrainedModel, _YourDiffusersModel):
     config_class = YourTransformerConfig

@@ -19,9 +19,9 @@ from diffusers.models.transformers.transformer_qwenimage import (
     compute_text_seq_len_from_mask,
 )
 from diffusers.utils import apply_lora_scale
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
 
 from .....distributed.parallel_state import get_parallel_state

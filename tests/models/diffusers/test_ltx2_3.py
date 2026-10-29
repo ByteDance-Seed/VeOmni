@@ -270,9 +270,9 @@ def test_ltx_automatic_to_callable_reads_ops_config():
     adapter = AttentionFunction.AUTOMATIC.to_callable(config=config)
     masked = MaskedAttentionFunction.AUTOMATIC.to_callable(config=config)
     assert isinstance(adapter, VeomniLTXAttention)
-    assert adapter.veomni_attn.impl == "sdpa"
+    assert adapter.veomni_attn.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
-    assert masked.veomni_attn.impl == "sdpa"
+    assert masked.veomni_attn.impl == "veomni_sdpa"
     assert masked.veomni_attn_masked is masked.veomni_attn
 
 

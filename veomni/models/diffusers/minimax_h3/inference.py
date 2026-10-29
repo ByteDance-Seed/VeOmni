@@ -28,7 +28,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
-from veomni.models.configuration_base import _defer_ops_validation
 from veomni.utils.device import get_device_type
 
 from .minimax_h3_condition.configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
@@ -386,8 +385,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         # Video VAE weights live in video_vae/source (checkpoint layout); the
         # config default subfolder "video_vae" has no safetensors directly.
         condition_model_cfg.setdefault("video_vae_subfolder", "video_vae/source")
-        with _defer_ops_validation():
-            condition_cfg = MiniMaxH3ConditionModelConfig.from_pretrained(condition_model_path, **condition_model_cfg)
+        condition_cfg = MiniMaxH3ConditionModelConfig.from_pretrained(
+            condition_model_path, _validate_ops=False, **condition_model_cfg
+        )
         condition_cfg._apply_ops_overrides(ops_implementation=ops_implementation)
         condition_model = MiniMaxH3ConditionModel._from_config(condition_cfg)
         condition_model.eval()
@@ -421,10 +421,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         # CPU and the DiT stages its blocks in two halves per forward.
         # Meta init skips weight load; the explicit call below materializes
         # the weights on CPU instead.
-        with _defer_ops_validation():
-            dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
-                transformer_config_path, **(transformer_config_kwargs or {})
-            )
+        dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
+            transformer_config_path, _validate_ops=False, **(transformer_config_kwargs or {})
+        )
         dit_config._apply_ops_overrides(ops_implementation=ops_implementation)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch.bfloat16)

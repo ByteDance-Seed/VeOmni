@@ -180,7 +180,7 @@ def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
         captured.update(kwargs)
         return query.transpose(1, 2), None
 
-    assert attn.processor.veomni_attn.impl == "sdpa"
+    assert attn.processor.veomni_attn.impl == "veomni_sdpa"
     assert not attn.processor._use_flash
     attn.processor.veomni_attn = record
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)

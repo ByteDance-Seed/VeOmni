@@ -15,8 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl

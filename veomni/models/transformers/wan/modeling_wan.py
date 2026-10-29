@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Adapted from https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py"""
 
 import math
@@ -22,7 +23,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -33,6 +33,7 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor_scale_grad,
 )
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
 
 from ....utils import logging

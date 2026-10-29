@@ -7,7 +7,8 @@ from typing import Any
 
 import torch
 from torchvision.transforms import InterpolationMode, functional
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....utils import logging
 from .....utils.device import get_device_type

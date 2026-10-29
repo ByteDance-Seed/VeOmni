@@ -15,8 +15,7 @@
 import math
 import os
 import sys
-from collections.abc import Mapping
-from dataclasses import MISSING, asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -1625,17 +1624,23 @@ class OpsImplementationConfig:
         """Validate Hub and AITER requests and resolve their registered VeOmni names."""
         OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
-        return {
+        return OpsImplementationConfig.normalize_attention_backend(implementation, veomni_names=False)
+
+    @staticmethod
+    def normalize_attention_backend(implementation: Optional[str], *, veomni_names: bool = True) -> Optional[str]:
+        """Normalize names without validating an intermediate config selection."""
+        aliases = _DEPRECATED_IMPLEMENTATION_ALIASES["attn_implementation"]
+        if implementation in aliases:
+            replacement = aliases[implementation]
+            OpsImplementationConfig._warn_deprecated("attn_implementation", implementation, replacement)
+            implementation = replacement
+        implementation = {
             "aiter": "veomni_flash_attention_aiter",
             "flash_attention_2_hub": "veomni_flash_attention_2_hub",
             "flash_attention_3_hub": "veomni_flash_attention_3_hub",
         }.get(implementation, implementation)
-
-    def __post_init__(self):
-        self._apply_deprecated_aliases()
-        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
-        if get_env("MODELING_BACKEND") == "veomni":
-            replacements = {
+        if veomni_names and get_env("MODELING_BACKEND") == "veomni":
+            return {
                 "flash_attention_2": "veomni_flash_attention_2",
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
@@ -1643,58 +1648,19 @@ class OpsImplementationConfig:
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
-            }
-            if self.attn_implementation in replacements:
-                new_impl = replacements[self.attn_implementation]
-                logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
-                self.attn_implementation = new_impl
+            }.get(implementation, implementation)
+        return implementation
 
+    def __post_init__(self):
+        self._apply_deprecated_aliases()
+        self.validate_attention_backend(self.attn_implementation)
+        self.validate_hub_attention_backend(self.attn_implementation)
+        self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
         return {k: v for k, v in asdict(self).items() if v is not None}
-
-    @classmethod
-    def validate_and_extract_dict(cls, d: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        """Validate a sparse op-selection mapping and return only its explicitly provided non-None keys."""
-        if not d:
-            return {}
-        validated = cls.from_dict(d, validate=True)
-        return {key: value for key in d if hasattr(validated, key) and (value := getattr(validated, key)) is not None}
-
-    @classmethod
-    def from_dict(
-        cls,
-        d: Optional[Mapping[str, Any]] = None,
-        validate: bool = True,
-    ) -> "OpsImplementationConfig":
-        """Construct an :class:`OpsImplementationConfig` from a mapping.
-
-        When ``validate=True``, runs ``__post_init__`` alias resolution,
-        attention backend normalization, and hardware checks. When
-        ``validate=False``, populates fields directly without re-running
-        ``__post_init__`` for fast repeated access from
-        :attr:`~veomni.models.VeOmniPretrainedConfig.ops_config`.
-        """
-        data = dict(d or {})
-        if validate:
-            return cls(**data)
-
-        instance = object.__new__(cls)
-        for f in fields(cls):
-            if f.name in data:
-                setattr(instance, f.name, data[f.name])
-            elif f.default is not MISSING:
-                setattr(instance, f.name, f.default)
-            elif f.default_factory is not MISSING:
-                setattr(instance, f.name, f.default_factory())
-        if "attn_implementation" not in data and get_env("MODELING_BACKEND") == "veomni":
-            instance.attn_implementation = "veomni_flash_attention_2"
-        for k, v in data.items():
-            if not hasattr(instance, k):
-                setattr(instance, k, v)
-        return instance
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""

@@ -29,7 +29,7 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from ...configuration_base import VeOmniPretrainedConfig, _defer_ops_validation
+from ...configuration_base import VeOmniPretrainedConfig
 
 
 class OmniModuleConfig(VeOmniPretrainedConfig):
@@ -125,33 +125,32 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
         base_ops = kwargs.pop("base_ops_implementation", None)
         attention = kwargs.pop("attn_implementation", None)
 
-        with _defer_ops_validation():
-            if cls is OmniModuleConfig:
-                from . import OMNI_MODEL_REGISTRY, read_model_type
+        if cls is OmniModuleConfig:
+            from . import OMNI_MODEL_REGISTRY, read_model_type
 
-                cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
+            cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
 
-            hf_config = super().from_pretrained(
-                pretrained_model_name_or_path,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                local_files_only=local_files_only,
-                token=token,
-                revision=revision,
-                **kwargs,
-            )
+        hf_config = super().from_pretrained(
+            pretrained_model_name_or_path,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            _validate_ops=False,
+            **kwargs,
+        )
         if not isinstance(hf_config, OmniModuleConfig):
             raise TypeError(
                 f"Module config loaded from {pretrained_model_name_or_path} is a "
                 f"{type(hf_config).__name__}, not a OmniModuleConfig."
             )
-        with _defer_ops_validation():
-            hf_config._apply_composed_overwrites(
-                model_config=model_config,
-                processor_config=processor_config,
-                ops_implementation=entry_ops,
-                base_ops_implementation=base_ops,
-            )
+        hf_config._apply_composed_overwrites(
+            model_config=model_config,
+            processor_config=processor_config,
+            ops_implementation=entry_ops,
+            base_ops_implementation=base_ops,
+        )
         hf_config._apply_ops_overrides(attn_implementation=attention)
         return hf_config
 
@@ -190,6 +189,7 @@ class OmniModuleConfig(VeOmniPretrainedConfig):
             self._set_ops_implementation(
                 {**(base_ops or {}), **(entry_ops or {})},
                 _validate_tree=validate_ops,
+                _validate=validate_ops,
             )
 
 

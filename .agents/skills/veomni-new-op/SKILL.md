@@ -159,6 +159,11 @@ with `get_veomni_config_class` or opt in with `as_veomni_config`.
 Attention's HF accessors alias the same dictionary; do not add synchronization
 fields or repair attention state in builders. See `docs/design/module_config.md`.
 
+Merge all load-time ops layers as dictionaries before validation. The owning
+config caches a standard `OpsImplementationConfig` instance after the final
+selection is known; do not bypass its dataclass constructor or introduce an
+ambient validation context. Caches stay out of saved config dictionaries.
+
 Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
 supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
 `eager` row preserves model-local eager math when present and otherwise

@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass, replace
 
 import torch
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 
 # isort: off

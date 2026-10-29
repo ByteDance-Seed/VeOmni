@@ -57,10 +57,13 @@ def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
 
 
 @pytest.mark.parametrize("impl", ["liger_kernel", "npu"])
-def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(impl):
+def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(monkeypatch, impl):
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", impl == "npu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = impl
-    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{impl}'"):
+    resolved = "torch_npu" if impl == "npu" else impl
+    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{resolved}'"):
         _build_ours(_tiny_config(), ops)
 
 

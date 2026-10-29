@@ -209,10 +209,13 @@ def test_qat_resolves_from_the_installed_ops_config(monkeypatch):
     assert modeling_gpu._qat_is_fp8_blockwise(config.ops_config.qat_implementation)
 
 
-def test_qat_recipe_stays_on_the_constructed_instance():
+def test_qat_recipe_stays_on_the_constructed_instance(monkeypatch):
     """A later config change must not retarget an already-built FP32 module."""
     from tests.models.compare import eager_ops_config
     from tests.models.tiny_configs import tiny_deepseek_v4_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda device: 90)
 
     none_ops = eager_ops_config()
     none_ops.qat_implementation = "none"

@@ -17,7 +17,8 @@ from collections import OrderedDict
 from typing import Any
 
 import torch
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....utils import logging
 from ..minimax_h3_core.cfg_conditioning import (

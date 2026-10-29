@@ -8,7 +8,9 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.pipelines.wan.pipeline_wan import WanPipeline
 from diffusers.video_processor import VideoProcessor
 from torchvision.transforms import InterpolationMode, functional
-from transformers import AutoTokenizer, PreTrainedModel, UMT5EncoderModel
+from transformers import AutoTokenizer, UMT5EncoderModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging

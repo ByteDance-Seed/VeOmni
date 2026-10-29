@@ -99,7 +99,10 @@ def get_model_config(config_path: str, **kwargs):
         if model_type in CONFIG_MAPPING and not config_dict.get("auto_map"):
             config_class = CONFIG_MAPPING[model_type]
         else:
-            config_class = type(AutoConfig.from_pretrained(config_path, **kwargs))
+            schema_kwargs = {
+                key: value for key, value in kwargs.items() if key not in {"ops_implementation", "attn_implementation"}
+            }
+            config_class = type(AutoConfig.from_pretrained(config_path, **schema_kwargs))
     kwargs.pop("trust_remote_code", None)
     # Pass overrides through the selected class's own loader. Composed configs
     # must apply root choices before they load and validate module sidecars.

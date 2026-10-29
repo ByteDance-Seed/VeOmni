@@ -411,15 +411,13 @@ class OmniConfig(VeOmniPretrainedConfig):
         :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
         too, through a weight-free split view of it.
         """
-        from ..configuration_base import _defer_ops_validation
         from .utils.hf_layout import resolve_omni_checkpoint_root
 
         pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
-        with _defer_ops_validation():
-            config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        config = super().from_pretrained(pretrained_model_name_or_path, *model_args, _validate_ops=False, **kwargs)
         root = config.checkpoint_root or str(pretrained_model_name_or_path)
         config.apply_omni_kwargs(omni_kwargs)
         config.load_checkpoint_sidecars(root)
