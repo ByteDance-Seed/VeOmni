@@ -41,7 +41,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from veomni.optim.swap_adamw import SwapAdamW
-from veomni.utils.device import FUSED_ADAMW_DEVICE_TYPES, get_device_type
+from veomni.utils.device import FUSED_ADAMW_DEVICE_TYPES, STREAM_DEVICE_TYPES, get_device_type
 
 
 pytestmark = pytest.mark.skipif(get_device_type() == "cpu", reason="accelerator backend required")
@@ -59,10 +59,11 @@ def test_matches_torch_adamw_step_by_step_on_accelerator():
     ref_opt = torch.optim.AdamW([ref], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, foreach=False)
     swap_opt = SwapAdamW([swapped], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
-    # The module-level skip guarantees an accelerator backend, so this run
-    # must take the stream path; the fused kernel runs on the backends that
-    # register it (others, e.g. MLU, take the elementwise fallback).
-    assert swap_opt._use_streams is True
+    # The module-level skip guarantees an accelerator backend, but only the
+    # backends in ``STREAM_DEVICE_TYPES`` take the stream path (others, e.g.
+    # MLU, copy synchronously); the fused kernel likewise runs only on the
+    # backends that register it.
+    assert swap_opt._use_streams == (device_type in STREAM_DEVICE_TYPES)
     assert swap_opt._use_fused == (device_type in FUSED_ADAMW_DEVICE_TYPES)
 
     for _ in range(5):

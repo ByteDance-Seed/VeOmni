@@ -32,7 +32,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim.swap_adamw import SwapAdamW
-from veomni.utils.device import get_device_type
+from veomni.utils.device import STREAM_DEVICE_TYPES, get_device_type
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -68,9 +68,11 @@ def test_default_construction_resolves_device_dependent_pinning(cpu_mesh):
     # construction with all defaults must not raise (CPU -> pinning disabled).
     param = _swap_param(torch.randn(4, 3), cpu_mesh)
     opt = SwapAdamW([param])
-    on_accelerator = get_device_type() != "cpu"
-    assert opt.pin_memory is on_accelerator
-    assert opt._use_streams is on_accelerator
+    device_type = get_device_type()
+    assert opt.pin_memory is (device_type != "cpu")
+    # Streams are gated on the validated backends, not on "any accelerator":
+    # MLU copies synchronously.
+    assert opt._use_streams is (device_type in STREAM_DEVICE_TYPES)
 
 
 def test_fused_matches_elementwise_on_cpu(cpu_mesh):
