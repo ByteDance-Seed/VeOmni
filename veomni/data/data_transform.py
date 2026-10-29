@@ -385,6 +385,15 @@ def _process_sample_qwen_vl_base(
     return [tokenized_example]
 
 
+@DATA_TRANSFORM_REGISTRY.register("gemma4")
+def process_sample_gemma4(sample, processor, position_id_func, **kwargs):
+    from .multimodal.gemma4 import process_gemma4_sample
+
+    # Gemma4 formats through the native processor, not a Qwen-style template.
+    kwargs.pop("chat_template", None)
+    return process_gemma4_sample(sample, processor, position_id_func, **kwargs)
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_vl")
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_vl")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl")

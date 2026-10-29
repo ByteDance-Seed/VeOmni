@@ -52,6 +52,68 @@ Under FSDP2, missing modalities participate through config-derived dummy
 forwards in a fixed image, video, audio order, with live compute dtypes and
 zero-valued projected graph dependencies.
 
+## VLM training data
+
+`tasks/train_vlm.py` selects the registered `gemma4` transform from the model
+type. Point `model.model_path` (or `model.tokenizer_path`) at a checkpoint with
+its native `Gemma4Processor` assets and chat template. No VeOmni chat-template
+override is needed. The model exposes picklable position and collation hooks;
+positions start at zero for every document before packing.
+
+The transform accepts HF-style `messages`, with inline media paths:
+
+```json
+{"messages": [{"role": "user", "content": [{"type": "image", "image": "image.png"}, {"type": "text", "text": "Describe this image."}]}, {"role": "assistant", "content": [{"type": "text", "text": "A red flower."}]}]}
+```
+
+It also accepts existing source-registered `conversations` preprocessors with
+`images` / `videos` / `audios` sidecars in placeholder order. Video and audio
+items use `type="video"` / `type="audio"` and matching path fields. Inputs may
+mix modalities or contain text only. Assistant targets are text responses;
+`loss_mask=0` on an assistant message excludes that turn from supervision.
+
+HF performs patchification, media-token expansion and tokenization. Native
+image/video/audio token IDs and `mm_token_type_ids` are retained. Assistant-only
+labels are mapped through HF's actual replacement offsets, including the native
+turn terminator, while prompt and modality tokens remain masked. Prefix-rewriting
+templates and samples without a supervised assistant response are rejected.
+
+The model-owned collate hook pads ragged audio time dimensions with zero features
+and false masks. Video frames retain their patch coordinates and are packed as
+independent single-frame vision rows, preserving their original temporal order;
+their encoded features match the native multi-frame layout. Compressed video
+paths/bytes require the existing FFmpeg/torchcodec decoding dependencies. Video
+audio is not extracted implicitly; supply audio inputs explicitly.
+
+Example data settings (with ordinary model/optimizer/training settings):
+
+```yaml
+data:
+  train_path: data/gemma4_train.jsonl
+  max_seq_len: 2048
+  mm_configs:
+    min_frames: 2
+    max_frames: 2
+    processor_kwargs:
+      images_kwargs:
+        max_soft_tokens: 70
+      videos_kwargs:
+        max_soft_tokens: 70
+```
+
+```bash
+torchrun --standalone --nproc_per_node=2 tasks/train_vlm.py path/to/gemma4.yaml
+```
+
+Media budgets must fit `data.max_seq_len`; overlength multimodal samples raise
+instead of truncating tokens away from their features. By default, video fetching
+uses the native processor's frame count for both minimum and maximum frames.
+Keep these equal when processing multiple videos in one sample, as the native
+processor stacks their frame axes. Set `ulysses_size=1` and disable other sequence
+parallelism for this VLM data path. `freeze_vit`, `freeze_audio_tower` and `vit_lr`
+recognize Gemma4's tower layout; freezing the audio tower leaves its separate
+projector trainable.
+
 ## Validation
 
 CPU regressions cover output/loss/gradient parity, packed sample isolation,
@@ -61,6 +123,7 @@ channel-loss interception, audio visibility and dummy graph participation:
 pytest tests/models/test_gemma4.py -q
 pytest tests/models/test_gemma4_numerics.py -q
 pytest tests/models/base/test_auto_registry.py -k gemma4 -q
+pytest tests/data/test_gemma4_data.py tests/trainer/test_vlm_trainer.py -k gemma4 -q
 ```
 
 CPU backend-dispatch tests exercise the real HF/VeOmni Flash adapters up to a

@@ -9,6 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma4ForConditionalGeneration.get_position_id_func
+#      Expose picklable Gemma4 training position IDs to the VLM data transform
+#    - method_override: Gemma4ForConditionalGeneration.get_extra_collate_infos
+#      Declare Gemma4 token and vision-feature packing without Qwen sequence-parallel topology
+#    - method_override: Gemma4ForConditionalGeneration.get_metadata_collate_func
+#      Expose native Gemma4 audio collation through the existing model-owned collator hook
 #    - method_override: Gemma4VisionModel.dummy_forward
 #      Execute a minimal vision forward using live projection dtype for FSDP participation
 #    - method_override: Gemma4AudioModel.dummy_forward
@@ -101,6 +107,35 @@ from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 # ======================================================================
 # [HELPERS] Module-level helpers injected via config.add_helper
 # ======================================================================
+
+
+def gemma4_position_ids(input_ids, **kwargs):
+    """Picklable per-sample positions; each packed document starts at zero."""
+    return {"position_ids": torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)}
+
+
+def collate_gemma4_features(batch, sp_pad):
+    """Consolidate native ragged audio after generic CPU packing.
+
+    Unknown audio fields arrive either stacked by default_collate or as an
+    ordered list when their lengths/counts differ. Pad only the time axis;
+    preserve the native per-audio mask so padded frames produce no soft tokens.
+    """
+    if "input_features" not in batch:
+        return
+    features, masks = list(batch["input_features"]), list(batch["input_features_mask"])
+    if len(features) != len(masks):
+        raise ValueError("Gemma4 audio features and masks must have matching sample counts.")
+    max_length = max(value.shape[1] for value in features)
+    padded_features, padded_masks = [], []
+    for value, mask in zip(features, masks):
+        if value.ndim != 3 or mask.shape != value.shape[:2]:
+            raise ValueError("Gemma4 audio expects [num_audio, time, features] and [num_audio, time] masks.")
+        padding = max_length - value.shape[1]
+        padded_features.append(torch.nn.functional.pad(value, (0, 0, 0, padding)))
+        padded_masks.append(torch.nn.functional.pad(mask.bool(), (0, padding), value=False))
+    batch["input_features"] = torch.cat(padded_features, dim=0)
+    batch["input_features_mask"] = torch.cat(padded_masks, dim=0)
 
 
 def _gemma4_create_mask(
@@ -2675,7 +2710,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma4ForConditionalGeneration
-# Methods patched: __init__, forward
+# Methods patched: get_position_id_func, get_extra_collate_infos, get_metadata_collate_func, __init__, forward
 # ======================================================================
 
 
@@ -2842,6 +2877,23 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
             _ = model_inputs.pop("per_layer_inputs", None)
 
         return model_inputs
+
+    def get_position_id_func(self):
+        return gemma4_position_ids
+
+    def get_extra_collate_infos(self):
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("Gemma4 VLM data packing requires sequence parallelism to be disabled.")
+        return {
+            "mm_token_type_ids": (-1, False, 0, 1),
+            "pixel_values": (0, False, None, None),
+            "pixel_values_videos": (0, False, None, None),
+            "image_position_ids": (0, False, None, None),
+            "video_position_ids": (0, False, None, None),
+        }
+
+    def get_metadata_collate_func(self):
+        return collate_gemma4_features
 
 
 __all__ = [

@@ -53,9 +53,14 @@ def _get_vlm_visual_module(model):
     if visual is not None:
         return visual
 
+    vision_tower = getattr(model, "vision_tower", None)
+    if vision_tower is not None:
+        return vision_tower
+
     inner_model = getattr(model, "model", None)
     if inner_model is not None:
-        return getattr(inner_model, "visual", None)
+        visual = getattr(inner_model, "visual", None)
+        return visual if visual is not None else getattr(inner_model, "vision_tower", None)
 
     return None
 
@@ -186,6 +191,10 @@ class VLMModelRuntime(VeOmniModelRuntime):
                     getattr(self.model.thinker.audio_tower, "proj1", None) or self.model.thinker.audio_tower.proj
                 )
                 audio_proj.requires_grad_(True)
+            elif train_args.freeze_audio_tower and model_config.model_type == "gemma4":
+                audio_tower = self.model.model.audio_tower
+                if audio_tower is not None:
+                    audio_tower.requires_grad_(False)
 
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
@@ -197,7 +206,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if "visual" in name:
+                if "visual" in name or "vision_tower" in name or "embed_vision" in name:
                     vit_params.append(param)
                 else:
                     other_params.append(param)
@@ -246,13 +255,16 @@ class VLMTrainer:
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model.model_config.model_type
+        mm_configs = dict(args.data.mm_configs)
+        if model_type == "gemma4":
+            mm_configs.setdefault("max_seq_len", args.data.max_seq_len)
 
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.model.processor,
             chat_template=self.base.model.chat_template,
             position_id_func=self.base.model.unwrapped_module.get_position_id_func(),
-            **args.data.mm_configs,
+            **mm_configs,
         )
 
     def _build_collate_fn(self):
