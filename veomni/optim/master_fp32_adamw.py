@@ -5,7 +5,10 @@ BF16 parameters are compute copies. The FP32 master is updated directly,
 including decoupled weight decay; only the compute copy is rounded.
 """
 
+import copy
 import math
+from collections import defaultdict
+from itertools import chain
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -79,24 +82,62 @@ class MasterFP32AdamW(Optimizer):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, chunk_size=chunk_size))
 
     def load_state_dict(self, state_dict):
-        preserved = []
-        for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            for key, param in zip(saved_group["params"], group["params"], strict=True):
-                saved = state_dict["state"].get(key, {})
-                if saved and set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
-                    raise RuntimeError("Legacy AdamW checkpoint requires explicit migration")
-                for name in ("master_weight", "exp_avg", "exp_avg_sq"):
-                    if name in saved:
-                        expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
-                        saved[name] = _align_state_to_parameter(saved[name], param)
-                        if saved[name].dtype != expected_dtype or saved[name].shape != param.shape:
-                            raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
-                        preserved.append((param, name, saved[name]))
-        super().load_state_dict(state_dict)
-        # Restore original tensors, not the BF16-rounded copies made by PyTorch.
-        for param, name, tensor in preserved:
-            dtype = torch.float32 if name == "master_weight" else self.moment_dtype
-            self.state[param][name] = tensor.to(device=param.device, dtype=dtype)
+        # PyTorch's default loader casts floating-point state to the compute
+        # parameter dtype, temporarily materializing BF16 copies of FP32 state.
+        # Preserve its group validation, unassigned state and load-hook contract
+        # while keeping our explicitly validated state precision.
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+
+        groups = self.param_groups
+        saved_groups = copy.deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        if any(
+            len(group["params"]) != len(saved["params"]) for group, saved in zip(groups, saved_groups, strict=True)
+        ):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group"
+            )
+        id_map = dict(
+            zip(
+                chain.from_iterable(group["params"] for group in saved_groups),
+                chain.from_iterable(group["params"] for group in groups),
+                strict=True,
+            )
+        )
+        group_by_id = {key: group for group in saved_groups for key in group["params"]}
+        restored = defaultdict(dict)
+        for key, saved in state_dict["state"].items():
+            param = id_map.get(key)
+            if param is None:
+                restored[key] = saved
+                continue
+            saved = dict(saved)
+            if saved and set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
+                raise RuntimeError("Legacy AdamW checkpoint requires explicit migration")
+            for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+                if name in saved:
+                    expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
+                    tensor = _align_state_to_parameter(saved[name], param)
+                    if tensor.dtype != expected_dtype or tensor.shape != param.shape:
+                        raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
+                    saved[name] = tensor.to(device=param.device)
+            group = group_by_id[key]
+            if saved and torch.is_tensor(saved["step"]) and (group.get("capturable") or group.get("fused")):
+                saved["step"] = saved["step"].to(dtype=torch.float32, device=param.device)
+            restored[param] = saved
+
+        for group, saved in zip(groups, saved_groups, strict=True):
+            saved["params"] = group["params"]
+            if "param_names" in group and "param_names" not in saved:
+                saved["param_names"] = group["param_names"]
+        self.__setstate__({"state": restored, "param_groups": saved_groups})
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     @torch.no_grad()
     def step(self, closure=None):
