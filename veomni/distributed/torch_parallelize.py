@@ -475,9 +475,9 @@ def parallelize_model_fsdp2(
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     if mixed_precision.npu_expert_fp32_wgrad:
-        from .npu_moe_precision import require_expert_precision_consensus
+        from .npu_moe_precision import validate_expert_precision_config
 
-        require_expert_precision_consensus(
+        validate_expert_precision_config(
             mixed_precision,
             parallel_state.dp_mode,
             low_precision_reduce_scatter_comm,
@@ -1091,9 +1091,9 @@ def build_parallelize_model(
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     if mixed_precision.npu_expert_fp32_wgrad:
-        from .npu_moe_precision import require_expert_precision_consensus
+        from .npu_moe_precision import validate_expert_precision_config
 
-        require_expert_precision_consensus(
+        validate_expert_precision_config(
             mixed_precision,
             parallel_state.dp_mode,
             low_precision_reduce_scatter_comm,

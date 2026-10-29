@@ -615,10 +615,12 @@ avoids rounding each local expert gradient to BF16 before reduction; it does
 not make the rest of the model's BF16 computation equivalent to FP32.
 
 The current integration requires Qwen4-Exp SiLU `fused_npu`, FSDP2, TP=PP=1,
-FP32 reduction, native communication, and `torch.compile` disabled. The
-common NPU trainer initialization checks the precision config and MoE backend
-across all job ranks before mesh creation; direct runtimes, composed Omni wraps,
-and custom model parallelization without that check reject the opt-in. DPO reference-model isolation and resume
+FP32 reduction, native communication, and `torch.compile` disabled. Each rank
+validates its local precision settings and constructed expert modules before
+FSDP wrapping. As with the rest of the trainer configuration, all ranks must
+use the same settings. Composed Omni wraps and custom model parallelization
+reject the opt-in. MoE LoRA expert wrappers also reject the opt-in because
+their separate kernel is not covered. DPO reference-model isolation and resume
 configuration checks are not wired by this option yet. Keep the setting fixed
 across checkpoint save and resume when comparing training trajectories.
 

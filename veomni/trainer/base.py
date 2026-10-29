@@ -354,13 +354,6 @@ class BaseTrainer(Stateful, ABC):
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
-        if get_device_type() == "npu":
-            from ..distributed.npu_moe_precision import validate_expert_precision_consensus
-
-            # This is unconditional on the flag: otherwise differing rank configs could hang.
-            moe_impl = getattr(getattr(args.model, "ops_implementation", None), "moe_implementation", None)
-            validate_expert_precision_consensus(args.model.accelerator, moe_impl)
-
         # Register ParallelState before seed/determinism env vars. Mesh creation
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
         init_parallel_state_from_config(args.model.accelerator, name="base")

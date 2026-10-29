@@ -27,7 +27,6 @@ from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig
-from veomni.distributed.npu_moe_precision import validate_expert_precision_consensus
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -126,11 +125,6 @@ def run(rank, phase, output_dir, ep, endpoint=None):
     dist.init_process_group(**kwargs)
     try:
         mixed = MixedPrecisionConfig(npu_expert_fp32_wgrad=True)
-        fsdp = SimpleNamespace(mixed_precision=mixed, fsdp_mode="fsdp2", low_precision_reduce_scatter_comm=False)
-        accelerator = SimpleNamespace(
-            fsdp_config=fsdp, tp_size=1, pp_size=1, torch_compile=SimpleNamespace(enable=False)
-        )
-        validate_expert_precision_consensus(accelerator, "fused_npu")
         _init_parallel_state(
             dp_size=2,
             dp_shard_size=2,

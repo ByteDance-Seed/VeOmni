@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.moe_experts.standard.npu import GmmFunction
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -63,6 +64,7 @@ def _cpu_inputs(counts=(6, 7)):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fp32_wgrad_keeps_bf16_forward_and_input_gradient(fake_npu):
     x, master, dy = _cpu_inputs()
     counts = [6, 7]
@@ -77,6 +79,7 @@ def test_fp32_wgrad_keeps_bf16_forward_and_input_gradient(fake_npu):
     assert not torch.equal(param.grad, param.grad.bfloat16().float())
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_bf16_default_and_cast_before_autograd_preserve_legacy_rounding(fake_npu):
     x, master, dy = _cpu_inputs()
     counts = [6, 7]
@@ -86,6 +89,7 @@ def test_bf16_default_and_cast_before_autograd_preserve_legacy_rounding(fake_npu
     assert not torch.equal(param.grad, _reference(x, dy, counts))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("reentrant", [True, False])
 def test_checkpoint_recomputation_keeps_fp32_weight_gradient(fake_npu, reentrant):
     x, master, dy = _cpu_inputs()
@@ -98,6 +102,7 @@ def test_checkpoint_recomputation_keeps_fp32_weight_gradient(fake_npu, reentrant
     assert torch.equal(param.grad, _reference(x, dy, counts))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("counts", [[4, 0, 4], [0, 0, 0]])
 def test_empty_experts_keep_zero_fp32_gradient(fake_npu, counts):
     x, master, dy = _cpu_inputs(counts)
@@ -107,6 +112,7 @@ def test_empty_experts_keep_zero_fp32_gradient(fake_npu, counts):
     assert torch.equal(param.grad, _reference(x, dy, counts))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_bad_compute_or_master_dtype_is_rejected(fake_npu):
     x, master, _ = _cpu_inputs()
     with pytest.raises(ValueError, match="FP32 expert wgrad"):
