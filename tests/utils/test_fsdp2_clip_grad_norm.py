@@ -3,7 +3,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups, _local_pth_sum
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.distributed.fsdp2.clip_grad_norm import (
+    _clip_grads_with_norm,
+    _fsdp_grad_norm_reduce_groups,
+    _local_pth_sum,
+)
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=1))
 
 
 def _parallel_state(
@@ -111,3 +119,33 @@ def test_local_pth_sum_matches_previous_fp32_conversion(dtype, p):
 
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual.cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cpu_shards_use_one_external_global_clip_coefficient(dtype):
+    # The supplied norm includes other ownership buckets/ranks. Recomputing a
+    # local-only norm would produce a different update.
+    params = [torch.nn.Parameter(torch.ones(2, dtype=dtype)), torch.nn.Parameter(torch.ones(1, dtype=dtype))]
+    params[0].grad = torch.tensor([3.0, 4.0], dtype=dtype)
+    params[1].grad = torch.tensor([12.0], dtype=dtype)
+    norm = torch.tensor(26.0)
+    expected = [p.grad.clone().mul_(torch.clamp(13.0 / (norm + 1e-6), max=1.0)) for p in params]
+    _clip_grads_with_norm(params, 13.0, norm)
+    for parameter, reference in zip(params, expected, strict=True):
+        assert torch.equal(parameter.grad, reference)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"cpu_offload_extra_parallel_names": ["ep"], "offload": True},
+        {"cpu_offload_extra_parallel_names": ["ep"], "fsdp_mode": "ddp"},
+        {"cpu_offload_extra_parallel_names": ["ple"]},
+        {"cpu_offload_exclude_module_patterns": ["layers.0.experts"]},
+    ],
+)
+def test_selective_expert_offload_rejects_incompatible_configuration(settings):
+    from veomni.arguments.arguments_types import FSDPConfig
+
+    with pytest.raises(ValueError):
+        FSDPConfig(**settings)

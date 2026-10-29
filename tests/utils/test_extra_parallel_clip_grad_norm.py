@@ -39,6 +39,7 @@ from veomni.utils.device import (
 
 _CI_LAUNCH_4 = LaunchSpec(nproc=4)
 _CI_LAUNCH_8 = LaunchSpec(nproc=8)
+_CI_LAUNCH_2 = LaunchSpec(nproc=2)
 
 
 # from veomni.optim.optimizer import build_optimizer
@@ -127,6 +128,100 @@ class ToyMoeExperts(torch.nn.Module):
 
     def forward(self) -> torch.Tensor:
         return self.experts.sum()
+
+
+class SelectiveOffloadModel(ToyMoeAndEmbedModel):
+    """Two expert groups let one remain resident while the other is offloaded."""
+
+    def __init__(self):
+        super().__init__()
+        self.decoder2 = ToyMoeAndEmbedDecoderLayer()
+
+    def forward(self, x):
+        return super().forward(x) + self.decoder2()
+
+    def init_weights(self):
+        super().init_weights()
+        for parameter in self.decoder2.parameters():
+            parameter.data.fill_(1.0)
+
+    def get_parallel_plan(self):
+        plan = super().get_parallel_plan()
+        plan.extra_parallel_plan["ep"]["decoder2.moe.experts"] = Shard(0)
+        plan.extra_parallel_plan["emb"]["decoder2.embed_tokens.weight"] = Shard(0)
+        plan.extra_parallel_fsdp_no_shard_module["ep"].add("decoder2.moe")
+        plan.extra_parallel_fsdp_no_shard_module["emb"].add("decoder2.embed_tokens")
+        return plan
+
+
+def _run_selective_expert_offload():
+    world = dist.get_world_size()
+    ps = _init_parallel_state(
+        dp_size=world,
+        dp_shard_size=world,
+        extra_parallel_names=("ep", "emb"),
+        extra_parallel_sizes=(world, 1),
+        extra_parallel_placement_innermost=(False, False),
+        dp_mode="fsdp2",
+        name="selective_expert_offload",
+    )
+    device = torch.device(get_device_type(), get_device_id())
+    config = ModelArguments(config_path="test").accelerator.fsdp_config
+
+    def build(selected, resident):
+        return build_parallelize_model(
+            SelectiveOffloadModel(),
+            init_device="meta",
+            weights_path=None,
+            basic_modules=[],
+            mixed_precision=config.mixed_precision,
+            enable_gradient_checkpointing=False,
+            enable_fsdp_offload=False,
+            fsdp_offload_pin_memory=False,
+            cpu_offload_extra_parallel_names=["ep"] if selected else [],
+            cpu_offload_exclude_module_patterns=resident,
+            broadcast_model_weights_from_rank0=False,
+        )
+
+    def local(value):
+        return value.to_local() if isinstance(value, DTensor) else value
+
+    with use_parallel_state(ps):
+        for resident in ([], ["decoder.moe"]):
+            reference, candidate = build(False, []), build(True, resident)
+            assert candidate._cpu_offload_resident_module_fqns == tuple(resident)
+            for name, parameter in candidate.named_parameters():
+                offloaded = (
+                    name in ("decoder.moe.experts", "decoder2.moe.experts")
+                    and name.removesuffix(".experts") not in resident
+                )
+                assert local(parameter).device.type == ("cpu" if offloaded else device.type)
+            # Register the real EP/non-EP ownership buckets used by clipping.
+            optimizers = [
+                build_optimizer(model, lr=0.125, weight_decay=0.0, fused=False, optimizer_type="adamw")
+                for model in (reference, candidate)
+            ]
+            for _step in range(2):
+                for scale in (1.0, 2.0, 0.5):
+                    x = torch.ones(16, device=device)
+                    left, right = reference(x) * scale, candidate(x) * scale
+                    torch.testing.assert_close(left, right, rtol=0, atol=0)
+                    left.backward()
+                    right.backward()
+                get_torch_device().synchronize()
+                for left, right in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    torch.testing.assert_close(local(left.grad).cpu(), local(right.grad).cpu(), rtol=0, atol=0)
+                norms = [veomni_clip_grad_norm(model, 0.5) for model in (reference, candidate)]
+                torch.testing.assert_close(norms[0], norms[1], rtol=1e-6, atol=1e-6)
+                for optimizer in optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                for left, right in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    torch.testing.assert_close(local(left).cpu(), local(right).cpu(), rtol=1e-6, atol=1e-7)
+            del reference, candidate, optimizers
+            gc.collect()
+        with pytest.raises(ValueError, match="did not match selected CPU-offload modules"):
+            build(True, ["missing.experts"])
 
 
 # (label, ep_size, emb_size, dp_replicate_size, cpu_offload)
@@ -335,7 +430,7 @@ def _run_clip_scenario(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", choices=["fsdp2_4gpu", "hsdp_8gpu"], required=True)
+    parser.add_argument("--suite", choices=["fsdp2_4gpu", "hsdp_8gpu", "selective_offload"], required=True)
     parser.add_argument("--reverse-scenarios", action="store_true")
     cli_args = parser.parse_args()
 
@@ -344,7 +439,9 @@ def main():
     dist.init_process_group(backend=get_dist_comm_backend())
     world_size = dist.get_world_size()
 
-    if cli_args.suite == "fsdp2_4gpu":
+    if cli_args.suite == "selective_offload":
+        scenarios = []
+    elif cli_args.suite == "fsdp2_4gpu":
         scenarios = list(_FSDP2_4GPU_SCENARIOS)
     else:
         scenarios = [
@@ -356,6 +453,8 @@ def main():
         scenarios = list(reversed(scenarios))
 
     try:
+        if cli_args.suite == "selective_offload":
+            _run_selective_expert_offload()
         for label, ep_size, emb_size, dp_replicate_size, cpu_offload in scenarios:
             _run_clip_scenario(
                 label=label,
@@ -393,6 +492,11 @@ def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = 
 def test_clip_grad_norm_fsdp2_4gpu():
     """Fused 4-rank FSDP2 worker covering no-extra, EP2, EP4, emb4, and EP2+emb4 across no_offload/cpu_offload."""
     _run_clip_grad_norm_suite("fsdp2_4gpu", nproc=_CI_LAUNCH_4.nproc)
+
+
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
+def test_selective_expert_cpu_offload_preserves_accumulation_and_update():
+    _run_clip_grad_norm_suite("selective_offload", nproc=_CI_LAUNCH_2.nproc)
 
 
 # ---------------------------------------------------------------------------
