@@ -216,6 +216,10 @@ def _persistent_optimizer_rows(model, optimizer):
                     continue
                 if name in rows:
                     raise RuntimeError(f"Duplicate optimizer parameter for persistent shard {name}")
+                if not param.requires_grad:
+                    raise RuntimeError(
+                        f"Cannot checkpoint frozen persistent optimizer parameter {name}; rebuild the optimizer"
+                    )
                 layout = json.loads(group.get("qwen38_ple_step_layout", "null"))
                 owner_grid = (
                     group.get("qwen38_ple_lookup") is True
@@ -230,11 +234,6 @@ def _persistent_optimizer_rows(model, optimizer):
                     raise RuntimeError("Persistent-shard optimizer checkpoints do not support state-dict hooks")
                 if owner_grid:
                     rows[name] = ("owner-grid", True, None)
-                    continue
-                if not param.requires_grad and not state:
-                    if not leaf.state:
-                        raise RuntimeError("Cannot save an empty persistent scalar optimizer without initializing it")
-                    rows[name] = ("inactive", False, None)
                     continue
                 local = param.to_local() if isinstance(param, DTensor) else param
                 if not state and (local.numel() or not leaf.state):
@@ -264,21 +263,99 @@ def _persistent_optimizer_rows(model, optimizer):
     return rows
 
 
+def _checkpoint_group_has_complete_replica(mesh, placements, ranks):
+    """Whether the group covers every distinct shard, across any replicas."""
+    grid = mesh.mesh
+    if len(placements) != grid.ndim:
+        raise RuntimeError("Checkpoint mesh placements do not match mesh dimensionality")
+    flat_ranks = grid.reshape(-1).tolist()
+    if set(flat_ranks).issubset(ranks):
+        return True
+    shard_axes = [axis for axis, placement in enumerate(placements) if not isinstance(placement, Replicate)]
+    strides = [math.prod(grid.shape[axis + 1 :]) for axis in range(grid.ndim)]
+    covered = {
+        tuple((index // strides[axis]) % grid.shape[axis] for axis in shard_axes)
+        for index, rank in enumerate(flat_ranks)
+        if rank in ranks
+    }
+    return len(covered) == math.prod(grid.shape[axis] for axis in shard_axes)
+
+
+def _validate_persistent_optimizer_ownership(model, optimizer, group=None, *, coordinated=False, check_coverage=True):
+    """Check frozen targets and ensure the DCP group covers each persistent mesh."""
+    error = None
+    try:
+        specs = getattr(model, "_fqn2spec_info", None) or {}
+        persistent = {
+            name for name, spec in specs.items() if getattr(spec, "persistent_fsdp_shard_dim", None) is not None
+        }
+        names = {id(param): name for name, param in model.named_parameters() if name in specs}
+        params = [
+            param
+            for leaf in _iter_optimizer_leaves(optimizer)
+            for param_group in leaf.param_groups
+            for param in param_group["params"]
+            if id(param) in names
+        ]
+        if dist.is_initialized() and group is not None and not coordinated:
+            raise RuntimeError("Optimizer checkpoints with an explicit group require coordinated DCP validation")
+        if (
+            dist.is_initialized()
+            and dist.get_world_size() > 1
+            and not coordinated
+            and any(names[id(param)] in persistent for param in params)
+        ):
+            raise RuntimeError("Persistent optimizer checkpoints require coordinated DCP validation")
+        ranks = None
+        if dist.is_initialized():
+            ranks = set(range(dist.get_world_size())) if group is None else set(dist.get_process_group_ranks(group))
+        coverage = {}
+        for param in params:
+            name = names[id(param)]
+            if name in persistent and not param.requires_grad:
+                raise RuntimeError(
+                    f"Cannot checkpoint frozen persistent optimizer parameter {name}; rebuild the optimizer"
+                )
+            if ranks is not None and check_coverage:
+                spec = specs[name]
+                mesh = (
+                    getattr(spec, "para_fsdp_mesh", None)
+                    if isinstance(getattr(spec, "placement", None), Shard)
+                    else None
+                )
+                if mesh is not None:
+                    # ParallelPlan uses (... replica, FSDP, ExtraParallel).
+                    placements = [Replicate()] * max(0, mesh.ndim - 2) + [Shard(0)] * min(2, mesh.ndim)
+                elif isinstance(param, DTensor):
+                    mesh, placements = param.device_mesh, param.placements
+                else:
+                    continue
+                key = (id(mesh), tuple(isinstance(placement, Replicate) for placement in placements))
+                if key not in coverage:
+                    coverage[key] = _checkpoint_group_has_complete_replica(mesh, placements, ranks)
+                if not coverage[key]:
+                    raise RuntimeError(f"DCP group does not cover extra-parallel parameter owners for {name}")
+    except BaseException as exc:
+        error = exc
+    if coordinated:
+        raise_if_any_rank_failed(error, "validating persistent optimizer ownership", group=group)
+    elif error is not None:
+        raise error
+
+
 def _validate_persistent_optimizer_steps(model, optimizer, group=None, *, coordinated=False):
     """Guard scalar owner steps without introducing implicit process groups."""
-    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
-        return {}
     rows, error = {}, None
     try:
         rows = _persistent_optimizer_rows(model, optimizer)
-        if not coordinated and rows:
+        if not coordinated and rows and dist.is_initialized() and dist.get_world_size() > 1:
             raise RuntimeError(
                 "Saving persistent-shard optimizer steps requires coordinated DCP validation; "
                 "use DistributedCheckpointer or explicitly supply the DCP process group"
             )
     except BaseException as exc:
         error = exc
-    if not coordinated:
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1 or not coordinated:
         if error is not None:
             raise error
         return rows
@@ -346,9 +423,16 @@ def _validate_muon_owner_state(model, optimizer, group=None):
     """Reject rank-dependent lazy states that the DCP schema cannot represent."""
     if not dist.is_initialized() or dist.get_world_size(group) <= 1:
         return
-    local_rows, error = {}, None
+    leaves, error = (), None
     try:
         leaves = tuple(_iter_optimizer_leaves(optimizer))
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "enumerating Muon optimizer leaves", group=group)
+    if not any_rank_failed(any(getattr(leaf, "requires_exact_recipe", False) for leaf in leaves), group=group):
+        return
+    local_rows, error = {}, None
+    try:
         if any(
             getattr(leaf, key, None)
             for leaf in leaves
@@ -367,6 +451,10 @@ def _validate_muon_owner_state(model, optimizer, group=None):
                     name = names.get(id(param))
                     if name is None or name in local_rows:
                         raise RuntimeError("Cannot identify a unique Muon checkpoint optimizer parameter")
+                    if not param.requires_grad:
+                        raise RuntimeError(
+                            f"Cannot checkpoint frozen Muon optimizer parameter {name}; rebuild the optimizer"
+                        )
                     state = leaf.state.get(param, {})
                     owner_grid = (
                         param_group.get("qwen38_ple_lookup") is True
@@ -416,6 +504,38 @@ def _validate_muon_owner_state(model, optimizer, group=None):
             or (writers and contributors and contributors[0] is None)
         ):
             raise RuntimeError(f"DCP cannot preserve differing Muon owner state/step for {name}")
+
+
+def _validate_exact_optimizer_ownership(optimizer, group=None, *, coordinated=False, check_coverage=True):
+    """Reject frozen restore targets and incomplete distributed owner groups."""
+    error = None
+    try:
+        leaves = [leaf for leaf in _iter_optimizer_leaves(optimizer) if getattr(leaf, "requires_exact_recipe", False)]
+        if dist.is_initialized() and dist.get_world_size() > 1 and not coordinated and leaves:
+            raise RuntimeError("Distributed Muon checkpoints require coordinated DCP validation")
+        ranks = None
+        if dist.is_initialized():
+            ranks = set(range(dist.get_world_size())) if group is None else set(dist.get_process_group_ranks(group))
+        coverage = {}
+        for leaf in leaves:
+            for param_group in leaf.param_groups:
+                for param in param_group["params"]:
+                    if not param.requires_grad:
+                        raise RuntimeError("Cannot checkpoint frozen Muon optimizer parameters; rebuild the optimizer")
+                    if ranks is not None and check_coverage and isinstance(param, DTensor):
+                        key = (id(param.device_mesh), tuple(isinstance(p, Replicate) for p in param.placements))
+                        if key not in coverage:
+                            coverage[key] = _checkpoint_group_has_complete_replica(
+                                param.device_mesh, param.placements, ranks
+                            )
+                        if not coverage[key]:
+                            raise RuntimeError("DCP group does not cover Muon optimizer parameter owners")
+    except BaseException as exc:
+        error = exc
+    if coordinated:
+        raise_if_any_rank_failed(error, "validating Muon optimizer ownership", group=group)
+    elif error is not None:
+        raise error
 
 
 @contextmanager
@@ -918,8 +1038,8 @@ class OptimizerState(Stateful):
             avoiding synthetic zero state for unused parameters (e.g. unused
             MoE experts) in the checkpoint.
         coordinated_group_validation: opt in only when every rank in the DCP
-            save group calls this wrapper collectively. Required for saving
-            persistent extra-parallel optimizer states on multiple ranks.
+            checkpoint group calls this wrapper collectively. Required for
+            persistent extra-parallel state and explicit process groups.
         coordinated_group: the same process group passed to ``dcp.save``;
             ``None`` denotes the default world group.
 
@@ -928,6 +1048,10 @@ class OptimizerState(Stateful):
     the fresh optimizer's default lazy state; unused parameters can be absent.
     A zero-step sparse MultiOptimizer checkpoint records an explicit marker, so
     an entirely empty optimizer state restores lazy instead of being rejected.
+
+    Persistent scalar-owner checkpoints reject uninitialized or differing owner
+    states. All persistent parameters owned by the optimizer must be trainable;
+    rebuild the optimizer after changing which persistent parameters train.
     """
 
     def __init__(
@@ -952,13 +1076,23 @@ class OptimizerState(Stateful):
         self._coordinated_group = coordinated_group
 
     def state_dict(self):
+        _validate_persistent_optimizer_ownership(
+            self.model,
+            self.optimizer,
+            self._coordinated_group,
+            coordinated=self._coordinated_group_validation,
+            check_coverage=not self._load,
+        )
+        _validate_exact_optimizer_ownership(
+            self.optimizer,
+            self._coordinated_group,
+            coordinated=self._coordinated_group_validation,
+            check_coverage=not self._load,
+        )
         rows = {}
         if not self._load:
-            if dist.is_initialized() and dist.get_world_size(self._coordinated_group) > 1:
-                if _requires_exact_optimizer_recipe(self.optimizer):
-                    if not self._coordinated_group_validation:
-                        raise RuntimeError("Distributed Muon checkpoint save requires coordinated DCP validation")
-                    _validate_muon_owner_state(self.model, self.optimizer, self._coordinated_group)
+            if self._coordinated_group_validation:
+                _validate_muon_owner_state(self.model, self.optimizer, self._coordinated_group)
             rows = _validate_persistent_optimizer_steps(
                 self.model,
                 self.optimizer,
@@ -1841,6 +1975,8 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
                 load=True,
+                coordinated_group_validation=True,
+                coordinated_group=process_group,
             )
 
         wants_optimizer = state.get("optimizer") is not None

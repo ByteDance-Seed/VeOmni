@@ -5,9 +5,13 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import OptimizerState, _ModelStrictLoadPlanner
 from veomni.optim.optimizer import MultiOptimizer
 from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _make_model_and_optimizer():
@@ -65,6 +69,29 @@ def test_dcp_preserves_dormant_muon_recipe_without_creating_state(tmp_path):
             torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
 
 
+def test_frozen_muon_parameter_save_fails_before_state_is_lost():
+    model, optimizer = _make_model_and_optimizer()
+    model.first.down_proj.weight.grad = torch.ones_like(model.first.down_proj.weight)
+    optimizer.step()
+    model.first.down_proj.weight.requires_grad_(False)
+    wrapper = OptimizerState(model, optimizer, parallel_state=SimpleNamespace(dp_mode="ddp"))
+    with pytest.raises(RuntimeError, match="frozen Muon optimizer parameters"):
+        wrapper.state_dict()
+
+
+def test_frozen_muon_restore_target_is_rejected(tmp_path):
+    model, optimizer = _make_model_and_optimizer()
+    model.first.down_proj.weight.grad = torch.ones_like(model.first.down_proj.weight)
+    optimizer.step()
+    ps = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=ps)}, checkpoint_id=tmp_path)
+    target, target_optimizer = _make_model_and_optimizer()
+    target.first.down_proj.weight.requires_grad_(False)
+    wrapper = OptimizerState(target, target_optimizer, parallel_state=ps, load=True)
+    with pytest.raises(RuntimeError, match="frozen Muon optimizer parameters"):
+        dcp.load({"optimizer": wrapper}, checkpoint_id=tmp_path)
+
+
 def _global_marker_worker(rank, rendezvous, checkpoint_dir, all_dormant):
     import torch.distributed as dist
 
@@ -94,6 +121,7 @@ def _global_marker_worker(rank, rendezvous, checkpoint_dir, all_dormant):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_zero_optimizer_marker_uses_all_ranks(tmp_path):
     for all_dormant in (False, True):
         mp.start_processes(
@@ -124,10 +152,44 @@ def _rank_dependent_muon_state_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_rank_dependent_muon_state_fails_closed(tmp_path):
     mp.start_processes(
         _rank_dependent_muon_state_worker,
         args=(str(tmp_path / "rdzv-lazy"),),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
+def _ordinary_adam_hook_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+        calls = []
+        hook = optimizer.register_state_dict_pre_hook(lambda _: calls.append(True))
+        wrapper = OptimizerState(
+            model, optimizer, parallel_state=SimpleNamespace(dp_mode="ddp"), coordinated_group_validation=True
+        )
+        wrapper.state_dict()
+        assert calls == [True]
+        hook.remove()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_ordinary_adam_state_dict_hooks_are_preserved(tmp_path):
+    mp.start_processes(
+        _ordinary_adam_hook_worker,
+        args=(str(tmp_path / "rdzv-hook"),),
         nprocs=2,
         join=True,
         start_method="fork",
@@ -175,7 +237,11 @@ def _empty_ple_owner_worker(rank, rendezvous, checkpoint_dir):
 
         resumed_model, resumed_leaf, resumed_optimizer = make()
         dcp.load(
-            {"optimizer": OptimizerState(resumed_model, resumed_optimizer, parallel_state=ps, load=True)},
+            {
+                "optimizer": OptimizerState(
+                    resumed_model, resumed_optimizer, parallel_state=ps, load=True, coordinated_group_validation=True
+                )
+            },
             checkpoint_id=checkpoint_dir,
             planner=_ModelStrictLoadPlanner(False, True, True, optimizer=resumed_optimizer),
         )
@@ -185,6 +251,7 @@ def _empty_ple_owner_worker(rank, rendezvous, checkpoint_dir):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_empty_ple_owner_checkpoint_keeps_optimizer_lazy(tmp_path):
     mp.start_processes(
         _empty_ple_owner_worker,
