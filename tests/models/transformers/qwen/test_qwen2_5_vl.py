@@ -17,9 +17,10 @@
 Direct-import the generated class. Compare a toy model against Hugging Face on
 the text-only, image+text, and video+text paths.
 
-This file owns non-default dummy geometry and CPU/Gloo SP execution. The shared
-vision suite in tests/distributed/test_dummy_forward.py owns standard geometry
-and accelerator rejection coverage.
+This file owns Qwen2.5 regular vision forward, non-default dummy geometry, and
+CPU/Gloo SP execution. The shared vision suite in
+tests/distributed/test_dummy_forward.py owns standard geometry and accelerator
+rejection coverage.
 """
 
 from __future__ import annotations
@@ -89,6 +90,32 @@ def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch
         output = model.dummy_forward().pooler_output
         assert torch.isfinite(output).all()
         (output.float().mean() * 0.0).backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, name
+                assert torch.isfinite(param.grad).all(), name
+
+
+@pytest.mark.parametrize("attention", ["eager", "veomni_sdpa"])
+def test_qwen2_5_vl_regular_vision_forward(attention):
+    from veomni.models.transformers.qwen2_5vl.generated import patched_modeling_qwen2_5_vl_gpu as module
+
+    config = _tiny_config().vision_config
+    config._attn_implementation = attention
+    ops = eager_ops_config()
+    ops.attn_implementation = attention
+    with ops_config_scope(ops):
+        torch.manual_seed(177)
+        model = module.Qwen2_5_VisionTransformerPretrainedModel(config).train()
+        merge = config.spatial_merge_size
+        patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
+        pixels = torch.randn(merge * merge, patch_dim, requires_grad=True)
+        grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.long)
+        metadata = module._qwen2_5_vit_metadata(grid_thw.tolist(), 0, model.window_size, merge, model.patch_size)
+        output = model(pixels, grid_thw, return_dict=True, vit_metadata=metadata).pooler_output
+        assert torch.isfinite(output).all()
+        output.float().square().mean().backward()
+        assert pixels.grad is not None and torch.isfinite(pixels.grad).all()
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, name
