@@ -139,11 +139,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
     """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
 
     def __init__(self, config=None):
-        impl = (
-            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
-            if config is not None
-            else "veomni_sdpa"
-        )
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self._use_flash = impl in _WAN_FLASH_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)

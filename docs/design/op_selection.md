@@ -60,10 +60,11 @@ says what a row calls, so an Ascend row is `torch_npu`, `triton` for vendored
 Triton-Ascend, `cann` for `cann_ops_transformer`, or `fla_npu`. PyTorch math
 that merely runs on NPU is `eager`. MoE keeps `fused_npu`, in line with the
 other `fused_*` group-gemm backends. The
-`unweighted` RMSNorm variant (Flux, LTX-2.3, DeepSeek-V4) resolves
-`rms_norm_implementation: torch_npu` to `eager`, while the weighted variants keep
-their `torch_npu` rows. Any other variant without a row for the selected value
-fails at model build and lists the registered implementations.
+`unweighted` RMSNorm variant (Flux, LTX-2.3, DeepSeek-V4) supports only `eager`
+on NPU. Leave `rms_norm_implementation` unset or select `eager`; explicit
+`torch_npu` (including the deprecated `npu` alias) fails at module construction.
+Any variant without a row for the selected value fails and lists its registered
+implementations.
 
 **MLU `liger_kernel` rows require the Cambricon liger build.** `rms_norm`,
 `rope`, `swiglu_mlp`, and `cross_entropy_loss` register `liger_kernel`
@@ -153,7 +154,7 @@ model:
 
 | Public value | Implementation | Sequence Parallel | Requirements |
 |-------|--------|:-:|---|
-| `eager` | PyTorch | No | — |
+| `eager` | Model-local PyTorch eager; otherwise `veomni_sdpa` | Yes for the SDPA path | — |
 | `sdpa` | `F.scaled_dot_product_attention` | Yes after rewrite to `veomni_sdpa` | — |
 | `flash_attention_2` | Flash Attention v2 | Yes after rewrite | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
@@ -191,11 +192,12 @@ ROCm-only GPU requirement and does not resolve on NVIDIA, Ascend, or MLU. Both
 `veomni_flash_attention_aiter` name are rejected on Ascend before Transformers
 can select its NPU attention path.
 
-`eager` resolves the modeling file's own `eager_attention_forward`, as in
-Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so
-they read the field with `config.ops_config.resolve_impl("attn_implementation",
-eager_as="veomni_sdpa")`. Their masked fallback for a mask-less backend is
-also `veomni_sdpa`.
+The registered `eager` row uses the modeling file's `eager_attention_forward`
+when present, preserving model-specific math such as softcap and attention
+sinks. For modules without one (Flux, Qwen-Image, LTX-2.3, MiniMax-H3), that row
+forwards to `veomni_sdpa`, including its mask, packed-sequence, and Ulysses
+handling. Modeling reads `config.ops_config.attn_implementation` directly.
+Masked calls with a mask-less backend still use a separate `veomni_sdpa` handle.
 
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
@@ -415,7 +417,7 @@ model:
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package |
-| `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; `unweighted` resolves `npu` to `eager` | `torch_npu` |
+| `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; rejected for `unweighted` | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
 

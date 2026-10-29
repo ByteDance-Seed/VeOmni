@@ -40,11 +40,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             dim,
             dim_out=dim,
         )
-        unweighted_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
-            if config is not None
-            else "eager"
-        )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def forward(
@@ -120,11 +116,7 @@ class Embeddings1DConnector(torch.nn.Module):
             self.learnable_registers = torch.nn.Parameter(
                 torch.rand(self.num_learnable_registers, self.inner_dim, dtype=torch.bfloat16) * 2.0 - 1.0
             )
-        unweighted_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
-            if config is not None
-            else "eager"
-        )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def _replace_padded_with_learnable_registers(

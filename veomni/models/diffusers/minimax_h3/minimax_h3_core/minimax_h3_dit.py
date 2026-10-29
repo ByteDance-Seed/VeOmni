@@ -156,11 +156,7 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps, config=config)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
-        impl = (
-            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
-            if config is not None
-            else "veomni_sdpa"
-        )
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         if is_flash_attn_impl(impl):
             impl = "veomni_sdpa"
         bind_minimax_attention(self, is_causal=False, impl=impl, config=config)

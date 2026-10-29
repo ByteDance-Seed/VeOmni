@@ -193,12 +193,6 @@ class _ModelCase:
     # ops selection stamped before HF construction. Families that keep HF attn
     # as eager leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
     stamps_hf_attn: bool = True
-    # Families without a local ``eager_attention_forward`` select ``veomni_sdpa`` for ``eager``.
-    eager_attn_impl: str = "eager"
-
-
-def _expected_eager_impl(model_case: _ModelCase, op: str) -> str:
-    return model_case.eager_attn_impl if op == "attention" else "eager"
 
 
 # NPU glm_moe_dsa indexer keeps Hugging Face scoring and does not bind
@@ -261,7 +255,6 @@ _MODEL_CASES = (
         ),
         isolation_op_path="blocks.0.attn.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
         config_factory=_tiny_flux_config,
         architectures=("FluxModel",),
         has_registered_config=True,
@@ -578,7 +571,6 @@ _MODEL_CASES = (
         ),
         isolation_op_path="transformer_blocks.0.attn1.attention_function.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="MiniMaxH3DiTModel",
@@ -594,7 +586,6 @@ _MODEL_CASES = (
         ),
         isolation_op_path="dit.blocks.0.attn.q_norm.veomni_rms_norm",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",
@@ -606,7 +597,6 @@ _MODEL_CASES = (
         eager_ops=(("transformer_blocks.0.attn.processor.veomni_attn", "attention"),),
         isolation_op_path="transformer_blocks.0.attn.processor.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="wan",
@@ -681,9 +671,7 @@ def test_diffusers_constructor_attention_override_precedes_hf_init(
     assert config._attn_implementation == config.ops_config.attn_implementation == expected_attention
     assert "_attn_implementation_internal" not in vars(config)
     attention_path = model_case.isolation_op_path or "blocks.0.attn1.processor.veomni_attn"
-    assert attrgetter(attention_path)(model).impl == (
-        "veomni_sdpa" if expected_attention == "eager" else expected_attention
-    )
+    assert attrgetter(attention_path)(model).impl == expected_attention
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
@@ -725,7 +713,7 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
-        assert op.impl == _expected_eager_impl(model_case, expected_op), path
+        assert op.impl == "eager", path
     if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
         assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
@@ -785,7 +773,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
 
     eager = construct(eager_config)
     selected_op = attrgetter(selected_path)
-    assert selected_op(eager).impl == _expected_eager_impl(model_case, selected_op_name)
+    assert selected_op(eager).impl == "eager"
     eager_bindings = _op_bindings(eager, selected_path)
     field, alternate_impl = _ALTERNATE_OP_IMPLS[selected_op(eager).op]
     alternate_config = eager_ops_config()

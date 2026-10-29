@@ -62,7 +62,7 @@ def _build_model(device, gradient_checkpointing):
         ffn_dim=64,
         num_layers=2,
         rope_max_seq_len=64,
-        ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
+        ops_implementation=make_eager_ops_config(),
     )
     torch.manual_seed(0)
     model = WanTransformer3DModel(config).to(device)

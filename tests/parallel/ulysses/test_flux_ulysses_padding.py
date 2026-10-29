@@ -41,9 +41,7 @@ CASES = {
 
 def _build_model(device):
     with torch.device("meta"):
-        model = FluxModel(
-            FluxConfig(num_blocks=1, ops_implementation=make_eager_ops_config(attn_implementation="sdpa"))
-        )
+        model = FluxModel(FluxConfig(num_blocks=1, ops_implementation=make_eager_ops_config()))
     model.single_blocks = model.single_blocks[:1]
     model = model.to_empty(device=device).float()
     gen = torch.Generator().manual_seed(0)
@@ -87,7 +85,7 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
-    # Flash kernels only accept FP16/BF16, so this FP32 comparison explicitly selects SDPA.
+    # Flux's registered eager attention uses the SP-aware SDPA path for this FP32 comparison.
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         group = self._get_process_group()

@@ -17,11 +17,7 @@ from veomni.ops import VeomniOp
 def bind_minimax_attention(module: nn.Module, *, is_causal: bool, impl: str | None = None, config=None) -> None:
     """Attach the configured ``attention/standard`` handle and HF interface attrs."""
     if impl is None:
-        impl = (
-            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
-            if config is not None
-            else "veomni_sdpa"
-        )
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
     num_heads = module.num_heads
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.is_causal = is_causal
@@ -65,5 +61,5 @@ def is_flash_attn_impl(impl: str) -> bool:
 
 
 def is_sdpa_attn_impl(impl: str) -> bool:
-    """True when the selected attention impl is PyTorch SDPA."""
-    return impl in ("sdpa", "veomni_sdpa")
+    """True when MiniMax attention uses the SDPA path, including its eager row."""
+    return impl in ("eager", "sdpa", "veomni_sdpa")

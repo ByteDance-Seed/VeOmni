@@ -70,7 +70,7 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
-_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
 
 
 class QwenImageAttentionKernelModule:
@@ -156,11 +156,7 @@ class QwenImageSPAttnProcessor:
     """
 
     def __init__(self, config=None):
-        impl = (
-            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
-            if config is not None
-            else "veomni_sdpa"
-        )
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
             self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")

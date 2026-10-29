@@ -158,3 +158,8 @@ never patched globally; standalone module tests must construct an adapted config
 with `get_veomni_config_class` or opt in with `as_veomni_config`.
 Attention's HF accessors alias the same dictionary; do not add synchronization
 fields or repair attention state in builders. See `docs/design/module_config.md`.
+
+Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
+supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
+`eager` row preserves model-local eager math when present and otherwise
+forwards to `veomni_sdpa`; consumers do not remap eager themselves.

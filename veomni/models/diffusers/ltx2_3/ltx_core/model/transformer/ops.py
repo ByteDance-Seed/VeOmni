@@ -49,11 +49,7 @@ class AdaZeroCallable(Protocol):
 
 class PytorchAdaZeroFunction(AdaZeroCallable):
     def __init__(self, config=None) -> None:
-        unweighted_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
-            if config is not None
-            else "eager"
-        )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def __call__(
@@ -80,11 +76,7 @@ class PostSACallable(Protocol):
 class PytorchPostSAFunction(PostSACallable):
     def __init__(self, config=None) -> None:
         std_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
-        unweighted_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
-            if config is not None
-            else "eager"
-        )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm = VeomniOp("rms_norm", "standard", std_impl)
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 

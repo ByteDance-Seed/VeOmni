@@ -266,17 +266,13 @@ def init_weights_on_device(device=None, include_buffers: bool = False):
             setattr(torch, torch_function_name, old_torch_function)
 
 
-_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
 
 
 def bind_flux_attention(module: torch.nn.Module, impl: str | None = None, config=None) -> None:
     """Attach configured ``attention/standard`` plus a one-time SDPA mask fallback."""
     if impl is None:
-        impl = (
-            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
-            if config is not None
-            else "veomni_sdpa"
-        )
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.veomni_attn_masked = (
         module.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")

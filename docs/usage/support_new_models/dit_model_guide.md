@@ -648,10 +648,10 @@ For diffusers models this is done via an **attention processor** installed with
 
 ### Pattern (uses `VeomniOp("attention", "standard", ...)` from `config.ops_config`)
 
-1. In `YourSPAttnProcessor.__init__(self, config=None)`, resolve the attention
-   implementation from `config.ops_config` (mapping `"eager"` to `"veomni_sdpa"`
-   when the DiT family has no local `eager_attention_forward`) and bind an
-   instance-local `VeomniOp` handle:
+1. In `YourSPAttnProcessor.__init__(self, config=None)`, read the attention
+   implementation from `config.ops_config` and bind an instance-local `VeomniOp`
+   handle. The registered `eager` row forwards to `veomni_sdpa` when the module's
+   defining file has no local `eager_attention_forward`:
 
    ```python
    from types import SimpleNamespace
@@ -660,7 +660,7 @@ For diffusers models this is done via an **attention processor** installed with
    class YourSPAttnProcessor:
        def __init__(self, config=None):
            impl = (
-               config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+               config.ops_config.attn_implementation
                if config is not None
                else "veomni_sdpa"
            )

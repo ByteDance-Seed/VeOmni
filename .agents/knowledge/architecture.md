@@ -206,6 +206,11 @@ only that config, while explicit scalar/public writes propagate recursively.
 For HF modeling, the loader copies adapter configs back to native HF types before
 AutoModel dispatch. See `docs/design/module_config.md` for lifecycle contracts.
 
+Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attention
+`eager` row uses model-local eager math when present and otherwise forwards to
+`veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
+`torch_npu`/`npu` is rejected rather than remapped across variants.
+
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as
 `ops_implementation`; changing the config field would break existing CLI

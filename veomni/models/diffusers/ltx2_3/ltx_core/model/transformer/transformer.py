@@ -102,11 +102,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if ops is None:
             ops = TransformerOpsConfig.from_functions(config=config)
-        unweighted_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
-            if config is not None
-            else "eager"
-        )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
         self.ada_zero_function = ops.ada_zero_function
         self.post_sa_function = ops.post_sa_function

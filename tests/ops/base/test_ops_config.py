@@ -25,19 +25,7 @@ from veomni.models.configuration_base import get_veomni_config_class
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def test_resolve_impl_returns_field_and_remaps_eager_as():
-    from veomni.arguments import OpsImplementationConfig
-
-    cfg = OpsImplementationConfig.from_dict(
-        {"attn_implementation": "eager", "cross_entropy_loss_implementation": "chunk_loss"},
-        validate=False,
-    )
-    assert cfg.resolve_impl("cross_entropy_loss_implementation") == "chunk_loss"
-    assert cfg.resolve_impl("attn_implementation") == "eager"
-    assert cfg.resolve_impl("attn_implementation", eager_as="veomni_sdpa") == "veomni_sdpa"
-
-
-def test_resolve_impl_returns_none_for_unset_field_and_veomni_op_resolves_variant_default(monkeypatch):
+def test_unset_field_uses_registry_variant_default(monkeypatch):
     from veomni.arguments import OpsImplementationConfig
     from veomni.ops import VeomniOp
 
@@ -48,31 +36,19 @@ def test_resolve_impl_returns_none_for_unset_field_and_veomni_op_resolves_varian
     monkeypatch.setattr("veomni.ops.platform.requirement.IS_NPU_AVAILABLE", True)
 
     cfg = OpsImplementationConfig()
-    assert cfg.resolve_impl("rms_norm_implementation") is None
-    assert VeomniOp("rms_norm", "standard", cfg.resolve_impl("rms_norm_implementation")).impl == "torch_npu"
-    assert (
-        VeomniOp("rms_norm", "unweighted", cfg.resolve_impl("rms_norm_implementation", variant="unweighted")).impl
-        == "eager"
-    )
+    assert cfg.rms_norm_implementation is None
+    assert VeomniOp("rms_norm", "standard", cfg.rms_norm_implementation).impl == "torch_npu"
+    assert VeomniOp("rms_norm", "unweighted", cfg.rms_norm_implementation).impl == "eager"
 
 
-@pytest.mark.parametrize("impl", [None, "torch_npu", "npu", "eager", "liger_kernel"])
-def test_resolve_impl_preserves_variant_scoped_npu_compatibility(impl):
+@pytest.mark.parametrize("impl", ["torch_npu", "npu"])
+def test_unweighted_rms_norm_rejects_unregistered_backend(impl):
     from veomni.arguments import OpsImplementationConfig
+    from veomni.ops import VeomniOp
 
-    cfg = OpsImplementationConfig.from_dict(
-        {"rms_norm_implementation": impl} if impl is not None else {},
-        validate=False,
-    )
-    assert cfg.resolve_impl("rms_norm_implementation") == impl
-    assert cfg.resolve_impl("rms_norm_implementation", variant="standard") == impl
-    expected = "eager" if impl in ("torch_npu", "npu") else impl
-    resolved = cfg.resolve_impl("rms_norm_implementation", variant="unweighted")
-    assert resolved == expected
-    if expected == "eager":
-        from veomni.ops import VeomniOp
-
-        assert VeomniOp("rms_norm", "unweighted", resolved).impl == "eager"
+    cfg = OpsImplementationConfig.from_dict({"rms_norm_implementation": impl}, validate=False)
+    with pytest.raises(KeyError, match="Unknown op 'rms_norm' variant='unweighted'"):
+        VeomniOp("rms_norm", "unweighted", cfg.rms_norm_implementation)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

@@ -224,10 +224,14 @@ requirements are unmet. For example, `rms_norm/unweighted` has no Ascend kernel,
 so an unset `rms_norm_implementation` resolves `rms_norm/standard` to
 `torch_npu` and `rms_norm/unweighted` to `eager` on NPU.
 
-For compatibility, consumers pass `config.ops_config.resolve_impl(field, variant=...)`
-for variants with explicit-value aliases. In particular, an explicit
-`rms_norm_implementation='torch_npu'` (or the deprecated `npu`) still maps to
-`eager` for `unweighted`, while weighted variants retain `torch_npu`.
+Consumers read `config.ops_config.<field>` directly. On NPU, `unweighted`
+RMSNorm supports only `eager`; an explicit `torch_npu` or deprecated `npu`
+selection raises at module construction. Leave the selection unset to use each
+variant's device default.
+
+The registered attention `eager` row calls the modeling file's local
+`eager_attention_forward` when present. Otherwise it forwards to `veomni_sdpa`,
+so modules without local eager math use the same config field without remapping.
 
 Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
 query dtype for backward. Forward computation still receives the original

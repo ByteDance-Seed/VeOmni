@@ -96,7 +96,7 @@ def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace
     cfg = _tiny_config()
     cfg._set_ops_implementation(ops if ops is not None else eager_ops_config())
     if weight is None:
-        impl = cfg.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
+        impl = cfg.ops_config.rms_norm_implementation
         return resolve_op("rms_norm", "unweighted", impl).wrapper(x, eps=1e-6)
     impl = cfg.ops_config.rms_norm_implementation
     return resolve_op("rms_norm", "standard", impl).wrapper(x, weight, eps=1e-6)
@@ -292,14 +292,14 @@ def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa(available_nvidia_ops):
     assert adapter.veomni_attn_masked is not adapter.veomni_attn
 
 
-def test_ltx_automatic_eager_selects_veomni_sdpa():
+def test_ltx_automatic_eager_binds_registered_eager():
     config = _tiny_config()
     config._set_ops_implementation(eager_ops_config())
     adapter = AttentionFunction.AUTOMATIC.to_callable(config=config)
     masked = MaskedAttentionFunction.AUTOMATIC.to_callable(config=config)
-    assert adapter.veomni_attn.impl == "veomni_sdpa"
+    assert adapter.veomni_attn.impl == "eager"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
-    assert masked.veomni_attn.impl == "veomni_sdpa"
+    assert masked.veomni_attn.impl == "eager"
 
 
 def test_ltx_adapter_expands_mask_and_skips_ulysses():

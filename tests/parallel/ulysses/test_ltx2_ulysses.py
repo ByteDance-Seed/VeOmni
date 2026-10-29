@@ -64,7 +64,7 @@ def _build_model(device, with_audio, gradient_checkpointing):
         audio_in_channels=8,
         audio_out_channels=8,
         audio_cross_attention_dim=32,
-        ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
+        ops_implementation=make_eager_ops_config(),
     )
     torch.manual_seed(0)
     model = LTXVideoTransformerModel(config).to(device).float()

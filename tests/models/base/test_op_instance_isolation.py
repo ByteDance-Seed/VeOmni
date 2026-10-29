@@ -23,6 +23,7 @@ condition / DiT forwards.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -48,7 +49,7 @@ from veomni.ops import VeomniOp
 
 @pytest.mark.parametrize("impl", ["torch_npu", "npu"])
 @pytest.mark.parametrize("family", ["flux", "ltx2_3", "deepseek_v4"])
-def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
+def test_unweighted_rms_norm_rejects_explicit_npu_backend(family, impl):
     cfg = eager_ops_config()
     cfg.rms_norm_implementation = impl
     if family == "flux":
@@ -56,13 +57,13 @@ def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
 
         model_cfg = tiny_flux_config()
         model_cfg._set_ops_implementation(cfg)
-        handle = RMSNorm(8, eps=1e-6, elementwise_affine=False, config=model_cfg).veomni_rms_norm
+        build = partial(RMSNorm, 8, eps=1e-6, elementwise_affine=False, config=model_cfg)
     elif family == "ltx2_3":
         from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
 
         model_cfg = tiny_ltx2_3_config()
         model_cfg._set_ops_implementation(cfg)
-        handle = PytorchAdaZeroFunction(config=model_cfg).veomni_rms_norm
+        build = partial(PytorchAdaZeroFunction, config=model_cfg)
     else:
         from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
             DeepseekV4UnweightedRMSNorm,
@@ -70,13 +71,10 @@ def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
 
         model_cfg = tiny_deepseek_v4_config()
         model_cfg._set_ops_implementation(cfg)
-        handle = DeepseekV4UnweightedRMSNorm(config=model_cfg).veomni_unweighted_rms_norm
+        build = partial(DeepseekV4UnweightedRMSNorm, config=model_cfg)
     assert cfg.rms_norm_implementation == impl
-    assert handle.variant == "unweighted"
-    assert handle.impl == "eager"
-    hidden = torch.randn(2, 8)
-    expected = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
-    torch.testing.assert_close(handle(hidden, eps=1e-6), expected)
+    with pytest.raises(KeyError, match="Unknown op 'rms_norm' variant='unweighted'"):
+        build()
 
 
 def _output_tensor(result):

@@ -232,7 +232,7 @@ def test_qwen_image_eager_config_runs_unmasked_attention(monkeypatch):
     config = _tiny_config()
     config._set_ops_implementation(eager_ops_config())
     processor = modeling.QwenImageSPAttnProcessor(config)
-    assert processor.veomni_attn.impl == "veomni_sdpa"
+    assert processor.veomni_attn.impl == "eager"
     assert processor.veomni_attn_masked is processor.veomni_attn
 
     img_out, txt_out = processor(_tiny_attn(heads=2, dim_head=4), torch.randn(1, 4, 8), torch.randn(1, 3, 8))
@@ -249,7 +249,7 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     config = _tiny_config()
     model = QwenImageTransformer2DModel(config)
     assert model.config._attn_implementation == "eager"
-    assert model.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+    assert model.transformer_blocks[0].attn.processor.veomni_attn.impl == "eager"
     assert model.zero_cond_t is False
     ckpt_dir = tmp_path / "qwen_image_ckpt"
     model.save_pretrained(ckpt_dir)
@@ -259,9 +259,9 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     assert loaded_default.config._attn_implementation == "eager"
     assert loaded_default.config.ops_config.attn_implementation == "eager"
     for block in loaded_default.transformer_blocks:
-        assert block.attn.processor.veomni_attn.impl == "veomni_sdpa"
+        assert block.attn.processor.veomni_attn.impl == "eager"
         assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
-        assert block.attn.processor.config._attn_implementation == "veomni_sdpa"
+        assert block.attn.processor.config._attn_implementation == "eager"
 
     # 2. Passing config=... (instance or Mapping) participates in actual model construction (e.g. zero_cond_t=True)
     # and defers validation until ops_implementation overrides are applied across devices.
@@ -290,7 +290,7 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
         assert all(block.zero_cond_t is True for block in loaded_with_cfg.transformer_blocks)
         assert loaded_with_cfg.config.ops_config.rms_norm_implementation == "torch_npu"
         assert loaded_with_cfg.config.ops_config.attn_implementation == "eager"
-        assert loaded_with_cfg.transformer_blocks[0].attn.processor.veomni_attn.impl == "veomni_sdpa"
+        assert loaded_with_cfg.transformer_blocks[0].attn.processor.veomni_attn.impl == "eager"
 
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)

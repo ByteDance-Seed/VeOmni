@@ -131,11 +131,7 @@ class RMSNorm(torch.nn.Module):
         else:
             self.weight = None
             variant = "unweighted"
-        rms_norm_impl = (
-            config.ops_config.resolve_impl("rms_norm_implementation", variant=variant)
-            if config is not None
-            else "eager"
-        )
+        rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm = VeomniOp("rms_norm", variant, rms_norm_impl)
 
     def forward(self, hidden_states):

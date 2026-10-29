@@ -1357,12 +1357,6 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
 }
 
-# Compatibility aliases for explicit values on variants without that backend.
-# Unset values remain None and use the registry's per-variant default.
-_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
-}
-
 # Values that were never implementation names and have no implementation equivalent.
 _REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
     "rms_norm_implementation": {
@@ -1460,8 +1454,8 @@ class OpsImplementationConfig:
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend; the unweighted "
-            "variant has no Ascend kernel and uses 'eager') | "
+            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend weighted variants only; "
+            "unweighted requires 'eager' or an unset selection on Ascend) | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
@@ -1660,26 +1654,6 @@ class OpsImplementationConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
         return {k: v for k, v in asdict(self).items() if v is not None}
-
-    def resolve_impl(
-        self,
-        field: str,
-        *,
-        variant: Optional[str] = None,
-        eager_as: Optional[str] = None,
-    ) -> Optional[str]:
-        """Return ``getattr(self, field)`` with optional ``variant`` alias and ``eager_as`` remapping."""
-        impl = getattr(self, field)
-        if variant is not None:
-            alias = _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES.get(field, {}).get(variant, {}).get(impl)
-            if alias is not None:
-                logger.info_once(
-                    f"{field}={impl!r} has no third-party {variant!r} kernel; {variant!r} uses {alias!r}."
-                )
-                impl = alias
-        if eager_as is not None and impl == "eager":
-            return eager_as
-        return impl
 
     @classmethod
     def validate_and_extract_dict(cls, d: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:

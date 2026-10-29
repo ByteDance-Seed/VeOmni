@@ -31,20 +31,9 @@ from typing import Any, Callable
 import torch
 from torch import Tensor
 
-from ..utils import logging
 from ..utils.device import get_device_type
 from ..utils.import_utils import is_package_available
 from .platform import ANY_DEVICE, KernelRequirement
-
-
-logger = logging.get_logger(__name__)
-
-_VARIANT_IMPL_ALIASES: dict[tuple[str, str], dict[str, tuple[str, str]]] = {
-    ("rms_norm", "unweighted"): {
-        "torch_npu": ("rms_norm_implementation", "eager"),
-        "npu": ("rms_norm_implementation", "eager"),
-    },
-}
 
 
 Output = Tensor | tuple[Tensor, ...]
