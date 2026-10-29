@@ -19,10 +19,15 @@ import torch
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_gemma3_text_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_npu as gemma3_modeling
 from veomni.ops import VeomniOp
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_tiny_gemma3_vlm():
@@ -42,7 +47,7 @@ def _build_tiny_gemma3_vlm():
         image_token_index=120,
         tie_word_embeddings=False,
     )
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return gemma3_modeling.Gemma3ForConditionalGeneration(config)
 
 

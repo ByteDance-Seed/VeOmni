@@ -26,6 +26,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 from torch.testing._internal.common_utils import run_tests
 
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
     LTXVideoTransformerModelConfig,
@@ -63,6 +64,7 @@ def _build_model(device, with_audio, gradient_checkpointing):
         audio_in_channels=8,
         audio_out_channels=8,
         audio_cross_attention_dim=32,
+        ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
     )
     torch.manual_seed(0)
     model = LTXVideoTransformerModel(config).to(device).float()

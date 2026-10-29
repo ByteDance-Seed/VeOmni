@@ -566,8 +566,11 @@ class VectorQuantizer(nn.Module):
 
 class MoVQGAN(PreTrainedModel):
     config_class = MoVQGANConfig
-    _supports_flash_attn_2 = True
     supports_gradient_checkpointing = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The VAE uses fixed local torch attention, with no HF backend dispatch.
+        return attn_implementation
 
     def __init__(self, config: MoVQGANConfig, **kwargs):
         super().__init__(config, **kwargs)

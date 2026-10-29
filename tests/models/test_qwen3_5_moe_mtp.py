@@ -109,7 +109,7 @@ def test_qwen3_5_eval_text_model_returns_mtp_context_on_demand(
 ):
     config = deepcopy(AutoConfig.from_pretrained(config_path).text_config)
     config.num_hidden_layers = 0
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         text_model = text_model_cls(config)
     text_model.norm = torch.nn.Identity()
     text_model.rotary_emb = _EmptyRotary()

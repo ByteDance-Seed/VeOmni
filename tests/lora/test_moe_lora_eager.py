@@ -381,6 +381,7 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
         hidden_act="silu",
         ops_implementation=ops,
     )
+    as_veomni_config(config, validate=False)
     experts = Qwen3MoeExperts(config)
     assert experts.veomni_moe.impl == "fused_triton"
     wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)

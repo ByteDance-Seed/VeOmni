@@ -237,7 +237,7 @@ Core files:
 25. **Kernel handles belong to model instances**
    - Modeling classes construct `VeomniOp` handles from `self.config.ops_config` and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
-   - Attention-free containers and embedding/projecting modules override HF's `_check_and_adjust_attn_implementation` to return the canonical selection. Do not advertise a backend capability they do not execute, preload its kernel on the container, or bypass checks on the shared model base; attention-owning components validate themselves.
+   - Attention-free containers and embedding/projecting modules override HF's `_check_and_adjust_attn_implementation` to return the canonical selection. Do not advertise a backend capability they do not execute, preload its kernel on the container, or bypass checks on the shared model base; attention-owning components validate themselves. A model with its own deferred dispatch (MiniMax packed attention) may return the canonical selection from this hook only when its bind boundary validates the backend before execution.
    - Native configs created inside VeOmni models must explicitly opt in before calling VeOmni helpers; the native HF classes are never globally patched. Remote adapters export a native copy to preserve their source files and `auto_map`.
 
 26. **DCP full resume skips HF weight materialization**

@@ -26,6 +26,7 @@ from tests.tools.common_utils import ieee_fp32_matmul
 from veomni.arguments import OpsImplementationConfig
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
+from veomni.models.configuration_base import get_veomni_config_class
 from veomni.ops import OP_REGISTRY
 from veomni.utils.device import get_device_type
 
@@ -35,6 +36,8 @@ def _qwen3_mlp(ops: OpsImplementationConfig) -> nn.Module:
 
     from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3MLP
 
+    Qwen3Config = get_veomni_config_class(Qwen3Config)
+
     return Qwen3MLP(Qwen3Config(hidden_size=16, intermediate_size=32, hidden_act="silu", ops_implementation=ops))
 
 
@@ -42,6 +45,8 @@ def _llama_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import LlamaConfig
 
     from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaMLP
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
 
     config = LlamaConfig(
         hidden_size=16,
@@ -59,6 +64,8 @@ def _gemma3_mlp(ops: OpsImplementationConfig) -> nn.Module:
 
     from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3MLP
 
+    Gemma3TextConfig = get_veomni_config_class(Gemma3TextConfig)
+
     return Gemma3MLP(
         Gemma3TextConfig(
             hidden_size=16,
@@ -73,6 +80,8 @@ def _deepseek_v4_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
     from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4MLP
+
+    DeepseekV4Config = get_veomni_config_class(DeepseekV4Config)
 
     return DeepseekV4MLP(
         DeepseekV4Config(

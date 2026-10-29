@@ -568,6 +568,7 @@ def tiny_qwen2_vl_config(architecture: str = "Qwen2VLForConditionalGeneration") 
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -620,6 +621,7 @@ def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGenerati
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -700,6 +702,7 @@ def tiny_qwen2_5_omni_thinker_config(
         vision_end_token_id=VISION_END_TOKEN_ID,
         audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -713,6 +716,7 @@ def tiny_qwen2_5_omni_config(
         thinker_config=thinker.to_dict(),
         enable_audio_output=False,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -812,6 +816,7 @@ def tiny_qwen3_5_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -888,6 +893,7 @@ def tiny_qwen3_5_moe_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
     config._experts_implementation = "eager"
     config.text_config._experts_implementation = "eager"
@@ -1015,6 +1021,7 @@ def tiny_qwen3_omni_moe_thinker_config(
         vision_end_token_id=VISION_END_TOKEN_ID,
         audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -1030,6 +1037,7 @@ def tiny_qwen3_omni_moe_config(
         thinker_config=thinker.to_dict(),
         enable_audio_output=False,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -1083,6 +1091,7 @@ def tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration") 
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -1144,4 +1153,5 @@ def tiny_qwen3_vl_moe_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )

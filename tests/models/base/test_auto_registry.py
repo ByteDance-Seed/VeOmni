@@ -908,7 +908,9 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
-@pytest.mark.parametrize("family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni"])
+@pytest.mark.parametrize(
+    "family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"]
+)
 @pytest.mark.parametrize("attention", [None, "eager", "sdpa", "flash_attention_2"])
 def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkeypatch, family, attention):
     """Orchestration and embedding wrappers leave backend validation to actual attention modules."""
@@ -921,7 +923,24 @@ def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkey
     monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
     monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
     ops = {} if attention is None else {"attn_implementation": attention}
-    if family == "text_encoder":
+    if family in ("fake_a", "fake_b"):
+        from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+        from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+
+        cls = FakeModuleA if family == "fake_a" else FakeModuleB
+        config = cls.config_class(hidden_size=8, ops_implementation=ops)
+
+        def construct():
+            return cls(config)
+    elif family == "movqgan":
+        from veomni.models.transformers.movqgan.modeling_movqgan import MoVQGAN
+
+        config = _tiny_movqgan_config()
+        config._set_ops_implementation(ops)
+
+        def construct():
+            return MoVQGAN(config)
+    elif family == "text_encoder":
         from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
         from veomni.models.seed_omni.modules.text_encoder.modeling import TextEncoder
 
@@ -964,3 +983,28 @@ def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkey
     assert model.config is config
     assert config._attn_implementation == config.ops_config.attn_implementation == expected
     assert "_attn_implementation_internal" not in vars(config)
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+def test_cpu_hf_reference_constructs_without_optional_attention_kernels(monkeypatch, model_case):
+    """CPU parity references must select portable attention before the first model constructor."""
+    from importlib import import_module
+
+    config = model_case.config_factory(model_case.architectures[0])
+    native = getattr(type(config), "_hf_config_class", None)
+    if native is None:
+        pytest.skip("This family has no upstream Transformers reference config")
+    modeling = import_module(native.__module__.replace("configuration_", "modeling_"))
+    reference_class = getattr(modeling, model_case.architectures[0])
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("CPU reference construction must not preload optional attention kernels")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    reference = reference_class(config)
+    for module in reference.modules():
+        module_config = getattr(module, "config", None)
+        if isinstance(module_config, PretrainedConfig):
+            assert module_config._attn_implementation in ("eager", "sdpa", "veomni_sdpa")

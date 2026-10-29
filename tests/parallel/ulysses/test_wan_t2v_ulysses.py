@@ -6,7 +6,7 @@ Covers `WanTransformer3DModel_forward` / `WanSPAttnProcessor` on the cases that 
    attention, and RoPE must line up with each token.
 2. Per-token timesteps (Wan 2.2 style, `timestep.ndim == 2`): `timestep_proj` has to be
    sliced along with the hidden states.
-3. The `eager` backend has to see the full sequence, not just the local shard.
+3. The portable SDPA backend has to see the full sequence, not just the local shard.
 
 Runs a tiny random-weight model with SP off and with Ulysses SP on and compares outputs and
 SP-reduced parameter grads, with and without gradient checkpointing.
@@ -24,6 +24,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 
 from torch.testing._internal.common_utils import run_tests
 
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
@@ -61,9 +62,10 @@ def _build_model(device, gradient_checkpointing):
         ffn_dim=64,
         num_layers=2,
         rope_max_seq_len=64,
+        ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
     )
     torch.manual_seed(0)
-    model = WanTransformer3DModel(config, attn_implementation="eager").to(device)
+    model = WanTransformer3DModel(config).to(device)
     with torch.no_grad():
         for p in model.parameters():
             p.normal_(0, 0.1)

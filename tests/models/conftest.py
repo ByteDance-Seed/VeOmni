@@ -21,6 +21,7 @@ import os
 import pytest
 import torch
 
+from tests.tools.model_fixtures import cpu_model_attention_kernel_guard as cpu_model_attention_kernel_guard
 from veomni.ops import VeomniOp
 from veomni.ops import registry as op_registry
 from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform

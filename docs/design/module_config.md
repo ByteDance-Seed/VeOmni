@@ -62,7 +62,11 @@ containers and the token embedding/projecting `TextEncoder`, override HF's
 `_check_and_adjust_attn_implementation` to return the canonical selection.
 This avoids unsupported capability checks and kernel preloading on a container;
 components that execute attention retain their own backend validation. Keep
-this override on the attention-free wrapper, not on the shared model base.
+this override on the owning class, not on the shared model base. MiniMax's
+custom packed-attention dispatcher also overrides the HF check: it validates
+and binds FlashAttention on the first forward through
+`_load_packed_attention_kernel`, preserving deferred loading even when HF
+reads a canonical flash selection during construction.
 HF mask builders still read the canonical attention selection at
 forward time, so keep it consistent with the constructed attention handle.
 

@@ -27,6 +27,7 @@ import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.configuration_base import get_veomni_config_class
 from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 from veomni.ops import resolve_op
 from veomni.utils.import_utils import is_package_available
@@ -179,7 +180,8 @@ def bench_layer(
         causal_conv1d_implementation="fla",
         chunk_gated_delta_rule_implementation="flash_qla",
     )
-    config = Qwen3_5TextConfig(
+    config_class = get_veomni_config_class(Qwen3_5TextConfig)
+    config = config_class(
         hidden_size=hidden_size,
         intermediate_size=hidden_size * 2,
         num_hidden_layers=1,

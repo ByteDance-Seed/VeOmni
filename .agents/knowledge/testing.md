@@ -89,6 +89,19 @@ must explicitly select SDPA when the default attention backend requires half
 precision. Attention-free wrapper construction tests should forbid HF kernel
 preloading, including the local FlashAttention loader, so they also cover
 CPU workers in NPU environments without `flash_attn`.
+The model-test autouse fixture rejects FlashAttention preloading for CPU launch
+plans and CPU-only hosts, even when the package is installed. It guards both
+HF's lazy entry and VeOmni's loader so process caches cannot hide a dependency.
+Explicit availability-only mocks may replace the HF entry; real accelerator
+plans keep normal loading. Composite eager fixtures must set the root policy
+before constructing either reference or candidate, so otherwise unset
+vision/audio descendants inherit it. Do not rely on a later builder update or
+post-construction handle rebinding. Reuse `make_eager_ops_config()` for all-eager
+helpers, including LoRA, so GDN and vision fields cannot retain fused defaults.
+Standalone MLP/expert/attention fixtures and benchmarks must adapt native HF
+configs before passing them to patched leaf classes. Run the whole model suite without fail-fast
+when changing shared config semantics, then exercise FP32 distributed model
+comparisons with explicit config-owned SDPA.
 Plain-tensor checkpoint exports
 must not query an accelerator's current device; resolve the staging device only
 when a DTensor actually needs materialization. CPU-planned workers hide devices,

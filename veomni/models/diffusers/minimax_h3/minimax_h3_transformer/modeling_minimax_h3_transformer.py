@@ -63,6 +63,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     _checkpoint_conversion_mapping = {"^": "dit."}
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Packed attention validates and binds its backend on the first forward.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
         # HF's marker. The DiT declares its own, so the enable reaches its block loop too.

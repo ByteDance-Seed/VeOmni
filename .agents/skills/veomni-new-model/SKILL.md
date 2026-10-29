@@ -136,6 +136,10 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 2. **Model tests**: follow
    [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).
+   Set eager attention on composite roots before constructing HF references;
+   text-only eager settings leave root and vision/audio defaults unresolved.
+   CPU model tests reject optional attention preloading even when installed.
+   Use config-owned SDPA for FP32 accelerator comparisons.
    Add the canonical tiny-config factory, registry/build case, eager family
    forward/backward parity, and reference coverage for one supported
    accelerator training configuration. Shape checks and a successful import
