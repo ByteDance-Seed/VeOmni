@@ -37,7 +37,6 @@ import torch
 import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
@@ -148,6 +147,8 @@ def test_only_lora_trainable():
 
 
 def test_model_runtime_rejects_lora_without_trainable_adapters():
+    from tests.tools.training_utils import unbuilt_runtime
+
     runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]}))
     runtime.model = Toy()
 
@@ -157,6 +158,8 @@ def test_model_runtime_rejects_lora_without_trainable_adapters():
 
 @pytest.mark.parametrize("is_trainable", [True, False])
 def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
+    from tests.tools.training_utils import unbuilt_runtime
+
     VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))
     runtime = unbuilt_runtime(
         SimpleNamespace(lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable})
