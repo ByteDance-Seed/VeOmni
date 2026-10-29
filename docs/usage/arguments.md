@@ -518,7 +518,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
 | swap_mem_fraction_static | `float` | `0.8` | With `type="adamw_swap"`, fraction of currently free device memory used to size one batch of optimizer states streamed from host to device. The batch budget never exceeds free memory, so a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
-| swap_pin_memory | `bool` | `True` | With `type="adamw_swap"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. |
+| swap_pin_memory | `bool` | `True` | With `type="adamw_swap"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
 ### WandbConfig
 
@@ -698,7 +698,7 @@ configured and never round-trip through a saved config.
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
-| offload | `bool` | `False` | Enable CPU offload. |
+| offload | `bool` | `False` | Enable CPU offload. Cannot be combined with `model.optimizer.type="adamw_swap"`: both move training state to host, and the combination is rejected at config parse time. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |

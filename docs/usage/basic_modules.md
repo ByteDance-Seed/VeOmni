@@ -384,7 +384,7 @@ model = build_parallelize_model(
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
-| `adamw_swap` | AdamW whose moment states live in pinned host buffers and are streamed to the device in batches, lowering peak device memory. |
+| `adamw_swap` | AdamW whose moment states live in host buffers (pinned by default; pageable when `swap_pin_memory` is `false` or a pinned allocation fails) and are streamed to the device in batches, lowering peak device memory. |
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 

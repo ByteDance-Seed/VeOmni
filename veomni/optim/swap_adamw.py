@@ -18,7 +18,7 @@ Memory shape of a training step
 -------------------------------
 A vanilla ``torch.optim.AdamW`` keeps ``exp_avg`` and ``exp_avg_sq`` resident on
 the accelerator for the whole run: two extra copies of every parameter. This
-optimizer keeps those tensors on pinned host memory instead and only
+optimizer keeps those tensors on host memory (pinned by default) instead and only
 materializes the states of one *batch* of parameters at a time, sized from the
 currently free device memory. Peak device memory therefore drops to roughly
 ``params + grads + one batch of states`` at the cost of host<->device copies
@@ -32,12 +32,13 @@ Scope (v1)
 * Checkpoint save/load reads and writes the host buffers directly (see
   ``state_dict`` / ``load_state_dict``). Resuming across a changed FSDP/EP
   mesh (resharding) works through DCP's byte-level planning — an EP=4 → EP=2
-  resume at world 8 replayed bitwise in manual validation — but is not
-  covered by automated tests.
-* The update kernel is ``torch._fused_adamw_`` on CUDA and Ascend NPU, applied
-  per param group within each swapped-in batch. Other backends (CPU unit tests,
-  MLU, ...) take the plain elementwise AdamW path, which is numerically
-  equivalent.
+  resume at world 8 replayed steps 11-20 with matching printed loss and
+  grad_norm in manual validation — but is not covered by automated tests.
+* The update kernel is ``torch._fused_adamw_`` on CUDA and Ascend NPU, issued
+  once per ``(device, dtype)`` bucket inside a param group, within each
+  swapped-in batch (torch's own fused path groups the same way). Other backends
+  (CPU unit tests, MLU, ...) take the plain elementwise AdamW path, which is
+  numerically equivalent.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ class SwapAdamW(Optimizer):
     ``exp_avg`` and ``exp_avg_sq`` (plus ``max_exp_avg_sq`` when ``amsgrad``).
     Those tensors exist for the whole run, but their device storage is released
     between steps by resizing the underlying (untyped) storage to zero; the
-    values are preserved in pinned host buffers.
+    values are preserved in host buffers (pinned when ``pin_memory`` is enabled).
 
     Args:
         params: Parameters or parameter groups, as for ``torch.optim.Optimizer``.
@@ -100,7 +101,8 @@ class SwapAdamW(Optimizer):
             to size one batch of streamed-in states. Must fit at least the
             largest single parameter's states.
         pin_memory: Pin the host-side state buffers. Improves transfer bandwidth
-            at the cost of page-locked host memory.
+            at the cost of page-locked host memory; a failed pinned allocation
+            falls back to pageable memory with a rank-0 warning.
         chunk_bytes: State bytes updated (and swapped out) per pipeline chunk.
             A batch is swapped in up front; the chunk boundary then lets one
             chunk's swap-out overlap the next chunk's compute. A byte budget
@@ -300,7 +302,7 @@ class SwapAdamW(Optimizer):
 
         The host buffers are handed to DCP live (no copy here), but DCP's staging
         stager deep-copies them before writing, so a save transiently needs about
-        twice the host optimizer-state memory (on top of the pinned buffers).
+        twice the host optimizer-state memory (on top of the host buffers).
         """
         self._bind_host_states()
         state_dict = super().state_dict()
