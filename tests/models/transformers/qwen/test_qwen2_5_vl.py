@@ -117,10 +117,12 @@ def test_qwen2_5_vl_regular_vision_forward(attention):
         assert torch.isfinite(output).all()
         output.float().square().mean().backward()
         assert pixels.grad is not None and torch.isfinite(pixels.grad).all()
+        assert torch.count_nonzero(pixels.grad)
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, name
                 assert torch.isfinite(param.grad).all(), name
+        assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
 
 
 def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
