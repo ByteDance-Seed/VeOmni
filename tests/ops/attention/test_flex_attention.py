@@ -1465,6 +1465,7 @@ def test_flex_fa4_framework_scalars_with_compiled_mask_builder(case):
 
 
 @pytest.mark.parametrize("explicit_num_stages,expected_num_stages", [(None, 1), (2, 2)])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_flex_attention_limits_pipeline_depth_for_wide_heads(monkeypatch, explicit_num_stages, expected_num_stages):
     captured = {}
 
