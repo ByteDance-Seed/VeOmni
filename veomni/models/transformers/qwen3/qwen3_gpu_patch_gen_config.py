@@ -48,6 +48,10 @@ config = PatchConfig(
     description="Qwen3 with VeomniOp-based GPU kernel replacements",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import(

@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-from transformers import AutoConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from veomni.models import build_config
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -23,7 +23,7 @@ def test_deepseek_v4_indexer_matches_hf_model_and_optimizer_keys(backend):
     modeling = importlib.import_module(
         f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{backend}"
     )
-    config = AutoConfig.from_pretrained(_TOY_CONFIGS / "deepseek_v4_toy")
+    config = build_config(_TOY_CONFIGS / "deepseek_v4_toy")
     indexer = modeling.DeepseekV4Indexer(config)
     expected = {
         "position_bias",

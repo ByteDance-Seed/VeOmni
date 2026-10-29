@@ -79,6 +79,7 @@ from veomni.lora.moe_layers import (
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.models.configuration_base import as_veomni_config
 from veomni.ops.kernels.moe_experts_lora.routing import group_routing_assignments
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -296,7 +297,7 @@ def test_wrapper_follows_experts_handle_not_global_config(mode: str):
     patterns = lora_cfg["target_parameters"]
     sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
     assert experts.veomni_moe.impl == "eager"
-    model.config._set_ops_implementation(fused_triton_moe_ops())
+    as_veomni_config(model.config, validate=False)._set_ops_implementation(fused_triton_moe_ops())
     _apply(
         mode,
         model,

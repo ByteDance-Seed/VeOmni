@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen4_exp.qsa_metadata import cached_host_metadata, prepare_qsa_metadata
 
 
@@ -97,7 +98,7 @@ def test_model_reuses_metadata_without_changing_outputs_or_gradients(monkeypatch
     config = AutoConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.ple_layer_ids = []
     config.layer_types = ["full_attention"] * config.num_hidden_layers
-    config._set_ops_implementation(make_eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     candidate = module.Qwen4ExpTextModel(config)
     reference = copy.deepcopy(candidate)
     if checkpointing:

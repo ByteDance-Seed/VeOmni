@@ -78,7 +78,17 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
 
-5. **Patch patterns** — follow existing models:
+5. **Configuration ownership** — custom configs inherit `VeOmniPretrainedConfig`
+   (use `get_veomni_config_class(HFConfig)` when extending an HF schema). Generated
+   specs drop the HF `PreTrainedModel` import and import
+   `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
+   This adapts direct model inputs and the model's `config_class`, recursively.
+   Standalone attention/MLP tests must use `get_veomni_config_class(HFConfig)` or
+   `as_veomni_config(config)` explicitly; native HF classes have no `ops_config`.
+   Read `docs/design/module_config.md`. Never patch HF config base methods or
+   maintain a separate attention field beside `ops_implementation`.
+
+6. **Patch patterns** — follow existing models:
    - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.
    - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module.
    - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`.

@@ -30,7 +30,8 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
 import yaml
-from transformers import PretrainedConfig
+
+from ..configuration_base import VeOmniPretrainedConfig
 
 
 if TYPE_CHECKING:
@@ -181,7 +182,7 @@ def _split_omni_kwargs(
     return root_ops, per_module, remaining
 
 
-class OmniConfig(PretrainedConfig):
+class OmniConfig(VeOmniPretrainedConfig):
     """Checkpoint config for :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
     ``_module_entries`` is the dict of checkpoint entries. A loaded module config is
@@ -217,7 +218,7 @@ class OmniConfig(PretrainedConfig):
         # Model-level kernels: this composed model's defaults for every module
         # it holds. Sparse — only what was explicitly selected. A loaded module
         # config ranks its own file under this, then under the module entry.
-        self.ops_implementation: Dict[str, Any] = dict(ops_implementation or {})
+
         # Each module's own typed config, built by :meth:`from_pretrained`.
         # In-memory only: the modules are described by their own files, and a
         # copy here would be a second place to keep in sync. Dropped by
@@ -229,7 +230,7 @@ class OmniConfig(PretrainedConfig):
         # :attr:`_module_configs`: a saved config describes its own files.
         self._hf_source: Optional[HFSource] = None
 
-        super().__init__(**kwargs)
+        super().__init__(ops_implementation=ops_implementation, **kwargs)
 
     @property
     def train_types(self) -> List[str]:

@@ -64,6 +64,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_gpu.py",
     description="Qwen3-VL with VeOmni v5 patches and VeomniOp replacements",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 # Surface ``Qwen3VLCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
 # while preserving ``rope_deltas``. Mutating ``output.log_probs`` /

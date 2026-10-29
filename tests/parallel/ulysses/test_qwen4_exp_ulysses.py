@@ -26,6 +26,7 @@ from transformers import AutoConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
@@ -63,14 +64,14 @@ def _install_qwen4_exp_ops_config(config, qsa_attention_implementation: str = "e
     if hasattr(config, "text_config") and hasattr(config, "vision_config"):
         text_attn = getattr(config.text_config, "_attn_implementation", None)
         vision_attn = getattr(config.vision_config, "_attn_implementation", None)
-        config._set_ops_implementation(ops)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
         if text_attn is not None:
             config.text_config._attn_implementation = text_attn
         if vision_attn is not None:
             config.vision_config._attn_implementation = vision_attn
     else:
         attn = getattr(config, "_attn_implementation", None)
-        config._set_ops_implementation(ops)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
         if attn is not None:
             config._attn_implementation = attn
 

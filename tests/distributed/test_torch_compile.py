@@ -37,6 +37,7 @@ from veomni.distributed.torch_compile import (
     validate_compile_config_for_fsdp2,
     validate_compile_runtime,
 )
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -370,7 +371,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
         hidden_act="silu",
         rope_theta=10000,
     )
-    config._set_ops_implementation(make_eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
     compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
@@ -839,7 +840,7 @@ def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(comp
     torch.manual_seed(0)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
     eager_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
     compiled_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
@@ -888,7 +889,7 @@ def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
     torch.manual_seed(0)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
     model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
 
@@ -939,7 +940,7 @@ def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed
     torch.manual_seed(seed)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
     model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
     experts = model.model.layers[2].mlp.experts
@@ -1019,7 +1020,7 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
     torch.manual_seed(seed)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
 
     oracle = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.float32)
     with torch.no_grad():
@@ -1032,7 +1033,7 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
     base_state = {name: value.detach().cpu() for name, value in oracle.state_dict().items()}
 
     def build_bf16_model():
-        config._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
+        as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
         model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
         model.load_state_dict(
             {
@@ -1144,7 +1145,7 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
 
     torch.manual_seed(0)
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     eager_norm = DeepseekV4RMSNorm(64, config=config)
     compiled_norm = copy.deepcopy(eager_norm)
 

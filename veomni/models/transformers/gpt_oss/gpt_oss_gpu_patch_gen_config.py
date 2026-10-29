@@ -52,6 +52,10 @@ config = PatchConfig(
     description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniOp replacements",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",

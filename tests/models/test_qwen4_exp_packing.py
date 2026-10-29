@@ -12,6 +12,7 @@ import torch
 from transformers import Qwen4ExpConfig
 
 from tests.tools.training_utils import make_eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -45,7 +46,7 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
     torch.manual_seed(0)
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
-    config._set_ops_implementation(make_eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     config.use_cache = False
     text_model_cls = _load_text_model_class()
     packed_model = text_model_cls(config).float().eval()
@@ -90,7 +91,7 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
 
 def test_qwen4_exp_text_model_accepts_explicit_packing_metadata():
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
-    config._set_ops_implementation(make_eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     config.use_cache = False
     model = _load_text_model_class()(config).float().eval()
     input_ids = torch.randint(0, config.vocab_size, (1, 4))

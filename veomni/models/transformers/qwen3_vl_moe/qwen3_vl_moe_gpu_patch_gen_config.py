@@ -78,6 +78,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_moe_gpu.py",
     description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp replacements",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 config.drop_import_names("use_kernelized_func")
 

@@ -49,6 +49,10 @@ config = PatchConfig(
     description="DeepseekV3 with VeomniOp RMS / RoPE / SwiGLU / MoE / fused loss",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(

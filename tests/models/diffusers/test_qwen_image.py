@@ -254,15 +254,14 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
     ckpt_dir = tmp_path / "qwen_image_ckpt"
     model.save_pretrained(ckpt_dir)
 
-    # 1. Bare from_pretrained(ckpt_dir) with no overrides resolves default SDPA (matching bare __init__).
-    bare_model = QwenImageTransformer2DModel(model.config_class(**config.to_diffuser_dict()))
+    # 1. Saved attention remains canonical when no caller override is provided.
     loaded_default = QwenImageTransformer2DModel.from_pretrained(ckpt_dir)
-    assert loaded_default.config._attn_implementation == bare_model.config._attn_implementation == "sdpa"
-    assert loaded_default.config.ops_config.attn_implementation == "sdpa"
+    assert loaded_default.config._attn_implementation == "eager"
+    assert loaded_default.config.ops_config.attn_implementation == "eager"
     for block in loaded_default.transformer_blocks:
-        assert block.attn.processor.veomni_attn.impl == "sdpa"
+        assert block.attn.processor.veomni_attn.impl == "veomni_sdpa"
         assert block.attn.processor.veomni_attn_masked is block.attn.processor.veomni_attn
-        assert block.attn.processor.config._attn_implementation == "sdpa"
+        assert block.attn.processor.config._attn_implementation == "veomni_sdpa"
 
     # 2. Passing config=... (instance or Mapping) participates in actual model construction (e.g. zero_cond_t=True)
     # and defers validation until ops_implementation overrides are applied across devices.

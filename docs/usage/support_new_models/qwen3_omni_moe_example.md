@@ -22,13 +22,17 @@ This document provides in-depth implementation details for each patch applied in
 Many models set `tie_word_embeddings=True` by default but don't implement `get_output_embeddings()`. VeOmni's `CustomizedModelingLoader` tries to tie embeddings after weight loading and will crash. Fix in `configuration_*.py`:
 
 ```python
-class YourModelConfig(_HFYourModelConfig):
+from veomni.models import get_veomni_config_class
+from veomni.models.registry import MODEL_CONFIG_REGISTRY
+
+class YourModelConfig(get_veomni_config_class(_HFYourModelConfig)):
     def __init__(self, **kwargs):
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
 
-def apply_veomni_patch():
-    hf_config_module.YourModelConfig = YourModelConfig
+@MODEL_CONFIG_REGISTRY.register("your_model")
+def register_your_model_config():
+    return YourModelConfig
 ```
 
 ---

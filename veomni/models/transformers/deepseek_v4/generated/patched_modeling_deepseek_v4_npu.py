@@ -75,8 +75,6 @@
 # ==============================================================================
 
 from functools import partial
-
-# Additional imports for patches
 from typing import Optional
 
 import torch
@@ -90,7 +88,6 @@ from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -114,6 +111,9 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.transformers.deepseek_v4.dspark import build_dspark_blocks
 from veomni.models.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,

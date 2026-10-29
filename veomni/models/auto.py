@@ -213,6 +213,11 @@ def build_foundation_model(
             "`ops_implementation` populated). There is no silent all-eager fallback."
         )
 
+    from .configuration_base import as_veomni_config
+
+    if isinstance(config_path, PretrainedConfig):
+        config_path = as_veomni_config(config_path, validate=False)
+
     if attn_implementation is not None:
         attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
@@ -233,17 +238,12 @@ def build_foundation_model(
 
     if isinstance(config_path, PretrainedConfig):
         config = config_path
-        if ops_implementation is not None:
-            config._set_ops_implementation(ops_implementation)
+        config._apply_ops_overrides(ops_implementation=ops_implementation, attn_implementation=attn_implementation)
     else:
-        config = build_config(config_path, ops_implementation=ops_implementation, **config_kwargs)
-
-    if attn_implementation is not None:
-        config._attn_implementation = attn_implementation
-    else:
-        for cfg in _iter_configs(config):
-            if getattr(cfg, "_attn_implementation_internal", None) is None:
-                cfg._attn_implementation_internal = cfg.ops_config.attn_implementation
+        load_kwargs = {**config_kwargs, "ops_implementation": ops_implementation}
+        if attn_implementation is not None:
+            load_kwargs["attn_implementation"] = attn_implementation
+        config = build_config(config_path, **load_kwargs)
 
     effective_attn = attn_implementation if attn_implementation is not None else config.ops_config.attn_implementation
 

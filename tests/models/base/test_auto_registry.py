@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from operator import attrgetter
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -650,8 +651,10 @@ def test_get_model_class_hf_backend(monkeypatch):
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_build_foundation_model_requires_ops_config():
+    config = _tiny_qwen3_config()
+    config.ops_implementation.clear()
     with pytest.raises(ValueError, match="ops_implementation"):
-        build_foundation_model(_tiny_qwen3_config())
+        build_foundation_model(config)
 
 
 @pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
@@ -857,3 +860,48 @@ def test_build_foundation_model_preserves_subconfig_independent_attention():
     assert overridden.config.vision_config._attn_implementation == "eager"
     assert overridden.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
     assert overridden.model.visual.blocks[0].attn.veomni_attn.impl == "eager"
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_hf_backend_build_uses_native_config_without_mutating_adapter(monkeypatch):
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
+    config = _tiny_qwen3_config()
+    model = build_foundation_model(
+        config, torch_dtype="float32", init_device="cpu", ops_implementation=eager_ops_config()
+    )
+    assert type(model.config) is Qwen3Config
+    assert not hasattr(model.config, "ops_config")
+    assert isinstance(config, VeOmniPretrainedConfig)
+    assert model.config is not config
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_path):
+    from transformers import LlamaConfig
+
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        ops_implementation=OpsImplementationConfig(attn_implementation="eager", rms_norm_implementation="eager"),
+    )
+    assert not isinstance(config, VeOmniPretrainedConfig)
+    model = LlamaForCausalLM(config).eval()
+    assert model.config is config
+    assert isinstance(config, VeOmniPretrainedConfig)
+    assert issubclass(model.config_class, VeOmniPretrainedConfig)
+    model.save_pretrained(tmp_path)
+    reloaded = LlamaForCausalLM.from_pretrained(tmp_path).eval()
+    inputs = torch.tensor([[1, 2, 3]])
+    torch.testing.assert_close(model(inputs).logits, reloaded(inputs).logits)

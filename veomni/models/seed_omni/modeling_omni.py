@@ -126,6 +126,10 @@ class OmniModel(PreTrainedModel):
     supports_gradient_checkpointing = False
     _no_split_modules = []
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The graph runtime delegates attention to its independently configured modules.
+        return attn_implementation
+
     def __init__(self, config: OmniConfig, modules: Mapping[str, PretrainedOmniModule]):
         super().__init__(config)
         self.config = config

@@ -456,10 +456,11 @@ class WanModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["DiTBlock"]
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Wan dispatches attention exclusively through its local VeomniOp.
+        return attn_implementation
+
     def __init__(self, config: WanConfig, **kwargs):
-        if "attn_implementation" not in config.ops_implementation:
-            config.ops_implementation["attn_implementation"] = config.ops_config.attn_implementation
-        config._attn_implementation_internal = "eager"
         super().__init__(config, **kwargs)
         self.dim = config.dim
         self.freq_dim = config.freq_dim

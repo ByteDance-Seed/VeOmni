@@ -60,6 +60,10 @@ config = PatchConfig(
     description="Qwen2-VL with VeOmni v5 compatibility and LigerKernel GPU replacements",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("copy", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])

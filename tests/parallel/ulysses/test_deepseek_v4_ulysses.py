@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
@@ -43,7 +44,7 @@ def _load_dsv4_toy_config(**ops_overrides):
     ops = eager_ops_config()
     for key, value in ops_overrides.items():
         setattr(ops, key, value)
-    config._set_ops_implementation(ops)
+    as_veomni_config(config, validate=False)._set_ops_implementation(ops)
     return config
 
 

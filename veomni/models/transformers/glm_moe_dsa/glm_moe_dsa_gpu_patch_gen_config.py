@@ -46,6 +46,10 @@ config = PatchConfig(
     description="GLM-MoE-DSA with VeomniOp DSA indexer / attention and fused loss",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",

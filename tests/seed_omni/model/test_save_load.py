@@ -960,3 +960,16 @@ def test_omni_model_rejects_missing_default_generate():
     model = OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
     with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
         model.generate({})
+
+
+def test_public_config_builder_applies_root_ops_before_loading_modules(tmp_path):
+    from veomni.models import build_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    overrides = {"rms_norm_implementation": "eager", "attn_implementation": "eager"}
+    direct = OmniConfig.from_pretrained(tmp_path, ops_implementation=overrides)
+    built = build_config(tmp_path, ops_implementation=overrides)
+    assert built.ops_implementation == direct.ops_implementation == overrides
+    for name in built.module_names:
+        assert built._module_configs[name].ops_implementation == direct._module_configs[name].ops_implementation
+        assert built._module_configs[name].ops_config.rms_norm_implementation == "eager"

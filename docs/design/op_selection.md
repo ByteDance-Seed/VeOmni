@@ -101,7 +101,7 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
 
 VeOmniModelRuntime._build_model()             # (3) model build time
   └─ models.build_foundation_model(..., ops_implementation=ops)
-       ├─ config._set_ops_implementation(ops)
+       ├─ config._apply_ops_overrides(ops_implementation=ops)
        └─ model init + weight loading
             ├─ patched modules construct local VeomniOp handles from config.ops_config
             ├─ registry validates row hardware + optional packages
@@ -130,6 +130,12 @@ an explicit `ops_implementation` nor a `PretrainedConfig` with `ops_implementati
 populated receive `ValueError`; there is no silent all-eager fallback.
 
 ---
+
+Configuration lifecycle, recursive HF adapters, override precedence, and model
+entry-point contracts are documented in [Module-level configuration](module_config.md).
+Importing VeOmni does not modify HF's `PretrainedConfig` methods. The
+`ops_implementation` dictionary is the only attention selection state;
+`_attn_implementation` and HF's private attention accessor read that dictionary.
 
 ## 1. Attention
 

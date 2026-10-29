@@ -188,3 +188,16 @@ def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
 
     assert "cu_seq_lens_q" not in captured
     assert "max_length_q" not in captured
+
+
+def test_wan_diffusers_save_preserves_module_ops(tmp_path):
+    import json
+
+    from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import WanTransformer3DModel
+
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = WanTransformer3DModel(config)
+    model.save_pretrained(tmp_path)
+    assert json.loads((tmp_path / "config.json").read_text())["ops_implementation"] == config.ops_implementation
+    assert type(config).from_pretrained(tmp_path).ops_implementation == config.ops_implementation

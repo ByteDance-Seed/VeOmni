@@ -48,6 +48,10 @@ config = PatchConfig(
     description="Qwen3Moe with VeOmni patches and VeomniOp replacements",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("typing", names=["Optional"])
 
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can return

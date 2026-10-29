@@ -63,6 +63,7 @@ import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.moe_router_replay import set_active_replay
 
 
@@ -155,7 +156,7 @@ def _make_qwen3_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 
@@ -183,7 +184,7 @@ def _make_qwen3_5_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 
@@ -193,7 +194,7 @@ def _make_qwen4_exp_config(norm_topk_prob: bool):
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.norm_topk_prob = norm_topk_prob
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 

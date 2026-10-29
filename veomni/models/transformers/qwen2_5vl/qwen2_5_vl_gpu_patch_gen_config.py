@@ -62,6 +62,10 @@ config = PatchConfig(
     description="Qwen2.5-VL with VeOmni v5 compatibility (SP + window attention + fused-loss)",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("copy", is_from_import=False)
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("functools", names=["partial"])

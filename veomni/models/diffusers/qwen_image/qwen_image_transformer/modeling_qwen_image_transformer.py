@@ -671,7 +671,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
-        self.config = self.config.to_diffuser_dict()
+        self.config = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
         try:
             _QwenImageTransformer2DModel.save_pretrained(self, path, **kwargs)
         finally:
@@ -708,30 +708,24 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
                 )
             kwargs = {**veomni_cfg.to_diffuser_dict(), **kwargs}
 
+        if veomni_cfg is None:
+            hub_kwargs = {
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "subfolder")
+                if key in kwargs
+            }
+            veomni_cfg = cls.config_class.from_pretrained(
+                path, **hub_kwargs, **caller_diffuser_overrides, **override_kwargs
+            )
+            kwargs = {**veomni_cfg.to_diffuser_dict(), **kwargs}
+
         loaded = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
         diffusers_model = loaded[0] if isinstance(loaded, tuple) else loaded
         diffusers_model.__class__ = cls
 
-        diffusers_cfg = dict(diffusers_model.config)
-        if veomni_cfg is None:
-            cfg_kwargs = {k: v for k, v in diffusers_cfg.items() if k in valid_keys}
-            if "attn_implementation" in diffusers_cfg:
-                cfg_kwargs["attn_implementation"] = diffusers_cfg["attn_implementation"]
-            if "ops_implementation" in diffusers_cfg:
-                cfg_kwargs["ops_implementation"] = diffusers_cfg["ops_implementation"]
-            veomni_cfg = cls.config_class.from_dict(cfg_kwargs, **override_kwargs)
-        else:
-            for k, v in caller_diffuser_overrides.items():
-                setattr(veomni_cfg, k, v)
+        for key, value in caller_diffuser_overrides.items():
+            setattr(veomni_cfg, key, value)
 
-        if (
-            "attn_implementation" not in veomni_cfg.ops_implementation
-            and getattr(veomni_cfg, "_attn_implementation_internal", None) is None
-        ):
-            veomni_cfg._attn_implementation_internal = diffusers_model._check_and_adjust_attn_implementation(
-                veomni_cfg._attn_implementation,
-                is_init_check=True,
-            )
         diffusers_model.config = veomni_cfg
         diffusers_model.config.tie_word_embeddings = False
 

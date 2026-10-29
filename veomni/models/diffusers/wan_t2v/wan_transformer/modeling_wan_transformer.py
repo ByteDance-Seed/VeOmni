@@ -587,9 +587,11 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
-        self.config = self.config.to_diffuser_dict()
-        _WanTransformer3DModel.save_pretrained(self, path, **kwargs)
-        self.config = hf_config
+        self.config = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
+        try:
+            _WanTransformer3DModel.save_pretrained(self, path, **kwargs)
+        finally:
+            self.config = hf_config
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):

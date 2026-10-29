@@ -149,3 +149,12 @@ Use these separate mechanisms only when their semantics require them:
 - Letting an unavailable optimized implementation fall back silently.
 - Editing patchgen-generated files instead of their patch config.
 - Renaming `ops_implementation` while changing the internal kernel plumbing.
+
+## Configuration ownership
+
+Model ops selections belong to `VeOmniPretrainedConfig.ops_implementation`.
+Read `config.ops_config.<field>` when binding a handle. HF config methods are
+never patched globally; standalone module tests must construct an adapted config
+with `get_veomni_config_class` or opt in with `as_veomni_config`.
+Attention's HF accessors alias the same dictionary; do not add synchronization
+fields or repair attention state in builders. See `docs/design/module_config.md`.

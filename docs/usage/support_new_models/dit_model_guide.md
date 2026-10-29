@@ -96,7 +96,10 @@ resolves from `config.ops_config`. The weights are not touched.
 ```python
 def save_pretrained(self, path, **kwargs):
     hf_config = copy.deepcopy(self.config)      # 1. stash VeOmni config
-    self.config = self.config.to_diffuser_dict() # 2. swap in pure diffusers dict
+    self.config = {                            # 2. preserve local ops metadata
+        **self.config.to_diffuser_dict(),
+        "ops_implementation": dict(self.config.ops_implementation),
+    }
     _WanTransformer3DModel.save_pretrained(self, path, **kwargs)  # 3. delegate
     self.config = hf_config                      # 4. restore VeOmni config
 ```
@@ -104,8 +107,10 @@ def save_pretrained(self, path, **kwargs):
 Step 2 calls `to_diffuser_dict()`, which returns **only the parameters that
 appear in the diffusers model's `__init__` signature** (inspected at import
 time via `inspect.signature`). VeOmni-only fields (`model_type`,
-`condition_model_type`, `ops_implementation`, etc.) are automatically
-excluded because they are not in that signature.
+`condition_model_type`, etc.) are excluded because they are not in that
+signature. Persist the sparse `ops_implementation` separately in the saved
+config so a VeOmni reload retains the module's selected kernels. Diffusers
+ignores this extra metadata when constructing its native model.
 
 Step 3 delegates to the diffusers `save_pretrained`, which:
 - Writes `config.json` using `to_dict()` (overridden to inject `_class_name`
@@ -114,8 +119,7 @@ Step 3 delegates to the diffusers `save_pretrained`, which:
   key names are identical to the original diffusers model because VeOmni
   inherits all layers without renaming them.
 
-The resulting checkpoint directory is indistinguishable from one produced by
-diffusers directly. A downstream pipeline can load it without any knowledge of
+The weight layout remains compatible with checkpoints produced by diffusers. A downstream pipeline can load it without any knowledge of
 VeOmni:
 
 ```python

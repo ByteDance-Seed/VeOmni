@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.configuration_base import as_veomni_config
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
@@ -375,11 +376,11 @@ def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
     torch.manual_seed(31)
     eager_ops = eager_ops_config()
     eager_ops.qsa_attention_implementation = "eager"
-    config._set_ops_implementation(eager_ops)
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops)
     reference = modeling.Qwen4ExpTextAttention(config, layer_idx=1).float().to(DEVICE)
     tilelang_ops = eager_ops_config()
     tilelang_ops.qsa_attention_implementation = "tilelang"
-    config._set_ops_implementation(tilelang_ops)
+    as_veomni_config(config, validate=False)._set_ops_implementation(tilelang_ops)
     attention = modeling.Qwen4ExpTextAttention(config, layer_idx=1).to(DEVICE, dtype=torch.bfloat16)
     attention.load_state_dict(copy.deepcopy(reference.state_dict()))
     assert reference.veomni_qsa_attn.impl == "eager"

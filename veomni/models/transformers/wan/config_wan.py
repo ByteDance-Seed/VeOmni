@@ -70,6 +70,7 @@ class WanConfig(VeOmniPretrainedConfig):
         config = {
             "_class_name": "WanModel",
             "_diffusers_version": diffusers_version,
+            "ops_implementation": dict(self.ops_implementation),
             "dim": self.dim,
             "eps": self.eps,
             "ffn_dim": self.ffn_dim,

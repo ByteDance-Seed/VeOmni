@@ -161,7 +161,13 @@ def _assert_isolated(
             from veomni.models.auto import _iter_configs
 
             for sub_cfg in _iter_configs(hf_config):
+                attention = sub_cfg._attn_implementation
                 sub_cfg.ops_implementation = dict(vars(poison_cfg))
+                check(eager, eager_cfg.attn_implementation)
+                check(alternate, alt_cfg.attn_implementation)
+                # HF builds masks from the canonical selection on every forward.
+                # Restore that selection after verifying bound handles are stable.
+                sub_cfg.ops_implementation["attn_implementation"] = attention
         eager_out = _output_tensor(run(eager))
         alt_out = _output_tensor(run(alternate))
         check(eager, eager_cfg.attn_implementation)
@@ -417,7 +423,7 @@ def test_gemma3_text_forward_keeps_construction_impls():
     )
 
 
-def test_gemma3_eager_instance_keeps_first_token_causal_after_global_sdpa_switch():
+def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model():
     from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
 
     config = tiny_gemma3_text_config()

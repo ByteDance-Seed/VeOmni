@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.configuration_base import get_veomni_config_class
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -120,13 +121,16 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
-    """Upstream PretrainedConfig subclasses support ops_implementation init, save, and reload."""
+    """Adapted HF config subclasses support ops_implementation init, save, and reload."""
     import json
 
-    from transformers import AutoConfig
     from transformers.models.llama.configuration_llama import LlamaConfig
 
-    import veomni.models  # noqa: F401 - ensures PretrainedConfig patch is applied
+    from veomni.models import build_config
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
+
+    import veomni.models  # noqa: F401
 
     bare = LlamaConfig(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4)
     assert bare.ops_implementation == {}
@@ -157,7 +161,7 @@ def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
     }
 
     configured.save_pretrained(tmp_path)
-    reloaded = AutoConfig.from_pretrained(tmp_path)
+    reloaded = build_config(tmp_path)
     assert reloaded.ops_implementation == {
         "rms_norm_implementation": "eager",
         "attn_implementation": "veomni_sdpa",
@@ -180,6 +184,8 @@ def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
 def test_pretrained_config_attn_implementation_bidirectional_sync():
     """config._attn_implementation and config.ops_config.attn_implementation stay synchronized."""
     from transformers.models.llama.configuration_llama import LlamaConfig
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
     from transformers.models.llama.modeling_llama import LlamaForCausalLM as HFLlamaForCausalLM
 
     import veomni.models  # noqa: F401
@@ -217,17 +223,18 @@ def test_pretrained_config_attn_implementation_bidirectional_sync():
     assert cfg_both.ops_implementation["attn_implementation"] == "eager"
     assert cfg_both.ops_config.attn_implementation == "eager"
 
-    # 4. Bare config passed into PreTrainedModel.__init__ resolves None -> "sdpa" on both attributes.
+    # 4. Model initialization writes the same canonical ops state.
     cfg_bare = LlamaConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=1,
         num_attention_heads=4,
+        attn_implementation="eager",
     )
     HFLlamaForCausalLM(cfg_bare)
-    assert cfg_bare._attn_implementation == "sdpa"
-    assert cfg_bare.ops_config.attn_implementation == "sdpa"
+    assert cfg_bare._attn_implementation == "eager"
+    assert cfg_bare.ops_config.attn_implementation == "eager"
 
 
 def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
@@ -235,6 +242,8 @@ def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
     import json
 
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
 
     import veomni.models  # noqa: F401
 
@@ -288,6 +297,8 @@ def test_three_level_nested_config_preserves_grandchild_overrides(tmp_path, monk
 
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
+    Qwen3OmniMoeConfig = get_veomni_config_class(Qwen3OmniMoeConfig)
+
     import veomni.models  # noqa: F401
 
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
@@ -339,6 +350,9 @@ def test_subconfig_hf_attn_implementation_merges_and_roundtrips(tmp_path, sub_as
     """A child sub-config specifying HF attn_implementation updates both _attn_implementation and ops_config."""
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
+    Qwen3VLVisionConfig = get_veomni_config_class(Qwen3VLVisionConfig)
+
     import veomni.models  # noqa: F401
 
     vision_arg = (
@@ -369,6 +383,8 @@ def test_subconfig_hf_attn_implementation_merges_and_roundtrips(tmp_path, sub_as
 def test_nested_attn_implementation_mapping_overrides_grandchild():
     """Nested HF attn_implementation dict on a 3-level root config overrides grandchild's initial selection."""
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+
+    Qwen3OmniMoeConfig = get_veomni_config_class(Qwen3OmniMoeConfig)
 
     import veomni.models  # noqa: F401
 
@@ -404,7 +420,11 @@ def test_nested_attn_implementation_mapping_overrides_grandchild():
 def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch):
     """Sparse ops_implementation overrides on from_pretrained only propagate caller-specified keys."""
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+
+    Qwen3OmniMoeConfig = get_veomni_config_class(Qwen3OmniMoeConfig)
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
 
     import veomni.models  # noqa: F401
 
@@ -461,7 +481,11 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
 def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
     """Sparse overrides on existing or loaded configs validate the merged state at every node."""
     from transformers.models.llama.configuration_llama import LlamaConfig
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
 
     import veomni.models  # noqa: F401
 
@@ -518,7 +542,11 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
 def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path, monkeypatch):
     """Loading a GPU checkpoint on NPU succeeds when caller overrides GPU-only ops to NPU-supported ones."""
     from transformers.models.llama.configuration_llama import LlamaConfig
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
 
     import veomni.models  # noqa: F401
     from veomni.models.seed_omni.configuration_omni import OmniConfig
@@ -635,3 +663,111 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
     assert llama_both_npu._attn_implementation == "sdpa"
     assert llama_both_npu.ops_config.attn_implementation == "sdpa"
     assert llama_both_npu.ops_config.rms_norm_implementation == "torch_npu"
+
+
+def test_import_leaves_native_hf_config_methods_unchanged():
+    """A fresh interpreter verifies the import boundary before any VeOmni import."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        from transformers import PretrainedConfig, LlamaConfig
+        before = (PretrainedConfig.__post_init__, PretrainedConfig.from_dict.__func__,
+                  PretrainedConfig.to_diff_dict, PretrainedConfig._attn_implementation)
+        import veomni.models
+        after = (PretrainedConfig.__post_init__, PretrainedConfig.from_dict.__func__,
+                 PretrainedConfig.to_diff_dict, PretrainedConfig._attn_implementation)
+        assert before == after
+        native = LlamaConfig(attn_implementation='eager')
+        assert not hasattr(native, 'ops_config')
+        assert not hasattr(PretrainedConfig, '_set_ops_implementation')
+        assert native._attn_implementation == 'eager'
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+
+def test_adapter_config_instances_pickle_in_fresh_interpreter():
+    """Every nested dynamic class reconstructs through the cached factory on spawn."""
+    import pickle
+    import subprocess
+    import sys
+
+    from transformers import Qwen3VLConfig
+
+    config = get_veomni_config_class(Qwen3VLConfig)(
+        ops_implementation={"attn_implementation": "sdpa"},
+        vision_config={"ops_implementation": {"attn_implementation": "eager"}},
+    )
+    script = """
+import pickle, sys
+from veomni.models.configuration_base import VeOmniPretrainedConfig, get_veomni_config_class
+from transformers import Qwen3VLConfig
+config = pickle.loads(sys.stdin.buffer.read())
+assert type(config) is get_veomni_config_class(Qwen3VLConfig)
+assert isinstance(config.text_config, VeOmniPretrainedConfig)
+assert config.text_config._attn_implementation == 'veomni_sdpa'
+assert config.vision_config._attn_implementation == 'eager'
+assert '_attn_implementation_internal' not in vars(config)
+"""
+    subprocess.run([sys.executable, "-c", script], input=pickle.dumps(config), check=True, capture_output=True)
+
+
+def test_config_loader_preserves_nested_hf_attention_keywords(tmp_path):
+    """The adapter must initialize before native HF parent attention propagation."""
+    import json
+
+    from transformers import Qwen3VLConfig
+
+    from veomni.models import VeOmniPretrainedConfig, build_config
+
+    payload = {
+        "model_type": "qwen3_vl",
+        "attn_implementation": "eager",
+        "text_config": {"attn_implementation": "sdpa"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(payload))
+    loaded = build_config(tmp_path)
+    assert type(loaded) is get_veomni_config_class(Qwen3VLConfig)
+    assert isinstance(loaded.text_config, VeOmniPretrainedConfig)
+    assert loaded._attn_implementation == "eager"
+    assert loaded.text_config._attn_implementation == "veomni_sdpa"
+    assert loaded.vision_config._attn_implementation == "eager"
+
+
+def test_attention_has_one_storage_and_private_hf_write_is_local():
+    from transformers import Qwen3VLConfig
+
+    config = get_veomni_config_class(Qwen3VLConfig)(
+        ops_implementation={"attn_implementation": "sdpa"},
+        vision_config={"ops_implementation": {"attn_implementation": "eager"}},
+    )
+    config._attn_implementation_internal = "sdpa"
+    assert config.ops_implementation["attn_implementation"] == "sdpa"
+    assert config.ops_config.attn_implementation == config._attn_implementation == "sdpa"
+    assert config.vision_config._attn_implementation == "eager"
+    assert "_attn_implementation_internal" not in vars(config)
+    config.ops_implementation["attn_implementation"] = "eager"
+    assert config._attn_implementation_internal == "eager"
+    config._attn_implementation = {"text_config": "eager"}
+    assert config.text_config.ops_config.attn_implementation == "eager"
+
+
+def test_omni_config_uses_module_config_base_and_preserves_root_ops():
+    import pickle
+
+    from veomni.models import VeOmniPretrainedConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = OmniConfig(
+        _module_entries={},
+        training_graphs={},
+        generation_graphs={},
+        ops_implementation={"attn_implementation": "eager"},
+    )
+    assert isinstance(config, VeOmniPretrainedConfig)
+    assert config.ops_implementation == {"attn_implementation": "eager"}
+    # Stable handwritten subclasses of an adapter must retain their exact type.
+    custom = DeepseekV4Config(attn_implementation="eager")
+    assert type(pickle.loads(pickle.dumps(custom))) is DeepseekV4Config

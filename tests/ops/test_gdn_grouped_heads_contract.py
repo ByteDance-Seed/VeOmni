@@ -21,6 +21,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
     Qwen3_5GatedDeltaNet,
 )
@@ -114,7 +115,7 @@ def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]]):
     from tests.models.compare import eager_ops_config
 
     config = _make_config(model_name)
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     if model_name == "qwen3_5":
         layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
     elif model_name == "qwen3_5_moe":

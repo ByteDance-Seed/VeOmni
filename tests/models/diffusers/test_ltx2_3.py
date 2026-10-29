@@ -391,3 +391,14 @@ def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
             if name == "ltx_core" or name.startswith("ltx_core."):
                 sys.modules.pop(name, None)
         sys.modules.update(saved_modules)
+
+
+def test_ltx_save_preserves_module_ops(tmp_path):
+    import json
+
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = ltx_modeling.LTXVideoTransformerModel(config)
+    model.save_pretrained(tmp_path)
+    assert json.loads((tmp_path / "config.json").read_text())["ops_implementation"] == config.ops_implementation
+    assert type(config).from_pretrained(tmp_path).ops_implementation == config.ops_implementation

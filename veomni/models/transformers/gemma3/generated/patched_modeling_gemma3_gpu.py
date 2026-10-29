@@ -38,8 +38,6 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-
-# Additional imports for patches
 from functools import partial
 
 import torch
@@ -66,7 +64,6 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModel
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.processing_utils import Unpack
@@ -82,6 +79,9 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.mask import packed_causal_mask, sliding_window_mask

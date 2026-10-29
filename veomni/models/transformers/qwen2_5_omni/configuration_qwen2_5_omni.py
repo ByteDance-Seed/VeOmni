@@ -16,8 +16,10 @@
 
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig as _Qwen2_5OmniConfig
 
+from veomni.models.configuration_base import get_veomni_config_class
 
-class Qwen2_5OmniConfig(_Qwen2_5OmniConfig):
+
+class Qwen2_5OmniConfig(get_veomni_config_class(_Qwen2_5OmniConfig)):
     def __init__(
         self,
         **kwargs,

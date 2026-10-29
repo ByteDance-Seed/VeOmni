@@ -43,7 +43,7 @@ from .checkpoint.weights import (
     save_model_assets,
     save_model_weights,
 )
-from .configuration_base import VeOmniPretrainedConfig
+from .configuration_base import VeOmniPretrainedConfig, as_veomni_config, get_veomni_config_class
 from .registry import (
     MODEL_CONFIG_REGISTRY,
     MODEL_PROCESSOR_REGISTRY,
@@ -58,6 +58,8 @@ __all__ = [
     "MODELING_REGISTRY",
     "ModelCheckpointManager",
     "VeOmniPretrainedConfig",
+    "as_veomni_config",
+    "get_veomni_config_class",
     "build_config",
     "build_foundation_model",
     "build_processor",

@@ -476,7 +476,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
 
-        config_dict = self.config.to_diffuser_dict()
+        config_dict = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
         config_dict["_class_name"] = "LTXVideoTransformerModel"
         config_dict["_diffusers_version"] = diffusers_version
 

@@ -13,6 +13,7 @@ from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 from veomni.distributed.utils import check_fqn_match
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen3_5_moe import (
     register_qwen3_5_moe_modeling,
     register_qwen3_5_moe_text_modeling,
@@ -37,7 +38,7 @@ INTERMEDIATE_DIM = 6
 
 
 def _eager_ops(config):
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return nullcontext()
 
 

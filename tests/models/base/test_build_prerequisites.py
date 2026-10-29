@@ -22,12 +22,13 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from transformers import PretrainedConfig
 
 import veomni.models.auto as auto
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig as PretrainedConfig
+from veomni.models.configuration_base import as_veomni_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -181,7 +182,9 @@ def test_hub_flash_build_passes_normalized_name_to_loader(
         kwargs["ops_implementation"] = eager_ops_config()
         kwargs["attn_implementation"] = implementation
     else:
-        config._set_ops_implementation(OpsImplementationConfig(attn_implementation=implementation))
+        as_veomni_config(config, validate=False)._set_ops_implementation(
+            OpsImplementationConfig(attn_implementation=implementation)
+        )
 
     auto.build_foundation_model(config, init_device="cpu", **kwargs)
 
@@ -225,7 +228,9 @@ def test_aiter_build_passes_normalized_name_to_loader(
         kwargs["ops_implementation"] = eager_ops_config()
         kwargs["attn_implementation"] = implementation
     else:
-        config._set_ops_implementation(OpsImplementationConfig(attn_implementation=implementation))
+        as_veomni_config(config, validate=False)._set_ops_implementation(
+            OpsImplementationConfig(attn_implementation=implementation)
+        )
 
     auto.build_foundation_model(config, init_device="cpu", **kwargs)
 

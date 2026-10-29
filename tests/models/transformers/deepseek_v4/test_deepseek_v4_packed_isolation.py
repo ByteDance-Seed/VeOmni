@@ -25,6 +25,7 @@ import yaml
 from transformers import AutoConfig
 
 from tests.models.compare import eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu_modeling
 from veomni.ops import resolve_op
@@ -37,7 +38,7 @@ _TOY_CONFIG = "tests/toy_config/deepseek_v4_toy"
 
 def _toy_config():
     config = AutoConfig.from_pretrained(_TOY_CONFIG)
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 
@@ -48,7 +49,7 @@ def _eager_compressors(config):
     zeros it in ``_init_weights``. Standalone construction must do the same or
     softmax-gated compression sees allocator garbage / NaNs.
     """
-    config._set_ops_implementation(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     compressors = [cls(config) for cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor)]
     with torch.no_grad():
         for compressor in compressors:
