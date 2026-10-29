@@ -10,8 +10,8 @@ classes. `OmniConfig` and `OmniModuleConfig` use this same base.
 
 | Interface | Owner and behavior | Framework caller |
 |---|---|---|
-| [get_veomni_config_class](../../veomni/models/configuration_base.py#L283) | Framework factory; callers use it rather than creating adapters themselves. Returns a cached subclass of both the VeOmni base and the requested HF schema. Declared `sub_configs` are adapted recursively. Native validation and `model_type` remain available. | [get_model_config](../../veomni/models/registry.py#L76), [VeOmniPreTrainedModel.__init_subclass__](../../veomni/models/modeling_base.py#L25) |
-| [as_veomni_config](../../veomni/models/configuration_base.py#L317) | Framework helper; callers may explicitly opt an existing HF config tree in. Adapts in place, preserving references and supplied native child instances. Validation can be deferred until load overrides are complete. | [build_foundation_model](../../veomni/models/auto.py#L164), [VeOmniPreTrainedModel.__init__](../../veomni/models/modeling_base.py#L30) |
+| [get_veomni_config_class](../../veomni/models/configuration_base.py#L289) | Framework factory; callers use it rather than creating adapters themselves. Returns a cached subclass of both the VeOmni base and the requested HF schema. Declared `sub_configs` are adapted recursively. Native validation and `model_type` remain available. | [get_model_config](../../veomni/models/registry.py#L76), [VeOmniPreTrainedModel.__init_subclass__](../../veomni/models/modeling_base.py#L25) |
+| [as_veomni_config](../../veomni/models/configuration_base.py#L323) | Framework helper; callers may explicitly opt an existing HF config tree in. Adapts in place, preserving references and supplied native child instances. Validation can be deferred until load overrides are complete. | [build_foundation_model](../../veomni/models/auto.py#L164), [VeOmniPreTrainedModel.__init__](../../veomni/models/modeling_base.py#L30) |
 | [VeOmniPretrainedConfig.__post_init__](../../veomni/models/configuration_base.py#L73) | Framework-provided lifecycle. Custom HF post-init overrides must call `super()`. Concrete HF initialization runs, explicit child selections survive its attention broadcasts, then parent defaults are merged beneath child selections. Empty selections remain sparse. | HF config constructor and [from_dict](../../veomni/models/configuration_base.py#L222) |
 | [ops_config](../../veomni/models/configuration_base.py#L97) | Framework-provided read projection; models consume its fields while constructing handles. Does not repeat hardware validation on each read. | Model and module constructors |
 | [_apply_ops_overrides](../../veomni/models/configuration_base.py#L191) | Framework-provided load boundary. Applies sparse or complete ops selections plus explicit attention, validates the resulting tree, and updates it atomically. Callers must apply all load overrides together. | [get_model_config](../../veomni/models/registry.py#L76), [build_foundation_model](../../veomni/models/auto.py#L164), config [from_dict](../../veomni/models/configuration_base.py#L222) |
@@ -21,6 +21,10 @@ classes. `OmniConfig` and `OmniModuleConfig` use this same base.
 AutoModel mappings use that name. Config instances, including nested adapters,
 can be pickled and reconstructed in a fresh process without importing a dynamic
 class from the parent's globals. Handwritten subclasses keep their exact type.
+When a remote schema registers an HF Auto class, saving uses a native config
+copy so HF exports that schema's original source and relative dependencies.
+The saved `auto_map` points to the original remote class; loading through
+VeOmni adapts it again and restores the saved ops selections.
 
 ## Attention and override precedence
 
@@ -44,10 +48,22 @@ subtrees. At load time, saved selections are merged with caller ops overrides,
 then caller `attn_implementation` wins. Sparse mappings preserve unspecified
 child choices; a complete `OpsImplementationConfig` replaces them.
 
+Composed `OmniConfig` load kwargs merge into the root or named module entry
+before sidecars load. They accept dictionaries and typed
+`OpsImplementationConfig` selections. Typed selections contribute every
+non-`None` value from `to_dict()`, including dataclass defaults; unspecified
+fields remain in that layer. Module entry choices still override root choices.
+
 Validation runs after load overrides, so a checkpoint saved with device-specific
 ops can be loaded on another device by replacing those selections. Changing
 ops dictionaries after model construction does not replace bound `VeomniOp`
-handles. HF mask builders still read the canonical attention selection at
+handles. Wrappers that execute no HF attention, including condition model
+containers and the token embedding/projecting `TextEncoder`, override HF's
+`_check_and_adjust_attn_implementation` to return the canonical selection.
+This avoids unsupported capability checks and kernel preloading on a container;
+components that execute attention retain their own backend validation. Keep
+this override on the attention-free wrapper, not on the shared model base.
+HF mask builders still read the canonical attention selection at
 forward time, so keep it consistent with the constructed attention handle.
 
 ## Opt in

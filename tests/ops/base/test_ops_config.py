@@ -771,3 +771,53 @@ def test_omni_config_uses_module_config_base_and_preserves_root_ops():
     # Stable handwritten subclasses of an adapter must retain their exact type.
     custom = DeepseekV4Config(attn_implementation="eager")
     assert type(pickle.loads(pickle.dumps(custom))) is DeepseekV4Config
+
+
+@pytest.mark.parametrize("adaptation", ["factory", "in_place"])
+def test_remote_config_export_preserves_native_source_and_reload_target(tmp_path, adaptation):
+    import json
+
+    from transformers import AutoConfig
+
+    from veomni.models import build_config
+    from veomni.models.configuration_base import VeOmniPretrainedConfig, as_veomni_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "configuration_remote.py").write_text(
+        "from transformers import PretrainedConfig\n"
+        "from .remote_defaults import HIDDEN_SIZE\n"
+        "class RemoteConfig(PretrainedConfig):\n"
+        "    model_type = 'veomni_test_remote'\n"
+        "    def __init__(self, hidden_size=HIDDEN_SIZE, **kwargs):\n"
+        "        self.hidden_size = hidden_size\n"
+        "        super().__init__(**kwargs)\n"
+    )
+    (source / "remote_defaults.py").write_text("HIDDEN_SIZE = 8\n")
+    (source / "config.json").write_text(
+        json.dumps(
+            {"model_type": "veomni_test_remote", "auto_map": {"AutoConfig": "configuration_remote.RemoteConfig"}}
+        )
+    )
+    native = AutoConfig.from_pretrained(source, trust_remote_code=True, local_files_only=True)
+    if adaptation == "factory":
+        config = get_veomni_config_class(type(native))(ops_implementation={"attn_implementation": "eager"})
+    else:
+        config = as_veomni_config(native)
+        config._set_ops_implementation({"attn_implementation": "eager"})
+    original_type = type(config)
+    exported = tmp_path / "exported"
+    config.save_pretrained(exported)
+    saved = json.loads((exported / "config.json").read_text())
+    assert saved["auto_map"]["AutoConfig"] == "configuration_remote.RemoteConfig"
+    assert (exported / "configuration_remote.py").read_text() == (source / "configuration_remote.py").read_text()
+    assert (exported / "remote_defaults.py").is_file()
+    assert not (exported / "configuration_base.py").exists()
+    assert type(config) is original_type
+    assert isinstance(config, VeOmniPretrainedConfig)
+    plain = AutoConfig.from_pretrained(exported, trust_remote_code=True, local_files_only=True)
+    assert not isinstance(plain, VeOmniPretrainedConfig)
+    restored = build_config(exported, trust_remote_code=True, local_files_only=True)
+    assert isinstance(restored, VeOmniPretrainedConfig)
+    assert restored.hidden_size == 8
+    assert restored.ops_config.attn_implementation == "eager"

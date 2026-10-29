@@ -21,6 +21,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 
 from torch.testing._internal.common_utils import run_tests
 
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.transformers.flux.config_flux import FluxConfig
 from veomni.models.transformers.flux.modeling_flux import FluxModel
@@ -40,7 +41,9 @@ CASES = {
 
 def _build_model(device):
     with torch.device("meta"):
-        model = FluxModel(FluxConfig(num_blocks=1))
+        model = FluxModel(
+            FluxConfig(num_blocks=1, ops_implementation=make_eager_ops_config(attn_implementation="sdpa"))
+        )
     model.single_blocks = model.single_blocks[:1]
     model = model.to_empty(device=device).float()
     gen = torch.Generator().manual_seed(0)
@@ -84,8 +87,7 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
-    # Flash kernels only accept FP16/BF16, so this FP32 comparison has to run on SDPA. With no
-    # explicit ops_implementation on FluxConfig, PreTrainedModel.__init__ selects SDPA.
+    # Flash kernels only accept FP16/BF16, so this FP32 comparison explicitly selects SDPA.
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         group = self._get_process_group()

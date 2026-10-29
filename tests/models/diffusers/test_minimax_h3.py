@@ -448,3 +448,46 @@ def test_minimax_h3_rms_norm_matches_official():
         return model(hidden)
 
     assert_outputs_and_grads_match(official, ours, call)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_native_text_encoder_adapts_qwen_config(monkeypatch):
+    from transformers import Qwen3VLConfig
+
+    from veomni.models import VeOmniPretrainedConfig
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as modeling
+
+    def tiny_config(**kwargs):
+        return Qwen3VLConfig(
+            text_config={
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
+            },
+            vision_config={
+                "depth": 1,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+                "out_hidden_size": 16,
+                "patch_size": 2,
+                "temporal_patch_size": 1,
+                "spatial_merge_size": 1,
+                "num_position_embeddings": 4,
+                "deepstack_visual_indexes": [],
+            },
+        )
+
+    monkeypatch.setattr(modeling, "Qwen3VLConfig", tiny_config)
+    parent = _tiny_condition_config(ops_implementation={"attn_implementation": "sdpa"})
+    encoder = modeling.MiniMaxH3TextEncoder(num_retained_layers=1, config=parent)
+    assert isinstance(encoder.config, VeOmniPretrainedConfig)
+    assert encoder.config.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert encoder.config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+    output = encoder.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
+    assert output.last_hidden_state.shape == (1, 3, 16)

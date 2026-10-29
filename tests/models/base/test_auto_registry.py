@@ -905,3 +905,62 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
     reloaded = LlamaForCausalLM.from_pretrained(tmp_path).eval()
     inputs = torch.tensor([[1, 2, 3]])
     torch.testing.assert_close(model(inputs).logits, reloaded(inputs).logits)
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize("family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni"])
+@pytest.mark.parametrize("attention", [None, "eager", "sdpa", "flash_attention_2"])
+def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkeypatch, family, attention):
+    """Orchestration and embedding wrappers leave backend validation to actual attention modules."""
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.seed_omni.modeling_omni import OmniModel
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("A wrapper without HF attention must not preload attention kernels")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    ops = {} if attention is None else {"attn_implementation": attention}
+    if family == "text_encoder":
+        from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
+        from veomni.models.seed_omni.modules.text_encoder.modeling import TextEncoder
+
+        config = TextEncoderConfig(vocab_size=8, hidden_size=8, ops_implementation=ops)
+
+        def construct():
+            return TextEncoder(config)
+    elif family == "omni":
+        config = OmniConfig(_module_entries={}, training_graphs={}, generation_graphs={}, ops_implementation=ops)
+
+        def construct():
+            return OmniModel(config, {})
+    else:
+        from veomni.models.diffusers.ltx2_3.ltx_condition.modeling_ltx2_3_condition import LTXVideoConditionModel
+        from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3_condition import (
+            MiniMaxH3ConditionModel,
+        )
+        from veomni.models.diffusers.qwen_image.qwen_image_condition.modeling_qwen_image_condition import (
+            QwenImageConditionModel,
+        )
+        from veomni.models.diffusers.wan_t2v.wan_condition.modeling_wan_condition import WanTransformer3DConditionModel
+
+        cls = {
+            "ltx": LTXVideoConditionModel,
+            "minimax": MiniMaxH3ConditionModel,
+            "qwen_image": QwenImageConditionModel,
+            "wan": WanTransformer3DConditionModel,
+        }[family]
+        if family == "minimax":
+            config = cls.config_class(skip_encoder_load=True, ops_implementation=ops)
+        else:
+            monkeypatch.setattr(cls, "_load_components", lambda self: None)
+            config = cls.config_class(ops_implementation=ops)
+
+        def construct():
+            return cls(config)
+
+    expected = config.ops_config.attn_implementation
+    model = construct()
+    assert model.config is config
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected
+    assert "_attn_implementation_internal" not in vars(config)

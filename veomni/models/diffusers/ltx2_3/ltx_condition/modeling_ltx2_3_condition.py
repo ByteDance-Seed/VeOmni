@@ -178,6 +178,10 @@ class LTXVideoConditionModel(PreTrainedModel):
     config_class = LTXVideoConditionModelConfig
     supports_gradient_checkpointing = False
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
+
     def __init__(self, config: LTXVideoConditionModelConfig, meta_init=False, **kwargs):
         super().__init__(config, **kwargs)
         self.config = config

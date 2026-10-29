@@ -44,6 +44,10 @@ _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3ConditionModelConfig, **kwargs):
         super().__init__(config)
         self._video_vae = None

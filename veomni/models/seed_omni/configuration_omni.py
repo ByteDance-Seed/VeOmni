@@ -131,6 +131,8 @@ def _split_omni_kwargs(
     caller meant for HF (``torch_dtype``, ``device_map``, …). A block states
     choices rather than replacing the layer it lands on.
     """
+    from ...arguments import OpsImplementationConfig
+
     ops_fields = _ops_field_names()
     root_ops: Dict[str, Any] = {}
     per_module: Dict[str, Dict[str, Any]] = {}
@@ -138,6 +140,10 @@ def _split_omni_kwargs(
 
     def ops_selection(key: str, field: str, value: Any) -> Dict[str, Any]:
         if field == "ops_implementation":
+            if value is None:
+                return {}
+            if isinstance(value, OpsImplementationConfig):
+                value = value.to_dict()
             if not isinstance(value, dict):
                 raise ValueError(
                     f"Load kwarg {key!r} must be a dict of kernel selections, got {type(value).__name__}."

@@ -435,6 +435,9 @@ def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model
     sdpa_cfg = _attn_cfg("sdpa")
     other_config = tiny_gemma3_text_config()
     other_config._set_ops_implementation(sdpa_cfg)
+    other_model = Gemma3ForCausalLM(other_config).eval()
+    assert model.model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert other_model.model.layers[0].self_attn.veomni_attn.impl == "sdpa"
     with torch.no_grad():
         logits = model(input_ids=input_ids, use_cache=False).logits
         mutated_logits = model(input_ids=mutated, use_cache=False).logits

@@ -237,6 +237,8 @@ Core files:
 25. **Kernel handles belong to model instances**
    - Modeling classes construct `VeomniOp` handles from `self.config.ops_config` and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
+   - Attention-free containers and embedding/projecting modules override HF's `_check_and_adjust_attn_implementation` to return the canonical selection. Do not advertise a backend capability they do not execute, preload its kernel on the container, or bypass checks on the shared model base; attention-owning components validate themselves.
+   - Native configs created inside VeOmni models must explicitly opt in before calling VeOmni helpers; the native HF classes are never globally patched. Remote adapters export a native copy to preserve their source files and `auto_map`.
 
 26. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.

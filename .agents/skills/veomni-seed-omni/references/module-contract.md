@@ -51,6 +51,13 @@ modules/<family>/<submodule>/
   `accelerated/accelerated.py`, define plain module-level functions in
   `modeling.py`.
 
+Attention-free modules such as `TextEncoder` override HF's
+`_check_and_adjust_attn_implementation` to return the canonical selection.
+Keep this override local to those modules: attention-owning modules must still
+validate their selected backend. Do not set a false `_supports_sdpa` capability
+or introduce a second HF-only attention state. See
+`docs/design/module_config.md` for the configuration boundary.
+
 ## 3. IDE Type Stubs on `TrainingMixin`
 
 Because `VeOmniMixin` precedes `Xxx` in `XxxAccelerated(VeOmniMixin, Xxx)`'s

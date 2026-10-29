@@ -84,7 +84,12 @@ independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
 
 CPU model tests must explicitly select eager implementations for every consumed
 op, rather than only setting attention to eager: host defaults can otherwise bind
-accelerator RMSNorm/MLP kernels to CPU inputs. Plain-tensor checkpoint exports
+accelerator RMSNorm/MLP kernels to CPU inputs. FP32 accelerator parity tests
+must explicitly select SDPA when the default attention backend requires half
+precision. Attention-free wrapper construction tests should forbid HF kernel
+preloading, including the local FlashAttention loader, so they also cover
+CPU workers in NPU environments without `flash_attn`.
+Plain-tensor checkpoint exports
 must not query an accelerator's current device; resolve the staging device only
 when a DTensor actually needs materialization. CPU-planned workers hide devices,
 so unnecessary device queries can initialize an unavailable vendor runtime.

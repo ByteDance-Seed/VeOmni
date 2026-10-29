@@ -2,6 +2,8 @@ import numpy as np
 import torch
 from transformers import Qwen3VLConfig, Qwen3VLModel
 
+from ....configuration_base import as_veomni_config
+
 
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
@@ -144,6 +146,7 @@ class MiniMaxH3TextEncoder(torch.nn.Module):
                 "vision_start_token_id": 151652,
             }
         )
+        qwen_config = as_veomni_config(qwen_config, validate=False)
         if config is not None and getattr(config, "ops_implementation", None):
             qwen_config._set_ops_implementation(config.ops_implementation)
         self.model = Qwen3VLModel(qwen_config)

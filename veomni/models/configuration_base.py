@@ -228,6 +228,12 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         config._apply_ops_overrides(ops_implementation=ops, attn_implementation=attention)
         return result
 
+    def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
+        """Export remote config code from its native schema rather than the adapter."""
+        if type(self).__dict__.get("_hf_config_class") is not None and self._auto_class is not None:
+            return as_hf_config(self).save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
+        return super().save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
+
     def to_diff_dict(self) -> dict[str, Any]:
         diff = super().to_diff_dict()
         _prune_subconfig_ops_diff(self, diff)

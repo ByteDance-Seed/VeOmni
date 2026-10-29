@@ -973,3 +973,25 @@ def test_public_config_builder_applies_root_ops_before_loading_modules(tmp_path)
     for name in built.module_names:
         assert built._module_configs[name].ops_implementation == direct._module_configs[name].ops_implementation
         assert built._module_configs[name].ops_config.rms_norm_implementation == "eager"
+
+
+@pytest.mark.parametrize("entry", ["direct", "builder"])
+def test_omni_typed_ops_preserve_composed_merge_precedence(tmp_path, entry):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models import build_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    config_file = tmp_path / "config.json"
+    saved = json.loads(config_file.read_text())
+    saved["ops_implementation"] = {"rms_norm_implementation": "eager"}
+    saved["_module_entries"][FAKE_B]["ops_implementation"] = {"attn_implementation": "sdpa"}
+    config_file.write_text(json.dumps(saved))
+    selection = OpsImplementationConfig(attn_implementation="eager")
+    loader = OmniConfig.from_pretrained if entry == "direct" else build_config
+    loaded = loader(tmp_path, ops_implementation=selection)
+    assert loaded.ops_implementation == {"rms_norm_implementation": "eager", **selection.to_dict()}
+    assert loaded._module_configs[FAKE_A].ops_config.attn_implementation == "eager"
+    assert loaded._module_configs[FAKE_B].ops_config.attn_implementation == "veomni_sdpa"
+    assert loaded._module_configs[FAKE_B].ops_config.rms_norm_implementation == "eager"
+    loaded.save_pretrained(tmp_path / "resaved")
+    assert OmniConfig.from_pretrained(tmp_path / "resaved").ops_implementation == loaded.ops_implementation
