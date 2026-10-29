@@ -778,8 +778,14 @@ class OffloadConfig:
         if self.activation_offload_backend == "bounded":
             if not self.enable_async_activation or not self.activation_offload_modules:
                 raise ValueError("Bounded activation offload requires async mode and explicit target modules")
-            if self.activation_offload_staging_buffer_mib <= 0 or self.activation_offload_prefetch_depth not in (0, 1):
-                raise ValueError("Invalid bounded staging capacity or prefetch depth")
+            mib, depth = self.activation_offload_staging_buffer_mib, self.activation_offload_prefetch_depth
+            if isinstance(mib, bool) or not isinstance(mib, int) or mib <= 0:
+                raise ValueError("activation_offload_staging_buffer_mib must be a positive integer")
+            if isinstance(depth, bool) or not isinstance(depth, int) or depth not in (0, 1):
+                raise ValueError("activation_offload_prefetch_depth must be 0 or 1")
+            limit = self.activation_offload_pageable_limit_gb
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                raise ValueError("activation_offload_pageable_limit_gb must be a number")
             if not math.isfinite(self.activation_offload_pageable_limit_gb) or (
                 self.activation_offload_pageable_limit_gb * 1024 < self.activation_offload_staging_buffer_mib
             ):
