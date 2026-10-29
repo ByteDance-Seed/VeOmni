@@ -982,6 +982,31 @@ def _requires_exact_optimizer_state_dtypes(optimizer):
     return any(_requires_exact_optimizer_state_dtypes(child) for child in children.values())
 
 
+def _exact_optimizer_parameter_names(model, optimizer):
+    """Identify exact-state parameters in a mixture using DCP canonical FQNs."""
+    if model is None or optimizer is None:
+        return None
+    if getattr(optimizer, "requires_exact_state_dtypes", False):
+        return None
+    optimizer = getattr(optimizer, "optimizer", optimizer)
+    if getattr(optimizer, "requires_exact_state_dtypes", False):
+        return None
+    leaves = list(_iter_optimizer_leaves(optimizer))
+    if all(getattr(leaf, "requires_exact_state_dtypes", False) for leaf in leaves):
+        return None
+    selected = {
+        id(param)
+        for leaf in leaves
+        if getattr(leaf, "requires_exact_state_dtypes", False)
+        for group in leaf.param_groups
+        for param in group["params"]
+    }
+    names = _dcp_parameter_name_map(model)
+    if selected.difference(id(param) for param in names.values()):
+        raise RuntimeError("Precision-sensitive optimizer parameter is absent from the DCP model inventory")
+    return {name for name, param in names.items() if id(param) in selected}
+
+
 def _requires_exact_optimizer_recipe(optimizer):
     optimizer = getattr(optimizer, "optimizer", optimizer)
     if getattr(optimizer, "requires_exact_recipe", False):
@@ -1164,6 +1189,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             )
         resume_zero_optimizer_state = has_zero_state_marker and not has_optimizer_state
 
+        exact_names = None
         if self.strict_optimizer_dtype:
             # DCP otherwise casts saved tensors to the target placeholders before
             # optimizer.load_state_dict sees them. Validate original metadata
@@ -1171,6 +1197,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             assert self.metadata is not None
             if any(path and path[0] == "optimizer" for path in self.mappings.values()):
                 _validate_exact_optimizer_state_targets(self.optimizer)
+            exact_names = _exact_optimizer_parameter_names(self.model, self.optimizer)
         # DCP silently ignores saved keys without target placeholders. Check
         # the optimizer-owned names from its parameter groups, so partially
         # initialized targets or a changed optimizer recipe cannot drop a
@@ -1312,7 +1339,11 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             if source is None:
                 missing_state_fields.append(base)
                 continue
-            if not self.strict_optimizer_dtype or not torch.is_tensor(target):
+            if (
+                not self.strict_optimizer_dtype
+                or (exact_names is not None and name not in exact_names)
+                or not torch.is_tensor(target)
+            ):
                 continue
             source_shape = getattr(source, "size", None)
             if source_shape != target.shape:
@@ -1326,8 +1357,8 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     f"DCP optimizer dtype mismatch for {key}: saved={source_dtype}, configured={target.dtype}; "
                     "explicit precision migration is required"
                 )
+        lazy_bases = set()
         if missing_state_fields:
-            lazy_bases = set()
             for base in missing_state_fields:
                 prefix = base + "."
                 saved_index = bisect_left(saved_keys, prefix)
@@ -1341,13 +1372,6 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                 raise RuntimeError(
                     "DCP is missing every precision-sensitive optimizer state entry; "
                     "explicit checkpoint migration is required"
-                )
-            if lazy_bases and not resume_zero_optimizer_state:
-                if self.optimizer is not None:
-                    _record_absent_optimizer_state(self.optimizer, lazy_bases)
-                logger.info_rank0(
-                    "DCP resume preserves lazy optimizer state for %d parameter(s) absent from the checkpoint",
-                    len(lazy_bases),
                 )
         plan = super().create_local_plan()
         if self.strict_model:
@@ -1368,6 +1392,13 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     f"{preview}{suffix}"
                 )
 
+        if lazy_bases and not resume_zero_optimizer_state:
+            if self.optimizer is not None:
+                _record_absent_optimizer_state(self.optimizer, lazy_bases)
+            logger.info_rank0(
+                "DCP resume preserves lazy optimizer state for %d parameter(s) absent from the checkpoint",
+                len(lazy_bases),
+            )
         if resume_zero_optimizer_state:
             _mark_zero_optimizer_state_resume(self.optimizer)
             logger.info_rank0("DCP resume restored an explicitly zero-step optimizer checkpoint")
@@ -2986,6 +3017,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 raise
             finally:
                 _reset_zero_optimizer_state_resume(state.get("optimizer"))
+                _reset_absent_optimizer_state(state.get("optimizer"))
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state, required=file_mode, group=process_group)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
@@ -3013,6 +3045,7 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
         finally:
             _reset_zero_optimizer_state_resume(state.get("optimizer"))
+            _reset_absent_optimizer_state(state.get("optimizer"))
         if wants_optimizer:
             try:
                 reader = cls._create_storage_reader(optimizer_dir(path, module))
@@ -3036,6 +3069,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 raise
             finally:
                 _reset_zero_optimizer_state_resume(state.get("optimizer"))
+                _reset_absent_optimizer_state(state.get("optimizer"))
 
         cls._load_extra_state(checkpoint_dir=model_root, state=state, required=file_mode, group=process_group)
 

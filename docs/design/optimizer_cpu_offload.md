@@ -2,6 +2,10 @@
 
 Opt in with optimizer type `master_fp32_adamw`, `full_fp32_adamw` or `cpu_offload_adamw`. Existing AdamW remains unchanged. Master weights and update arithmetic are FP32; compute weights may remain BF16. BF16 moment storage is lossy and is not equivalent to FP32 moments.
 
+In a mixed optimizer, strict checkpoint dtype and shape checks apply to the parameters owned by precision-sensitive optimizer leaves. Unknown saved fields on those parameters require an explicit migration; ordinary AdamW leaves retain their existing loading policy.
+
+Use the framework `DistributedCheckpointer.load` for resume: it clears temporary optimizer handoff markers if DCP loading fails. Calling `torch.distributed.checkpoint.load` directly bypasses that cleanup if an error occurs after planning. Saving a single empty optimizer, or an ExtraParallel-aware `MultiOptimizer` containing an empty child, is not yet safe: PyTorch can materialize synthetic optimizer state while collecting it. Avoid those save paths until they are fixed.
+
 For CPU offload, `cpu_offload_param_patterns` selects parameters by full parameter-name regex. `cpu_offload_cpu_moment_dtype` and `cpu_offload_resident_moment_dtype` independently choose `float32` or `bfloat16`; both default to FP32. Run optimizer steps after gradient synchronization and global clipping. Parameters and gradients stay on the accelerator; selected master/moment states are stored and updated on CPU using bounded staging.
 
 DCP load preserves offloaded CPU storage instead of temporarily materializing the optimizer on the accelerator. Precision-sensitive restores reject dtype changes and incomplete optimizer fields, including partially missing states for unused parameters. Such checkpoints need an explicit migration; silent initialization from pre-load compute weights is unsafe.
@@ -12,7 +16,7 @@ CPU tests cover FP32 reference updates, cold optimizer-state restoration, missin
 
 Resume validates saved tensor shapes and dtypes before DCP reads. Use a fresh optimizer when resuming. The loader prepares target placeholders, then removes those for parameters whose saved state is wholly absent. A partially initialized target optimizer is rejected if its existing state cannot represent the saved state. Partial ordinary AdamW state remains supported. Validation itself allocates no additional master or moment tensors.
 
-Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors. A zero-step sparse `MultiOptimizer` checkpoint carries an exclusive marker and restores lazy state. A marker combined with tensor state is rejected; marker-less checkpoints with no optimizer state remain rejected because they are indistinguishable from lost state.
+Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors. A zero-step non-ExtraParallel sparse `MultiOptimizer` checkpoint carries an exclusive marker and restores lazy state. A marker combined with tensor state is rejected; marker-less checkpoints with no optimizer state remain rejected because they are indistinguishable from lost state.
 
 Qwen3.8 Muon keeps a zero-step PLE placeholder if a user registers an optimizer
 load pre-hook: the hook can change tensors or their aliasing, so discarding it

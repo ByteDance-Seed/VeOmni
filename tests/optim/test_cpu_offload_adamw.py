@@ -41,6 +41,207 @@ def test_cpu_offload_pattern_requires_a_trainable_match():
     assert both[0]["cpu_offload"] and both[0]["params"] == [model.weight, model.bias]
 
 
+@pytest.mark.parametrize("standard_dtype", [torch.float32, torch.bfloat16])
+def test_dcp_mixed_optimizer_only_enforces_dtype_for_exact_leaf(tmp_path, standard_dtype):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build(dtype):
+        model = torch.nn.Module()
+        model.p = torch.nn.Parameter(torch.ones(3))
+        model.q = torch.nn.Parameter(torch.ones(3, dtype=dtype))
+        exact = CPUOffloadAdamW([model.p], lr=0.001)
+        standard = torch.optim.AdamW([model.q], lr=0.001)
+        return (
+            model,
+            exact,
+            standard,
+            MultiOptimizer(model, {"exact": exact, "standard": standard}, ["exact", "standard"]),
+        )
+
+    source_model, source_exact, source_standard, source = build(torch.float32)
+    source_model.p.grad = torch.ones_like(source_model.p)
+    source_model.q.grad = torch.ones_like(source_model.q)
+    source_exact.step()
+    source_standard.step()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=parallel)}, checkpoint_id=tmp_path)
+
+    target_model, target_exact, target_standard, target = build(standard_dtype)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(
+            strict_model=False, strict_optimizer_dtype=True, optimizer=target, model=target_model
+        ),
+    )
+    assert target_standard.state[target_model.q]["exp_avg"].dtype == standard_dtype
+    torch.testing.assert_close(
+        target_exact.state[target_model.p]["master_weight"], source_exact.state[source_model.p]["master_weight"]
+    )
+
+
+def test_dcp_mixed_exact_optimizer_rejects_parameter_missing_from_model():
+    from veomni.checkpoint.dcp_checkpointer import _exact_optimizer_parameter_names
+
+    model = torch.nn.Linear(3, 2)
+    foreign = torch.nn.Parameter(torch.ones(3))
+    exact = CPUOffloadAdamW([foreign], lr=0.001)
+    ordinary = torch.optim.AdamW(model.parameters(), lr=0.001)
+    with pytest.raises(RuntimeError, match="absent from the DCP model inventory"):
+        _exact_optimizer_parameter_names(model, {"exact": exact, "ordinary": ordinary})
+
+
+def test_dcp_mixed_optimizer_respects_wrapper_level_exact_policy():
+    from veomni.checkpoint.dcp_checkpointer import _exact_optimizer_parameter_names
+
+    model = torch.nn.Linear(3, 2)
+    ordinary = torch.optim.AdamW(model.parameters(), lr=0.001)
+    wrapper = SimpleNamespace(requires_exact_state_dtypes=True, optimizers_dict={"ordinary": ordinary})
+    assert _exact_optimizer_parameter_names(model, wrapper) is None
+
+
+def test_dcp_rejects_unknown_exact_optimizer_state_field(tmp_path):
+    model = torch.nn.Linear(3, 2, bias=False)
+    optimizer = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    model.weight.grad = torch.ones_like(model.weight)
+    optimizer.step()
+    optimizer.state[model.weight]["max_exp_avg_sq"] = torch.ones_like(model.weight)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(model, optimizer, parallel_state=parallel)}, checkpoint_id=tmp_path)
+    target_model = torch.nn.Linear(3, 2, bias=False)
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    with pytest.raises(
+        CheckpointException, match="unsupported precision-sensitive optimizer state field|no target placeholder"
+    ):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False, strict_optimizer_dtype=True, optimizer=target, model=target_model
+            ),
+        )
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_dcp_allows_custom_step_in_optimizer_param_group(tmp_path, multi):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build():
+        model = torch.nn.Linear(3, 2, bias=False)
+        exact = CPUOffloadAdamW([{"params": [model.weight], "step": 7}], lr=0.001)
+        container = MultiOptimizer(model, {"exact": exact}, ["exact"]) if multi else exact
+        return model, exact, container
+
+    source_model, exact, source = build()
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    exact.step()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=parallel)}, checkpoint_id=tmp_path)
+    target_model, target_exact, target = build()
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(
+            strict_model=False, strict_optimizer_dtype=True, optimizer=target, model=target_model
+        ),
+    )
+    assert target_exact.param_groups[0]["step"] == 7
+
+
+def test_dcp_failed_metadata_validation_does_not_leave_lazy_state_handoff(tmp_path):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    source_model = torch.nn.Linear(3, 2)
+    source = CPUOffloadAdamW(source_model.parameters(), lr=0.001)
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    source.step()
+    source.state[source_model.bias]["unexpected"] = torch.ones_like(source_model.bias)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=parallel)}, checkpoint_id=tmp_path)
+
+    target_model = torch.nn.Linear(3, 2)
+    target = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    wrapper = OptimizerState(target_model, target, parallel_state=parallel, load=True)
+    with pytest.raises(
+        CheckpointException, match="unsupported precision-sensitive optimizer state field|no target placeholder"
+    ):
+        dcp.load(
+            {"optimizer": wrapper},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False, strict_optimizer_dtype=True, optimizer=target, model=target_model
+            ),
+        )
+    assert not getattr(target, "_veomni_absent_optimizer_state_bases", None)
+
+    complete_model = torch.nn.Linear(3, 2)
+    complete = CPUOffloadAdamW(complete_model.parameters(), lr=0.001)
+    for param in complete_model.parameters():
+        param.grad = torch.ones_like(param)
+    complete.step()
+    wrapper.load_state_dict(get_optimizer_state_dict(complete_model, complete))
+    torch.testing.assert_close(
+        target.state[target_model.weight]["master_weight"], complete.state[complete_model.weight]["master_weight"]
+    )
+
+
+def test_distributed_checkpointer_clears_lazy_handoff_on_load_failure(monkeypatch):
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    model = torch.nn.Linear(3, 2)
+    optimizer = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    monkeypatch.setattr(DistributedCheckpointer, "_legacy_fused_dir", lambda *_args: "/unused")
+    monkeypatch.setattr(DistributedCheckpointer, "_create_storage_reader", lambda *_args: object())
+
+    def fail_after_plan(**_kwargs):
+        optimizer._veomni_absent_optimizer_state_bases = {"optimizer.state.weight"}
+        raise RuntimeError("storage failure")
+
+    monkeypatch.setattr(dcp, "load", fail_after_plan)
+    with pytest.raises(RuntimeError, match="storage failure"):
+        DistributedCheckpointer.load(
+            "/unused", {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not getattr(optimizer, "_veomni_absent_optimizer_state_bases", None)
+
+
+@pytest.mark.parametrize(
+    "saved_dtype,target_dtype", [(torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)]
+)
+def test_dcp_mixed_optimizer_still_rejects_exact_leaf_dtype_migration(tmp_path, saved_dtype, target_dtype):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build(dtype):
+        model = torch.nn.Module()
+        model.p = torch.nn.Parameter(torch.ones(3))
+        model.q = torch.nn.Parameter(torch.ones(3))
+        exact = CPUOffloadAdamW([model.p], lr=0.001, resident_moment_dtype=dtype)
+        standard = torch.optim.AdamW([model.q], lr=0.001)
+        return (
+            model,
+            exact,
+            standard,
+            MultiOptimizer(model, {"exact": exact, "standard": standard}, ["exact", "standard"]),
+        )
+
+    source_model, exact, standard, source = build(saved_dtype)
+    source_model.p.grad = torch.ones_like(source_model.p)
+    source_model.q.grad = torch.ones_like(source_model.q)
+    exact.step()
+    standard.step()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    dcp.save({"optimizer": OptimizerState(source_model, source, parallel_state=parallel)}, checkpoint_id=tmp_path)
+    target_model, _, _, target = build(target_dtype)
+    with pytest.raises(CheckpointException, match="optimizer dtype mismatch"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False, strict_optimizer_dtype=True, optimizer=target, model=target_model
+            ),
+        )
+
+
 @pytest.mark.parametrize("offload", [False, True])
 def test_cpu_update_and_cold_resume_match_fp32_reference(offload):
     torch.manual_seed(3)
