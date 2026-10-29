@@ -16,6 +16,10 @@
 
 Direct-import the generated class. Compare a toy model against Hugging Face on
 the text-only, image+text, and video+text paths.
+
+This file owns non-default dummy geometry and CPU/Gloo SP execution. The shared
+vision suite in tests/distributed/test_dummy_forward.py owns standard geometry
+and accelerator rejection coverage.
 """
 
 from __future__ import annotations
@@ -66,7 +70,7 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
 
 @pytest.mark.parametrize(
     "channels,temporal,patch,merge",
-    [(3, 2, 8, 2), (1, 1, 8, 2), (3, 2, 14, 2), (3, 2, 8, 1), (3, 2, 8, 4)],
+    [(3, 2, 8, 2), (1, 1, 8, 2), (3, 2, 8, 1), (3, 2, 8, 4)],
 )
 def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch, merge):
     from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
@@ -89,30 +93,6 @@ def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch
             if param.requires_grad:
                 assert param.grad is not None, name
                 assert torch.isfinite(param.grad).all(), name
-
-
-@pytest.mark.parametrize("sp_size,merge", [(1, 2), (8, 2), (4, 4)])
-def test_qwen2_5_vl_dummy_forward_builds_local_patches_and_global_grid(monkeypatch, sp_size, merge):
-    from veomni.models.transformers.qwen2_5vl.generated import patched_modeling_qwen2_5_vl_gpu as module
-
-    class Probe(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.config = SimpleNamespace(in_channels=1, temporal_patch_size=1)
-            self.patch_size = 8
-            self.spatial_merge_size = merge
-            self.window_size = 4 * merge * self.patch_size
-            self.dtype = torch.float32
-            self.device = torch.device("cpu")
-
-        def forward(self, *, hidden_states, grid_thw, vit_metadata):
-            return hidden_states, grid_thw, vit_metadata
-
-    monkeypatch.setattr(module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=sp_size > 1, sp_size=sp_size))
-    pixels, grid, metadata = module.Qwen2_5_VisionTransformerPretrainedModel.dummy_forward(Probe())
-    assert pixels.shape == (merge * merge, 8 * 8)
-    assert grid.tolist() == [[1, merge * sp_size, merge]]
-    assert metadata["cu_seqlens"].tolist() == [0, merge * merge * sp_size]
 
 
 def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
