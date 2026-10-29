@@ -388,6 +388,7 @@ model = build_parallelize_model(
 | `full_fp32_adamw` | FP32 master weights, moments and updates, with compute weights kept in their original dtype. |
 | `cpu_offload_adamw` | Selective optimizer-only CPU offload: matched parameters' FP32 masters and moments live on CPU; model weights and gradients stay on the accelerator. |
 | `qwen38_muon` | Qwen4-Exp logical-matrix Muon + AdamW with FP32 master weights and states. See the [Qwen3.8 Muon recipe](qwen38_muon.md). |
+
 For `cpu_offload_adamw`, `cpu_offload_param_patterns` defaults to `[]` but must be nonempty. Each regex uses `re.search` against full parameter names; anchor it for exact matching. Every pattern must match a trainable parameter. Unmatched parameters keep resident optimizer state. `cpu_offload_resident_moment_dtype` and `cpu_offload_cpu_moment_dtype` independently select `float32` (default) or lossy `bfloat16` moment storage; masters and update arithmetic remain FP32. Resume does not silently change saved precision. See [optimizer CPU offload](../design/optimizer_cpu_offload.md).
 
 For a DCP process group with more than one rank, save rejects pre-existing

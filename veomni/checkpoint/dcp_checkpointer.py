@@ -83,8 +83,8 @@ _QWEN4_GDN_FP32_LEGACY_MARKER = "__veomni_qwen4_gdn_fp32_v1__"
 _QWEN4_GDN_FP32_MARKER = "__veomni_qwen4_gdn_fp32_v2__"
 _ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
 _ABSENT_OPTIMIZER_STATE_ATTR = "_veomni_absent_optimizer_state_bases"
-_EXTRA_PARALLEL_FIRST_MESHES = weakref.WeakKeyDictionary()
-_EXTRA_PARALLEL_FIRST_MESH_LOCK = threading.Lock()
+_EXTRA_PARALLEL_FIRST_MESHES = {}
+_EXTRA_PARALLEL_FIRST_MESH_LOCK = threading.RLock()
 
 
 def read_qwen4_gdn_manifest(checkpoint_path) -> Optional[set[str]]:
@@ -140,20 +140,29 @@ def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
     DTensor/DCP publish the real EP-outer / FSDP-inner global offsets.
     """
     with _EXTRA_PARALLEL_FIRST_MESH_LOCK:
-        cached = _EXTRA_PARALLEL_FIRST_MESHES.get(mesh)
-        if cached is not None:
-            return cached
+        key = id(mesh)
+        cached = _EXTRA_PARALLEL_FIRST_MESHES.get(key)
+        if cached is not None and cached[0]() is mesh:
+            return cached[1]
 
         names = mesh.mesh_dim_names
         if names is None or len(names) != mesh.ndim or mesh.ndim not in (2, 3):
             raise RuntimeError("ExtraParallel checkpoint mesh must have 2 or 3 named dimensions")
         order = tuple(range(mesh.ndim - 2)) + (mesh.ndim - 1, mesh.ndim - 2)
-        reordered = DeviceMesh(
-            mesh.device_type,
-            mesh.mesh.permute(order),
+        reordered = DeviceMesh.from_group(
+            [mesh.get_group(index) for index in order],
+            device_type=mesh.device_type,
+            mesh=mesh.mesh.permute(order),
             mesh_dim_names=tuple(names[index] for index in order),
         )
-        _EXTRA_PARALLEL_FIRST_MESHES[mesh] = reordered
+
+        def discard(reference):
+            with _EXTRA_PARALLEL_FIRST_MESH_LOCK:
+                current = _EXTRA_PARALLEL_FIRST_MESHES.get(key)
+                if current is not None and current[0] is reference:
+                    _EXTRA_PARALLEL_FIRST_MESHES.pop(key, None)
+
+        _EXTRA_PARALLEL_FIRST_MESHES[key] = (weakref.ref(mesh, discard), reordered)
         return reordered
 
 
@@ -1490,10 +1499,10 @@ def _apply_extra_parallel_dim(
 
 
 def _coordinated_prime_checkpoint_meshes(specs, enabled, group):
-    """Agree on the group-creation plan before creating any checkpoint mesh."""
+    """Agree on checkpoint mesh topology before reusing existing mesh groups."""
     plan, meshes, error = [], [], None
     try:
-        seen = set()
+        layouts, topology_indices = {}, {}
         if enabled:
             for name in sorted(specs):
                 info = specs[name]
@@ -1504,18 +1513,22 @@ def _coordinated_prime_checkpoint_meshes(specs, enabled, group):
                     and info.placement.dim == info.fsdp_shard_dim
                 ):
                     mesh = info.para_fsdp_mesh
-                    if mesh in seen:
-                        continue
-                    seen.add(mesh)
                     if mesh.ndim not in (2, 3) or mesh.mesh_dim_names is None:
                         raise ValueError("File-backed checkpoint mesh must have 2 or 3 named dimensions")
-                    with _EXTRA_PARALLEL_FIRST_MESH_LOCK:
-                        cached = mesh in _EXTRA_PARALLEL_FIRST_MESHES
-                    plan.append((name, mesh.device_type, tuple(mesh.mesh_dim_names), mesh.mesh.tolist(), cached))
-                    meshes.append(mesh)
-        if dist.is_initialized() and group is not None and dist.get_world_size(group) != dist.get_world_size():
-            if any(not item[-1] for item in plan):
-                raise ValueError("A subgroup checkpoint requires the global ExtraParallel meshes to be precreated")
+                    identity = id(mesh)
+                    if identity not in layouts:
+                        layout = (
+                            mesh.device_type,
+                            tuple(mesh.mesh_dim_names),
+                            tuple(mesh.mesh.shape),
+                            tuple(mesh.mesh.reshape(-1).tolist()),
+                        )
+                        if layout not in topology_indices:
+                            topology_indices[layout] = len(topology_indices)
+                        layouts[identity] = topology_indices[layout]
+                        meshes.append(mesh)
+                    plan.append((name, layouts[identity]))
+        plan = (tuple(topology_indices), plan)
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "preparing checkpoint mesh plan", group=group)

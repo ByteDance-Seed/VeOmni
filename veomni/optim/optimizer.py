@@ -1332,7 +1332,7 @@ def build_extra_parallel_fsdp2_optimizer(
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError(f"Unsupported optimizer selection; got optimizer_type={optimizer_type!r}.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     world_profile = optimizer_type == "qwen38_muon" and (cpu_offload_kwargs or {}).get(

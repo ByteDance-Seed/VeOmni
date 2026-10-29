@@ -97,6 +97,35 @@ def test_range_eviction_preserves_unaligned_chunks_and_other_pages(tmp_path):
         store.evict_range(tensor, 9999, 2)
 
 
+def test_evict_all_defers_reentrant_finalizer_release(tmp_path, monkeypatch):
+    store = module.FileBackedFP32State(tmp_path, minimum_free_bytes=0)
+    first, second = store.zeros((4,)), store.zeros((4,))
+    second_id = second.untyped_storage()._cdata
+    second_file = store._entries[second_id][1]
+    visited = []
+
+    class FinalizingEntries(dict):
+        def values(self):
+            iterator = iter(super().values())
+            yield next(iterator)
+            # Snapshot construction itself can run a weakref finalizer.
+            store._release(second_id)
+            assert not second_file.closed
+            yield from iterator
+
+    store._entries = FinalizingEntries(store._entries)
+
+    def evict(entry):
+        assert not entry[1].closed
+        visited.append(entry)
+
+    monkeypatch.setattr(store, "_sync_and_evict", evict)
+    store.evict_all()
+    assert len(visited) == 2
+    assert second_file.closed
+    assert first is not None and second is not None
+
+
 def test_file_backed_state_rejects_memory_backed_scratch(monkeypatch):
     monkeypatch.setattr(module, "_filesystem_type", real_filesystem_type)
     if not Path("/dev/shm").is_dir():

@@ -58,6 +58,8 @@ class FileBackedFP32State:
         self.minimum_free_bytes = minimum_free_bytes
         self._entries = {}
         self._lock = threading.RLock()
+        self._evict_depth = 0
+        self._deferred_releases = {}
 
     def zeros(self, shape):
         numel = 1
@@ -151,14 +153,30 @@ class FileBackedFP32State:
 
     def evict_all(self):
         with self._lock:
-            for entry in self._entries.values():
-                self._sync_and_evict(entry)
+            self._evict_depth += 1
+            try:
+                for entry in tuple(self._entries.values()):
+                    self._sync_and_evict(entry)
+            finally:
+                self._evict_depth -= 1
+                if self._evict_depth == 0:
+                    entries, self._deferred_releases = self._deferred_releases, {}
+                    for identity, entry in entries.items():
+                        if self._entries.get(identity) is entry:
+                            self._entries.pop(identity)
+                        self._release_entry(entry)
 
     def _release(self, identity):
         with self._lock:
-            entry = self._entries.pop(identity, None)
+            entry = self._entries.get(identity)
             if entry is not None:
-                self._release_entry(entry)
+                if self._evict_depth:
+                    # Even constructing the snapshot in evict_all may trigger
+                    # finalizers: defer dictionary mutation as well as closing.
+                    self._deferred_releases[identity] = entry
+                else:
+                    self._entries.pop(identity)
+                    self._release_entry(entry)
 
     @staticmethod
     def _release_entry(entry):
