@@ -517,6 +517,61 @@ def _drop_absent_optimizer_state(model, optimizer) -> None:
         logger.info_rank0("DCP resume dropped %d wholly absent optimizer state entr(ies)", dropped)
 
 
+def _install_absent_optimizer_state_hooks(model, optimizer):
+    """Remove DCP placeholders before user load hooks observe optimizer state."""
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    handles = []
+    seen = set()
+    expected = set()
+    specs = []
+    parameter_names = _dcp_parameter_name_map(model)
+    for target in targets:
+        bases = getattr(target, _ABSENT_OPTIMIZER_STATE_ATTR, ())
+        zero = getattr(target, "_veomni_resume_zero_optimizer_state", False)
+        if not bases and not zero:
+            continue
+        absent = set()
+        for base in bases:
+            if isinstance(base, str) and base.startswith("optimizer.state."):
+                fqn = base.removeprefix("optimizer.state.")
+                param = parameter_names.get(fqn)
+                if param is None:
+                    raise RuntimeError(f"Cannot resolve parameter for absent optimizer state: {fqn}")
+                absent.add(id(param))
+        for leaf in _iter_optimizer_leaves(target):
+            specs.append((leaf, absent, zero))
+    try:
+        for leaf, absent, zero in specs:
+
+            def filter_state(opt, state_dict, *, absent=absent, zero=zero):
+                state = dict(state_dict["state"])
+                for saved, current in zip(state_dict["param_groups"], opt.param_groups, strict=True):
+                    for key, param in zip(saved["params"], current["params"], strict=True):
+                        if zero or id(param) in absent:
+                            state.pop(key, None)
+                seen.add(id(opt))
+                return {**state_dict, "state": state}
+
+            handles.append(leaf.register_load_state_dict_pre_hook(filter_state, prepend=True))
+            expected.add(id(leaf))
+    except Exception:
+        for handle in handles:
+            handle.remove()
+        raise
+    return handles, expected, seen
+
+
+def _validate_dcp_optimizer_state_keys(optimizer):
+    """DCP's optimizer FQN mapper supports only parameter-owned state."""
+    for leaf in _iter_optimizer_leaves(optimizer):
+        parameter_ids = {id(param) for group in leaf.param_groups for param in group["params"]}
+        has_state_hooks = getattr(leaf, "_optimizer_state_dict_pre_hooks", None) or getattr(
+            leaf, "_optimizer_state_dict_post_hooks", None
+        )
+        if not has_state_hooks and any(id(key) not in parameter_ids for key in leaf.state):
+            raise RuntimeError("DCP cannot serialize non-parameter optimizer state; remove or save it separately")
+
+
 def _requires_exact_optimizer_state_dtypes(optimizer):
     """Opt in only precision-sensitive optimizers, including MultiOptimizer."""
     optimizer = getattr(optimizer, "optimizer", optimizer)
@@ -974,6 +1029,7 @@ class OptimizerState(Stateful):
             )
         result, error = None, None
         try:
+            _validate_dcp_optimizer_state_keys(self.optimizer)
             with _prevent_synthetic_owner_steps(self.model, self.optimizer, rows):
                 result = self._state_dict_impl()
                 _verify_serialized_persistent_steps(self.model, rows, result)
@@ -1026,7 +1082,10 @@ class OptimizerState(Stateful):
             self.should_extra_parallel_aware
             and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
         )
+        handles = []
+        restored = False
         try:
+            handles, expected, seen = _install_absent_optimizer_state_hooks(self.model, self.optimizer)
             if self.should_extra_parallel_aware:
                 # we need to drop ExtraParallel dim before loading them into optimizers
                 optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
@@ -1051,10 +1110,19 @@ class OptimizerState(Stateful):
                     optim_state_dict=optim_state_from_dcp_load,
                     options=StateDictOptions(strict=False),
                 )
-            _drop_absent_optimizer_state(self.model, self.optimizer)
+            if expected != seen:
+                raise RuntimeError("Optimizer load bypassed DCP state cleanup hooks")
+            if not handles:
+                _drop_absent_optimizer_state(self.model, self.optimizer)
+            restored = True
         finally:
+            for handle in handles:
+                handle.remove()
             _reset_absent_optimizer_state(self.optimizer)
-            _finish_zero_optimizer_state_resume(self.optimizer)
+            if restored and handles:
+                _reset_zero_optimizer_state_resume(self.optimizer)
+            else:
+                _finish_zero_optimizer_state_resume(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
