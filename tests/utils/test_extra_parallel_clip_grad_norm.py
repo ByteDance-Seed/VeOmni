@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -154,7 +155,12 @@ class SelectiveOffloadModel(ToyMoeAndEmbedModel):
         return plan
 
 
-def _run_selective_expert_offload():
+def _run_selective_expert_offload(fused, checkpoint_dir):
+    import torch.distributed.checkpoint as dcp
+    from torch.utils._pytree import tree_map
+
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+
     world = dist.get_world_size()
     ps = _init_parallel_state(
         dp_size=world,
@@ -186,6 +192,12 @@ def _run_selective_expert_offload():
     def local(value):
         return value.to_local() if isinstance(value, DTensor) else value
 
+    def optimizer_snapshot(optimizer):
+        return tree_map(
+            lambda tensor: local(tensor).detach().cpu().clone() if torch.is_tensor(tensor) else tensor,
+            optimizer.state_dict(),
+        )
+
     with use_parallel_state(ps):
         for resident in ([], ["decoder.moe"]):
             reference, candidate = build(False, []), build(True, resident)
@@ -198,7 +210,7 @@ def _run_selective_expert_offload():
                 assert local(parameter).device.type == ("cpu" if offloaded else device.type)
             # Register the real EP/non-EP ownership buckets used by clipping.
             optimizers = [
-                build_optimizer(model, lr=0.125, weight_decay=0.0, fused=False, optimizer_type="adamw")
+                build_optimizer(model, lr=0.125, weight_decay=0.0, fused=fused, optimizer_type="adamw")
                 for model in (reference, candidate)
             ]
             for _step in range(2):
@@ -218,7 +230,45 @@ def _run_selective_expert_offload():
                     optimizer.zero_grad()
                 for left, right in zip(reference.parameters(), candidate.parameters(), strict=True):
                     torch.testing.assert_close(local(left).cpu(), local(right).cpu(), rtol=1e-6, atol=1e-7)
-            del reference, candidate, optimizers
+            checkpoint = str(Path(checkpoint_dir) / f"resident-{len(resident)}")
+            saved = {"model": ModelState(candidate), "optimizer": OptimizerState(candidate, optimizers[1])}
+            model_state, optimizer_state = saved["model"].state_dict(), saved["optimizer"].state_dict()
+            for name, parameter in candidate.named_parameters():
+                if local(parameter).device.type == "cpu":
+                    for value in (
+                        model_state[name],
+                        optimizer_state[f"state.{name}.exp_avg"],
+                        optimizer_state[f"state.{name}.exp_avg_sq"],
+                    ):
+                        assert local(value).device.type == "cpu"
+                        assert value.dtype == torch.float32
+            dcp.save(saved, checkpoint_id=checkpoint)
+            resumed = build(True, resident)
+            resumed_optimizer = build_optimizer(
+                resumed, lr=0.125, weight_decay=0.0, fused=fused, optimizer_type="adamw"
+            )
+            dcp.load(
+                {"model": ModelState(resumed), "optimizer": OptimizerState(resumed, resumed_optimizer, load=True)},
+                checkpoint_id=checkpoint,
+            )
+
+            for left, right in zip(candidate.parameters(), resumed.parameters(), strict=True):
+                assert local(left).device == local(right).device
+                torch.testing.assert_close(local(left).cpu(), local(right).cpu(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                optimizer_snapshot(optimizers[1]), optimizer_snapshot(resumed_optimizer), rtol=0, atol=0
+            )
+            for model, optimizer in ((candidate, optimizers[1]), (resumed, resumed_optimizer)):
+                model(torch.ones(16, device=device)).backward()
+                veomni_clip_grad_norm(model, 0.5)
+                optimizer.step()
+                optimizer.zero_grad()
+            for left, right in zip(candidate.parameters(), resumed.parameters(), strict=True):
+                torch.testing.assert_close(local(left).cpu(), local(right).cpu(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                optimizer_snapshot(optimizers[1]), optimizer_snapshot(resumed_optimizer), rtol=0, atol=0
+            )
+            del reference, candidate, resumed, resumed_optimizer, optimizers
             gc.collect()
         with pytest.raises(ValueError, match="did not match selected CPU-offload modules"):
             build(True, ["missing.experts"])
@@ -432,7 +482,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", choices=["fsdp2_4gpu", "hsdp_8gpu", "selective_offload"], required=True)
     parser.add_argument("--reverse-scenarios", action="store_true")
+    parser.add_argument("--fused", action="store_true")
+    parser.add_argument("--checkpoint-dir")
     cli_args = parser.parse_args()
+    if cli_args.suite == "selective_offload" and cli_args.checkpoint_dir is None:
+        parser.error("--checkpoint-dir is required for the selective_offload save/resume test")
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
@@ -454,7 +508,7 @@ def main():
 
     try:
         if cli_args.suite == "selective_offload":
-            _run_selective_expert_offload()
+            _run_selective_expert_offload(cli_args.fused, cli_args.checkpoint_dir)
         for label, ep_size, emb_size, dp_replicate_size, cpu_offload in scenarios:
             _run_clip_scenario(
                 label=label,
@@ -473,7 +527,9 @@ def main():
             clear_parallel_state()
 
 
-def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = False) -> None:
+def _run_clip_grad_norm_suite(
+    suite: str, nproc: int, reverse_scenarios: bool = False, fused: bool = False, checkpoint_dir=None
+) -> None:
     command = [
         "torchrun",
         "--nnodes=1",
@@ -484,6 +540,10 @@ def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = 
     ]
     if reverse_scenarios:
         command.append("--reverse-scenarios")
+    if fused:
+        command.append("--fused")
+    if checkpoint_dir is not None:
+        command.extend(["--checkpoint-dir", str(checkpoint_dir)])
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
@@ -495,8 +555,9 @@ def test_clip_grad_norm_fsdp2_4gpu():
 
 
 @pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
-def test_selective_expert_cpu_offload_preserves_accumulation_and_update():
-    _run_clip_grad_norm_suite("selective_offload", nproc=_CI_LAUNCH_2.nproc)
+@pytest.mark.parametrize("fused", [False, True])
+def test_selective_expert_cpu_offload_preserves_accumulation_and_update(fused, tmp_path):
+    _run_clip_grad_norm_suite("selective_offload", nproc=_CI_LAUNCH_2.nproc, fused=fused, checkpoint_dir=tmp_path)
 
 
 # ---------------------------------------------------------------------------

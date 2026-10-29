@@ -39,6 +39,88 @@ _CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
+def _offloaded_extra_parallel_checkpoint_worker(rank, world_size, directory, phase, fused, endpoint):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
+    try:
+        singleton_groups = [dist.new_group([i]) for i in range(world_size)]
+        # An accelerator mesh can describe CPU-resident offloaded shards. Gloo
+        # supplies the real checkpoint collectives without requiring a GPU.
+        local_mesh = DeviceMesh.from_group(singleton_groups[rank], "cuda", mesh_dim_names=("ep_fsdp",))
+        full_mesh = DeviceMesh.from_group(
+            [singleton_groups[rank], dist.group.WORLD],
+            "cuda",
+            mesh=torch.arange(world_size).reshape(1, world_size),
+            mesh_dim_names=("ep_fsdp", "ep"),
+        )
+        spec = DTensor.from_local(torch.empty(2, 4, device="meta"), local_mesh, [Shard(1)])._spec
+        weight = nn.Parameter((torch.arange(8, dtype=torch.float32).reshape(2, 4) + rank * 8) / 100)
+        optimizer = torch.optim.AdamW([weight], lr=0.01, fused=fused)
+
+        def update(step):
+            weight.grad = torch.full_like(weight, rank + step + 0.25)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        def snapshot():
+            return {"weight": weight.detach().clone(), **{k: v.clone() for k, v in optimizer.state[weight].items()}}
+
+        def checkpoint_view(value):
+            origin = DTensor(value.detach(), spec, requires_grad=False)
+            result = restore_extra_parallel_dim(origin, full_mesh, local_mesh)
+            assert result.to_local().device.type == "cpu"
+            assert result.to_local().data_ptr() == value.data_ptr()
+            assert result.dtype == torch.float32
+            return result
+
+        update(1)
+        state = optimizer.state[weight]
+        if phase == "resume":
+            with torch.no_grad():
+                weight.add_(100)
+                for value in state.values():
+                    value.add_(100)
+        tensors = {
+            "weight": checkpoint_view(weight),
+            "m": checkpoint_view(state["exp_avg"]),
+            "v": checkpoint_view(state["exp_avg_sq"]),
+            "step": state["step"],
+        }
+        directory = Path(directory)
+        if phase == "save":
+            dcp.save(tensors, checkpoint_id=str(directory / "dcp"))
+            before = snapshot()
+            update(2)
+            torch.save({"before": before, "after": snapshot()}, directory / f"rank-{rank}.pt")
+        else:
+            dcp.load(tensors, checkpoint_id=str(directory / "dcp"))
+            for key in ("weight", "m", "v"):
+                restored = drop_extra_parallel_dim(tensors[key], local_mesh)
+                assert restored.to_local().device.type == "cpu"
+                assert restored.dtype == torch.float32
+            expected = torch.load(directory / f"rank-{rank}.pt", weights_only=True)
+            for key, value in snapshot().items():
+                torch.testing.assert_close(value, expected["before"][key], rtol=0, atol=0)
+            update(2)
+            for key, value in snapshot().items():
+                torch.testing.assert_close(value, expected["after"][key], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("fused", [False, True])
+def test_offloaded_extra_parallel_checkpoint_preserves_cpu_storage_and_update(tmp_path, fused):
+    for phase in ("save", "resume"):
+        spawn_with_rendezvous(
+            _offloaded_extra_parallel_checkpoint_worker, args=(2, str(tmp_path), phase, fused), nprocs=2
+        )
+
+
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState

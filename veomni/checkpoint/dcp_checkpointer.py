@@ -374,6 +374,35 @@ class OptimizerState(Stateful):
         )
 
 
+def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
+    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
+
+    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
+    A metadata-only construction computes the same global shape/stride/spec;
+    attaching the actual local shard then preserves CPU storage and the original
+    mesh identity. DTensor's spec constructor is intentionally isolated here.
+    No collectives or accelerator allocations are needed (run_check=False).
+    """
+    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
+        metadata = DTensor.from_local(
+            local_tensor.to("meta"),
+            device_mesh=device_mesh,
+            placements=placements,
+            run_check=False,
+            shape=shape,
+            stride=stride,
+        )
+        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
+    return DTensor.from_local(
+        local_tensor,
+        device_mesh=device_mesh,
+        placements=placements,
+        run_check=False,
+        shape=shape,
+        stride=stride,
+    )
+
+
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
@@ -395,11 +424,11 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
@@ -457,10 +486,12 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        dtensor = _from_local_preserve_device(
+            orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)]
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
