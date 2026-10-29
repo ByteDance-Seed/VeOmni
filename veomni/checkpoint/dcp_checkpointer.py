@@ -73,7 +73,7 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_PARALLEL_LAYOUT_MARKER = "__veomni_ep_outer_layout_v1__"
 _ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
 _ABSENT_OPTIMIZER_STATE_ATTR = "_veomni_absent_optimizer_state_bases"
-_EXTRA_PARALLEL_FIRST_MESHES = weakref.WeakKeyDictionary()
+_EXTRA_PARALLEL_FIRST_MESHES = {}
 
 
 def _needs_extra_parallel_layout_marker(specs) -> bool:
@@ -107,20 +107,27 @@ def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
     Swapping only those two mesh dims preserves rank-local storage and makes
     DTensor/DCP publish the real EP-outer / FSDP-inner global offsets.
     """
-    cached = _EXTRA_PARALLEL_FIRST_MESHES.get(mesh)
-    if cached is not None:
-        return cached
-
+    key = id(mesh)
+    cached = _EXTRA_PARALLEL_FIRST_MESHES.get(key)
+    if cached is not None and cached[0]() is mesh:
+        return cached[1]
     names = mesh.mesh_dim_names
     if names is None or len(names) != mesh.ndim or mesh.ndim not in (2, 3):
         raise RuntimeError("ExtraParallel checkpoint mesh must have 2 or 3 named dimensions")
     order = tuple(range(mesh.ndim - 2)) + (mesh.ndim - 1, mesh.ndim - 2)
-    reordered = DeviceMesh(
-        mesh.device_type,
-        mesh.mesh.permute(order),
+    reordered = DeviceMesh.from_group(
+        [mesh.get_group(index) for index in order],
+        device_type=mesh.device_type,
+        mesh=mesh.mesh.permute(order),
         mesh_dim_names=tuple(names[index] for index in order),
     )
-    _EXTRA_PARALLEL_FIRST_MESHES[mesh] = reordered
+
+    def discard(reference):
+        current = _EXTRA_PARALLEL_FIRST_MESHES.get(key)
+        if current is not None and current[0] is reference:
+            _EXTRA_PARALLEL_FIRST_MESHES.pop(key, None)
+
+    _EXTRA_PARALLEL_FIRST_MESHES[key] = (weakref.ref(mesh, discard), reordered)
     return reordered
 
 
