@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Clamped SwiGLU pre-activation shared by standard Triton / Quack."""
+"""SwiGLU clamping and merged-FC1 forward activation shared across MoE experts."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+from .....utils.device import get_torch_device, is_nvidia_cuda_device
 
 
 def apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
@@ -34,3 +41,40 @@ def apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
     fc1_1_output = fc1_1_output.clamp(max=swiglu_limit)
     fc1_2_output = fc1_2_output.clamp(min=-swiglu_limit, max=swiglu_limit)
     return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
+
+
+def merged_swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
+    """Fuse staged ``silu(gate) * up`` for merged-FC1 halves on NVIDIA CUDA.
+
+    Called inside both non-EP and EP merged-FC1 custom autograd functions, which
+    continue to own saved tensors and backward math. Falls back to the staged
+    ATen expression on non-NVIDIA backends (ROCm, MLU).
+    """
+    assert gate.ndim == 2 and up.shape == gate.shape
+    assert gate.device == up.device
+    if not is_nvidia_cuda_device(gate.device):
+        return torch.ops.aten.silu(gate) * up
+    assert gate.dtype == up.dtype and gate.dtype in (torch.bfloat16, torch.float16)
+
+    output = gate.new_empty(gate.shape)
+    if output.numel() == 0:
+        return output
+    # Keep optional imports lazy; module loading creates the JIT object outside
+    # Dynamo's symbolic execution of this custom-autograd forward.
+    from ._triton_swiglu import _merged_swiglu_forward_kernel
+
+    with get_torch_device().device(gate.device):
+        _merged_swiglu_forward_kernel[((output.numel() + 1023) // 1024,)](
+            gate,
+            up,
+            output,
+            output.numel(),
+            columns=gate.shape[1],
+            gate_stride_m=gate.stride(0),
+            gate_stride_n=gate.stride(1),
+            up_stride_m=up.stride(0),
+            up_stride_n=up.stride(1),
+            BLOCK_SIZE=1024,
+            enable_fp_fusion=False,
+        )
+    return output

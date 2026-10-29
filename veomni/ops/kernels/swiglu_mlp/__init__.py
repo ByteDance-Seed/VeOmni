@@ -21,7 +21,7 @@ Empty biases are unused.
 
 from torch import nn
 
-from ...platform import GpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
@@ -30,6 +30,7 @@ from .standard import liger_kernel as standard_liger
 
 
 _GPU = GpuKernelRequirement()
+_MLU = MluKernelRequirement()
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
@@ -64,6 +65,18 @@ register_op(
 
 register_op(
     "swiglu_mlp",
+    "standard",
+    "liger_kernel",
+    standard_liger.forward,
+    standard_liger.backward,
+    description="Liger Kernel SwiGLU MLP with optional activation clamping",
+    requirement=_MLU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "swiglu_mlp",
     "geglu",
     "eager",
     geglu_eager.forward,
@@ -79,6 +92,18 @@ register_op(
     geglu_liger.backward,
     description="Liger Kernel GeGLU MLP with tanh-approximate GELU",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "swiglu_mlp",
+    "geglu",
+    "liger_kernel",
+    geglu_liger.forward,
+    geglu_liger.backward,
+    description="Liger Kernel GeGLU MLP with tanh-approximate GELU",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )
