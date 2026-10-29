@@ -1050,8 +1050,6 @@ def build_parallelize_model(
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
-        if use_reentrant:
-            torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
         # The entry points the policy does not bind keep whatever HF is given here,
         # so the run's own recompute context has to be in it — otherwise a module
@@ -1074,6 +1072,10 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+        # Models may reject unsupported configurations. Install the custom
+        # implementation only after validation succeeds.
+        if use_reentrant:
+            torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
     # Layer selection and SAC are bound per block, after HF has set its own
     # function on every checkpointing layer and before FSDP shards them. Runs

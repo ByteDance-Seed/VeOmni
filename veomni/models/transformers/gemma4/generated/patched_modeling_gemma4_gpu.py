@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma4PreTrainedModel.gradient_checkpointing_enable
+#      Reject reentrant checkpointing before shared KV tensors can lose producer gradients
 #    - method_override: Gemma4ForConditionalGeneration.get_position_id_func
 #      Expose picklable Gemma4 training position IDs to the VLM data transform
 #    - method_override: Gemma4ForConditionalGeneration.get_extra_collate_infos
@@ -1679,6 +1681,12 @@ class Gemma4TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma4PreTrainedModel
+# Methods patched: gradient_checkpointing_enable
+# ======================================================================
+
+
 @auto_docstring
 class Gemma4PreTrainedModel(PreTrainedModel):
     config: Gemma4Config
@@ -1787,6 +1795,25 @@ class Gemma4PreTrainedModel(PreTrainedModel):
                 add_hook_to_module(new_embeddings_per_layer, hook)
             new_embeddings_per_layer.requires_grad_(embed_tokens_per_layer.weight.requires_grad)
             self.set_per_layer_input_embeddings(new_embeddings_per_layer)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1):
+        # HF's omitted kwargs select non-reentrant checkpointing; an explicit empty
+        # dict or use_reentrant=None instead inherits torch's reentrant default.
+        use_reentrant = False
+        if gradient_checkpointing_kwargs is not None:
+            use_reentrant = gradient_checkpointing_kwargs.get("use_reentrant")
+            if use_reentrant is None:
+                use_reentrant = True
+        if use_reentrant and getattr(self.config.get_text_config(), "num_kv_shared_layers", 0) > 0:
+            raise ValueError(
+                "Gemma4 with num_kv_shared_layers > 0 does not support reentrant gradient checkpointing: "
+                "shared KV states lose producer gradients. Pass use_reentrant=False "
+                "(VeOmni: model.accelerator.gradient_checkpointing.enable_reentrant=False), "
+                "or disable gradient checkpointing."
+            )
+        return super().gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs, every_n_layers=every_n_layers
+        )
 
 
 # ======================================================================

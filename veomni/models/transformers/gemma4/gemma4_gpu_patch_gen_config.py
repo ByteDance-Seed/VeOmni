@@ -68,6 +68,30 @@ config.add_import("veomni.ops.mask", names=["packed_causal_mask", "sliding_windo
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 
 
+@config.override_method(
+    "Gemma4PreTrainedModel.gradient_checkpointing_enable",
+    description="Reject reentrant checkpointing before shared KV tensors can lose producer gradients",
+)
+def gemma4_gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1):
+    # HF's omitted kwargs select non-reentrant checkpointing; an explicit empty
+    # dict or use_reentrant=None instead inherits torch's reentrant default.
+    use_reentrant = False
+    if gradient_checkpointing_kwargs is not None:
+        use_reentrant = gradient_checkpointing_kwargs.get("use_reentrant")
+        if use_reentrant is None:
+            use_reentrant = True
+    if use_reentrant and getattr(self.config.get_text_config(), "num_kv_shared_layers", 0) > 0:
+        raise ValueError(
+            "Gemma4 with num_kv_shared_layers > 0 does not support reentrant gradient checkpointing: "
+            "shared KV states lose producer gradients. Pass use_reentrant=False "
+            "(VeOmni: model.accelerator.gradient_checkpointing.enable_reentrant=False), "
+            "or disable gradient checkpointing."
+        )
+    return super().gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs, every_n_layers=every_n_layers
+    )
+
+
 @config.add_helper
 def gemma4_position_ids(input_ids, **kwargs):
     """Picklable per-sample positions; each packed document starts at zero."""

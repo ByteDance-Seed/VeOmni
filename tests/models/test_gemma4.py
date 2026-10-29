@@ -26,6 +26,7 @@ from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel as HFGem
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.models.compare import ops_config_scope
 from tests.ops.tol import EAGER_GRAD_ATOL, EAGER_GRAD_RTOL
 from tests.tools.gemma4_utils import make_gemma4_batch
 from veomni.arguments.arguments_types import OpsImplementationConfig
@@ -57,6 +58,116 @@ def _eager_ops_config(attn_implementation: str) -> OpsImplementationConfig:
 
 def _toy_config() -> Gemma4Config:
     return Gemma4Config.from_pretrained(_TOY_CONFIG)
+
+
+def _checkpoint_config(shared_layers=2):
+    config = _toy_config()
+    config.text_config.num_hidden_layers = 4
+    config.text_config.layer_types = ["sliding_attention", "full_attention"] * 2
+    config.text_config.num_kv_shared_layers = shared_layers
+    return config
+
+
+@pytest.mark.parametrize(
+    "model_name", ["Gemma4TextModel", "Gemma4ForCausalLM", "Gemma4Model", "Gemma4ForConditionalGeneration"]
+)
+@pytest.mark.parametrize("checkpoint_kwargs", [{}, {"use_reentrant": True}, {"use_reentrant": None}])
+def test_gemma4_rejects_reentrant_checkpointing_with_shared_kv(model_name, checkpoint_kwargs):
+    config = _checkpoint_config()
+    model_config = config.text_config if model_name in ("Gemma4TextModel", "Gemma4ForCausalLM") else config
+    model = getattr(gemma4_modeling, model_name)._from_config(model_config, attn_implementation="eager")
+    original_kwargs = checkpoint_kwargs.copy()
+
+    with pytest.raises(ValueError, match="num_kv_shared_layers.*use_reentrant=False"):
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
+
+    assert not model.is_gradient_checkpointing
+    assert model.config.get_text_config().num_kv_shared_layers == 2
+    assert checkpoint_kwargs == original_kwargs
+
+
+@pytest.mark.parametrize("checkpoint_kwargs", [None, {"use_reentrant": False}])
+def test_gemma4_shared_kv_accepts_non_reentrant_checkpointing_and_layer_stride(checkpoint_kwargs):
+    model = gemma4_modeling.Gemma4ForCausalLM._from_config(
+        _checkpoint_config().text_config, attn_implementation="eager"
+    )
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs, every_n_layers=2)
+    assert [layer.gradient_checkpointing for layer in model.model.layers] == [True, False, True, False]
+    model.gradient_checkpointing_disable()
+    assert not model.is_gradient_checkpointing
+
+
+@pytest.mark.parametrize("model_name", ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
+@pytest.mark.parametrize("shared_layers,use_reentrant", [(2, False), (0, True)])
+def test_gemma4_supported_checkpointing_matches_all_parameter_gradients(model_name, shared_layers, use_reentrant):
+    torch.manual_seed(731)
+    config = _checkpoint_config(shared_layers)
+    model_config = config.text_config if model_name == "Gemma4ForCausalLM" else config
+    model_cls = getattr(gemma4_modeling, model_name)
+    with ops_config_scope(_eager_ops_config("eager")):
+        baseline = model_cls._from_config(deepcopy(model_config), attn_implementation="eager", dtype=torch.float32)
+        checkpointed = model_cls._from_config(deepcopy(model_config), attn_implementation="eager", dtype=torch.float32)
+    checkpointed.load_state_dict(baseline.state_dict())
+    for (name, value), (other_name, other_value) in zip(baseline.named_buffers(), checkpointed.named_buffers()):
+        assert name == other_name
+        torch.testing.assert_close(value, other_value, rtol=0, atol=0)
+    checkpointed.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
+    inputs = torch.randint(1, 110, (2, 24))
+    expected = baseline(input_ids=inputs, labels=inputs, use_cache=False)
+    actual = checkpointed(input_ids=inputs, labels=inputs, use_cache=False)
+    torch.testing.assert_close(actual.logits, expected.logits)
+    torch.testing.assert_close(actual.loss, expected.loss)
+    expected.loss.backward()
+    actual.loss.backward()
+    expected_parameters = dict(baseline.named_parameters())
+    for name, parameter in checkpointed.named_parameters():
+        reference = expected_parameters[name].grad
+        assert (parameter.grad is None) == (reference is None), name
+        if reference is not None:
+            assert torch.isfinite(parameter.grad).all(), name
+            torch.testing.assert_close(parameter.grad, reference, msg=lambda message, name=name: f"{name}: {message}")
+
+
+@pytest.mark.parametrize("enable_checkpointing", [True, False])
+def test_gemma4_parallelize_rejects_shared_kv_before_global_checkpoint_mutation(monkeypatch, enable_checkpointing):
+    import veomni.distributed.torch_parallelize as torch_parallelize
+    from veomni.arguments import MixedPrecisionConfig
+
+    model = gemma4_modeling.Gemma4ForCausalLM._from_config(
+        _checkpoint_config().text_config, attn_implementation="eager"
+    )
+    original_checkpoint_function = object()
+    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", original_checkpoint_function)
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
+    )
+    parallelized = []
+
+    def record_parallelization(model, **kwargs):
+        parallelized.append(model)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", record_parallelization)
+
+    def parallelize():
+        return torch_parallelize.build_parallelize_model(
+            model,
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            enable_gradient_checkpointing=enable_checkpointing,
+            enable_reentrant=True,
+        )
+
+    if enable_checkpointing:
+        with pytest.raises(ValueError, match="num_kv_shared_layers.*use_reentrant=False"):
+            parallelize()
+        assert parallelized == []
+    else:
+        assert parallelize() is model
+        assert parallelized == [model]
+    assert torch.utils.checkpoint.CheckpointFunction is original_checkpoint_function
+    assert not model.is_gradient_checkpointing
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa", _FLEX_IMPLEMENTATION])

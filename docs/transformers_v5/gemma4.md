@@ -52,6 +52,35 @@ Under FSDP2, missing modalities participate through config-derived dummy
 forwards in a fixed image, video, audio order, with live compute dtypes and
 zero-valued projected graph dependencies.
 
+## Gradient checkpointing
+
+When `text_config.num_kv_shared_layers > 0`, use non-reentrant gradient
+checkpointing. Reentrant recomputation captures detached shared KV states and
+silently drops shared layers' gradient contributions to the producer projections.
+The model rejects this combination when checkpointing is enabled, before training
+or any checkpoint flags are changed. The restriction applies to the text and
+multimodal model entry points, including direct `gradient_checkpointing_enable()`
+calls.
+
+The VeOmni default is supported:
+
+```yaml
+model:
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+```
+
+For direct model calls, pass
+`gradient_checkpointing_kwargs={"use_reentrant": False}`. Omitting the kwargs
+argument also selects non-reentrant checkpointing in the pinned Transformers
+5.16.1; an explicit empty dict or `{"use_reentrant": None}` inherits PyTorch's
+reentrant default and is rejected with shared KV. Disabling checkpointing is
+supported, as is reentrant checkpointing when `num_kv_shared_layers=0`.
+Regression tests compare logits, loss and every parameter gradient of supported
+text and multimodal models against the same model without checkpointing.
+
 ## VLM training data
 
 `tasks/train_vlm.py` selects the registered `gemma4` transform from the model
