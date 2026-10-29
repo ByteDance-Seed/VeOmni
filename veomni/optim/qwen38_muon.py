@@ -294,6 +294,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
 
         validate_constructor(ple_moments_scratch_dir, ple_moments_world_profile, ple_world_receipt, ple_factory_permit)
         super().__init__(*args, **kwargs)
+        self._state_receipt_emitted = False
         if self.resident_moment_dtype != torch.float32 or self.cpu_moment_dtype != torch.float32:
             raise ValueError("Qwen3.8 Muon requires FP32 master and all optimizer states")
         if not 0 <= momentum < 1:
@@ -512,15 +513,6 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 if key not in assigned or not (isinstance(value, dict) and not value)
             }
             return result
-
-    def _emit_state_receipt(self):
-        # CPUOffloadAdamW.step runs only the pure Adam groups. Emit after *all*
-        # mixed groups have initialized and updated instead.
-        return
-
-    def _emit_step_timing(self):
-        # Parent timing covers only fallback groups, not this full optimizer.
-        return
 
     def _emit_complete_receipt(self):
         if self._state_receipt_emitted:
