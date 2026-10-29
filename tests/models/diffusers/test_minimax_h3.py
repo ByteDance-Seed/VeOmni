@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_minimax_h3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_config as _tiny_config
@@ -360,6 +361,80 @@ def test_minimax_h3_pipeline_constructs_without_weights():
     assert pipe.dit is None
     assert pipe.units
     assert callable(pipe.model_fn)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("replace_all", [False, True], ids=["sparse", "full"])
+def test_minimax_h3_pipeline_applies_cross_device_ops_before_config_validation(tmp_path, monkeypatch, replace_all):
+    """Validate the final selections while preserving file < local kwargs < pipeline priority."""
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.diffusers.minimax_h3 import inference
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    source_ops = {"rms_norm_implementation": "liger_kernel"}
+    condition_path = tmp_path / "condition"
+    transformer_path = tmp_path / "transformer"
+    _tiny_condition_config(ops_implementation=source_ops).save_pretrained(condition_path)
+    _tiny_config(ops_implementation=source_ops).save_pretrained(transformer_path)
+
+    loaded_configs = []
+
+    def load_condition(config):
+        loaded_configs.append(config)
+        return SimpleNamespace(
+            _text_encoder=None,
+            _video_vae=None,
+            _audio_vae=None,
+            _tokenizer=None,
+            _processor=None,
+            _scheduler_video=None,
+            _scheduler_audio=None,
+            eval=lambda: None,
+        )
+
+    class ConfigsLoaded(Exception):
+        pass
+
+    def load_transformer(config, **kwargs):
+        loaded_configs.append(config)
+        raise ConfigsLoaded
+
+    monkeypatch.setattr(inference.MiniMaxH3ConditionModel, "_from_config", load_condition)
+    monkeypatch.setattr(inference.MiniMaxH3DiTModel, "_from_config", load_transformer)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    if hasattr(torch, "npu"):
+        monkeypatch.setattr(torch.npu, "empty_cache", lambda: None)
+
+    load_kwargs = dict(
+        device="cpu",
+        condition_model_path=str(condition_path),
+        transformer_config_path=str(transformer_path),
+        condition_model_cfg={
+            "attn_implementation": "eager",
+            "ops_implementation": {"rotary_pos_emb_implementation": "eager"},
+        },
+        transformer_config_kwargs={
+            "attn_implementation": "eager",
+            "ops_implementation": {"rotary_pos_emb_implementation": "eager"},
+        },
+    )
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        inference.MiniMaxH3Pipeline.from_pretrained(**load_kwargs)
+    assert loaded_configs == []
+
+    runtime_ops = {"rms_norm_implementation": "torch_npu", "attn_implementation": "sdpa"}
+    if replace_all:
+        runtime_ops = OpsImplementationConfig(**runtime_ops)
+    with pytest.raises(ConfigsLoaded):
+        inference.MiniMaxH3Pipeline.from_pretrained(**load_kwargs, ops_implementation=runtime_ops)
+    assert len(loaded_configs) == 2
+    assert all(config.ops_config.rms_norm_implementation == "torch_npu" for config in loaded_configs)
+    assert all(config.ops_config.attn_implementation == "veomni_sdpa" for config in loaded_configs)
+    if replace_all:
+        assert all("rotary_pos_emb_implementation" not in config.ops_implementation for config in loaded_configs)
+    else:
+        assert all(config.ops_config.rotary_pos_emb_implementation == "eager" for config in loaded_configs)
 
 
 def test_minimax_h3_rms_norm_matches_official():

@@ -82,6 +82,13 @@ its first parallel call, reproducing the original 757-element CI mismatch.
 Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
 independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
 
+CPU model tests must explicitly select eager implementations for every consumed
+op, rather than only setting attention to eager: host defaults can otherwise bind
+accelerator RMSNorm/MLP kernels to CPU inputs. Plain-tensor checkpoint exports
+must not query an accelerator's current device; resolve the staging device only
+when a DTensor actually needs materialization. CPU-planned workers hide devices,
+so unnecessary device queries can initialize an unavailable vendor runtime.
+
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory
 paths. See `docs/testing.md` under "Registering Tests in CI" for the manifest

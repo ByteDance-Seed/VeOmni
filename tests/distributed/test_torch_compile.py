@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     DataArguments,
@@ -343,8 +344,10 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
     assert all(not getattr(block, "_veomni_forward_compiled", False) for block in model.model.visual.blocks)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
@@ -367,7 +370,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
         hidden_act="silu",
         rope_theta=10000,
     )
-    config._attn_implementation = "eager"
+    config._set_ops_implementation(make_eager_ops_config())
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
     compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)

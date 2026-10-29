@@ -458,9 +458,7 @@ class WanModel(PreTrainedModel):
 
     def __init__(self, config: WanConfig, **kwargs):
         if "attn_implementation" not in config.ops_implementation:
-            attn_implementation = getattr(config, "_attn_implementation_internal", None)
-            if attn_implementation is not None:
-                config.ops_implementation["attn_implementation"] = attn_implementation
+            config.ops_implementation["attn_implementation"] = config.ops_config.attn_implementation
         config._attn_implementation_internal = "eager"
         super().__init__(config, **kwargs)
         self.dim = config.dim

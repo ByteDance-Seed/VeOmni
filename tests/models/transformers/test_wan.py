@@ -285,3 +285,23 @@ def test_wan_preserves_explicit_attn_when_ops_implementation_is_sparse():
     assert model.config._attn_implementation == "eager"
     assert model.config.ops_config.attn_implementation == "sdpa"
     assert model.blocks[0].self_attn.attn.veomni_attn.impl == "sdpa"
+
+
+def test_wan_preserves_default_attn_when_ops_implementation_is_sparse(available_nvidia_ops):
+    """The HF eager compatibility setting must not replace the module's default kernel."""
+    from veomni.models.transformers.wan.modeling_wan import WanModel
+
+    config = _tiny_config(
+        attn_implementation=None,
+        ops_implementation={
+            "rms_norm_implementation": "eager",
+            "rotary_pos_emb_implementation": "eager",
+        },
+    )
+    expected_impl = config.ops_config.attn_implementation
+    assert expected_impl == "veomni_flash_attention_2"
+
+    model = WanModel(config)
+    assert model.config._attn_implementation == "eager"
+    assert model.config.ops_config.attn_implementation == expected_impl
+    assert model.blocks[0].self_attn.attn.veomni_attn.impl == expected_impl
