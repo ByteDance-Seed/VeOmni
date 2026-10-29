@@ -131,6 +131,7 @@ _BUILTIN_ENTRIES = (
     ),
     ("chunk_gated_delta_rule", "standard", "triton", "npu", _NPU, ("triton",)),
     ("chunk_gated_delta_rule", "standard", "fla_npu", "npu", _NPU, ("fla_npu", "triton")),
+    ("chunk_gated_delta_rule", "standard", "fla_npu_reuse", "npu", _NPU, ("fla_npu", "triton")),
     ("load_balancing_loss", "standard", "eager", "any", _ANY, ()),
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
