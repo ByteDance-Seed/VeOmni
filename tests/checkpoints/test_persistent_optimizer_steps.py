@@ -105,10 +105,22 @@ def test_frozen_persistent_parameter_with_state_is_still_checked():
 
 
 def test_frozen_persistent_parameter_without_state_is_still_in_inventory():
-    model, optimizer = _model_and_optimizer()
+    model = torch.nn.Linear(2, 2)
+    model._fqn2spec_info = {"weight": SimpleNamespace(persistent_fsdp_shard_dim=1)}
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.bias.grad = torch.ones_like(model.bias)
+    optimizer.step()
     model.weight.requires_grad_(False)
-    optimizer.state.clear()
     assert checkpoint._persistent_optimizer_rows(model, optimizer)["weight"][0] == "inactive"
+
+
+def test_empty_scalar_owner_is_rejected_before_optimizer_serialization():
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.empty(0, 2))
+    model._fqn2spec_info = {"weight": SimpleNamespace(persistent_fsdp_shard_dim=1)}
+    optimizer = torch.optim.AdamW(model.parameters())
+    with pytest.raises(RuntimeError, match="uninitialized persistent optimizer state"):
+        checkpoint._persistent_optimizer_rows(model, optimizer)
 
 
 def _persistent_step_worker(rank, rendezvous, differing):

@@ -232,10 +232,12 @@ def _persistent_optimizer_rows(model, optimizer):
                     rows[name] = ("owner-grid", True, None)
                     continue
                 if not param.requires_grad and not state:
+                    if not leaf.state:
+                        raise RuntimeError("Cannot save an empty persistent scalar optimizer without initializing it")
                     rows[name] = ("inactive", False, None)
                     continue
                 local = param.to_local() if isinstance(param, DTensor) else param
-                if not state and local.numel():
+                if not state and (local.numel() or not leaf.state):
                     raise RuntimeError(
                         f"Saving an uninitialized persistent optimizer state for {name} is unsupported; "
                         "save after all owners have state or use a lazy-state-aware optimizer"
