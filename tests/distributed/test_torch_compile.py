@@ -412,6 +412,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
 def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     pytest.importorskip("flash_attn")
 
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
@@ -437,7 +438,9 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
         hidden_act="silu",
         rope_theta=10000,
     )
-    config._attn_implementation = "flash_attention_2"
+    as_veomni_config(config, validate=False)._set_ops_implementation(
+        make_eager_ops_config(attn_implementation="flash_attention_2")
+    )
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
     compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
