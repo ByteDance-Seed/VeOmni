@@ -73,7 +73,7 @@ def _build_ours(config: Qwen2Config, ops: SimpleNamespace | None = None):
     return _construct_ours(causal_cls, config, ops)
 
 
-def test_qwen2_rope_reads_selected_impl(monkeypatch):
+def test_qwen2_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
     from veomni.models.transformers.qwen2.generated import patched_modeling_qwen2_gpu as modeling
 
     selected: list[tuple[str, str, str]] = []
@@ -87,12 +87,12 @@ def test_qwen2_rope_reads_selected_impl(monkeypatch):
 
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
-    ops.rotary_pos_emb_implementation = "test_impl"
+    ops.rotary_pos_emb_implementation = selected_rope_impl
     config = _tiny_config()
     config._set_ops_implementation(ops)
     attn = modeling.Qwen2Attention(config, layer_idx=0)
 
-    assert ("rope", "full", "test_impl") in selected
+    assert ("rope", "full", selected_rope_impl) in selected
     assert attn.veomni_rope is not None
 
 

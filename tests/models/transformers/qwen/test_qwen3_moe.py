@@ -33,12 +33,16 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeModel as HFQwen3MoeModel
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
     eager_ops_config,
 )
 from tests.models.tiny_configs import tiny_qwen3_moe_config as _tiny_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _qwen3_moe_classes():
@@ -79,7 +83,7 @@ def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
     return _construct_ours(causal_cls, config, ops)
 
 
-def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):
+def test_qwen3_moe_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
     from veomni.models.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as modeling
 
     selected: list[tuple[str, str, str]] = []
@@ -93,12 +97,12 @@ def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):
 
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
-    ops.rotary_pos_emb_implementation = "test_impl"
+    ops.rotary_pos_emb_implementation = selected_rope_impl
     config = _tiny_config()
     config._set_ops_implementation(ops)
     attn = modeling.Qwen3MoeAttention(config, layer_idx=0)
 
-    assert ("rope", "full", "test_impl") in selected
+    assert ("rope", "full", selected_rope_impl) in selected
     assert attn.veomni_rope is not None
 
 

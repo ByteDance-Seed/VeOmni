@@ -240,6 +240,11 @@ needed" without a reason is what the reviewer is looking for.
   deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
   consumer reads, including `impl`.
+- Model selection tests that stub `VeomniOp` must still use valid implementation
+  names: module config validation runs before the stub receives the selection.
+  Cover legal eager and optimized selections under simulated GPU/NPU/MLU hosts
+  rather than using a synthetic backend name or bypassing validation. Config
+  mutations in handle-isolation tests must also remain valid on the host.
 - CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
   pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
   replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed

@@ -291,13 +291,14 @@ def test_wrapper_selects_op_impl(mode: str):
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-def test_wrapper_follows_experts_handle_not_global_config(mode: str):
+def test_wrapper_follows_experts_handle_after_config_changes(mode: str):
     """A config change after model build must not change the wrapped experts' impl."""
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
     assert experts.veomni_moe.impl == "eager"
-    as_veomni_config(model.config, validate=False)._set_ops_implementation(fused_triton_moe_ops())
+    as_veomni_config(model.config, validate=False)._set_ops_implementation({"moe_implementation": None})
+    assert model.config.ops_config.moe_implementation is None
     _apply(
         mode,
         model,

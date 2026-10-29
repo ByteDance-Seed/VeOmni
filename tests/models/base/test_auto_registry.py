@@ -922,7 +922,7 @@ def test_hf_backend_build_uses_native_config_without_mutating_adapter(monkeypatc
 def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_path):
     from transformers import LlamaConfig
 
-    from veomni.arguments import OpsImplementationConfig
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.configuration_base import VeOmniPretrainedConfig
     from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 
@@ -933,7 +933,7 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=2,
-        ops_implementation=OpsImplementationConfig(attn_implementation="eager", rms_norm_implementation="eager"),
+        ops_implementation=make_eager_ops_config(),
     )
     assert not isinstance(config, VeOmniPretrainedConfig)
     model = LlamaForCausalLM(config).eval()

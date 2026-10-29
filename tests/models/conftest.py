@@ -89,6 +89,25 @@ def cpu_safe_diffusers_rms_norm(monkeypatch, request):
     yield
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(("gpu", "eager"), id="gpu-eager"),
+        pytest.param(("gpu", "liger_kernel"), id="gpu-liger"),
+        pytest.param(("npu", "eager"), id="npu-eager"),
+        pytest.param(("npu", "torch_npu"), id="npu-native"),
+        pytest.param(("mlu", "eager"), id="mlu-eager"),
+        pytest.param(("mlu", "liger_kernel"), id="mlu-liger"),
+    ]
+)
+def selected_rope_impl(monkeypatch, request):
+    """Use valid host selections while the consumer stubs kernel binding."""
+    host, impl = request.param
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", host == "npu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: host == "mlu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_liger_kernel_mlu_available", lambda: host == "mlu")
+    return impl
+
+
 @pytest.fixture
 def available_nvidia_ops(monkeypatch):
     """Make static NVIDIA/package gates pass without executing a GPU kernel."""
