@@ -904,6 +904,13 @@ def build_extra_parallel_fsdp2_optimizer(
             group_lr = group_config.get("lr", lr)
             group_params = group_config["params"]
 
+            def split_decay(params, config=group_config):
+                groups = _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+                if "weight_decay" in config:
+                    for subgroup in groups:
+                        subgroup["weight_decay"] = config["weight_decay"]
+                return groups
+
             # Split this group's params into ExtraParallel and non-ExtraParallel
             group_extra_parallel_params = {
                 para: []  # List[torch.nn.Parameter]
@@ -932,9 +939,7 @@ def build_extra_parallel_fsdp2_optimizer(
             # Create subgroups with weight decay handling
             for para in parallel_state.extra_parallel_names:
                 if group_extra_parallel_params[para]:
-                    group_para_subgroups = _make_param_groups_for_subset(
-                        model, group_extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
-                    )
+                    group_para_subgroups = split_decay(group_extra_parallel_params[para])
                     for subgroup in group_para_subgroups:
                         subgroup["lr"] = group_lr
                         # Preserve other custom settings from original group
@@ -944,9 +949,7 @@ def build_extra_parallel_fsdp2_optimizer(
                     extra_parallel_groups[para].extend(group_para_subgroups)
 
             if group_non_extra_parallel_params:
-                group_non_extra_parallel_subgroups = _make_param_groups_for_subset(
-                    model, group_non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
-                )
+                group_non_extra_parallel_subgroups = split_decay(group_non_extra_parallel_params)
                 for subgroup in group_non_extra_parallel_subgroups:
                     subgroup["lr"] = group_lr
                     # Preserve other custom settings from original group
