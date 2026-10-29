@@ -173,6 +173,17 @@ def test_gdn_grouped_heads_dispatch_contract(
         def scatter_seq(x, head_dim, seq_dim, group=None):
             return torch.chunk(x, 2, dim=seq_dim)[0].repeat(1, 1, 2, 1)
 
+        coalesced_calls = []
+
+        def coalesced_heads(q, k, v, beta, decay, group):
+            coalesced_calls.append(True)
+            return tuple(scatter_heads(value, seq_dim=1, head_dim=2, group=group) for value in (q, k, v, beta, decay))
+
+        monkeypatch.setattr(
+            f"veomni.models.transformers.{model_name}.generated.patched_modeling_{model_name}_gpu.coalesced_gather_aligned",
+            coalesced_heads,
+        )
+
         if model_name == "qwen3_5":
             monkeypatch.setattr(
                 "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
@@ -220,6 +231,8 @@ def test_gdn_grouped_heads_dispatch_contract(
     hidden_states = torch.randn(1, 3 if ulysses else 6, 64, requires_grad=True)
     cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None
     out = layer(hidden_states, cu_seq_lens_q=cu_seq_lens_q)
+    if ulysses:
+        assert len(coalesced_calls) == 1
     out.sum().backward()
 
     expected_calls = 2 if (model_name == "qwen4_exp" and packed and impl == "eager" and not ulysses) else 1
