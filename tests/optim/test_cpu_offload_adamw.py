@@ -563,7 +563,7 @@ def test_dcp_load_hooks_observe_saved_state_and_keep_their_changes(tmp_path, emp
     assert target.state[target_model.bias]["exp_avg"].item() == 0.75
 
 
-def test_state_receipt_ignores_unassigned_metadata_after_resume():
+def test_checkpoint_rejects_unassigned_metadata_until_hook_removes_it():
     param = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
     source = CPUOffloadAdamW([param])
     param.grad = torch.ones_like(param)
