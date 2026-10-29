@@ -47,7 +47,7 @@ def _get_vlm_visual_module(model):
             return _get_vlm_visual_module(base_model)
 
     # VLM wrappers are not consistent across model families and transformers
-    # versions. Qwen uses `visual`, while Gemma 3 uses `vision_tower`.
+    # versions. Qwen uses `visual`, while Gemma 3/4 use `vision_tower`.
     for module_name in ("visual", "vision_tower"):
         visual = getattr(model, module_name, None)
         if visual is not None:
@@ -186,6 +186,10 @@ class VLMModelRuntime(VeOmniModelRuntime):
                     getattr(self.model.thinker.audio_tower, "proj1", None) or self.model.thinker.audio_tower.proj
                 )
                 audio_proj.requires_grad_(True)
+            elif train_args.freeze_audio_tower and model_config.model_type == "gemma4":
+                audio_tower = self.model.model.audio_tower
+                if audio_tower is not None:
+                    audio_tower.requires_grad_(False)
 
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
@@ -198,6 +202,12 @@ class VLMModelRuntime(VeOmniModelRuntime):
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
         visual = self.model.thinker.visual if is_omni else _get_vlm_visual_module(self.model)
         visual_param_ids = {id(param) for param in visual.parameters()} if visual is not None else set()
+        if model_config.model_type == "gemma4":
+            # Gemma4's vision projector is separate from the tower. Preserve its
+            # visual learning rate, including through PEFT's module-name prefix.
+            visual_param_ids.update(
+                id(param) for name, param in self.model.named_parameters() if "embed_vision" in name.split(".")
+            )
 
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
@@ -251,14 +261,15 @@ class VLMTrainer:
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model.model_config.model_type
+        mm_configs = dict(args.data.mm_configs)
+        mm_configs.setdefault("max_seq_len", args.data.max_seq_len)
 
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.model.processor,
             chat_template=self.base.model.chat_template,
             position_id_func=self.base.model.unwrapped_module.get_position_id_func(),
-            max_seq_len=args.data.max_seq_len,
-            **args.data.mm_configs,
+            **mm_configs,
         )
 
     def _build_collate_fn(self):

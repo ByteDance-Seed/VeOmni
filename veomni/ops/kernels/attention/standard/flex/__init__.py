@@ -102,6 +102,9 @@ def resolve_flex_attention(
         backend = FLEX_BACKEND_TRITON
 
     kernel_options["BACKEND"] = backend
+    if backend == FLEX_BACKEND_TRITON and head_dim is not None and head_dim >= 256:
+        # Wide heads otherwise exhaust shared memory on Ampere during backward.
+        kernel_options.setdefault("num_stages", 1)
     if backend == FLEX_BACKEND_FLASH:
         return _flex_attention_fa4
     return _flex_attention_triton

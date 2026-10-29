@@ -207,6 +207,15 @@ guarantees:
 
 ## Model coverage
 
+Gemma4 uses the same model-owned collation hooks for a different native feature
+layout: `get_extra_collate_infos` preserves image/video patch rows and coordinates,
+and `get_metadata_collate_func` pads ragged `[num_audio, time, features]` tensors
+with their boolean masks after generic packing. Its data transform packs video
+frames as independent single-frame rows. This is **feature collation only**;
+Gemma4 does not emit Qwen `*_grid_thw` or `multimodal_metadata`, and its existing
+vision forward is unchanged. Do not reuse Qwen's flattened-patch or audio-feature
+collate rules for it. See `docs/transformers_v5/gemma4.md#vlm-training-data`.
+
 | Model | Status | Notes |
 |---|---|---|
 | qwen3_vl | ✅ wired | Canonical. `collate_multimodal_metadata` helper in the gpu config; npu reuses it. |

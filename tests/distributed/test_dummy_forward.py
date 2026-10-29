@@ -182,6 +182,10 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     loss.backward()
 
     for name, param in model.named_parameters():
+        if model_type == "gemma4" and name.startswith(
+            ("model.vision_tower.", "model.audio_tower.", "model.embed_vision.", "model.embed_audio.")
+        ):
+            assert param.grad is not None, f"[Rank {rank}] Missing modality gradient for {name}"
         if param.grad is not None:
             assert torch.isfinite(param.grad).all(), f"[Rank {rank}] Non-finite gradient in {name}"
 
@@ -261,5 +265,38 @@ def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
 
     torchrun(
         partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
+        world_size=_CI_ACCELERATOR_2.nproc,
+    )
+
+
+def _gemma4_batch(*, rank, device, dtype, rank_zero_modalities, rank_one_modalities):
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+
+    from tests.tools.gemma4_utils import make_gemma4_batch
+
+    config = Gemma4Config.from_pretrained("./tests/toy_config/gemma4_toy")
+    modalities = rank_zero_modalities if rank == 0 else rank_one_modalities
+    return make_gemma4_batch(config, modalities, device=device, dtype=dtype)
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs for FSDP2 validation")
+@pytest.mark.parametrize(
+    "rank_zero_modalities,rank_one_modalities",
+    [
+        pytest.param(("image",), (), id="image_vs_text"),
+        pytest.param(("video", "audio"), (), id="video_audio_vs_text"),
+        pytest.param(("image",), ("video", "audio"), id="split_modalities"),
+    ],
+)
+def test_asymmetric_forward_gemma4(rank_zero_modalities, rank_one_modalities):
+    """Validate actual BF16 FSDP collectives with real modality data on different ranks."""
+    from ..tools.launch_utils import torchrun
+
+    batch_fn = partial(
+        _gemma4_batch, rank_zero_modalities=rank_zero_modalities, rank_one_modalities=rank_one_modalities
+    )
+    torchrun(
+        partial(_asymmetric_forward_worker, "gemma4", "./tests/toy_config/gemma4_toy", batch_fn),
         world_size=_CI_ACCELERATOR_2.nproc,
     )

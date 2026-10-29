@@ -1087,3 +1087,20 @@ def tiny_qwen3_vl_moe_config(
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
     )
+
+
+def tiny_gemma4_config(architecture: str = "Gemma4ForConditionalGeneration") -> PretrainedConfig:
+    """Keep the Gemma 4 PLE and all three modality towers in the shared toy."""
+    from pathlib import Path
+
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+
+    config = Gemma4Config.from_pretrained(Path(__file__).parents[1] / "toy_config" / "gemma4_toy")
+    config.architectures = [architecture]
+    return config
+
+
+def tiny_gemma4_text_config(architecture: str = "Gemma4ForCausalLM") -> PretrainedConfig:
+    config = tiny_gemma4_config().text_config
+    config.architectures = [architecture]
+    return config

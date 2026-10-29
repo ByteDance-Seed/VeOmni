@@ -5,6 +5,8 @@ This section documents VeOmni's integration with HuggingFace
 
 ## Included Notes
 
+- [Gemma 4](gemma4.md): model scope, instance-local loss selection, packed masks, and validation limits.
+
 - [Attention interface](veomni_attention_interface.md): documents instance-local `VeomniOp` dispatch, config routing, native BlockMask contract, and Ulysses restrictions.
 - [Flash Attention custom-name handling](veomni_flash_attention_op_adapter.md): explains why `_lazy_imports` fails for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
 - [MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights to be laid out and documents qwen3_moe handling.
@@ -20,5 +22,6 @@ veomni_flash_attention_op_adapter.md
 veomni_attention_interface.md
 transformers_v5_moe_weight_loading.md
 testing_new_model.md
+gemma4.md
 upgrade_5_9_to_5_16.md
 ```

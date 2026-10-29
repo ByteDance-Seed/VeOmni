@@ -37,6 +37,7 @@ from tests.models.tiny_configs import (
 from tests.models.tiny_configs import (
     tiny_gemma3_text_config as _tiny_gemma3_text_config,
 )
+from tests.models.tiny_configs import tiny_gemma4_config, tiny_gemma4_text_config
 from tests.models.tiny_configs import (
     tiny_glm_moe_dsa_config as _tiny_glm_moe_dsa_config,
 )
@@ -217,6 +218,16 @@ def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
 
 
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="gemma4",
+        config_factory=tiny_gemma4_config,
+        architectures=("Gemma4ForConditionalGeneration", "Gemma4Model"),
+    ),
+    _ModelCase(
+        model_type="gemma4_text",
+        config_factory=tiny_gemma4_text_config,
+        architectures=("Gemma4ForCausalLM", "Gemma4TextModel"),
+    ),
     _ModelCase(
         model_type="deepseek_v3",
         eager_ops=(
