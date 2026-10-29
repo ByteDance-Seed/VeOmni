@@ -14,9 +14,10 @@ Choose attention through `OpsImplementationConfig`, for example
 does not support supplied `past_key_values` and disables automatic cache
 creation, including when `use_cache=True`; unpacked masks retain HF cache handling.
 With `use_bidirectional_attention="all"`, full attention remains bidirectional
-within each packed sample. Eager/SDPA/Flex sliding attention preserves HF's
-inclusive, symmetric window on both sides of each token; document boundaries
-still apply. FlashAttention 2/3/4 and the FA2/FA3 Hub variants retain their
+within each packed sample. For bidirectional Eager/SDPA/Flex attention, sliding
+attention preserves HF's inclusive, symmetric window on both sides of each token.
+Causal calls still block future tokens; document boundaries apply in both modes.
+FlashAttention 2/3/4 and the FA2/FA3 Hub variants retain their
 native metadata path: the attention adapter receives the module's causal
 setting, sliding window and cumulative sequence lengths. No custom mask
 predicate is sent to Flash. The pinned HF native Flash conversion uses radius

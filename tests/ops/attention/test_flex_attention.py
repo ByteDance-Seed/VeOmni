@@ -1477,6 +1477,7 @@ def test_flex_attention_limits_pipeline_depth_for_wide_heads(monkeypatch, explic
         "get_parallel_state",
         lambda: SimpleNamespace(ulysses_enabled=False),
     )
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     monkeypatch.setattr(flex_backend, "_flex_attention_triton", fake_flex_forward)
     block_mask = create_block_mask(
         lambda batch, head, query, key: query >= key,
