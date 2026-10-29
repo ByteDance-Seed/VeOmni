@@ -6,6 +6,10 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 spec = importlib.util.spec_from_file_location(
     "master", Path(__file__).parents[2] / "veomni/optim/master_fp32_adamw.py"
