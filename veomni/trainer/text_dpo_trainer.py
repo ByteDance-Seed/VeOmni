@@ -279,13 +279,7 @@ class TextDPOTrainer:
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
-        callback = getattr(self.base, "channel_loss_callback", None)
-        repeat_key = (
-            "channel_loss_source_repeat"
-            if callback is not None and hasattr(callback.computer, "observe_dpo_log_probs")
-            else "source_repeat"
-        )
-        self.base.on_step_begin(micro_batches=micro_batches, **{repeat_key: 2})
+        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
 
     @staticmethod
     def dpo_loss(
@@ -347,10 +341,6 @@ class TextDPOTrainer:
         """
         model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
-        channel_loss_callback = getattr(self, "channel_loss_callback", None)
-        observe = getattr(getattr(channel_loss_callback, "computer", None), "observe_dpo_log_probs", None)
-        if observe is not None:
-            observe(outputs.fused_linear_aux.log_probs, micro_batch["labels"], micro_batch.get("cu_seq_lens_q"))
 
         # ``outputs.fused_linear_aux.log_probs`` is shape [1, packed_L]
         # (actual log-probabilities; sign already flipped). PostCollator
@@ -395,12 +385,7 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        get_registered = getattr(BaseTrainer, "_get_registered_channel_loss_callback", None)
-        channel_loss_callback = (
-            get_registered(self.base)
-            if get_registered is not None
-            else getattr(self.base, "channel_loss_callback", None)
-        )
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None

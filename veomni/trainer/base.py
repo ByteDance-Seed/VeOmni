@@ -49,7 +49,7 @@ from ..data import (
     build_dataloader,
     build_dataset,
 )
-from ..data.data_collator import CHANNEL_LOSS_PROVENANCE, DataCollator, MainCollator, _ChannelLossProvenance
+from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
@@ -452,9 +452,6 @@ class BaseTrainer(Stateful, ABC):
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
-            channel_loss_source_id_keys=(
-                tuple(self.args.train.channel_loss.source_id_keys) if self.args.train.channel_loss.enable else None
-            ),
         )
 
     def _build_dataloader(self):
@@ -524,11 +521,9 @@ class BaseTrainer(Stateful, ABC):
         # (EnvironMeter, DCP checkpointer) are handed the state directly, so
         # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
         #
-        # ``channel_loss_callback`` is ordered after the meter for
-        # ``on_step_end`` (the meter resets ``step_*_metrics``) and before
-        # ``wandb`` (which logs them), so its per-source metrics survive into
-        # the logged payload. ``on_step_begin`` snapshots channel metadata first
-        # because multi-source accounting consumes it.
+        # ``channel_loss_callback`` is ordered after the meter (which resets
+        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
+        # logs them), so its per-source metrics survive into the logged payload.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
@@ -594,24 +589,8 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def _get_registered_channel_loss_callback(self):
-        callback = getattr(self, "channel_loss_callback", None)
-        if callback is not None and any(item is callback for item in getattr(self, "_callbacks", ())):
-            return callback
-        return None
-
     def on_step_begin(self, micro_batches=None, **kwargs):
-        # Multi-source accounting consumes ``ds_idx`` / ``source_name`` from the
-        # micro-batches. Channel loss must snapshot that metadata first, while
-        # keeping its on_step_end position after the meter so its metrics are not
-        # overwritten by the meter's per-step reset.
-        channel_loss_callback = self._get_registered_channel_loss_callback()
-        channel_loss_registered = channel_loss_callback is not None
-        if channel_loss_registered:
-            channel_loss_callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
         for callback in self._callbacks:
-            if channel_loss_registered and callback is channel_loss_callback:
-                continue
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
@@ -636,11 +615,7 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        micro_batch = {
-            k: _to_device(v)
-            for k, v in micro_batch.items()
-            if not (k == CHANNEL_LOSS_PROVENANCE and isinstance(v, _ChannelLossProvenance))
-        }
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
@@ -694,7 +669,7 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        channel_loss_callback = self._get_registered_channel_loss_callback()
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None

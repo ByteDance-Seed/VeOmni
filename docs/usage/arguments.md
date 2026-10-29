@@ -555,67 +555,17 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
-adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
-Source-aligned capture requires the standard `ForCausalLMLoss` and a standard
-cross-entropy implementation. A custom loss may declare
-`__veomni_channel_loss_contract__ = "outer_causal_ce_v1"` only if its per-token
-CE, target masking, and token order are exactly those of the outer arguments,
-including when capture falls back to detached recomputation. Otherwise channel
-observation is skipped, or fails in strict mode; the training loss is unchanged.
-For an opted-in custom loss, metrics are always recomputed from the outer
-arguments: an incidental chunk-loss invocation may not be its actual objective.
-Use the canonical loss argument names (including `ignore_index`); nonempty
-anonymous `*args` and unknown parameter names make binding ambiguous and cause
-observation to be skipped or to fail in strict mode.
-Sampled steps also report per-source `samples`, `input_tokens`, `label_tokens`,
-and `label_tokens_per_sample`. Physical-data counters use the primary labels once;
-auxiliary objectives do not add extra samples or input tokens. Channel CE continues
-to aggregate all observed objectives. The observer does not change training loss
-or gradients. Strict capture and missing-primary-label failures are coordinated
-before optimizer updates; cross-step source-name conflicts are checked at step end.
-A model-forward or communication failure is left to the distributed launcher.
-Auxiliary MTP statistics require the original `mtp_labels` in the micro-batch;
-when source alignment cannot be proven, non-strict mode skips all channel metrics
-for that sampled model forward and strict mode raises. Ambiguous primary/MTP
-targets are handled the same way.
-
-The standard `chunk_loss` backend reuses the main LM-head projection, but detached
-per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
-backends may recompute the LM-head projection on sampled steps, so the default
-interval is 10 steps; set `interval=1` for per-step metrics. Compiled `chunk_loss`
-also uses detached recomputation instead of injecting a capture into the compiled
-graph. When explicitly
-enabled, `release_cache` synchronizes and releases detached CE allocator cache
-before backward, trading extra synchronization for lower memory pressure. DiT trainers and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+not change the returned training loss or gradients. Fused-loss backends may
+recompute the LM-head projection on sampled steps, so the default interval is
+10 steps; set `interval=1` for per-step metrics. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
 alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
-reference-model forward is excluded, the chosen/rejected segments use their
-preference pair's source metadata, and `samples` counts the pair once. DPO
-segment-tail masking follows the objective; SP/CP layouts without provable tail
-positions are skipped (or rejected in strict mode). The source observer alone
-does not fix the existing DPO multisource dataloader's pair-versus-segment token
-accounting; use the separate DPO provenance and pair-normalization fix before
-using multisource DPO. If distinct source names sanitize to
+reference-model forward is excluded, and the chosen/rejected segments both use
+their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
-
-The standard `MainCollator` records source IDs, original feature boundaries and
-padding before packing. The observer intersects those boundaries with the
-contiguous SP shards used by the collator, including Ulysses and CP; attention
-sequence boundaries are kept separate because one source feature can contain
-more than one attention segment. DPO requires exactly two nonempty attention
-segments per preference pair, and the observer masks their last positions
-without changing the training labels. Private source metadata is removed before
-the model forward, including on unsampled steps.
-
-Custom collators and model hooks that reorder token inputs are not automatically
-covered by this provenance contract. If source layout cannot be proved or SP
-ranks disagree, non-strict mode skips the affected channel metrics; strict mode
-raises a metadata error. The non-strict path leaves the training objective and
-gradients unchanged. Direct `ChannelLossComputer` use also requires provenance
-by default; position-derived attention boundaries alone do not prove sample
-source boundaries.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -628,9 +578,17 @@ source boundaries.
 | weighted_loss_metric_prefix | `str` | `"channel_loss_weighted"` | Prefix for loss-sum divided by all logged step tokens. |
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
-| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
+
+Sampled steps also report `samples/<source>`, `input_tokens/<source>`,
+`label_tokens/<source>` and `label_tokens_per_sample/<source>`, using the same
+source-qualified suffix as channel loss. Counts accumulate over micro-batches,
+merge segments across SP (Ulysses/CP), and sum across DP; padding is excluded.
+`label_tokens_per_sample` divides the summed supervised tokens by samples,
+not by packed batches. The existing `source_repeat` divides repeated sample
+counts (for example, chosen/rejected segments represent one preference pair).
+These are detached data metrics; DPO objective and completion masking are separate.
 
 ### GradientCheckpointingConfig
 

@@ -46,39 +46,6 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
-CHANNEL_LOSS_PROVENANCE = "_veomni_channel_loss_source_provenance"
-_CHANNEL_LOSS_HOOK_CHANGED = object()
-
-
-class _ChannelLossProvenance(dict):
-    """Distinguish private observer metadata from identically named user data."""
-
-
-@dataclass(frozen=True)
-class _GuardChannelLossMetadataHook:
-    """Ensure a model metadata hook does not reorder loss inputs."""
-
-    hook: MetadataCollateFunc
-
-    def __call__(self, batch: Dict[str, Any], sp_pad: Dict[str, int]) -> None:
-        keys = ("input_ids", "labels", "mtp_labels", "position_ids", "attention_mask")
-        try:
-            before = {key: value.clone() for key in keys if isinstance(value := batch.get(key), torch.Tensor)}
-        except Exception:
-            before = None
-        self.hook(batch, sp_pad)
-        try:
-            changed = before is None or any(
-                (key in batch) != (key in before)
-                or (
-                    key in before
-                    and (not isinstance(batch[key], torch.Tensor) or not torch.equal(before[key], batch[key]))
-                )
-                for key in keys
-            )
-        except Exception:
-            changed = True
-        batch[_CHANNEL_LOSS_HOOK_CHANGED] = changed
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -481,7 +448,6 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
-    channel_loss_source_id_keys: Optional[Tuple[str, ...]] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -523,19 +489,13 @@ class MainCollator(DataCollator):
         """
         assert self.collate_infos["attention_mask"].sp_pad_value == 1
 
-        metadata_hook = self.metadata_collate_func
-        if metadata_hook is not None and self.channel_loss_source_id_keys is not None:
-            metadata_hook = _GuardChannelLossMetadataHook(metadata_hook)
-        parallel_state = get_parallel_state()
-        self.channel_loss_sp_size = parallel_state.sp_size if parallel_state.sp_enabled else 1
-        self.channel_loss_sp_rank = parallel_state.sp_rank if parallel_state.sp_enabled else 0
         self.preforward_pipeline.append(PrecomputePositionIDsCollator())
         self.preforward_pipeline.append(
             PackingCollator(
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
-                metadata_collate_func=metadata_hook,
+                metadata_collate_func=self.metadata_collate_func,
             )
         )
         if get_parallel_state().sp_enabled:
@@ -543,78 +503,14 @@ class MainCollator(DataCollator):
                 SequenceParallelCollator(
                     collate_infos=self.collate_infos,
                     seq_classification=self.seq_classification,
-                    metadata_collate_func=metadata_hook,
+                    metadata_collate_func=self.metadata_collate_func,
                 )
             )
         logger.info_rank0(self.log_collate_infos())
 
     def __call__(self, micro_batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        provenance = None
-        if self.channel_loss_source_id_keys is not None:
-            try:
-                points, source_ids, masks = [0], [], []
-                valid = (
-                    bool(micro_batch)
-                    and not self.seq_classification
-                    and all(self.collate_infos[key].pack_dim == -1 for key in ("input_ids", "labels", "position_ids"))
-                )
-                if self.channel_loss_sp_size > 1:
-                    valid = valid and all(self.collate_infos[key].sp_slice for key in ("input_ids", "labels"))
-                for feature in micro_batch:
-                    ids, labels, mask = feature.get("input_ids"), feature.get("labels"), feature.get("attention_mask")
-                    key = next((key for key in self.channel_loss_source_id_keys if key in feature), None)
-                    if (
-                        not isinstance(ids, torch.Tensor)
-                        or ids.ndim != 1
-                        or not isinstance(labels, torch.Tensor)
-                        or labels.ndim != 1
-                        or labels.numel() != ids.numel()
-                        or (mask is not None and (not isinstance(mask, torch.Tensor) or mask.shape != ids.shape))
-                        or key is None
-                        or CHANNEL_LOSS_PROVENANCE in feature
-                    ):
-                        valid = False
-                        break
-                    source_ids.append(feature[key])
-                    points.append(points[-1] + ids.numel())
-                    masks.append(
-                        mask.to(dtype=torch.bool).clone()
-                        if mask is not None
-                        else torch.ones_like(ids, dtype=torch.bool)
-                    )
-                if valid:
-                    provenance = {"source_ids": source_ids, "source_cu": points, "input_mask": torch.cat(masks)}
-            except Exception:
-                provenance = None
         for preforward_func in self.preforward_pipeline:
             micro_batch = preforward_func(micro_batch)
-        if self.channel_loss_source_id_keys is not None:
-            hook_changed = micro_batch.pop(_CHANNEL_LOSS_HOOK_CHANGED, False)
-            ids, labels, positions = (micro_batch.get(key) for key in ("input_ids", "labels", "position_ids"))
-            valid = (
-                provenance is not None
-                and not hook_changed
-                and all(isinstance(value, torch.Tensor) for value in (ids, labels, positions))
-                and ids.ndim == 2
-                and ids.size(0) == 1
-                and labels.shape == ids.shape
-                and positions.ndim >= 1
-                and positions.size(-1) in (ids.size(-1), ids.size(-1) * self.channel_loss_sp_size)
-            )
-            if valid:
-                width = ids.size(-1)
-                total = width * self.channel_loss_sp_size
-                tail = total - provenance["source_cu"][-1]
-                if tail >= 0:
-                    provenance.update(
-                        {"tail": tail, "sp_size": self.channel_loss_sp_size, "sp_rank": self.channel_loss_sp_rank}
-                    )
-                else:
-                    valid = False
-            if CHANNEL_LOSS_PROVENANCE not in micro_batch:
-                micro_batch[CHANNEL_LOSS_PROVENANCE] = _ChannelLossProvenance(
-                    provenance if valid else {"error": "unsupported source layout"}
-                )
         return micro_batch
 
     def log_collate_infos(self) -> None:
