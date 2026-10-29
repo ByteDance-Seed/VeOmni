@@ -33,19 +33,21 @@ def _capture_chunk_tokens(target):
         chunk_loss_impl._CAPTURE.reset(token)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _deterministic_npu_comparisons():
-    """Keep exact offload comparisons independent of NPU reduction scheduling."""
-    if not IS_NPU_AVAILABLE:
-        yield
-        return
+@pytest.fixture(autouse=True)
+def _deterministic_reductions(device):
+    """Keep bitwise comparisons independent of parallel reduction scheduling."""
     enabled = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    torch.use_deterministic_algorithms(True)
+    num_threads = torch.get_num_threads()
     try:
+        if device == "cpu":
+            torch.set_num_threads(1)
+        if device in {"cpu", "npu"}:
+            torch.use_deterministic_algorithms(True, warn_only=False)
         yield
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        torch.set_num_threads(num_threads)
 
 
 def _run(device, dtype, *, offload, recompute, frozen, all_ignored, bias_kind=None, observed=None):
