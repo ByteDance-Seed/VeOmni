@@ -780,5 +780,64 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         self.assertEqual(getattr(model, "_veomni_prepared_fqn_to_index_mapping", None), mapping)
 
 
+def _lora_extra_parallel_export_worker(rank, rendezvous, output_dir, ep_dim, fsdp_dim):
+    import torch.distributed as dist
+    from safetensors.torch import load_file
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.distributed.parallel_plan import SpecInfo
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        fsdp_rank, ep_rank = mesh.get_coordinate()
+        shape = (6, 4, 4) if ep_dim == 0 else (4, 6, 4)
+        full = torch.arange(96, dtype=torch.bfloat16).reshape(shape)
+        ep_local = torch.tensor_split(full, 2, dim=ep_dim)[ep_rank].contiguous()
+        local = torch.tensor_split(ep_local, 2, dim=fsdp_dim)[fsdp_rank].contiguous()
+        tensor = DTensor.from_local(
+            local, mesh["ep_fsdp"], [Shard(fsdp_dim)], run_check=False, shape=ep_local.shape, stride=ep_local.stride()
+        )
+        name = "layers.0.experts.gate_proj.lora_A.weight"
+        spec_name = name.replace(".weight", ".default.weight")
+        spec = SpecInfo("ep", Shard(ep_dim), spec_name, mesh, tuple(full.shape), fsdp_dim)
+
+        class TinyAdapter:
+            _fqn2spec_info = {spec_name: spec}
+
+            def get_lora_config(self):
+                return self
+
+            def save_pretrained(self, path):
+                pass
+
+        with (
+            patch("veomni.lora.state_dict.get_lora_state_dict", return_value={name: tensor}),
+            patch("veomni.lora.is_veomni_lora_model", return_value=True),
+        ):
+            save_lora_adapter_with_dcp(TinyAdapter(), output_dir)
+        if rank == 0:
+            restored = load_file(f"{output_dir}/adapter_model.safetensors")
+            torch.testing.assert_close(restored[name], full, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+@pytest.mark.parametrize(("ep_dim", "fsdp_dim"), [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_lora_ep_export_preserves_global_shape(tmp_path, ep_dim, fsdp_dim):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _lora_extra_parallel_export_worker,
+        args=(str(tmp_path / "rdzv"), str(tmp_path / "adapter"), ep_dim, fsdp_dim),
+        nprocs=4,
+        join=True,
+        start_method="fork",
+    )
+
+
 if __name__ == "__main__":
     unittest.main()
