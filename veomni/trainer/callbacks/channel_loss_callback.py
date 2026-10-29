@@ -1140,7 +1140,11 @@ class ChannelLossCallback(Callback):
         return {source_id: tuple(values) for source_id, values in zip(source_ids, counts.cpu().tolist())}
 
     def _data_totals_device(self, local_totals: dict[ChannelKey, torch.Tensor]) -> torch.device:
-        return next(iter(local_totals.values())).device if local_totals else self._totals_device({})
+        return (
+            next(iter(local_totals.values())).device
+            if local_totals
+            else self._totals_device(self.computer.step_totals)
+        )
 
     def _build_data_metrics(
         self,
@@ -1158,7 +1162,6 @@ class ChannelLossCallback(Callback):
             label_tokens = loss_totals[source_id][1]
             metrics[f"samples/{name}"] = float(samples)
             metrics[f"input_tokens/{name}"] = float(input_tokens)
-            metrics[f"label_tokens/{name}"] = float(label_tokens)
             metrics[f"label_tokens_per_sample/{name}"] = label_tokens / samples
         return metrics
 

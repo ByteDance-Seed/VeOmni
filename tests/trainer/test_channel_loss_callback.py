@@ -1593,9 +1593,55 @@ def test_channel_data_metrics_use_unrepeated_sample_counts(monkeypatch, repeat):
     assert metrics == {
         "samples/source-i-1__train_a": 4,
         "input_tokens/source-i-1__train_a": 20,
-        "label_tokens/source-i-1__train_a": 12,
         "label_tokens_per_sample/source-i-1__train_a": 3,
     }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_data_totals_use_loss_device_when_empty(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    callback.computer.step_totals = {0: (torch.empty((), device="meta"), torch.empty((), device="meta"))}
+    assert callback._data_totals_device({}) == torch.device("meta")
+    assert callback._data_totals_device({0: torch.zeros(2)}) == torch.device("cpu")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_per_sample_count_is_independent_of_token_count_logging(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, log_token_count=False))
+            )
+        )
+    )
+    callback.on_step_begin(TrainerState(global_step=10), micro_batches=[])
+    totals, names = {1: (12.0, 12)}, {1: "train/a"}
+    metrics = callback._build_metrics(totals, names)
+    metrics.update(callback._build_data_metrics({1: (4, 20)}, totals, names))
+    assert "channel_tokens/source-i-1__train_a" not in metrics
+    assert "label_tokens/source-i-1__train_a" not in metrics
+    assert metrics["label_tokens_per_sample/source-i-1__train_a"] == 3
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_zero_supervised_tokens_keeps_sample_counts(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    callback.on_step_begin(TrainerState(global_step=10), micro_batches=[])
+    totals, names = {1: (0.0, 0)}, {1: "train/a"}
+    metrics = callback._build_metrics(totals, names)
+    metrics.update(callback._build_data_metrics({1: (4, 20)}, totals, names))
+    assert "channel_tokens/source-i-1__train_a" not in metrics
+    assert "label_tokens/source-i-1__train_a" not in metrics
+    assert metrics["samples/source-i-1__train_a"] == 4
+    assert metrics["input_tokens/source-i-1__train_a"] == 20
+    assert metrics["label_tokens_per_sample/source-i-1__train_a"] == 0
 
 
 @pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
@@ -1648,7 +1694,7 @@ def test_channel_data_metrics_preserve_accumulated_training_updates(monkeypatch,
         metrics = trainer.step_train_metrics
         assert metrics["samples/source-i-0__source_0"] == 4
         assert metrics["input_tokens/source-i-0__source_0"] == 16
-        assert metrics["label_tokens/source-i-0__source_0"] == 12
+        assert metrics["channel_tokens/source-i-0__source_0"] == 12
         assert metrics["label_tokens_per_sample/source-i-0__source_0"] == 3
         assert metrics["samples/source-i-1__source_1"] == 2
         assert metrics["input_tokens/source-i-1__source_1"] == 14
@@ -1720,7 +1766,7 @@ def _gloo_channel_data_metrics_worker(rank, world_size, sp_size, endpoint):
             metrics = trainer.step_train_metrics
             assert metrics[f"samples/{suffix}"] == samples
             assert metrics[f"input_tokens/{suffix}"] == input_tokens
-            assert metrics[f"label_tokens/{suffix}"] == label_tokens
+            assert metrics[f"channel_tokens/{suffix}"] == label_tokens
             assert metrics[f"label_tokens_per_sample/{suffix}"] == label_tokens / samples
             assert metrics[f"channel_loss/{suffix}"] == pytest.approx(loss_sum / label_tokens, rel=1e-6)
     finally:

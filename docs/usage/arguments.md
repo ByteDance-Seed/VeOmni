@@ -581,9 +581,9 @@ distinct from the first emission.
 | log_token_count | `bool` | `True` | Log token-count metrics. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
-Sampled steps also report `samples/<source>`, `input_tokens/<source>`,
-`label_tokens/<source>` and `label_tokens_per_sample/<source>`, using the same
-source-qualified suffix as channel loss. Counts accumulate over micro-batches,
+Sampled steps also report `samples/<source>`, `input_tokens/<source>`, and
+`label_tokens_per_sample/<source>`, using the same source-qualified suffix as
+channel loss. Counts accumulate over micro-batches,
 merge segments across SP (Ulysses/CP), and sum across DP; padding is excluded.
 `label_tokens_per_sample` divides the summed supervised tokens by samples,
 not by packed batches. The existing `source_repeat` divides repeated sample
