@@ -567,8 +567,21 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    npu_expert_fp32_wgrad: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Compute NPU fused MoE expert weight gradients in FP32 while keeping BF16 forward and "
+                "input gradients. Currently supports Qwen4-Exp with FSDP2, BF16 parameters, FP32 "
+                "reduction, and native communication; increases expert gather and temporary memory."
+            )
+        },
+    )
 
     def __post_init__(self):
+        if not isinstance(self.npu_expert_fp32_wgrad, bool):
+            raise ValueError("npu_expert_fp32_wgrad must be a boolean (true or false).")
+
         def _check_dtype(dtype: str):
             if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
                 raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")

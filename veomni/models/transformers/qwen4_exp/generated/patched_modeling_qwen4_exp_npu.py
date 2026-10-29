@@ -1444,6 +1444,7 @@ class Qwen4ExpTextExperts(nn.Module):
                 self.num_experts,
             )
         unused = self.gate_up_proj.new_empty(0)
+        expert_options = {"fp32_wgrad": True} if getattr(self, "_veomni_fp32_expert_wgrad", False) else {}
         return self.veomni_moe(
             hidden_states,
             top_k_weights,
@@ -1453,6 +1454,7 @@ class Qwen4ExpTextExperts(nn.Module):
             self.down_proj,
             self.gate_up_proj,
             num_experts=self.num_experts,
+            **expert_options,
         )
         # --- Patch.1 ---
 
