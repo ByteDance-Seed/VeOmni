@@ -20,10 +20,12 @@ the text-only, image+text, and video+text paths.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
 )
@@ -60,6 +62,102 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
         "image_mask": zeros,
         "video_mask": zeros,
     }
+
+
+@pytest.mark.parametrize(
+    "channels,temporal,patch,merge",
+    [(3, 2, 8, 2), (1, 1, 8, 2), (3, 2, 14, 2), (3, 2, 8, 1), (3, 2, 8, 4)],
+)
+def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch, merge):
+    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+        Qwen2_5_VisionTransformerPretrainedModel,
+    )
+
+    config = _tiny_config().vision_config
+    config.in_channels = channels
+    config.temporal_patch_size = temporal
+    config.patch_size = patch
+    config.spatial_merge_size = merge
+    config.window_size = 4 * merge * patch
+    config._attn_implementation = "eager"
+    with ops_config_scope(eager_ops_config()):
+        model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
+        output = model.dummy_forward().pooler_output
+        assert torch.isfinite(output).all()
+        (output.float().mean() * 0.0).backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, name
+                assert torch.isfinite(param.grad).all(), name
+
+
+@pytest.mark.parametrize("sp_size,merge", [(1, 2), (8, 2), (4, 4)])
+def test_qwen2_5_vl_dummy_forward_builds_local_patches_and_global_grid(monkeypatch, sp_size, merge):
+    from veomni.models.transformers.qwen2_5vl.generated import patched_modeling_qwen2_5_vl_gpu as module
+
+    class Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(in_channels=1, temporal_patch_size=1)
+            self.patch_size = 8
+            self.spatial_merge_size = merge
+            self.window_size = 4 * merge * self.patch_size
+            self.dtype = torch.float32
+            self.device = torch.device("cpu")
+
+        def forward(self, *, hidden_states, grid_thw, vit_metadata):
+            return hidden_states, grid_thw, vit_metadata
+
+    monkeypatch.setattr(module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=sp_size > 1, sp_size=sp_size))
+    pixels, grid, metadata = module.Qwen2_5_VisionTransformerPretrainedModel.dummy_forward(Probe())
+    assert pixels.shape == (merge * merge, 8 * 8)
+    assert grid.tolist() == [[1, merge * sp_size, merge]]
+    assert metadata["cu_seqlens"].tolist() == [0, merge * merge * sp_size]
+
+
+def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
+    from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+        Qwen2_5_VisionTransformerPretrainedModel,
+    )
+
+    os.environ.update(
+        MASTER_ADDR=endpoint.host,
+        MASTER_PORT=str(endpoint.port),
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        WORLD_SIZE="2",
+    )
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2)
+    try:
+        _init_parallel_state(ulysses_size=2, device_type="cpu")
+        torch.manual_seed(177)
+        config = _tiny_config().vision_config
+        config.patch_size = 8
+        config.spatial_merge_size = merge
+        config.window_size = 4 * merge * config.patch_size
+        config._attn_implementation = "veomni_sdpa"
+        ops = eager_ops_config()
+        ops.attn_implementation = "veomni_sdpa"
+        with ops_config_scope(ops):
+            model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
+            output = model.dummy_forward().pooler_output
+            assert torch.isfinite(output).all()
+            (output.float().mean() * 0.0).backward()
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    assert param.grad is not None, name
+                    assert torch.isfinite(param.grad).all(), name
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("merge", [2, 4])
+def test_qwen2_5_vl_dummy_forward_with_sequence_parallel(merge):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_qwen2_5_vl_dummy_sp_worker, args=(merge,), nprocs=2)
 
 
 def test_qwen2_5_vl_eager_matches_hf_text_only():
