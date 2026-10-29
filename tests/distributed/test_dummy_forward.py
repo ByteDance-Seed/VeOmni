@@ -537,10 +537,11 @@ def _check_dummy_vision_inputs(family, backend):
 
         config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
     config._attn_implementation = "eager"
-    set_ops_config(make_eager_ops_config())
+    set_ops_config(make_eager_ops_config(rotary_pos_emb_vision_implementation="eager"))
     with pytest.MonkeyPatch.context() as monkeypatch:
         _install_vision_state(monkeypatch, module, 1, 0)
         vision = vision_cls(config).train()
+        assert all(block.attn.veomni_rope.impl == "eager" for block in vision.blocks)
         result = vision.dummy_forward().pooler_output
         assert torch.isfinite(result).all()
         result.float().square().sum().backward()
@@ -634,7 +635,7 @@ if __name__ == "__main__":
         )
         from veomni.ops.config import set_ops_config
 
-        set_ops_config(make_eager_ops_config())
+        set_ops_config(make_eager_ops_config(rotary_pos_emb_vision_implementation="eager"))
         config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json")
         Qwen4ExpForConditionalGeneration(config).save_pretrained(arguments[0])
     else:
