@@ -20,6 +20,7 @@ from safetensors.torch import save_file
 from transformers import Qwen3Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments import OpsImplementationConfig
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments, _validate_hf_view_modules
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -30,6 +31,7 @@ from veomni.models.seed_omni.utils.hf_layout import (
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
 )
+from veomni.ops import OP_REGISTRY
 
 
 TEXT_ENCODER = "qwen3_text_encoder"
@@ -228,7 +230,12 @@ def test_offline_convert_matches_the_runtime_load(hf_root, tmp_path):
     out = tmp_path / "split"
     convert_checkpoint(str(root), str(out))
     assert json.loads((out / "config.json").read_text(encoding="utf-8"))["model_type"] == "omni"
-    assert "ops_implementation" not in json.loads((out / LLM / "config.json").read_text(encoding="utf-8"))
+    llm_config = json.loads((out / LLM / "config.json").read_text(encoding="utf-8"))
+    if OpsImplementationConfig().attn_implementation in OP_REGISTRY.list_available("attention", "standard"):
+        assert "ops_implementation" not in llm_config
+    else:
+        # A host that cannot run the selected kernel records the eager fallback.
+        assert llm_config["ops_implementation"] == {"attn_implementation": "eager"}
     assert read_hf_source(out) is None
 
     split = OmniModel.from_pretrained(

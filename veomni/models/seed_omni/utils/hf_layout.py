@@ -543,7 +543,7 @@ def convert_with_hf_layout(
     Returns the kwargs :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
     writes out. Modules load on CPU in the checkpoint's own ``dtype``, built
     under the config's attention selection when this host can run it and eager
-    otherwise; that build-time fallback never reaches the saved config.
+    otherwise; a host that cannot run the kernel records the eager fallback.
     """
     from ....ops import OP_REGISTRY
     from ..modules import OMNI_MODEL_REGISTRY
@@ -576,10 +576,6 @@ def convert_with_hf_layout(
             torch_dtype=dtype,
             attn_implementation="eager" if use_eager else None,
         )
-        if use_eager:
-            # Keep the exported config sparse: a build-time fallback must not
-            # outrank the runtime ops selection.
-            module.config._attn_implementation = None
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
         training_graph=training_graph, generation_graph=generation_graph
