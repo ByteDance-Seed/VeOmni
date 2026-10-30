@@ -48,7 +48,7 @@ _FIELD_TO_OP = {
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
 
-_FUNCTIONAL_IMPLEMENTATION_FIELDS = {"qat_implementation"}
+_FUNCTIONAL_IMPLEMENTATION_FIELDS = {"qat_implementation", "qat_target_modules"}
 
 
 def _registered_implementations(op: str) -> set[str]:
