@@ -493,6 +493,8 @@ def test_legacy_callback_can_replace_valid_batches_before_weighting(monkeypatch)
 @pytest.mark.parametrize("channel_loss", [False, True])
 def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, channel_loss):
     import veomni.data.data_collator as collator_module
+    from veomni.trainer.callbacks.trace_callback import EnvironMeterCallback
+    from veomni.utils.helper import EnvironMeter
 
     class Tokenizer:
         dpo_unpadded_output_contract = True
@@ -505,10 +507,22 @@ def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, cha
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     trainer, metrics = _build_trainer(state, distributed=False, monkeypatch=monkeypatch)
     trainer.base.args.dpo_config.explicit_segment_provenance = True
-    trainer.base.args.data = SimpleNamespace(enable_multisource=False)
+    trainer.base.args.data = SimpleNamespace(enable_multisource=True)
     trainer.policy_model.model_config = SimpleNamespace(vocab_size=256)
     callback = _attach_channel_callback(trainer, metrics, channel_loss)
-    collator = DPOProvenanceCollator(MainCollator(pad_to_length=24))
+    meter = object.__new__(EnvironMeter)
+    meter.config = SimpleNamespace()
+    meter.enable_multisource = True
+    meter.dpo_provenance_enabled = True
+    meter.multisource_tracker = SimpleNamespace(names=("source-0",))
+    meter.batch_seqlens, meter.images_seqlens, meter.batch_ds_idx, meter.batch_source_seqlens = [], [], [], []
+    trainer.environ_meter = meter
+    meter_callback = object.__new__(EnvironMeterCallback)
+    meter_callback.trainer = trainer
+    trainer.base.environ_meter_callback = meter_callback
+    # Match production step-begin dispatch; the meter consumes source keys.
+    trainer.base._callbacks.insert(0, meter_callback)
+    collator = DPOProvenanceCollator(MainCollator(pad_to_length=24), require_ds_idx=True)
 
     def feature(coefficient):
         result = process_dpo_example(
@@ -521,6 +535,7 @@ def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, cha
 
     batches = [collator([feature(1)]), collator([feature(3), feature(3), feature(3)])]
     trainer.train_step(iter([batches]))
+    assert meter.batch_ds_idx == [0, 0, 0, 0]
     expected_loss, expected_grad, _ = _expected([1, 3, 3, 3])
     torch.testing.assert_close(trainer.policy_model.optimizer.gradient, expected_grad, rtol=1e-6, atol=1e-7)
     assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
@@ -601,6 +616,8 @@ def _attach_channel_callback(trainer, metrics, enabled):
 
 def _channel_loss_worker(rank, world_size, parallel_options, native_npu, endpoint):
     from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
+    from veomni.trainer.callbacks.trace_callback import EnvironMeterCallback
+    from veomni.utils.helper import EnvironMeter
 
     device = _init_test_group(rank, world_size, native_npu, endpoint)
     try:
@@ -616,6 +633,16 @@ def _channel_loss_worker(rank, world_size, parallel_options, native_npu, endpoin
         for enabled in (False, True):
             trainer, metrics = _build_trainer(state, distributed=True, device=device)
             _attach_channel_callback(trainer, metrics, enabled)
+            meter = object.__new__(EnvironMeter)
+            meter.config = SimpleNamespace()
+            meter.enable_multisource = True
+            meter.dpo_provenance_enabled = False
+            meter.batch_seqlens, meter.images_seqlens, meter.batch_ds_idx, meter.batch_source_seqlens = [], [], [], []
+            trainer.environ_meter = meter
+            meter_callback = object.__new__(EnvironMeterCallback)
+            meter_callback.trainer = trainer
+            trainer.base.environ_meter_callback = meter_callback
+            trainer.base._callbacks.insert(0, meter_callback)
             _replace_with_adamw(trainer)
             gradients = []
             trainer.policy_model.optimizer.register_step_pre_hook(
@@ -628,6 +655,7 @@ def _channel_loss_worker(rank, world_size, parallel_options, native_npu, endpoin
                 batch["ds_idx"] = torch.full((len(group),), state.dp_rank)
                 batch["source_name"] = [f"source-{state.dp_rank}"] * len(group)
             trainer.train_step(iter([batches]))
+            assert meter.batch_ds_idx == [state.dp_rank] * sum(map(len, groups))
             torch.testing.assert_close(gradients[0].cpu(), expected_grad, rtol=1e-6, atol=1e-7)
             assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
             weight = trainer.policy_model.module.weight
@@ -669,6 +697,9 @@ def test_native_hccl_dpo_channel_loss_preserves_dp_cp_update(monkeypatch):
 
 def _provenance_dp_sp_worker(rank, world_size, native_npu, endpoint):
     import veomni.data.data_collator as collator_module
+    import veomni.trainer.callbacks.base as callback_base_module
+    from veomni.trainer.callbacks.trace_callback import EnvironMeterCallback
+    from veomni.utils.helper import EnvironMeter
 
     class Tokenizer:
         dpo_unpadded_output_contract = True
@@ -687,26 +718,47 @@ def _provenance_dp_sp_worker(rank, world_size, native_npu, endpoint):
             sp_size=2,
             sp_rank=rank % 2,
             sp_group=groups[dp_rank],
+            dp_size=2,
             dp_group=dp_groups[rank % 2],
             fsdp_group=dist.group.WORLD,
         )
         collator_module.get_parallel_state = lambda: state
+        callback_base_module.get_parallel_state = lambda: state
         trainer, metrics = _build_trainer(state, distributed=True, device=device)
         trainer._dpo_provenance_required = True
         trainer.base.args.dpo_config.explicit_segment_provenance = True
         trainer._dpo_objective_parameters = dpo._dpo_objective_parameters(trainer.base.args.dpo_config)
-        trainer.base.args.data = SimpleNamespace(enable_multisource=False)
-        collator = DPOProvenanceCollator(MainCollator())
+        trainer.base.args.data = SimpleNamespace(enable_multisource=True)
+        callback = _attach_channel_callback(trainer, metrics, True)
+        meter = object.__new__(EnvironMeter)
+        meter.config = SimpleNamespace()
+        meter.enable_multisource = True
+        meter.dpo_provenance_enabled = True
+        meter.multisource_tracker = SimpleNamespace(names=("source-0", "source-1"))
+        meter.batch_seqlens, meter.images_seqlens, meter.batch_ds_idx, meter.batch_source_seqlens = [], [], [], []
+        trainer.environ_meter = meter
+        meter_callback = object.__new__(EnvironMeterCallback)
+        meter_callback.trainer = trainer
+        trainer.base.environ_meter_callback = meter_callback
+        trainer.base._callbacks.insert(0, meter_callback)
+        collator = DPOProvenanceCollator(MainCollator(), require_ds_idx=True)
 
         def feature(coefficient):
-            return process_dpo_example(
+            result = process_dpo_example(
                 {"chosen": "!" + chr(ord("A") + coefficient) + "x", "rejected": "!Ax"},
                 tokenizer=Tokenizer(),
                 record_segment_provenance=True,
             )[0]
+            result.update(ds_idx=dp_rank, source_name=f"source-{dp_rank}")
+            return result
 
         microbatches = [[1], [3, 3]] if dp_rank == 0 else [[2], [4, 5, 6]]
         trainer.train_step(iter([[collator([feature(value) for value in group]) for group in microbatches]]))
+        assert meter.batch_ds_idx == [dp_rank] * sum(map(len, microbatches))
+        assert meter.batch_source_seqlens == [6] * sum(map(len, microbatches))
+        assert callback.computer.source_names[dp_rank] == f"source-{dp_rank}"
+        for source in (0, 1):
+            assert f"channel_loss/source-i-{source}__source-{source}" in trainer.step_env_metrics
         expected_loss, expected_grad, _ = _expected([1, 3, 3, 2, 4, 5, 6])
         torch.testing.assert_close(trainer.policy_model.optimizer.gradient.cpu(), expected_grad, rtol=1e-5, atol=1e-6)
         assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)

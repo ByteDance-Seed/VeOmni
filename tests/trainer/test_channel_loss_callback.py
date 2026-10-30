@@ -1710,3 +1710,67 @@ def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch)
         assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
     finally:
         computer.uninstall()
+
+
+@pytest.mark.parametrize(
+    "enabled,strict,repeat", [(True, True, 1), (True, True, 2), (True, False, 2), (False, False, 1)]
+)
+@pytest.mark.parametrize("nested", [False, True])
+def test_multisource_meter_preserves_channel_metadata_until_capture(monkeypatch, enabled, strict, repeat, nested):
+    """Production callback order must capture source metadata before the meter consumes it."""
+    import veomni.trainer.base as base_trainer_module
+    import veomni.trainer.callbacks.trace_callback as trace_callback_module
+    from veomni.trainer.callbacks.trace_callback import EnvironMeterCallback
+    from veomni.utils.helper import EnvironMeter
+
+    _stub_parallel_state(monkeypatch)
+    clock = iter((10.0, 12.0))
+    monkeypatch.setattr(base_trainer_module, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    monkeypatch.setattr(trace_callback_module, "time", SimpleNamespace(time=lambda: 100.0))
+    meter = object.__new__(EnvironMeter)
+    meter.config = SimpleNamespace()
+    meter.enable_multisource = True
+    meter.dpo_provenance_enabled = False
+    meter.batch_seqlens, meter.images_seqlens, meter.batch_ds_idx, meter.batch_source_seqlens = [], [], [], []
+    config = ChannelLossConfig(enable=enabled, strict=strict, interval=1)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=config)), environ_meter=meter)
+    meter_callback = object.__new__(EnvironMeterCallback)
+    meter_callback.trainer = trainer
+    channel = ChannelLossCallback(trainer)
+    base = SimpleNamespace(
+        _callbacks=[meter_callback, channel],
+        environ_meter_callback=meter_callback,
+        channel_loss_callback=channel,
+        state=TrainerState(global_step=1),
+    )
+    batch = {
+        "input_ids": torch.tensor([[3, 4, 5, 6]]),
+        "labels": torch.tensor([[3, 4, 5, 6]]),
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "ds_idx": torch.tensor([3, 4]),
+        "source_name": ["a", "b"],
+        "cur_token_num": torch.tensor([4]),
+    }
+    if nested:
+        batch = [
+            {
+                "input_ids": torch.tensor([[token, token + 1]]),
+                "labels": torch.tensor([[token, token + 1]]),
+                "position_ids": torch.tensor([[0, 1]]),
+                "ds_idx": source,
+                "source_name": name,
+                "cur_token_num": 2,
+            }
+            for token, source, name in ((3, 3, "a"), (5, 4, "b"))
+        ]
+    BaseTrainer.on_step_begin(base, micro_batches=[batch], source_repeat=repeat)
+    assert meter_callback.start_time == 98.0
+    assert meter.batch_ds_idx == [3, 4]
+    for sample in batch if nested else [batch]:
+        assert not ({"ds_idx", "source_name", "cur_token_num"} & sample.keys())
+    if enabled:
+        assert channel.computer._per_mb_source_ids == [[3] * repeat + [4] * repeat]
+        assert channel.computer.source_names == {3: "a", 4: "b"}
+    else:
+        assert channel.computer._per_mb_source_ids == []

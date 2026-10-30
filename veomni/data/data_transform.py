@@ -327,6 +327,8 @@ def _dpo_completion_only_messages(chosen: list, rejected: list) -> tuple[list, l
 
 
 def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list, max_seq_len: int):
+    from .chat_template import GptOssTokenizerTemplate
+
     if type(max_seq_len) is not int or max_seq_len <= 0:
         raise ValueError("DPO max_seq_len must be a positive integer")
     chosen_masked, rejected_masked, prefix = _dpo_completion_only_messages(chosen, rejected)
@@ -337,6 +339,26 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
             key: result[key] if isinstance(result[key], torch.Tensor) else torch.tensor(result[key])
             for key in ("input_ids", "attention_mask", "labels")
         }
+
+    def matches_prefix(short, full, messages):
+        if short.ndim != 1 or short.numel() > full.numel():
+            return False
+        size = short.numel()
+        if torch.equal(full[:size], short):
+            return True
+        # GPT-OSS changes only the last assistant terminal token when a
+        # following message is rendered. Its template already checks every
+        # incremental render for insertions or other rewrites.
+        return (
+            type(chat_template) is GptOssTokenizerTemplate
+            and bool(messages)
+            and messages[-1].get("role") == "assistant"
+            and size > 0
+            and size < full.numel()
+            and short[-1].item() == chat_template.return_token_id
+            and full[size - 1].item() == chat_template.end_token_id
+            and torch.equal(full[: size - 1], short[:-1])
+        )
 
     prefix_ids = encode(prefix, sys.maxsize)["input_ids"] if prefix else torch.empty(0, dtype=torch.int64)
     prefix_len = prefix_ids.numel()
@@ -363,7 +385,7 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
             raise ValueError("DPO conversation producer must emit flat token and label sequences")
         if not torch.equal(raw_ids, full_ids):
             raise ValueError("DPO conversation loss masks must not change tokenization")
-        if prefix_ids.ndim != 1 or prefix_len > full_ids.numel() or not torch.equal(full_ids[:prefix_len], prefix_ids):
+        if not matches_prefix(prefix_ids, full_ids, prefix):
             raise ValueError("DPO conversation template must preserve the shared prompt prefix")
         for index in range(len(prefix), len(masked)):
             if masked[index].get("role") == "assistant":
@@ -375,7 +397,7 @@ def _dpo_conversation_encodings(chat_template: Any, chosen: list, rejected: list
                 or after.ndim != 1
                 or before.numel() > after.numel()
                 or after.numel() > full_ids.numel()
-                or not torch.equal(full_ids[: before.numel()], before)
+                or not matches_prefix(before, full_ids, masked[:index])
                 or not torch.equal(full_ids[: after.numel()], after)
                 or not bool((full["labels"][before.numel() : after.numel()] == IGNORE_INDEX).all())
             ):

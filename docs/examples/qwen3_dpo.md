@@ -228,10 +228,12 @@ used to derive the configured epoch length, not a count of available batches. Do
 overstate the tokens available after filtering and dataset sharding; also verify
 that each rank can actually produce the configured number of optimizer steps
 with the chosen batch, sequence length, warmup, and packing settings. A token
-count alone does not guarantee this. If the source and buffer are exhausted
-before that length, training raises an error rather than replaying data. With
-`drop_last=False`, a final step that would require synthetic padding is also
-rejected. Adjust the budget or batching configuration to fit the available data;
+count alone does not guarantee this. DPO supports main-process dynamic batching;
+worker-mode dynamic batching is rejected during configuration. If the source and
+buffer are exhausted before the configured length, training raises an error
+rather than replaying data. With `drop_last=False`, a final step that would
+require synthetic padding is also rejected. Adjust the budget or batching
+configuration to fit the available data;
 `train.max_steps` can cap steps per epoch for debugging.
 The mapping distributed sampler may repeat individual samples to make shards
 even when dataset size is not divisible by the data-parallel size; the pair mean

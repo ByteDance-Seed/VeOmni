@@ -1696,3 +1696,79 @@ def test_dpo_multisource_counts_features_not_attention_segments(monkeypatch):
     assert tracker.accumulate_counter[0].num_tokens == 5
     assert tracker.accumulate_counter[1].num_tokens == 6
     assert loader.update == (0, 11)
+
+
+class _GptOssDpoTokenizer:
+    """Small native-style renderer with GPT-OSS assistant terminal rewriting."""
+
+    chat_template = "{{ messages }}"
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|return|>": 51, "<|end|>": 50}.get(token, self.unk_token_id)
+
+    def apply_chat_template(self, messages, **kwargs):
+        roles = {"user": 2, "assistant": 3, "tool": 4}
+        ids = [99]
+        for index, message in enumerate(messages):
+            ids.extend([roles[message["role"]], *message["content"]])
+            if message["role"] == "assistant":
+                ids.append(52 if message.get("tool_calls") else 51 if index == len(messages) - 1 else 50)
+        return {"input_ids": ids}
+
+
+def test_gpt_oss_dpo_masks_multiturn_tool_after_terminal_rewrite():
+    from veomni.data.chat_template import GptOssTokenizerTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    template = GptOssTokenizerTemplate(_GptOssDpoTokenizer())
+    prompt = [{"role": "user", "content": [10]}]
+    chosen = prompt + [
+        {"role": "assistant", "content": [20]},
+        {"role": "tool", "content": [30], "loss_mask": 1},
+        {"role": "assistant", "content": [40]},
+    ]
+    rejected = prompt + [
+        {"role": "assistant", "content": [21]},
+        {"role": "tool", "content": [31], "loss_mask": 1},
+        {"role": "assistant", "content": [41]},
+    ]
+    for output, first, tool, last in zip(
+        _dpo_conversation_encodings(template, chosen, rejected, 100), (20, 21), (30, 31), (40, 41)
+    ):
+        assert output["input_ids"].tolist() == [99, 2, 10, 3, first, 50, 4, tool, 3, last, 51]
+        assert output["labels"].tolist() == [-100, -100, -100, 3, first, 50, -100, -100, 3, last, 51]
+
+
+def test_gpt_oss_dpo_shared_assistant_prefix_terminal_rewrite():
+    from veomni.data.chat_template import GptOssTokenizerTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    template = GptOssTokenizerTemplate(_GptOssDpoTokenizer())
+    prompt = [{"role": "user", "content": [10]}, {"role": "assistant", "content": [15]}]
+    chosen = prompt + [{"role": "assistant", "content": [20], "tool_calls": True}]
+    rejected = prompt + [{"role": "assistant", "content": [21], "tool_calls": True}]
+    chosen_output, rejected_output = _dpo_conversation_encodings(template, chosen, rejected, 100)
+    for output, token in ((chosen_output, 20), (rejected_output, 21)):
+        assert output["input_ids"].tolist() == [99, 2, 10, 3, 15, 50, 3, token, 52]
+        assert output["labels"].tolist() == [-100, -100, -100, -100, -100, -100, 3, token, 52]
+
+
+def test_gpt_oss_dpo_rejects_insertion_at_rewritten_boundary():
+    from veomni.data.chat_template import GptOssTokenizerTemplate
+    from veomni.data.data_transform import _dpo_conversation_encodings
+
+    class InsertingTokenizer(_GptOssDpoTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            result = super().apply_chat_template(messages, **kwargs)
+            if len(messages) >= 3 and messages[-1]["role"] == "tool":
+                # Illegal insertion of the old terminal after the replacement.
+                result["input_ids"].insert(6, 51)
+            return result
+
+    template = GptOssTokenizerTemplate(InsertingTokenizer())
+    prompt = [{"role": "user", "content": [10]}]
+    chosen = prompt + [{"role": "assistant", "content": [20]}, {"role": "tool", "content": [30]}]
+    rejected = prompt + [{"role": "assistant", "content": [21]}, {"role": "tool", "content": [31]}]
+    with pytest.raises(ValueError, match="structurally rewrote"):
+        _dpo_conversation_encodings(template, chosen, rejected, 100)

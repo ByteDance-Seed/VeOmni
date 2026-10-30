@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import threading
+import time
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -590,8 +591,32 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
-        for callback in self._callbacks:
+        callbacks = self._callbacks
+        channel = getattr(self, "channel_loss_callback", None)
+        meter = getattr(self, "environ_meter_callback", None)
+        reordered = (
+            channel is not None
+            and meter is not None
+            and channel in callbacks
+            and meter in callbacks
+            and callbacks.index(channel) > callbacks.index(meter)
+        )
+        if reordered:
+            # The meter consumes multisource metadata. Capture it first, while
+            # retaining the original callback order for step-end reporting.
+            callbacks = list(callbacks)
+            callbacks.remove(channel)
+            callbacks.insert(callbacks.index(meter), channel)
+        channel_elapsed = 0.0
+        for callback in callbacks:
+            started = time.perf_counter() if reordered and callback is channel else None
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
+            if started is not None:
+                channel_elapsed = time.perf_counter() - started
+            elif reordered and callback is meter:
+                # Keep the meter's previous timing contract: include channel
+                # capture, but exclude the meter's own metadata accounting.
+                meter.start_time -= channel_elapsed
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         for callback in self._callbacks:
