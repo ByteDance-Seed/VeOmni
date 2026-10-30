@@ -661,7 +661,9 @@ def test_dpo_channel_loss_preserves_distributed_update(world_size, ulysses, cp):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=8))
 @pytest.mark.skipif(not IS_NPU_AVAILABLE or runner_device_count() < 8, reason="requires eight Ascend NPUs and HCCL")
-def test_native_hccl_dpo_channel_loss_preserves_dp_cp_update():
+def test_native_hccl_dpo_channel_loss_preserves_dp_cp_update(monkeypatch):
+    # Exact observer parity requires deterministic collectives in the fresh workers.
+    monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
     spawn_with_rendezvous(_channel_loss_worker, args=(8, dict(dp_size=2, cp_size=4), True), nprocs=8)
 
 
