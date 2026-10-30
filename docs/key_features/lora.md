@@ -26,7 +26,7 @@ uv sync --extra gpu --dev
 `peft` is only needed to run the cross-compatibility interop test
 (`tests/lora/test_veomni_lora_native.py::test_peft_bidirectional_interop`, which
 `pytest.importorskip`s it). It ships inside the hardware extras (`peft==0.18.1` in
-`gpu` / `npu` / `npu_aarch64`), so the standard `uv sync --extra gpu --dev` above already
+`gpu` / `rocm` / `npu` / `npu_aarch64`), so the standard `uv sync --extra gpu --dev` above already
 installs it — no separate extra is required.
 
 ---
