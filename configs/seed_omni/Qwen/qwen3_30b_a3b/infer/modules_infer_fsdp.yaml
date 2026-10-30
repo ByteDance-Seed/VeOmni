@@ -1,0 +1,14 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+qwen3_moe_llm:
+  model_path: qwen3_moe_llm
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+    ep_size: 4
+    ep_outside: false

@@ -1,0 +1,25 @@
+# Qwen3-VL-2B inference — image/video understanding (I2T / VQA).
+#
+# prompt_encode: qwen3vl_vision.generate encodes the user image(s)/video(s),
+# qwen3vl_text_encoder.generate templates the prompt + samples the first token,
+# qwen3vl_llm prefills. text_ar: autoregressive text decoding until EOS.
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: qwen3vl_vision,        to: qwen3vl_llm }
+      - { from: qwen3vl_text_encoder,  to: qwen3vl_llm }
+      - { from: qwen3vl_llm,           to: qwen3vl_text_encoder }
+      - { from: qwen3vl_text_encoder,  to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: qwen3vl_text_encoder,  to: qwen3vl_llm }
+      - { from: qwen3vl_llm,           to: qwen3vl_text_encoder }
+      - { from: qwen3vl_text_encoder,  to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
