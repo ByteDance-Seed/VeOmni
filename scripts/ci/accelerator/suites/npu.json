@@ -10,6 +10,18 @@
     ]
   },
   {
+    "name": "qwen4-hybrid-native-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence"
+    ]
+  },
+  {
     "name": "npu-unit-02",
     "suite": "unit",
     "args": [

@@ -2,8 +2,10 @@
 
 Supported in this correctness stage:
 
-- GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism, plus
-  GPU context parallelism (`cp_size > 1`).
+- GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism and
+  context parallelism (`cp_size > 1`). NPU context parallelism is enabled only
+  for Qwen4-Exp and requires NPU-compatible attention and GatedDeltaNet backends.
+  Combined Ulysses/CP uses the explicit opt-in described below.
 - GatedDeltaNet sequence-to-head all-to-all using the existing Qwen3.5
   causal-conv and gated-delta kernels over the active SP/CP group.
 - VisionModel follows Qwen3.5's SP path: each rank runs patch embedding and
@@ -60,8 +62,8 @@ parallel path are documented in
 
 Known limitations:
 
-- Cache prefill/decode, HSDP replicas of persistent PLE, NPU context
-  parallelism, and hybrid CP × Ulysses remain unsupported.
+- Cache prefill/decode and HSDP replicas of persistent PLE remain unsupported.
+  Combined CP × Ulysses requires the explicit Qwen4-Exp opt-in described below.
 - The default `eager` QSA backend expands compact indices to a dense mask and
   materializes the `[B, H_q, S_local, S_global]` attention-score tensor. Use
   `qsa_attention_implementation=tilelang` (NVIDIA CUDA, bf16) for the 16K
@@ -70,8 +72,10 @@ Known limitations:
   falls back to eager QSA and therefore loses the sparse kernel's memory
   advantage.
 - Ulysses/CP GatedDeltaNet requires non-eager, varlen-capable causal-conv and
-  chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
-  the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
+  chunk gated-delta-rule kernels. Both GatedDeltaNet key and value head counts
+  must be divisible by `ulysses_size` for Ulysses-only execution, by `cp_size`
+  for CP-only execution, and by `ulysses_size * cp_size` for combined execution.
+  QSA attention has no head-divisibility
   constraint because it keeps all query heads local and all-gathers only KV.
   When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
   preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
@@ -113,3 +117,20 @@ On a host with at least two CUDA or NPU devices, the test uses VLM dummy data,
 `ple_size=2`, `ep_size=2`, and `ulysses_size=2` to cover FSDP2 streaming load
 and a fused-MoE forward/backward training smoke with finite loss and gradient
 norm. It does not load the released 95 GiB PLE table.
+
+### Combined Ulysses/CP (opt-in)
+
+Set `model.accelerator.allow_hybrid_cp=true` to opt into a combined topology,
+for example `ulysses_size=8, cp_size=2` on 32 ranks with DP=2. Other model
+families retain the combined-topology rejection. The collator's contiguous
+rank order is the flattened CP×Ulysses group order; QSA keeps local queries
+and gathers KV over that complete group. GDN exchanges sequence for heads
+over the same group. The combined degree must divide both GDN key and value
+head counts. This is not recurrent-state context sharding for GDN.
+
+Vision uses FlashAttention/Ulysses over that complete sequence group, with
+local patch rows and global varlen metadata. Eager/SDPA vision remains
+unsupported under SP. Combined degree 32 is not supported by a real model
+with only 16 GDN key heads; enabling the flag does not bypass head constraints.
+Hardware numerical and cold-resume qualification are recorded per profile,
+not implied by configuration parsing.
