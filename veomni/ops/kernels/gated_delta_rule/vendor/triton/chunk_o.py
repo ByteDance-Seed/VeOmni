@@ -251,8 +251,8 @@ def chunk_bwd_kernel_dv_local(
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(k + offset_kh, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             p_q = tl.make_block_ptr(q + offset_kh, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+            b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
             b_A += tl.dot(b_k, b_q)
 
         if USE_G:
@@ -280,7 +280,7 @@ def chunk_bwd_kernel_dv_local(
         for i_v in range(tl.cdiv(V, BV)):
             p_do = tl.make_block_ptr(do + offset_vh, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             p_dv = tl.make_block_ptr(dv + offset_vh, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            b_do = tl.load(p_do, boundary_check=(0, 1))
+            b_do = tl.load(p_do, boundary_check=(0, 1), padding_option="zero")
             b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
             tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
@@ -364,9 +364,9 @@ def chunk_fwd_kernel_o(
                         p_h = tl.make_block_ptr(
                             h_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
                         )
-                        b_q = tl.load(p_q, boundary_check=(0, 1))
-                        b_k = tl.load(p_k, boundary_check=(0, 1))
-                        b_h = tl.load(p_h, boundary_check=(0, 1))
+                        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+                        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+                        b_h = tl.load(p_h, boundary_check=(0, 1), padding_option="zero")
 
                         # [BT, BK] @ [BK, BV] -> [BT, BV]
                         b_o += tl.dot(b_q, b_h)
@@ -395,7 +395,7 @@ def chunk_fwd_kernel_o(
                     p_o = tl.make_block_ptr(
                         o + o_offset, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
                     )
-                    b_v = tl.load(p_v, boundary_check=(0, 1))
+                    b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
 
                     # to fix mma -> mma layout conversion
                     # already solved by triton v3.2 or higher

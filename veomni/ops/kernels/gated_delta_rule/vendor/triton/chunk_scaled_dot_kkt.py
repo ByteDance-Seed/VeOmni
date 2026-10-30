@@ -77,7 +77,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             b_A = tl.zeros([BT, BT], dtype=tl.float32)
             for i_k in range(tl.cdiv(K, BK)):
                 p_k = tl.make_block_ptr(k + k_batch_off + (bos * H + i_h) * K, (T_local, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                 dot_product = tl.dot(b_k, tl.trans(b_k))
 
                 o_t = i_t * BT + tl.arange(0, BT)

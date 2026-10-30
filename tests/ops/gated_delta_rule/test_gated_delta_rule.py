@@ -29,6 +29,7 @@ from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -319,8 +320,11 @@ def test_causal_conv1d_fla_matches_eager(device):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
 @pytest.mark.parametrize("dim", (256, 640))
-@pytest.mark.parametrize("packed", (False, True))
-def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
+@pytest.mark.parametrize("lengths", (None, (61, 67), (1, 127)))
+@pytest.mark.parametrize("checkpointed", (False, True))
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, checkpointed):
+    from torch.utils.checkpoint import checkpoint
+
     _require_npu_gdr_dependencies()
     from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
 
@@ -331,7 +335,7 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
     # 640 channels reproduces Qwen4-Exp's real U8CP2 GDN head shard.
-    batch, seq, kernel = (1, 128, 4) if packed else (2, 64, 4)
+    batch, seq, kernel = (1, 128, 4) if lengths else (2, 64, 4)
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
@@ -342,12 +346,16 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     # accurate fused FP32 reduction (notably for the packed 640-channel shard).
     x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
-    if packed:
-        out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split((61, 67), dim=1)], dim=1)
+    cu = torch.tensor([0, lengths[0], 128], dtype=torch.int32) if lengths else None
+    if lengths:
+        out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split(lengths, dim=1)], dim=1)
     else:
         out_e = eager(x_e, w_e, b_e, activation="silu")
-    out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
+
+    def run(*inputs):
+        return other(*inputs, cu_seqlens=cu, activation="silu")
+
+    out_o = checkpoint(run, x_o, w_o, b_o, use_reentrant=False) if checkpointed else run(x_o, w_o, b_o)
     torch.testing.assert_close(out_o.float().cpu(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
     grad_output = torch.randn_like(out_o)
@@ -1077,3 +1085,34 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert by_name["g"] is None
     assert by_name["beta"] is None
     assert "requires g and beta" in source
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_convolution_boundary_cache_inference_to_training():
+    """Inference warmup cannot cache tensors that autograd refuses to save."""
+    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import _cached_boundary_tensor
+
+    _cached_boundary_tensor.cache_clear()
+    with torch.inference_mode():
+        warm = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    actual = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    assert actual is warm
+    assert not actual.is_inference()
+
+    class SaveBoundaries(torch.autograd.Function):
+        """Exercise the integer saved-tensor contract used by the registry."""
+
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(actual)
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            assert torch.equal(ctx.saved_tensors[0], actual)
+            return grad
+
+    value = torch.ones(1, requires_grad=True)
+    SaveBoundaries.apply(value).sum().backward()
+    assert value.grad.item() == 1
+    _cached_boundary_tensor.cache_clear()
