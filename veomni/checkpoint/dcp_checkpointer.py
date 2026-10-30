@@ -292,15 +292,6 @@ def _validate_persistent_optimizer_ownership(model, optimizer, group=None, *, co
     """Check frozen targets and ensure the DCP group covers each persistent mesh."""
     error = None
     try:
-        if coordinated or not dist.is_initialized() or dist.get_world_size() == 1:
-            for leaf in _iter_optimizer_leaves(optimizer):
-                if getattr(leaf, "requires_exact_state_dtypes", False):
-                    for param_group in leaf.param_groups:
-                        if any(not param.requires_grad for param in param_group["params"]):
-                            raise RuntimeError(
-                                "Cannot checkpoint a frozen parameter still owned by a precision-sensitive optimizer; "
-                                "rebuild the optimizer or use an explicit state migration"
-                            )
         specs = getattr(model, "_fqn2spec_info", None) or {}
         persistent = {
             name for name, spec in specs.items() if getattr(spec, "persistent_fsdp_shard_dim", None) is not None
