@@ -27,6 +27,7 @@ get_started/installation/install_ascend_arm.md
 
 usage/arguments.md
 usage/basic_modules.md
+usage/qwen38_muon.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
@@ -117,6 +118,7 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
+design/optimizer_cpu_offload.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
