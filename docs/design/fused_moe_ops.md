@@ -58,14 +58,40 @@ grad_fc2_output = moe_scatter(grad_output, scatter_index)
 num_scattered_tokens = grad_fc2_output.shape[0]
 ```
 
-Use `num_scattered_tokens` for the downstream `group_gemm_same_nk(...,
-max_M=...)` calls in non-EP backward. The matching `group_gemm_same_mn(...,
-max_K=...)` value is kept consistent with the scattered input row count, but the
-stale-row correctness issue is about `group_gemm_same_nk` under-covering its
-output rows.
+The split-FC1 backward uses `num_scattered_tokens` for the downstream
+`group_gemm_same_nk(..., max_M=...)` calls. The merged backward reuses its
+forward's shape-derived bound: total routed rows by default, or original
+tokens only when the caller explicitly guarantees distinct top-k routes.
+The matching `group_gemm_same_mn(..., max_K=...)` value stays the total
+scattered row count. Weight-gradient reduction dimensions are unchanged.
 
-Do not use the original token count as the backward grouped-GEMM bound. It is
-only safe when every expert group has at most `tokens` scattered rows.
+Only use the original token count when every expert group is guaranteed to
+have at most `tokens` scattered rows.
+
+## Device-side row-tile schedule
+
+Eligible eager merged-FC1 calls build a device prefix of each expert's
+`ceil(expert_rows / 128)` output-row tiles. The same prefix is saved for
+backward and reused by both forward and both input-gradient same-NK GEMMs.
+Expert counts remain on-device; there is no scalar read back to the host.
+
+The host can bound the row-tile grid using tensor shapes:
+
+```text
+sum(ceil(expert_rows / 128)) <= ceil(total_routed_rows / 128) + experts - 1
+```
+
+The kernel checks the actual total in the device prefix, then binary-searches
+the expert owning each valid tile. Row and column tile axes are flattened
+into `grid.x`, preserving the original launch's supported column range.
+The schedule may launch a few unused tail tiles but avoids repeating the
+whole per-expert upper bound for every expert.
+
+The prefix applies to CUDA tensors, 1–256 experts, nonempty routed input
+and the existing 128-row GEMM tiles. Other cases use the shape-derived
+schedule. Compilation, stream capture and unavailable capture-state queries
+also retain that schedule. Neither path reads a device scalar on the host.
+Split-FC1, expert-parallel routing and GEMM tile parameters are unchanged.
 
 ## Why ordinary top-k routing may hide the bug
 

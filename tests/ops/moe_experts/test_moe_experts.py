@@ -24,6 +24,7 @@ from transformers import GptOssConfig, Qwen3MoeConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.moe_experts.reference import standard_ep_reference, standard_fused_reference
 from tests.ops.tol import (
     EAGER_ATOL,
@@ -54,8 +55,14 @@ from tests.ops.tol import (
 from tests.ops.utils import assert_close_with_error, assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
+from veomni.ops.kernels.moe_experts.standard import triton as triton_moe_module
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, is_sm90_or_above
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    is_sm90_or_above,
+)
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
@@ -482,6 +489,7 @@ def _run_fused_three_way(
     require_active_clamp: bool = False,
     grad_routing_atol: float | None = None,
     grad_routing_rtol: float | None = None,
+    assume_distinct_experts: bool = False,
 ):
     """Compare one fused implementation's split and merged layouts with eager math.
 
@@ -504,6 +512,9 @@ def _run_fused_three_way(
     empty = _empty(device, dtype)
     fused = resolve_op("moe_experts", "standard", impl).wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
+    fused_kwargs = dict(kwargs)
+    if impl == "fused_triton":
+        fused_kwargs["assume_distinct_experts"] = assume_distinct_experts
 
     if require_active_clamp:
         assert swiglu_limit is not None
@@ -515,10 +526,11 @@ def _run_fused_three_way(
     hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     hidden_m, routing_m, fc1_12_m, fc2_m = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
-    out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **kwargs)
-    out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
+    out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **fused_kwargs)
+    out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **fused_kwargs)
     if impl == "fused_triton":
-        assert len(out_m.grad_fn.saved_tensors) == 11
+        # Eleven upstream tensors plus the optional device tile prefix.
+        assert len(out_m.grad_fn.saved_tensors) == 12
     reference_fn = standard_ep_reference if impl == "fused_triton" else standard_fused_reference
     out_e = reference_fn(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
     torch.testing.assert_close(out_s, out_m, rtol=0, atol=0)
@@ -987,3 +999,318 @@ def test_build_moe_indices_cuda_does_not_synchronize(monkeypatch):
     assert cu_seqlens_m.cpu().tolist() == [0, 3, 6, 8]
     assert a_idx.cpu().tolist() == [0, 1, 3, 1, 2, 3, 0, 2]
     assert scatter_index.shape == expert_index.shape
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("compiling", True),
+        ("capturing", True),
+        ("eager", False),
+        ("unknown", True),
+        ("noncallable", True),
+        ("ambiguous", True),
+        ("query_error", True),
+    ],
+)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monkeypatch: pytest.MonkeyPatch):
+    """Select the original schedule during compilation or unknown capture state."""
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: mode == "compiling")
+
+    if mode == "compiling":
+
+        def unexpected_device_query():
+            raise AssertionError("Compilation must not query a live device")
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", unexpected_device_query)
+    elif mode == "unknown":
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", object)
+    elif mode == "noncallable":
+
+        class DeviceAPI:
+            is_current_stream_capturing = False
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+    else:
+
+        class DeviceAPI:
+            def is_current_stream_capturing(self):
+                if mode == "query_error":
+                    raise RuntimeError("Capture state unavailable")
+                if mode == "ambiguous":
+                    return None
+                return mode == "capturing"
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+
+    assert triton_moe_module._must_use_shape_derived_bound() is expected
+
+
+@pytest.mark.parametrize(
+    "routing_kind,assume_distinct_experts",
+    [("distinct", False), ("distinct", True), ("duplicate", False), ("concentrated", False)],
+)
+def test_triton_merged_same_nk_compact_schedule(
+    routing_kind: str, assume_distinct_experts: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """Build one prefix and reuse it for all four merged forward/backward calls."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    device = torch.device("cuda")
+    num_tokens, num_experts, top_k = 128, 8, 2
+    torch.manual_seed(42)
+    if routing_kind == "duplicate":
+        selected = torch.zeros(num_tokens, top_k, device=device, dtype=torch.long)
+    elif routing_kind == "concentrated":
+        selected = torch.arange(top_k, device=device).expand(num_tokens, top_k).contiguous()
+    else:
+        selected = torch.randn(num_tokens, num_experts, device=device).topk(top_k, dim=-1).indices
+    routing = torch.full((num_tokens, top_k), 1 / top_k, device=device, dtype=torch.bfloat16)
+    shape_bound = num_tokens if assume_distinct_experts else num_tokens * top_k
+    nk_bounds, mn_bounds, schedules, prefixes = [], [], [], []
+    original_nk, original_mn = gemm_module.group_gemm_same_nk, gemm_module.group_gemm_same_mn
+    original_prefix = gemm_module.merged_same_nk_tile_prefix
+
+    def record_prefix(*args, **kwargs):
+        """Retain the prefix built by the actual native helper."""
+        prefix = original_prefix(*args, **kwargs)
+        prefixes.append(prefix)
+        return prefix
+
+    def record_nk(*args, **kwargs):
+        """Record the shape fallback and optional schedule without changing them."""
+        nk_bounds.append(kwargs["max_M"])
+        schedules.append(kwargs.get("tile_cumsum"))
+        return original_nk(*args, **kwargs)
+
+    def record_mn(*args, **kwargs):
+        """Record the total-row reduction bound for weight gradients."""
+        mn_bounds.append(kwargs["max_K"])
+        return original_mn(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_nk)
+    monkeypatch.setattr(gemm_module, "group_gemm_same_mn", record_mn)
+    monkeypatch.setattr(gemm_module, "merged_same_nk_tile_prefix", record_prefix)
+    _run_fused_three_way(
+        "fused_triton",
+        shape=(num_tokens, num_experts, 128, 64, top_k),
+        selected=selected,
+        routing=routing,
+        device=device,
+        seed=7,
+        assume_distinct_experts=assume_distinct_experts,
+    )
+    # The helper runs split forward, merged forward, split backward, merged backward.
+    assert nk_bounds == [shape_bound] * 5 + [num_tokens * top_k] * 3 + [shape_bound] * 2
+    assert mn_bounds == [num_tokens * top_k] * 5
+    assert len(prefixes) == 1 and prefixes[0] is not None
+    assert all(schedule is None for schedule in schedules[:3] + schedules[5:8])
+    assert all(schedule.data_ptr() == prefixes[0].data_ptr() for schedule in schedules[3:5] + schedules[8:])
+    counts = torch.bincount(selected.flatten(), minlength=num_experts)
+    expected = torch.cumsum(torch.div(counts + 127, 128, rounding_mode="floor"), dim=0)
+    torch.testing.assert_close(prefixes[0], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("reason", ["cpu", "empty", "too_many_experts", "no_rows", "other_tile"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_same_nk_prefix_metadata_fallback(reason: str, monkeypatch: pytest.MonkeyPatch):
+    """Unsupported metadata must return before launching or allocating a prefix."""
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    class Metadata:
+        is_cuda = reason != "cpu"
+
+        def numel(self):
+            return 0 if reason == "empty" else 257 if reason == "too_many_experts" else 2
+
+    if reason == "other_tile":
+        monkeypatch.setitem(gemm_module._GROUP_GEMM_BLOCK, "BLOCK_M", 64)
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("An unsupported prefix must not allocate a device tensor")
+
+    monkeypatch.setattr(torch, "empty_like", unexpected_allocation)
+    assert gemm_module.merged_same_nk_tile_prefix(Metadata(), 0 if reason == "no_rows" else 1) is None
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("counts", [(2147483646,), (2147483647,), (0, 2147483646, 1)])
+def test_same_nk_prefix_near_int32_limit(counts: tuple[int, ...], dtype):
+    """Large logical row counts need only a tiny prefix allocation for this check."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    cumsum = torch.tensor(counts, device="cuda", dtype=dtype).cumsum(0, dtype=dtype)
+    prefix = gemm_module.merged_same_nk_tile_prefix(cumsum, sum(counts))
+    expected, total_tiles = [], 0
+    for count in counts:
+        total_tiles += (count + 127) // 128
+        expected.append(total_tiles)
+    assert prefix is not None
+    assert prefix.cpu().tolist() == expected
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "counts,block_m",
+    [
+        pytest.param((0, 1, 127, 128, 129, 257), 128, id="tile-boundaries"),
+        pytest.param((256, 0, 0, 0), 128, id="concentrated"),
+        pytest.param((0, 0, 0), 128, id="empty"),
+        pytest.param((0,) * 255 + (129,), 128, id="max-experts"),
+        pytest.param((0,) * 256 + (1,), 128, id="expert-fallback"),
+        pytest.param((1, 129, 0), 64, id="tile-fallback"),
+    ],
+)
+def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...], block_m: int, dtype, monkeypatch):
+    """Cover tile tails, zero-load experts and shape fallbacks without a host read."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    monkeypatch.setitem(gemm_module._GROUP_GEMM_BLOCK, "BLOCK_M", block_m)
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    total, experts, hidden, output_dim = sum(counts), len(counts), 31, 145
+    cumsum = torch.tensor(counts, device=device, dtype=dtype).cumsum(0, dtype=dtype)
+    a = torch.randn(total, hidden, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(experts, output_dim, hidden, device=device, dtype=torch.bfloat16)
+
+    def run():
+        """Build a device prefix and consume it in the native grouped GEMM."""
+        prefix = gemm_module.merged_same_nk_tile_prefix(cumsum, total)
+        output = gemm_module.group_gemm_same_nk(
+            a, weights, cumsum, max_M=max(counts), transpose_b=True, tile_cumsum=prefix
+        )
+        return prefix, output
+
+    run()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        prefix, output = run()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    classic = gemm_module.group_gemm_same_nk(a, weights, cumsum, max_M=max(counts), transpose_b=True)
+    torch.testing.assert_close(output, classic, rtol=0, atol=0)
+    expected_outputs, expected_prefix = [], []
+    start, tile_count = 0, 0
+    for expert, count in enumerate(counts):
+        # Accumulate independently in high precision before the output cast.
+        reference = a[start : start + count].double() @ weights[expert].double().T
+        expected_outputs.append(reference.to(a.dtype))
+        start += count
+        tile_count += (count + 127) // 128
+        expected_prefix.append(tile_count)
+    torch.testing.assert_close(output, torch.cat(expected_outputs), rtol=MOE_FUSED_RTOL, atol=MOE_FUSED_ATOL)
+    if total and experts <= 256 and block_m == 128:
+        assert prefix is not None
+        assert prefix.cpu().tolist() == expected_prefix
+    else:
+        assert prefix is None
+
+
+@pytest.mark.parametrize("reason", ["capture_unavailable", "unsupported_experts"])
+def test_triton_merged_shape_fallback_does_not_synchronize(reason: str, monkeypatch: pytest.MonkeyPatch):
+    """Run the actual fallback forward/backward with scalar synchronization forbidden."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    torch.manual_seed(42)
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    tokens, experts, hidden, intermediate, top_k = 31, 257 if reason == "unsupported_experts" else 8, 128, 64, 2
+    routes = torch.randn(tokens, experts, device=device).topk(top_k, dim=-1).indices
+    gate = torch.full((tokens, top_k), 1 / top_k, device=device, dtype=dtype, requires_grad=True)
+    x = torch.randn(tokens, hidden, device=device, dtype=dtype, requires_grad=True)
+    w1 = torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=dtype, requires_grad=True)
+    w2 = torch.randn(experts, hidden, intermediate, device=device, dtype=dtype, requires_grad=True)
+    empty = _empty(device, dtype)
+    fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+    bounds, schedules = [], []
+    original_nk = gemm_module.group_gemm_same_nk
+
+    def record_bound(*args, **kwargs):
+        """Observe the real fallback without changing its computation."""
+        bounds.append(kwargs["max_M"])
+        schedules.append(kwargs.get("tile_cumsum"))
+        return original_nk(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_bound)
+    if reason == "capture_unavailable":
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", object)
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        output = fused(x, gate, routes, empty, empty, w2, w1, num_experts=experts)
+        output.sum().backward()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert bounds == [tokens * top_k] * 4
+    assert schedules == [None] * 4
+    assert torch.isfinite(output).all()
+    for tensor in (x, gate, w1, w2):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
+def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.MonkeyPatch):
+    """Captured forward and backward reuse the shape bound without a scalar read."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    tokens, experts, hidden, intermediate, top_k = 128, 8, 128, 64, 2
+    routes = torch.randn(tokens, experts, device=device).topk(top_k, dim=-1).indices
+    assert torch.bincount(routes.flatten(), minlength=experts).max().item() < tokens
+    gate = torch.full((tokens, top_k), 1 / top_k, device=device, dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16, requires_grad=True)
+    empty = _empty(device, torch.bfloat16)
+    fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+    bounds, schedules = [], []
+    original = gemm_module.group_gemm_same_nk
+
+    def record_bound(*args, **kwargs):
+        """Record capture bounds while keeping the native operation unchanged."""
+        bounds.append(kwargs["max_M"])
+        schedules.append(kwargs.get("tile_cumsum"))
+        return original(*args, **kwargs)
+
+    def forward():
+        """Exercise the registered merged implementation under stream capture."""
+        return fused(x, gate, routes, empty, empty, w2, w1, num_experts=experts, assume_distinct_experts=True)
+
+    monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_bound)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    # Warm the shape-only specialization that the real capture will select.
+    with monkeypatch.context() as warmup_patch:
+        warmup_patch.setattr(triton_moe_module, "_must_use_shape_derived_bound", lambda: True)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                forward().sum().backward()
+    warmup_stream.synchronize()
+    x.grad = w1.grad = w2.grad = None
+    bounds.clear()
+    schedules.clear()
+
+    def unexpected_prefix(*args, **kwargs):
+        raise AssertionError("Capture must retain the original schedule")
+
+    monkeypatch.setattr(gemm_module, "merged_same_nk_tile_prefix", unexpected_prefix)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+        output.sum().backward()
+    assert bounds == [tokens] * 4
+    assert schedules == [None] * 4
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    for tensor in (x, w1, w2):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
