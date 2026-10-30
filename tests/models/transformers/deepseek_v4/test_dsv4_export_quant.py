@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSV4 export quantization must reject non-SM90 before importing TileLang."""
+"""DSV4 export quantization must reject unsupported GPUs before importing a quantizer backend."""
 
 from __future__ import annotations
 
 import importlib
 import sys
+from types import ModuleType
 
 import pytest
 import torch
@@ -46,6 +47,7 @@ def test_export_wrappers_reject_pre_sm90_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
+    monkeypatch.setattr(quant.torch.version, "hip", None, raising=False)
     monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 89)
 
@@ -56,16 +58,37 @@ def test_export_wrappers_reject_pre_sm90_before_import(monkeypatch):
     assert _ACT_QUANT not in sys.modules
 
 
-def test_export_wrappers_reject_rocm_before_import(monkeypatch):
+def test_export_wrappers_reject_unsupported_rocm_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
     monkeypatch.setattr(quant.torch.version, "hip", "6.0", raising=False)
     monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 90)
+    monkeypatch.setattr(quant, "get_rocm_gcn_arch", lambda: "gfx90a")
 
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         quant.fp4_act_quant(torch.empty(0))
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         quant.fp8_weight_quant(torch.empty(0))
     assert _ACT_QUANT not in sys.modules
+
+
+def test_export_fp8_runs_triton_on_gfx942_and_fp4_stays_nvidia_only(monkeypatch):
+    import veomni.models.transformers.deepseek_v4.export_quant as quant
+
+    calls = []
+    backend = ModuleType("veomni.ops.qat.triton_quant")
+    backend.fp8_weight_quant = lambda x, *args: calls.append(args) or (x, x)
+    monkeypatch.setitem(sys.modules, "veomni.ops.qat.triton_quant", backend)
+    monkeypatch.setattr(quant.torch.version, "hip", "7.14", raising=False)
+    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(quant, "get_rocm_gcn_arch", lambda: "gfx942")
+
+    quant.fp8_weight_quant(torch.empty(0), 128, "ue8m0", torch.float8_e8m0fnu)
+    assert calls == [(128, "ue8m0", torch.float8_e8m0fnu)]
+    quant.require_export_quantizers(fp4=False)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        quant.require_export_quantizers(fp4=True)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        quant.fp4_act_quant(torch.empty(0))
