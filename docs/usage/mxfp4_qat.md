@@ -138,7 +138,7 @@ torchao version when saving and loading artifacts.
 
 ## Validation
 
-CPU operator, model and offline conversion cases live in
+The CPU training-to-export roundtrip lives in
 [`test_mxfp4_qat.py`](../../tests/models/test_mxfp4_qat.py#L15). The physical
 two-GPU acceptance case is
 [`test_mxfp4_qat_fsdp.py`](../../tests/models/test_mxfp4_qat_fsdp.py#L182):
@@ -154,10 +154,17 @@ continuation and ordinary HF export/reload. It declares a two-card CI launch
 plan and skips on CPU/NPU or insufficient hardware. Both files are covered by
 the existing `tests/models/` directory selection.
 
-The multi-GPU test is prepared but has not yet been executed on physical
-GPUs for this change. Collection or a CPU skip is not a passing distributed
-acceptance result. Representative convergence, throughput, peak memory and
-deployment-format compatibility remain outside the current evidence.
+On 2026-10-30, both tests passed with no skips on Modal with two physical
+NVIDIA A100-SXM4-40GB GPUs at revision `76753d8d`. The environment used Python
+3.12.1, PyTorch 2.11.0+cu130, torchao 0.18.0 and transformers 5.16.1. The run's
+local artifacts are `outputs/mxfp4-modal/20261030T101017Z/run.log` and
+`junit.xml`; the report records **2 passed, 0 failed, 0 skipped**.
+
+This acceptance uses a tiny random Qwen3 model with eager ops. DCP continuation
+rebuilds the model and AdamW within the same rank processes; it does not test a
+fresh-process restart or the full trainer/data/scheduler/RNG resume path.
+Representative convergence, throughput, peak memory and deployment-format
+compatibility remain outside the current evidence.
 
 ### Run on Modal
 
@@ -175,8 +182,8 @@ uvx --python 3.12 --from modal==1.6.3 modal run -m scripts.run_mxfp4_modal
 
 This command builds the cloud image and starts a billable GPU job. Importing
 the module or requesting `--help` only inspects the local definition. The
-dependency image has been built successfully on Modal; GPU execution has
-not yet been validated.
+dependency image and two-GPU execution have both been validated as described
+above.
 
 The runner uploads Git-tracked files from `veomni/`, `tests/` and `scripts/`,
 plus the dependency metadata; stage newly added source files before running.
