@@ -120,6 +120,121 @@ def test_frozen_persistent_parameter_with_state_is_rejected():
         checkpoint._persistent_optimizer_rows(model, optimizer)
 
 
+@pytest.mark.parametrize("load", [False, True])
+@pytest.mark.parametrize("initialized", [False, True])
+def test_frozen_exact_optimizer_parameter_is_rejected_before_save_or_load(load, initialized):
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    optimizer = FullFP32AdamW(model.parameters())
+    if initialized:
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+    before = model.weight.detach().clone()
+    model.weight.requires_grad_(False)
+    wrapper = checkpoint.OptimizerState(model, optimizer, SimpleNamespace(dp_mode="fsdp2"), load=load)
+    with pytest.raises(RuntimeError, match="frozen parameter still owned"):
+        wrapper.state_dict()
+    torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
+
+
+def test_frozen_ordinary_adam_without_persistent_spec_keeps_existing_policy():
+    model = torch.nn.Linear(2, 2, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.weight.requires_grad_(False)
+    checkpoint._validate_persistent_optimizer_ownership(model, optimizer)
+
+
+def test_frozen_exact_optimizer_rejected_for_initialized_single_rank(monkeypatch):
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    optimizer = FullFP32AdamW(model.parameters())
+    model.weight.requires_grad_(False)
+    monkeypatch.setattr(checkpoint.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(checkpoint.dist, "get_world_size", lambda group=None: 1)
+    with pytest.raises(RuntimeError, match="frozen parameter still owned"):
+        checkpoint._validate_persistent_optimizer_ownership(model, optimizer)
+
+
+def _exact_optimizer_checkpoint_worker(rank, rendezvous, output_dir):
+    import torch.distributed as dist
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        first = dist.new_group([0])
+        second = dist.new_group([1])
+        subgroup = first if rank == 0 else second
+        model = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1)
+        optimizer = FullFP32AdamW(model.parameters())
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+        for group, suffix in ((dist.group.WORLD, "world"), (subgroup, f"rank{rank}")):
+            saved = checkpoint.OptimizerState(
+                model,
+                optimizer,
+                SimpleNamespace(dp_mode="ddp"),
+                coordinated_group_validation=True,
+                coordinated_group=group,
+            )
+            path = f"{output_dir}/{suffix}"
+            dcp.save({"optimizer": saved}, checkpoint_id=path, process_group=group)
+            target = torch.nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                target.weight.copy_(model.weight)
+            target_optimizer = FullFP32AdamW(target.parameters())
+            restored = checkpoint.OptimizerState(
+                target,
+                target_optimizer,
+                SimpleNamespace(dp_mode="ddp"),
+                load=True,
+                coordinated_group_validation=True,
+                coordinated_group=group,
+            )
+            dcp.load({"optimizer": restored}, checkpoint_id=path, process_group=group)
+            for name, expected in optimizer.state[model.weight].items():
+                torch.testing.assert_close(target_optimizer.state[target.weight][name], expected, rtol=0, atol=0)
+        if rank == 1:
+            model.weight.requires_grad_(False)
+        original = checkpoint.raise_if_any_rank_failed
+
+        def unexpected_collective(*args, **kwargs):
+            raise AssertionError("uncoordinated wrapper must not introduce a collective")
+
+        checkpoint.raise_if_any_rank_failed = unexpected_collective
+        try:
+            checkpoint._validate_persistent_optimizer_ownership(model, optimizer, coordinated=False)
+        finally:
+            checkpoint.raise_if_any_rank_failed = original
+        wrapper = checkpoint.OptimizerState(
+            model,
+            optimizer,
+            SimpleNamespace(dp_mode="ddp"),
+            coordinated_group_validation=True,
+            coordinated_group=dist.group.WORLD,
+        )
+        with pytest.raises(RuntimeError, match="frozen parameter still owned|another rank"):
+            wrapper.state_dict()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_exact_optimizer_checkpoint_world_and_subgroups_and_frozen_rejection(tmp_path):
+    mp.start_processes(
+        _exact_optimizer_checkpoint_worker,
+        args=(str(tmp_path / "rdzv-exact"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
 def test_frozen_persistent_parameter_without_state_is_rejected():
     model = torch.nn.Linear(2, 2)
     model._fqn2spec_info = {"weight": SimpleNamespace(persistent_fsdp_shard_dim=1)}
