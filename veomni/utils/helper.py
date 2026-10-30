@@ -866,8 +866,11 @@ def create_profiler(
         experimental_config=experimental_config,
     )
     # Older XPU builds of PyTorch have no allocator history API.
-    has_memory_history = hasattr(get_torch_device().memory, "_record_memory_history")
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE) and profile_memory and has_memory_history:
+    if (
+        (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE)
+        and profile_memory
+        and hasattr(get_torch_device().memory, "_record_memory_history")
+    ):
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
