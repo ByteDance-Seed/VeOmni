@@ -1,15 +1,10 @@
 # Dense Qwen3 MXFP4 QAT
 
-`torchao_mxfp4` applies quantization-aware training to selected Dense Qwen3
-projections. It simulates MXFP4 activation and weight rounding during forward
-and uses a straight-through gradient estimator. Parameters remain ordinary
-floating-point tensors, so the existing optimizer and checkpoint paths apply.
-
-This is the first implementation slice of the
-[low-precision RFC](https://github.com/ByteDance-Seed/VeOmni/issues/1360).
-The recipe uses torchao's **emulated** MXFP4 implementation, not native FP4
-training GEMMs. It makes no training speedup, convergence or downstream
-rollout-compatibility claim.
+`torchao_mxfp4` simulates MXFP4 activation and weight rounding in selected Dense
+Qwen3 projections, using straight-through gradients and ordinary floating-point
+parameters. This initial [low-precision RFC](https://github.com/ByteDance-Seed/VeOmni/issues/1360)
+recipe uses torchao's **emulated** MXFP4, without native FP4 training GEMMs or a
+Blackwell requirement. Training requires NVIDIA CUDA devices with BF16 support.
 
 ## Recipe and scope
 
@@ -22,25 +17,17 @@ rollout-compatibility claim.
 | Training | NVIDIA CUDA, FSDP2, BF16 unsharded parameters, FP32 masters and gradient reduction |
 | CPU | Eager numerical checks and offline artifact conversion/reload |
 | Parameter AllGather | Existing BF16 transport; no quantized AllGather |
-| Checkpoints | Existing DCP for exact optimizer continuation; ordinary HF floating-point export |
+| Checkpoints | DCP for exact optimizer continuation; ordinary HF floating-point export |
 
-The emulated recipe does not require Blackwell's native FP4 instructions.
-Use CUDA devices with BF16 support for training. CPU emulation does not verify
-CUDA kernels, NCCL collectives or physical multi-GPU FSDP2.
+Unsupported: other model families, MoE, shared selected weights, biased
+projections, and projection input widths not divisible by 32. `lm_head` is
+excluded because training loss can read its weight without calling its forward.
 
-The first implementation rejects other model families, MoE, shared selected
-weights, projections with biases, and inputs whose projection width is not
-divisible by 32. `lm_head` is excluded because the training loss can read its
-weight directly instead of calling the projection's forward.
-
-Distributed use rejects DDP, HSDP, SP/CP, TP/PP, ExtraParallel, LoRA, FSDP
-parameter CPU offload and `torch.compile`. The example keeps activation
-offload disabled; combining activation offload with this recipe has not been
-validated. Native DeepSeek `fp8_blockwise` QAT remains a separate recipe.
+Distributed use rejects DDP, HSDP, SP/CP, TP/PP, ExtraParallel, LoRA, FSDP parameter
+CPU offload and `torch.compile`. Activation offload is unvalidated and disabled
+in the example. Native DeepSeek `fp8_blockwise` QAT remains a separate recipe.
 
 ## Configure training
-
-Install the normal GPU environment:
 
 ```bash
 uv sync --locked --extra gpu --dev
@@ -67,48 +54,37 @@ model:
         cast_forward_inputs: true
 ```
 
-Patterns match complete module names. Every pattern must select at least one
-supported projection. To include attention, add
-`model.layers.*.self_attn.q_proj`, `k_proj`, `v_proj` and `o_proj` as separate
-patterns with the same prefix. The default recipe remains `none`.
+Patterns match complete module names; each must select a supported projection.
+For attention, add `model.layers.*.self_attn.q_proj`, `k_proj`, `v_proj` and
+`o_proj` as separate patterns with the same prefix. The default recipe is `none`.
 
 Start from [the Qwen3 example](../../configs/text/qwen3_mxfp4_qat.yaml), set
-`model.model_path` and `data.train_path` to the desired checkpoint and prepared
-conversation dataset, then run on a host with at least two CUDA devices:
+`model.model_path` and `data.train_path` to your checkpoint and prepared conversation
+dataset, then run on at least two CUDA devices:
 
 ```bash
 bash train.sh tasks/train_text.py configs/text/qwen3_mxfp4_qat.yaml
 ```
 
-The example's learning rate and training duration are starting settings, not a
-validated convergence recipe.
+The example's learning rate and duration are starting settings, not a validated convergence recipe.
 
 ## Construction and checkpoints
 
-1. [The foundation-model builder](../../veomni/models/auto.py#L164) loads the model
-   and applies [the QAT preparation helper](../../veomni/models/qat.py#L119) before
-   returning it, including when parameters are still on the meta device.
-2. Selected projections become torchao fake-quant modules without changing
-   their weight names. SwiGLU calls their forwards instead of bypassing them
-   through the plain-Linear fused path.
-3. [The parallel builder](../../veomni/distributed/torch_parallelize.py#L1011)
-   validates the supported topology and precision, then applies normal FSDP2
-   sharding and weight loading. AdamW updates the FP32 master shards.
-4. DCP saves model and optimizer state using the existing checkpointer.
-   Rebuild with the same recipe and target config before restoring a training
-   checkpoint. Fake-quant scales are derived from current operands each
-   forward; they are not separate persistent training state.
+[The model builder](../../veomni/models/auto.py#L164) applies
+[QAT preparation](../../veomni/models/qat.py#L119) before FSDP2, including on meta.
+Weight names stay unchanged; SwiGLU calls the fake-quant projections' forwards.
+[The parallel builder](../../veomni/distributed/torch_parallelize.py#L1011) validates
+topology and precision before sharding/loading. AdamW updates FP32 master shards.
 
-Ordinary HF export keeps the recipe and target metadata in `config.json`.
-Loading through VeOmni's foundation-model builder prepares the same selected
-projections again. The existing distributed HF writer normally rounds FP32
-parameters to BF16; it does not save packed MXFP4 weights or optimizer state.
-Use DCP when exact training continuation is required.
+For exact optimizer continuation, restore DCP after rebuilding the same recipe
+and targets. Fake-quant scales are derived each forward, not persisted state.
+Ordinary HF export retains recipe/target metadata in `config.json` and normally
+rounds FP32 parameters to BF16, without optimizer state or packed MXFP4 weights.
+Reloading through the model builder prepares the selected projections again.
 
 ## Offline MXFP4 artifact
 
-After saving an ordinary HF checkpoint, create a separate packed torchao
-artifact:
+Convert an ordinary HF checkpoint into a separate CPU packed torchao artifact:
 
 ```bash
 PYTHONPATH=. python scripts/export_mxfp4.py \
@@ -116,14 +92,12 @@ PYTHONPATH=. python scripts/export_mxfp4.py \
   --output /path/to/empty_mxfp4_directory
 ```
 
-The converter operates on an unsharded model. It copies the model, reproduces
-BF16-facing parameter rounding, and converts only the selected projections.
-The training checkpoint is not modified. Allow host memory for both the
-loaded model and conversion copy.
+Conversion copies an unsharded model, reproduces BF16-facing rounding and packs
+only selected projections, leaving the training checkpoint unchanged. Allow host
+memory for the loaded model and copy. Output: `model.pt`, `config.json`, `mxfp4.json`.
 
-The output contains `model.pt`, `config.json` and `mxfp4.json`. It is a
-versioned torchao inference artifact with packed MXTensor weights, **not** a
-standard Hugging Face, vLLM or SGLang quantized checkpoint. Reload it using:
+This versioned MXTensor artifact is torchao-specific, **not** a standard Hugging
+Face, vLLM or SGLang quantized checkpoint. Reload with the same pinned torchao version:
 
 ```python
 from veomni.models.qat import load_mxfp4
@@ -131,64 +105,24 @@ from veomni.models.qat import load_mxfp4
 model = load_mxfp4("/path/to/mxfp4_directory", device="cpu")
 ```
 
-`load_mxfp4` returns an evaluation model with gradients disabled and uses
-torchao's emulated inference path. This format does not establish train/rollout
-log-probability agreement or support repeated rollout refits. Keep its pinned
-torchao version when saving and loading artifacts.
+The loaded model uses emulated inference with gradients disabled. This format
+does not establish train/rollout log-probability agreement or support repeated rollout refits.
 
 ## Validation
 
-The CPU training-to-export roundtrip lives in
-[`test_mxfp4_qat.py`](../../tests/models/test_mxfp4_qat.py#L15). The physical
-two-GPU acceptance case is
-[`test_mxfp4_qat_fsdp.py`](../../tests/models/test_mxfp4_qat_fsdp.py#L182):
+Run the [CPU roundtrip](../../tests/models/test_mxfp4_qat.py#L48) and
+[two-GPU acceptance](../../tests/models/test_mxfp4_qat_fsdp.py#L183) tests:
 
 ```bash
 pytest tests/models/test_mxfp4_qat.py -q
 CUDA_VISIBLE_DEVICES=0,1 pytest tests/models/test_mxfp4_qat_fsdp.py -q
 ```
 
-The second test uses two distinct CUDA ranks with NCCL, generated Qwen3
-modeling, two accumulated microbatches, FP32 master updates, exact DCP/AdamW
-continuation and ordinary HF export/reload. It declares a two-card CI launch
-plan and skips on CPU/NPU or insufficient hardware. Both files are covered by
-the existing `tests/models/` directory selection.
+The second test covers NCCL on two CUDA ranks, generated Qwen3 modeling, two
+accumulated microbatches, FP32 master updates, DCP/AdamW continuation and HF reload.
+It declares a two-card CI plan and skips without suitable CUDA hardware; both tests
+are selected by `tests/models/`. CPU checks do not validate CUDA or collectives.
 
-On 2026-10-30, both tests passed with no skips on Modal with two physical
-NVIDIA A100-SXM4-40GB GPUs at revision `76753d8d`. The environment used Python
-3.12.1, PyTorch 2.11.0+cu130, torchao 0.18.0 and transformers 5.16.1. The run's
-local artifacts are `outputs/mxfp4-modal/20261030T101017Z/run.log` and
-`junit.xml`; the report records **2 passed, 0 failed, 0 skipped**.
-
-This acceptance uses a tiny random Qwen3 model with eager ops. DCP continuation
-rebuilds the model and AdamW within the same rank processes; it does not test a
-fresh-process restart or the full trainer/data/scheduler/RNG resume path.
-Representative convergence, throughput, peak memory and deployment-format
-compatibility remain outside the current evidence.
-
-### Run on Modal
-
-The optional [Modal runner](../../scripts/run_mxfp4_modal.py#L58) runs the same
-two tests in one container with two A100 40 GB GPUs. Its Ubuntu 24.04 image
-uses Python 3.12 and uv 0.11.16 to install the locked `gpu` extra, `test` group
-and default `transformers-stable` group. The local Modal SDK stays separate
-from VeOmni's dependencies.
-
-After configuring a Modal account, run from the repository root:
-
-```bash
-uvx --python 3.12 --from modal==1.6.3 modal run -m scripts.run_mxfp4_modal
-```
-
-This command builds the cloud image and starts a billable GPU job. Importing
-the module or requesting `--help` only inspects the local definition. The
-dependency image and two-GPU execution have both been validated as described
-above.
-
-The runner uploads Git-tracked files from `veomni/`, `tests/` and `scripts/`,
-plus the dependency metadata; stage newly added source files before running.
-It uses the existing tiny random model and requires no model or dataset
-download. Test output streams to the terminal; `run.log` and `junit.xml`
-are also saved under `outputs/mxfp4-modal/<UTC timestamp>/`, including when
-pytest fails. Both tests must pass with no skips. The function has a
-15-minute timeout and no automatic test retries.
+Acceptance uses tiny random Qwen3 with eager ops and rebuilds DCP/AdamW state in
+the same rank processes. It does not cover fresh-process or full trainer/data/
+scheduler/RNG resume, convergence, speedup, peak memory or deployment compatibility.
