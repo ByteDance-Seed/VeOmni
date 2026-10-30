@@ -34,6 +34,9 @@ elif command -v cnmon &> /dev/null; then
   else
     NPROC_PER_NODE=${NPROC_PER_NODE:=$(cnmon -l 2>/dev/null | grep -c "MLU")}
   fi
+elif [[ "$(python3 -c 'import torch; print(torch.xpu.device_count())' 2>/dev/null)" -gt 0 ]]; then
+  # Intel GPU (XPU). device_count() already honors ZE_AFFINITY_MASK.
+  NPROC_PER_NODE=${NPROC_PER_NODE:=$(python3 -c 'import torch; print(torch.xpu.device_count())')}
 else
   # NPU
   if [[ -n "${ASCEND_RT_VISIBLE_DEVICES}" ]]; then
