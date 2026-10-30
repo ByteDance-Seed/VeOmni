@@ -31,6 +31,8 @@ IS_CUDA_AVAILABLE = torch.cuda.is_available()
 # not registered, so treat that as NPU-unavailable rather than crashing on import.
 IS_NPU_AVAILABLE = is_torch_npu_available() and hasattr(torch, "npu")
 IS_MLU_AVAILABLE = is_torch_mlu_available()
+# Intel GPU support ships in stock PyTorch, so no package check is needed.
+IS_XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
@@ -39,13 +41,15 @@ MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
 
 
 def get_device_type() -> str:
-    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
+    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU, XPU."""
     if IS_CUDA_AVAILABLE:
         device = "cuda"
     elif IS_NPU_AVAILABLE:
         device = "npu"
     elif IS_MLU_AVAILABLE:
         device = "mlu"
+    elif IS_XPU_AVAILABLE:
+        device = "xpu"
     else:
         device = "cpu"
 
@@ -92,6 +96,8 @@ def get_dist_comm_backend() -> str:
         return "hccl"
     elif IS_MLU_AVAILABLE:
         return "cncl"
+    elif IS_XPU_AVAILABLE:
+        return "xccl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
@@ -109,6 +115,8 @@ def stream_synchronize() -> None:
         torch.npu.current_stream().synchronize()
     elif IS_MLU_AVAILABLE:
         torch.mlu.current_stream().synchronize()
+    elif IS_XPU_AVAILABLE:
+        torch.xpu.current_stream().synchronize()
     else:
         synchronize()
 

@@ -830,10 +830,10 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
-    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
+    init_device: Literal["cuda", "meta", "npu", "mlu", "xpu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU. 5. `xpu`: Init parameters on Intel GPU."
         },
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)

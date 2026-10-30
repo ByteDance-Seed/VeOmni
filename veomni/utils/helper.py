@@ -43,6 +43,7 @@ from .device import (
     IS_CUDA_AVAILABLE,
     IS_MLU_AVAILABLE,
     IS_NPU_AVAILABLE,
+    IS_XPU_AVAILABLE,
     get_device_type,
     get_torch_device,
 )
@@ -178,7 +179,8 @@ def compute_device_memory_metrics() -> Dict[str, Any]:
     """
     allocated_memory = get_torch_device().max_memory_allocated()
     reserved_memory = get_torch_device().max_memory_reserved()
-    num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
+    # The Intel GPU caching allocator does not count retries.
+    num_alloc_retries = get_torch_device().memory_stats().get("num_alloc_retries", 0)
     cpu_memory_info = psutil.virtual_memory()
     # One max-reduce: the min of available memory is the max of its negation.
     (
@@ -524,6 +526,10 @@ def enable_full_determinism(seed: int):
         torch.mlu.manual_seed(seed)
         torch.mlu.manual_seed_all(seed)
 
+    if IS_XPU_AVAILABLE:
+        torch.xpu.manual_seed(seed)
+        torch.xpu.manual_seed_all(seed)
+
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:
     """
@@ -603,7 +609,7 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_MLU_AVAILABLE or IS_XPU_AVAILABLE:
         from veomni.utils.device import empty_cache
 
         empty_cache()
@@ -751,7 +757,7 @@ def create_profiler(
     global_rank: int,
 ):
     """
-    Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
+    Creates a profiler to record the CPU and CUDA / MLU / XPU activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
 
     When is_npu_available = True, the profiler will be created as torch_npu.profiler.
@@ -785,7 +791,7 @@ def create_profiler(
             nonlocal npu_trace_handler
             npu_trace_handler(p)
             trace_file = p.prof_if.prof_path
-        elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
+        elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE or IS_XPU_AVAILABLE:
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
@@ -828,6 +834,10 @@ def create_profiler(
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.MLU]
         experimental_config = None
+    elif IS_XPU_AVAILABLE:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.XPU]
+        experimental_config = None
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
@@ -854,7 +864,7 @@ def create_profiler(
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
