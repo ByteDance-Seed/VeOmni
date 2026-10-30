@@ -12,20 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense Qwen3 MXFP4 QAT conversion and offline torchao inference artifacts.
+"""Dense Qwen3 MXFP4 QAT preparation and distributed validation.
 
-Training keeps ordinary parameters and state-dict keys. Quantization is derived
-on each forward; packed MXTensor weights belong only to the offline artifact.
+Training keeps ordinary parameters and state-dict keys, with quantization
+derived on each forward.
 """
 
 from __future__ import annotations
 
-import copy
-import json
 import re
 from fnmatch import fnmatchcase
 from importlib.metadata import version
-from pathlib import Path
 
 import torch
 from torch import nn
@@ -34,13 +31,6 @@ from torch import nn
 _RECIPE = "torchao_mxfp4"
 _TORCHAO_VERSION = "0.18.0"
 _PROJECTION = re.compile(r"model\.layers\.\d+\.(?:self_attn\.[qkvo]_proj|mlp\.(?:gate|up|down)_proj)")
-_INFERENCE_OPS = {
-    "attn_implementation": "eager",
-    "rms_norm_implementation": "eager",
-    "swiglu_mlp_implementation": "eager",
-    "rotary_pos_emb_implementation": "eager",
-    "cross_entropy_loss_implementation": "eager",
-}
 
 
 def _nested_mxfp4(config):
@@ -119,8 +109,7 @@ def _selected_projections(model, patterns, prepared_type):
 def prepare_mxfp4_qat(model: nn.Module) -> nn.Module:
     """Replace selected Qwen3 projections before FSDP wrapping, including on meta.
 
-    Ordinary models do not import torchao. CPU eager execution is available for
-    numerical checks and offline conversion; distributed training uses CUDA.
+    Ordinary models do not import torchao. Distributed training uses CUDA.
     """
     ops = _qat_ops(model)
     if ops is None:
@@ -160,7 +149,7 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
     if kwargs.get("is_peft_model") or kwargs.get("enable_fsdp_offload") or getattr(compile_config, "enable", False):
         raise ValueError("torchao_mxfp4 does not yet support LoRA, FSDP CPU offload or torch.compile.")
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
-        raise ValueError("Distributed torchao_mxfp4 training requires NVIDIA CUDA; CPU is for eager checks/export.")
+        raise ValueError("Distributed torchao_mxfp4 training requires NVIDIA CUDA.")
     _, _, _, prepared_type = _torchao_api()
     selected = _selected_projections(model, ops.qat_target_modules, prepared_type)
     if any(type(module) is not prepared_type for module in selected.values()):
@@ -169,66 +158,3 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
         raise ValueError(
             "torchao_mxfp4 requires FP32 master parameters; use build_parallelize_model or model.float()."
         )
-
-
-def export_mxfp4(model: nn.Module, output_dir: str | Path) -> None:
-    """Write a separate BF16-facing, packed torchao inference artifact.
-
-    Pass an unsharded model loaded from the normal HF training export, not a
-    live FSDP model. The input model and its FP32 master weights are unchanged.
-    This format is loaded by :func:`load_mxfp4`, not HF ``from_pretrained``.
-    """
-    from torch.distributed.tensor import DTensor
-
-    ops = _qat_ops(model)
-    if ops is None:
-        raise ValueError("Export requires a Qwen3 model configured for torchao_mxfp4 QAT.")
-    if any(param.is_meta or isinstance(param, DTensor) for param in model.parameters()):
-        raise ValueError("Export requires materialized, unsharded parameters; first save a normal HF checkpoint.")
-    quantize, QATConfig, recipe, prepared_type = _torchao_api()
-    selected = _selected_projections(model, ops.qat_target_modules, prepared_type)
-    if any(type(module) is not prepared_type for module in selected.values()):
-        raise ValueError(
-            "Export requires prepared QAT projections; use build_foundation_model to load the checkpoint."
-        )
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if any(output_dir.iterdir()):
-        raise ValueError("MXFP4 output directory must be empty.")
-    # Reproduce BF16 FSDP-facing weights before quantization, not FP32 masters.
-    exported = copy.deepcopy(model).to(device="cpu", dtype=torch.bfloat16).eval()
-    quantize(exported, QATConfig(recipe, step="convert"), filter_fn=lambda module, name: name in selected)
-    from .configuration_base import as_veomni_config
-
-    as_veomni_config(exported.config)._set_ops_implementation(
-        {**_INFERENCE_OPS, "qat_implementation": "none", "qat_target_modules": None}
-    )
-    exported.config.save_pretrained(output_dir)
-    torch.save(exported.state_dict(), output_dir / "model.pt")
-    (output_dir / "mxfp4.json").write_text(
-        json.dumps(
-            {"format_version": 1, "recipe": _RECIPE, "torchao_version": _TORCHAO_VERSION, "targets": sorted(selected)},
-            indent=2,
-        )
-        + "\n"
-    )
-
-
-def load_mxfp4(output_dir: str | Path, device: str = "cpu") -> nn.Module:
-    """Load an offline MXFP4 artifact for emulated torchao inference only."""
-    from .auto import build_config, build_foundation_model
-
-    _torchao_api()  # Register MXTensor's weights-only serialization support.
-    output_dir = Path(output_dir)
-    manifest = json.loads((output_dir / "mxfp4.json").read_text())
-    if (
-        manifest["format_version"] != 1
-        or manifest["recipe"] != _RECIPE
-        or manifest["torchao_version"] != _TORCHAO_VERSION
-    ):
-        raise ValueError("Unsupported MXFP4 artifact format or torchao version.")
-    config = build_config(str(output_dir))
-    model = build_foundation_model(config, init_device="meta", torch_dtype="bfloat16")
-    state = torch.load(output_dir / "model.pt", map_location="cpu", weights_only=True)
-    model.load_state_dict(state, strict=True, assign=True)
-    return model.to(device).eval().requires_grad_(False)

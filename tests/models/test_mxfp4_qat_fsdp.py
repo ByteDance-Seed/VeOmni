@@ -79,6 +79,17 @@ def _optimizer_snapshot(model, optimizer):
 
 
 def _step(model, optimizer, step):
+    from torch.distributed.tensor import DTensor
+    from torchao.prototype.qat import MXFakeQuantizedLinear
+
+    prepared = {name: module for name, module in model.named_modules() if isinstance(module, MXFakeQuantizedLinear)}
+    assert len(prepared) == 7 * model.config.num_hidden_layers and type(model.lm_head) is torch.nn.Linear
+    before = {name: module.weight.to_local().detach().clone() for name, module in prepared.items()}
+    called = set()
+    handles = [
+        module.register_forward_hook(lambda _module, _inputs, _output, name=name: called.add(name))
+        for name, module in prepared.items()
+    ]
     optimizer.zero_grad(set_to_none=True)
     losses = []
     # Unequal microbatch lengths exercise per-forward dynamic MX quantization.
@@ -92,8 +103,17 @@ def _step(model, optimizer, step):
         assert torch.isfinite(loss)
         loss.backward()
         losses.append(loss.detach().cpu())
+    for handle in handles:
+        handle.remove()
+    assert called == set(prepared)
     assert all(torch.isfinite(param.grad.to_local()).all() for param in model.parameters() if param.grad is not None)
+    for name, module in prepared.items():
+        grad = module.weight.grad
+        assert isinstance(grad, DTensor) and grad.dtype == torch.float32, name
+        grad = grad.to_local()
+        assert torch.isfinite(grad).all() and torch.count_nonzero(grad) > 0, name
     optimizer.step()
+    assert all(not torch.equal(module.weight.to_local(), before[name]) for name, module in prepared.items())
     optimizer.zero_grad(set_to_none=True)
     return torch.stack(losses)
 
@@ -144,7 +164,6 @@ def _fsdp_worker(root: str):
         _step(model, optimizer, 0)
         saved_weights = _master_snapshot(model)
         assert initial.keys() == saved_weights.keys()
-        assert any(not torch.equal(initial[name], saved_weights[name]) for name in saved_weights if ".mlp." in name)
         saved_optimizer = _optimizer_snapshot(model, optimizer)
         assert all(state for state in saved_optimizer.values())
         DistributedCheckpointer.save(str(dcp_path), {"model": model, "optimizer": optimizer})

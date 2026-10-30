@@ -122,8 +122,9 @@ BaseRLTrainer (ABC)  subclasses BaseTrainer
 - `build_foundation_model()` prepares opt-in Dense Qwen3 `torchao_mxfp4` QAT
   projections before returning, for both meta training builds and eager HF
   reloads. The recipe and target patterns live in the model's persisted ops
-  config; `veomni/models/qat.py` owns preparation and the separate offline
-  torchao artifact. See `docs/usage/mxfp4_qat.md`.
+  config; `veomni/models/qat.py` owns preparation and distributed validation.
+  DCP and ordinary HF checkpoints retain floating-point weights. See
+  `docs/usage/mxfp4_qat.md`.
 - `_freeze_model_module()` / `_setup_lora()` -> trainable surface
 - `_build_parallelized_model()` -> FSDP2/DDP wrap + weight load
 - `_build_optimizer()` -> optimization

@@ -19,7 +19,7 @@ clamp. Variant ``geglu`` is ``down(gelu_pytorch_tanh(gate(x)) * up(x))``.
 Empty biases are unused.
 """
 
-from torch import Tensor, nn
+from torch import nn
 
 from ...platform import GpuKernelRequirement, MluKernelRequirement
 from ...registry import register_op
@@ -37,13 +37,8 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
     Wrapped projections and Linear subclasses must run their own forward.
-    Tensor-subclass weights also need Linear's dispatch (for example packed
-    torchao inference weights), rather than a weight-only fused kernel.
     """
-    return all(
-        type(projection := getattr(mlp, name)) is nn.Linear and type(projection.weight) in (Tensor, nn.Parameter)
-        for name in ("gate_proj", "up_proj", "down_proj")
-    )
+    return all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
 
 
 register_op(
