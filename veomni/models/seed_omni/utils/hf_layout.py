@@ -537,15 +537,16 @@ def convert_with_hf_layout(
     *,
     training_graph: str | None = None,
     generation_graph: str | None = None,
+    attn_implementation: str | None = None,
 ) -> dict[str, Any]:
     """Offline split through the family's :class:`OmniHFLayout` — the same key map the runtime load uses.
 
     Returns the kwargs :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
-    writes out. Modules load on CPU in the checkpoint's own ``dtype``, built
-    under the config's attention selection when this host can run it and eager
-    otherwise; a host that cannot run the kernel records the eager fallback.
+    writes out. Modules load on CPU in the checkpoint's own ``dtype``.
+    ``attn_implementation`` is forwarded to every module build, so an explicit
+    selection is recorded in the exported config; unset keeps the config
+    default, and a backend this host cannot run fails at build time.
     """
-    from ....ops import OP_REGISTRY
     from ..modules import OMNI_MODEL_REGISTRY
     from .convert_registry import attach_module_assets
 
@@ -559,13 +560,9 @@ def convert_with_hf_layout(
     module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
-    # The convert only copies weights: build under eager when this host cannot
-    # run the module config's attention selection.
-    available_attention = OP_REGISTRY.list_available("attention", "standard")
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-        selected_attn = module_config.ops_config.attn_implementation
         module = load_module_from_hf_source(
             module_cls,
             module_config,
@@ -573,7 +570,7 @@ def convert_with_hf_layout(
             name,
             device_map="cpu",
             torch_dtype=dtype,
-            attn_implementation=None if selected_attn in available_attention else "eager",
+            attn_implementation=attn_implementation,
         )
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
