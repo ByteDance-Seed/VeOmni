@@ -54,7 +54,7 @@ def forward(
 ) -> tuple[Tensor, SavedState]:
     """All-to-all seq-to-heads, then the output linear. No head reshape."""
     sp_group = get_ulysses_sequence_parallel_group() if group is None else group
-    hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension)
+    hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension, group=sp_group)
     hidden_states = all_to_all_tensor(
         hidden_states, scatter_dim=seq_dimension, gather_dim=head_dimension, group=sp_group
     )
@@ -85,5 +85,7 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         proj_weight,
         has_bias=proj_bias is not None,
     )
-    grad_hidden = unpadding_tensor_for_seqeunce_parallel(grad_out_res(), meta.seq_dimension, meta.unpadded_dim_size)
+    grad_hidden = unpadding_tensor_for_seqeunce_parallel(
+        grad_out_res(), meta.seq_dimension, meta.unpadded_dim_size, group=meta.group
+    )
     return grad_hidden, grad_proj_weight, grad_proj_bias

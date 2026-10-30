@@ -68,7 +68,7 @@ def forward(
     collective covers the QK norm.
     """
     sp_group = get_ulysses_sequence_parallel_group() if group is None else group
-    ulysses_size = get_ulysses_sequence_parallel_world_size()
+    ulysses_size = get_ulysses_sequence_parallel_world_size(sp_group)
     num_q_heads = q_weight.shape[0] // head_dim
     num_kv_heads = k_weight.shape[0] // head_dim
     batch_size = hidden_states.shape[0]
@@ -107,8 +107,8 @@ def forward(
     v_res = all_to_all_tensor(v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True)
 
     # Wait Q/K for the post-collect norm. Leave V in flight.
-    q = unpadding_tensor_for_seqeunce_parallel(q_res(), seq_dimension, unpadded_dim_size)
-    k = unpadding_tensor_for_seqeunce_parallel(k_res(), seq_dimension, unpadded_dim_size)
+    q = unpadding_tensor_for_seqeunce_parallel(q_res(), seq_dimension, unpadded_dim_size, group=sp_group)
+    k = unpadding_tensor_for_seqeunce_parallel(k_res(), seq_dimension, unpadded_dim_size, group=sp_group)
     q = q.contiguous()
     k = k.contiguous()
 
@@ -133,7 +133,9 @@ def forward(
     else:
         raise NotImplementedError(f"{norm_type} is not supported in async-ulysses now!")
 
-    v = unpadding_tensor_for_seqeunce_parallel(v_res(), seq_dimension, unpadded_dim_size)  # wait after QK norm
+    v = unpadding_tensor_for_seqeunce_parallel(
+        v_res(), seq_dimension, unpadded_dim_size, group=sp_group
+    )  # wait after QK norm
 
     saved: list[Tensor | None] = [
         hidden_states,
@@ -184,7 +186,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
         saved_rms_k, rest = take_inner(rest, meta.rms_k)
 
     # Start V reverse all-to-all first so QK-norm math overlaps it.
-    grad_v = padding_tensor_for_seqeunce_parallel(grad_output[2].contiguous(), dim=seq_dimension)
+    grad_v = padding_tensor_for_seqeunce_parallel(grad_output[2].contiguous(), dim=seq_dimension, group=sp_group)
     grad_v_res = all_to_all_tensor(
         grad_v,
         scatter_dim=seq_dimension,
@@ -215,7 +217,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
             head_dimension=head_dimension,
         )
 
-    grad_k = padding_tensor_for_seqeunce_parallel(grad_k, dim=seq_dimension)
+    grad_k = padding_tensor_for_seqeunce_parallel(grad_k, dim=seq_dimension, group=sp_group)
     grad_k_res = all_to_all_tensor(
         grad_k,
         scatter_dim=seq_dimension,
@@ -240,7 +242,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
             head_dimension=head_dimension,
         )
 
-    grad_q = padding_tensor_for_seqeunce_parallel(grad_q, dim=seq_dimension)
+    grad_q = padding_tensor_for_seqeunce_parallel(grad_q, dim=seq_dimension, group=sp_group)
     grad_q_res = all_to_all_tensor(
         grad_q,
         scatter_dim=seq_dimension,
