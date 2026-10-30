@@ -643,5 +643,25 @@
       "-x",
       "tests/models/test_omni_fsdp.py"
     ]
+  },
+  {
+    "name": "62-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ring"
+    ]
+  },
+  {
+    "name": "63-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/e2e/test_usp_training_equivalence.py"
+    ]
   }
 ]

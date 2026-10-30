@@ -66,6 +66,7 @@ class ParallelState:
     tp_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
+    cp_layout: Literal["contiguous", "zigzag"] = "contiguous"
     ulysses_size: int = 1
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
@@ -91,7 +92,12 @@ class ParallelState:
         if self.ulysses_size < 1:
             raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.async_enabled:
+            raise NotImplementedError("Context parallelism cannot be combined with async Ulysses yet.")
+
+        if self.cp_layout not in ("contiguous", "zigzag"):
+            raise ValueError(f"Unsupported cp_layout: {self.cp_layout!r}.")
+        if self.cp_size > 1 and self.ulysses_size > 1 and self.cp_layout != "zigzag":
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -498,6 +504,7 @@ def _init_parallel_state(
     tp_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
+    cp_layout: Literal["contiguous", "zigzag"] = "contiguous",
     ulysses_size: int = 1,
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
@@ -581,6 +588,7 @@ def _init_parallel_state(
         tp_size,
         pp_size,
         cp_size,
+        cp_layout,
         ulysses_size,
         dp_mode,
         device_type,
@@ -725,6 +733,7 @@ def _init_parallel_state(
         tp_size=tp_size,
         pp_size=pp_size,
         cp_size=cp_size,
+        cp_layout=cp_layout,
         ulysses_size=ulysses_size,
         dp_mode=dp_mode,
         device_type=device_type,
@@ -760,6 +769,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         tp_size=accelerator.tp_size,
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,
+        cp_layout=accelerator.cp_layout,
         ulysses_size=accelerator.ulysses_size,
         extra_parallel_sizes=accelerator.extra_parallel_sizes,
         extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,

@@ -34,8 +34,15 @@ from .data import (
     sp_pad,
     sp_pad_and_slice,
     sp_take_own_seq,
+    zigzag_reorder,
+    zigzag_undo,
 )
 from .loss import reduce_sequence_parallel_loss
+from .ring_attention import (
+    ring_flash_attn_func,
+    zigzag_ring_flash_attn_func,
+    zigzag_ring_flash_attn_varlen_func,
+)
 from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
@@ -63,6 +70,8 @@ __all__ = [
     "sp_take_own_seq",
     "sp_pad",
     "sp_pad_and_slice",
+    "zigzag_reorder",
+    "zigzag_undo",
     "gather_heads_scatter_seq",
     "gather_seq_scatter_heads",
     "all_to_all_images",
@@ -71,4 +80,7 @@ __all__ = [
     "pad_tensor",
     "unpad_tensor",
     "reduce_sequence_parallel_loss",
+    "ring_flash_attn_func",
+    "zigzag_ring_flash_attn_func",
+    "zigzag_ring_flash_attn_varlen_func",
 ]

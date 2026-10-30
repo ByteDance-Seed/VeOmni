@@ -405,3 +405,112 @@ Async Ulysses is currently consumed by:
 - Wan
 
 Support for more models will be added in future releases.
+
+## 🔗 USP: Unified Sequence Parallelism (Ulysses × Ring)
+
+USP combines Ulysses head/sequence all-to-all with Ring-Attention across a
+context-parallel group:
+
+```
+sp_size = ulysses_size × cp_size
+```
+
+Ulysses requires the query-head count to divide evenly across its group.
+The shared adapter can repeat KV heads when the Ulysses group exceeds the KV
+head count, at the cost of extra memory and communication. Ring adds a sequence
+partition that does not depend on the head count. Keep the Ulysses group within
+a fast interconnect where possible; benchmark the CP/Ulysses split on the target
+hardware rather than selecting it from sequence length alone.
+
+VeOmni uses **zig-zag** block placement for the ring so causal attention stays
+load-balanced: the sequence is split into `2·cp_size` blocks and cp-rank `r`
+owns blocks `r` and `2·cp_size-1-r`.
+
+### Quick Start
+
+The configuration below uses 32 sequence-parallel ranks; the world size must
+be divisible by 32. For one eight-GPU node, override with
+`--model.accelerator.ulysses_size 4 --model.accelerator.cp_size 2`.
+
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
+    --model.model_path YOUR_MODEL_PATH \
+    --data.train_path YOUR_DATA_PATH \
+    --model.accelerator.ulysses_size 8 \
+    --model.accelerator.cp_size 4          # effective SP size = 32
+```
+
+### Constraints
+
+- **Ring path is causal-only**: `cp_size > 1` does not support explicit
+  attention masks (only causal). Packed (varlen) sequences ARE supported —
+  each document is zig-zag split independently across the `cp` group.
+- **Packed divisibility**: under `cp_size > 1`, `PackingCollator` automatically
+  pads every packed document to a multiple of `2 · cp_size` before concatenation.
+  The inserted tokens use ignored labels (`-100`) and continuing position IDs,
+  so they satisfy the zig-zag layout without creating extra varlen boundaries.
+  Dynamic batching budgets these aligned physical lengths, and fixed/SP tail
+  padding is coalesced into one aligned segment. The lower-level USP reorder
+  helpers still validate the invariant and reject manually constructed
+  unaligned batches. Dynamic batching selects both its logical and physical
+  counters via `get_length_fn_by_count_mode(count_mode, cp_size=..., cp_layout=...)`.
+  The explicit topology aligns `total` counts while leaving `effective` counts
+  unchanged; callers without topology retain the original counting behavior.
+- **Flash-attention backend**: Ring uses the implementation selected by
+  `model.ops_implementation.attn_implementation`. FA2 and FA4 are detected
+  independently, so installing both does not override an explicit FA4 choice.
+  The selected backend is saved for backward; unavailable or incompatible
+  primitives are rejected before communication. FA3 is not a Ring backend.
+  The example YAML selects FA2. For FA4 (including Blackwell/GB200), add
+  `--model.ops_implementation.attn_implementation flash_attention_4` to the command
+  above. Blackwell requires separate hardware validation.
+  Direct Ring primitive callers can pass `backend="fa2"` or `backend="fa4"`;
+  omitting it retains the default of FA2 when installed, otherwise FA4.
+- **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
+  (the collator pads up to this multiple automatically).
+- **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
+  cp-outer (zig-zag) / ulysses-inner (contiguous). SFT cross-entropy reduces
+  over the SP group by token count, so it is invariant to this reordering. The
+  RL/DPO trainers (which gather and re-linearise logits) do not yet support
+  `cp_size > 1`.
+
+### Implementation Map
+
+- Ring kernel: `veomni/distributed/sequence_parallel/ring_attention.py`
+  (`zigzag_ring_flash_attn_func` for dense, `zigzag_ring_flash_attn_varlen_func`
+  for packed, online-softmax `update_out_and_lse`, `RingComm`).
+- Data layout: `veomni/distributed/sequence_parallel/data.py`
+  (`zigzag_reorder` / `zigzag_undo` for dense, `zigzag_reorder_varlen` /
+  `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
+- Attention integration: the ring branch in
+  `veomni/ops/kernels/attention/standard/flash.py` runs after the Ulysses all-to-all.
+- Mesh: `init_parallel_state_from_config()` builds `[cp, ulysses]` and flattens `sp`.
+
+### USP integration with model-specific CP
+
+Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
+layout preserves DeepSeek V4's model-specific CP and does not allow combining
+CP with Ulysses. CP cannot be combined with `model.accelerator.enable_async: true`;
+async Ulysses and Ring are not integrated yet. USP requires `MODELING_BACKEND=veomni`. This release enables
+USP for Qwen3 causal text training with
+VeOmni FlashAttention 2 or 4 (`Qwen3ForCausalLM` only). RL/DPO, sequence
+classification, multimodal packing, sliding-window attention,
+softcap, attention sinks, nonzero attention dropout, and deterministic backward
+(`train.enable_full_determinism` / `FLASH_ATTENTION_DETERMINISTIC=1`) are unsupported and
+rejected. Other models require a separate compatibility check before enabling USP.
+
+For packed input, the CPU `SequenceParallelCollator` prepares
+`usp_cu_seqlens` (CP-local int32 offsets), `usp_max_seqlen` (local maximum
+document length), and `usp_half0` / `usp_half1` (int64 gather indices for the
+two halves of each local document). These describe the sequence after the
+Ulysses gather. The trainer moves tensors with the batch; attention consumes
+them without reading device scalars. Custom packed callers must provide the
+same metadata, using `prepare_usp_metadata` before moving the batch to the
+accelerator. A missing packed metadata set raises before communication.
+
+BF16 Ring changes attention reduction and rounding order. The tests check
+dense and packed Ring output/gradient parity, CP=2/4, Ulysses=2 × CP=2, and
+tiny Qwen3 packed padding/loss/gradient/SGD parity. Optimizer comparisons use
+FP32 master weights so BF16 rounding of small parameter updates does not hide
+or amplify the gradient error. These checks do not establish long-run
+convergence, cross-node performance, NPU support or Qwen3-VL support.

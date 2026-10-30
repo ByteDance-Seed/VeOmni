@@ -163,6 +163,7 @@ Core files:
     - `DynamicBatchingSizeDataset` (preferred) / `DynBszBuffer` (legacy): per-worker buffer, yields when token sum ≥ `micro_batch_seq_length`.
     - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
     - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
+    - With USP context parallelism (`cp_size > 1`), `PackingCollator` pads each document to `2 * cp_size`; dynamic batching must therefore budget total/physical sample lengths rounded up to the same alignment. Padding labels use `IGNORE_INDEX`, while padding position IDs continue monotonically so they do not create false document boundaries.
 
 ### Multimodal Data
 
@@ -254,6 +255,25 @@ Core files:
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
     - `_Gather.backward` uses out-of-place NCCL reduce-scatter (`reduce_scatter_tensor` for equal shards, `reduce_scatter` for uneven shards) into a freshly allocated local `grad_input` buffer, and clones `grad_output` (`grad_output.clone(memory_format=torch.contiguous_format)`) before running an in-place `dist.all_reduce` on other backends (`_GatherConcatSP.backward` likewise clones before `dist.all_reduce`). Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients across layouts for `_Gather`.
+
+### USP versus model-specific context parallelism
+
+- `model.accelerator.cp_layout` defaults to `contiguous` for DeepSeek V4.
+  USP requires explicit `zigzag`; only this layout pads documents to `2*cp_size`
+  and reorders them. Include layout in the parallel-state cache key.
+- Reject CP with async Ulysses in both accelerator arguments and direct ParallelState
+  construction, before mesh initialization. Async callers skip attention-side collectives.
+- USP model builds currently allow only Qwen3 with VeOmni FA2/FA4 and
+  `MODELING_BACKEND=veomni`. RL/DPO, deterministic backward and
+  unsupported attention modifiers must fail before training rather than silently
+  using a different attention function.
+- Ring detects FA2/FA4 independently and uses the configured backend, saved on
+  the autograd context for backward. Package import order must not override an
+  explicit implementation.
+- Packed USP half indices and CP-local offsets are computed on CPU in the
+  collator and passed with the batch; do not rebuild them using GPU scalar reads
+  or dynamic boolean indexing in every attention layer.
+
 
 29. **Saved RoPE table metadata must stay stable across checkpoint recomputation**
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
