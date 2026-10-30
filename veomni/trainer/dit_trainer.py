@@ -15,6 +15,7 @@
 import math
 import os
 import pickle as pk
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional, Sequence
@@ -40,6 +41,7 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
+from ..utils.loss_utils import contains_padding, reject_objective_padding
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -517,6 +519,8 @@ class DiTTrainer:
         return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
+        if contains_padding(micro_batch):
+            raise ValueError("DiT does not support padded micro-batches")
         micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
@@ -547,8 +551,6 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
         # SP broadcast of micro_batches
         with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
@@ -567,6 +569,9 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
+        self.base._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "DiT")
+        self.base.state.global_step += 1
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
 

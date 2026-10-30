@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -31,7 +32,7 @@ from ..models import build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
-from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
+from ..utils.loss_utils import contains_padding, count_loss_token, is_padding_microbatch, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
@@ -307,9 +308,19 @@ class VLMTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.base._step_preflight_start_time = time.time()
+        self.base.micro_batches_token_len = count_loss_token(micro_batches)
+        self.base.global_micro_batches_token_len = reduce_global_loss_token(
+            self.base.micro_batches_token_len,
+            contains_padding_batch=contains_padding(micro_batches) or not micro_batches,
+        )
+        if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
+            raise ValueError("Padding inside an unpacked micro-batch is unsupported")
+        real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
+        if not real_micro_steps:
+            raise ValueError("A training step must contain at least one real micro-batch")
+        self.base.state.global_step += 1
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
@@ -321,15 +332,14 @@ class VLMTrainer:
         total_loss_dict = defaultdict(int)
         total_aux_metrics = defaultdict(float)
 
-        # token num for fixed_ce_loss in postforward
-        self.base.micro_batches_token_len = count_loss_token(micro_batches)
-        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
-        num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
-        for micro_step, micro_batch in enumerate(micro_batches):
-            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
+        real_micro_step = 0
+        for micro_batch in micro_batches:
+            if not is_padding_microbatch(micro_batch):
+                mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
+                self.base.model_reshard(real_micro_step, real_micro_steps)
+                self.base._configure_hsdp_allreduce(real_micro_step, real_micro_steps)
+                real_micro_step += 1
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
@@ -355,7 +365,7 @@ class VLMTrainer:
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm,
-            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+            aux_metrics=mean_aux_metrics(total_aux_metrics, max(real_micro_steps, 1)),
         )
 
     def train(self):

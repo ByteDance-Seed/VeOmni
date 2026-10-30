@@ -18,7 +18,26 @@ import torch
 
 from ..distributed.parallel_state import get_parallel_state
 from .constants import IGNORE_INDEX
-from .dist_utils import all_reduce
+from .device import get_device_type
+from .dist_utils import all_reduce, any_rank_failed
+
+
+def is_padding_microbatch(batch) -> bool:
+    return isinstance(batch, dict) and bool(batch.get("padding_flag", False))
+
+
+def contains_padding(batch) -> bool:
+    if isinstance(batch, (list, tuple)):
+        return any(contains_padding(item) for item in batch)
+    return is_padding_microbatch(batch)
+
+
+def reject_objective_padding(batch, objective: str) -> None:
+    found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        found = any_rank_failed(found)
+    if found:
+        raise ValueError(f"{objective} does not support padded micro-batches or an empty step")
 
 
 def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
@@ -30,7 +49,12 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     }
 
     def _count(obj):
-        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+        if isinstance(obj, dict):
+            if is_padding_microbatch(obj):
+                for key in obj:
+                    if key.endswith("_labels"):
+                        token_len.setdefault(f"{key.split('_labels')[0]}_tokens", torch.tensor(0))
+                return
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 
             for key in obj.keys():
@@ -92,6 +116,29 @@ def mean_global_loss(
     return loss_dict
 
 
-def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
+def reduce_global_loss_token(
+    micro_batches_token_len: dict[str, torch.Tensor], *, contains_padding_batch: bool = False
+) -> dict[str, float]:
     """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # Piggyback the padding guard on the first existing token collective.
+        # Every rank stops before model collectives if any rank supplied a
+        # synthetic batch, including custom loaders outside the native guard.
+        local = torch.tensor(
+            [micro_batches_token_len["foundation_tokens"].item(), int(contains_padding_batch)],
+            dtype=torch.float,
+            device=get_device_type(),
+        )
+        foundation, padding_count = all_reduce(local, op="sum")
+        if padding_count:
+            raise RuntimeError("Distributed training does not support padded micro-batches or an empty step")
+        reduced = {"foundation_tokens": foundation}
+        reduced.update(
+            {
+                key: all_reduce(value.item(), op="sum")
+                for key, value in micro_batches_token_len.items()
+                if key != "foundation_tokens"
+            }
+        )
+        return reduced
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}

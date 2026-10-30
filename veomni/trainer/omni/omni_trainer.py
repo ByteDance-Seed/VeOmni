@@ -51,6 +51,7 @@ Division of labour
 
 import json
 import os
+import time
 from collections import defaultdict
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping
@@ -82,6 +83,7 @@ from ...utils.device import (
     is_nccl_backend,
     synchronize,
 )
+from ...utils.loss_utils import contains_padding, reject_objective_padding
 from ...utils.omni_helper import OmniEnvironMeter
 from ..base import VeOmniIter
 from ..callbacks import (
@@ -510,6 +512,8 @@ class OmniTrainer:
         over micro-batches, not a sum that grows with the accumulation count. The
         returned loss stays unscaled for logging.
         """
+        if contains_padding(micro_batch):
+            raise ValueError("Omni training does not support padded micro-batches")
         micro_batch = self.preforward(micro_batch)
 
         # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
@@ -545,6 +549,8 @@ class OmniTrainer:
         # Fetch first: an iterator that runs dry before ``train_steps`` raises
         # here, and must not leave a step counted that never ran.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "Omni training")
         self.state.global_step += 1
 
         self._reset_async_activation_offload_if_enabled()
@@ -575,6 +581,8 @@ class OmniTrainer:
             raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "Omni training")
         self.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)

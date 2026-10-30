@@ -149,6 +149,16 @@ def build_native_dataloader(
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
+    if (
+        dyn_bsz
+        and dyn_bsz_runtime == "main"
+        and not drop_last
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    ):
+        raise ValueError(
+            "Distributed main-process dynamic batching requires drop_last=True until tail steps are aligned"
+        )
 
     if collate_fn is None:
         if build_collate_fn:

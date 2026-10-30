@@ -45,6 +45,20 @@ nothing else. The two exports are inference artifacts that resume never reads.
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
 
+When main-process dynamic batching emits padded micro-batches in single-process
+SFT, padding is excluded from loss token counts, channel loss and auxiliary
+metrics, and its model forward/backward is skipped. Distributed main-process
+dynamic batching must use `drop_last=True` until tail step counts can be
+coordinated across ranks. Custom distributed loaders must likewise avoid injecting padded
+micro-batches. DPO and Omni reject padded micro-batches; custom data loaders
+must not inject padding into those objectives. DiT also rejects marked padding.
+The rejection adds one small collective per step to DPO, Omni and DiT; the SFT
+check shares its existing token-count collective.
+Environment-meter token and FLOP estimates likewise count useful batches only.
+The main dynamic loader's configured `train_steps` limit is unchanged: a
+normal trainer does not consume extra flush batches beyond that limit, and a
+restartable source can be replayed to fill the requested number of steps.
+
 Three splits in the tree above are deliberate:
 
 - **`loader/` and `extra_state/` are per rank** because their contents are.

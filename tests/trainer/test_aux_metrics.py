@@ -237,7 +237,9 @@ def run_train_step(request, monkeypatch):
     monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
     # Single process: the all-reduce over the step's token denominators is the identity.
     monkeypatch.setattr(
-        module, "reduce_global_loss_token", lambda token_len: {key: value.item() for key, value in token_len.items()}
+        module,
+        "reduce_global_loss_token",
+        lambda token_len, **kwargs: {key: value.item() for key, value in token_len.items()},
     )
     # VLMTrainer's loop does not mark compile steps.
     monkeypatch.setattr(module, "mark_compile_step_begin", lambda *args, **kwargs: None, raising=False)
@@ -289,6 +291,43 @@ def test_single_micro_batch_reports_the_metric_unscaled(run_train_step, identity
     run_train_step(trainer, [{"labels": torch.tensor([[1, 2, -100, 4]])}])
 
     assert recorded["aux_metrics"]["indexer_kl"] == pytest.approx(6.0)
+
+
+def test_unpacked_list_micro_batch_still_runs(run_train_step, identity_loss):
+    recorded = {}
+    trainer = _accumulating_trainer([_Output(torch.tensor(1.0), {"indexer_kl": torch.tensor(6.0)})], recorded)
+    run_train_step(trainer, [[{"labels": torch.tensor([[1, 2]])}]])
+    assert recorded["aux_metrics"]["indexer_kl"] == pytest.approx(6.0)
+
+
+def test_aux_metric_averages_only_non_padding_micro_batches(run_train_step, identity_loss):
+    recorded = {}
+    trainer = _accumulating_trainer([], recorded)
+
+    def forward(micro_batch):
+        value = micro_batch["metric"]
+        metrics = {} if micro_batch.get("padding_flag", False) else {"indexer_kl": torch.tensor(value)}
+        return torch.tensor(0.0), {}, metrics
+
+    trainer.forward_backward_step = forward
+    micro_batches = [
+        {"labels": torch.tensor([[1]]), "metric": 6.0},
+        {"labels": torch.tensor([[1]]), "metric": 99.0, "padding_flag": True},
+        {"labels": torch.tensor([[1]]), "metric": 12.0},
+    ]
+    run_train_step(trainer, micro_batches)
+    assert recorded["aux_metrics"]["indexer_kl"] == pytest.approx(9.0)
+
+
+def test_padding_does_not_replace_last_real_reshard_or_allreduce_step(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+    calls = []
+    trainer.model_reshard = lambda step, count: calls.append(("reshard", step, count))
+    trainer._configure_hsdp_allreduce = lambda step, count: calls.append(("allreduce", step, count))
+    trainer.forward_backward_step = lambda batch: (torch.tensor(0.0), {}, {})
+    batches = [{"labels": torch.tensor([1])}, {"labels": torch.tensor([2])}, {"padding_flag": True}]
+    run_train_step(trainer, batches)
+    assert calls == [("reshard", 0, 2), ("allreduce", 0, 2), ("reshard", 1, 2), ("allreduce", 1, 2)]
 
 
 def test_metric_emitted_by_some_micro_batches_is_averaged_over_all_of_them(run_train_step, identity_loss):
