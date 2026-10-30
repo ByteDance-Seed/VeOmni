@@ -117,6 +117,7 @@ def _fsdp_worker(root: str):
         if dist.get_rank() == 0:
             torch.manual_seed(42)
             config = Qwen3Config(
+                architectures=["Qwen3ForCausalLM"],
                 vocab_size=128,
                 hidden_size=128,
                 intermediate_size=256,
