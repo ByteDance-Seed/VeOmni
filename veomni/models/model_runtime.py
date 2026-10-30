@@ -419,6 +419,8 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
+            if args.accelerator.fsdp_config.mixed_precision.npu_expert_fp32_wgrad:
+                raise ValueError("NPU expert FP32 wgrad is unsupported with custom model parallelization")
             parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model

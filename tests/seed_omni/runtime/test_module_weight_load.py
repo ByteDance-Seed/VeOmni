@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import GradientCheckpointingConfig
+from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
 from veomni.distributed.torch_compile import CompileConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
@@ -94,7 +94,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 fsdp_mode="fsdp2",
                 fsdp_scope="module",
                 reshard_after_forward=True,
-                mixed_precision=SimpleNamespace(enable=False),
+                mixed_precision=MixedPrecisionConfig(enable=False),
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
