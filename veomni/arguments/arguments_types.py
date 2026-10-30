@@ -1172,6 +1172,24 @@ class TrainingArguments:
             )
         },
     )
+    freeze_ple_embeddings: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze Qwen4-Exp PLE n-gram embedding tables. The forward lookup still "
+                "reads them, but they are excluded from the optimizer and Adam states."
+            )
+        },
+    )
+    frozen_ple_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Storage dtype for frozen PLE tables after parallelization: float32 or "
+                "bfloat16. Requires freeze_ple_embeddings=true."
+            )
+        },
+    )
 
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -1184,6 +1202,9 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.frozen_ple_dtype is not None:
+            if not self.freeze_ple_embeddings or self.frozen_ple_dtype not in ("float32", "bfloat16"):
+                raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
