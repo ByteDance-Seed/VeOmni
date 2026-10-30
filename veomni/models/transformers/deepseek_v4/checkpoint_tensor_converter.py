@@ -352,7 +352,11 @@ def validate_deepseek_v4_export_quant_support(
     should_quantize: Callable[[str], bool] | None = None,
     enable_mtp: bool = False,
 ) -> None:
-    """Validate that SM90+ TileLang quantization is available when ``.scale`` keys will be quantized on export."""
+    """Validate that the export quantizers run on this GPU when ``.scale`` keys will be quantized on export.
+
+    FP8 weights need an SM90+ NVIDIA or AMD gfx942/gfx950 GPU; FP4 experts, read
+    from ``model.config.expert_dtype``, need an SM90+ NVIDIA GPU.
+    """
     if fqn_to_index_mapping is None and model is not None:
         fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
         if fqn_to_index_mapping is None:
@@ -362,7 +366,8 @@ def validate_deepseek_v4_export_quant_support(
     if not fqn_to_index_mapping:
         return
 
-    needs_quant = False
+    _quant_cfg, _fp8_block_size, expert_dtype, _has_quant = _extract_quant_config(getattr(model, "config", None))
+    needs_quant = needs_fp4 = False
     for origin in fqn_to_index_mapping:
         if (not enable_mtp and _is_mtp_checkpoint_key(origin)) or not origin.endswith(".weight"):
             continue
@@ -372,12 +377,16 @@ def validate_deepseek_v4_export_quant_support(
         if should_quantize is not None and not should_quantize(origin):
             continue
         needs_quant = True
-        break
+        if expert_dtype != "fp4":
+            break
+        if "ffn.experts." in origin:
+            needs_fp4 = True
+            break
 
     if needs_quant:
-        from veomni.models.transformers.deepseek_v4.export_quant import _require_tilelang_sm90
+        from veomni.models.transformers.deepseek_v4.export_quant import require_export_quantizers
 
-        _require_tilelang_sm90()
+        require_export_quantizers(fp4=needs_fp4)
 
 
 @lru_cache(maxsize=None)
@@ -697,7 +706,7 @@ class DeepseekV4CheckpointTensorConverter:
         fqn_to_index_mapping: Mapping[str, int] | None = None,
         should_quantize: Callable[[str], bool] | None = None,
     ) -> None:
-        """Fail before training or export if quantized ``.scale`` export is requested on a non-SM90 device."""
+        """Fail before training or export if quantized ``.scale`` export is requested on an unsupported GPU."""
         validate_deepseek_v4_export_quant_support(
             fqn_to_index_mapping,
             model=model,
