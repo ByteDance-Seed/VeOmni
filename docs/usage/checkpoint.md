@@ -49,6 +49,11 @@ Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
 a batch was yielded. Older cursors lack that phase and may resume with a
 different next batch; exact continuation from them requires an independently
 verified migration. Worker-mode dynamic batching uses a separate cursor path.
+When a `drop_last=True` one-shot source cannot restart, the loader drains
+complete buffered microbatches before failing or reaching the requested step
+count. Saving or restoring this exhausted-source cursor requires the source to
+implement both `state_dict` and `load_state_dict`; implicit pickle state alone
+is not a supported exact-resume contract for this case.
 With background prefetch enabled, exact resume of `drop_last=False` flush
 batches assumes consumers do not mutate yielded microbatches; prefetch can
 snapshot the cursor before such a mutation. Validate the loader and prefetch

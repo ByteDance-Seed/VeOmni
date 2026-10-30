@@ -272,3 +272,233 @@ def test_background_prefetch_resume_preserves_next_unmutated_group():
     resumed.load_state_dict(state)
     actual = [[sample["id"] for sample in batch] for batch in next(iter(resumed))]
     assert actual == expected
+
+
+def test_empty_source_fails_with_actionable_restart_error():
+    loader = DynamicBatchSizeDataLoader(iter(()), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    with pytest.raises(RuntimeError, match="exhausted.*could not restart"):
+        next(iter(loader))
+
+
+def test_exhausted_iterator_fails_before_replaying_a_sample():
+    sample = {"id": 7, "attention_mask": torch.ones(1, dtype=torch.int64)}
+    loader = DynamicBatchSizeDataLoader(
+        iter([sample]), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=2
+    )
+    iterator = iter(loader)
+    assert [item["id"] for item in next(iterator)[0]] == [7]
+    with pytest.raises(RuntimeError, match="exhausted.*could not restart"):
+        next(iterator)
+
+
+def test_restartable_finite_source_still_repeats_until_requested_length():
+    samples = [{"id": 7, "attention_mask": torch.ones(1, dtype=torch.int64)}]
+    loader = DynamicBatchSizeDataLoader(samples, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=2)
+    iterator = iter(loader)
+    assert [[item["id"] for item in next(iterator)[0]] for _ in range(2)] == [[7], [7]]
+
+
+def test_exhausted_source_drains_ready_buffer_before_error():
+    samples = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3)]
+    loader = DynamicBatchSizeDataLoader(
+        iter([samples]), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3
+    )
+    iterator = iter(loader)
+    assert [[item["id"] for item in next(iterator)[0]] for _ in range(3)] == [[1], [2], [3]]
+
+
+def test_resume_exhausted_source_drains_the_same_buffered_samples():
+    class OneBatch(_StatefulSamples):
+        def __next__(self):
+            if self.cursor:
+                raise StopIteration
+            self.cursor = 1
+            return [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3)]
+
+    def make_loader():
+        return DynamicBatchSizeDataLoader(OneBatch(), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3)
+
+    original = make_loader()
+    iterator = iter(original)
+    assert [item["id"] for item in next(iterator)[0]] == [1]
+    state = original.state_dict()
+    expected = [[item["id"] for item in next(iterator)[0]] for _ in range(2)]
+    resumed = make_loader()
+    resumed.load_state_dict(state)
+    actual = [[item["id"] for item in next(iter(resumed))[0]]]
+    actual.extend([[item["id"] for item in next(resumed)[0]]])
+    assert actual == expected == [[2], [3]]
+
+
+def test_exhausted_source_resume_preserves_gradient_accumulation_groups():
+    class OneBatch(_StatefulSamples):
+        def __next__(self):
+            if self.cursor:
+                raise StopIteration
+            self.cursor = 1
+            return [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3, 4)]
+
+    def make_loader():
+        return DynamicBatchSizeDataLoader(
+            OneBatch(), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), num_micro_batch=2, length=2
+        )
+
+    original = make_loader()
+    iterator = iter(original)
+    first = [[item["id"] for item in microbatch] for microbatch in next(iterator)]
+    state = original.state_dict()
+    expected = [[item["id"] for item in microbatch] for microbatch in next(iterator)]
+    resumed = make_loader()
+    resumed.load_state_dict(state)
+    actual = [[item["id"] for item in microbatch] for microbatch in next(iter(resumed))]
+    assert first == [[1], [2]]
+    assert actual == expected == [[3], [4]]
+
+
+def test_exhausted_source_does_not_repeat_a_stateful_readiness_check():
+    class ReservingStrategy:
+        def __init__(self):
+            self.pending = []
+            self.reserved = None
+
+        def put_item(self, item):
+            self.pending.append(item)
+
+        def is_ready_for_micro_batch(self):
+            if self.pending:
+                self.reserved = self.pending.pop(0)
+                return True
+            return False
+
+        def get_micro_batch(self, step):
+            return [self.reserved]
+
+        def empty(self):
+            return not self.pending
+
+    samples = [{"id": i} for i in (1, 2, 3)]
+    loader = DynamicBatchSizeDataLoader(iter([samples]), ReservingStrategy(), length=3)
+    iterator = iter(loader)
+    assert [[item["id"] for item in next(iterator)[0]] for _ in range(3)] == [[1], [2], [3]]
+
+
+def test_exhausted_source_with_unsupported_tail_fails_closed():
+    samples = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3)]
+    loader = DynamicBatchSizeDataLoader(
+        iter([samples]), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3, drop_last=False
+    )
+    iterator = iter(loader)
+    assert [item["id"] for item in next(iterator)[0]] == [1]
+    with pytest.raises(RuntimeError, match="exhausted.*could not restart"):
+        next(iterator)
+
+
+def test_exhausted_source_is_not_reopened_for_each_buffered_microbatch():
+    class OneBatch(_StatefulSamples):
+        def __init__(self):
+            super().__init__()
+            self.iter_calls = 0
+
+        def __iter__(self):
+            self.iter_calls += 1
+            return self
+
+        def __next__(self):
+            if self.cursor:
+                raise StopIteration
+            self.cursor = 1
+            return [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in range(10)]
+
+    source = OneBatch()
+    loader = DynamicBatchSizeDataLoader(source, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=10)
+    iterator = iter(loader)
+    assert [[item["id"] for item in next(iterator)[0]] for _ in range(10)] == [[i] for i in range(10)]
+    assert source.iter_calls == 2
+
+
+def test_resume_does_not_reopen_exhausted_one_shot_source():
+    class ClosedAfterRestart(_StatefulSamples):
+        def __init__(self):
+            super().__init__()
+            self.iter_calls = 0
+
+        def __iter__(self):
+            self.iter_calls += 1
+            if self.iter_calls > 2:
+                raise RuntimeError("source already closed")
+            return self
+
+        def __next__(self):
+            if self.cursor:
+                raise StopIteration
+            self.cursor = 1
+            return [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3)]
+
+        def state_dict(self):
+            return {"cursor": self.cursor, "iter_calls": self.iter_calls}
+
+        def load_state_dict(self, state):
+            self.cursor = state["cursor"]
+            self.iter_calls = state["iter_calls"]
+
+    def make_loader():
+        return DynamicBatchSizeDataLoader(
+            ClosedAfterRestart(), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3
+        )
+
+    original = make_loader()
+    iterator = iter(original)
+    assert [item["id"] for item in next(iterator)[0]] == [1]
+    assert [item["id"] for item in next(iterator)[0]] == [2]
+    state = original.state_dict()
+    assert state["_veomni_source_exhausted"] is True
+    resumed = make_loader()
+    resumed.load_state_dict(state)
+    assert [item["id"] for item in next(iter(resumed))[0]] == [3]
+
+
+def test_checkpoint_rejects_exhausted_source_without_state_protocol():
+    samples = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in (1, 2, 3)]
+    loader = DynamicBatchSizeDataLoader(
+        iter([samples]), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3
+    )
+    iterator = iter(loader)
+    assert [item["id"] for item in next(iterator)[0]] == [1]
+    assert [item["id"] for item in next(iterator)[0]] == [2]
+    with pytest.raises(RuntimeError, match="exhausted source.*state_dict.*load_state_dict"):
+        loader.state_dict()
+
+
+def test_exhausted_source_resume_preserves_next_epoch_iterator_state():
+    class EpochSource:
+        def __init__(self):
+            self.calls = 0
+
+        def __iter__(self):
+            self.calls += 1
+            ids = {1: [1, 2, 3], 2: [], 3: [100], 4: [200]}.get(self.calls, [])
+            return iter([[{"id": i, "attention_mask": torch.ones(1)} for i in ids]] if ids else [])
+
+        def state_dict(self):
+            return {"calls": self.calls}
+
+        def load_state_dict(self, state):
+            self.calls = state["calls"]
+
+    def make_loader():
+        return DynamicBatchSizeDataLoader(
+            EpochSource(), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=3
+        )
+
+    def value(iterator):
+        return next(iterator)[0][0]["id"]
+
+    original = make_loader()
+    iterator = iter(original)
+    assert [value(iterator), value(iterator)] == [1, 2]
+    state = original.state_dict()
+    assert state["_veomni_source_exhausted"] is True
+    resumed = make_loader()
+    resumed.load_state_dict(state)
+    assert value(iter(resumed)) == value(iterator) == 3
+    assert value(iter(original)) == value(iter(resumed)) == 100

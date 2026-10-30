@@ -287,6 +287,7 @@ class DynamicBatchSizeDataLoader:
         self._resume = False
         self._checkpoint_phase = "running"
         self._checkpoint_flush_micro_batch = None
+        self._checkpoint_source_exhausted = False
         self._batch_data_iter: Generator
 
         if length > 0:
@@ -307,6 +308,7 @@ class DynamicBatchSizeDataLoader:
             self.step = 0
             self._checkpoint_phase = "running"
             self._checkpoint_flush_micro_batch = None
+            self._checkpoint_source_exhausted = False
             self._data_iter = iter(self._dataloader)
             self._batch_data_iter = self.batch_data_generator()
         self._resume = False
@@ -324,13 +326,15 @@ class DynamicBatchSizeDataLoader:
             return
         after_yield = self._checkpoint_phase == "after_yield"
         self._checkpoint_phase = "running"
+        ready_after_exhaustion = False
 
         while True:
             if not after_yield:
                 if self._length and self.step >= self._length:
                     return
 
-                if self.batching_strategy.is_ready_for_micro_batch():
+                if ready_after_exhaustion or self.batching_strategy.is_ready_for_micro_batch():
+                    ready_after_exhaustion = False
                     micro_batch = self.batching_strategy.get_micro_batch(self.step)
                     if self._collate_fn:
                         micro_batch = self._collate_fn(micro_batch)
@@ -343,6 +347,18 @@ class DynamicBatchSizeDataLoader:
                         batch = []
             after_yield = False
 
+            if self._checkpoint_source_exhausted:
+                if self.step >= self._length:
+                    self._checkpoint_phase = "done"
+                    return
+                if self._drop_last and self.batching_strategy.is_ready_for_micro_batch():
+                    ready_after_exhaustion = True
+                    continue
+                raise RuntimeError(
+                    "Dynamic batching source exhausted and could not restart before the requested "
+                    "number of steps; check for an empty or non-restartable input."
+                )
+
             try:
                 processing_item = next(self._data_iter)
             except Exception as e:
@@ -350,7 +366,19 @@ class DynamicBatchSizeDataLoader:
                     if self.step < self._length:
                         # call iter until reach length
                         self._data_iter = iter(self._dataloader)
-                        processing_item = next(self._data_iter)
+                        try:
+                            processing_item = next(self._data_iter)
+                        except StopIteration as exc:
+                            self._checkpoint_source_exhausted = True
+                            if self._drop_last and self.batching_strategy.is_ready_for_micro_batch():
+                                # A one-shot source can end while enough samples
+                                # remain buffered for another complete microbatch.
+                                ready_after_exhaustion = True
+                                continue
+                            raise RuntimeError(
+                                "Dynamic batching source exhausted and could not restart before the requested "
+                                "number of steps; check for an empty or non-restartable input."
+                            ) from exc
                     elif not self._drop_last and not self.batching_strategy.empty():
                         yield from self._flush_remaining(batch, None)
                         return
@@ -390,6 +418,13 @@ class DynamicBatchSizeDataLoader:
         yield batch
 
     def state_dict(self):
+        if self._checkpoint_source_exhausted and not (
+            callable(getattr(self._dataloader, "state_dict", None))
+            and callable(getattr(self._dataloader, "load_state_dict", None))
+        ):
+            raise RuntimeError(
+                "Cannot checkpoint an exhausted source without an explicit state_dict/load_state_dict protocol."
+            )
         # save state
         state = self.__dict__.copy()
         # remove internal fields
@@ -397,6 +432,7 @@ class DynamicBatchSizeDataLoader:
             if k.startswith("_"):
                 del state[k]
         state["_veomni_resume_phase"] = self._checkpoint_phase
+        state["_veomni_source_exhausted"] = self._checkpoint_source_exhausted
         if self._checkpoint_phase == "flushing":
             state["_veomni_flush_micro_batch"] = self._checkpoint_flush_micro_batch
 
@@ -415,6 +451,16 @@ class DynamicBatchSizeDataLoader:
     def load_state_dict(self, state: Dict[str, Any]):
         state = copy.deepcopy(state)
         self._checkpoint_phase = state.pop("_veomni_resume_phase", None)
+        self._checkpoint_source_exhausted = state.pop("_veomni_source_exhausted", False)
+        if type(self._checkpoint_source_exhausted) is not bool:
+            raise ValueError("invalid dynamic loader source-exhausted state")
+        if self._checkpoint_source_exhausted and not (
+            callable(getattr(self._dataloader, "state_dict", None))
+            and callable(getattr(self._dataloader, "load_state_dict", None))
+        ):
+            raise RuntimeError(
+                "Cannot restore an exhausted source without an explicit state_dict/load_state_dict protocol."
+            )
         if self._checkpoint_phase is None:
             logger.warning("Legacy dynamic loader cursor lacks its post-yield phase; exact resume is not guaranteed.")
             self._checkpoint_phase = "running"
@@ -442,7 +488,7 @@ class DynamicBatchSizeDataLoader:
             )
             del state["batching_strategy_state"]
 
-        self._data_iter = iter(self._dataloader)
+        self._data_iter = iter(()) if self._checkpoint_source_exhausted else iter(self._dataloader)
         self._batch_data_iter = self.batch_data_generator()
 
     def set_epoch(self, epoch: int) -> None:
