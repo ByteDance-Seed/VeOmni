@@ -87,8 +87,8 @@ def _step(model, optimizer, step):
         tokens = torch.randint(0, model.config.vocab_size, (1, length), generator=generator).to(get_device_type())
         positions = torch.arange(length, device=tokens.device).unsqueeze(0)
         output = model(input_ids=tokens, position_ids=positions, labels=tokens, use_cache=False)
-        # The VeOmni loss is per-token; the final causal target is ignored.
-        loss = output.loss.sum() / (2 * (length - 1))
+        # The eager loss is already a token mean; average the two microbatches.
+        loss = output.loss / 2
         assert torch.isfinite(loss)
         loss.backward()
         losses.append(loss.detach().cpu())
