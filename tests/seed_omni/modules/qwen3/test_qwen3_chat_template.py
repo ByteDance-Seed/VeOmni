@@ -207,6 +207,44 @@ def test_qwen3_llm_generate_rejects_ulysses_sequence_parallel(monkeypatch):
         llm.generate(conversation_list=[ConversationItem(type="text", value="hi", role="user")])
 
 
+def test_qwen3_llm_decode_keeps_the_prompt_attention_mask(monkeypatch):
+    """Masked prompt positions stay masked once their keys are in the cache."""
+    import veomni.models.seed_omni.modules.base.llm_packing as llm_packing
+
+    monkeypatch.setattr(llm_packing, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation="eager"),
+        )
+    )
+
+    seen: list[torch.Tensor | None] = []
+    real_forward = llm.forward
+
+    def record_forward(*, attention_mask=None, **kwargs):
+        seen.append(None if attention_mask is None else attention_mask.detach().clone())
+        return real_forward(attention_mask=attention_mask, **kwargs)
+
+    llm.forward = record_forward
+
+    conversation = [
+        ConversationItem(
+            type="text",
+            value=torch.randn(4, 32),
+            role="user",
+            meta={"attention_mask": torch.tensor([1, 1, 0, 0])},
+        )
+    ]
+    llm.generate(conversation)  # prefill
+    llm.generate(conversation)  # first decode
+
+    assert seen[0].tolist() == [[1, 1, 0, 0]]
+    assert seen[1].tolist() == [[1, 1, 0, 0, 1]]
+
+
 @pytest.mark.parametrize("attn_impl", ["eager", "sdpa", "veomni_sdpa"])
 def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatch, attn_impl):
     import copy

@@ -100,6 +100,9 @@ class SimpleArGenerationMixin:
     """
 
     _past_key_values: Any
+    # Prompt mask carried across decode steps: the cached keys include masked
+    # prompt positions, so dropping it would make those keys visible again.
+    _generation_attention_mask: torch.Tensor | None = None
 
     def reset_local_inference_state(self) -> None:
         return
@@ -107,6 +110,7 @@ class SimpleArGenerationMixin:
     def reset_global_inference_state(self) -> None:
         self.reset_local_inference_state()
         self._past_key_values = None
+        self._generation_attention_mask = None
 
     def generate(
         self,
@@ -128,6 +132,7 @@ class SimpleArGenerationMixin:
                 position_ids
             )
 
+            self._generation_attention_mask = attention_mask
             outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -158,7 +163,7 @@ class SimpleArGenerationMixin:
 
         outputs = self.forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=None,
+            attention_mask=self._extend_generation_attention_mask(),
             past_key_values=self._past_key_values,
             use_cache=True,
         )
@@ -173,6 +178,15 @@ class SimpleArGenerationMixin:
             )
         )
         return {"conversation_list": conversation_list}
+
+    def _extend_generation_attention_mask(self) -> torch.Tensor | None:
+        """Extend the prompt mask by one valid position for each decoded token."""
+        mask = self._generation_attention_mask
+        if mask is None:
+            return None
+        mask = torch.cat([mask, mask.new_ones(1, 1)], dim=1)
+        self._generation_attention_mask = mask
+        return mask
 
     @staticmethod
     def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
