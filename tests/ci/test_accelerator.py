@@ -222,7 +222,7 @@ def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monk
     import json
     from types import SimpleNamespace
 
-    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
+    from scripts.ci.accelerator.launch_plan import XPU_HIDDEN_MASK, RunnerCapabilities
     from scripts.ci.accelerator.runtime.devices import child_environment, probe
     from veomni.utils import device
 
@@ -230,7 +230,7 @@ def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monk
     worker = child_environment(caps, ["5"], environ={"ZE_AFFINITY_MASK": "0,1"})
     assert worker["ZE_AFFINITY_MASK"] == "5"
     cpu = child_environment(caps, [], cpu=True, environ={"ZE_AFFINITY_MASK": "2,5"})
-    assert cpu["ZE_AFFINITY_MASK"] == ""
+    assert cpu["ZE_AFFINITY_MASK"] == XPU_HIDDEN_MASK
 
     monkeypatch.setenv("ZE_AFFINITY_MASK", "2,5")
     monkeypatch.setattr(device, "get_device_type", lambda: "xpu")
@@ -242,6 +242,10 @@ def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monk
     output = tmp_path / "capabilities.json"
     probe(str(output))
     assert json.loads(output.read_text()) == {"backend": "xpu", "devices": ["2", "5"]}
+
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "")  # Level Zero treats an empty mask as unset.
+    probe(str(output))
+    assert json.loads(output.read_text()) == {"backend": "xpu", "devices": ["0", "1"]}
 
 
 def test_xpu_launch_validation_uses_affinity_mask(monkeypatch, tmp_path):
