@@ -366,20 +366,489 @@ def test_strict_cuda_precision_scope_preserves_inheritance(parent):
 import torch
 from veomni.optim.qwen38_muon import _strict_matmul
 torch.backends.fp32_precision = PARENT
+before = torch.backends.cuda.matmul.fp32_precision
 with _strict_matmul('cuda'):
-    assert torch.backends.cuda.matmul.fp32_precision == 'ieee'
+    assert torch.backends.cuda.matmul.fp32_precision == before
 torch.backends.fp32_precision = 'tf32'
 assert torch.backends.cuda.matmul.fp32_precision == 'tf32'
 """.replace("PARENT", repr(parent))
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
 
-def test_strict_cuda_precision_scope_restores_legacy_tf32(monkeypatch):
+def test_strict_cuda_precision_scope_rejects_legacy_tf32_without_mutation(monkeypatch):
     backend = types.SimpleNamespace(allow_tf32=True)
     monkeypatch.setattr(torch.backends.cuda, "matmul", backend)
-    with module._strict_matmul("cuda"):
-        assert backend.allow_tf32 is False
+    with pytest.raises(RuntimeError, match="IEEE FP32"):
+        with module._strict_matmul("cuda"):
+            pass
     assert backend.allow_tf32 is True
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "torch.backends.fp32_precision = 'tf32'",
+        "torch.backends.cuda.matmul.fp32_precision = 'tf32'",
+        "torch.set_float32_matmul_precision('high')",
+        "torch.set_float32_matmul_precision('medium')",
+        "torch.set_float32_matmul_precision('medium'); torch.backends.cuda.matmul.fp32_precision = 'none'",
+    ],
+)
+def test_cuda_precision_preflight_rejects_unsafe_policy_without_mutating_it(setup):
+    code = """
+import torch
+from veomni.optim.qwen38_muon import _check_cuda_fp32_policy
+SETUP
+before = torch.backends.cuda.matmul.fp32_precision
+try:
+    _check_cuda_fp32_policy()
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('unsupported policy was accepted')
+assert torch.backends.cuda.matmul.fp32_precision == before
+""".replace("SETUP", setup)
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+def test_cuda_precision_preflight_rejects_cublas_override(monkeypatch):
+    monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    with pytest.raises(RuntimeError, match="forced cuBLAS TF32"):
+        module._check_cuda_fp32_policy()
+
+
+def test_cuda_precision_preflight_fails_before_adam_or_muon_updates(monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    model = torch.nn.Module()
+    model.first = torch.nn.Parameter(torch.tensor([1.0]))
+    model.second = torch.nn.Parameter(torch.ones(2, 2))
+    model.first.grad = torch.ones_like(model.first)
+    model.second.grad = torch.ones_like(model.second)
+    adam = torch.optim.AdamW([model.first], lr=0.01)
+    muon = implementation.Qwen38MuonAdamW(
+        [{"params": [model.second], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+    )
+    combined = factory.MultiOptimizer(model, {"adam": adam, "muon": muon}, ["adam", "muon"])
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+
+    def reject():
+        raise RuntimeError("unsafe test precision")
+
+    monkeypatch.setattr(implementation, "_check_cuda_fp32_policy", reject)
+    before = [p.detach().clone() for p in model.parameters()]
+    with pytest.raises(RuntimeError, match="unsafe test precision"):
+        combined.step()
+    assert all(torch.equal(p, saved) for p, saved in zip(model.parameters(), before, strict=True))
+    assert not adam.state and not muon.state
+
+
+def test_cuda_precision_preflight_rejects_child_step_hook_before_any_update(monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.tensor([1.0]))
+    model.weight.grad = torch.ones_like(model.weight)
+    adam = torch.optim.AdamW([model.weight], lr=0.01)
+    calls = []
+    adam.register_step_pre_hook(lambda *_: calls.append("executed"))
+    combined = factory.MultiOptimizer(model, {"adam": adam}, ["adam"], qwen38_cuda_guard=True)
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(implementation, "_check_cuda_fp32_policy", lambda: None)
+    with pytest.raises(RuntimeError, match="step hooks"):
+        combined.step()
+    assert not calls and not adam.state
+    assert torch.equal(model.weight, torch.tensor([1.0]))
+
+
+def test_direct_cuda_preflight_runs_before_pytorch_step_hooks(monkeypatch):
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.grad = torch.ones_like(param)
+    opt = make_optimizer(param, [("muon", 0, 2)])
+    calls = []
+
+    def mutate(*_):
+        calls.append(True)
+        with torch.no_grad():
+            param.add_(10)
+
+    opt.register_step_pre_hook(mutate)
+    monkeypatch.setattr(module, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(module, "_check_cuda_fp32_policy", lambda: None)
+    with pytest.raises(RuntimeError, match="step hooks"):
+        opt.step()
+    assert not calls and not opt.state
+    assert torch.equal(param, torch.ones_like(param))
+
+
+def test_direct_cuda_preflight_runs_before_global_step_hook(monkeypatch):
+    from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.grad = torch.ones_like(param)
+    opt = make_optimizer(param, [("muon", 0, 2)])
+    calls = []
+    handle = register_optimizer_step_pre_hook(lambda *_: calls.append(True))
+    try:
+        monkeypatch.setattr(module, "_optimizer_uses_cuda", lambda _: True)
+        monkeypatch.setattr(module, "_check_cuda_fp32_policy", lambda: None)
+        with pytest.raises(RuntimeError, match="global optimizer step hooks"):
+            opt.step()
+    finally:
+        handle.remove()
+    assert not calls and not opt.state
+    assert torch.equal(param, torch.ones_like(param))
+
+
+def test_cuda_preflight_rejects_custom_child_before_its_step(monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    class CustomAdam(torch.optim.AdamW):
+        def step(self, closure=None):
+            raise AssertionError("custom step must not execute")
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(1))
+    model.weight.grad = torch.ones_like(model.weight)
+    adam = CustomAdam([model.weight])
+    combined = factory.MultiOptimizer(model, {"adam": adam}, ["adam"], qwen38_cuda_guard=True)
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(implementation, "_check_cuda_fp32_policy", lambda: None)
+    with pytest.raises(RuntimeError, match="custom optimizer children"):
+        combined.step()
+    assert not adam.state and torch.equal(model.weight, torch.ones(1))
+
+
+def test_npu_precision_scope_still_restores_hf32(monkeypatch):
+    from contextlib import nullcontext
+
+    backend = types.SimpleNamespace(allow_hf32=True)
+    monkeypatch.setattr(torch, "npu", types.SimpleNamespace(matmul=backend), raising=False)
+    monkeypatch.setattr(torch, "autocast", lambda **kwargs: nullcontext())
+    with module._strict_matmul("npu"):
+        assert backend.allow_hf32 is False
+    assert backend.allow_hf32 is True
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_multioptimizer_direct_load_does_not_run_a_synthetic_cuda_step(monkeypatch, compiled):
+    import copy
+
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    def make():
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.ones(2, 2))
+        if compiled:
+            model = torch.compile(model, backend="eager")
+        opt = implementation.Qwen38MuonAdamW(
+            [{"params": [model.weight], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+        )
+        combined = factory.MultiOptimizer(model, {"muon": opt}, ["muon"])
+        return model, opt, combined
+
+    source, source_opt, source_combined = make()
+    source.weight.grad = torch.full_like(source.weight, 0.5)
+    source_combined.step()
+    saved = copy.deepcopy(source_combined.state_dict(for_load=False))
+    target, target_opt, target_combined = make()
+    with torch.no_grad():
+        target.weight.copy_(source.weight)
+    before = target.weight.detach().clone()
+    hooks = []
+    target_opt.register_step_pre_hook(lambda *_: hooks.append(True))
+    monkeypatch.setattr(implementation, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+
+    def unexpected_step(*args, **kwargs):
+        raise AssertionError("checkpoint load must not synthesize an optimizer step")
+
+    monkeypatch.setattr(implementation, "_cuda_step_preflight", unexpected_step)
+    target_combined.load_state_dict(saved)
+    assert not hooks
+    assert torch.equal(target.weight, before)
+    for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            target_opt.state[target.weight][key], source_opt.state[source.weight][key], rtol=0, atol=0
+        )
+    monkeypatch.undo()
+    source.weight.grad = torch.full_like(source.weight, 0.25)
+    target.weight.grad = source.weight.grad.clone()
+    source_combined.step()
+    target_combined.step()
+    torch.testing.assert_close(target.weight, source.weight, rtol=0, atol=0)
+    assert hooks == [True]
+
+
+def test_cuda_subclass_override_cannot_run_before_outer_preflight(monkeypatch):
+    from functools import wraps
+
+    make_optimizer(torch.nn.Parameter(torch.ones(2, 2)), [("muon", 0, 2)])
+
+    class Child(module.Qwen38MuonAdamW):
+        @wraps(module.Qwen38MuonAdamW.step)
+        def step(self, *args, **kwargs):
+            with torch.no_grad():
+                self.param_groups[0]["params"][0].add_(10)
+            return super().step(*args, **kwargs)
+
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.grad = torch.ones_like(param)
+    opt = Child([{"params": [param], "qwen38_recipe": module.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}])
+    monkeypatch.setattr(module, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(module, "_check_cuda_fp32_policy", lambda: None)
+    with pytest.raises(RuntimeError, match="custom optimizer children"):
+        opt.step()
+    assert not opt.state and torch.equal(param, torch.ones_like(param))
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_cuda_closure_is_rejected_before_execution_or_update(monkeypatch, positional):
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.grad = torch.ones_like(param)
+    opt = make_optimizer(param, [("muon", 0, 2)])
+    called = []
+
+    def closure():
+        called.append(True)
+
+    monkeypatch.setattr(module, "_optimizer_uses_cuda", lambda _: True)
+    monkeypatch.setattr(module, "_check_cuda_fp32_policy", lambda: None)
+    with pytest.raises(RuntimeError, match="closures"):
+        if positional:
+            opt.step(closure)
+        else:
+            opt.step(closure=closure)
+    assert not called and not opt.state and torch.equal(param, torch.ones_like(param))
+
+
+@pytest.mark.parametrize("failure", [None, "partial", "missing_group", "pre_hook", "post_hook"])
+def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure, monkeypatch):
+    import copy
+
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def make():
+        model = torch.nn.Module()
+        model.a = torch.nn.Parameter(torch.ones(2, 2))
+        model.b = torch.nn.Parameter(torch.ones(2, 2))
+        groups = [
+            {"params": [p], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}
+            for p in (model.a, model.b)
+        ]
+        opt = implementation.Qwen38MuonAdamW(groups)
+        return model, opt, MultiOptimizer(model, {"muon": opt}, ["muon"])
+
+    source, source_opt, source_combined = make()
+    source.a.grad = torch.full_like(source.a, 0.5)
+    source_combined.step()
+    saved = copy.deepcopy(source_combined.state_dict(for_load=False))
+    target, target_opt, target_combined = make()
+    target.a.grad = torch.full_like(target.a, 0.25)
+    target_combined.step()
+    before_state = copy.deepcopy(target_opt.state_dict())
+    if failure == "partial":
+        del saved["state.a.exp_avg"]
+    elif failure == "missing_group":
+        del saved["param_groups.a.qwen38_plan"]
+    elif failure == "pre_hook":
+        target_opt.register_load_state_dict_pre_hook(lambda *_: None)
+    elif failure == "post_hook":
+
+        def post_hook(opt):
+            opt.state[target.b] = {
+                "step": torch.tensor(17.0),
+                "master_weight": target.b.detach().clone(),
+                "exp_avg": torch.zeros_like(target.b),
+                "exp_avg_sq": torch.zeros_like(target.b),
+            }
+
+        target_opt.register_load_state_dict_post_hook(post_hook)
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+
+    if failure:
+        with pytest.raises((RuntimeError, KeyError)):
+            target_combined.load_state_dict(saved)
+        assert target_opt.state_dict()["param_groups"] == before_state["param_groups"]
+        assert not target_opt.state.get(target.b)
+        for key in before_state["state"][0]:
+            torch.testing.assert_close(target_opt.state[target.a][key], before_state["state"][0][key], rtol=0, atol=0)
+        return
+
+    with torch.no_grad():
+        target.a.copy_(source.a)
+        target.b.copy_(source.b)
+    target_combined.load_state_dict(saved)
+    assert not target_opt.state.get(target.b)
+    monkeypatch.undo()
+    source.a.grad = target.a.grad = None
+    source.b.grad = torch.full_like(source.b, 0.25)
+    target.b.grad = source.b.grad.clone()
+    source_combined.step()
+    target_combined.step()
+    torch.testing.assert_close(target.b, source.b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["second_pre_hook", "second_missing_group"])
+def test_multioptimizer_cuda_load_is_atomic_across_children(failure, monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    def make():
+        model = torch.nn.Module()
+        model.a = torch.nn.Parameter(torch.ones(2, 2))
+        model.b = torch.nn.Parameter(torch.ones(2, 2))
+        opts = {
+            name: implementation.Qwen38MuonAdamW(
+                [{"params": [param], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+            )
+            for name, param in (("a", model.a), ("b", model.b))
+        }
+        return model, opts, factory.MultiOptimizer(model, opts, ["a", "b"])
+
+    source, _, source_combined = make()
+    source.a.grad = torch.ones_like(source.a)
+    source.b.grad = torch.ones_like(source.b)
+    source_combined.step()
+    source_combined.step()
+    saved = copy.deepcopy(source_combined.state_dict(for_load=False))
+    target, opts, target_combined = make()
+    target.a.grad = torch.ones_like(target.a)
+    target.b.grad = torch.ones_like(target.b)
+    target_combined.step()
+    old = {name: copy.deepcopy(opt.state_dict()) for name, opt in opts.items()}
+    if failure == "second_pre_hook":
+        opts["b"].register_load_state_dict_pre_hook(lambda *_: None)
+    else:
+        del saved["param_groups.b.qwen38_plan"]
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    with pytest.raises((RuntimeError, KeyError)):
+        target_combined.load_state_dict(saved)
+    for name, opt in opts.items():
+        assert opt.state_dict()["param_groups"] == old[name]["param_groups"]
+        for key in old[name]["state"][0]:
+            torch.testing.assert_close(opt.state_dict()["state"][0][key], old[name]["state"][0][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["adamw", "amsgrad", "offload", "full", "master"])
+def test_multioptimizer_cuda_load_initializes_adam_without_synthetic_step(monkeypatch, kind):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    def make(*, target=False):
+        model = torch.nn.Module()
+        model.a = torch.nn.Parameter(torch.ones(2, 2))
+        model.b = torch.nn.Parameter(torch.ones(2, 2))
+        model.c = torch.nn.Parameter(torch.ones(2, 2))
+        qwen = implementation.Qwen38MuonAdamW(
+            [{"params": [model.a], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+        )
+        if kind == "adamw":
+            adam = torch.optim.AdamW([model.b, model.c])
+        elif kind == "amsgrad":
+            adam = torch.optim.AdamW([model.b, model.c], amsgrad=not target)
+        else:
+            cls = {
+                "offload": factory.CPUOffloadAdamW,
+                "full": factory.FullFP32AdamW,
+                "master": factory.MasterFP32AdamW,
+            }[kind]
+            adam = cls([model.b, model.c])
+        return model, adam, factory.MultiOptimizer(model, {"qwen": qwen, "adam": adam}, ["qwen", "adam"])
+
+    source, source_adam, source_combined = make()
+    source.a.grad = torch.ones_like(source.a)
+    source.b.grad = torch.ones_like(source.b)
+    for _ in range(3):
+        source_combined.step()
+    saved = copy.deepcopy(source_combined.state_dict(for_load=False))
+    target, target_adam, target_combined = make(target=True)
+    with torch.no_grad():
+        target.a.copy_(source.a)
+        target.b.copy_(source.b)
+        target.c.copy_(source.c)
+    target.b.grad = torch.ones_like(target.b)
+    before = target.b.detach().clone()
+    hooks = []
+    handle = target_adam.register_step_pre_hook(lambda *_: hooks.append(True))
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    target_combined.load_state_dict(saved)
+    assert not hooks and torch.equal(target.b, before)
+    assert not target_adam.state.get(target.c)
+    for key in source_adam.state[source.b]:
+        torch.testing.assert_close(target_adam.state[target.b][key], source_adam.state[source.b][key], rtol=0, atol=0)
+    handle.remove()
+    monkeypatch.undo()
+    target.a.grad = source.a.grad.clone()
+    target_combined.step()
+    source_combined.step()
+    torch.testing.assert_close(target.b, source.b, rtol=0, atol=0)
+
+
+def test_multioptimizer_cuda_checkpoint_rejects_empty_non_muon_child_before_step(monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    model = torch.nn.Module()
+    model.a = torch.nn.Parameter(torch.ones(2, 2))
+    model.b = torch.nn.Parameter(torch.ones(2, 2))
+    qwen = implementation.Qwen38MuonAdamW(
+        [{"params": [model.a], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+    )
+    adam = torch.optim.AdamW([model.b])
+    hooks = []
+    adam.register_step_pre_hook(lambda *_: hooks.append(True))
+    combined = factory.MultiOptimizer(model, {"qwen": qwen, "adam": adam}, ["qwen", "adam"])
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    with pytest.raises(RuntimeError, match="initialized non-Muon child state"):
+        combined.state_dict(for_load=False)
+    with pytest.raises(RuntimeError, match="initialized non-Muon child state"):
+        combined.state_dict(for_load=True)
+    assert not hooks and not adam.state and torch.equal(model.b, torch.ones_like(model.b))
+
+
+def test_multioptimizer_cuda_load_rejects_empty_group_without_synthetic_step(monkeypatch):
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(2, 2))
+    qwen = implementation.Qwen38MuonAdamW(
+        [{"params": [model.weight], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+    )
+    empty = torch.optim.AdamW([{"params": []}])
+    hooks = []
+    empty.register_step_pre_hook(lambda *_: hooks.append(True))
+    combined = factory.MultiOptimizer(model, {"qwen": qwen, "empty": empty}, ["qwen", "empty"])
+    monkeypatch.setattr(factory, "_optimizer_uses_cuda", lambda _: True)
+    with pytest.raises(RuntimeError, match="empty parameter group"):
+        combined.load_state_dict({"param_groups.weight.lr": 0.001})
+    assert not hooks and torch.equal(model.weight, torch.ones_like(model.weight))
+
+
+def test_non_cuda_malformed_layout_does_not_clear_zero_state_resume():
+    from types import SimpleNamespace
+
+    from torch.distributed.tensor import Shard
+
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    model._fqn2spec_info = {"weight": SimpleNamespace(placement=Shard(0), fsdp_shard_dim=0)}
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer.state[model.weight]["saved"] = torch.tensor(17.0)
+    optimizer._veomni_resume_zero_optimizer_state = True
+    wrapper = OptimizerState(model, optimizer, parallel_state=SimpleNamespace(dp_mode="fsdp2"), load=True)
+    with pytest.raises(RuntimeError, match="Unversioned same-dimension"):
+        wrapper.load_state_dict({})
+    assert optimizer.state[model.weight]["saved"].item() == 17
+    assert optimizer._veomni_resume_zero_optimizer_state
 
 
 def test_polar_disables_ambient_autocast():

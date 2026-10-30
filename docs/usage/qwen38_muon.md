@@ -37,12 +37,31 @@ to `type: muon` and do not change this recipe. `lr`, `betas`, weight decay and
 scheduler fields still apply. Muon and AdamW share the configured SFT LR; the
 recipe does not import the pretraining LR from the paper.
 
-On CUDA, this candidate preserves inherited default/`ieee` matmul precision
-while disabling down-conversion for Muon. PyTorch's new-API TF32 setting and
-legacy `medium` precision cannot yet be safely restored by this scope; use an
-explicit `torch.backends.cuda.matmul.fp32_precision = "ieee"` setting in a
-fresh process without legacy precision/`allow_tf32` settings for Muon until
-those modes are supported. Ascend uses its separate `allow_hf32` path.
+On CUDA, matmul must already use IEEE FP32 (`highest`, TF32 disabled); unsafe
+or mixed precision policies are rejected before any optimizer child updates.
+The optimizer does not change process-wide CUDA precision flags. A distributed
+CUDA optimizer requires the explicit training process group; the framework's
+optimizer factory supplies it for `TP=PP=1` and requires the group to cover the
+whole training world. Directly constructed distributed optimizers must pass
+`cuda_precision_group`, and custom `MultiOptimizer` users must pass the same
+complete communication domain and enable `qwen38_cuda_guard` on every
+participant. A custom subgroup is valid only for an independent training
+domain with no dependent collectives outside it. CUDA Muon steps do not support
+closures or optimizer step hooks, which could change precision after the
+preflight. For a `MultiOptimizer`, the only supported exact child types are
+`Qwen38MuonAdamW`, `torch.optim.AdamW`, `CPUOffloadAdamW`, `FullFP32AdamW` and
+`MasterFP32AdamW`; subclasses are not supported. Do not change process-wide
+matmul settings from another thread during an optimizer step.
+Direct CUDA `MultiOptimizer` checkpoint loading rejects user load hooks to
+avoid partial restoration across children; the framework's internal DCP
+filter remains supported. Generating CUDA DCP templates fails closed when a
+non-Muon child has uninitialized optimizer state; that case requires an
+explicit state migration before checkpoint save or resume.
+Use the framework's coordinated DCP wrapper for distributed CUDA checkpoint
+operations; calling the underlying `MultiOptimizer` directly does not coordinate
+errors across ranks.
+Ascend uses its separate `allow_hf32` path and does not perform this CUDA
+preflight.
 
 ## Offload and distributed semantics
 

@@ -9,15 +9,17 @@ this first implementation prioritizes safe resume over CPU memory savings.
 
 import json
 import math
+import os
 import time
 from contextlib import contextmanager
+from functools import wraps
 
 import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from .cpu_offload_adamw import CPUOffloadAdamW
-from .master_fp32_adamw import _local
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW, _local
 
 
 # Generated with the Polar Express author's optimal_composition(l=1e-3,
@@ -39,6 +41,71 @@ POLAR_EXPRESS_8 = (
 RECIPE = "qwen38-polar8-fp32-v1"
 
 
+def _check_cuda_fp32_policy():
+    """Fail closed unless CUDA matmul is already configured for IEEE FP32.
+
+    PyTorch's legacy and hierarchical precision APIs cannot always be mixed,
+    and their getters do not reveal whether a value was inherited. Do not
+    mutate a process-wide precision policy that cannot be restored faithfully.
+    """
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1":
+        raise RuntimeError("Qwen3.8 Muon requires IEEE FP32; forced cuBLAS TF32 is unsupported")
+    try:
+        backend = torch.backends.cuda.matmul
+        precision = getattr(backend, "fp32_precision", None)
+        allow_tf32 = backend.allow_tf32
+        mode = torch.get_float32_matmul_precision()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Qwen3.8 Muon cannot safely inspect mixed CUDA matmul precision APIs; "
+            "configure IEEE FP32 in a fresh process"
+        ) from exc
+    if precision not in (None, "none", "ieee") or allow_tf32 or mode != "highest":
+        raise RuntimeError("Qwen3.8 Muon requires CUDA matmul IEEE FP32 (highest), without TF32")
+
+
+def _cuda_step_preflight(optimizers, group, *, closure=False):
+    """Validate policy on every participant before any child optimizer step."""
+    error = None
+    try:
+        _check_cuda_fp32_policy()
+        import torch.optim.optimizer as optimizer_module
+
+        if (
+            closure
+            or getattr(optimizer_module, "_global_optimizer_pre_hooks", None)
+            or getattr(optimizer_module, "_global_optimizer_post_hooks", None)
+        ):
+            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support closures or global optimizer step hooks")
+        if any(
+            getattr(opt, "_optimizer_step_pre_hooks", None) or getattr(opt, "_optimizer_step_post_hooks", None)
+            for opt in optimizers
+        ):
+            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support optimizer step hooks")
+        supported_children = (Qwen38MuonAdamW, torch.optim.AdamW, CPUOffloadAdamW, FullFP32AdamW, MasterFP32AdamW)
+        if any(type(opt) not in supported_children for opt in optimizers):
+            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support custom optimizer children")
+    except Exception as exc:
+        error = exc
+
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    ):
+        if group is None:
+            raise RuntimeError("Distributed Qwen3.8 Muon CUDA steps require an explicit precision process group")
+        from veomni.utils.dist_utils import raise_if_any_rank_failed
+
+        raise_if_any_rank_failed(error, "checking Qwen3.8 Muon CUDA precision", group=group)
+    elif error is not None:
+        raise error
+
+
+def _optimizer_uses_cuda(optimizer):
+    return any(param.device.type == "cuda" for group in optimizer.param_groups for param in group["params"])
+
+
 @contextmanager
 def _strict_matmul(device_type):
     """Disallow autocast and hardware down-conversion during NS only."""
@@ -47,16 +114,7 @@ def _strict_matmul(device_type):
     if device_type == "npu":
         backend, option = torch.npu.matmul, "allow_hf32"
     elif device_type == "cuda":
-        backend = torch.backends.cuda.matmul
-        precision = getattr(backend, "fp32_precision", None)
-        if precision == "ieee":
-            # Avoid pinning an explicit override when this value is inherited.
-            backend = None
-        elif precision == "none":
-            # Restoring "none" keeps future parent precision changes visible.
-            option = "fp32_precision"
-        else:
-            option = "allow_tf32"
+        _check_cuda_fp32_policy()
     previous = getattr(backend, option) if backend is not None else None
     try:
         if backend is not None:
@@ -205,10 +263,38 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
 
     requires_exact_recipe = True
 
+    def _patch_step_function(self):
+        """Place CUDA preflight outside PyTorch's optimizer step-hook wrapper."""
+        super()._patch_step_function()
+        cls = type(self)
+        wrapped_step = cls.step
+        if getattr(wrapped_step, "_qwen38_outer_preflight", None) is wrapped_step:
+            return
+
+        @wraps(wrapped_step)
+        def guarded_step(optimizer, *args, **kwargs):
+            closure = args[0] if args else kwargs.get("closure")
+            if _optimizer_uses_cuda(optimizer) and not getattr(optimizer, "_cuda_parent_preflight", False):
+                _cuda_step_preflight(
+                    [optimizer], getattr(optimizer, "_cuda_precision_group", None), closure=closure is not None
+                )
+            return wrapped_step(optimizer, *args, **kwargs)
+
+        guarded_step._qwen38_outer_preflight = guarded_step
+        cls.step = guarded_step
+
     def __init__(
-        self, *args, momentum=0.95, max_matrix_parameter_numel=134217728, max_logical_matrix_numel=33554432, **kwargs
+        self,
+        *args,
+        momentum=0.95,
+        max_matrix_parameter_numel=134217728,
+        max_logical_matrix_numel=33554432,
+        cuda_precision_group=None,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self._cuda_precision_group = cuda_precision_group
+        self._cuda_parent_preflight = False
         self._state_receipt_emitted = False
         if self.resident_moment_dtype != torch.float32 or self.cpu_moment_dtype != torch.float32:
             raise ValueError("Qwen3.8 Muon requires FP32 master and all optimizer states")

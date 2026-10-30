@@ -1258,24 +1258,55 @@ class OptimizerState(Stateful):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
-            state_dict,
-            self.should_extra_parallel_aware
-            and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
+        cuda_coordinated = getattr(self.optimizer, "_qwen38_cuda_guard", False) and self._coordinated_group_validation
+        snapshots = (
+            [
+                (opt, opt.state.copy(), [dict(group) for group in opt.param_groups])
+                for opt in self.optimizer.optimizers_dict.values()
+            ]
+            if cuda_coordinated
+            else []
+        )
+        missing_marker = object()
+        marker_snapshot = (
+            {
+                name: getattr(self.optimizer, name, missing_marker)
+                for name in ("_veomni_resume_zero_optimizer_state", _ABSENT_OPTIMIZER_STATE_ATTR)
+            }
+            if cuda_coordinated
+            else {}
         )
         handles = []
         restored = False
+        cleanup_enabled = False
         try:
-            handles, expected, seen = _install_absent_optimizer_state_hooks(self.model, self.optimizer)
-            if self.should_extra_parallel_aware:
-                # we need to drop ExtraParallel dim before loading them into optimizers
-                optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                    optim_state_from_dcp_load, "drop"
+            error = None
+            try:
+                optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
+                    state_dict,
+                    self.should_extra_parallel_aware
+                    and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
                 )
+                cleanup_enabled = True
+                handles, expected, seen = _install_absent_optimizer_state_hooks(self.model, self.optimizer)
+                if self.should_extra_parallel_aware:
+                    optim_state_from_dcp_load = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                        optim_state_from_dcp_load, "drop"
+                    )
+            except BaseException as exc:
+                error = exc
+            if cuda_coordinated:
+                raise_if_any_rank_failed(error, "preparing CUDA optimizer checkpoint", group=self._coordinated_group)
+            elif error is not None:
+                raise error
+            multi_load_kwargs = (
+                {"coordinated": True, "coordinated_group": self._coordinated_group} if cuda_coordinated else {}
+            )
+            if self.should_extra_parallel_aware:
                 # Delegate to MultiOptimizer (it will split/filter correctly)
-                self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+                self.optimizer.load_state_dict(optim_state_from_dcp_load, **multi_load_kwargs)
             elif getattr(self.optimizer, "_is_multi_optimizer", False):
-                self.optimizer.load_state_dict(optim_state_from_dcp_load)
+                self.optimizer.load_state_dict(optim_state_from_dcp_load, **multi_load_kwargs)
             else:
                 # Single torch optimizer.
                 # ``strict=False`` matches the DCP planner's allow_partial_load intent:
@@ -1291,19 +1322,39 @@ class OptimizerState(Stateful):
                     optim_state_dict=optim_state_from_dcp_load,
                     options=StateDictOptions(strict=False),
                 )
-            if expected != seen:
-                raise RuntimeError("Optimizer load bypassed DCP state cleanup hooks")
-            if not handles:
-                _drop_absent_optimizer_state(self.model, self.optimizer)
+            error = None
+            try:
+                if expected != seen:
+                    raise RuntimeError("Optimizer load bypassed DCP state cleanup hooks")
+                if not handles:
+                    _drop_absent_optimizer_state(self.model, self.optimizer)
+            except BaseException as exc:
+                error = exc
+            if cuda_coordinated:
+                raise_if_any_rank_failed(error, "finishing CUDA optimizer checkpoint", group=self._coordinated_group)
+            elif error is not None:
+                raise error
             restored = True
         finally:
-            for handle in handles:
-                handle.remove()
-            _reset_absent_optimizer_state(self.optimizer)
-            if restored and handles:
-                _reset_zero_optimizer_state_resume(self.optimizer)
-            else:
-                _finish_zero_optimizer_state_resume(self.optimizer)
+            if cleanup_enabled:
+                for handle in handles:
+                    handle.remove()
+                _reset_absent_optimizer_state(self.optimizer)
+                if restored and handles:
+                    _reset_zero_optimizer_state_resume(self.optimizer)
+                else:
+                    _finish_zero_optimizer_state_resume(self.optimizer)
+            if not restored:
+                for opt, old_state, old_groups in snapshots:
+                    opt.state.clear()
+                    opt.state.update(old_state)
+                    opt.param_groups[:] = old_groups
+                for name, old_value in marker_snapshot.items():
+                    if old_value is missing_marker:
+                        if hasattr(self.optimizer, name):
+                            delattr(self.optimizer, name)
+                    else:
+                        setattr(self.optimizer, name, old_value)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
