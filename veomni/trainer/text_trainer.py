@@ -98,6 +98,7 @@ class TextTrainer:
         initial_microbatch_count = len(micro_batches)
         self.base._step_preflight_start_time = time.time()
         reject_distributed_padding(micro_batches)
+        initial_padding = [(batch, is_padding_microbatch(batch)) for batch in micro_batches]
         if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
             raise ValueError("Padding inside an unpacked micro-batch is unsupported")
         real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
@@ -106,9 +107,15 @@ class TextTrainer:
         previous_step = self.base.state.global_step
         self.base.state.global_step += 1
         try:
-            self.base._reset_async_activation_offload_if_enabled(self.base.model)
-            self.on_step_begin(micro_batches=micro_batches)
-            self.base.micro_batches_token_len = count_loss_token_synchronized(micro_batches, initial_microbatch_count)
+            preflight_error = None
+            try:
+                self.base._reset_async_activation_offload_if_enabled(self.base.model)
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
+                preflight_error = exc
+            self.base.micro_batches_token_len = count_loss_token_synchronized(
+                micro_batches, initial_microbatch_count, preflight_error
+            )
             self.base.global_micro_batches_token_len = reduce_global_loss_token(
                 self.base.micro_batches_token_len,
                 contains_padding_batch=(
@@ -119,6 +126,14 @@ class TextTrainer:
             )
             if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
                 raise ValueError("Padding inside an unpacked micro-batch is unsupported")
+            if (any(flag for _, flag in initial_padding) or contains_padding(micro_batches)) and (
+                len(initial_padding) != len(micro_batches)
+                or any(
+                    original is not current or was_padding != is_padding_microbatch(current)
+                    for (original, was_padding), current in zip(initial_padding, micro_batches, strict=False)
+                )
+            ):
+                raise ValueError("A callback changed a padded microbatch sequence after metrics were recorded")
             real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
             if not real_micro_steps:
                 raise ValueError("A training step must contain at least one real micro-batch")

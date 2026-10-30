@@ -41,13 +41,27 @@ def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool 
     return bool(values[0]) or values[2] != -values[3], bool(values[1])
 
 
-def reject_objective_padding(batch, objective: str, *, initial_microbatch_count: int | None = None) -> None:
-    found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+def reject_objective_padding(
+    batch, objective: str, *, initial_microbatch_count: int | None = None, preflight_error: Exception | None = None
+) -> None:
+    has_preflight_error = preflight_error is not None
+    try:
+        found = has_preflight_error or contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+    except Exception as exc:  # noqa: BLE001 - peers must reach the validation collective
+        if preflight_error is None:
+            preflight_error = exc
+        found = True
+        has_preflight_error = True
+    distributed = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+    if distributed:
         if initial_microbatch_count is not None and isinstance(batch, (list, tuple)):
             found = found or len(batch) != initial_microbatch_count
-        found, _ = _distributed_batch_status(batch, found)
+        found, has_preflight_error = _distributed_batch_status(batch, found, has_preflight_error)
     if found:
+        if has_preflight_error:
+            if not distributed and not isinstance(preflight_error, StopIteration):
+                raise preflight_error
+            raise RuntimeError(f"{objective} step-begin preflight failed on a rank") from preflight_error
         raise ValueError(
             f"{objective} does not support padded micro-batches, an empty step, "
             "unequal microbatch counts across ranks, or callback changes to the microbatch count"
@@ -56,9 +70,16 @@ def reject_objective_padding(batch, objective: str, *, initial_microbatch_count:
 
 def reject_distributed_padding(batch) -> None:
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
-        found, _ = _distributed_batch_status(batch, invalid)
+        error = None
+        try:
+            invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+        except Exception as exc:  # noqa: BLE001 - peers must reach the validation collective
+            error = exc
+            invalid = True
+        found, has_error = _distributed_batch_status(batch, invalid, error is not None)
         if found:
+            if has_error:
+                raise RuntimeError("Invalid padding metadata on a rank") from error
             raise RuntimeError(
                 "Distributed training does not support padded micro-batches, an empty step, "
                 "unequal microbatch counts across ranks, or callback changes to the microbatch count"
@@ -98,13 +119,16 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     return token_len
 
 
-def count_loss_token_synchronized(batches, initial_microbatch_count: int):
+def count_loss_token_synchronized(batches, initial_microbatch_count: int, preflight_error: Exception | None = None):
     """Count callback-adjusted inputs, propagating local input errors before reductions."""
-    error = None
+    error = preflight_error
     token_len = None
     try:
-        token_len = count_loss_token(batches)
-        invalid = contains_padding(batches) or not batches or len(batches) != initial_microbatch_count
+        if error is None:
+            token_len = count_loss_token(batches)
+        invalid = (
+            error is not None or contains_padding(batches) or not batches or len(batches) != initial_microbatch_count
+        )
     except Exception as exc:  # noqa: BLE001 - peers must not enter the next collective alone
         error = exc
         invalid = True
@@ -113,9 +137,11 @@ def count_loss_token_synchronized(batches, initial_microbatch_count: int):
         found, has_auxiliary_targets = _distributed_batch_status(batches, invalid, has_auxiliary_targets)
         if found:
             if error is not None:
-                raise RuntimeError("Invalid loss-token input in distributed training") from error
+                raise RuntimeError(
+                    "Step-begin preflight or loss-token input failed in distributed training"
+                ) from error
             raise RuntimeError(
-                "Distributed training does not support padded micro-batches, an empty step, "
+                "A peer preflight failed, or distributed training does not support padded micro-batches, an empty step, "
                 "unequal microbatch counts across ranks, or callback changes to the microbatch count"
             )
         if has_auxiliary_targets:
@@ -126,6 +152,8 @@ def count_loss_token_synchronized(batches, initial_microbatch_count: int):
             for key in sorted({key for keys in key_lists for key in keys}):
                 token_len.setdefault(key, torch.tensor(0))
     elif error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError("A step-begin preflight raised StopIteration") from error
         raise error
     return token_len
 

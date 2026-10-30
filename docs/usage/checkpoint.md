@@ -49,7 +49,8 @@ When main-process dynamic batching emits padded micro-batches in single-process
 SFT, padding is excluded from loss token counts, channel loss and auxiliary
 metrics, and its model forward/backward is skipped. Distributed main-process
 dynamic batching must use `drop_last=True` until tail step counts can be
-coordinated across ranks. Custom distributed loaders must likewise avoid injecting padded
+coordinated across ranks. Custom distributed loaders must also coordinate
+fetch failures and EOF before entering the trainer and avoid injecting padded
 micro-batches. DPO and Omni reject padded micro-batches; custom data loaders
 must not inject padding into those objectives. DiT also rejects marked padding.
 The rejection adds two small collectives per SFT, DPO, Omni or DiT step
@@ -57,6 +58,15 @@ The rejection adds two small collectives per SFT, DPO, Omni or DiT step
 SFT still counts valid loss tokens after step-begin callbacks, so callbacks can
 adjust labels before the loss denominator is computed. Distributed training
 rejects unequal microbatch counts across ranks and callbacks that change them.
+Callbacks must not replace, reorder, add or remove microbatches when the step
+contains padding, or change their padding flags after metrics are recorded.
+Step-begin preflight errors are propagated if all ranks reach the validation;
+an internal `StopIteration` is treated as an error rather than an epoch end.
+An earlier rank-local reset or callback failure can still strand another rank
+inside a callback collective before validation; the whole preflight sequence
+must coordinate its own failures when callbacks use collectives.
+A failed preflight does not undo callback side effects; abort or restart the
+training process rather than retrying the step in place.
 If any rank has auxiliary target keys, their union is synchronized once per
 step; missing targets contribute zero and keys are reduced in sorted order.
 This includes MTP inputs; object-gather overhead on accelerators is unmeasured.

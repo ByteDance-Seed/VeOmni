@@ -575,9 +575,18 @@ class DiTTrainer:
         previous_step = self.base.state.global_step
         self.base.state.global_step += 1
         try:
-            self.base._reset_async_activation_offload_if_enabled(self.base.model)
-            self.on_step_begin(micro_batches=micro_batches)
-            reject_objective_padding(micro_batches, "DiT", initial_microbatch_count=initial_microbatch_count)
+            preflight_error = None
+            try:
+                self.base._reset_async_activation_offload_if_enabled(self.base.model)
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
+                preflight_error = exc
+            reject_objective_padding(
+                micro_batches,
+                "DiT",
+                initial_microbatch_count=initial_microbatch_count,
+                preflight_error=preflight_error,
+            )
         except BaseException:
             self.base.state.global_step = previous_step
             raise

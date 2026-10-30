@@ -122,6 +122,18 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
         dist.all_gather_object(results, (error, trainer.state.global_step, entered))
         assert all(message and "empty step" in message and step == 3 and not seen for message, step, seen in results)
 
+        batch = {"padding_flag": torch.tensor([1, 0])} if rank == 0 else {"labels": torch.tensor([1])}
+        error = None
+        try:
+            trainer.train_step(iter([[batch]]))
+        except RuntimeError as exc:
+            error = str(exc)
+        dist.all_gather_object(results, (error, trainer.state.global_step, entered))
+        assert all(
+            message and "Invalid padding metadata" in message and step == 3 and not seen
+            for message, step, seen in results
+        )
+
         batches = [{"labels": torch.tensor([1])} for _ in range(rank + 1)]
         error = None
         try:
@@ -153,6 +165,19 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
         error = None
         try:
             trainer.train_step(iter([batches]))
+        except RuntimeError as exc:
+            error = str(exc)
+        dist.all_gather_object(results, (error, trainer.state.global_step))
+        assert all(message and step == 3 for message, step in results)
+
+        def fail_step_begin(micro_batches):
+            if rank == 0:
+                raise StopIteration("not a dataloader EOF")
+
+        trainer.on_step_begin = fail_step_begin
+        error = None
+        try:
+            trainer.train_step(iter([[{"labels": torch.tensor([1])}]]))
         except RuntimeError as exc:
             error = str(exc)
         dist.all_gather_object(results, (error, trainer.state.global_step))
@@ -274,6 +299,33 @@ def _composed_post_callback_padding_worker(rank, endpoint):
             results = [None, None]
             dist.all_gather_object(results, (error, state.global_step))
             assert all(message and "padded micro-batches" in message and step == 3 for message, step in results)
+
+            def fail_step_begin(micro_batches):
+                if rank == 0:
+                    raise StopIteration("not a dataloader EOF")
+
+            trainer.on_step_begin = fail_step_begin
+            error = None
+            try:
+                fn(iter([[{"labels": torch.tensor([1])}]]))
+            except RuntimeError as exc:
+                error = str(exc)
+            dist.all_gather_object(results, (error, state.global_step))
+            assert all(message and "preflight failed" in message and step == 3 for message, step in results)
+
+            def invalid_step_begin(micro_batches):
+                if rank == 0:
+                    raise StopIteration("not a dataloader EOF")
+                micro_batches[0]["padding_flag"] = torch.tensor([1, 0])
+
+            trainer.on_step_begin = invalid_step_begin
+            error = None
+            try:
+                fn(iter([[{"labels": torch.tensor([1])}]]))
+            except RuntimeError as exc:
+                error = str(exc)
+            dist.all_gather_object(results, (error, state.global_step))
+            assert all(message and "preflight failed" in message and step == 3 for message, step in results)
     finally:
         dist.destroy_process_group()
 
@@ -283,6 +335,15 @@ def test_composed_trainers_synchronize_post_callback_padding():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_composed_post_callback_padding_worker, args=(), nprocs=2)
+
+
+@pytest.mark.parametrize("objective", ["DPO", "Omni training", "DiT"])
+def test_objective_preflight_preserves_single_rank_exception(objective):
+    batch = [{"labels": torch.tensor([1])}]
+    with pytest.raises(ValueError, match="callback error"):
+        loss_utils.reject_objective_padding(batch, objective, preflight_error=ValueError("callback error"))
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        loss_utils.reject_objective_padding(batch, objective, preflight_error=StopIteration())
 
 
 def test_exactly_full_flush_does_not_emit_padding_only_step():

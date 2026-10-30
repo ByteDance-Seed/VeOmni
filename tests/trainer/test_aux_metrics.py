@@ -353,7 +353,47 @@ def test_step_begin_label_mask_is_reflected_in_global_loss_denominator(run_train
 def test_callback_creating_all_padding_does_not_advance_step(run_train_step, identity_loss):
     trainer = _accumulating_trainer([], {})
     trainer.on_step_begin = lambda micro_batches=None, **_kwargs: micro_batches[0].update(padding_flag=True)
-    with pytest.raises(ValueError, match="at least one real micro-batch"):
+    with pytest.raises(ValueError, match="callback changed a padded microbatch sequence"):
+        run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}])
+    assert trainer.state.global_step == 0
+
+
+def test_callback_marking_one_batch_padding_does_not_advance_step(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+    trainer.on_step_begin = lambda micro_batches=None, **_kwargs: micro_batches[0].update(padding_flag=True)
+    with pytest.raises(ValueError, match="callback changed a padded microbatch sequence"):
+        run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}, {"labels": torch.tensor([[-100, 3]])}])
+    assert trainer.state.global_step == 0
+
+
+def test_callback_replacing_batch_with_padding_does_not_advance_step(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+
+    def replace_with_padding(micro_batches=None, **_kwargs):
+        micro_batches[0] = {**micro_batches[0], "padding_flag": True}
+
+    trainer.on_step_begin = replace_with_padding
+    with pytest.raises(ValueError, match="callback changed a padded microbatch sequence"):
+        run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}, {"labels": torch.tensor([[-100, 3]])}])
+    assert trainer.state.global_step == 0
+
+
+def test_callback_reordering_padding_does_not_advance_step(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+    trainer.on_step_begin = lambda micro_batches=None, **_kwargs: micro_batches.reverse()
+    with pytest.raises(ValueError, match="callback changed a padded microbatch sequence"):
+        run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}, {"padding_flag": True}])
+    assert trainer.state.global_step == 0
+
+
+def test_callback_stop_iteration_is_not_data_exhaustion(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+
+    def stop_inside_callback(**_kwargs):
+        raise StopIteration("not a dataloader EOF")
+
+    trainer.on_step_begin = stop_inside_callback
+    with pytest.raises(RuntimeError, match="preflight"):
         run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}])
     assert trainer.state.global_step == 0
 
