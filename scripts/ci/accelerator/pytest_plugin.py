@@ -56,7 +56,11 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         raise ResourcePlanError("VEOMNI_CI_ACTIVE_PLAN is set without VEOMNI_CI_LEASE")
     lease = json.loads(encoded_lease)
     specs = [spec for spec in plan.launches if spec.nproc == nproc]
-    key = "CUDA_VISIBLE_DEVICES" if caps.backend == "cuda" else "ASCEND_RT_VISIBLE_DEVICES"
+    key = {
+        "cuda": "CUDA_VISIBLE_DEVICES",
+        "npu": "ASCEND_RT_VISIBLE_DEVICES",
+        "xpu": "ZE_AFFINITY_MASK",
+    }.get(caps.backend, "ASCEND_RT_VISIBLE_DEVICES")
     visible = [value for value in env.get(key, "").split(",") if value]
     cpu = not visible and any(spec.device == "cpu" for spec in specs)
     if not cpu and not any(spec.device == "accelerator" for spec in specs):

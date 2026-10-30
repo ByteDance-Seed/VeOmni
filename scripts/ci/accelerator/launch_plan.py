@@ -18,7 +18,7 @@ class RunnerCapabilities:
     devices: tuple[str, ...] = ()
 
     def __post_init__(self):
-        if self.backend not in ("cpu", "cuda", "npu"):
+        if self.backend not in ("cpu", "cuda", "npu", "xpu"):
             raise ResourcePlanError(f"Unsupported accelerator: {self.backend}")
         if len(set(self.devices)) != len(self.devices):
             raise ResourcePlanError("Runner devices must be distinct")
