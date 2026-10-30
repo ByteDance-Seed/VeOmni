@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 sparse MQA TileLang adapter (SM90+)."""
+"""DeepSeek-V4 sparse MQA TileLang adapter (SM90+ NVIDIA, gfx942/gfx950 AMD)."""
 
 from __future__ import annotations
 

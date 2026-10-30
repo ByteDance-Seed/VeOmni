@@ -43,6 +43,7 @@ _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _GPU_ROCM = ("gpu", (("rocm", None, None),))
+_GPU_TILELANG = ("gpu", (("nvidia", 90, None), ("rocm", ("gfx942", "gfx950"), None)))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
 
@@ -97,13 +98,13 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_sage_attention", "cuda", _GPU_NVIDIA_SM80, ("sageattention",)),
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
-    ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_TILELANG, ("tilelang",)),
     ("dsa_attention", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),
     ("dsa_attention", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_attention", "glm", "eager", "any", _ANY, ()),
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
     ("dsa_indexer", "deepseek_v4", "eager", "any", _ANY, ()),
-    ("dsa_indexer", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_indexer", "deepseek_v4", "tilelang", "cuda", _GPU_TILELANG, ("tilelang",)),
     ("dsa_indexer", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_indexer", "glm", "eager", "any", _ANY, ()),
     ("dsa_indexer", "glm", "cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
@@ -142,13 +143,13 @@ _BUILTIN_ENTRIES = (
     ("token_logprobs", "standard", "flash_attn", "cuda", _GPU, ("flash_attn.ops.triton.cross_entropy",)),
     ("token_logprobs", "standard", "torch_npu", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
-    ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "pre", "tilelang", "cuda", _GPU_TILELANG, ("tile_kernels",)),
     ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "post", "eager", "any", _ANY, ()),
-    ("mhc", "post", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "post", "tilelang", "cuda", _GPU_TILELANG, ("tile_kernels",)),
     ("mhc", "post", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "head", "eager", "any", _ANY, ()),
-    ("mhc", "head", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "head", "tilelang", "cuda", _GPU_TILELANG, ("tile_kernels",)),
     ("mhc", "head", "cann", "npu", _NPU, ()),
     ("qsa_attention", "standard", "eager", "any", _ANY, ()),
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
@@ -220,7 +221,7 @@ def _requirement_metadata(requirement):
             if isinstance(platform, NvidiaGpuPlatform):
                 platforms.append(("nvidia", platform.min_cc, platform.max_cc))
             elif isinstance(platform, RocmGpuPlatform):
-                platforms.append(("rocm", None, None))
+                platforms.append(("rocm", platform.archs, None))
             else:
                 raise AssertionError(f"unexpected GPU platform type: {type(platform).__name__}")
         return "gpu", tuple(platforms)

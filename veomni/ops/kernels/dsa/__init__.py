@@ -20,7 +20,7 @@ rows. Fused impls are opaque wrappers around TileLang, Triton, or FlashMLA
 Lightning Indexer and sparse FlashMLA.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement, NpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, TILELANG_GPUS, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .attention.deepseek_v4 import cann as dsv4_attn_cann
 from .attention.deepseek_v4 import eager as dsv4_attn_eager
@@ -35,7 +35,7 @@ from .indexer.glm import cudnn as glm_indexer_cudnn
 from .indexer.glm import eager as glm_indexer_eager
 
 
-_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_TILELANG = GpuKernelRequirement(platforms=TILELANG_GPUS)
 _ROCM = GpuKernelRequirement(platforms=(ROCM_GPU,))
 _GLM_FUSED = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 

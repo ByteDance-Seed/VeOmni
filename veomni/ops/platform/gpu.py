@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
 
 
 class GpuPlatform(ABC):
@@ -83,15 +83,30 @@ class NvidiaGpuPlatform(GpuPlatform):
 
 @dataclass(frozen=True)
 class RocmGpuPlatform(GpuPlatform):
-    """AMD ROCm/HIP as exposed through PyTorch's ``cuda`` namespace."""
+    """AMD ROCm/HIP as exposed through PyTorch's ``cuda`` namespace.
+
+    ``archs`` optionally restricts the match to GPU architectures, named as in
+    ``gcnArchName`` without its feature suffix (``"gfx950"``, not ``"gfx950:sramecc+:xnack-"``).
+    """
+
+    archs: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the architecture list."""
+        if self.archs is not None and not self.archs:
+            raise ValueError("archs must be None or a non-empty tuple")
 
     def matches(self) -> bool:
-        """Return whether an AMD ROCm GPU is available."""
-        return IS_CUDA_AVAILABLE and torch.version.hip is not None
+        """Return whether an AMD ROCm GPU of a requested architecture is available."""
+        if not IS_CUDA_AVAILABLE or torch.version.hip is None:
+            return False
+        return self.archs is None or get_rocm_gcn_arch() in self.archs
 
     def describe(self) -> str:
         """Return the AMD ROCm platform description."""
-        return "AMD ROCm"
+        if self.archs is None:
+            return "AMD ROCm"
+        return f"AMD ROCm {'/'.join(self.archs)}"
 
 
 NVIDIA_GPU = NvidiaGpuPlatform()
@@ -99,3 +114,7 @@ ROCM_GPU = RocmGpuPlatform()
 NVIDIA_SM70_PLUS = NvidiaGpuPlatform(min_cc=70)
 NVIDIA_SM90_PLUS = NvidiaGpuPlatform(min_cc=90)
 NVIDIA_SM100_PLUS = NvidiaGpuPlatform(min_cc=100)
+# gfx942 (64 KB LDS, FP8 is e4m3fnuz) and gfx950 (160 KB LDS).
+ROCM_GFX942_GFX950 = RocmGpuPlatform(archs=("gfx942", "gfx950"))
+# GPUs that run the DeepSeek-V4 TileLang kernels: DSA attention / indexer, mHC and the QAT quantizers.
+TILELANG_GPUS = (NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950)

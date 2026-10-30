@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
 
 
 def make_grad_leaf(tensor: Tensor) -> Tensor:
@@ -77,6 +77,33 @@ def require_nvidia_cuda(*packages: str, min_cc: int | None = None, max_cc: int |
         pytest.skip(f"test requires SM{min_cc} or later")
     if max_cc is not None and capability > max_cc:
         pytest.skip(f"test requires SM{max_cc} or earlier")
+
+
+def is_tilelang_gpu_available() -> bool:
+    """Return whether this GPU runs the DeepSeek-V4 TileLang kernels (SM90+ NVIDIA or gfx942/gfx950 AMD)."""
+    from veomni.ops.qat._hardware import is_tilelang_gpu_supported
+
+    return is_tilelang_gpu_supported()
+
+
+def require_tilelang_gpu(*packages: str) -> None:
+    """Skip unless optional packages and a GPU that runs the DeepSeek-V4 TileLang kernels are available."""
+    for package in packages:
+        pytest.importorskip(package)
+    if not is_tilelang_gpu_available():
+        pytest.skip("test requires an SM90+ NVIDIA CUDA GPU or an AMD gfx942/gfx950 GPU")
+
+
+def assert_e4m3fn_bytes_equal(actual: Tensor, expected: Tensor) -> None:
+    """Bitwise FP8 equality, except for the sign of zero on gfx94x.
+
+    Those GPUs quantize through e4m3fnuz, which has no negative zero: a negative value
+    that rounds to zero is written as +0 (0x00) where e4m3fn writes 0x80.
+    """
+    actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+    if get_rocm_gcn_arch() in ("gfx940", "gfx941", "gfx942"):
+        expected = expected.masked_fill(expected == 0x80, 0)
+    assert torch.equal(actual, expected)
 
 
 def tensor_error_stats(actual: Tensor, expected: Tensor) -> dict[str, float]:

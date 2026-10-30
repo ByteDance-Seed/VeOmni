@@ -15,17 +15,17 @@
 """DSV4 checkpoint export quantization.
 
 TileLang is optional and GPU-only. Importing this module must not load
-``act_quant``. Callers go through the wrappers, which reject non-SM90 first.
+``act_quant``. Callers go through the wrappers, which reject unsupported GPUs first.
 """
 
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.ops.qat._hardware import TILELANG_GPU_DESCRIPTION, is_tilelang_gpu_supported, require_tilelang_fp4_gpu
 
 
-def _require_tilelang_sm90() -> None:
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
-        raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
+def _require_tilelang_gpu() -> None:
+    if not is_tilelang_gpu_supported():
+        raise RuntimeError(f"DeepSeek V4 TileLang kernels require {TILELANG_GPU_DESCRIPTION}")
 
 
 def fp4_act_quant(
@@ -34,7 +34,8 @@ def fp4_act_quant(
     dequant: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor to packed E2M1 FP4 with E8M0 block scales on SM90+ CUDA GPUs."""
-    _require_tilelang_sm90()
+    _require_tilelang_gpu()
+    require_tilelang_fp4_gpu()
     from veomni.ops.qat.quant import fp4_act_quant as impl
 
     return impl(x, block_size, dequant)
@@ -46,8 +47,8 @@ def fp8_weight_quant(
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2D bfloat16 weight tensor to block-scaled FP8 on SM90+ CUDA GPUs."""
-    _require_tilelang_sm90()
+    """Quantize a 2D bfloat16 weight tensor to block-scaled FP8 on a TileLang GPU."""
+    _require_tilelang_gpu()
     from veomni.ops.qat.quant import fp8_weight_quant as impl
 
     return impl(x, block_size, scale_fmt, scale_dtype)

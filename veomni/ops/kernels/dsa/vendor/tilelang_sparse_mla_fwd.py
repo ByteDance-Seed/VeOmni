@@ -25,7 +25,40 @@ import tilelang
 import torch
 from tilelang import language as T
 
-from veomni.utils.device import get_torch_device
+from veomni.utils.device import get_max_shared_memory_per_block
+
+
+def _smem_lower_bound(H_per_block, block_I, dim, num_stages):
+    return (
+        H_per_block * dim * 2  # Q_shared, bf16
+        + H_per_block * block_I * 2  # S_shared, bf16
+        + max(num_stages, 1) * block_I * dim * 2  # KV_shared, one buffer per stage
+    )
+
+
+def fit_forward_tiling(heads, dim, block_I=64, num_stages=0, threads=256, block_H=64):
+    """Return the ``block_I``/``threads``/``block_H`` of the largest tile that fits this device.
+
+    Hopper and gfx950 host the requested tile, which is returned unchanged. gfx942's 64 KB
+    LDS does not: at dim=512 the 64-row KV tile alone fills it, so the gather block is
+    halved first, then the head block (only wide head counts need that). The CTA narrows
+    with the gather block so that every warp still owns a whole matrix-core column tile
+    of the QK^T product, whose N is block_I (16 on MFMA, 8 on MMA).
+    """
+    smem_limit = get_max_shared_memory_per_block()
+    padded_H = max(tilelang.math.next_power_of_2(heads), 16)
+    warp_size, n_per_warp = (64, 16) if torch.version.hip is not None else (32, 8)
+    # 2048 B is the inter-buffer alignment TileLang adds on top of the lower bound.
+    for bi in (block_I, block_I // 2, block_I // 4):
+        for bh in (block_H, block_H // 2, block_H // 4):
+            if bi < n_per_warp or bh < 16 or (heads > bh and heads % bh):
+                continue
+            H_per_block = padded_H if heads <= bh else bh
+            if _smem_lower_bound(H_per_block, bi, dim, num_stages) + 2048 <= smem_limit:
+                cta = threads if bi == block_I else min(threads, bi // n_per_warp * warp_size)
+                return {"block_I": bi, "threads": cta, "block_H": bh}
+    # Nothing fits: hand back the request so the kernel's own guard names the bytes.
+    return {"block_I": block_I, "threads": threads, "block_H": block_H}
 
 
 @tilelang.jit(
@@ -43,6 +76,7 @@ def sparse_mqa_fwd(
     block_I=64,
     num_stages=0,
     threads=256,
+    block_H=64,
 ):
     # ``num_stages >= 1`` pipelines the KV gather, and that is only legal because the
     # gather takes its row index straight from ``Indices`` in global memory. This is
@@ -89,13 +123,15 @@ def sparse_mqa_fwd(
     NI = tilelang.cdiv(topk, block_I)
     D = dim
 
-    if heads > 64:
-        assert heads % 64 == 0, "heads should be a multiple of 64"
-        REPLICATE_H = heads // 64
+    # block_H caps the heads one CTA stages in shared memory; wider head counts are
+    # split across CTAs that each re-gather the same KV rows.
+    if heads > block_H:
+        assert heads % block_H == 0, f"heads ({heads}) should be a multiple of block_H ({block_H})"
+        REPLICATE_H = heads // block_H
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else block_H
 
     # Every stage past the first double-buffers the BI x D KV tile, so the depth is
     # bounded by shared memory rather than by anything in the algorithm -- and by
@@ -110,17 +146,8 @@ def sparse_mqa_fwd(
     # that run today. The 2048 stays out because it is TileLang's own padding rule
     # rather than ours; leaving the sum a lower bound means it can only under-reject,
     # and a depth that slips through still fails loudly at launch naming its bytes.
-    smem_lower_bound = (
-        H_per_block * D * 2  # Q_shared, bf16
-        + H_per_block * BI * 2  # S_shared, bf16
-        + max(num_stages, 1) * BI * D * 2  # KV_shared, one buffer per stage
-    )
-    # Every kernel here is NVIDIA CUDA-only, so the device-agnostic helper reads as more
-    # portable than it is -- but it stays: `device-api-check` rejects a vendor-namespaced
-    # device reference under veomni/ unless `veomni/utils/device.py` has no equivalent,
-    # and here it does. Reaching this line already implies an accelerator anyway, since
-    # the module imports tilelang at import time and only a compiling kernel gets here.
-    smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
+    smem_lower_bound = _smem_lower_bound(H_per_block, BI, D, num_stages)
+    smem_limit = get_max_shared_memory_per_block()
     assert smem_lower_bound <= smem_limit, (
         f"num_stages={num_stages} at block_I={block_I}, dim={dim} needs at least "
         f"{smem_lower_bound} B of shared memory per block, above this device's {smem_limit} B"
@@ -158,7 +185,7 @@ def sparse_mqa_fwd(
             b_i = by
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
 
-            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * block_H
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -249,6 +276,10 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     assert seq_len_kv > 0, "kv must have at least one row"
     _, _, topk = topk_idxs.shape
 
+    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
+    tiling = fit_forward_tiling(padded_heads, dim, block_I, num_stages, threads)
+    block_I = tiling["block_I"]
+
     # Pad topk to next multiple of block_I (kernel requires divisibility)
     padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
@@ -256,19 +287,10 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
     if padded_heads != heads:
         q = torch.cat([q, q.new_zeros(batch, seq_len, padded_heads - heads, dim)], dim=2).contiguous()
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(padded_heads - heads)])
 
-    kernel = sparse_mqa_fwd(
-        padded_heads,
-        dim,
-        topk,
-        sm_scale,
-        block_I=block_I,
-        num_stages=num_stages,
-        threads=threads,
-    )
+    kernel = sparse_mqa_fwd(padded_heads, dim, topk, sm_scale, num_stages=num_stages, **tiling)
     out, lse = kernel(q, kv, attn_sink, topk_idxs)
     return out[:, :, :heads].contiguous(), lse[:, :, :heads].contiguous()
