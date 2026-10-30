@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from operator import attrgetter
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.compare import eager_ops_config, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
@@ -129,7 +130,6 @@ from veomni.models import (
     get_model_class,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -189,16 +189,10 @@ class _ModelCase:
     # Representative integration points, not an exhaustive snapshot of model internals.
     eager_ops: tuple[tuple[str, str], ...] = (("veomni_ce", "cross_entropy_loss"),)
     isolation_op_path: str | None = None
-    # Attention that binds from ``config._attn_implementation`` needs the
-    # ops selection stamped before HF construction. resolve_op_impl families
-    # leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
+    # Attention that binds from ``config.ops_config.attn_implementation`` needs the
+    # ops selection stamped before HF construction. Families that keep HF attn
+    # as eager leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
     stamps_hf_attn: bool = True
-    # Families without a local ``eager_attention_forward`` select ``veomni_sdpa`` for ``eager``.
-    eager_attn_impl: str = "eager"
-
-
-def _expected_eager_impl(model_case: _ModelCase, op: str) -> str:
-    return model_case.eager_attn_impl if op == "attention" else "eager"
 
 
 # NPU glm_moe_dsa indexer keeps Hugging Face scoring and does not bind
@@ -261,7 +255,6 @@ _MODEL_CASES = (
         ),
         isolation_op_path="blocks.0.attn.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
         config_factory=_tiny_flux_config,
         architectures=("FluxModel",),
         has_registered_config=True,
@@ -578,7 +571,6 @@ _MODEL_CASES = (
         ),
         isolation_op_path="transformer_blocks.0.attn1.attention_function.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="MiniMaxH3DiTModel",
@@ -592,9 +584,8 @@ _MODEL_CASES = (
             ("dit.blocks.0.attn.veomni_attn", "attention"),
             ("dit.blocks.0.attn.veomni_rope", "rope"),
         ),
-        isolation_op_path="dit.blocks.0.attn.veomni_attn",
+        isolation_op_path="dit.blocks.0.attn.q_norm.veomni_rms_norm",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",
@@ -606,7 +597,6 @@ _MODEL_CASES = (
         eager_ops=(("transformer_blocks.0.attn.processor.veomni_attn", "attention"),),
         isolation_op_path="transformer_blocks.0.attn.processor.veomni_attn",
         stamps_hf_attn=False,
-        eager_attn_impl="veomni_sdpa",
     ),
     _ModelCase(
         model_type="wan",
@@ -636,6 +626,55 @@ _MODEL_CASES = (
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize(
+    "model_case",
+    [
+        case
+        for case in _MODEL_CASES
+        if case.model_type in {"WanTransformer3DModel", "LTXVideoTransformerModel", "QwenImageTransformer2DModel"}
+    ],
+    ids=lambda case: case.model_type,
+)
+@pytest.mark.parametrize(
+    ("initial_attention", "constructor_kwargs", "expected_attention"),
+    [
+        pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-flash-sdpa"),
+        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-flash-eager"),
+        pytest.param("sdpa", {}, "sdpa", id="preserve-omitted"),
+        pytest.param("sdpa", {"attn_implementation": None}, "sdpa", id="preserve-none"),
+        pytest.param("sdpa", {"attn_implementation": "not_a_backend"}, None, id="reject-invalid"),
+    ],
+)
+def test_diffusers_constructor_attention_override_precedes_hf_init(
+    monkeypatch, model_case, initial_attention, constructor_kwargs, expected_attention
+):
+    """Constructor choices must reach HF checks and the same bound attention handle."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = model_case.config_factory(model_case.architectures[0])
+    config._set_ops_implementation(eager_ops_config())
+    # Simulate a saved flash selection without requiring its package on this CPU worker.
+    config._attn_implementation = initial_attention
+    previous_ops = dict(config.ops_implementation)
+    model_cls = get_model_class(config)
+    if expected_attention is None:
+        with pytest.raises(ValueError, match="not_a_backend"):
+            model_cls(config, **constructor_kwargs)
+        return
+
+    model = model_cls(config, **constructor_kwargs)
+    assert model.config is config
+    assert {key: value for key, value in config.ops_implementation.items() if key != "attn_implementation"} == {
+        key: value for key, value in previous_ops.items() if key != "attn_implementation"
+    }
+    if constructor_kwargs.get("attn_implementation") is None:
+        assert config.ops_implementation == previous_ops
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected_attention
+    assert "_attn_implementation_internal" not in vars(config)
+    attention_path = model_case.isolation_op_path or "blocks.0.attn1.processor.veomni_attn"
+    assert attrgetter(attention_path)(model).impl == expected_attention
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_get_model_class_unknown_type_raises():
     with pytest.raises(RuntimeError, match="unregistered_test_model.*not registered in veomni.models"):
         get_model_class(_UnregisteredConfig())
@@ -651,30 +690,30 @@ def test_get_model_class_hf_backend(monkeypatch):
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_build_foundation_model_requires_ops_config():
-    with ops_config_scope(None):
-        with pytest.raises(ValueError, match="ops_implementation"):
-            build_foundation_model(_tiny_qwen3_config())
+    config = _tiny_qwen3_config()
+    config.ops_implementation.clear()
+    with pytest.raises(ValueError, match="ops_implementation"):
+        build_foundation_model(config)
 
 
 @pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
-    with ops_config_scope(None):
-        model = build_foundation_model(
-            model_case.config_factory(model_case.architectures[0]),
-            torch_dtype="float32",
-            init_device="cpu",
-            ops_implementation=cfg,
-        )
-        assert get_ops_config() is cfg
+    model = build_foundation_model(
+        model_case.config_factory(model_case.architectures[0]),
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=cfg,
+    )
+    assert model.config.ops_implementation["rms_norm_implementation"] == "eager"
     assert model.__class__.__name__ == model_case.architectures[0]
     _assert_expected_generated_module_source(model_case.model_type, type(model))
     for path, expected_op in _eager_ops(model_case):
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
-        assert op.impl == _expected_eager_impl(model_case, expected_op), path
+        assert op.impl == "eager", path
     if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
         assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
@@ -683,7 +722,7 @@ _ALTERNATE_OP_IMPLS = {
     "cross_entropy_loss": ("cross_entropy_loss_implementation", "chunk_loss"),
     "moe_experts": ("moe_implementation", "fused_triton"),
     "rms_norm": ("rms_norm_implementation", "liger_kernel"),
-    "attention": ("attn_implementation", "sdpa"),
+    "attention": ("attn_implementation", "veomni_flash_attention_2"),
     "rope": ("rotary_pos_emb_implementation", "liger_kernel"),
 }
 
@@ -719,26 +758,22 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     This checks selection only; platform gates are stubbed and no optimized
     kernel executes. Family parity and ops tests own numerical execution.
     """
-    previous = get_ops_config()
     eager_config = eager_ops_config()
     selected_path = model_case.isolation_op_path or model_case.eager_ops[0][0]
     selected_op_name = next(op for path, op in model_case.eager_ops if path == selected_path)
 
     def construct(config):
         model_config = model_case.config_factory(model_case.architectures[0])
-        # HF-interface attention binds from ``config._attn_implementation``.
-        # VL nested ``to_dict()`` also drops the field and HF then defaults
-        # to sdpa, so eager construction must stamp as well.
         if selected_op_name == "attention" and model_case.stamps_hf_attn:
             stamp_attn_implementation(model_config, config.attn_implementation)
-        with ops_config_scope(config):
-            model_cls = get_model_class(model_config)
-            _assert_expected_generated_module_source(model_case.model_type, model_cls)
-            return model_cls(model_config)
+        model_config._set_ops_implementation(config)
+        model_cls = get_model_class(model_config)
+        _assert_expected_generated_module_source(model_case.model_type, model_cls)
+        return model_cls(model_config)
 
     eager = construct(eager_config)
     selected_op = attrgetter(selected_path)
-    assert selected_op(eager).impl == _expected_eager_impl(model_case, selected_op_name)
+    assert selected_op(eager).impl == "eager"
     eager_bindings = _op_bindings(eager, selected_path)
     field, alternate_impl = _ALTERNATE_OP_IMPLS[selected_op(eager).op]
     alternate_config = eager_ops_config()
@@ -747,11 +782,8 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     assert selected_op(alternate).impl == alternate_impl
     alternate_bindings = _op_bindings(alternate, selected_path)
 
-    for config in (alternate_config, eager_config, None):
-        with ops_config_scope(config):
-            assert _op_bindings(eager, selected_path) == eager_bindings
-            assert _op_bindings(alternate, selected_path) == alternate_bindings
-    assert get_ops_config() is previous
+    assert _op_bindings(eager, selected_path) == eager_bindings
+    assert _op_bindings(alternate, selected_path) == alternate_bindings
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
@@ -809,14 +841,14 @@ def test_the_generic_hook_reaches_the_model_that_implements_it():
 
     cfg = eager_ops_config()
     cfg.dsa_indexer_implementation = "eager"
-    with ops_config_scope(cfg):
-        config = DeepseekV4Config(
-            num_hidden_layers=2,
-            layer_types=["compressed_sparse_attention"] * 2,
-            dsa_indexer_loss=True,
-        )
-        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
-            check_model_build_prerequisites(config)
+    config = DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=True,
+        ops_implementation=cfg,
+    )
+    with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+        check_model_build_prerequisites(config)
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
@@ -840,3 +872,178 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
     monkeypatch.setattr(parallel_state_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
     check_context_parallel_supported(_tiny_qwen3_config())
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_build_foundation_model_preserves_subconfig_independent_attention():
+    """build_foundation_model must not flatten sub-config attention unless attn_implementation is passed."""
+    from veomni.models.auto import build_foundation_model
+
+    config = _tiny_qwen3_vl_config()
+    config._set_ops_implementation(eager_ops_config())
+    config.vision_config._set_ops_implementation({"attn_implementation": "sdpa"})
+
+    assert config._attn_implementation == "eager"
+    assert config.text_config._attn_implementation == "eager"
+    assert config.vision_config._attn_implementation == "veomni_sdpa"
+
+    model = build_foundation_model(config_path=config, init_device="meta")
+    assert model.config.text_config._attn_implementation == "eager"
+    assert model.config.vision_config._attn_implementation == "veomni_sdpa"
+    assert model.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert model.model.visual.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
+
+    # Explicit attn_implementation kwarg overrides all sub-configs.
+    overridden = build_foundation_model(config_path=config, init_device="meta", attn_implementation="eager")
+    assert overridden.config.text_config._attn_implementation == "eager"
+    assert overridden.config.vision_config._attn_implementation == "eager"
+    assert overridden.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert overridden.model.visual.blocks[0].attn.veomni_attn.impl == "eager"
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_hf_backend_build_uses_native_config_without_mutating_adapter(monkeypatch):
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
+    config = _tiny_qwen3_config()
+    model = build_foundation_model(
+        config, torch_dtype="float32", init_device="cpu", ops_implementation=eager_ops_config()
+    )
+    assert type(model.config) is Qwen3Config
+    assert not hasattr(model.config, "ops_config")
+    assert isinstance(config, VeOmniPretrainedConfig)
+    assert model.config is not config
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_path):
+    from transformers import LlamaConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        ops_implementation=make_eager_ops_config(),
+    )
+    assert not isinstance(config, VeOmniPretrainedConfig)
+    model = LlamaForCausalLM(config).eval()
+    assert model.config is config
+    assert isinstance(config, VeOmniPretrainedConfig)
+    assert issubclass(model.config_class, VeOmniPretrainedConfig)
+    model.save_pretrained(tmp_path)
+    reloaded = LlamaForCausalLM.from_pretrained(tmp_path).eval()
+    inputs = torch.tensor([[1, 2, 3]])
+    torch.testing.assert_close(model(inputs).logits, reloaded(inputs).logits)
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize(
+    "family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"]
+)
+@pytest.mark.parametrize("attention", [None, "eager", "sdpa", "flash_attention_2"])
+def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkeypatch, family, attention):
+    """Orchestration and embedding wrappers leave backend validation to actual attention modules."""
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.seed_omni.modeling_omni import OmniModel
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("A wrapper without HF attention must not preload attention kernels")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    ops = {} if attention is None else {"attn_implementation": attention}
+    if family in ("fake_a", "fake_b"):
+        from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+        from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+
+        cls = FakeModuleA if family == "fake_a" else FakeModuleB
+        config = cls.config_class(hidden_size=8, ops_implementation=ops)
+
+        def construct():
+            return cls(config)
+    elif family == "movqgan":
+        from veomni.models.transformers.movqgan.modeling_movqgan import MoVQGAN
+
+        config = _tiny_movqgan_config()
+        config._set_ops_implementation(ops)
+
+        def construct():
+            return MoVQGAN(config)
+    elif family == "text_encoder":
+        from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
+        from veomni.models.seed_omni.modules.text_encoder.modeling import TextEncoder
+
+        config = TextEncoderConfig(vocab_size=8, hidden_size=8, ops_implementation=ops)
+
+        def construct():
+            return TextEncoder(config)
+    elif family == "omni":
+        config = OmniConfig(_module_entries={}, training_graphs={}, generation_graphs={}, ops_implementation=ops)
+
+        def construct():
+            return OmniModel(config, {})
+    else:
+        from veomni.models.diffusers.ltx2_3.ltx_condition.modeling_ltx2_3_condition import LTXVideoConditionModel
+        from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3_condition import (
+            MiniMaxH3ConditionModel,
+        )
+        from veomni.models.diffusers.qwen_image.qwen_image_condition.modeling_qwen_image_condition import (
+            QwenImageConditionModel,
+        )
+        from veomni.models.diffusers.wan_t2v.wan_condition.modeling_wan_condition import WanTransformer3DConditionModel
+
+        cls = {
+            "ltx": LTXVideoConditionModel,
+            "minimax": MiniMaxH3ConditionModel,
+            "qwen_image": QwenImageConditionModel,
+            "wan": WanTransformer3DConditionModel,
+        }[family]
+        if family == "minimax":
+            config = cls.config_class(skip_encoder_load=True, ops_implementation=ops)
+        else:
+            monkeypatch.setattr(cls, "_load_components", lambda self: None)
+            config = cls.config_class(ops_implementation=ops)
+
+        def construct():
+            return cls(config)
+
+    expected = config.ops_config.attn_implementation
+    model = construct()
+    assert model.config is config
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected
+    assert "_attn_implementation_internal" not in vars(config)
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+@pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+def test_cpu_hf_reference_constructs_without_optional_attention_kernels(monkeypatch, model_case):
+    """CPU parity references must select portable attention before the first model constructor."""
+    from importlib import import_module
+
+    config = model_case.config_factory(model_case.architectures[0])
+    native = getattr(type(config), "_hf_config_class", None)
+    if native is None:
+        pytest.skip("This family has no upstream Transformers reference config")
+    modeling = import_module(native.__module__.replace("configuration_", "modeling_"))
+    reference_class = getattr(modeling, model_case.architectures[0])
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("CPU reference construction must not preload optional attention kernels")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    reference = reference_class(config)
+    for module in reference.modules():
+        module_config = getattr(module, "config", None)
+        if isinstance(module_config, PretrainedConfig):
+            assert module_config._attn_implementation in ("eager", "sdpa", "veomni_sdpa")

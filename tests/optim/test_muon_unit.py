@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import Partial, Replicate, Shard
 
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.optim import muon as muon_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
@@ -113,7 +115,7 @@ def _dsv4_csa_attention_model() -> nn.Module:
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "deepseek_v4_toy"))
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     config.index_n_heads = 64
     config.index_head_dim = 128
     torch.manual_seed(0)
@@ -129,7 +131,7 @@ def _glm_dsa_attention_model() -> nn.Module:
     from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "glm_moe_dsa_toy"))
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     torch.manual_seed(0)
     model = nn.Module()
     model.self_attn = modeling.GlmMoeDsaAttention(config, 0)

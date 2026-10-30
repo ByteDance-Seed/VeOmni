@@ -52,7 +52,6 @@ from veomni.distributed.sequence_parallel import (
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -65,6 +64,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_gpu.py",
     description="Qwen3-VL with VeOmni v5 patches and VeomniOp replacements",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 # Surface ``Qwen3VLCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
 # while preserving ``rope_deltas``. Mutating ``output.log_probs`` /
@@ -117,16 +120,11 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
     Qwen3VLCausalLMOutputWithLogProbs,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.models.loss_utils import ForCausalLMLoss
 """)
 
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -144,11 +142,12 @@ config.add_import(
     "Qwen3VLTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -172,7 +171,40 @@ def qwen3_vl_text_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "Qwen3VLTextDecoderLayer.__init__",
+    description="Pass config to Qwen3VLTextRMSNorm instances",
+)
+def qwen3_vl_text_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
+    self.mlp = Qwen3VLTextMLP(config)
+    self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "Qwen3VLTextModel.__init__",
+    description="Pass config to final Qwen3VLTextRMSNorm",
+)
+def qwen3_vl_text_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.override_method(
@@ -247,7 +279,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
     if not is_flash_attention_requested(self.config):
         raise ValueError(
             "Async Ulysses attention only supports flash attention implementations. "
-            f"Current implementation: '{self.config._attn_implementation}'. "
+            f"Current implementation: '{self.config.ops_config.attn_implementation}'. "
             "Please set attn_implementation to a flash attention variant or disable async Ulysses."
         )
 
@@ -407,8 +439,8 @@ def collate_multimodal_metadata(batch, sp_pad):
 @config.modify_init("Qwen3VLVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -869,11 +901,33 @@ def qwen3_vl_vision_dummy_forward_patched(self):
 #    `get_parallel_state().async_enabled` is True; otherwise fall
 #    through to the upstream logic unchanged
 # ================================================================
-@config.modify_init("Qwen3VLTextAttention", description="Bind instance-local rope and attention VeomniOps")
-def qwen3_vl_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+@config.override_method(
+    "Qwen3VLTextAttention.__init__",
+    description="Pass config to Qwen3VLTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
+def qwen3_vl_text_attention_bind_ops(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # unlike olmo, only on the head dim!
+    self.k_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # thus post q_norm does not need reshape
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -1423,7 +1477,7 @@ def qwen3_vl_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3VLModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

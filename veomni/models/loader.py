@@ -21,6 +21,7 @@ from transformers import PreTrainedModel
 from transformers.initialization import no_init_weights
 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
+from veomni.models.configuration_base import as_hf_config
 from veomni.models.qwen4_gdn_precision import prepare_qwen4_gdn_precision
 from veomni.models.registry import get_model_class
 from veomni.utils import logging
@@ -52,6 +53,7 @@ class HuggingfaceLoader(BaseModelLoader):
 
     def load_model(self, init_kwargs: dict, **kwargs):
         """Construct ``model_cls`` and optionally load checkpoint weights."""
+        init_kwargs = {**init_kwargs, "config": as_hf_config(init_kwargs["config"])}
         init_kwargs.pop("trust_remote_code", True)
 
         init_device = kwargs.pop("init_device", "cuda")
