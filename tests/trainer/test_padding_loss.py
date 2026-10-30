@@ -6,6 +6,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils import loss_utils
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -157,7 +158,7 @@ def test_asymmetric_distributed_padding_fails_on_all_ranks():
     spawn_with_rendezvous(_asymmetric_distributed_padding_worker, args=(), nprocs=2)
 
 
-def _strict_channel_error_worker(rank, endpoint):
+def _strict_channel_error_worker(rank, accelerator, endpoint):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -167,7 +168,10 @@ def _strict_channel_error_worker(rank, endpoint):
     from veomni.trainer.base import BaseTrainer
     from veomni.trainer.callbacks.channel_loss_callback import ChannelLossCallback
 
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    if accelerator:
+        get_torch_device().set_device(rank)
+    backend = get_dist_comm_backend() if accelerator else "gloo"
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     callback_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
     original_reduce = dist.all_reduce
     reduce_sizes = []
@@ -186,21 +190,30 @@ def _strict_channel_error_worker(rank, endpoint):
         trainer.model = SimpleNamespace()
         trainer._reset_async_activation_offload_if_enabled = lambda _model: None
         callback = ChannelLossCallback(trainer)
-        trainer.on_step_begin = lambda micro_batches: callback.on_step_begin(
-            trainer.state, micro_batches=micro_batches
-        )
+        callback_succeeded = False
+
+        def step_begin(micro_batches):
+            nonlocal callback_succeeded
+            callback.on_step_begin(trainer.state, micro_batches=micro_batches)
+            callback_succeeded = True
+
+        trainer.on_step_begin = step_begin
         batch = {"labels": torch.tensor([1])}
         if rank == 1:
             batch["ds_idx"] = torch.tensor([1])
         error = None
+        cause = None
         try:
             trainer.train_step(iter([[batch]]))
         except RuntimeError as exc:
             error = str(exc)
+            cause = None if exc.__cause__ is None else (type(exc.__cause__).__name__, str(exc.__cause__))
         results = [None, None]
-        dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes))
-        assert all(message and "callback or loss-token" in message and step == 3 for message, step, _ in results)
-        assert all(sizes == [5, 2] for _, _, sizes in results)
+        dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
+        assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
+        assert all(sizes == [5, 2] for _, _, sizes, *_ in results)
+        assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
+        assert results[1][3] and results[1][4] is None
 
         error = ValueError("strict source missing") if rank == 0 else None
         with pytest.raises(RuntimeError, match="DPO step-begin callback failed"):
@@ -211,10 +224,21 @@ def _strict_channel_error_worker(rank, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_strict_channel_callback_failure_is_synchronized_without_extra_sft_collective():
+def test_strict_channel_callback_failure_is_synchronized_without_extra_sft_all_reduce():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_strict_channel_error_worker, args=(), nprocs=2)
+    spawn_with_rendezvous(_strict_channel_error_worker, args=(False,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="accelerator"))
+@pytest.mark.skipif(
+    get_device_type() == "cpu" or not get_torch_device().is_available() or get_torch_device().device_count() < 2,
+    reason="Requires two accelerator devices",
+)
+def test_accelerator_strict_channel_failure_uses_existing_token_reduction():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_strict_channel_error_worker, args=(True,), nprocs=2)
 
 
 def test_stop_iteration_from_step_begin_is_not_dataloader_eof():
