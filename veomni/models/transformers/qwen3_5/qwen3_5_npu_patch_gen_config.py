@@ -42,7 +42,9 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     compute_mtp_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_attention_bind_ops,
     qwen3_5_attention_forward_patched,
+    qwen3_5_decoder_layer_init_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forcausallm_init_patched,
     qwen3_5_forconditional_generation_forward_patched,
@@ -59,6 +61,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_init_patched,
     qwen3_5_rmsnorm_forward_patched,
     qwen3_5_rmsnorm_init_patched,
+    qwen3_5_text_model_init_patched,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -80,6 +83,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
@@ -88,6 +95,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
@@ -108,10 +116,6 @@ config.add_import(
 )  # noqa: F401
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.attention_utils",
     names=["prepare_dense_attention_inputs"],
@@ -192,6 +196,16 @@ config.override_method(
     "Qwen3_5MLP.forward",
     replacement=qwen3_5_mlp_forward_patched,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.override_method(
+    "Qwen3_5DecoderLayer.__init__",
+    replacement=qwen3_5_decoder_layer_init_patched,
+    description="Pass config to Qwen3_5RMSNorm instances",
+)
+config.override_method(
+    "Qwen3_5TextModel.__init__",
+    replacement=qwen3_5_text_model_init_patched,
+    description="Pass config to final Qwen3_5RMSNorm",
 )
 
 
@@ -274,15 +288,16 @@ def qwen3_5_gated_deltanet_forward_patched(
         k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-        q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-        k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-        v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-
         b = b.reshape(batch_size, seq_len, self.num_v_heads)
         a = a.reshape(batch_size, seq_len, self.num_v_heads)
-        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+        if q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
+            q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(q_proj, k_proj, v_proj, b, a, ulysses_group)
+        else:
+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
         # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
         q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -817,15 +832,10 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
     # picks it up via `vision_max_seqlen` and falls back to the original
     # recompute when the key is absent (so non-VeOmni callers keep working).
-    # Gate is two-pronged:
-    #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       when Qwen3_5VisionAttention.forward is patched to consume
-    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-    #   (b) `is_flash_attention_requested(self.config)` — only FA's
-    #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-    #       and sdpa paths in the consumer pop+discard the kwarg, so the
-    #       host sync would be wasted.
-    if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+    # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
+    # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
+    # GPU and NPU both register that consumer.
+    if _VEOMNI_VISION_ATTENTION_PATCHED:
         if precomputed_max_seqlen is not None:
             # Collator-side max already accounts for sp-pad; use as-is.
             kwargs["vision_max_seqlen"] = precomputed_max_seqlen
@@ -935,6 +945,11 @@ config.override_method(
         "the per-block host sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D device tensors."
     ),
+)
+config.override_method(
+    "Qwen3_5Attention.__init__",
+    replacement=qwen3_5_attention_bind_ops,
+    description="Pass config to Qwen3_5RMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3_5Attention.forward",

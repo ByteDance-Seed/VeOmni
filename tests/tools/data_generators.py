@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 
+import torch
 import torch.distributed as dist
 from datasets import Dataset
 
@@ -25,6 +26,7 @@ class DummyDataset:
         dataset_type: str = "text",
         cache_name: str | None = None,
     ) -> None:
+        """Initialize the dummy dataset and write deterministic parquet shards."""
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.num_shard = 2
@@ -32,13 +34,24 @@ class DummyDataset:
         self.save_path = get_cache_dir(f"./{cache_name or dataset_type}")
 
         if not dist.is_initialized() or dist.get_rank() == 0:
-            self.dataset = build_dummy_dataset(dataset_type, self.num_samples, self.seq_len)
-            self.build_dummy_dataset()
+            # Seed CPU RNG so fixture-generated parquet shards are deterministic
+            # even when evaluated in a fresh worker process before any test body
+            # calls ``torch.manual_seed(0)``, and restore the caller's CPU RNG state.
+            previous_cpu_state = torch.get_rng_state()
+            try:
+                seeded_cpu = torch.Generator()
+                seeded_cpu.manual_seed(0)
+                torch.set_rng_state(seeded_cpu.get_state())
+                self.dataset = build_dummy_dataset(dataset_type, self.num_samples, self.seq_len)
+                self.build_dummy_dataset()
+            finally:
+                torch.set_rng_state(previous_cpu_state)
 
         if dist.is_initialized():
             dist.barrier()
 
     def build_dummy_dataset(self):
+        """Write deterministic parquet shards for ``self.dataset`` into ``self.save_path``."""
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
 
@@ -51,8 +64,16 @@ class DummyDataset:
             print(f"Generating {shard_idx}th parquet file (samples {start}:{end})")
 
             def _shard_generator(s=start, e=end):
-                for i in range(s, e):
-                    yield self.dataset[i][0]
+                """Yield deterministic examples for shard slice ``[s, e)``."""
+                previous_cpu_state = torch.get_rng_state()
+                try:
+                    seeded_cpu = torch.Generator()
+                    seeded_cpu.manual_seed(s)
+                    torch.set_rng_state(seeded_cpu.get_state())
+                    for i in range(s, e):
+                        yield self.dataset[i][0]
+                finally:
+                    torch.set_rng_state(previous_cpu_state)
 
             ds = Dataset.from_generator(
                 _shard_generator,

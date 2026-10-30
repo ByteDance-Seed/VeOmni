@@ -81,6 +81,9 @@ class ChannelLossComputer:
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
         self._micro_step = 0
         self.step_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.include_data_stats = False
+        self.source_repeat = 1
+        self.step_data_totals: dict[ChannelKey, torch.Tensor] = {}
         self.source_names: dict[ChannelKey, str] = {}
         self.strict = False
 
@@ -208,6 +211,7 @@ class ChannelLossComputer:
         self._per_mb_attention_masks = per_mb_attention_masks
         self._micro_step = 0
         self.step_totals = {}
+        self.step_data_totals = {}
 
     def before_micro_step(self) -> None:
         step = self._micro_step
@@ -232,6 +236,9 @@ class ChannelLossComputer:
                     self.step_totals[source_id] = (loss_sum, token_count)
                 else:
                     self.step_totals[source_id] = (previous[0] + loss_sum, previous[1] + token_count)
+                if "input_token_count" in item:
+                    counts = torch.stack([item["sample_count"], item["input_token_count"]]).detach()
+                    self.step_data_totals[source_id] = self.step_data_totals.get(source_id, 0) + counts
         self._source_ids = []
         self._position_ids = None
         self._attention_mask = None
@@ -250,17 +257,32 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        main_loss = self._original_loss_fn(*args, **kwargs)
+        if not self.capture_active or not self._source_ids:
+            return self._original_loss_fn(*args, **kwargs)
+
+        from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+        captured = {}
+        token = chunk_loss._CAPTURE.set(captured)
+        try:
+            main_loss = self._original_loss_fn(*args, **kwargs)
+        finally:
+            chunk_loss._CAPTURE.reset(token)
+        if captured.get("error"):
+            logger.warning_rank0("Channel loss: chunk observation failed; recomputing detached metrics.")
+            captured.clear()
 
         call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
         logits = call_args.get("logits")
         labels = call_args.get("labels")
+        if labels is None:
+            labels = call_args.get("shift_labels")
         vocab_size = call_args.get("vocab_size")
         ignore_index = call_args.get("ignore_index", IGNORE_INDEX)
         if ignore_index is None:
             ignore_index = IGNORE_INDEX
         if self.capture_active and self._source_ids and labels is not None:
-            self.compute_side_channel(
+            observer_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -269,6 +291,22 @@ class ChannelLossComputer:
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
             )
+            extras = {
+                "reused_per_token_loss": captured.get("per_token"),
+                "logits_bias": call_args.get("logits_bias"),
+                "logits_bias_weight": call_args.get("logits_bias_weight"),
+            }
+            accepted = _supported_observer_kwargs(self.compute_side_channel, extras)
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                self._result = None
+                if self.strict:
+                    raise ChannelLossMetadataError("Custom channel observer cannot receive logits bias.")
+                logger.warning_rank0(
+                    "Channel loss: custom observer cannot receive logits bias; skipping this micro-batch."
+                )
+                return main_loss
+            observer_kwargs.update(accepted)
+            self.compute_side_channel(**observer_kwargs)
 
         return main_loss
 
@@ -281,9 +319,12 @@ class ChannelLossComputer:
         weights: torch.Tensor | None,
         shift_labels: torch.Tensor | None = None,
         ignore_index: int = IGNORE_INDEX,
+        reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> None:
         try:
-            self._result = self._compute_channel_loss(
+            compute_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -293,12 +334,28 @@ class ChannelLossComputer:
                 shift_labels=shift_labels,
                 ignore_index=ignore_index,
             )
+            extras = {
+                "reused_per_token_loss": reused_per_token_loss,
+                "logits_bias": logits_bias,
+                "logits_bias_weight": logits_bias_weight,
+            }
+            accepted = _supported_observer_kwargs(self._compute_channel_loss, extras)
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                raise ChannelLossMetadataError("Custom channel loss computation cannot receive logits bias.")
+            compute_kwargs.update(accepted)
+            self._result = self._compute_channel_loss(**compute_kwargs)
         except ChannelLossMetadataError:
             if self.strict:
                 raise
             logger.warning_rank0("Channel loss: metadata mismatch; skipping this micro-batch.", exc_info=True)
             self._result = None
         except Exception:
+            if (
+                self.strict
+                and getattr(self._compute_channel_loss, "__func__", None)
+                is not ChannelLossComputer._compute_channel_loss
+            ):
+                raise
             logger.warning_rank0("Channel loss: per-token CE failed; skipping this micro-batch.", exc_info=True)
             self._result = None
 
@@ -313,6 +370,9 @@ class ChannelLossComputer:
         attention_mask: torch.Tensor | None,
         shift_labels: torch.Tensor | None,
         ignore_index: int,
+        reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> list[dict[str, Any]]:
         sp_enabled = bool(self.parallel_state.sp_enabled)
         # Match ``ForCausalLMLoss``: a provided ``shift_labels`` wins, including under SP.
@@ -329,7 +389,14 @@ class ChannelLossComputer:
             labels=labels,
             effective_labels=effective_labels,
         )
-        per_token_loss = self._per_token_ce(logits, labels_flat, vocab_size, hidden_states, weights, ignore_index)
+        if reused_per_token_loss is not None:
+            per_token_loss = reused_per_token_loss.detach().reshape(-1)
+            if per_token_loss.numel() != labels_flat.numel():
+                raise ChannelLossMetadataError("Captured token loss does not match labels.")
+        else:
+            per_token_loss = self._per_token_ce(
+                logits, labels_flat, vocab_size, hidden_states, weights, ignore_index, logits_bias, logits_bias_weight
+            )
         if per_token_loss is None:
             return []
         labels_flat = labels_flat.to(per_token_loss.device)
@@ -346,6 +413,7 @@ class ChannelLossComputer:
             sp_enabled=sp_enabled,
             parallel_state=self.parallel_state,
             strict=self.strict,
+            include_data_stats=self.include_data_stats,
         )
 
     def _per_token_ce(
@@ -356,11 +424,13 @@ class ChannelLossComputer:
         hidden_states: torch.Tensor | None,
         weights: torch.Tensor | None,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if hidden_states is not None and weights is not None:
             hs = hidden_states.detach().reshape(-1, hidden_states.size(-1))
             w = weights.detach()
-            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index)
+            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index, logits_bias, logits_bias_weight)
 
         if logits is not None:
             vocab = vocab_size if vocab_size is not None else logits.size(-1)
@@ -395,12 +465,19 @@ class ChannelLossComputer:
         weights: torch.Tensor,
         labels_flat: torch.Tensor,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_len = hidden_states.size(0)
         result = torch.empty(seq_len, device=hidden_states.device, dtype=torch.float32)
         for start in range(0, seq_len, cls.EAGER_CHUNK_SIZE):
             end = min(start + cls.EAGER_CHUNK_SIZE, seq_len)
             chunk_logits = F.linear(hidden_states[start:end], weights).float()
+            if logits_bias is not None:
+                bias = logits_bias.detach().reshape(-1, logits_bias.size(-1))[start:end]
+                if logits_bias_weight is not None:
+                    bias = F.linear(bias, logits_bias_weight.detach())
+                chunk_logits = chunk_logits + bias.float()
             result[start:end] = F.cross_entropy(
                 chunk_logits,
                 labels_flat[start:end],
@@ -421,6 +498,7 @@ class ChannelLossComputer:
         sp_enabled: bool = False,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if not source_ids:
             return []
@@ -452,6 +530,7 @@ class ChannelLossComputer:
                     ignore_index=ignore_index,
                     parallel_state=parallel_state,
                     strict=strict,
+                    include_data_stats=include_data_stats,
                 )
 
             row_width = pos_2d.size(1)
@@ -499,6 +578,14 @@ class ChannelLossComputer:
                     "token_count": token_count,
                 }
             )
+            if include_data_stats:
+                mask = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
+                channel_loss[-1]["sample_count"] = torch.ones_like(token_count)
+                channel_loss[-1]["input_token_count"] = (
+                    mask.to(torch.bool).sum(dtype=torch.int64)
+                    if mask is not None
+                    else token_count.new_tensor(end - start + 1)
+                )
         return channel_loss
 
     @staticmethod
@@ -512,6 +599,7 @@ class ChannelLossComputer:
         ignore_index: int,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if parallel_state is None:
             raise ValueError("parallel_state is required for SP channel-loss aggregation.")
@@ -567,6 +655,12 @@ class ChannelLossComputer:
                     "token_count": token_count,
                 }
             )
+            if include_data_stats:
+                segments[-1]["input_token_count"] = (
+                    mask_slice.to(torch.bool).sum(dtype=torch.int64)
+                    if mask_slice is not None
+                    else token_count.new_tensor(flat_end - flat_start)
+                )
 
         for batch_idx, row_pos in enumerate(positions_cpu):
             row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
@@ -593,12 +687,14 @@ class ChannelLossComputer:
             device=per_token_loss.device,
             parallel_state=parallel_state,
             strict=strict,
+            include_data_stats=include_data_stats,
         )
         return [
             {
                 "source_id": item["source_id"],
                 "loss_sum": torch.as_tensor(item["loss_sum"], device=per_token_loss.device, dtype=torch.float32),
                 "token_count": torch.as_tensor(item["token_count"], device=per_token_loss.device, dtype=torch.int64),
+                **({key: item[key] for key in ("sample_count", "input_token_count")} if include_data_stats else {}),
             }
             for item in reduced
         ]
@@ -610,6 +706,7 @@ class ChannelLossComputer:
         device: torch.device,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if local_segments:
             local_zero_position_flags = torch.tensor(
@@ -657,12 +754,15 @@ class ChannelLossComputer:
                     local_zero_position_flags = torch.stack(
                         [segment["has_only_zero_positions"] for segment in local_segments]
                     ).to(device=device, dtype=torch.int64)
-                    local_integer_stats = torch.stack(
-                        [local_token_counts, local_explicit_padding_flags, local_zero_position_flags], dim=1
-                    )
+                    columns = [local_token_counts, local_explicit_padding_flags, local_zero_position_flags]
+                    if include_data_stats:
+                        columns.append(torch.stack([segment["input_token_count"] for segment in local_segments]))
+                    local_integer_stats = torch.stack(columns, dim=1)
                 else:
                     local_loss_sums = torch.empty(0, dtype=torch.float32, device=device)
-                    local_integer_stats = torch.empty((0, 3), dtype=torch.int64, device=device)
+                    local_integer_stats = torch.empty(
+                        (0, 3 + int(include_data_stats)), dtype=torch.int64, device=device
+                    )
 
                 loss_padding = local_loss_sums.new_zeros(max_segment_count - local_loss_sums.size(0))
                 integer_padding = local_integer_stats.new_zeros(
@@ -687,6 +787,8 @@ class ChannelLossComputer:
                                 "has_only_zero_positions": integer_stats[2].to(torch.bool),
                             }
                         )
+                        if include_data_stats:
+                            all_segments[-1]["input_token_count"] = integer_stats[3]
 
         all_segments.sort(
             key=lambda segment: (
@@ -725,6 +827,9 @@ class ChannelLossComputer:
                         "token_count": segment["token_count"],
                     }
                 )
+                if include_data_stats:
+                    result[-1]["sample_count"] = torch.ones_like(segment["token_count"])
+                    result[-1]["input_token_count"] = segment["input_token_count"]
                 last_result_idx_by_batch[batch_idx] = len(result) - 1
                 doc_idx += 1
                 continue
@@ -741,6 +846,8 @@ class ChannelLossComputer:
                 continue
             result[result_idx]["loss_sum"] += segment["loss_sum"]
             result[result_idx]["token_count"] += segment["token_count"]
+            if include_data_stats:
+                result[result_idx]["input_token_count"] += segment["input_token_count"]
         return result
 
 
@@ -766,6 +873,7 @@ class ChannelLossCallback(Callback):
                 "after the common channel-loss step lifecycle captures alignment metadata."
             )
         self.computer = ChannelLossComputer(parallel_state=self.parallel_state)
+        self.computer.include_data_stats = True
         self._strip_keys = set(self.config.source_id_keys)
         self._strip_keys.update(self.config.source_name_keys)
         self._strip_keys.update(self.config.extra_strip_keys)
@@ -836,6 +944,7 @@ class ChannelLossCallback(Callback):
             return
         if source_repeat < 1:
             raise ValueError(f"Channel loss source_repeat must be >= 1, got {source_repeat}.")
+        self.computer.source_repeat = source_repeat
 
         self._collect_step = state.global_step % self.config.interval == 0
         if not self._collect_step:
@@ -938,6 +1047,8 @@ class ChannelLossCallback(Callback):
             return
 
         metrics = self._build_metrics(totals, source_names)
+        data_totals = self._reduce_step_data_totals(self.computer.step_data_totals, list(totals))
+        metrics.update(self._build_data_metrics(data_totals, totals, source_names))
         if not metrics:
             return
 
@@ -1013,6 +1124,46 @@ class ChannelLossCallback(Callback):
         }
         registered_names = self._register_sources(source_ids, synchronized_names)
         return totals, registered_names
+
+    def _reduce_step_data_totals(
+        self,
+        local_totals: dict[ChannelKey, torch.Tensor],
+        source_ids: list[ChannelKey],
+    ) -> dict[ChannelKey, tuple[int, int]]:
+        counts = torch.zeros((len(source_ids), 2), dtype=torch.int64, device=self._data_totals_device(local_totals))
+        for index, source_id in enumerate(source_ids):
+            if source_id in local_totals:
+                counts[index] = local_totals[source_id]
+        ps = self.parallel_state
+        if ps.dp_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts, group=ps.dp_group)
+        return {source_id: tuple(values) for source_id, values in zip(source_ids, counts.cpu().tolist())}
+
+    def _data_totals_device(self, local_totals: dict[ChannelKey, torch.Tensor]) -> torch.device:
+        return (
+            next(iter(local_totals.values())).device
+            if local_totals
+            else self._totals_device(self.computer.step_totals)
+        )
+
+    def _build_data_metrics(
+        self,
+        data_totals: dict[ChannelKey, tuple[int, int]],
+        loss_totals: dict[ChannelKey, tuple[float, int]],
+        source_names: dict[ChannelKey, str],
+    ) -> dict[str, float]:
+        names = self._render_metric_names(loss_totals, source_names)
+        metrics = {}
+        for source_id, (samples, input_tokens) in data_totals.items():
+            if samples <= 0:
+                continue
+            samples /= self.computer.source_repeat
+            name = names[source_id]
+            label_tokens = loss_totals[source_id][1]
+            metrics[f"samples/{name}"] = float(samples)
+            metrics[f"input_tokens/{name}"] = float(input_tokens)
+            metrics[f"label_tokens_per_sample/{name}"] = label_tokens / samples
+        return metrics
 
     def _register_sources(
         self,
@@ -1183,6 +1334,20 @@ def _as_flat_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _supported_observer_kwargs(method: Callable[..., Any], extras: dict[str, Any]) -> dict[str, Any]:
+    """Pass extensions accepted by old or user-overridden observer signatures."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {
+        name: value
+        for name, value in extras.items()
+        if name in parameters
+        and parameters[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+
+
 def _bind_loss_call_args(
     loss_fn: Callable[..., Any],
     args: tuple[Any, ...],
@@ -1201,8 +1366,26 @@ def _bind_loss_call_args(
             elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
                 bound_args.pop(name, None)
 
-        for key, value in zip(_LOSS_CALL_POSITIONAL_KEYS, args):
-            bound_args.setdefault(key, value)
+        has_varargs = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in signature.parameters.values())
+        positional_names = [
+            p.name
+            for p in signature.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        known_names = set(_LOSS_CALL_POSITIONAL_KEYS) | {
+            "hidden_states",
+            "weights",
+            "shift_labels",
+            "logits_bias",
+            "logits_bias_weight",
+        }
+        for index, (key, value) in enumerate(zip(_LOSS_CALL_POSITIONAL_KEYS, args)):
+            if (
+                key in signature.parameters
+                or (has_varargs and index >= len(positional_names))
+                or (index < 3 and index < len(positional_names) and positional_names[index] not in known_names)
+            ):
+                bound_args.setdefault(key, value)
         return bound_args
     except (TypeError, ValueError):
         bound_args = dict(zip(_LOSS_CALL_POSITIONAL_KEYS, args))
@@ -1231,71 +1414,44 @@ def _filter_surplus_tail_padding_segments(
     attention_mask_flat: torch.Tensor | None,
     ignore_index: int,
 ) -> list[tuple[int, int, int]]:
-    surplus = len(segments) - source_count
-    if surplus <= 0:
-        return segments
-
-    indexed_by_batch: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
-    for segment_idx, (batch_idx, start, end) in enumerate(segments):
-        indexed_by_batch[batch_idx].append((segment_idx, start, end))
-
-    candidates_by_batch: dict[int, list[tuple[bool, int]]] = defaultdict(list)
-    for batch_idx, row_segments in indexed_by_batch.items():
-        for segment_idx, start, end in reversed(row_segments):
-            mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
-            if not _is_padding_only_segment(
-                labels_slice=labels_flat[start : end + 1],
-                positions_slice=positions_flat[start : end + 1] if positions_flat is not None else None,
-                attention_mask_slice=mask_slice,
-                ignore_index=ignore_index,
-            ):
-                break
-            candidates_by_batch[batch_idx].append((_has_explicit_padding_mask(mask_slice), segment_idx))
-
-    selected = _select_unambiguous_tail_candidates(candidates_by_batch, surplus)
-    if selected is None:
-        return segments
-    removed = set(selected)
-    return [segment for segment_idx, segment in enumerate(segments) if segment_idx not in removed]
+    """Drop trailing padding-only segments until segment count matches ``source_count``."""
+    while len(segments) > source_count:
+        _, start, end = segments[-1]
+        mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
+        if not _is_padding_only_segment(
+            labels_slice=labels_flat[start : end + 1],
+            positions_slice=positions_flat[start : end + 1] if positions_flat is not None else None,
+            attention_mask_slice=mask_slice,
+            ignore_index=ignore_index,
+        ):
+            break
+        segments.pop()
+    return segments
 
 
 def _filter_surplus_tail_padding_sp_segments(
     segments: list[dict[str, Any]],
     source_count: int,
 ) -> list[dict[str, Any]]:
+    """Drop trailing padding-only SP logical segments until start count matches ``source_count``."""
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
         return segments
 
-    indexed_by_batch: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    logical_segments: list[list[int]] = []
     for segment_idx, segment in enumerate(segments):
-        indexed_by_batch[int(segment.get("batch_idx", 0))].append((segment_idx, segment))
+        if segment["is_start"]:
+            logical_segments.append([])
+        if logical_segments:
+            logical_segments[-1].append(segment_idx)
 
-    candidates_by_batch: dict[int, list[tuple[bool, list[int]]]] = defaultdict(list)
-    for batch_idx, row_partials in indexed_by_batch.items():
-        logical_segments: list[list[tuple[int, dict[str, Any]]]] = []
-        for segment_idx, segment in row_partials:
-            if segment["is_start"]:
-                logical_segments.append([])
-            if logical_segments:
-                logical_segments[-1].append((segment_idx, segment))
-
-        for logical_segment in reversed(logical_segments):
-            if not logical_segment or not all(partial.get("is_padding_only", False) for _, partial in logical_segment):
-                break
-            candidates_by_batch[batch_idx].append(
-                (
-                    all(partial.get("has_explicit_padding_mask", False) for _, partial in logical_segment),
-                    [segment_idx for segment_idx, _ in logical_segment],
-                )
-            )
-
-    selected = _select_unambiguous_tail_candidates(candidates_by_batch, surplus)
-    if selected is None:
-        return segments
     removed: set[int] = set()
-    for segment_indices in selected:
-        removed.update(segment_indices)
+    remaining = surplus
+    for logical_segment in reversed(logical_segments):
+        if remaining == 0 or not all(segments[idx].get("is_padding_only", False) for idx in logical_segment):
+            break
+        removed.update(logical_segment)
+        remaining -= 1
     return [segment for segment_idx, segment in enumerate(segments) if segment_idx not in removed]
 
 
@@ -1305,6 +1461,7 @@ def _is_padding_only_segment(
     attention_mask_slice: torch.Tensor | None,
     ignore_index: int,
 ) -> bool:
+    """Return whether a segment contains only ignored labels and padding positions/mask."""
     if labels_slice.numel() == 0 or labels_slice.ne(ignore_index).any().item():
         return False
 
@@ -1316,56 +1473,6 @@ def _is_padding_only_segment(
         return bool(positions_slice.eq(0).all().item())
 
     return False
-
-
-def _has_explicit_padding_mask(attention_mask_slice: torch.Tensor | None) -> bool:
-    return bool(
-        attention_mask_slice is not None
-        and attention_mask_slice.numel() > 0
-        and not attention_mask_slice.to(torch.bool).any().item()
-    )
-
-
-def _select_unambiguous_tail_candidates(
-    candidates_by_batch: dict[int, list[tuple[bool, Any]]],
-    surplus: int,
-) -> list[Any] | None:
-    # Each layer stores compact backpointers instead of copying payload prefixes.
-    batch_ids = sorted(candidates_by_batch)
-    states: dict[int, tuple[int, bool]] = {0: (0, True)}
-    layers: list[dict[int, tuple[int, bool, int, int]]] = []
-    for batch_idx in batch_ids:
-        row_candidates = candidates_by_batch[batch_idx]
-        explicit_prefix = [0]
-        for has_explicit_mask, _ in row_candidates:
-            explicit_prefix.append(explicit_prefix[-1] + int(has_explicit_mask))
-
-        next_layer: dict[int, tuple[int, bool, int, int]] = {}
-        for removed_count, (score, is_unique) in states.items():
-            for row_removed in range(len(row_candidates) + 1):
-                new_count = removed_count + row_removed
-                if new_count > surplus:
-                    break
-                candidate_score = score + explicit_prefix[row_removed]
-                existing = next_layer.get(new_count)
-                if existing is None or candidate_score > existing[0]:
-                    next_layer[new_count] = (candidate_score, is_unique, removed_count, row_removed)
-                elif candidate_score == existing[0]:
-                    next_layer[new_count] = (existing[0], False, existing[2], existing[3])
-        layers.append(next_layer)
-        states = {removed_count: (entry[0], entry[1]) for removed_count, entry in next_layer.items()}
-
-    best = states.get(surplus)
-    if best is None or not best[1]:
-        return None
-
-    selected: list[Any] = []
-    removed_count = surplus
-    for batch_idx, layer in zip(reversed(batch_ids), reversed(layers)):
-        _, _, previous_count, row_removed = layer[removed_count]
-        selected.extend(payload for _, payload in candidates_by_batch[batch_idx][:row_removed])
-        removed_count = previous_count
-    return selected
 
 
 def _validate_segment_count(segment_count: int, source_count: int, strict: bool, context: str) -> bool:

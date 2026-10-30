@@ -21,6 +21,11 @@ unverified**. Real-data training requires the complete pretrained components.
 - Dense PyTorch SDPA replaces the source's CUDA attention imports. The native
   `flash` config label selects dense SDPA here. Sparse/SSTA and sequence
   parallelism are rejected; use `ulysses_size: 1`.
+  The backbone config owns its ops selection and defaults to `sdpa`.
+  `model.ops_implementation.attn_implementation` accepts `sdpa`, `veomni_sdpa`,
+  and the existing `eager` label; all use native dense SDPA. Other framework
+  attention backends are rejected during construction. The frozen condition
+  wrapper leaves attention selection to its individual encoders.
 - Frozen native VAE, Qwen text encoder and Glyph ByT5 provide conditions.
   The Transformers encoders are reused without modifying their modeling code.
   T2V does not execute the vision encoder, but its backbone projection parameters

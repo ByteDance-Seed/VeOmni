@@ -28,7 +28,6 @@ from transformers.models.seed_oss.modeling_seed_oss import SeedOssForCausalLM as
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_seed_oss_config as _tiny_config
 
@@ -48,8 +47,8 @@ def _seed_oss_cls():
 
 
 def _build_ours(config: SeedOssConfig, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _seed_oss_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _seed_oss_cls()(config)
 
 
 def test_seed_oss_eager_matches_hf():

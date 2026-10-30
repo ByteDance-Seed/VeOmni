@@ -1,7 +1,8 @@
 from copy import deepcopy
 
 import torch
-from transformers import PretrainedConfig
+
+from ...configuration_base import VeOmniPretrainedConfig
 
 
 NATIVE_DEFAULTS = {
@@ -39,7 +40,7 @@ NATIVE_DEFAULTS = {
 }
 
 
-class HunyuanVideo15Config(PretrainedConfig):
+class HunyuanVideo15Config(VeOmniPretrainedConfig):
     model_type = "HunyuanVideo15Model"
     condition_model_type = "HunyuanVideo15ConditionModel"
 
@@ -51,6 +52,9 @@ class HunyuanVideo15Config(PretrainedConfig):
         if not self.concat_condition or self.guidance_embed or self.use_meanflow:
             raise ValueError("Distilled/meanflow/unconditional-input variants are not supported")
         kwargs["tie_word_embeddings"] = False
+        # Native attention always uses dense SDPA, including the checkpoint's
+        # "flash" label. Do not inherit the framework's FlashAttention default.
+        kwargs.setdefault("attn_implementation", "sdpa")
         super().__init__(**kwargs)
         self.architectures = ["HunyuanVideo15Model"]
 
@@ -63,7 +67,7 @@ def _normalize_condition_dtype(dtype):
     return str(dtype).removeprefix("torch.") if isinstance(dtype, torch.dtype) else dtype
 
 
-class HunyuanVideo15ConditionConfig(PretrainedConfig):
+class HunyuanVideo15ConditionConfig(VeOmniPretrainedConfig):
     model_type = "HunyuanVideo15ConditionModel"
 
     def __init__(
@@ -113,5 +117,6 @@ class HunyuanVideo15ConditionConfig(PretrainedConfig):
     def get_config_dict(cls, pretrained_model_name_or_path, **kwargs):
         config, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
         # The native root config describes a pipeline, not a Transformers model.
-        config = {"base_model_path": str(pretrained_model_name_or_path)}
+        if config.get("model_type") != cls.model_type:
+            config = {"base_model_path": str(pretrained_model_name_or_path)}
         return config, kwargs

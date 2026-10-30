@@ -119,12 +119,40 @@ Keep backend-specific imports isolated so one backend does not break another's
 import path.
 
 Model/config registries live in `veomni/models/registry.py`; use the public
-`veomni.models` builders for construction. When binding optimized operations,
-construct instance-local `VeomniOp` handles from the installed ops selection.
+`veomni.models` builders for construction. Register supported modeling classes
+at import time in the model package's `__init__.py`.
+
+### Configuration ownership and operation binding
+
+Read `docs/design/module_config.md`. Custom configs inherit
+`VeOmniPretrainedConfig`; when extending an HF schema, inherit
+`(VeOmniPretrainedConfig, HFConfig)`. Declared `sub_configs` are adapted
+recursively at class creation. Custom constructors and lifecycle overrides
+must call `super()` so the native schema and VeOmni contracts both run.
+
+Generated specs replace the HF `PreTrainedModel` import with
+`VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
+Handwritten HF-compatible models use the same base. It adapts the model's
+`config_class` and direct config inputs recursively and validates final ops
+before HF initialization. Native HF configs remain unmodified; standalone
+attention/MLP/expert tests must explicitly use
+`get_veomni_config_class(HFConfig)` or `as_veomni_config(config)`.
+
+The sparse `ops_implementation` dictionary owns operation selections, including
+attention; `config.ops_config` is the validated, cached runtime projection.
+Merge load overrides before validating the final tree, preserving child-local
+choices according to the documented precedence. Never patch native HF config
+base methods or maintain an independent attention field. Handwritten Diffusers
+constructors accepting `attn_implementation` must apply a non-`None` override
+to the owning config before HF initialization and kernel binding; omission or
+`None` preserves existing selections.
+
+Construct instance-local `VeomniOp` handles from `self.config.ops_config`.
+Changing config selections after construction does not replace bound handles.
 Keep model-specific input normalization and loss policy in modeling, and keep
 registered op contracts tensor-level. Do not introduce mutable module-level
-dispatch callables. Follow the current peer model and op documentation rather
-than restoring a removed dispatch API.
+dispatch callables. Follow current peer models and `docs/design/op_selection.md`
+for attention, MoE, and loss binding rather than restoring a removed dispatch API.
 
 First obtain a working eager/native path on representative small inputs.
 Introduce fused kernels or distributed execution only after this reference works.
@@ -260,6 +288,24 @@ Check clean-process import, config/registry lookup, output shapes, and expected
 forward behavior. For generated modeling, run applicable patch tests and drift
 checks required by the patchgen skill.
 
+For Transformers families, follow
+[Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).
+Add one canonical factory in `tests/models/tiny_configs.py`, a registry/build
+case in `tests/models/base/test_auto_registry.py`, and eager forward/backward
+parity in the matching family under `tests/models/transformers/`. Set eager
+attention on the composite root before constructing HF references so unset
+vision/audio children inherit it. Candidate CPU models must select eager for
+all consumed ops; reuse `tests.tools.training_utils.make_eager_ops_config()`.
+CPU model tests reject optional attention preloading even when installed.
+Use config-owned SDPA for FP32 accelerator comparisons when the default backend
+requires half precision.
+
+For each supported accelerator claimed, cover one supported training
+configuration against an independent reference, including loss and backward.
+Distinct optimized operator implementations need their own numerical/backward
+coverage under `tests/ops/`; model binding and integrated distributed training
+need their corresponding model and E2E coverage.
+
 For ported modeling, layouts, or operations, compare source and VeOmni with
 matched weights, inputs, masks, dtype, and execution mode. Supply identical
 noise/timesteps for stochastic objectives; matching seeds alone may not match
@@ -282,6 +328,22 @@ Use a controlled repeated fixture only when convergence evidence is requested.
 Define its acceptance rule in advance, such as initial/final window medians;
 do not require every stochastic step to decrease or claim production quality
 from a tiny overfit experiment.
+
+### Parallel training coverage
+
+For Transformers integrations, extend the matching family table in
+`tests/e2e/test_e2e_parallel.py` using the coverage policy's default
+four-process matrix: dense `(SP1, EP1)` / `(SP2, EP1)`, ordinary MoE
+`(SP1, EP1)` / `(SP2, EP2)`. Follow its capability exceptions when SP or EP is
+unsupported, and add modes only for a justified implementation or topology
+representative. Keep launch plans consistent with actual worker counts.
+
+Align loss and grad norm with matched initial weights, data, global batch size,
+and optimizer settings. Process success alone is smoke coverage; document any
+remaining alignment gap. Check `.agents/knowledge/testing.md` for GPU/NPU
+manifest collection and launch plans, and record actual hardware execution and
+skips. For VLM/Omni integrations, include the applicable freeze-ViT and
+asymmetric `dummy_forward` coverage described by the policy.
 
 ### Fresh-process resume
 

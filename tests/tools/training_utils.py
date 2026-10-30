@@ -11,10 +11,24 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import torch
+import torch.distributed as dist
+
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
 
-from .launch_utils import find_free_port
+
+def dp_mean(value: float, trainer) -> float:
+    """Average a logged scalar over the trainer model's data-parallel group."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return float(value)
+    ps = trainer.model.parallel_state
+    dp_group = ps.dp_group
+    if dp_group is None or ps.dp_size <= 1:
+        return float(value)
+    tensor = torch.tensor([float(value)], dtype=torch.float32, device=trainer.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=dp_group)
+    return float(tensor.item() / dist.get_world_size(dp_group))
 
 
 # NPU ops_implementation overrides per model. Every per-op field is pinned so
@@ -158,6 +172,7 @@ def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
         rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
         swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
         rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
+        rotary_pos_emb_vision_implementation=overrides.pop("rotary_pos_emb_vision_implementation", "eager"),
         load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
         rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
         causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
@@ -250,7 +265,6 @@ def build_torchrun_cmd(
             NPU runs pick the right per-model eager fallbacks. ``None`` is
             fine for tests not tied to a specific model.
     """
-    port = find_free_port()
     if nproc is not None:
         n = nproc
     elif parallel_config is not None:
@@ -262,7 +276,7 @@ def build_torchrun_cmd(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={n}",
-        f"--master_port={port}",
+        "--standalone",
         script,
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",

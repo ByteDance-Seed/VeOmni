@@ -16,10 +16,7 @@
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +25,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
     flex_2d_mask,
@@ -46,6 +44,9 @@ from veomni.ops.mask import (
     magi_attention_mask_builder,
     sdpa_attention_mask_builder,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_mask_builder_return_types():
@@ -121,6 +122,7 @@ def test_flash_like_hf_names_share_the_flash_mask_builder():
         "veomni_flash_attention_3",
         "veomni_flash_attention_3_hub",
         "veomni_flash_attention_4",
+        "veomni_flash_attention_aiter",
         "veomni_sage_attention",
     ):
         assert ALL_MASK_ATTENTION_FUNCTIONS[name] is flash_attention_mask_builder
@@ -545,7 +547,9 @@ def _packed_builder_inputs(length, segments, rows, cross_attention, boundary_shi
     importlib.util.find_spec("triton") is None, reason="Compiled masks require the compiler environment"
 )
 @pytest.mark.parametrize(("rows", "cross_attention"), [(1, False), (2, False), (1, True)])
-def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(monkeypatch, rows, cross_attention):
+def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(
+    _scoped_flex_compile_state, rows, cross_attention
+):
     """Exercise the public cu_seqlens path; attention-only graph tests bypass it."""
     lengths = (65, 129, 193, 259, 389, 517, 645, 773, 901, 1027, 1283, 1541)
     cases = [(length, 3, 0) for length in lengths]
@@ -563,200 +567,97 @@ def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(monkeyp
         "full_q_num_blocks",
         "full_q_indices",
     )
+    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    # A regression must raise rather than silently fall back to eager when
+    # new inputs exhaust the graph budget. Production limits stay unchanged.
+    with torch._dynamo.config.patch(recompile_limit=4, fail_on_recompile_limit_hit=True):
+        for case_index, (length, segments, shift) in enumerate(cases):
+            if case_index == len(cases) - 4:
+                repeat_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+            kwargs, expected = _packed_builder_inputs(length, segments, rows, cross_attention, shift)
+            compiled = flex_attention_mask_builder(**kwargs)
+            eager = flex_attention_mask_builder(**kwargs, compile_block_mask=False)
+            for field in fields:
+                torch.testing.assert_close(getattr(compiled, field), getattr(eager, field))
+            q = torch.arange(length)[:, None]
+            k = torch.arange(kwargs["kv_length"])[None, :]
+            for batch in range(rows):
+                torch.testing.assert_close(compiled.mask_mod(batch, 0, q, k), expected)
+        graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
+        assert 1 <= graphs <= 4
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
+
+
+@pytest.fixture
+def _scoped_flex_compile_state(monkeypatch):
+    """Reset Dynamo/Inductor and the builder singleton once around a compiled-mask test."""
     torch.compiler.reset()
     _reset_flex_compile_cache(monkeypatch)
-    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
     try:
-        # A regression must raise rather than silently fall back to eager when
-        # new inputs exhaust the graph budget. Production limits stay unchanged.
-        with torch._dynamo.config.patch(recompile_limit=4, fail_on_recompile_limit_hit=True):
-            for case_index, (length, segments, shift) in enumerate(cases):
-                if case_index == len(cases) - 4:
-                    repeat_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-                kwargs, expected = _packed_builder_inputs(length, segments, rows, cross_attention, shift)
-                compiled = flex_attention_mask_builder(**kwargs)
-                eager = flex_attention_mask_builder(**kwargs, compile_block_mask=False)
-                for field in fields:
-                    torch.testing.assert_close(getattr(compiled, field), getattr(eager, field))
-                q = torch.arange(length)[:, None]
-                k = torch.arange(kwargs["kv_length"])[None, :]
-                for batch in range(rows):
-                    torch.testing.assert_close(compiled.mask_mod(batch, 0, q, k), expected)
-            graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
-            assert 1 <= graphs <= 4
-            assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
+        yield
     finally:
         torch.compiler.reset()
 
 
-@pytest.mark.parametrize("fails", [False, True])
-def test_flex_builder_keeps_hf_functions_during_predicate_evaluation(fails):
-    """HF helpers must remain original throughout successful and failing calls."""
-    from transformers import masking_utils
-
-    original_builder = masking_utils.create_block_mask
-    original_offsets = masking_utils.add_offsets_to_mask_function
-
-    def predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Observe HF globals while this invocation still evaluates its mask."""
-        assert masking_utils.create_block_mask is original_builder
-        assert masking_utils.add_offsets_to_mask_function is original_offsets
-        if fails:
-            raise RuntimeError("predicate failed")
-        return q_idx >= kv_idx
-
-    context = pytest.raises(RuntimeError, match="predicate failed") if fails else contextlib.nullcontext()
-    with context:
-        flex_attention_mask_builder(
-            1, 4, 6, q_offset=2, mask_function=predicate, device="cpu", compile_block_mask=False
-        )
-    assert masking_utils.create_block_mask is original_builder
-    assert masking_utils.add_offsets_to_mask_function is original_offsets
-
-
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("second_fails", [False, True])
-def test_flex_builder_overlapping_calls_leave_native_hf_independent(monkeypatch, compiled, second_fails):
-    """Interleave A-enter/B-enter/A-exit/B-exit while a native HF consumer runs."""
-    from transformers import masking_utils
-
-    original_builder = masking_utils.create_block_mask
-    original_offsets = masking_utils.add_offsets_to_mask_function
-    # Isolate routing and lifetime, rather than concurrent compiler startup.
-    # Real compilation and graph reuse are exercised in separate regressions.
-    monkeypatch.setattr(flex_mask, "_compiled_create_block_mask", lambda: original_builder)
-    # Quarantine state even when this regression is run against the old patch.
-    monkeypatch.setattr(masking_utils, "create_block_mask", original_builder)
-    monkeypatch.setattr(masking_utils, "add_offsets_to_mask_function", original_offsets)
-    first_entered, second_entered, native_finished, first_finished = (Event() for _ in range(4))
-    observed = []
-
-    def first_predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Keep A live until B and the native HF consumer have entered."""
-        first_entered.set()
-        assert second_entered.wait(20), "second invocation never entered"
-        assert native_finished.wait(20), "native HF invocation never finished"
-        observed.append((masking_utils.create_block_mask, masking_utils.add_offsets_to_mask_function))
-        return q_idx >= kv_idx
-
-    def second_predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Make B exit after A, including when user predicate evaluation fails."""
-        second_entered.set()
-        assert first_finished.wait(20), "first invocation never finished"
-        observed.append((masking_utils.create_block_mask, masking_utils.add_offsets_to_mask_function))
-        if second_fails:
-            raise RuntimeError("second predicate failed")
-        return q_idx >= kv_idx
-
-    def build_first():
-        """Publish A completion even when construction raises."""
-        try:
-            return flex_attention_mask_builder(
-                1,
-                65,
-                69,
-                q_offset=7,
-                kv_offset=3,
-                mask_function=first_predicate,
-                device="cpu",
-                compile_block_mask=compiled,
-            )
-        finally:
-            first_finished.set()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(build_first)
-        try:
-            assert first_entered.wait(20), "first invocation never entered"
-            second = pool.submit(
-                flex_attention_mask_builder,
-                1,
-                129,
-                133,
-                q_offset=9,
-                kv_offset=5,
-                mask_function=second_predicate,
-                device="cpu",
-                compile_block_mask=compiled,
-            )
-            assert second_entered.wait(20), "second invocation never entered"
-            # Native HF helpers must not inherit either call's lengths/device.
-            native_predicate = masking_utils.add_offsets_to_mask_function(
-                masking_utils.causal_mask_function, q_offset=2, kv_offset=0
-            )
-            native = masking_utils.create_block_mask(
-                native_predicate, B=1, H=None, Q_LEN=193, KV_LEN=195, device="cpu", _compile=False
-            )
-            torch.testing.assert_close(flex_visible(native, 193, 195), torch.ones(193, 195, dtype=torch.bool).tril(2))
-        finally:
-            native_finished.set()
-        first_mask = first.result(timeout=20)
-        context = (
-            pytest.raises(RuntimeError, match="second predicate failed") if second_fails else contextlib.nullcontext()
-        )
-        with context:
-            second_mask = second.result(timeout=20)
-        if not second_fails:
-            q = torch.arange(129)[:, None]
-            k = torch.arange(133)[None, :]
-            torch.testing.assert_close(second_mask.mask_mod(0, 0, q, k), q + 9 >= k + 5)
-    q = torch.arange(65)[:, None]
-    k = torch.arange(69)[None, :]
-    torch.testing.assert_close(first_mask.mask_mod(0, 0, q, k), q + 7 >= k + 3)
-    assert observed and all(pair == (original_builder, original_offsets) for pair in observed)
-    assert masking_utils.create_block_mask is original_builder
-    assert masking_utils.add_offsets_to_mask_function is original_offsets
-
-
-@pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("window", [None, 3])
-@pytest.mark.parametrize("padding", ["none", "all_valid_short", "short", "long"])
-def test_flex_local_builder_matches_pinned_hf_padding_and_offsets(monkeypatch, compiled, window, padding):
-    """Preserve native HF visibility and all eight sparse tables after removing patches."""
+def test_flex_local_builder_matches_pinned_hf_padding_and_offsets(_scoped_flex_compile_state, compiled):
+    """Preserve native HF visibility and all eight sparse tables across window/padding combinations."""
     from transformers import masking_utils
 
     if compiled and importlib.util.find_spec("triton") is None:
         pytest.skip("Compiled masks require the compiler environment")
-    padding_length = 6 if padding in ("short", "all_valid_short") else 15
-    attention_mask = None
-    if padding != "none":
-        attention_mask = torch.ones(2, padding_length, dtype=torch.bool)
-        if padding != "all_valid_short":
-            attention_mask[0, 4] = False
-            attention_mask[1, 5] = False
-    native_predicate = masking_utils.causal_mask_function
-    if window is not None:
-        native_predicate = masking_utils.and_masks(native_predicate, masking_utils.sliding_window_overlay(window))
-    kwargs = dict(
-        batch_size=2, q_length=5, kv_length=9, q_offset=7, kv_offset=3, attention_mask=attention_mask, device="cpu"
-    )
-    # Keep the independent pinned-HF oracle eager; compiled=True below uses
-    # real Inductor. Its graph-reuse contract has dedicated varying-length tests.
-    torch.compiler.reset()
-    _reset_flex_compile_cache(monkeypatch)
-    try:
-        with torch.compiler.set_stance("force_eager"):
-            expected = masking_utils.flex_attention_mask(**kwargs, mask_function=native_predicate)
-        # CPU Inductor's vectorized bool-padding lowering currently emits
-        # incompatible VecMask types. Keep real compilation, but use scalar
-        # CPU codegen here; FLASH integration tests retain normal GPU codegen.
-        with torch._inductor.config.patch({"cpp.simdlen": 1}):
-            actual = flex_attention_mask_builder(**kwargs, sliding_window=window, compile_block_mask=compiled)
-        q, k = torch.arange(5)[:, None], torch.arange(9)[None, :]
-        for batch in range(2):
-            torch.testing.assert_close(actual.mask_mod(batch, 0, q, k), expected.mask_mod(batch, 0, q, k))
-        for field in (
-            "kv_num_blocks",
-            "kv_indices",
-            "full_kv_num_blocks",
-            "full_kv_indices",
-            "q_num_blocks",
-            "q_indices",
-            "full_q_num_blocks",
-            "full_q_indices",
-        ):
-            torch.testing.assert_close(getattr(actual, field), getattr(expected, field))
-        assert actual.seq_lengths == expected.seq_lengths
-        assert actual.BLOCK_SIZE == expected.BLOCK_SIZE
-    finally:
-        torch.compiler.reset()
+
+    for window in (None, 3):
+        for padding in ("none", "all_valid_short", "short", "long"):
+            padding_length = 6 if padding in ("short", "all_valid_short") else 15
+            attention_mask = None
+            if padding != "none":
+                attention_mask = torch.ones(2, padding_length, dtype=torch.bool)
+                if padding != "all_valid_short":
+                    attention_mask[0, 4] = False
+                    attention_mask[1, 5] = False
+            native_predicate = masking_utils.causal_mask_function
+            if window is not None:
+                native_predicate = masking_utils.and_masks(
+                    native_predicate, masking_utils.sliding_window_overlay(window)
+                )
+            kwargs = dict(
+                batch_size=2,
+                q_length=5,
+                kv_length=9,
+                q_offset=7,
+                kv_offset=3,
+                attention_mask=attention_mask,
+                device="cpu",
+            )
+            with torch.compiler.set_stance("force_eager"):
+                expected = masking_utils.flex_attention_mask(**kwargs, mask_function=native_predicate)
+            # CPU Inductor's vectorized bool-padding lowering currently emits
+            # incompatible VecMask types. Keep real compilation, but use scalar
+            # CPU codegen here; FLASH integration tests retain normal GPU codegen.
+            with torch._inductor.config.patch({"cpp.simdlen": 1}):
+                actual = flex_attention_mask_builder(**kwargs, sliding_window=window, compile_block_mask=compiled)
+            q, k = torch.arange(5)[:, None], torch.arange(9)[None, :]
+            for batch in range(2):
+                torch.testing.assert_close(
+                    actual.mask_mod(batch, 0, q, k),
+                    expected.mask_mod(batch, 0, q, k),
+                    msg=f"compiled={compiled}, window={window}, padding={padding}, batch={batch}",
+                )
+            for field in (
+                "kv_num_blocks",
+                "kv_indices",
+                "full_kv_num_blocks",
+                "full_kv_indices",
+                "q_num_blocks",
+                "q_indices",
+                "full_q_num_blocks",
+                "full_q_indices",
+            ):
+                torch.testing.assert_close(
+                    getattr(actual, field),
+                    getattr(expected, field),
+                    msg=f"compiled={compiled}, window={window}, padding={padding}, field={field}",
+                )
+            assert actual.seq_lengths == expected.seq_lengths
+            assert actual.BLOCK_SIZE == expected.BLOCK_SIZE

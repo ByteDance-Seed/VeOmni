@@ -82,7 +82,7 @@ Use these separate mechanisms only when their semantics require them:
 4. Import the family from `veomni/ops/kernels/__init__.py` so registration
    happens when `veomni.ops` is imported.
 5. In each consuming model, construct a `VeomniOp` from
-   `resolve_op_impl(...)` and store it on the model/module instance.
+   `config.ops_config.<field>` and store it on the model/module instance.
 6. For a compound raw kernel, call the nested row's raw `forward`/`backward`
    and use the saved-state helpers in `veomni/ops/compound.py`; do not call
    the nested autograd wrapper.
@@ -104,10 +104,18 @@ Use these separate mechanisms only when their semantics require them:
    - explicit failure for unknown or unavailable implementations.
 2. Put consumer-specific normalization and model wiring tests under
    `tests/models/` instead of duplicating them in the raw-kernel suite.
+   Cover distinct variants and custom backward implementations separately,
+   including EP/non-EP and split/merged layouts when implemented. Standard
+   Quack and GPT-OSS Quack share GEMM but not the expert computation. An
+   EP-local compute test does not qualify token all-to-all; add a model/backend
+   E2E representative when that integrated path is new. Follow the
+   [new-model coverage policy](../../../docs/transformers_v5/testing_new_model.md)
+   for representative selection and capability exceptions.
 3. Run the family tests plus the registry and documentation guards:
 
-   The GPU job runs `tests/ops/` wholesale. The NPU job enumerates ops files,
-   so add an NPU workflow entry when the new tests must run on Ascend.
+   GPU and NPU unit manifests select `tests/ops/`, with hardware prerequisites
+   and selection filters controlling individual cases. Check both manifests
+   before adding an entry; an already-collected case needs no workflow edit.
 
    ```bash
    pytest -q tests/ops/<kernel_name>/ tests/ops/base/
@@ -141,3 +149,22 @@ Use these separate mechanisms only when their semantics require them:
 - Letting an unavailable optimized implementation fall back silently.
 - Editing patchgen-generated files instead of their patch config.
 - Renaming `ops_implementation` while changing the internal kernel plumbing.
+
+## Configuration ownership
+
+Model ops selections belong to `VeOmniPretrainedConfig.ops_implementation`.
+Read `config.ops_config.<field>` when binding a handle. HF config methods are
+never patched globally; standalone module tests must construct an adapted config
+with `get_veomni_config_class` or opt in with `as_veomni_config`.
+Attention's HF accessors alias the same dictionary; do not add synchronization
+fields or repair attention state in builders. See `docs/design/module_config.md`.
+
+Merge all load-time ops layers as dictionaries before validation. The owning
+config caches a standard `OpsImplementationConfig` instance after the final
+selection is known; do not bypass its dataclass constructor or introduce an
+ambient validation context. Caches stay out of saved config dictionaries.
+
+Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
+supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
+`eager` row preserves model-local eager math when present and otherwise
+forwards to `veomni_sdpa`; consumers do not remap eager themselves.

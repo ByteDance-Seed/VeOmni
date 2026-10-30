@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from ....distributed.parallel_state import get_parallel_state
+from ...modeling_base import VeOmniPreTrainedModel
 from .configuration_hunyuanvideo15 import HunyuanVideo15Config
 from .native.modules.embed_layers import PatchEmbed, TimestepEmbedder
 from .native.modules.mlp_layers import FinalLayer
@@ -23,13 +23,19 @@ class HunyuanVideo15Output(ModelOutput):
     predictions: torch.Tensor | list[torch.Tensor] | None = None
 
 
-class HunyuanVideo15Model(PreTrainedModel):
+class HunyuanVideo15Model(VeOmniPreTrainedModel):
     config_class = HunyuanVideo15Config
     supports_gradient_checkpointing = True
     _no_split_modules = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
     _supports_sdpa = True
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, attn_implementation=None, **kwargs):
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
+        if config._attn_implementation not in ("eager", "sdpa", "veomni_sdpa"):
+            raise ValueError(
+                f"HunyuanVideo 1.5 currently supports dense SDPA only, got {config._attn_implementation!r}"
+            )
         super().__init__(config)
         native = NativeTransformer(**config.to_native_dict())
         # Adopt the native hierarchy without a "backbone." prefix. State keys

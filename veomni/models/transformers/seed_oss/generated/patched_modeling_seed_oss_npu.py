@@ -17,6 +17,10 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: SeedOssMLP.forward
 #      Always call the local swiglu_mlp VeomniOp, then residual dropout
+#    - method_override: SeedOssDecoderLayer.__init__
+#      Pass config to SeedOssRMSNorm instances
+#    - method_override: SeedOssModel.__init__
+#      Pass config to final SeedOssRMSNorm
 #    - method_override: SeedOssForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: SeedOssForCausalLM.forward
@@ -31,7 +35,6 @@
 from collections.abc import Callable
 from functools import partial
 
-# Additional imports for patches
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
@@ -47,7 +50,6 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -56,8 +58,11 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -70,11 +75,12 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 @use_kernel_forward_from_hub("RMSNorm")
 class SeedOssRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -100,7 +106,7 @@ class SeedOssMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
         self.residual_dropout = config.residual_dropout
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -190,8 +196,8 @@ class SeedOssAttention(nn.Module):
 
         self.residual_dropout = config.residual_dropout
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -214,6 +220,13 @@ class SeedOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=self.veomni_attn.impl,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -222,7 +235,7 @@ class SeedOssAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **kwargs,
+            **attn_kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -232,16 +245,20 @@ class SeedOssAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] SeedOssDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class SeedOssDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: SeedOssConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.self_attn = SeedOssAttention(config=config, layer_idx=layer_idx)
-
         self.mlp = SeedOssMLP(config)
-        self.input_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self,
@@ -351,9 +368,15 @@ class SeedOssRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] SeedOssModel
+# Methods patched: __init__
+# ======================================================================
+
+
 @auto_docstring
 class SeedOssModel(SeedOssPreTrainedModel):
-    def __init__(self, config: SeedOssConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -362,11 +385,10 @@ class SeedOssModel(SeedOssPreTrainedModel):
         self.layers = nn.ModuleList(
             [SeedOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = SeedOssRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -443,7 +465,7 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         self.model = SeedOssModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

@@ -42,29 +42,36 @@ when the selected implementation runs.
 
 | Op | Variants | Implementations |
 |---|---|---|
-| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
+| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
+| `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
-| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
+
+The MLU `liger_kernel` rows reuse the CUDA adapters and use
+`MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
+liger build keeps the upstream `liger_kernel.ops.*` API, and the registry
+checks its `__mlu_version__` marker so upstream GPU liger on an MLU host is
+never selected.
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
 and derives visibility itself rather than reading a dense mask. Each row
-expands that contract its own way: `eager` and `tilelang` build explicit
+expands that contract its own way: `eager`, `tilelang`, and `triton` build explicit
 candidate slots, where repeated valid indices participate once per occurrence
 and sentinel entries contribute no attention mass, while `cann` passes mask
-modes to the kernel. With `return_lse=True`, `eager` and `tilelang` return a
-detached base-2 log-sum-exp tensor.
+modes to the kernel. With `return_lse=True`, `eager`, `tilelang`, and `triton` return a
+detached base-2 log-sum-exp tensor. The `triton` row is ROCm-only.
 
 Qwen4-Exp `qsa_attention` takes the indexer's compact `[B, S, K]` selection of
 global K/V token indices, where `-1` marks an unused slot. The selection
@@ -107,6 +114,14 @@ and is optional; install it with:
 ```bash
 uv sync --extra gpu --extra magi --dev
 ```
+
+The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
+Its hidden states and expert weights remain BF16; routing weights retain their
+supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+for dependency installation, configuration, precision and distributed coverage.
 
 ## Registering an op
 
@@ -179,27 +194,24 @@ optional packages raise `RuntimeError` during resolution.
 
 ## Calling an op from modeling
 
-Models construct a local handle once and call it directly:
+Models construct a local handle once from `config.ops_config` and call it directly:
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
-self.veomni_rms_norm = VeomniOp(
-    "rms_norm",
-    "standard",
-    resolve_op_impl("rms_norm_implementation"),
-)
+rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 ```
 
 `VeomniOp` resolves its row at construction, is interned by the resolved
 triple, and always calls the row's wrapper. `models.build_foundation_model`
-installs the `OpsImplementationConfig` object in `ops/config.py` before
-constructing the model. Changing the installed config later does not
-retarget handles that already exist.
+attaches `ops_implementation` onto the model `PretrainedConfig` (exposed as
+`config.ops_config: OpsImplementationConfig`) before constructing the model.
+Changing `config.ops_implementation` later does not retarget handles that
+already exist.
 
 Unset fields on `OpsImplementationConfig` remain `None`, and
 `resolve_op(op, variant, None)` / `VeomniOp(op, variant, None)` selects the
@@ -212,10 +224,14 @@ requirements are unmet. For example, `rms_norm/unweighted` has no Ascend kernel,
 so an unset `rms_norm_implementation` resolves `rms_norm/standard` to
 `torch_npu` and `rms_norm/unweighted` to `eager` on NPU.
 
-For compatibility, consumers pass `resolve_op_impl(field, variant=...)`
-for variants with explicit-value aliases. In particular, an explicit
-`rms_norm_implementation='torch_npu'` (or the deprecated `npu`) still maps to
-`eager` for `unweighted`, while weighted variants retain `torch_npu`.
+Consumers read `config.ops_config.<field>` directly. On NPU, `unweighted`
+RMSNorm supports only `eager`; an explicit `torch_npu` or deprecated `npu`
+selection raises at module construction. Leave the selection unset to use each
+variant's device default.
+
+The registered attention `eager` row calls the modeling file's local
+`eager_attention_forward` when present. Otherwise it forwards to `veomni_sdpa`,
+so modules without local eager math use the same config field without remapping.
 
 Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
 query dtype for backward. Forward computation still receives the original
@@ -244,16 +260,21 @@ into the outer custom-autograd state.
 ## Process-wide integrations
 
 The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
-masks but do not expose a packed/varlen API, following the public
-[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
-which has `attn_mask` but no `cu_seqlens` arguments. `packed_causal_mask`
-composes the segments into a dense block-diagonal mask for these
+masks, while the underlying
+[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
+has `attn_mask` and no `cu_seqlens` arguments. `packed_causal_mask`
+composes segments into a dense block-diagonal mask for these
 implementations. Their attention calls and the VeOmni SDPA mask builder drop
 cumulative-length and varlen maximum-length metadata when it describes at most
-one segment per batch row, or when the call carries a 3-D/4-D dense mask.
-Several segments per row without such a mask raise, because SDPA would attend
-across samples. Opaque dense masks are not inspected to infer whether they
-encode sequence boundaries.
+one segment per batch row, or when the call carries a 3-D/4-D dense mask. When
+an `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), or
+`veomni_sage_attention` attention call has `attention_mask=None` and
+`batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
+the sequence dimension by the segment lengths derived from `cu_seqlens` (after
+any Ulysses gather) and concatenates the per-segment outputs. Multi-segment
+metadata with a 2-D mask or `batch_size != 1` raises, as does multi-segment
+metadata passed to `sdpa_attention_mask_builder`. Opaque dense masks are not
+inspected to infer whether they encode sequence boundaries.
 
 The VeOmni SDPA mask builder only honors causal mask-elision hints for the
 canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
@@ -282,3 +303,14 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
+
+### GDN projection exchange
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically coalesce same-dtype Q/K/V,
+beta and decay projections before their explicit-group sequence exchange.
+Mixed projection dtypes retain five separate collectives without casting.
+The packed width retains the key/value head ratio. Peer packets are padded to
+512 bytes, then unpadded before interpreting the sequence; backward inverts the
+same permutation without rescaling. Output exchange, recurrence and packed
+boundaries are unchanged, and existing head-divisibility requirements remain.
+No `OpsImplementationConfig` flag is needed for this layout optimization.

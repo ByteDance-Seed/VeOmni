@@ -3,12 +3,72 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
+import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools import training_utils
 from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def test_dp_mean_without_distributed_initialization(monkeypatch):
+    """Logging outside distributed training needs no model or process group."""
+    monkeypatch.setattr(training_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils.dist, "is_initialized", lambda: False)
+    assert training_utils.dp_mean(3.5, None) == 3.5
+
+
+@pytest.mark.parametrize(("dp_group", "dp_size"), [(None, 2), (object(), 1)])
+def test_dp_mean_without_multiple_dp_ranks(monkeypatch, dp_group, dp_size):
+    """A missing or singleton DP group must not enter a collective."""
+    monkeypatch.setattr(training_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils.dist, "is_initialized", lambda: True)
+
+    def unexpected_reduce(*args, **kwargs):
+        pytest.fail("a missing or singleton DP group must not reduce")
+
+    monkeypatch.setattr(training_utils.dist, "all_reduce", unexpected_reduce)
+    trainer = SimpleNamespace(
+        model=SimpleNamespace(parallel_state=SimpleNamespace(dp_group=dp_group, dp_size=dp_size))
+    )
+    assert training_utils.dp_mean(3.5, trainer) == 3.5
+
+
+def test_dp_mean_reduces_over_model_dp_group(monkeypatch):
+    """Use the model's DP group and SUM/division, including on NPU backends."""
+    dp_group = object()
+    monkeypatch.setattr(training_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils.dist, "is_initialized", lambda: True)
+
+    def reduce_sum(tensor, *, op, group):
+        assert op == torch.distributed.ReduceOp.SUM
+        assert group is dp_group
+        assert tensor.device.type == "cpu"
+        assert tensor.item() == 3.5
+        tensor.add_(6.5)
+
+    def group_size(group):
+        assert group is dp_group
+        return 2
+
+    monkeypatch.setattr(training_utils.dist, "all_reduce", reduce_sum)
+    monkeypatch.setattr(training_utils.dist, "get_world_size", group_size)
+    trainer = SimpleNamespace(
+        model=SimpleNamespace(parallel_state=SimpleNamespace(dp_group=dp_group, dp_size=2)), device="cpu"
+    )
+    assert training_utils.dp_mean(3.5, trainer) == 5.0
+
+
+def test_training_command_uses_agent_bound_rendezvous():
+    command = training_utils.build_torchrun_cmd("worker.py", "config", "weights", "data", "output", nproc=2)
+    assert "--standalone" in command
+    assert not any(arg.startswith(("--master_port", "--master-port")) for arg in command)
 
 
 @pytest.mark.parametrize("previous_backend", [None, "veomni"])
@@ -116,3 +176,14 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
     overrides = training_utils.resolve_ops_overrides("deepseek_v3")
 
     assert not any(flag.startswith("--model.ops_implementation.moe_implementation=") for flag in overrides)
+
+
+def test_make_eager_ops_config_covers_every_kernel_field():
+    from dataclasses import fields
+
+    from veomni.arguments import OpsImplementationConfig
+
+    selection = training_utils.make_eager_ops_config()
+    for field in fields(OpsImplementationConfig):
+        expected = "none" if field.name == "qat_implementation" else "eager"
+        assert getattr(selection, field.name) == expected, field.name

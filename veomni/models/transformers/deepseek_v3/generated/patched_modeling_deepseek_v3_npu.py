@@ -25,6 +25,10 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV3MLP.forward
 #      Always call the local swiglu_mlp VeomniOp
+#    - method_override: DeepseekV3DecoderLayer.__init__
+#      Pass config to DeepseekV3RMSNorm instances
+#    - method_override: DeepseekV3Model.__init__
+#      Pass config to final DeepseekV3RMSNorm
 #    - class_replacement: DeepseekV3Experts
 #      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV3TopkRouter.forward
@@ -42,8 +46,6 @@
 
 import math
 from collections.abc import Callable
-
-# Additional imports for patches
 from functools import partial
 
 import torch
@@ -62,7 +64,6 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -71,9 +72,12 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -84,10 +88,10 @@ from veomni.utils.moe_monitor import record_router_indices
 # ======================================================================
 
 
-def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
+def _deepseek_v3_rope_op(config, rope_interleave: bool = False) -> VeomniOp:
     if rope_interleave:
         return VeomniOp("rope", "interleave", "eager")
-    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    impl = config.ops_config.rotary_pos_emb_implementation
     return VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
 
 
@@ -99,11 +103,12 @@ def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
 
 @use_kernel_forward_from_hub("RMSNorm")
 class DeepseekV3RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -137,7 +142,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         self.inv_freq = nn.Buffer(inv_freq, persistent=False)
         self.original_inv_freq = nn.Buffer(inv_freq.clone(), persistent=False)
         # Capture rotary freq impl at construct time
-        self.veomni_rope_use_triton = resolve_op_impl("rotary_pos_emb_implementation") == "triton"
+        self.veomni_rope_use_triton = self.config.ops_config.rotary_pos_emb_implementation == "triton"
 
     @staticmethod
     @deprecate_kwarg("device", version="5.18")
@@ -200,7 +205,7 @@ class DeepseekV3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -281,7 +286,7 @@ class DeepseekV3Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -293,18 +298,16 @@ class DeepseekV3Experts(nn.Module):
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
-                top_k_weights.to(hidden_states.dtype),
+                top_k_weights,
                 self.gate_up_proj,
                 self.down_proj,
                 self.act_fn,
                 self.num_experts,
             )
         unused = self.gate_up_proj.new_empty(0)
-        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
-        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            routing_weights,
+            top_k_weights,
             top_k_index,
             unused,
             unused,
@@ -463,8 +466,11 @@ class DeepseekV3Attention(nn.Module):
 
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = _deepseek_v3_rope_op(self.config.rope_interleave)
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        if self.q_lora_rank is not None:
+            self.q_a_layernorm = DeepseekV3RMSNorm(self.config.q_lora_rank, config=self.config)
+        self.kv_a_layernorm = DeepseekV3RMSNorm(self.config.kv_lora_rank, config=self.config)
+        self.veomni_rope = _deepseek_v3_rope_op(self.config, self.config.rope_interleave)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Expands the compressed latents into key and value states. Args:
@@ -517,6 +523,12 @@ class DeepseekV3Attention(nn.Module):
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states, value_states = self.expand_kv(kv_nope, k_rot)
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=self.veomni_attn.impl,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -525,27 +537,30 @@ class DeepseekV3Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **kwargs,
+            **attn_kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3DecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: DeepseekV3Config, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
-
+        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)  # noqa: F821
         if layer_idx >= config.first_k_dense_replace:
-            self.mlp = DeepseekV3MoE(config)
+            self.mlp = DeepseekV3MoE(config)  # noqa: F821
         else:
-            self.mlp = DeepseekV3MLP(config)
-
-        self.input_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp = DeepseekV3MLP(config)  # noqa: F821
+        self.input_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.post_attention_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
 
     def forward(
         self,
@@ -610,22 +625,27 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3Model
+# Methods patched: __init__
+# ======================================================================
+
+
 @auto_docstring
 class DeepseekV3Model(DeepseekV3PreTrainedModel):
-    def __init__(self, config: DeepseekV3Config):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
         )
-        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
+        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)  # noqa: F821
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -702,7 +722,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

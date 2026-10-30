@@ -26,6 +26,7 @@ from transformers import AutoConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
@@ -51,31 +52,28 @@ except ImportError:
     pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
 
 
-def _install_qwen4_exp_ops_config(qsa_attention_implementation: str = "eager") -> None:
-    """Install FLA GatedDeltaNet selections; every other op stays eager unless specified."""
-    from veomni.ops.config import set_ops_config
+def _install_qwen4_exp_ops_config(config, qsa_attention_implementation: str = "eager") -> None:
+    """Attach FLA GatedDeltaNet selections to ``config``; every other op stays eager unless specified."""
+    from tests.models.compare import eager_ops_config
 
-    set_ops_config(
-        SimpleNamespace(
-            rms_norm_gated_implementation="fla",
-            causal_conv1d_implementation="fla",
-            chunk_gated_delta_rule_implementation="fla",
-            qsa_attention_implementation=qsa_attention_implementation,
-        )
-    )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _configured_qwen4_exp_kernels():
-    """Scope the default selections to this module's in-process tests."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
-    previous = get_ops_config()
-    _install_qwen4_exp_ops_config()
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
+    ops = eager_ops_config()
+    ops.rms_norm_gated_implementation = "fla"
+    ops.causal_conv1d_implementation = "fla"
+    ops.chunk_gated_delta_rule_implementation = "fla"
+    ops.qsa_attention_implementation = qsa_attention_implementation
+    if hasattr(config, "text_config") and hasattr(config, "vision_config"):
+        text_attn = getattr(config.text_config, "_attn_implementation", None)
+        vision_attn = getattr(config.vision_config, "_attn_implementation", None)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
+        if text_attn is not None:
+            config.text_config._attn_implementation = text_attn
+        if vision_attn is not None:
+            config.vision_config._attn_implementation = vision_attn
+    else:
+        attn = getattr(config, "_attn_implementation", None)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
+        if attn is not None:
+            config._attn_implementation = attn
 
 
 def _set_deterministic(seed: int = 42) -> None:
@@ -210,6 +208,7 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
             name="dp",
         )
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(17)
         device = torch.device(get_device_type(), rank)
         ple = qwen4_exp.Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).float().to(device)
@@ -225,11 +224,21 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         local_ids = full_ids[:, local_slice].contiguous()
 
+        boundaries = [0, local_seq_len - 1, seq_len] if packed else None
+        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device) if boundaries is not None else None
         with use_parallel_state(dp_state):
-            expected_embeddings = ple.ple_embedding(full_ids, past_key_values=None).detach()
+            expected_embeddings = ple.ple_embedding(
+                full_ids,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens,
+            ).detach()
 
         with use_parallel_state(sp_state):
-            actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None).detach()
+            actual_embeddings = ple.ple_embedding(
+                local_ids,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens,
+            ).detach()
         torch.testing.assert_close(_gather_sequence(actual_embeddings), expected_embeddings)
 
         torch.manual_seed(29)
@@ -240,8 +249,6 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
             device=device,
             requires_grad=True,
         )
-        boundaries = [0, local_seq_len - 1, seq_len] if packed else None
-        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device) if boundaries is not None else None
         with use_parallel_state(dp_state):
             expected_output = ple._short_conv(
                 full_hidden,
@@ -320,7 +327,6 @@ def _run_qsa_equivalence(
             device_type=get_device_type(),
             name="dp",
         )
-        _install_qwen4_exp_ops_config(qsa_attention_implementation=qsa_implementation)
         device = torch.device(get_device_type(), rank)
         dtype = torch.bfloat16 if qsa_implementation == "tilelang" else torch.float32
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -329,6 +335,7 @@ def _run_qsa_equivalence(
         if qsa_implementation == "tilelang":
             config.head_dim = 64
             config.indexer_head_dim = 32
+        _install_qwen4_exp_ops_config(config, qsa_attention_implementation=qsa_implementation)
         torch.manual_seed(31)
         attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).to(device=device, dtype=dtype)
         _broadcast_module(attention)
@@ -428,7 +435,6 @@ def _run_qsa_equivalence(
                         msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                     )
     finally:
-        _install_qwen4_exp_ops_config()
         clear_parallel_state()
 
 
@@ -475,7 +481,6 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     """Local channels and weights reproduce the matching full-conv channels."""
     Qwen4ExpTextGatedDeltaNet = importlib.import_module(_PATCHED_MODULE).Qwen4ExpTextGatedDeltaNet
 
-    _install_qwen4_exp_ops_config()
     key_dim = num_k_heads * head_k_dim
     value_dim = num_v_heads * head_v_dim
     conv_dim = key_dim * 2 + value_dim
@@ -490,6 +495,7 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     config.linear_key_head_dim = head_k_dim
     config.linear_value_head_dim = head_v_dim
     config.linear_conv_kernel_dim = kernel_size
+    _install_qwen4_exp_ops_config(config)
     layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
     layer.conv1d.weight.data.copy_(weight_full.unsqueeze(1))
 
@@ -561,7 +567,7 @@ def _run_gated_deltanet_equivalence(
         if num_v_heads is not None:
             config.linear_num_value_heads = num_v_heads
         torch.manual_seed(43)
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
         _broadcast_module(layer)
 
@@ -645,6 +651,7 @@ def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
     config.linear_num_key_heads = num_k_heads
     config.linear_num_value_heads = num_v_heads
+    _install_qwen4_exp_ops_config(config)
     layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float()
     parallel_state = SimpleNamespace(ulysses_enabled=True, ulysses_group=None, ulysses_rank=0, ulysses_size=2)
     hidden_states = torch.randn(1, 4, config.hidden_size)
@@ -656,13 +663,24 @@ def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_
         layer(hidden_states)
 
 
-def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
+_QWEN4_EXP_DETERMINISM_SHAPES: tuple[tuple[int, int], ...] = (
+    (1, 8),
+    (4, 8),
+    (1, 2048),
+    (4, 2048),
+)
+
+
+def _run_gated_deltanet_determinism() -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    shapes = list(_QWEN4_EXP_DETERMINISM_SHAPES)
+    if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        shapes = list(reversed(shapes))
     try:
         _init_parallel_state(
             dp_size=1,
@@ -670,31 +688,32 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
             device_type=get_device_type(),
             name=None,
         )
-        _install_qwen4_exp_ops_config()
-        _set_deterministic()
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
-        layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
-        _broadcast_module(layer)
+        _install_qwen4_exp_ops_config(config)
+        for bsz, seq_len in shapes:
+            _set_deterministic()
+            layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
+            _broadcast_module(layer)
 
-        if rank == 0:
-            full_input = torch.randn(bsz, seq_len, config.hidden_size, device=device)
-        else:
-            full_input = torch.empty(bsz, seq_len, config.hidden_size, device=device)
-        dist.broadcast(full_input, src=0)
+            if rank == 0:
+                full_input = torch.randn(bsz, seq_len, config.hidden_size, device=device)
+            else:
+                full_input = torch.empty(bsz, seq_len, config.hidden_size, device=device)
+            dist.broadcast(full_input, src=0)
 
-        shard_len = seq_len // world_size
-        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
-        _assert_forward_deterministic(layer, local_input)
+            shard_len = seq_len // world_size
+            local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+            _assert_forward_deterministic(layer, local_input)
+            dist.barrier()
+        dist.barrier()
     finally:
         clear_parallel_state()
 
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
-@pytest.mark.parametrize("bsz", [1, 4])
-@pytest.mark.parametrize("seq_len", [8, 2048])
-def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: int) -> None:
-    torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc, bsz, seq_len)
+def test_qwen4_exp_gated_deltanet_forward_deterministic_sp() -> None:
+    torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc)
 
 
 @pytest.mark.parametrize("bsz", [1, 4])
@@ -702,10 +721,10 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: in
 def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len: int) -> None:
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
-    _install_qwen4_exp_ops_config()
     _set_deterministic()
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+    _install_qwen4_exp_ops_config(config)
     layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
     inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device)
 
@@ -749,7 +768,7 @@ def _run_text_model_equivalence() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config._attn_implementation = "eager"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(59)
         model = qwen4_exp.Qwen4ExpTextModel(config).float().to(device)
         _broadcast_module(model)
@@ -852,7 +871,7 @@ def _run_router_aux_loss_equivalence() -> None:
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(67)
         model = qwen4_exp.Qwen4ExpForConditionalGeneration(config).float().to(device)
         model.model.visual.to(dtype=torch.bfloat16)
@@ -981,7 +1000,7 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(71)
         model = qwen4_exp.Qwen4ExpModel(config).to(device=device, dtype=torch.bfloat16)
         _broadcast_module(model)
@@ -1114,7 +1133,7 @@ def _run_vision_real_image_cp_non_fa_rejection() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
         config._attn_implementation = "veomni_sdpa"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         vision = qwen4_exp.Qwen4ExpVisionModel(config).to(device=device, dtype=torch.bfloat16)
         _broadcast_module(vision)
 
@@ -1155,7 +1174,7 @@ def test_qwen4_exp_text_attention_rejects_invalid_sp_attention_mask_before_colle
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
     config._attn_implementation = "eager"
-    _install_qwen4_exp_ops_config()
+    _install_qwen4_exp_ops_config(config)
     attn = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).float()
     hidden_states = torch.randn(1, 4, config.hidden_size)
     cos = torch.ones(1, 4, attn.head_dim)
@@ -1193,7 +1212,7 @@ def test_qwen4_exp_vision_attention_projects_cp_state_to_ulysses_parallel_state(
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
     config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
     config._attn_implementation = "veomni_flash_attention_2"
-    _install_qwen4_exp_ops_config()
+    _install_qwen4_exp_ops_config(config)
     attn = qwen4_exp.Qwen4ExpVisionAttention(config).float()
     hidden_states = torch.randn(4, config.hidden_size)
     head_dim = config.hidden_size // config.num_heads

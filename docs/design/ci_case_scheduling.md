@@ -60,11 +60,11 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1174)
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
-[launcher defaults](../../tests/tools/launch_utils.py#L119) and
-[training command resolution](../../tests/tools/training_utils.py#L228) provide
+[launcher defaults](../../tests/tools/launch_utils.py#L149) and
+[training command resolution](../../tests/tools/training_utils.py#L243) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests
@@ -82,7 +82,15 @@ shared plan inputs rather than a second quota definition.
   or concurrent relationships. Keep comparison and resume dependencies intact.
 - Do not choose a smaller `world_size` from the leased device count. The lease
   is chosen from the plan, not the other way around.
-- Use case-scoped output/rendezvous directories and the common port allocator.
+- Use case-scoped output/rendezvous directories and the shared launch helpers.
+  For `mp.spawn`, `spawn_with_rendezvous` appends a parent-owned endpoint to
+  worker arguments; pass `endpoint.connect()` as `store=` to process-group
+  initialization on every rank. After spawn returns its context, the parent
+  joins or terminates its workers before closing the server. Partial startup
+  failures before that return rely on the CI runner's enclosing process-scope
+  cleanup. Single-node torchrun uses `--standalone` with
+  agent Store sharing enabled. Do not probe and close a socket before binding
+  a distributed server: a registry cannot stop unrelated sockets taking it.
   Shared fixture caches must be immutable with locking, or isolated per case;
   one worker must not delete a dataset while another reads it. Keep temporary
   directory paths short enough for multiprocessing Unix sockets.
@@ -101,7 +109,7 @@ Use the `provider` keyword on `pytest.mark.launch_plan`. A provider is either a
 [CasePlan](../../scripts/ci/accelerator/launch_plan.py#L48), or a callable accepting a
 [PlanContext](../../scripts/ci/accelerator/launch_plan.py#L81) and returning one of those
 values. The planner calls it through
-[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L22). Using a keyword prevents pytest from interpreting a
+[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L23). Using a keyword prevents pytest from interpreting a
 callable provider as the test function being decorated.
 
 A fixed distributed launch keeps its process count in one place:
@@ -123,11 +131,14 @@ A parameterized launch uses the same parameter for planning and execution:
 
 ```python
 from scripts.ci.accelerator.launch_plan import from_parameter
+from tests.tools.launch_utils import spawn_with_rendezvous
 
 @pytest.mark.launch_plan(provider=from_parameter("cp_size"))
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_context_parallel(cp_size):
-    mp.spawn(check_context_parallel, args=(cp_size,), nprocs=cp_size)
+    # check_context_parallel(rank, cp_size, endpoint) initializes with
+    # store=endpoint.connect() on every rank.
+    spawn_with_rendezvous(check_context_parallel, args=(cp_size,), nprocs=cp_size)
 ```
 
 For CPU-only tests, use `LaunchSpec(device="cpu")`. For CPU distributed tests,
@@ -184,18 +195,21 @@ fits. CPU work has a separate concurrency limit. No historical timings are
 required or consumed. Measured case timings remain available as reporting
 artifacts. Results stay keyed by node ID, independent of completion order.
 
-Each worker receives its visible-device mapping and a unique rendezvous port
-before importing torch or the accelerator runtime. A run-scoped, locked port
-registry prevents reuse while another launch is preparing to bind. Common launchers validate actual `nproc`, node count, and child device visibility
-against the plan and lease. Compare observed launch arguments with the baseline
-to verify backend and parallel-topology coverage. Release resources only after scoped
+Each pytest worker receives its visible-device mapping before importing torch
+or the accelerator runtime. Its default env:// port uses the legacy run-scoped
+locked registry, which prevents cooperative reuse but does not hold an OS
+reservation. Distributed spawn launches instead own a live TCPStore from
+allocation through worker cleanup; standalone torchrun agents bind their own
+Stores atomically on port zero.
+Common launchers validate actual `nproc`, node count, and child device visibility
+against the plan and lease. Release resources only after scoped
 cleanup of the launcher's process group and tracked descendants, including
 when its group leader has already exited. By default the first failed pytest
 phase or worker stops new dispatches and cancels running peers in the same
 suite/job. Wait for owned process cleanup, then return failure. `--keep-going`
 continues all cases and batches without cancelling peers.
 If owned processes survive cleanup, stop admission and cancel running peers
-even with `--keep-going`; the affected device lease must not be reused.
+even with `--keep-going`; the affected worker process scope cannot be safely reused.
 
 On Ctrl-C, collection and scheduling cancel their owned subprocess scopes before
 waiting for thread-pool callbacks. Workers then use the existing bounded
@@ -204,7 +218,7 @@ Unrelated processes are outside the cancellation scope. Interrupted execution
 records retain a failure return code and the summary records the interruption.
 
 Foreground case logs use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`,
-with `[e2e-57-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
+with `[e2e-59-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
 IDs come from the manifest; case IDs are one-based indices within each entry's
 collected inventory, including parameterized cases. IDs remain stable across
 batching, sorting and dispatch order. Batch indices are not displayed.
@@ -219,7 +233,7 @@ Failure output includes the node ID and pytest traceback summary, followed by
 the failed worker's complete combined stdout/stderr. Actions groups this output
 under the manifest entry ID so training-rank tracebacks remain accessible when
 pytest reports an outer subprocess error. Local runs print the same output
-inline. Stream the existing log in bounded chunks after worker cleanup, while
+inline. Read and write the full worker log in one call after worker cleanup, while
 successful batches retain compact progress output.
 Cancelled batches are distinguished from test failures, and the original
 failure remains the final error even if a cancelled peer exits first. Preserve
@@ -262,6 +276,20 @@ defaults. The torch_npu optimizer override queries the NPU device name even
 when optimizer parameters are all CPU tensors. The worker restores that
 override after the case; explicit `foreach` and `fused` settings keep their
 normal Torch behavior, and accelerator cases retain the vendor policy.
+The same CPU scope temporarily uses torch_npu's saved Torch multi-worker
+DataLoader iterator constructor. Its vendor wrapper otherwise queries NPU
+affinity before starting CPU workers. The worker replaces only that known
+wrapper and restores it after teardown or failure; unrelated constructor
+patches and accelerator cases retain their original behavior.
+CPU compilation also temporarily disables the loaded vendor registry's NPU
+Inductor registration, which otherwise queries a hidden device before compiling
+CPU graphs. The prior registration policy is restored after teardown or failure.
+This keeps actual CPU compilation enabled and leaves accelerator cases unchanged.
+The worker also initializes a missing built-in CPU device-op override. In Torch
+2.10, torch_npu's eager NPU entry makes the registry nonempty and prevents the
+ordinary lazy import of CPU overrides. Existing CPU and vendor entries are
+preserved; this is standard CPU backend initialization rather than a temporary
+replacement of an existing policy.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.
@@ -279,7 +307,7 @@ remain part of test collection.
 - Exercise defaults, parameterized plans, CPU workers, sequential/concurrent
   case peaks, mismatches, starvation prevention, fixture isolation, and cleanup.
 - Run the full unit/e2e selections, including conditional coverage. Preserve
-  per-case timings, actual wall time, device assignments, logs/JUnit, source
-  fingerprints, and cache/environment limits.
+  per-case timings, actual wall time, device assignments, logs/JUnit, and
+  cache/environment limits.
 - Run serial and concurrent GPU/NPU adapter checks on their respective hardware;
   record any NPU validation gap explicitly.

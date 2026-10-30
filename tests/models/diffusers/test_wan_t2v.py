@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
@@ -28,13 +29,13 @@ from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
 from tests.models.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_wan_t2v_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_wan_t2v_config as _tiny_config
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
+from veomni.ops.platform import RocmGpuPlatform
 
 
 _OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
@@ -52,8 +53,8 @@ def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None
         WanTransformer3DModel,
     )
 
-    with ops_config_scope(ops if ops is not None else _sdpa_ops_config()):
-        return WanTransformer3DModel(config)
+    config._set_ops_implementation(ops if ops is not None else _sdpa_ops_config())
+    return WanTransformer3DModel(config)
 
 
 def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypatch):
@@ -81,8 +82,8 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
     # Registry resolution installs the production backbone forward. Restore that
     # class-level patch after this test, including when an assertion fails.
     monkeypatch.setattr(OfficialWanTransformer3DModel, "forward", OfficialWanTransformer3DModel.forward)
-    with ops_config_scope(_sdpa_ops_config()):
-        ours = get_model_class(config)(config)
+    config._set_ops_implementation(_sdpa_ops_config())
+    ours = get_model_class(config)(config)
     ours.load_state_dict(official.state_dict())
     samples = [
         {
@@ -126,14 +127,20 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
             torch.testing.assert_close(actual[key].grad, expected[key].grad)
 
 
-def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvidia_ops):
+@pytest.mark.parametrize(
+    "implementation",
+    ("veomni_flash_attention_2", "veomni_flash_attention_aiter"),
+)
+def test_wan_t2v_flash_kernel_passes_full_sequence_varlen_kwargs(monkeypatch, available_nvidia_ops, implementation):
+    if implementation == "veomni_flash_attention_aiter":
+        monkeypatch.setattr(RocmGpuPlatform, "matches", lambda self: True)
     ops = eager_ops_config()
-    ops.attn_implementation = "veomni_flash_attention_2"
+    ops.attn_implementation = implementation
     model = _build_ours(_tiny_config(), ops).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
-    assert processor.veomni_attn.impl == "veomni_flash_attention_2"
-    assert processor._use_flash2
+    assert processor.veomni_attn.impl == implementation
+    assert processor._use_flash
 
     captured: dict = {}
 
@@ -151,13 +158,13 @@ def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvid
     assert captured["cu_seq_lens_k"].tolist() == [0, 8, 16]
 
 
-def test_wan_t2v_eager_falls_back_to_veomni_sdpa():
-    """Default eager has no local Wan forward, so the processor uses the SDPA row."""
+def test_wan_t2v_registered_eager_runs_through_sdpa():
+    """The processor retains eager selection and its registered row executes SDPA."""
     model = _build_ours(_tiny_config(), eager_ops_config()).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
-    assert processor.veomni_attn.impl == "veomni_sdpa"
-    assert not processor._use_flash2
+    assert processor.veomni_attn.impl == "eager"
+    assert not processor._use_flash
 
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
     output = processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
@@ -173,11 +180,24 @@ def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
         captured.update(kwargs)
         return query.transpose(1, 2), None
 
-    assert attn.processor.veomni_attn.impl == "sdpa"
-    assert not attn.processor._use_flash2
+    assert attn.processor.veomni_attn.impl == "veomni_sdpa"
+    assert not attn.processor._use_flash
     attn.processor.veomni_attn = record
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
     attn.processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
 
     assert "cu_seq_lens_q" not in captured
     assert "max_length_q" not in captured
+
+
+def test_wan_diffusers_save_preserves_module_ops(tmp_path):
+    import json
+
+    from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import WanTransformer3DModel
+
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = WanTransformer3DModel(config)
+    model.save_pretrained(tmp_path)
+    assert json.loads((tmp_path / "config.json").read_text())["ops_implementation"] == config.ops_implementation
+    assert type(config).from_pretrained(tmp_path).ops_implementation == config.ops_implementation

@@ -4,11 +4,11 @@ import re
 from pathlib import Path
 
 import torch
-from transformers import PreTrainedModel
 
 from ....distributed.parallel_state import get_parallel_state
 from ....utils import logging
 from ....utils.device import get_device_type
+from ...modeling_base import VeOmniPreTrainedModel
 from .conditioning import FlowMatchingConditioner, prepare_video
 from .configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
 
@@ -16,8 +16,12 @@ from .configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
 logger = logging.get_logger(__name__)
 
 
-class HunyuanVideo15ConditionModel(PreTrainedModel):
+class HunyuanVideo15ConditionModel(VeOmniPreTrainedModel):
     config_class = HunyuanVideo15ConditionConfig
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the frozen components, which select their own backends.
+        return attn_implementation
 
     def __init__(self, config, meta_init=False, **kwargs):
         super().__init__(config)

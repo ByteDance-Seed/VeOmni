@@ -211,22 +211,11 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
     # precomputed multimodal metadata (fast path) — so the ViT's own
-    # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
-    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
-    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
-    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
-    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
-    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
-    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
-    #    a path production bypasses → tagged HF-eager-only.
-    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    # `.tolist()` + host-side cu_seqlens build do not appear here, and the
+    # single-segment SDPA wrapper drops single-segment `cu_seqlens` without
+    # splitting or `.tolist()`-syncing. What remains:
+    #  - get_rope_index / get_vision_position_ids: the HF-verbatim mrope algorithm.
     "qwen3_5_vl-sdpa": {
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
-            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
-            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
-            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
-            "case runs SDPA only because FA2 NaNs on the toy config."
-        ),
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -797,7 +786,7 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
 
-    from tests.models.compare import eager_ops_config, ops_config_scope
+    from tests.models.compare import eager_ops_config
     from tests.models.tiny_configs import tiny_deepseek_v4_config
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
@@ -806,9 +795,9 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
     seq_len = 16
     slices = ((0, 8), (8, 16))
     config = tiny_deepseek_v4_config("DeepseekV4Model")
-    with ops_config_scope(eager_ops_config()):
-        torch.manual_seed(0)
-        model = dsv4.DeepseekV4Model(config).to(device=device, dtype=dtype).eval()
+    config._set_ops_implementation(eager_ops_config())
+    torch.manual_seed(0)
+    model = dsv4.DeepseekV4Model(config).to(device=device, dtype=dtype).eval()
 
     input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device)
     position_ids = torch.cat([torch.arange(8, device=device), torch.arange(8, device=device)]).view(1, seq_len)

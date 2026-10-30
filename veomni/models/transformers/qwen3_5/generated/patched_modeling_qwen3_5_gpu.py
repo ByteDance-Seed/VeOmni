@@ -17,6 +17,10 @@
 #      Always call the local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen3_5DecoderLayer.__init__
+#      Pass config to Qwen3_5RMSNorm instances
+#    - method_override: Qwen3_5TextModel.__init__
+#      Pass config to final Qwen3_5RMSNorm
 #    - method_override: Qwen3_5MLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
@@ -59,8 +63,8 @@
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
 #      Always call ForCausalLMLoss VeomniOp and combine weighted MTP loss
-#    - init_modification: Qwen3_5Attention
-#      Bind instance-local rope and attention VeomniOps
+#    - method_override: Qwen3_5Attention.__init__
+#      Pass config to Qwen3_5RMSNorm and bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3_5Attention.forward
 #      Always call the local rope and attention VeomniOps
 #
@@ -68,8 +72,6 @@
 
 import itertools
 from collections.abc import Callable
-
-# Additional imports for patches
 from copy import copy
 from dataclasses import dataclass
 from functools import partial
@@ -104,14 +106,12 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
-    is_flash_attention_requested,
     maybe_autocast,
     merge_with_config_defaults,
 )
@@ -119,11 +119,14 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
+from veomni.distributed.sequence_parallel.gdn_exchange import coalesced_gather_aligned
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -657,17 +660,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.veomni_rms_norm_gated = VeomniOp(
             "rms_norm_gated",
             "standard",
-            resolve_op_impl("rms_norm_gated_implementation"),
+            config.ops_config.rms_norm_gated_implementation,
         )
         self.veomni_causal_conv1d = VeomniOp(
             "causal_conv1d",
             "standard",
-            resolve_op_impl("causal_conv1d_implementation"),
+            config.ops_config.causal_conv1d_implementation,
         )
         self.veomni_chunk_gated_delta_rule = VeomniOp(
             "chunk_gated_delta_rule",
             "standard",
-            resolve_op_impl("chunk_gated_delta_rule_implementation"),
+            config.ops_config.chunk_gated_delta_rule_implementation,
         )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
@@ -746,15 +749,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
             v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-            # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-
             b = b.reshape(batch_size, seq_len, self.num_v_heads)
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
-            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+            if q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
+                q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(q_proj, k_proj, v_proj, b, a, ulysses_group)
+            else:
+                q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+                a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
             # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
             q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -966,16 +970,15 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5Attention
-# Methods patched: forward, __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # [modified __init__] Bind instance-local rope and attention VeomniOps
-    def __init__(self, config: Qwen3_5Config, layer_idx: int):
-        super().__init__()
+    def __init__(self, config, layer_idx: int):
+        nn.Module.__init__(self)
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -995,11 +998,10 @@ class Qwen3_5Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.veomni_rope = VeomniOp("rope", "partial", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -1068,7 +1070,7 @@ class Qwen3_5MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -1092,11 +1094,12 @@ class Qwen3_5MLP(nn.Module):
 
 class Qwen3_5RMSNorm(nn.Module):
     # ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -1110,7 +1113,7 @@ class Qwen3_5RMSNorm(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5DecoderLayer
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -1120,12 +1123,12 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.block_type = config.layer_types[layer_idx]
         if self.block_type == "linear_attention":
-            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)  # noqa: F821
         elif self.block_type == "full_attention":
-            self.self_attn = Qwen3_5Attention(config, layer_idx)
-        self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attn = Qwen3_5Attention(config, layer_idx)  # noqa: F821
+        self.mlp = Qwen3_5MLP(config, config.intermediate_size)  # noqa: F821
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
 
     def forward(
         self,
@@ -1212,13 +1215,13 @@ class Qwen3_5MTP(nn.Module):
         )
         mtp_layer_idx = config.layer_types.index("full_attention")
 
-        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, mtp_layer_idx) for _ in range(num_layers)]  # noqa: F821
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
 
     def forward(
         self,
@@ -1364,8 +1367,8 @@ class Qwen3_5VisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -1386,54 +1389,28 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        if is_flash_attention_requested(self.config):
-            # Modification: prefer the int max_seqlen pre-computed once in
-            # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
-            # GPU-side reduction so this method still works when the model forward
-            # has not been patched (e.g. external callers, unit tests).
-            max_seqlen = kwargs.pop("vision_max_seqlen", None)
-            if max_seqlen is None:
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = self.veomni_attn(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            # Modification: drop `vision_max_seqlen` from kwargs before falling through
-            # to the non-FA path so it doesn't reach kernels that don't expect it.
-            kwargs.pop("vision_max_seqlen", None)
-            # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-
-            attn_outputs = [
-                self.veomni_attn(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        # Modification: prefer the int max_seqlen pre-computed once in
+        # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
+        # GPU-side reduction so this method still works when the model forward
+        # has not been patched (e.g. external callers, unit tests).
+        max_seqlen = kwargs.pop("vision_max_seqlen", None)
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -1772,15 +1749,10 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
         # picks it up via `vision_max_seqlen` and falls back to the original
         # recompute when the key is absent (so non-VeOmni callers keep working).
-        # Gate is two-pronged:
-        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-        #       when Qwen3_5VisionAttention.forward is patched to consume
-        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-        #   (b) `is_flash_attention_requested(self.config)` — only FA's
-        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-        #       and sdpa paths in the consumer pop+discard the kwarg, so the
-        #       host sync would be wasted.
-        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+        # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
+        # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
+        # GPU and NPU both register that consumer.
+        if _VEOMNI_VISION_ATTENTION_PATCHED:
             if precomputed_max_seqlen is not None:
                 # Collator-side max already accounts for sp-pad; use as-is.
                 kwargs["vision_max_seqlen"] = precomputed_max_seqlen
@@ -1864,7 +1836,7 @@ class Qwen3_5MTPContextOutput(Qwen3_5ModelOutputWithPast):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5TextModel
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -1875,12 +1847,11 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
-            [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)  # noqa: F821
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -2508,7 +2479,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
@@ -2656,7 +2627,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3_5Model(config)  # noqa: F821
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
 
@@ -2745,9 +2716,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             # mask instead — eager, sdpa, flex, magi — would silently mask against the
             # compact length and fail on a shape mismatch, so refuse them here rather than
             # deeper in the stack.
-            attn_impl = getattr(self.config.text_config, "_attn_implementation", None) or getattr(
-                self.config, "_attn_implementation", ""
-            )
+            attn_impl = self.config.text_config.ops_config.attn_implementation or ""
             if "flash_attention" not in attn_impl:
                 raise NotImplementedError(
                     f"Shared-prefix training needs a varlen attention backend that honours "

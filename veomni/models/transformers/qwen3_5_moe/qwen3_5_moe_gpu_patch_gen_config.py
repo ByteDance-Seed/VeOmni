@@ -60,6 +60,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
     qwen3_5_text_model_forward_patched,
+    qwen3_5_text_model_init_patched,
     qwen3_5_vision_attention_bind_ops,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
@@ -69,7 +70,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -82,6 +82,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_moe_gpu.py",
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
@@ -90,6 +94,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
@@ -109,10 +114,6 @@ config.add_import(
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.attention_utils",
     names=["prepare_dense_attention_inputs"],
@@ -153,11 +154,12 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
     "Qwen3_5MoeRMSNorm.__init__",
     description="Construct a local rms_norm offset VeomniOp",
 )
-def qwen3_5_moe_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
+def qwen3_5_moe_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
-    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
 
 @config.override_method(
@@ -181,7 +183,32 @@ def qwen3_5_moe_mlp_init_patched(self, config, intermediate_size: int):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "Qwen3_5MoeDecoderLayer.__init__",
+    description="Pass config to Qwen3_5MoeRMSNorm instances",
+)
+def qwen3_5_moe_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.block_type = config.layer_types[layer_idx]
+    if self.block_type == "linear_attention":
+        self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)  # noqa: F821
+    elif self.block_type == "full_attention":
+        self.self_attn = Qwen3_5MoeAttention(config, layer_idx)  # noqa: F821
+    self.mlp = Qwen3_5MoeSparseMoeBlock(config)  # noqa: F821
+    self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+
+
+config.override_method(
+    "Qwen3_5MoeTextModel.__init__",
+    replacement=qwen3_5_text_model_init_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Pass config to final Qwen3_5MoeRMSNorm",
+)
 
 
 @config.override_method(
@@ -613,11 +640,11 @@ class Qwen3_5MoeMTP(nn.Module):
         num_layers = int(config.mtp_num_hidden_layers)
         assert "full_attention" in config.layer_types
         layer_idx = config.layer_types.index("full_attention")
-        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.layers = nn.ModuleList([Qwen3_5MoeDecoderLayer(config, layer_idx) for _ in range(num_layers)])
-        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
@@ -881,7 +908,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -1027,13 +1054,13 @@ def qwen3_5_moe_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
@@ -1154,13 +1181,13 @@ def qwen3_5_moe_forconditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3_5MoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.mtp = None
@@ -1334,10 +1361,11 @@ def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
     return _get_causal_lm_parallel_plan()
 
 
-config.modify_init(
-    "Qwen3_5MoeAttention",
+config.override_method(
+    "Qwen3_5MoeAttention.__init__",
     replacement=qwen3_5_attention_bind_ops,
-    description="Bind instance-local rope and attention VeomniOps",
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3_5MoeRMSNorm and bind instance-local rope and attention VeomniOps",
 )
 
 

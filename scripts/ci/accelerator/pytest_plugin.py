@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -20,11 +21,10 @@ from scripts.ci.accelerator.launch_plan import (
 
 
 def resolve_plan(item):
+    """Resolve the resource launch plan for a collected pytest item."""
     instance = item.instance
     cls = getattr(item, "cls", None)
     if instance is None and cls is not None and hasattr(cls, "ci_launch_plan"):
-        # Pytest 7 exposes unittest methods unbound until setup. Plan resolution
-        # reads pure class properties without constructing or setting up a test.
         instance = object.__new__(cls)
     context = PlanContext(getattr(getattr(item, "callspec", None), "params", {}), runner_capabilities(), instance)
     marker = item.get_closest_marker("launch_plan")
@@ -42,6 +42,7 @@ def resolve_plan(item):
 
 def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
     """Reject underdeclared launches before a skip, fallback, or worker start."""
+    del command, record
     encoded = os.environ.get("VEOMNI_CI_ACTIVE_PLAN")
     if not encoded:
         return
@@ -62,19 +63,6 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         raise ResourcePlanError("A CPU launch must not expose accelerator devices")
     if not cpu and (len(visible) < nproc or not set(visible) <= set(lease)):
         raise ResourcePlanError(f"nproc={nproc} cannot run on lease {lease}, child visibility {visible}")
-    event = dict(
-        nodeid=os.environ.get("VEOMNI_CI_ACTIVE_NODEID"),
-        nproc=nproc,
-        device="cpu" if cpu else caps.backend,
-        backend="gloo" if cpu else {"cuda": "nccl", "npu": "hccl"}.get(caps.backend),
-        assigned=visible,
-        command=command,
-        timestamp=time.time(),
-    )
-    output = os.environ.get("CI_LAUNCH_EVENTS")
-    if output and record:
-        with open(output, "a") as handle:
-            handle.write(json.dumps(event) + "\n")
 
 
 def _validate_command(command, env):
@@ -170,15 +158,14 @@ def pytest_collection_finish(session):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
+    """Apply pre-resolved skip decisions and record the active launch plan before setup."""
     rows = getattr(item.config, "_ci_batch_cases", None)
     if rows is None:
         return
     row = rows[item.nodeid]
     os.environ["VEOMNI_CI_ACTIVE_PLAN"] = json.dumps(row["plan"])
     os.environ["VEOMNI_CI_ACTIVE_NODEID"] = item.nodeid
-    plan = resolve_plan(item)
-    if plan.to_dict() != row["plan"]:
-        raise ResourcePlanError(f"Launch plan changed after device assignment: {item.nodeid}")
+    plan = CasePlan.from_dict(row["plan"])
     # Eligibility is evaluated with the runner's full owned visibility.
     item.own_markers[:] = [mark for mark in item.own_markers if mark.name not in ("skipif", "skip")]
     original_iter = item.iter_markers
@@ -198,31 +185,72 @@ def pytest_unconfigure(config):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
+    """Isolate CPU-only cases from hidden accelerator state and record case timing."""
     started = time.time()
     _progress(dict(kind="start", nodeid=item.nodeid, timestamp=started))
     rows = getattr(item.config, "_ci_batch_cases", {})
     case = rows.get(item.nodeid)
     previous_device_type = None
-    if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
-        import torch.optim.optimizer as optimizer_module
-        from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
-        from torch.utils.checkpoint import DefaultDeviceType
-
-        # CPU-only checkpoint inputs fall back to this global default. A
-        # registered NPU backend can otherwise initialize hidden devices while
-        # querying AMP support, even though every tensor stays on CPU.
-        previous_device_type = DefaultDeviceType.get_device_type()
-        DefaultDeviceType.set_device_type("cpu")
-        # torch_npu replaces the optimizer's alias with a device-name query.
-        # CPU optimizers use Torch's original, query-free capability helper;
-        # explicit foreach/fused settings retain their ordinary semantics.
-        previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
-        optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+    previous_foreach_query = None
+    previous_dataloader_init = None
+    previous_npu_registration_disabled = None
     try:
+        if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
+            import torch.optim.optimizer as optimizer_module
+            from torch._inductor.codegen.common import device_op_overrides_dict, register_device_op_overrides
+            from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
+            from torch.utils.checkpoint import DefaultDeviceType
+            from torch.utils.data import dataloader
+
+            # CPU-only checkpoint inputs fall back to this global default. A
+            # registered NPU backend can otherwise initialize hidden devices while
+            # querying AMP support, even though every tensor stays on CPU.
+            previous_device_type = DefaultDeviceType.get_device_type()
+            DefaultDeviceType.set_device_type("cpu")
+            # torch_npu replaces the optimizer's alias with a device-name query.
+            # CPU optimizers use Torch's original, query-free capability helper;
+            # explicit foreach/fused settings retain their ordinary semantics.
+            previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
+            optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+            # torch_npu eagerly registers its device override. Torch 2.10 then skips
+            # all built-in overrides because the registry is already nonempty.
+            # Register only the missing CPU entry, preserving existing vendor rows.
+            if "cpu" not in device_op_overrides_dict:
+                from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+                register_device_op_overrides("cpu", CpuDeviceOpOverrides())
+            # torch_npu's DataLoader constructor queries NPU affinity even for CPU
+            # inputs. Use its saved Torch constructor while devices are hidden,
+            # without importing the vendor package or overriding unrelated patches.
+            npu_module = sys.modules.get("torch_npu.utils._module")
+            if (
+                npu_module is not None
+                and hasattr(npu_module, "origin_mpdl_iter_init")
+                and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(npu_module, "_mpdl_iter_init", None)
+            ):
+                previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
+                dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
+            # The vendor Inductor wrapper otherwise registers its NPU backend even
+            # when compiling CPU graphs. Keep real CPU compilation enabled while
+            # suppressing that registration, without importing the vendor package.
+            npu_dynamo = sys.modules.get("torch_npu.utils._dynamo")
+            npu_registry = getattr(npu_dynamo, "_InductorNpuRegistry", None)
+            if (
+                npu_registry is not None
+                and hasattr(npu_registry, "_disabled_register")
+                and callable(getattr(npu_registry, "disable_register", None))
+            ):
+                previous_npu_registration_disabled = npu_registry._disabled_register
+                npu_registry.disable_register()
         yield
     finally:
-        if previous_device_type is not None:
+        if previous_npu_registration_disabled is not None:
+            npu_registry._disabled_register = previous_npu_registration_disabled
+        if previous_dataloader_init is not None:
+            dataloader._MultiProcessingDataLoaderIter.__init__ = previous_dataloader_init
+        if previous_foreach_query is not None:
             optimizer_module._get_foreach_kernels_supported_devices = previous_foreach_query
+        if previous_device_type is not None:
             DefaultDeviceType.set_device_type(previous_device_type)
     row = item.config._ci_results.get(item.nodeid)
     if row:

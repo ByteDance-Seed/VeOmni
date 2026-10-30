@@ -21,6 +21,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
     Qwen3_5GatedDeltaNet,
 )
@@ -39,7 +40,6 @@ from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_g
 from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
     get_parallel_state as qwen4_exp_get_parallel_state,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -112,20 +112,18 @@ def _make_config(model_name: str):
 
 
 def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]]):
+    from tests.models.compare import eager_ops_config
+
     config = _make_config(model_name)
-    prev_cfg = get_ops_config()
-    set_ops_config(None)
-    try:
-        if model_name == "qwen3_5":
-            layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
-        elif model_name == "qwen3_5_moe":
-            layer = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
-        elif model_name == "qwen4_exp":
-            layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0)
-        else:
-            raise ValueError(f"Unsupported model_name={model_name!r}")
-    finally:
-        set_ops_config(prev_cfg)
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    if model_name == "qwen3_5":
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
+    elif model_name == "qwen3_5_moe":
+        layer = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    elif model_name == "qwen4_exp":
+        layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0)
+    else:
+        raise ValueError(f"Unsupported model_name={model_name!r}")
 
     layer.veomni_causal_conv1d = _PassthroughConv1d(impl=impl)
     layer.veomni_chunk_gated_delta_rule = _RecordingGdnOp(impl=impl, calls=calls)
@@ -172,6 +170,17 @@ def test_gdn_grouped_heads_dispatch_contract(
 
         def scatter_seq(x, head_dim, seq_dim, group=None):
             return torch.chunk(x, 2, dim=seq_dim)[0].repeat(1, 1, 2, 1)
+
+        coalesced_calls = []
+
+        def coalesced_heads(q, k, v, beta, decay, group):
+            coalesced_calls.append(True)
+            return tuple(scatter_heads(value, seq_dim=1, head_dim=2, group=group) for value in (q, k, v, beta, decay))
+
+        monkeypatch.setattr(
+            f"veomni.models.transformers.{model_name}.generated.patched_modeling_{model_name}_gpu.coalesced_gather_aligned",
+            coalesced_heads,
+        )
 
         if model_name == "qwen3_5":
             monkeypatch.setattr(
@@ -220,6 +229,8 @@ def test_gdn_grouped_heads_dispatch_contract(
     hidden_states = torch.randn(1, 3 if ulysses else 6, 64, requires_grad=True)
     cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None
     out = layer(hidden_states, cu_seq_lens_q=cu_seq_lens_q)
+    if ulysses:
+        assert len(coalesced_calls) == 1
     out.sum().backward()
 
     expected_calls = 2 if (model_name == "qwen4_exp" and packed and impl == "eager" and not ulysses) else 1

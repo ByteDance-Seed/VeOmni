@@ -18,7 +18,8 @@ from typing import Optional, Tuple
 
 import diffusers
 from diffusers import WanTransformer3DModel
-from transformers import PretrainedConfig
+
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
 WAN_INIT_SIGNATURE = inspect.signature(WanTransformer3DModel.__init__)
@@ -26,7 +27,7 @@ WAN_INIT_SIGNATURE = inspect.signature(WanTransformer3DModel.__init__)
 diffusers_version = diffusers.__version__
 
 
-class WanTransformer3DModelConfig(PretrainedConfig):
+class WanTransformer3DModelConfig(VeOmniPretrainedConfig):
     model_type = "WanTransformer3DModel"
     condition_model_type = "WanTransformer3DConditionModel"
 

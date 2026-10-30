@@ -3,6 +3,30 @@
 How to decide whether a change needs a test, where to put it, and whether CI
 will actually run it. Read this before adding a test file.
 
+## New-model coverage policy
+
+Follow [Testing a New Model](../../docs/transformers_v5/testing_new_model.md)
+for the maintained coverage matrix. Require registry/build, eager family
+forward/backward parity, one supported accelerator training configuration
+against a reference, and E2E alignment for supported parallel modes.
+
+Ordinary dense E2E uses `(SP1, EP1)` and `(SP2, EP1)`; ordinary MoE uses
+`(SP1, EP1)` and `(SP2, EP2)`, with four processes per run. Qwen3-MoE retains
+the full matrix and eight-process SP2 topology. GPT-OSS uses three four-process
+modes `(1,1)`, `(2,1)`, `(2,2)` for its dedicated Quack variant. Check the SOP
+for capability exceptions and justification for additional representatives.
+Preserve a common initial checkpoint, data and global batch; fixed-world-size
+SP changes DP size, so compare DP-mean losses and grad norm. Aggregate metric
+alignment does not prove per-parameter update equivalence.
+
+Keep alignment assertions enabled. Smoke tests establish execution only;
+record any numerical gap explicitly. Separate model integration, raw operator
+numerics, and full distributed execution: standard Quack and GPT-OSS Quack
+need distinct coverage, and an EP-local GEMM test does not exercise all-to-all.
+Record GPU/NPU eligibility and actual skips; SM90-only cases skipped by SM89
+CI are not validated by that job. Use the same mode list for command creation
+and resource plans, reserving the actual sequential peak device count.
+
 ## CI selects tests by explicit enumeration
 
 GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
@@ -13,19 +37,19 @@ directory. Do not add per-file pytest workflow lines or manual device quotas.
 CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
-The lightweight device-API workflow imports CPU-marked architecture/docstring
-tests directly, so it installs pytest even though it does not install Torch.
+The lightweight device-API workflow runs architecture, op-documentation and
+generated-call-site-signature tests with `pytest --noconftest`, without Torch.
+The patchgen workflow owns `test_modify_init.py`, using the standalone
+`patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+Device-API acceptance also includes the three `check_device_api_usage.py`
+scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
+that workflow. CPU tests checking device-name forwarding should use a mock
+backend sentinel when no real hardware API is involved.
 CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
-`cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
-fall back to the registered NPU and AMP capability queries can initialize a
-hidden device. Preserve this scope across fixture setup and teardown as well
-as the test body; accelerator plans and full-visibility collection stay unchanged.
-During that scope, optimizer foreach-capability queries use the canonical
-`torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
-alias with a device-name lookup that initializes NPU even for CPU parameters.
-Restore the prior alias on exit, preserving explicit foreach/fused options.
-A synthetic registered backend alone misses vendor monkeypatches: exercise
-the pinned wheel's optimizer patch in CPU isolation audits too.
+`cpu`, restore Torch's query-free optimizer foreach helper, register the built-in
+CPU device-op overrides when `torch_npu` left them out, and bypass `torch_npu`'s
+DataLoader affinity and Inductor NPU registration hooks while devices are hidden,
+restoring the prior settings afterward.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
@@ -33,6 +57,38 @@ PyTorch 2.11 CPU FP32 `torch.exp` was observed to return inaccurate values on
 its first parallel call, reproducing the original 757-element CI mismatch.
 Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
 independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
+
+CPU model tests must explicitly select eager implementations for every consumed
+op, rather than only setting attention to eager: host defaults can otherwise bind
+accelerator RMSNorm/MLP kernels to CPU inputs. FP32 accelerator parity tests
+must explicitly select SDPA when the default attention backend requires half
+precision. Attention-free wrapper construction tests should forbid HF kernel
+preloading, including the local FlashAttention loader, so they also cover
+CPU workers in NPU environments without `flash_attn`.
+The model-test autouse fixture rejects FlashAttention preloading for CPU launch
+plans and CPU-only hosts, even when the package is installed. It guards both
+HF's lazy entry and VeOmni's loader so process caches cannot hide a dependency.
+Local MLU hosts bypass this CI-specific fixture before plan resolution, since
+the CUDA/NPU scheduler does not support MLU; normal MLU model tests still run.
+Explicit availability-only mocks may replace the HF entry; real accelerator
+plans keep normal loading. Composite eager fixtures must set the root policy
+before constructing either reference or candidate, so otherwise unset
+vision/audio descendants inherit it. Do not rely on a later builder update or
+post-construction handle rebinding. Reuse `make_eager_ops_config()` for all-eager
+helpers, including LoRA, so GDN and vision fields cannot retain fused defaults.
+Standalone MLP/expert/attention fixtures and benchmarks must adapt native HF
+configs before passing them to patched leaf classes. Run the whole model suite without fail-fast
+when changing shared config semantics, then exercise FP32 distributed model
+comparisons with explicit config-owned SDPA.
+Tests asserting VeOmni kernel aliases or using the composed module registry must
+scope `MODELING_BACKEND=veomni` with a restoring fixture; they must not inherit
+the caller's backend or a previous test's environment. For handwritten Diffusers
+constructors, cover explicit attention overrides before HF initialization, plus
+omitted/None preservation and invalid selections; check the bound handles too.
+Plain-tensor checkpoint exports
+must not query an accelerator's current device; resolve the staging device only
+when a DTensor actually needs materialization. CPU-planned workers hide devices,
+so unnecessary device queries can initialize an unavailable vendor runtime.
 
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory
@@ -46,6 +102,24 @@ Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
 for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
+A CPU launch plan isolates devices only when the accelerator runner executes
+the test. CPU-only launcher regressions must also isolate their subprocess
+environment before importing torch, so ordinary pytest on a GPU/NPU host does
+not choose an accelerator backend for CPU tensors. Architecture-specific
+kernel tests must check hardware eligibility before importing optional kernels.
+
+Distributed rendezvous must own its listener through worker startup. Use
+`tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
+endpoint is appended to their arguments; initialize with `store=endpoint.connect()`)
+or the existing `torchrun` callable helper. Single-node torchrun commands use
+`--standalone`; CI keeps agent Store sharing enabled. `find_free_port()` only
+returns a number and its run registry only coordinates cooperating callers:
+probing, closing, then binding in a child still races with other sockets.
+After `mp.spawn` returns its context, the helper reaps workers before releasing
+the Store on failure, interruption and success. Partial startup failures before
+that return rely on the runner's enclosing process-scope cleanup. Never solve a bind race by retrying an entire
+training/checkpoint operation that may already have produced side effects.
+
 A test that passes locally is not necessarily a test CI runs. The entries below
 describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 
@@ -54,12 +128,12 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/ci/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
-| `tests/ops/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
-| `tests/models/` | unit selection in both manifests; GPU excludes `test_omni_fsdp.py`, NPU collects the whole directory |
+| `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
+| `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
 | `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
-| `tests/models/test_omni_fsdp.py` | GPU manifest `59-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
+| `tests/models/test_omni_fsdp.py` | GPU manifest `61-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
 
 Consequences that cut both ways:
 
@@ -76,11 +150,6 @@ Consequences that cut both ways:
 The accelerator runner cancels running peers on the first failure by default;
 `--keep-going` continues all cases. Foreground logs must identify case progress,
 the original failure and cancelled peers without conflating their outcomes.
-Accelerator runner thread pools must cancel owned worker scopes before waiting
-for callbacks on interruption. Preserve scoped process cleanup and failure
-artifacts; do not terminate unrelated device users or rely on the batch timeout.
-Use future completion to prove callbacks drained: an interrupted `Thread.join`
-can report a stopped thread before its callback finishes cleanup.
 
 ## What the NPU job can actually run
 
@@ -161,14 +230,21 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- For API removals and config migrations, validate the result merged with the
+  latest target branch, including tests added upstream since the feature branch
+  diverged. GitHub PR CI checks out that merge result; passing tests on the branch
+  head alone does not cover newly added callers of the removed API.
 - Compiled backward can donate saved buffers and reject `retain_graph=True`.
   Numerical comparisons should use independent leaf tensors for the reference
   graph and differentiate each graph once without retaining it. Keep test inputs
   deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
-  consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
-  their incoming dtype and casts them for fused MoE; a recording double must
-  identify which path it represents and assert the corresponding dtype.
+  consumer reads, including `impl`.
+- Model selection tests that stub `VeomniOp` must still use valid implementation
+  names: module config validation runs before the stub receives the selection.
+  Cover legal eager and optimized selections under simulated GPU/NPU/MLU hosts
+  rather than using a synthetic backend name or bypassing validation. Config
+  mutations in handle-isolation tests must also remain valid on the host.
 - CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
   pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
   replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed

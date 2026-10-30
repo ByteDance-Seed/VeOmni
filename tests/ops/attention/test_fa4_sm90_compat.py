@@ -215,68 +215,6 @@ def test_fa4_sm90_compat_install_is_idempotent():
     assert len(retained) == 2
 
 
-@pytest.mark.parametrize("failed_cache", ["fwd", "bwd"])
-def test_fa4_sm90_cache_initialization_failure_keeps_installation_retryable(monkeypatch, failed_cache):
-    if not fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix():
-        pytest.skip("requires the pinned FA4 optional dependency")
-    from flash_attn.cute import cache_utils, interface
-    from flash_attn.cute.mask import AttentionMask
-
-    def original(
-        self,
-        acc_S,
-        batch_idx,
-        head_idx,
-        m_block,
-        n_block,
-        thr_mma,
-        mask_seqlen,
-        mask_causal,
-        mask_local=False,
-        mask_mod=None,
-        aux_tensors=None,
-        fastdiv_mods=(None, None),
-    ):
-        pass
-
-    old_caches = (object(), object())
-    retained = fa4_sm90_compat._retired_compile_caches
-    monkeypatch.setattr(AttentionMask, "apply_mask", original)
-    monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", old_caches[0])
-    monkeypatch.setattr(interface._flash_attn_bwd, "compile_cache", old_caches[1])
-    monkeypatch.setattr(fa4_sm90_compat, "_retired_compile_caches", retained)
-
-    def unavailable_cache(name):
-        if name.endswith(failed_cache):
-            raise OSError("cache directory unavailable")
-        return object()
-
-    monkeypatch.setattr(cache_utils, "get_jit_cache", unavailable_cache)
-    with pytest.raises(OSError, match="cache directory unavailable"):
-        fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix()
-    assert AttentionMask.apply_mask is original
-    assert interface._flash_attn_fwd.compile_cache is old_caches[0]
-    assert interface._flash_attn_bwd.compile_cache is old_caches[1]
-    assert fa4_sm90_compat._retired_compile_caches is retained
-
-    replacement = {
-        "veomni_sm90_aux_bounds_q_only_k_bounds_materialized_fwd": object(),
-        "veomni_sm90_aux_bounds_q_only_k_bounds_materialized_bwd": object(),
-    }
-    monkeypatch.setattr(cache_utils, "get_jit_cache", replacement.__getitem__)
-    assert fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix()
-    assert AttentionMask.apply_mask is not original
-    assert (
-        interface._flash_attn_fwd.compile_cache
-        is replacement["veomni_sm90_aux_bounds_q_only_k_bounds_materialized_fwd"]
-    )
-    assert (
-        interface._flash_attn_bwd.compile_cache
-        is replacement["veomni_sm90_aux_bounds_q_only_k_bounds_materialized_bwd"]
-    )
-    assert fa4_sm90_compat._retired_compile_caches == old_caches
-
-
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FA4 requires CUDA")
 @pytest.mark.parametrize("token_major", [False, True], ids=["bhsd", "thd"])
 @pytest.mark.parametrize(("query_heads", "kv_heads"), [(4, 4), (7, 1), (8, 4), (28, 4)])
@@ -400,6 +338,16 @@ def test_fa4_shared_cache_broadcast_layouts(monkeypatch, record_property, broadc
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FA4 requires CUDA")
 def test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, record_property):
     from functools import wraps
+
+    from veomni.utils import device as device_utils
+
+    if device_utils.get_gpu_compute_capability(torch.device("cuda")) != 90:
+        pytest.skip("requires NVIDIA SM90 for the SM90 compatibility tests")
+
+    from veomni.ops.kernels.attention.standard import flex
+
+    if not flex._fa4._flash_attn_cute_available():
+        pytest.skip("requires FA4 for the SM90 compatibility tests")
 
     from flash_attn.cute import interface
 

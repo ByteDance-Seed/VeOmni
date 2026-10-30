@@ -39,7 +39,6 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     pin_eager_attn_implementation,
     qwen_image_inputs,
 )
@@ -78,8 +77,8 @@ def _qwen3_omni_moe_thinker_cls():
 
 
 def _build_ours(config: Qwen3OmniMoeThinkerConfig, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _qwen3_omni_moe_thinker_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _qwen3_omni_moe_thinker_cls()(config)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:
@@ -218,6 +217,62 @@ def test_qwen3_omni_moe_eager_matches_hf_image_and_text():
         fwd_kwargs=image,
         ours_fwd_kwargs=ours_masks,
         logits_equal=True,
+    )
+
+
+def test_qwen3_omni_moe_vision_and_audio_attention_veomni_sdpa_matches_hf():
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeAudioAttention as HFQwen3OmniMoeAudioAttention,
+    )
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeVisionAttention as HFQwen3OmniMoeVisionAttention,
+    )
+
+    from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+        Qwen3OmniMoeAudioAttention,
+        Qwen3OmniMoeVisionAttention,
+    )
+
+    torch.manual_seed(0)
+    thinker_config = _tiny_thinker_config()
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+
+    vision_cfg_hf = thinker_config.vision_config
+    vision_cfg_hf._attn_implementation = "sdpa"
+    hf_vision_attn = HFQwen3OmniMoeVisionAttention(vision_cfg_hf).eval()
+
+    vision_cfg_ours = _tiny_thinker_config().vision_config
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_sdpa"
+    vision_cfg_ours._set_ops_implementation(ops)
+    ours_vision_attn = Qwen3OmniMoeVisionAttention(vision_cfg_ours).eval()
+    ours_vision_attn.load_state_dict(hf_vision_attn.state_dict())
+
+    vision_hidden = torch.randn(7, vision_cfg_hf.hidden_size)
+    head_dim = vision_cfg_hf.hidden_size // vision_cfg_hf.num_heads
+    pos_emb = (torch.randn(7, head_dim), torch.randn(7, head_dim))
+    torch.testing.assert_close(
+        ours_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        hf_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        rtol=0,
+        atol=0,
+    )
+
+    audio_cfg_hf = thinker_config.audio_config
+    audio_cfg_hf._attn_implementation = "sdpa"
+    hf_audio_attn = HFQwen3OmniMoeAudioAttention(audio_cfg_hf).eval()
+
+    audio_cfg_ours = _tiny_thinker_config().audio_config
+    audio_cfg_ours._set_ops_implementation(ops)
+    ours_audio_attn = Qwen3OmniMoeAudioAttention(audio_cfg_ours).eval()
+    ours_audio_attn.load_state_dict(hf_audio_attn.state_dict())
+
+    audio_hidden = torch.randn(7, audio_cfg_hf.d_model)
+    torch.testing.assert_close(
+        ours_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        hf_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        rtol=0,
+        atol=0,
     )
 
 

@@ -60,9 +60,64 @@ def batch(glyph=False):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    ("initial_attention", "constructor_kwargs", "expected_attention"),
+    [
+        pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-sdpa"),
+        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-eager"),
+        pytest.param(
+            "flash_attention_2", {"attn_implementation": "veomni_sdpa"}, "veomni_sdpa", id="override-veomni-sdpa"
+        ),
+        pytest.param("sdpa", {}, "sdpa", id="preserve-omitted"),
+        pytest.param("sdpa", {"attn_implementation": None}, "sdpa", id="preserve-none"),
+        pytest.param("sdpa", {"attn_implementation": "flash_attention_2"}, None, id="reject-flash"),
+        pytest.param("sdpa", {"attn_implementation": "not_a_backend"}, None, id="reject-invalid"),
+    ],
+)
+def test_constructor_attention_uses_config_before_hf_init(
+    monkeypatch, initial_attention, constructor_kwargs, expected_attention
+):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = tiny_config()
+    config._set_ops_implementation({"rms_norm_implementation": "eager"})
+    config._attn_implementation = initial_attention
+    if expected_attention is None:
+        with pytest.raises(ValueError, match="dense SDPA"):
+            HunyuanVideo15Model(config, **constructor_kwargs)
+        return
+
+    model = HunyuanVideo15Model(config, **constructor_kwargs)
+    assert model.config is config
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected_attention
+    assert config.ops_implementation["rms_norm_implementation"] == "eager"
+    assert "_attn_implementation_internal" not in vars(config)
+    assert model.attn_mode == model.double_blocks[0].attn_mode == "torch"
+    assert torch.isfinite(model(**batch()).predictions).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("attention", [None, "eager", "veomni_sdpa"])
+def test_dense_attention_ops_config_roundtrip(monkeypatch, tmp_path, attention):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = tiny_config()
+    if attention is not None:
+        config._set_ops_implementation({"attn_implementation": attention})
+    model = HunyuanVideo15Model(config)
+    expected = attention or "veomni_sdpa"
+    assert config._attn_implementation == config.ops_config.attn_implementation == expected
+    config.save_pretrained(tmp_path)
+    restored = HunyuanVideo15Config.from_pretrained(tmp_path)
+    assert restored.ops_implementation == config.ops_implementation
+    assert restored.ops_config.attn_implementation == expected
+    assert HunyuanVideo15Model(restored).attn_mode == model.attn_mode == "torch"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype_key", ["condition_dtype", "dtype"])
 @pytest.mark.parametrize("dtype_value", ["bfloat16", torch.bfloat16], ids=["string", "torch_dtype"])
-@pytest.mark.parametrize("config_source", ["constructor", "dict_payload", "from_dict", "from_pretrained"])
+@pytest.mark.parametrize(
+    "config_source", ["constructor", "dict_payload", "from_dict", "from_pretrained", "saved_condition"]
+)
 def test_condition_construction_preserves_component_dtypes(
     monkeypatch, tmp_path, dtype_key, dtype_value, config_source
 ):
@@ -79,7 +134,13 @@ def test_condition_construction_preserves_component_dtypes(
 
     monkeypatch.setattr(HunyuanVideo15ConditionModel, "_load_components", load_components)
     overrides = {"generator_device": "cpu", dtype_key: dtype_value}
-    if config_source == "from_pretrained":
+    if config_source == "saved_condition":
+        HunyuanVideo15ConditionConfig(
+            condition_dtype="float32", ops_implementation={"attn_implementation": "eager"}
+        ).save_pretrained(tmp_path)
+        config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
+        assert config.ops_config.attn_implementation == "eager"
+    elif config_source == "from_pretrained":
         (tmp_path / "config.json").write_text("{}")
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
     elif config_source == "from_dict":
@@ -265,8 +326,8 @@ def test_meta_materialization_preserves_native_initialization(text_projection, m
     assert all(parameter.is_meta for parameter in model.parameters())
     materialize = torch_parallelize._to_empty_preserving_nonpersistent_buffers
 
-    def poison_parameters(model, device):
-        materialize(model, device)
+    def poison_parameters(model, device, preserve_persistent_buffers=False):
+        materialize(model, device, preserve_persistent_buffers=preserve_persistent_buffers)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.fill_(float("nan"))

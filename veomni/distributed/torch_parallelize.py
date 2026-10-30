@@ -53,7 +53,9 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
-def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+def _to_empty_preserving_nonpersistent_buffers(
+    model: nn.Module, device: str, preserve_persistent_buffers: bool = False
+) -> None:
     """Materialize parameters without discarding config-derived buffers.
 
     ``init_empty_weights()`` patches ``register_parameter`` only, so a
@@ -65,11 +67,14 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
     per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
     tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
-    them. Persistent buffers are left to whichever loader runs next.
+    them. Persistent buffers are preserved for random initialization and left
+    to the loader during checkpoint recovery. Shared registration aliases follow
+    ``to_empty`` semantics and are not reconstructed by this helper.
     """
     buffers = []
     for module in model.modules():
-        for name in module._non_persistent_buffers_set:
+        names = module._buffers.keys() if preserve_persistent_buffers else module._non_persistent_buffers_set
+        for name in names:
             buffer = module._buffers.get(name)
             if buffer is None:
                 continue
@@ -79,7 +84,7 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
                 # No model does this today; say so rather than let ``to_empty()``
                 # leave uninitialized memory behind unannounced.
                 logger.warning_rank0(
-                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                    f"Buffer {name!r} on {type(module).__name__} is on meta and cannot be "
                     "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
                 )
                 continue
@@ -93,16 +98,32 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
 
 
 def _has_extra_parallel_plan(model: nn.Module) -> bool:
-    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
+    """True when the model's parallel plan shards tensors on an active ExtraParallel dimension.
 
     The question both ExtraParallel guards below actually need to ask. A plan is
     a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
-    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
-    every sub-module of a SeedOmni V2 config, including the ones that have no
-    experts.
+    which only says an ExtraParallel dim exists in the mesh — and a mesh dim is
+    inherited by every sub-module of a SeedOmni V2 config, including the ones that
+    have no experts or declare a different ExtraParallel axis (e.g. ``emb`` while
+    only ``ep`` is enabled).
     """
     plan = get_runtime_parallel_plan(model)
-    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
+    extra_plan = getattr(plan, "extra_parallel_plan", None) if plan is not None else None
+    if not extra_plan:
+        return False
+    planned_dims = {para for para, entries in extra_plan.items() if entries}
+    if not planned_dims:
+        return False
+    parallel_state = get_parallel_state()
+    if hasattr(parallel_state, "extra_parallel_enabled") and getattr(
+        parallel_state, "any_extra_parallel_enabled", False
+    ):
+        return any(
+            parallel_state.extra_parallel_enabled(para)
+            for para in planned_dims
+            if para in getattr(parallel_state, "extra_parallel_sizes", ())
+        )
+    return True
 
 
 def _materialize_and_load_weights(
@@ -187,11 +208,17 @@ def _materialize_and_load_weights(
         # Preserve non-persistent buffers on the random-init path too: HF's
         # ``_init_weights`` recomputes only rope tables shaped the way it expects,
         # so the rest would train on whatever ``to_empty()`` left behind.
-        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        _to_empty_preserving_nonpersistent_buffers(
+            model, materialize_device, preserve_persistent_buffers=not should_skip_hf_weight_load
+        )
         _reset_hf_initialized_flag(model)
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
             model.init_weights()
+        if fqn_to_index_mapping is not None:
+            from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
+
+            prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
         return
 
     from torch.distributed.tensor import distribute_tensor

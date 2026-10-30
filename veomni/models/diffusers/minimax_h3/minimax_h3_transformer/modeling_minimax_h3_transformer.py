@@ -15,11 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.core import bind_minimax_attention
+from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
@@ -63,6 +64,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     _checkpoint_conversion_mapping = {"^": "dit."}
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention validates and binds its backend on the first forward.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
         # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
@@ -87,9 +92,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+            config=config,
         )
 
-        self._configure_packed_attention(config._attn_implementation)
+        self._configure_packed_attention(config.ops_config.attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
         """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
@@ -217,7 +223,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             with torch.no_grad():
                 negative_predictions = self.forward(**negative_inputs).predictions
 
-        if self._packed_attn_implementation in _PACKED_FLASH_BACKENDS:
+        if is_flash_attn_impl(self._packed_attn_implementation or ""):
             self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(

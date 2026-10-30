@@ -62,11 +62,18 @@ The weight gradient covers every token of the `emb` group, but only this data-pa
 Build the embedding as a `ShardedEmbedding`, call it in the module's forward like any `nn.Embedding`, and list it in `_no_split_modules` so the parallelizer makes it its own FSDP2 unit:
 
 ```python
+from torch import nn
+
 from veomni.distributed.emb_parallel import ShardedEmbedding
+from veomni.models.modeling_base import VeOmniPreTrainedModel
 
 
-class TextEncoder(PreTrainedModel):
+class TextEncoder(VeOmniPreTrainedModel):
     _no_split_modules = ["ShardedEmbedding"]
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This container embeds and projects tokens; it does not execute attention.
+        return attn_implementation
 
     def __init__(self, config):
         super().__init__(config)
@@ -125,7 +132,7 @@ accelerator:
 
 ## Status and roadmap
 
-Today, `ShardedEmbedding` is the operator only; no model in this repository builds it yet. The SeedOmni V2 text encoder is the first planned user, calling it in its own forward. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
+Today, the SeedOmni base `TextEncoder` ([modeling.py](../../veomni/models/seed_omni/modules/text_encoder/modeling.py)) builds `embed_tokens` as a `ShardedEmbedding` and calls `embed_tokens.project` for its tied head. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
 
 - Unify it with the Qwen3.8 (`qwen4_exp`) PLE lookup, which uses the same vocab-row partition but keeps the hidden dim persistently sharded. It gathers activations rather than parameters; see [qwen4_exp_ple_2d_parallelism.md](../design/qwen4_exp_ple_2d_parallelism.md).
 - Bind the text embedding, PLE and n-gram tables of every transformers model to this operator through the parallel plan.
