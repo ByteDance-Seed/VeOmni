@@ -39,7 +39,15 @@ if modal.is_local():
 image = (
     modal.Image.from_registry("ubuntu:24.04", add_python="3.12")
     .apt_install("build-essential", "git", "ffmpeg", "libibverbs1")
-    .uv_sync(str(ROOT), extras=["gpu"], groups=["test"], frozen=True, uv_version="0.11.16")
+    # Modal 1.6.3's uv_sync uses a TOML parser that rejects this valid pyproject.
+    .dockerfile_commands("COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /usr/local/bin/")
+    .add_local_file(ROOT / "pyproject.toml", "/opt/veomni-env/pyproject.toml", copy=True)
+    .add_local_file(ROOT / "uv.lock", "/opt/veomni-env/uv.lock", copy=True)
+    .run_commands(
+        "uv sync --project /opt/veomni-env --python 3.12 --frozen --extra gpu --group test "
+        "--no-install-workspace --compile-bytecode"
+    )
+    .dockerfile_commands("ENV PATH=/opt/veomni-env/.venv/bin:$PATH")
     .env({"PYTHONPATH": REMOTE, "PYTHONUNBUFFERED": "1", "MODELING_BACKEND": "veomni"})
     .workdir(REMOTE)
     .add_local_dir(ROOT, REMOTE, ignore=lambda path: path.as_posix() not in tracked)
