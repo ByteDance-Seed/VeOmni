@@ -281,7 +281,7 @@ def bwd(
                 T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
                 # Atomic store dKV with split to reduce register pressure
-                for s in range(split_store):
+                for s in T.unroll(split_store, explicit=True):
                     for bi_i, d_i in T.Parallel(BS, D):
                         if bi_i < BS // split_store:
                             acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
