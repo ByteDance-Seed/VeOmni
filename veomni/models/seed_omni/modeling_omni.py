@@ -36,8 +36,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
-from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from transformers import PreTrainedModel
 
 from ...utils import helper  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import (
@@ -132,6 +131,7 @@ class OmniModel(PreTrainedModel):
         return attn_implementation
 
     def __init__(self, config: OmniConfig, modules: Mapping[str, PretrainedOmniModule]):
+        # Root ops are inheritance defaults; each built module validates its final selection.
         super().__init__(config)
         self.config = config
 

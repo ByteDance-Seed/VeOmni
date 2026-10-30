@@ -195,7 +195,7 @@ YAML Config -> VeOmniArguments -> Trainer
 2. Read `config.json` -> select a registered config or a cached HF schema adapter -> initialize a real `VeOmniPretrainedConfig` tree. Native HF config classes are never monkey-patched.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Generated and handwritten models use `VeOmniPreTrainedModel` to adapt raw HF config inputs and validate final ops before HF initialization. Construct instance-local `VeomniOp` handles from `self.config.ops_config`.
+5. Generated and handwritten execution models use `VeOmniPreTrainedModel` to adapt raw HF config inputs and validate final ops before HF initialization. Construct instance-local `VeomniOp` handles from `self.config.ops_config`. The composed `OmniModel` uses HF container initialization: root ops are inheritance defaults and effective module selections are validated by the module loaders and constructors.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
@@ -203,6 +203,9 @@ YAML Config -> VeOmniArguments -> Trainer
 HF attention accessors delegate to it; private HF initialization writes affect
 only that config, while explicit scalar/public writes propagate recursively.
 `OmniConfig` and `OmniModuleConfig` share `VeOmniPretrainedConfig`.
+Its `__init_subclass__` adapts declared `sub_configs` recursively without changing
+native HF schemas. Handwritten HF extensions inherit the VeOmni base and native
+schema directly; the cooperative constructor forwards fields along that MRO.
 For HF modeling, the loader copies adapter configs back to native HF types before
 AutoModel dispatch. See `docs/design/module_config.md` for lifecycle contracts.
 

@@ -79,7 +79,8 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
 
 5. **Configuration ownership** — custom configs inherit `VeOmniPretrainedConfig`
-   (use `get_veomni_config_class(HFConfig)` when extending an HF schema). Generated
+   (inherit `(VeOmniPretrainedConfig, HFConfig)` when extending an HF schema;
+   declared `sub_configs` are adapted recursively at class creation). Generated
    specs drop the HF `PreTrainedModel` import and import
    `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
    Handwritten models use the same base. It adapts direct model inputs and the

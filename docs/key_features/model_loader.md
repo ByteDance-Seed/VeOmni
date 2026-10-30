@@ -49,7 +49,9 @@ class YourCustomConfig(VeOmniPretrainedConfig):
     architectures = ["YourCustomModel"]  # This should match your model class name
 ```
 
-For an existing HF schema, use `get_veomni_config_class(HFConfig)`. VeOmni's
+To extend an HF schema, inherit `(VeOmniPretrainedConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively. To construct an adapted HF config without
+defining an extension, use `get_veomni_config_class(HFConfig)`. VeOmni's
 loaders and generated model base adapt native HF inputs automatically; native HF
 classes themselves remain unchanged. Custom config constructors forward
 `ops_implementation` to `super().__init__`. See the

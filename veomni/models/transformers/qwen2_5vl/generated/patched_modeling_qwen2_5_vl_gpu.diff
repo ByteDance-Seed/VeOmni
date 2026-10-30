@@ -683,7 +683,7 @@
          )
          self.gradient_checkpointing = False
 
-@@ -403,72 +677,248 @@
+@@ -403,72 +677,250 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -935,28 +935,30 @@
 +                self.patch_size,
 +            )
 +
++        merge = self.spatial_merge_size
++        patch_dim = self.config.in_channels * self.config.temporal_patch_size * self.patch_size**2
 +        # --- Patch.1 ---
 +        if get_parallel_state().sp_enabled:
 +            if getattr(self, "_sp_dummy_data", None) is None:
 +                # --- Patch.2 ---
 +                sp_size = get_parallel_state().sp_size
-+                pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-+                grid_thw = torch.tensor([[1, 2 * sp_size, 2]], dtype=torch.int32, device=self.device)
++                pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
++                grid_thw = torch.tensor([[1, merge * sp_size, merge]], dtype=torch.int32, device=self.device)
 +                # --- Patch.2 ---
 +                self._sp_dummy_data = {
 +                    "hidden_states": pixel_values,
 +                    "grid_thw": grid_thw,
-+                    "vit_metadata": _dummy_vit_metadata(1, 2 * sp_size, 2),
++                    "vit_metadata": _dummy_vit_metadata(1, merge * sp_size, merge),
 +                }
 +            outputs = self(**self._sp_dummy_data)
 +        else:
 +            if getattr(self, "_dummy_data", None) is None:
-+                pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-+                grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.int32, device=self.device)
++                pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
++                grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.int32, device=self.device)
 +                self._dummy_data = {
 +                    "hidden_states": pixel_values,
 +                    "grid_thw": grid_thw,
-+                    "vit_metadata": _dummy_vit_metadata(1, 2, 2),
++                    "vit_metadata": _dummy_vit_metadata(1, merge, merge),
 +                }
 +            outputs = self(**self._dummy_data)
 +        return outputs
@@ -964,7 +966,7 @@
 
 
  @auto_docstring
-@@ -538,9 +988,15 @@
+@@ -538,9 +990,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -981,7 +983,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -548,55 +1004,26 @@
+@@ -548,55 +1006,26 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -1055,7 +1057,7 @@
 
 
  class Qwen2_5_VLAttention(nn.Module):
-@@ -605,6 +1032,7 @@
+@@ -605,6 +1034,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
@@ -1063,7 +1065,7 @@
      def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -637,6 +1065,9 @@
+@@ -637,6 +1067,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -1073,7 +1075,7 @@
 
      def forward(
          self,
-@@ -649,6 +1080,7 @@
+@@ -649,6 +1082,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -1081,7 +1083,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -660,18 +1092,25 @@
+@@ -660,18 +1094,25 @@
          value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -1114,7 +1116,7 @@
              self,
              query_states,
              key_states,
-@@ -680,8 +1119,8 @@
+@@ -680,8 +1121,8 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1125,7 +1127,7 @@
          )
 
          attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-@@ -689,21 +1128,27 @@
+@@ -689,21 +1130,27 @@
          return attn_output, attn_weights
 
 
@@ -1162,7 +1164,7 @@
 
      def forward(
          self,
-@@ -757,6 +1202,12 @@
+@@ -757,6 +1204,12 @@
          return hidden_states
 
 
@@ -1175,7 +1177,7 @@
  @auto_docstring
  class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
      config: Qwen2_5_VLTextConfig
-@@ -766,22 +1217,21 @@
+@@ -766,22 +1219,21 @@
          "attentions": Qwen2_5_VLAttention,
      }
 
@@ -1204,7 +1206,7 @@
          self.post_init()
 
      @merge_with_config_defaults
-@@ -870,6 +1320,12 @@
+@@ -870,6 +1322,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -1217,7 +1219,7 @@
 
 
  @auto_docstring
-@@ -1066,14 +1522,27 @@
+@@ -1066,14 +1524,27 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1250,7 +1252,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1083,53 +1552,35 @@
+@@ -1083,53 +1554,35 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1324,7 +1326,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1180,6 +1631,25 @@
+@@ -1180,6 +1633,25 @@
              position_ids = None
          return position_ids
 
@@ -1350,7 +1352,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1190,39 +1660,166 @@
+@@ -1190,39 +1662,166 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1528,7 +1530,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1233,6 +1830,15 @@
+@@ -1233,6 +1832,15 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1544,7 +1546,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1241,16 +1847,21 @@
+@@ -1241,16 +1849,21 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1567,7 +1569,7 @@
 
 
  @auto_docstring
-@@ -1265,16 +1876,29 @@
+@@ -1265,16 +1878,29 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1598,7 +1600,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1314,91 +1938,83 @@
+@@ -1314,91 +1940,83 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1732,7 +1734,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1578,5 +2194,49 @@
+@@ -1578,5 +2196,49 @@
 
          return input_ids, model_kwargs
 

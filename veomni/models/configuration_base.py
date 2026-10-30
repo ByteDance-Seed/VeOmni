@@ -47,11 +47,8 @@ def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) ->
                 else:
                     sub_dict.pop("ops_implementation", None)
         # A missing child key means its device default, not the parent's choice.
-        resets = {
-            key: None
-            for key, value in parent_ops.items()
-            if value is not None and key not in sub_cfg.ops_implementation
-        }
+        child_ops = getattr(sub_cfg, "ops_implementation", None) or {}
+        resets = {key: None for key, value in parent_ops.items() if value is not None and key not in child_ops}
         if resets:
             sub_dict.setdefault("ops_implementation", {}).update(resets)
 
@@ -62,6 +59,19 @@ class VeOmniPretrainedConfig(PretrainedConfig):
     Native HF config classes opt in through :func:`get_veomni_config_class`.
     HF classes and instances outside VeOmni entry points are never patched.
     """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if cls.sub_configs:
+            cls.sub_configs = {
+                key: get_veomni_config_class(value)
+                if isinstance(value, type) and issubclass(value, PretrainedConfig)
+                else value
+                for key, value in cls.sub_configs.items()
+            }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
 
     def __post_init__(self, **kwargs: Any) -> None:
         ops = kwargs.pop("ops_implementation", getattr(self, "ops_implementation", None))
@@ -334,12 +344,6 @@ def get_veomni_config_class(config_class: type[PretrainedConfig]) -> type[VeOmni
             "__init__": config_class.__init__,
             "__reduce__": _reduce_config,
             "_hf_config_class": config_class,
-            "sub_configs": {
-                key: get_veomni_config_class(value)
-                if isinstance(value, type) and issubclass(value, PretrainedConfig)
-                else value
-                for key, value in config_class.sub_configs.items()
-            },
         },
     )
 

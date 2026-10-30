@@ -215,6 +215,72 @@ def test_pretrained_config_attn_implementation_bidirectional_sync():
     assert cfg_bare.ops_config.attn_implementation == "eager"
 
 
+@pytest.mark.parametrize("base_kind", ["model", "omni_module"])
+def test_custom_config_adapts_declared_subconfig_schema(tmp_path, base_kind):
+    from transformers import PretrainedConfig, Qwen3VLConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+
+    native_children = dict(Qwen3VLConfig.sub_configs)
+    base = VeOmniPretrainedConfig if base_kind == "model" else OmniModuleConfig
+
+    class CustomConfig(base):
+        sub_configs = {"backbone": Qwen3VLConfig}
+
+        def __init__(self, backbone=None, **kwargs):
+            self.backbone = self.sub_configs["backbone"](**(backbone or {}))
+            super().__init__(**kwargs)
+
+    assert issubclass(CustomConfig.sub_configs["backbone"], VeOmniPretrainedConfig)
+    assert Qwen3VLConfig.sub_configs == native_children
+    for child in native_children.values():
+        assert not issubclass(child, VeOmniPretrainedConfig)
+    config = CustomConfig(
+        backbone={"vision_config": {"ops_implementation": {"attn_implementation": "eager"}}},
+        ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
+    )
+    assert isinstance(config.backbone, PretrainedConfig)
+    assert config.backbone.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert config.backbone.vision_config.ops_config.attn_implementation == "eager"
+    config.save_pretrained(tmp_path)
+    restored = CustomConfig.from_pretrained(tmp_path)
+    assert restored.backbone.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert restored.backbone.vision_config.ops_config.attn_implementation == "eager"
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "qwen2_5_omni", "qwen3_omni_moe"])
+def test_handwritten_hf_config_subtrees_roundtrip(tmp_path, family):
+    import pickle
+
+    from transformers import PretrainedConfig
+
+    from tests.models import tiny_configs
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.configuration_base import VeOmniPretrainedConfig
+
+    config = getattr(tiny_configs, f"tiny_{family}_config")()
+    config._set_ops_implementation(make_eager_ops_config())
+
+    def check(node):
+        assert isinstance(node, VeOmniPretrainedConfig)
+        assert node.ops_config.attn_implementation == "eager"
+        for key, child_class in node.sub_configs.items():
+            if isinstance(child_class, type) and issubclass(child_class, PretrainedConfig):
+                assert issubclass(child_class, VeOmniPretrainedConfig)
+            child = getattr(node, key, None)
+            if child is not None:
+                assert isinstance(child, PretrainedConfig)
+                check(child)
+
+    check(config)
+    config.save_pretrained(tmp_path)
+    restored = type(config).from_pretrained(tmp_path)
+    check(restored)
+    assert type(pickle.loads(pickle.dumps(restored))) is type(config)
+
+
 def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
     """Nested sub_configs merge parent defaults under child overrides without sharing mutable state."""
     import json
@@ -837,7 +903,8 @@ def test_child_default_reset_survives_save_and_reload(tmp_path):
 
 
 @pytest.mark.parametrize("entrypoint", ["class", "builder"])
-def test_native_child_load_override_receives_ops(tmp_path, entrypoint):
+@pytest.mark.parametrize("saved_root_ops", [False, True], ids=["empty-root", "eager-root"])
+def test_native_child_load_override_receives_ops(tmp_path, entrypoint, saved_root_ops):
     from transformers import Qwen3VLConfig, Qwen3VLVisionConfig
 
     from tests.tools.training_utils import make_eager_ops_config
@@ -845,7 +912,7 @@ def test_native_child_load_override_receives_ops(tmp_path, entrypoint):
     from veomni.models.configuration_base import VeOmniPretrainedConfig
 
     Config = get_veomni_config_class(Qwen3VLConfig)
-    Config().save_pretrained(tmp_path)
+    Config(ops_implementation=make_eager_ops_config() if saved_root_ops else {}).save_pretrained(tmp_path)
     child = Qwen3VLVisionConfig(depth=1, hidden_size=32, num_heads=4)
     load = Config.from_pretrained if entrypoint == "class" else build_config
     config = load(tmp_path, vision_config=child, ops_implementation=make_eager_ops_config())

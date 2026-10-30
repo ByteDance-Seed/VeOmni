@@ -145,6 +145,48 @@ def _build_omni_model() -> OmniModel:
     )
 
 
+@pytest.mark.parametrize("entrypoint", ["constructor", "from_config", "from_pretrained"])
+@pytest.mark.parametrize("override_all_modules", [False, True], ids=["invalid-module", "overridden-root"])
+def test_npu_load_validates_effective_module_ops(tmp_path, monkeypatch, entrypoint, override_all_modules):
+    from tests.tools.training_utils import make_eager_ops_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    model = _build_omni_model()
+    model.config._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
+    eager = make_eager_ops_config().to_dict()
+    for name in (FAKE_A, FAKE_B) if override_all_modules else (FAKE_A,):
+        model.config._module_entries[name]["ops_implementation"] = dict(eager)
+    model.save_pretrained(tmp_path)
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+
+    def load():
+        if entrypoint == "from_pretrained":
+            return OmniModel.from_pretrained(tmp_path, device_map="cpu")
+        config = OmniConfig.from_pretrained(tmp_path)
+        if entrypoint == "from_config":
+            return OmniModel.from_config(config)
+        return OmniModel(
+            config,
+            {FAKE_A: FakeModuleA(config._module_configs[FAKE_A]), FAKE_B: FakeModuleB(config._module_configs[FAKE_B])},
+        )
+
+    if not override_all_modules:
+        with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+            load()
+        return
+
+    loaded = load()
+    assert loaded.config.ops_implementation["rms_norm_implementation"] == "liger_kernel"
+    for name in (FAKE_A, FAKE_B):
+        module = getattr(loaded, name)
+        assert module.config.ops_config.rms_norm_implementation == "eager"
+    if entrypoint == "from_pretrained":
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(loaded.state_dict()[key], value)
+
+
 def test_omni_config_from_pretrained_hydrates_graph_sidecars(tmp_path):
     _write_omni_checkpoint(tmp_path)
 

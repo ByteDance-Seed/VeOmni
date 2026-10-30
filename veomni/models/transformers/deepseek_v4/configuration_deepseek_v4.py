@@ -19,14 +19,14 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
 )
 
-from veomni.models.configuration_base import get_veomni_config_class
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
-class DeepseekV4Config(get_veomni_config_class(_DeepseekV4Config)):
+class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
     """DeepSeek-V4 config with Lightning Indexer KL and DSpark MTP fields.
 
     The objectives and DSpark draft-stage shape are configured on the model

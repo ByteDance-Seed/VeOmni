@@ -115,6 +115,11 @@ Workflow:
 Forward `ops_implementation` to `super().__init__` in custom constructors;
 assigning it before a superclass call can lose selections during initialization.
 The sparse dictionary owns attention state, including HF attention accessors.
-Use `get_veomni_config_class` when a module extends an HF config schema; importing
-VeOmni does not add lifecycle methods to native HF configs. The shared lifecycle
+An HF schema extension may inherit `(OmniModuleConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively, including on handwritten subclasses.
+Use `get_veomni_config_class` to construct an adapted native schema directly;
+importing VeOmni does not add lifecycle methods to native HF configs. The shared lifecycle
 and override contract is in `docs/design/module_config.md`.
+The composed `OmniModel` treats its root ops as inheritance defaults and validates
+effective selections on its independently built modules. An overridden root
+default must not reject a module whose final ops are valid for its device.

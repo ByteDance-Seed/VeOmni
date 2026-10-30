@@ -629,28 +629,30 @@ def qwen2_5_vit_dummy_forward_patched(self):
             self.patch_size,
         )
 
+    merge = self.spatial_merge_size
+    patch_dim = self.config.in_channels * self.config.temporal_patch_size * self.patch_size**2
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         if getattr(self, "_sp_dummy_data", None) is None:
             # --- Patch.2 ---
             sp_size = get_parallel_state().sp_size
-            pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-            grid_thw = torch.tensor([[1, 2 * sp_size, 2]], dtype=torch.int32, device=self.device)
+            pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, merge * sp_size, merge]], dtype=torch.int32, device=self.device)
             # --- Patch.2 ---
             self._sp_dummy_data = {
                 "hidden_states": pixel_values,
                 "grid_thw": grid_thw,
-                "vit_metadata": _dummy_vit_metadata(1, 2 * sp_size, 2),
+                "vit_metadata": _dummy_vit_metadata(1, merge * sp_size, merge),
             }
         outputs = self(**self._sp_dummy_data)
     else:
         if getattr(self, "_dummy_data", None) is None:
-            pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-            grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.int32, device=self.device)
+            pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.int32, device=self.device)
             self._dummy_data = {
                 "hidden_states": pixel_values,
                 "grid_thw": grid_thw,
-                "vit_metadata": _dummy_vit_metadata(1, 2, 2),
+                "vit_metadata": _dummy_vit_metadata(1, merge, merge),
             }
         outputs = self(**self._dummy_data)
     return outputs
