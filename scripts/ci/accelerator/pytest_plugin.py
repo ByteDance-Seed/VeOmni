@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ci.accelerator.launch_plan import (
+    XPU_HIDDEN_MASK,
     CasePlan,
     PlanContext,
     ResourcePlanError,
@@ -61,7 +62,7 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         "npu": "ASCEND_RT_VISIBLE_DEVICES",
         "xpu": "ZE_AFFINITY_MASK",
     }.get(caps.backend, "ASCEND_RT_VISIBLE_DEVICES")
-    visible = [value for value in env.get(key, "").split(",") if value]
+    visible = [value for value in env.get(key, "").split(",") if value and value != XPU_HIDDEN_MASK]
     cpu = not visible and any(spec.device == "cpu" for spec in specs)
     if not cpu and not any(spec.device == "accelerator" for spec in specs):
         raise ResourcePlanError("A CPU launch must not expose accelerator devices")
