@@ -19,7 +19,7 @@ import torch
 from ..distributed.parallel_state import get_parallel_state
 from .constants import IGNORE_INDEX
 from .device import get_device_type
-from .dist_utils import all_reduce, any_rank_failed
+from .dist_utils import all_reduce
 
 
 def is_padding_microbatch(batch) -> bool:
@@ -32,12 +32,37 @@ def contains_padding(batch) -> bool:
     return is_padding_microbatch(batch)
 
 
-def reject_objective_padding(batch, objective: str) -> None:
+def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool = False):
+    count = len(batch) if isinstance(batch, (list, tuple)) else 1
+    device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+    flags = torch.tensor([int(invalid), int(has_auxiliary_targets), count, -count], dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+    values = flags.tolist()
+    return bool(values[0]) or values[2] != -values[3], bool(values[1])
+
+
+def reject_objective_padding(batch, objective: str, *, initial_microbatch_count: int | None = None) -> None:
     found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        found = any_rank_failed(found)
+        if initial_microbatch_count is not None and isinstance(batch, (list, tuple)):
+            found = found or len(batch) != initial_microbatch_count
+        found, _ = _distributed_batch_status(batch, found)
     if found:
-        raise ValueError(f"{objective} does not support padded micro-batches or an empty step")
+        raise ValueError(
+            f"{objective} does not support padded micro-batches, an empty step, "
+            "unequal microbatch counts across ranks, or callback changes to the microbatch count"
+        )
+
+
+def reject_distributed_padding(batch) -> None:
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+        found, _ = _distributed_batch_status(batch, invalid)
+        if found:
+            raise RuntimeError(
+                "Distributed training does not support padded micro-batches, an empty step, "
+                "unequal microbatch counts across ranks, or callback changes to the microbatch count"
+            )
 
 
 def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
@@ -70,6 +95,38 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
             raise TypeError(f"Unsupported batch type: {type(obj)}")
 
     _count(batches)
+    return token_len
+
+
+def count_loss_token_synchronized(batches, initial_microbatch_count: int):
+    """Count callback-adjusted inputs, propagating local input errors before reductions."""
+    error = None
+    token_len = None
+    try:
+        token_len = count_loss_token(batches)
+        invalid = contains_padding(batches) or not batches or len(batches) != initial_microbatch_count
+    except Exception as exc:  # noqa: BLE001 - peers must not enter the next collective alone
+        error = exc
+        invalid = True
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        has_auxiliary_targets = bool(token_len and len(token_len) > 1)
+        found, has_auxiliary_targets = _distributed_batch_status(batches, invalid, has_auxiliary_targets)
+        if found:
+            if error is not None:
+                raise RuntimeError("Invalid loss-token input in distributed training") from error
+            raise RuntimeError(
+                "Distributed training does not support padded micro-batches, an empty step, "
+                "unequal microbatch counts across ranks, or callback changes to the microbatch count"
+            )
+        if has_auxiliary_targets:
+            # Auxiliary losses may be present on only some ranks. All ranks
+            # must reduce the same sorted keys, with zero for absent targets.
+            key_lists = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(key_lists, sorted(token_len))
+            for key in sorted({key for keys in key_lists for key in keys}):
+                token_len.setdefault(key, torch.tensor(0))
+    elif error is not None:
+        raise error
     return token_len
 
 
@@ -131,12 +188,15 @@ def reduce_global_loss_token(
         )
         foundation, padding_count = all_reduce(local, op="sum")
         if padding_count:
-            raise RuntimeError("Distributed training does not support padded micro-batches or an empty step")
+            raise RuntimeError(
+                "Distributed training does not support padded micro-batches, an empty step, "
+                "or callback changes to the microbatch count"
+            )
         reduced = {"foundation_tokens": foundation}
         reduced.update(
             {
                 key: all_reduce(value.item(), op="sum")
-                for key, value in micro_batches_token_len.items()
+                for key, value in sorted(micro_batches_token_len.items())
                 if key != "foundation_tokens"
             }
         )

@@ -551,10 +551,16 @@ class OmniTrainer:
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._step_preflight_start_time = time.time()
         reject_objective_padding(micro_batches, "Omni training")
+        initial_microbatch_count = len(micro_batches)
+        previous_step = self.state.global_step
         self.state.global_step += 1
-
-        self._reset_async_activation_offload_if_enabled()
-        self.on_step_begin(micro_batches=micro_batches)
+        try:
+            self._reset_async_activation_offload_if_enabled()
+            self.on_step_begin(micro_batches=micro_batches)
+            reject_objective_padding(micro_batches, "Omni training", initial_microbatch_count=initial_microbatch_count)
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
         self.sync_before_train_step()
 
         total_loss = 0.0
@@ -583,9 +589,15 @@ class OmniTrainer:
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._step_preflight_start_time = time.time()
         reject_objective_padding(micro_batches, "Omni training")
+        initial_microbatch_count = len(micro_batches)
+        previous_step = self.state.global_step
         self.state.global_step += 1
-
-        self.on_step_begin(micro_batches=micro_batches)
+        try:
+            self.on_step_begin(micro_batches=micro_batches)
+            reject_objective_padding(micro_batches, "Omni training", initial_microbatch_count=initial_microbatch_count)
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
         self.sync_before_train_step()
 
         num_micro_steps = len(micro_batches)

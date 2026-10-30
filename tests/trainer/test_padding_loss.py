@@ -121,6 +121,57 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
             error = str(exc)
         dist.all_gather_object(results, (error, trainer.state.global_step, entered))
         assert all(message and "empty step" in message and step == 3 and not seen for message, step, seen in results)
+
+        batches = [{"labels": torch.tensor([1])} for _ in range(rank + 1)]
+        error = None
+        try:
+            trainer.train_step(iter([batches]))
+        except RuntimeError as exc:
+            error = str(exc)
+        dist.all_gather_object(results, (error, trainer.state.global_step, entered))
+        assert all(
+            message and "unequal microbatch counts" in message and step == 3 and not seen
+            for message, step, seen in results
+        )
+
+        trainer.model = SimpleNamespace()
+        trainer._reset_async_activation_offload_if_enabled = lambda _model: None
+        trainer.on_step_begin = lambda micro_batches: micro_batches.pop() if rank == 0 else None
+        batches = [{"labels": torch.tensor([1])}, {"labels": torch.tensor([2])}]
+        error = None
+        try:
+            trainer.train_step(iter([batches]))
+        except RuntimeError as exc:
+            error = str(exc)
+        dist.all_gather_object(results, (error, trainer.state.global_step))
+        assert all(
+            message and "callback changes to the microbatch count" in message and step == 3
+            for message, step in results
+        )
+        trainer.on_step_begin = lambda micro_batches: micro_batches[0].pop("labels") if rank == 0 else None
+        batches = [{"labels": torch.tensor([1])}]
+        error = None
+        try:
+            trainer.train_step(iter([batches]))
+        except RuntimeError as exc:
+            error = str(exc)
+        dist.all_gather_object(results, (error, trainer.state.global_step))
+        assert all(message and step == 3 for message, step in results)
+
+        batch = {"labels": torch.tensor([1])}
+        if rank == 0:
+            batch.update(image_labels=torch.tensor([1, 2]), audio_labels=torch.tensor([1]))
+        else:
+            batch.update(audio_labels=torch.tensor([1, 2, 3]), image_labels=torch.tensor([1]))
+        counts = loss_utils.count_loss_token_synchronized([batch], 1)
+        totals = loss_utils.reduce_global_loss_token(counts)
+        assert totals["image_tokens"] == 3 and totals["audio_tokens"] == 4
+
+        batch = {"labels": torch.tensor([1])}
+        batch.update({"image_labels" if rank == 0 else "audio_labels": torch.tensor([1, 2])})
+        counts = loss_utils.count_loss_token_synchronized([batch], 1)
+        totals = loss_utils.reduce_global_loss_token(counts)
+        assert totals["image_tokens"] == 2 and totals["audio_tokens"] == 2
     finally:
         dist.destroy_process_group()
 
@@ -165,6 +216,73 @@ def test_asymmetric_dpo_omni_dit_padding_fails_on_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_asymmetric_objective_padding_worker, args=(), nprocs=2)
+
+
+def _composed_post_callback_padding_worker(rank, endpoint):
+    import importlib.util
+    import sys
+    import types
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    if importlib.util.find_spec("av") is None:
+        av = types.ModuleType("av")
+        av.container = SimpleNamespace(Container=object)
+        av.audio = SimpleNamespace(AudioStream=object)
+        av.AudioFrame = object
+        sys.modules["av"] = av
+    import veomni.trainer.dit_trainer as dit_module
+    from veomni.trainer.omni.omni_trainer import OmniTrainer
+    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+
+    dit_module.use_parallel_state = lambda _state: nullcontext()
+    dit_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        for kind in ("dpo", "omni", "omni_offline", "dit"):
+            state = SimpleNamespace(global_step=3)
+            if kind == "dpo":
+                trainer = object.__new__(TextDPOTrainer)
+                trainer.state = state
+                trainer.policy_model = object()
+                trainer.base = SimpleNamespace(_reset_async_activation_offload_if_enabled=lambda _model: None)
+            elif kind.startswith("omni"):
+                trainer = object.__new__(OmniTrainer)
+                trainer.state = state
+                trainer.offline_cache_writer = object()
+                trainer._reset_async_activation_offload_if_enabled = lambda: None
+            else:
+                trainer = object.__new__(dit_module.DiTTrainer)
+                trainer.base = SimpleNamespace(
+                    state=state,
+                    model=SimpleNamespace(parallel_state=object()),
+                    _reset_async_activation_offload_if_enabled=lambda _model: None,
+                )
+
+            def step_begin(micro_batches):
+                if rank == 0:
+                    micro_batches[0]["padding_flag"] = True
+
+            trainer.on_step_begin = step_begin
+            fn = trainer.offline_cache_step if kind == "omni_offline" else trainer.train_step
+            error = None
+            try:
+                fn(iter([[{"labels": torch.tensor([1])}]]))
+            except ValueError as exc:
+                error = str(exc)
+            results = [None, None]
+            dist.all_gather_object(results, (error, state.global_step))
+            assert all(message and "padded micro-batches" in message and step == 3 for message, step in results)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_composed_trainers_synchronize_post_callback_padding():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_composed_post_callback_padding_worker, args=(), nprocs=2)
 
 
 def test_exactly_full_flush_does_not_emit_padding_only_step():
@@ -541,8 +659,9 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
             self.parallel_state = parallel_state
 
         def forward(self, input_ids, labels, use_cache=False, **_kwargs):
-            selected = labels != -100
-            loss = (self.weight * input_ids[selected].float() - labels[selected].float()).square().mean()
+            targets = labels[..., 1:]
+            logits = self.weight * input_ids[..., :-1].float().unsqueeze(-1) * torch.arange(8, dtype=torch.float32)
+            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 8), targets.reshape(-1), ignore_index=-100)
             return SimpleNamespace(loss=loss)
 
     collator = collator_module.PackingCollator()
@@ -550,7 +669,7 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         [
             {
                 "input_ids": torch.tensor([1, 2, 3]),
-                "labels": torch.tensor([1, 2, 3]),
+                "labels": torch.tensor([-100, 2, 3]),
                 "position_ids": torch.tensor([0, 1, 2]),
             },
             {
@@ -560,9 +679,12 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
             },
         ]
     )
-    assert packed["labels"].flatten().tolist() == [1, 2, 3, -100, 5]
+    assert packed["labels"].flatten().tolist() == [-100, 2, 3, -100, 5]
+    packed_other = collator(
+        [{"input_ids": torch.tensor([6, 7]), "labels": torch.tensor([-100, 7]), "position_ids": torch.tensor([0, 1])}]
+    )
 
-    def run(pad):
+    def run(pad, mask_mode=None):
         model = TinyModel()
         model.optimizer = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0.1)
         model.lr_scheduler = SimpleNamespace(step=lambda: None)
@@ -580,9 +702,16 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         trainer._configure_hsdp_allreduce = lambda *_args: None
         trainer._reset_async_activation_offload_if_enabled = lambda *_args: None
         trainer.sync_before_train_step = lambda: None
-        trainer.on_step_begin = lambda **_kwargs: None
+
+        def step_begin(micro_batches):
+            if mask_mode == "callback":
+                micro_batches[0]["labels"][0, 1] = -100
+
+        trainer.on_step_begin = step_begin
         trainer.on_step_end = lambda **kwargs: recorded.update(kwargs)
-        batches = [copy.deepcopy(packed)] + ([{"padding_flag": True}] if pad else [])
+        batches = [copy.deepcopy(packed), copy.deepcopy(packed_other)] + ([{"padding_flag": True}] if pad else [])
+        if mask_mode == "before":
+            batches[0]["labels"][0, 1] = -100
         base_module.BaseTrainer.train_step(trainer, iter([batches]))
         return recorded, model.weight.detach().clone()
 
@@ -591,3 +720,9 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     assert torch.equal(actual["gradient"], reference["gradient"])
     assert torch.equal(actual_weight, reference_weight)
     assert actual["loss"] == reference["loss"]
+
+    masked_reference, masked_reference_weight = run(False, "before")
+    masked_callback, masked_callback_weight = run(False, "callback")
+    assert torch.equal(masked_callback["gradient"], masked_reference["gradient"])
+    assert torch.equal(masked_callback_weight, masked_reference_weight)
+    assert masked_callback["loss"] == masked_reference["loss"]

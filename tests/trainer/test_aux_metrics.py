@@ -330,6 +330,34 @@ def test_padding_does_not_replace_last_real_reshard_or_allreduce_step(run_train_
     assert calls == [("reshard", 0, 2), ("allreduce", 0, 2), ("reshard", 1, 2), ("allreduce", 1, 2)]
 
 
+def test_step_begin_label_mask_is_reflected_in_global_loss_denominator(run_train_step, identity_loss):
+    recorded = {}
+    trainer = _accumulating_trainer([], recorded)
+
+    def mask_one_label(micro_batches):
+        micro_batches[0]["labels"][0, 1] = -100
+
+    trainer.on_step_begin = lambda micro_batches=None, **_kwargs: mask_one_label(micro_batches)
+    trainer.forward_backward_step = lambda _batch: (
+        trainer.micro_batch_token_len["foundation_tokens"]
+        / trainer.global_micro_batches_token_len["foundation_tokens"],
+        {},
+        {},
+    )
+    batches = [{"labels": torch.tensor([[-100, 2, 3]])}, {"labels": torch.tensor([[-100, 4, 5]])}]
+    run_train_step(trainer, batches)
+    assert trainer.global_micro_batches_token_len["foundation_tokens"] == 3
+    assert recorded["loss"] == pytest.approx(1.0)
+
+
+def test_callback_creating_all_padding_does_not_advance_step(run_train_step, identity_loss):
+    trainer = _accumulating_trainer([], {})
+    trainer.on_step_begin = lambda micro_batches=None, **_kwargs: micro_batches[0].update(padding_flag=True)
+    with pytest.raises(ValueError, match="at least one real micro-batch"):
+        run_train_step(trainer, [{"labels": torch.tensor([[-100, 2]])}])
+    assert trainer.state.global_step == 0
+
+
 def test_metric_emitted_by_some_micro_batches_is_averaged_over_all_of_them(run_train_step, identity_loss):
     """The documented consequence of dividing by the step's micro-batch count.
 
