@@ -666,6 +666,14 @@ class FSDPConfig:
             )
         },
     )
+    cpu_offload_extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "CPU-offload selected ExtraParallel parameter/gradient groups (currently ep only)."},
+    )
+    cpu_offload_exclude_module_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Keep matching selected expert modules resident on the accelerator; complete FQN patterns."},
+    )
     low_precision_reduce_scatter_comm: bool = field(
         default=False,
         metadata={
@@ -689,6 +697,13 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
+        if self.cpu_offload_exclude_module_patterns and not self.cpu_offload_extra_parallel_names:
+            raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+        if self.cpu_offload_extra_parallel_names:
+            if self.fsdp_mode != "fsdp2" or self.offload:
+                raise ValueError("Selective ExtraParallel CPU offload requires FSDP2 and global offload=False")
+            if self.cpu_offload_extra_parallel_names != ["ep"]:
+                raise ValueError("Only the ep ExtraParallel axis supports selective CPU offload")
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "

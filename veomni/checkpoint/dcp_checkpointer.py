@@ -138,8 +138,7 @@ def _apply_extra_parallel_dim(
 
     * ``"exact"`` (model): the state-dict key IS the FQN,
       e.g. ``"model.layers.0.mlp.experts.gate_proj"``.
-    * ``"substring"`` (optimizer): the state-dict key contains the FQN
-      with extra prefix/suffix, e.g.
+    * ``"substring"`` (optimizer): the key starts with ``state.<FQN>.``, e.g.
       ``"state.model.layers.0.mlp.experts.gate_proj.exp_avg"``.
 
     Non-tensor values and 0-D tensors are skipped unconditionally — they
@@ -156,12 +155,18 @@ def _apply_extra_parallel_dim(
     extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys()) if key_match == "substring" else None
 
     for name in sorted(state_dict.keys()):
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor) or tensor.ndim == 0:
+            continue
+
         if key_match == "exact":
             if name not in extra_parallel_fqn2spec_info:
                 continue
             spec_info = extra_parallel_fqn2spec_info[name]
         else:  # "substring"
-            matches = [k for k in extra_parallel_keys if k in name]
+            # Anchor the optimizer namespace: a nested parameter may end with
+            # another parameter's FQN. Param-group fields are not tensor state.
+            matches = [k for k in extra_parallel_keys if name.startswith(f"state.{k}.")]
             if not matches:
                 continue
             assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
@@ -175,12 +180,6 @@ def _apply_extra_parallel_dim(
         # ``(ple_fsdp, ple)``). They are not managed by FSDP2, so there is no
         # temporary ExtraParallel dimension to drop or restore around DCP.
         if getattr(spec_info, "persistent_fsdp_shard_dim", None) is not None:
-            continue
-
-        tensor = state_dict[name]
-        if not torch.is_tensor(tensor):
-            continue
-        if tensor.ndim == 0:
             continue
 
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
@@ -374,6 +373,35 @@ class OptimizerState(Stateful):
         )
 
 
+def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
+    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
+
+    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
+    A metadata-only construction computes the same global shape/stride/spec;
+    attaching the actual local shard then preserves CPU storage and the original
+    mesh identity. DTensor's spec constructor is intentionally isolated here.
+    No collectives or accelerator allocations are needed (run_check=False).
+    """
+    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
+        metadata = DTensor.from_local(
+            local_tensor.to("meta"),
+            device_mesh=device_mesh,
+            placements=placements,
+            run_check=False,
+            shape=shape,
+            stride=stride,
+        )
+        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
+    return DTensor.from_local(
+        local_tensor,
+        device_mesh=device_mesh,
+        placements=placements,
+        run_check=False,
+        shape=shape,
+        stride=stride,
+    )
+
+
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
@@ -395,11 +423,11 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
@@ -457,10 +485,12 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        dtensor = _from_local_preserve_device(
+            orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)]
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 

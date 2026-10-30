@@ -442,6 +442,8 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
+                cpu_offload_extra_parallel_names=[],
+                cpu_offload_exclude_module_patterns=[],
                 max_load_broadcast_size=20.0,
             ),
             torch_compile=SimpleNamespace(

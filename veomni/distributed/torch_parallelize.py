@@ -656,6 +656,21 @@ def parallelize_model_fsdp2(
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
     offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
+    cpu_offload_axes = kwargs.pop("cpu_offload_extra_parallel_names", [])
+    resident_patterns = kwargs.pop("cpu_offload_exclude_module_patterns", [])
+    if resident_patterns and not cpu_offload_axes:
+        raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+    matched_resident_patterns = set()
+    resident_module_fqns = []
+    module_fqns = {id(module): name for name, module in model.named_modules()} if resident_patterns else {}
+    if cpu_offload_axes:
+        if cpu_offload_axes != ["ep"] or enable_fsdp_cpu_offload:
+            raise ValueError("Selective CPU offload supports ep only, without global CPU offload")
+        if not parallel_state.extra_parallel_enabled("ep"):
+            raise ValueError("Selective expert CPU offload requires expert parallelism")
+        if compile_config.enable:
+            raise ValueError("Selective expert CPU offload is not qualified with torch.compile")
+    cpu_offloaded_modules = []
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         if persistent_extra_parallel_params:
@@ -705,6 +720,10 @@ def parallelize_model_fsdp2(
             para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
+            if para in cpu_offload_axes:
+                if para_fsdp_mesh.size() != 1:
+                    raise ValueError("Selective expert CPU offload currently requires ep_fsdp_size=1")
+                para_fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding. A para this model's plan does not
@@ -791,7 +810,20 @@ def parallelize_model_fsdp2(
                     # decoder/root FSDP group through the normal bottom-up walk.
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
+                para_kwargs = extra_parallel_fsdp_kwargs[para]
+                resident_matches = (
+                    [pattern for pattern in resident_patterns if check_fqn_match(pattern, module_fqns[id(_para_mod)])]
+                    if para in cpu_offload_axes
+                    else []
+                )
+                if resident_matches:
+                    para_kwargs = dict(para_kwargs)
+                    para_kwargs.pop("offload_policy")
+                    matched_resident_patterns.update(resident_matches)
+                    resident_module_fqns.append(module_fqns[id(_para_mod)])
+                fully_shard(_para_mod, **para_kwargs)
+                if para in cpu_offload_axes and not resident_matches:
+                    cpu_offloaded_modules.append(_para_mod)
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -833,6 +865,12 @@ def parallelize_model_fsdp2(
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+
+    unmatched_resident_patterns = set(resident_patterns) - matched_resident_patterns
+    if unmatched_resident_patterns:
+        raise ValueError(
+            f"Resident patterns did not match selected CPU-offload modules: {sorted(unmatched_resident_patterns)}"
+        )
 
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
     # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
@@ -907,7 +945,16 @@ def parallelize_model_fsdp2(
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
 
-    if materialize_device == "cpu":
+    # FSDP stages the selected expert shards and their reduced gradients on CPU.
+    # Move them before optimizer construction so its parameter references agree.
+    for module in cpu_offloaded_modules:
+        module.cpu()
+        for parameter in module.parameters():
+            parameter._veomni_optimizer_compute_device = get_device_type()
+    model._cpu_offloaded_extra_parallel_names = tuple(cpu_offload_axes)
+    model._cpu_offload_resident_module_fqns = tuple(sorted(resident_module_fqns))
+
+    if materialize_device == "cpu" or cpu_offloaded_modules:
         _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2

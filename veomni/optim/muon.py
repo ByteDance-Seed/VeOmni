@@ -879,6 +879,8 @@ class DistributedMuon(Optimizer):
         if head_blocks < 1:
             raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
         for p in group["params"]:
+            if getattr(p, "_veomni_optimizer_compute_device", None) is not None:
+                raise ValueError("DistributedMuon does not support selectively CPU-offloaded parameters")
             if not _is_muon_eligible_ndim(p):
                 raise ValueError(
                     "DistributedMuon supports only 2D and 3D parameters; "
