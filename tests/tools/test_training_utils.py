@@ -184,6 +184,7 @@ def test_make_eager_ops_config_covers_every_kernel_field():
     from veomni.arguments import OpsImplementationConfig
 
     selection = training_utils.make_eager_ops_config()
+    non_kernel_defaults = {"qat_implementation": "none", "qat_target_modules": None}
     for field in fields(OpsImplementationConfig):
-        expected = "none" if field.name == "qat_implementation" else "eager"
+        expected = non_kernel_defaults.get(field.name, "eager")
         assert getattr(selection, field.name) == expected, field.name
