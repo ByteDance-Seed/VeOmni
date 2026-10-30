@@ -30,6 +30,7 @@ from .requirement import (
     KernelRequirement,
     MluKernelRequirement,
     NpuKernelRequirement,
+    XpuKernelRequirement,
 )
 
 
@@ -47,4 +48,5 @@ __all__ = [
     "NvidiaGpuPlatform",
     "ROCM_GPU",
     "RocmGpuPlatform",
+    "XpuKernelRequirement",
 ]

@@ -98,6 +98,23 @@ _original_load_and_register_attn_kernel: Callable | None = None
 _veomni_hub_kernel_loader_patch_applied = False
 
 
+_HUB_FLASH_KERNEL_DEFAULT_VERSION = 1
+
+
+def _hub_flash_kernel_version(repository: str) -> int:
+    """Major Hub version of ``repository`` to load.
+
+    Follows Transformers' own routing for Hub attention kernels, so the requested artifact is the
+    one that matches the installed torch and device builds. Falls back to version 1 when the
+    installed Transformers does not expose the resolver.
+    """
+    try:
+        from transformers.integrations.hub_kernels import get_attn_kernel_version
+    except ImportError:
+        return _HUB_FLASH_KERNEL_DEFAULT_VERSION
+    return get_attn_kernel_version(repository)
+
+
 @lru_cache(maxsize=None)
 def _load_hub_flash_kernel(repository: str):
     """Load a pinned Hub FlashAttention artifact through ``kernels``."""
@@ -106,7 +123,7 @@ def _load_hub_flash_kernel(repository: str):
     except ImportError as e:
         raise ImportError("VeOmni Hub FlashAttention implementations require `kernels` to be installed.") from e
 
-    return get_kernel(repository, version=1)
+    return get_kernel(repository, version=_hub_flash_kernel_version(repository))
 
 
 def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace | object:

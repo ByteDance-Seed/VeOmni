@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
 
-from ...utils.device import IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+from ...utils.device import IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, IS_XPU_AVAILABLE
 from .gpu import NVIDIA_GPU, ROCM_GPU, GpuPlatform
 
 
@@ -86,6 +86,23 @@ class NpuKernelRequirement:
         if self.matches():
             return
         raise RuntimeError("NpuKernelRequirement is not satisfied (torch_npu device is unavailable)")
+
+
+@dataclass(frozen=True)
+class XpuKernelRequirement:
+    """torch.xpu device is available (Intel GPUs)."""
+
+    device: ClassVar[str] = "xpu"
+
+    def matches(self) -> bool:
+        """Return whether a torch.xpu device is available."""
+        return IS_XPU_AVAILABLE
+
+    def check(self) -> None:
+        """Raise if a torch.xpu device is not available."""
+        if self.matches():
+            return
+        raise RuntimeError("XpuKernelRequirement is not satisfied (torch.xpu device is unavailable)")
 
 
 @dataclass(frozen=True)

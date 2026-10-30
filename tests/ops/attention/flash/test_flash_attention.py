@@ -581,8 +581,10 @@ def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
         ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
     ],
 )
-def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementation, repository):
+def test_hub_flash_loader_requests_the_transformers_selected_version(monkeypatch, implementation, repository):
     import sys
+
+    import transformers.integrations.hub_kernels as hub_kernels
 
     from veomni.ops import install as install_backend
 
@@ -594,14 +596,24 @@ def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementati
         return kernel
 
     monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: 7 if repo == repository else -1)
     install_backend._load_hub_flash_kernel.cache_clear()
     try:
         loaded = install_backend._load_veomni_local_flash_kernel(implementation)
         assert loaded is kernel
         assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
-        assert calls == [(repository, 1)]
+        assert calls == [(repository, 7)]
     finally:
         install_backend._load_hub_flash_kernel.cache_clear()
+
+
+def test_hub_flash_kernel_version_defaults_to_one_without_the_transformers_resolver(monkeypatch):
+    import transformers.integrations.hub_kernels as hub_kernels
+
+    from veomni.ops import install as install_backend
+
+    monkeypatch.delattr(hub_kernels, "get_attn_kernel_version")
+    assert install_backend._hub_flash_kernel_version("kernels-community/flash-attn2") == 1
 
 
 def test_hub_flash_loader_reports_missing_kernels_dependency(monkeypatch):

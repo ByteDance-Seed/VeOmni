@@ -36,6 +36,7 @@ from ...platform import (
     MluKernelRequirement,
     NpuKernelRequirement,
     NvidiaGpuPlatform,
+    XpuKernelRequirement,
 )
 from ...registry import register_op
 from .helper import (
@@ -167,6 +168,7 @@ _FA2_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
 )
 _FA2_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS,)), ("kernels",)),
+    (XpuKernelRequirement(), ("kernels",)),
 )
 _FA3_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn_interface",)),
