@@ -66,6 +66,10 @@ dataset, then run on at least two CUDA devices:
 bash train.sh tasks/train_text.py configs/text/qwen3_mxfp4_qat.yaml
 ```
 
+By default, `train.sh` uses all visible GPUs. The example sets `global_batch_size: null`
+to derive it as `micro_batch_size × data_parallel_size`, with one microbatch per step.
+With `micro_batch_size: 1`, four and eight GPUs use global batches of four and eight.
+
 The example's learning rate and duration are starting settings, not a validated convergence recipe.
 
 ## Construction and checkpoints

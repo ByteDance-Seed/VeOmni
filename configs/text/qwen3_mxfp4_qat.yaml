@@ -39,7 +39,7 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
-  global_batch_size: 2
+  global_batch_size: null
   micro_batch_size: 1
   num_train_epochs: 1
   checkpoint:
