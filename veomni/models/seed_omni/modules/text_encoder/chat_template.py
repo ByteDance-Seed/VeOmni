@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from ...utils.conversation import ConversationItem, ItemRole, ItemType, ItemValue
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, ItemRole, ItemType, ItemValue
 
 
 @dataclass(frozen=True)
@@ -117,6 +117,7 @@ class TextEncoderChatTemplate:
                 part.value = torch.tensor(input_ids, dtype=torch.long)
                 part.meta["labels"] = torch.tensor(labels, dtype=torch.long)
                 part.meta["attention_mask"] = torch.ones(len(input_ids), dtype=torch.long)
+                part.meta[_OMNI_TOKEN_LEN] = len(input_ids)
 
     @staticmethod
     def merge_text_embeds(parts: list[ConversationItem]) -> list[ConversationItem]:
@@ -135,6 +136,7 @@ class TextEncoderChatTemplate:
                 prev.value = torch.cat([prev.value, part.value])
                 prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
                 prev.meta["attention_mask"] = torch.cat([prev.meta["attention_mask"], part.meta["attention_mask"]])
+                prev.meta[_OMNI_TOKEN_LEN] = int(prev.value.numel())
                 continue
             merged.append(part)
         return merged

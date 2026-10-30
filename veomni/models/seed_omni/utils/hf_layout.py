@@ -537,11 +537,15 @@ def convert_with_hf_layout(
     *,
     training_graph: str | None = None,
     generation_graph: str | None = None,
+    attn_implementation: str | None = None,
 ) -> dict[str, Any]:
     """Offline split through the family's :class:`OmniHFLayout` — the same key map the runtime load uses.
 
     Returns the kwargs :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
     writes out. Modules load on CPU in the checkpoint's own ``dtype``.
+    ``attn_implementation`` is forwarded to every module build, so an explicit
+    selection is recorded in the exported config; unset keeps the config
+    default, and a backend this host cannot run fails at build time.
     """
     from ..modules import OMNI_MODEL_REGISTRY
     from .convert_registry import attach_module_assets
@@ -560,7 +564,13 @@ def convert_with_hf_layout(
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
         module = load_module_from_hf_source(
-            module_cls, module_config, source, name, device_map="cpu", torch_dtype=dtype
+            module_cls,
+            module_config,
+            source,
+            name,
+            device_map="cpu",
+            torch_dtype=dtype,
+            attn_implementation=attn_implementation,
         )
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(

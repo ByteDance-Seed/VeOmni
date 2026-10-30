@@ -1,0 +1,7 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+qwen3_llm:
+  model_path: qwen3_llm

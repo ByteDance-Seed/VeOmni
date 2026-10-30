@@ -323,7 +323,7 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L624),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L631),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot

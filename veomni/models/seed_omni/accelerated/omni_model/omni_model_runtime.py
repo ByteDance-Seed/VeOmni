@@ -467,11 +467,13 @@ class OmniModelRuntime:
         model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        max_steps = max_new_tokens
         total_steps = 0
 
-        while not model.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not model.generation_graph.is_done() and total_steps < max_steps:
             model._emit_progress(total_steps)
             state_name = model.generation_graph.current_state_name
+            emitted_before = len(model._generated)
             for node in model.generation_graph.iter_nodes(ctx):
                 execute_generation_node(
                     modules,
@@ -489,6 +491,10 @@ class OmniModelRuntime:
             fired = model.generation_graph.maybe_transition(ctx)
             if fired is not None and profiler is not None:
                 profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
+            if total_steps == 1 and len(model._generated) == emitted_before:
+                # Pass 1 emitted nothing: it was prompt prefill, so it must not
+                # consume the token budget.
+                max_steps += 1
 
         model._emit_progress(total_steps)
 
