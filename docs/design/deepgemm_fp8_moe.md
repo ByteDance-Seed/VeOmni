@@ -113,7 +113,14 @@ weight container and offloads ordinary saved activations as usual. FSDP owns
 the weight payload/scale storage and restores it before backward; activation
 offload must not copy that container to CPU or count it against its GPU budget.
 
-Initial constraints:
+`fp8_all_gather: true` applies only to modules whose actual `veomni_moe.impl`
+is `deepgemm_fp8`. If none match, the flag is silently ignored, for standalone
+models, composed models and individual children alike. FP8-specific policy
+checks run only after this selection, so a dense child can inherit the flag
+while using DDP, FP16, CPU offload or compilation under its usual backend
+rules. The flag itself must always be a boolean.
+
+Constraints for selected experts:
 
 - Two merged expert weights `[E,2*I,H]` and `[E,H,I]`, selected by the actual
   module's `veomni_moe.impl == "deepgemm_fp8"` handle.

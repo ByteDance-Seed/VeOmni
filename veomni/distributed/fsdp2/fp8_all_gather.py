@@ -53,20 +53,43 @@ class _ExpertAllGather:
         return weight, (scale,)
 
 
-def register_deepgemm_fp8_all_gather(model: torch.nn.Module, *, allow_empty: bool = False) -> int:
+def _deepgemm_experts(model):
+    return (
+        (name, module)
+        for name, module in model.named_modules()
+        if getattr(getattr(module, "veomni_moe", None), "impl", None) == "deepgemm_fp8"
+    )
+
+
+def resolve_fp8_all_gather(model, enabled, mixed_precision, *, fsdp_mode="fsdp2", offload=False):
+    """Ignore the inherited policy without matching experts; validate it otherwise."""
+    if not isinstance(enabled, bool):
+        raise ValueError("fp8_all_gather must be a boolean.")
+    if not enabled or next(_deepgemm_experts(model), None) is None:
+        return False
+    if (
+        fsdp_mode != "fsdp2"
+        or offload
+        or mixed_precision is None
+        or not mixed_precision.enable
+        or mixed_precision.param_dtype != "bfloat16"
+    ):
+        raise ValueError("fp8_all_gather requires FSDP2, BF16 mixed precision and no CPU offload.")
+    return True
+
+
+def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
     """Install hooks after FSDP wrapping/materialization and before first forward.
 
     Select only modules whose instance-local moe_experts handle uses DeepGEMM.
     Master shards remain ordinary tensors. Complete 128x128 blocks must fit
     inside each shard; uneven and block-splitting layouts fail before training.
     This integration targets the pinned Torch 2.11 eager FSDP extension API.
-    ``allow_empty`` is for composed-model children inheriting a global policy;
-    it does not relax validation of any selected expert parameter.
+    Models without matching experts register no hooks. Selected experts must
+    satisfy all shape, device and FSDP checks regardless of model scope.
     """
     selected = {}
-    for name, module in model.named_modules():
-        if getattr(getattr(module, "veomni_moe", None), "impl", None) != "deepgemm_fp8":
-            continue
+    for name, module in _deepgemm_experts(model):
         if not getattr(module, "use_swiglu_mlp", True):
             raise ValueError(f"FP8 all-gather requires the SwiGLU DeepGEMM execution path: {name}.")
         params = list(module.named_parameters(recurse=False))
@@ -75,9 +98,7 @@ def register_deepgemm_fp8_all_gather(model: torch.nn.Module, *, allow_empty: boo
         for param_name, param in params:
             selected[id(param)] = f"{name}.{param_name}"
     if not selected:
-        if allow_empty:
-            return 0
-        raise ValueError("FP8 all-gather requires routed experts using moe_implementation='deepgemm_fp8'.")
+        return 0
     pending = []
     for module in model.modules():
         if not isinstance(module, FSDPModule):

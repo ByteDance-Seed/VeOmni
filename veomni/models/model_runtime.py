@@ -398,14 +398,12 @@ class VeOmniModelRuntime:
             compile_enabled=self.args.accelerator.torch_compile.enable,
         )
 
-    def _build_parallelized_model(self, *, module_scope: bool = False) -> None:
+    def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
         The wrap preserves ``requires_grad`` (the shard inherits it) and the
         loader writes weights in place, so a freeze applied in
         :meth:`_freeze_model_module` survives and is not re-asserted here.
-        ``module_scope`` lets composed-model children inherit expert transport
-        settings even when this child has no matching routed experts.
         """
         args = self.args
         if args.accelerator.fsdp_config.fsdp_mode == "eager":
@@ -484,7 +482,6 @@ class VeOmniModelRuntime:
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             fp8_all_gather=args.accelerator.fsdp_config.fp8_all_gather,
-            module_scope=module_scope,
             expert_fsdp_shard_dim=args.accelerator.fsdp_config.expert_fsdp_shard_dim,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,

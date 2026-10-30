@@ -338,6 +338,10 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 `build_parallelize_model` into `parallelize_model_fsdp2`. After materialization,
 `distributed/fsdp2/fp8_all_gather.py` attaches native FSDP pre/post all-gather
 hooks to expert parameters selected by their actual DeepGEMM op handle.
+Before wrapping, the builders resolve the flag against those same handles:
+no matches means no FP8 hooks or FP8-specific compatibility checks, for all
+model scopes. Selected experts still require BF16 FSDP2 without CPU offload
+or compilation. Config parsing always validates the flag's boolean type.
 The pre-hook quantizes local shards and separately gathers compact scales;
 native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
 `GroupedLinear`, preserving BF16-facing autograd and high precision master

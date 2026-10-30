@@ -30,7 +30,6 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import (
     validate_expert_fsdp_shard_dim,
-    validate_fp8_all_gather,
     validate_low_precision_reduce_scatter_comm,
 )
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
@@ -430,7 +429,6 @@ def parallelize_model_fsdp2(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
-    module_scope: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -458,7 +456,12 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
-    validate_fp8_all_gather(fp8_all_gather, mixed_precision, offload=bool(kwargs.get("enable_fsdp_offload", False)))
+    if fp8_all_gather is not False:
+        from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
+
+        fp8_all_gather = resolve_fp8_all_gather(
+            model, fp8_all_gather, mixed_precision, offload=bool(kwargs.get("enable_fsdp_offload", False))
+        )
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim)
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
@@ -914,7 +917,7 @@ def parallelize_model_fsdp2(
     if fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
-        count = register_deepgemm_fp8_all_gather(model, allow_empty=module_scope)
+        count = register_deepgemm_fp8_all_gather(model)
         logger.info_rank0(f"Enabled DeepGEMM FP8 all-gather for {count} expert parameters.")
 
     if materialize_device == "cpu":
@@ -1028,7 +1031,6 @@ def build_parallelize_model(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
-    module_scope: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1043,17 +1045,21 @@ def build_parallelize_model(
             EP-local dim is divisible by ``ep_fsdp_size``.
         recompute_policy: Per-block recomputation strategy, bound after HF has
             enabled gradient checkpointing and before FSDP2 shards the blocks.
-        module_scope: Allow a composed-model child with no DeepGEMM experts to
-            inherit the global FP8 all-gather policy without registering hooks.
+        fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
+            Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
-    validate_fp8_all_gather(
-        fp8_all_gather,
-        mixed_precision,
-        fsdp_mode=parallel_state.dp_mode,
-        offload=bool(kwargs.get("enable_fsdp_offload", False)),
-    )
+    if fp8_all_gather is not False:
+        from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
+
+        fp8_all_gather = resolve_fp8_all_gather(
+            model,
+            fp8_all_gather,
+            mixed_precision,
+            fsdp_mode=parallel_state.dp_mode,
+            offload=bool(kwargs.get("enable_fsdp_offload", False)),
+        )
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
@@ -1128,7 +1134,6 @@ def build_parallelize_model(
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
-                module_scope=module_scope,
                 **kwargs,
             )
         else:
