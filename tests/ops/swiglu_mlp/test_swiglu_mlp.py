@@ -37,6 +37,7 @@ from tests.ops.tol import (
     SWIGLU_FUSED_RTOL,
 )
 from veomni.ops import resolve_op
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.kernels.swiglu_mlp.geglu import liger_kernel as geglu_liger
 from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
@@ -80,6 +81,18 @@ def _copy_linear(src: nn.Linear) -> nn.Linear:
     dst = nn.Linear(src.in_features, src.out_features, bias=src.bias is not None)
     dst.load_state_dict(src.state_dict())
     return dst
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_linear_subclasses_keep_their_projection_forward():
+    class OffsetLinear(nn.Linear):
+        def forward(self, inputs):
+            return super().forward(inputs) + 1
+
+    mlp = _tiny_qwen3_mlp()
+    assert has_plain_linear_projections(mlp)
+    mlp.up_proj = OffsetLinear(64, 128, bias=False)
+    assert not has_plain_linear_projections(mlp)
 
 
 def test_eager_matches_hf():

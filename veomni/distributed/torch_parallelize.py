@@ -33,6 +33,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .float8 import convert_float8_linears, validate_float8_training
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -465,6 +466,15 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+
+    validate_float8_training(
+        mixed_precision,
+        parallel_state,
+        cpu_offload=kwargs.get("enable_fsdp_offload", False),
+        compile_enabled=bool(compile_config and compile_config.enable),
+        is_peft_model=kwargs.get("is_peft_model", False),
+    )
+    convert_float8_linears(model, mixed_precision.float8)
 
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
@@ -1032,6 +1042,13 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+    validate_float8_training(
+        mixed_precision,
+        parallel_state,
+        cpu_offload=kwargs.get("enable_fsdp_offload", False),
+        compile_enabled=bool(compile_config and compile_config.enable),
+        is_peft_model=kwargs.get("is_peft_model", False),
+    )
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
