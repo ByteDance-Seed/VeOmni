@@ -210,9 +210,14 @@ class CPUOffloadAdamW(FullFP32AdamW):
                     if staging is not None:
                         staging.copy_(effective)
                         w[section].copy_(staging, non_blocking=True)
-                        self._synchronize(w.device)
                     else:
                         w[section].copy_(effective)
+                if offload and w.device.type != "cpu":
+                    # H2D and the next chunk's D2H use this device's current
+                    # stream. Its D2H synchronization completes the prior H2D
+                    # before the CPU reuses staging. Drain the final H2D here
+                    # before a later parameter can replace the pinned buffer.
+                    self._synchronize(w.device)
         for device in sorted(devices, key=str):
             self._synchronize(device)
         return loss
