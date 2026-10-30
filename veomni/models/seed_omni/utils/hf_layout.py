@@ -54,7 +54,6 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from ....utils import helper
-from ....utils.device import get_device_type
 from ....utils.registry import Registry
 from ...checkpoint.convert import (
     ConvertedCheckpointTensor,
@@ -543,9 +542,10 @@ def convert_with_hf_layout(
 
     Returns the kwargs :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
     writes out. Modules load on CPU in the checkpoint's own ``dtype``, built
-    under the config's attention backend on an accelerator and ``eager``
-    elsewhere (the convert never runs a forward).
+    under the config's attention selection when this host can run it and eager
+    otherwise; that build-time fallback never reaches the saved config.
     """
+    from ....ops import OP_REGISTRY
     from ..modules import OMNI_MODEL_REGISTRY
     from .convert_registry import attach_module_assets
 
@@ -559,13 +559,14 @@ def convert_with_hf_layout(
     module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
-    # The convert only copies weights, so build under a backend this host can
-    # run: accelerators keep the config's default, hosts without flash-attn
-    # (CPU) fall back to eager.
-    build_attn_implementation = None if get_device_type() in ("cuda", "npu") else "eager"
+    # The convert only copies weights, so a host that cannot run a module's own
+    # attention selection builds it under eager instead of failing on the kernel.
+    available_attention = OP_REGISTRY.list_available("attention", "standard")
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
+        has_explicit_attn = "attn_implementation" in module_config.ops_implementation
+        use_eager = not has_explicit_attn and module_config.ops_config.attn_implementation not in available_attention
         module = load_module_from_hf_source(
             module_cls,
             module_config,
@@ -573,8 +574,12 @@ def convert_with_hf_layout(
             name,
             device_map="cpu",
             torch_dtype=dtype,
-            attn_implementation=build_attn_implementation,
+            attn_implementation="eager" if use_eager else None,
         )
+        if use_eager:
+            # Keep the exported config sparse: a build-time fallback must not
+            # outrank the runtime ops selection.
+            module.config._attn_implementation = None
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
         training_graph=training_graph, generation_graph=generation_graph
