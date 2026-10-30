@@ -913,16 +913,20 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     if attention != "sdpa" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
 
-    from tests.models.test_minimax_h3_packing import cfg_condition, cfg_raw, condition_model, raw_sample, tiny_model
+    from tests.models.test_minimax_h3_packing import (
+        attention_model,
+        cfg_condition,
+        cfg_raw,
+        condition_model,
+        raw_sample,
+    )
     from veomni.trainer.dit_trainer import DiTDataCollator
 
     fused = attention != "sdpa"
     dtype = torch.bfloat16 if fused else torch.float32
     device = get_device_type()
     torch.manual_seed(0)
-    config = tiny_model().config
-    config._attn_implementation = attention
-    model = type(tiny_model())(config).to(device=device, dtype=dtype)
+    model = attention_model(attention).to(device=device, dtype=dtype)
     # Recompute the blocks through the run's own entry point, so the replayed forward is under test too.
     model.gradient_checkpointing_enable({"use_reentrant": False})
     make_sample = cfg_raw if cfg_mode == "per_sample" else raw_sample

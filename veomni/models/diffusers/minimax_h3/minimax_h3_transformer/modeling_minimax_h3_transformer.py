@@ -12,17 +12,21 @@ because VeOmni's DiTTrainer does not pop/process training targets externally.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from .....utils import logging
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.core import bind_minimax_attention
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3DiT, unpack_audio, unpatchify_video
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
+
+
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -31,28 +35,6 @@ class MiniMaxH3DiTOutput(ModelOutput):
 
     loss: dict | None = None
     predictions: list | None = None
-
-
-_PACKED_FLASH_BACKENDS = (
-    "veomni_flash_attention_2",
-    "veomni_flash_attention_2_hub",
-    "veomni_flash_attention_3",
-    "veomni_flash_attention_3_hub",
-    "flash_attention_2",
-    "flash_attention_2_hub",
-    "flash_attention_3",
-    "flash_attention_3_hub",
-)
-
-
-def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
-    if attn_implementation in (None, "eager", "sdpa", "veomni_sdpa"):
-        return None
-    if attn_implementation.startswith("flash_attention_"):
-        return f"veomni_{attn_implementation}"
-    if attn_implementation.startswith("veomni_flash_attention_"):
-        return attn_implementation
-    return None
 
 
 class MiniMaxH3DiTModel(PreTrainedModel):
@@ -89,28 +71,13 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             final_norm_eps=config.final_norm_eps,
         )
 
-        self._configure_packed_attention(config._attn_implementation)
-
-    def _configure_packed_attention(self, attn_implementation):
-        """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
-        cannot construct ``veomni_flash_attention_4``, so a flash name is
-        validated and bound on the first forward.
-        """
-        self._packed_attn_implementation = attn_implementation
-
-    def _load_packed_attention_kernel(self):
-        implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
-            return
-        impl = _veomni_attn_impl(implementation)
-        if impl is None or implementation not in _PACKED_FLASH_BACKENDS:
-            raise ValueError(f"Unsupported H3 packing backend: {implementation}")
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                bind_minimax_attention(module, is_causal=False, impl=impl)
+        if os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION"):
+            logger.warning_once(
+                "MINIMAX_H3_ATTENTION_IMPLEMENTATION no longer selects the H3 DiT attention; "
+                "use model.ops_implementation.attn_implementation."
+            )
 
     def _forward_batch(self, samples):
-        self._load_packed_attention_kernel()
         negatives = [sample.get("unconditional_inputs") for sample in samples]
         negative_predictions = [None] * len(samples)
         if any(negative is not None for negative in negatives):
@@ -217,8 +184,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             with torch.no_grad():
                 negative_predictions = self.forward(**negative_inputs).predictions
 
-        if self._packed_attn_implementation in _PACKED_FLASH_BACKENDS:
-            self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
             x=x,
