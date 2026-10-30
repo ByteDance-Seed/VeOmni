@@ -15,6 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -22,6 +25,7 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    _get_fqns,
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
@@ -31,7 +35,11 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.dist_utils import raise_if_any_rank_failed, require_same_rank_value
+from .cpu_offload_adamw import CPUOffloadAdamW, resolve_moment_dtype, select_cpu_offload_groups
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW, _align_state_to_parameter
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+from .qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
 
 
 if TYPE_CHECKING:
@@ -152,6 +160,8 @@ def filter_empty_param_groups(
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
+    requires_exact_state_dtypes = True
+
     def __init__(
         self,
         params,
@@ -175,6 +185,128 @@ class AnyPrecisionAdamW(Optimizer):
             "compensation_buffer_dtype": compensation_buffer_dtype,
         }
         super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        defaults = state.get("defaults", getattr(self, "defaults", {}))
+        had_differentiable = "differentiable" in defaults
+        super().__setstate__(state)
+        if not had_differentiable:
+            self.defaults.pop("differentiable", None)
+
+    def checkpoint_state_fields(self, param):
+        groups = getattr(self, "_checkpoint_param_groups", None)
+        if groups is None or param not in groups:
+            groups = {item: group for group in self.param_groups for item in group["params"]}
+            self._checkpoint_param_groups = groups
+        if param not in groups:
+            raise RuntimeError("Optimizer parameter is missing from its groups")
+        fields = ["step", "exp_avg", "exp_avg_sq"]
+        if groups[param]["use_kahan_summation"]:
+            fields.append("compensation")
+        return fields
+
+    @contextmanager
+    def checkpoint_state(self, *, load=False):
+        """Construct local targets without synthetic gradients or an optimizer step."""
+        added = []
+        try:
+            if load:
+                for group in self.param_groups:
+                    for param in group["params"]:
+                        if not param.requires_grad:
+                            continue
+                        state = self.state.get(param)
+                        if state:
+                            expected = set(self.checkpoint_state_fields(param))
+                            if expected != set(state):
+                                raise RuntimeError("Incomplete AnyPrecisionAdamW checkpoint target state")
+                            dtypes = {"exp_avg": group["momentum_dtype"], "exp_avg_sq": group["variance_dtype"]}
+                            if group["use_kahan_summation"]:
+                                dtypes["compensation"] = group["compensation_buffer_dtype"]
+                            for name, dtype in dtypes.items():
+                                value = state[name]
+                                if not torch.is_tensor(value) or value.dtype != dtype or value.shape != param.shape:
+                                    raise RuntimeError(
+                                        f"AnyPrecisionAdamW checkpoint target {name} dtype/shape differs from its policy"
+                                    )
+                            continue
+                        state = {
+                            "step": torch.tensor(0.0),
+                            "exp_avg": torch.zeros_like(param, dtype=group["momentum_dtype"]),
+                            "exp_avg_sq": torch.zeros_like(param, dtype=group["variance_dtype"]),
+                        }
+                        if group["use_kahan_summation"]:
+                            state["compensation"] = torch.zeros_like(param, dtype=group["compensation_buffer_dtype"])
+                        self.state[param] = state
+                        added.append(param)
+            yield
+        except BaseException:
+            for param in added:
+                self.state.pop(param, None)
+            raise
+
+    def load_state_dict(self, state_dict):
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+        if any(group.get("differentiable", False) is not False for group in state_dict["param_groups"]):
+            raise RuntimeError("Differentiable optimizer checkpoints are not supported by this no-grad optimizer")
+        groups = self.param_groups
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        if any(
+            len(saved["params"]) != len(group["params"]) for saved, group in zip(saved_groups, groups, strict=True)
+        ):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the optimizer group size"
+            )
+        for saved, group in zip(saved_groups, groups, strict=True):
+            for key in ("momentum_dtype", "variance_dtype", "compensation_buffer_dtype", "use_kahan_summation"):
+                if saved.get(key) != group[key]:
+                    raise RuntimeError(
+                        f"AnyPrecisionAdamW checkpoint precision policy differs: {key}; migrate explicitly"
+                    )
+        restored = defaultdict(dict)
+        assigned = set()
+        for saved_group, group in zip(saved_groups, groups, strict=True):
+            for key, param in zip(saved_group["params"], group["params"], strict=True):
+                assigned.add(key)
+                saved = state_dict["state"].get(key, {})
+                if saved:
+                    expected = {"step", "exp_avg", "exp_avg_sq"}
+                    if saved_group["use_kahan_summation"]:
+                        expected.add("compensation")
+                    if set(saved) != expected:
+                        raise RuntimeError("AnyPrecisionAdamW checkpoint has incomplete or unsupported state")
+                    fields = {
+                        "exp_avg": saved_group["momentum_dtype"],
+                        "exp_avg_sq": saved_group["variance_dtype"],
+                    }
+                    if "compensation" in expected:
+                        fields["compensation"] = saved_group["compensation_buffer_dtype"]
+                    saved = dict(saved)
+                    for name, dtype in fields.items():
+                        tensor = _align_state_to_parameter(saved[name], param)
+                        if tensor.dtype != dtype or tensor.shape != param.shape:
+                            raise RuntimeError(f"AnyPrecisionAdamW checkpoint {name} dtype/shape mismatch")
+                        saved[name] = tensor.detach().to(device=param.device, dtype=dtype)
+                if key in state_dict["state"]:
+                    restored[param] = saved
+        for key, value in state_dict["state"].items():
+            if key not in assigned:
+                restored[key] = value
+        for saved_group, group in zip(saved_groups, groups, strict=True):
+            saved_group["params"] = group["params"]
+            if "param_names" in group and "param_names" not in saved_group:
+                saved_group["param_names"] = group["param_names"]
+        # Preserve configured moment dtypes rather than casting to param.dtype.
+        self.__setstate__({"state": restored, "param_groups": saved_groups})
+        self.__dict__.pop("_checkpoint_param_groups", None)
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -255,6 +387,69 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def _optimizer_group_values_equal(left, right):
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and torch.equal(left, right)
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _optimizer_group_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _optimizer_group_values_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
+def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
+    """Keep lazy optimizer state untouched while saving its parameter groups."""
+    if any(not group["params"] for group in optimizer.param_groups):
+        raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
+    prepare = getattr(optimizer, "checkpoint_state", None)
+    with prepare(load=for_load) if prepare is not None else nullcontext():
+        # PyTorch initializes a wholly empty optimizer by calling step(). A
+        # temporary empty entry makes its getter serialize parameter groups
+        # without performing that update or materializing optimizer state.
+        sentinel = None
+        placeholder = None
+        sentinel_hook = None
+        sentinel_hook_called = False
+        if not for_load and not optimizer.state:
+            sentinel = next((p for group in optimizer.param_groups for p in group["params"]), None)
+            if sentinel is not None:
+                placeholder = {}
+                optimizer.state[sentinel] = placeholder
+
+                def remove_sentinel(optim):
+                    nonlocal sentinel_hook_called
+                    sentinel_hook_called = True
+                    if optim.state.get(sentinel) is placeholder and not placeholder:
+                        optim.state.pop(sentinel, None)
+
+                # _init_optim_state runs before optimizer.state_dict(). Remove
+                # the sentinel before user hooks inspect the live state.
+                sentinel_hook = optimizer.register_state_dict_pre_hook(remove_sentinel, prepend=True)
+        try:
+            result = get_optimizer_state_dict(
+                model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+            )
+            if sentinel_hook is not None and not sentinel_hook_called:
+                raise RuntimeError("Optimizer state_dict did not run registered pre-hooks during checkpoint save")
+        finally:
+            if sentinel_hook is not None:
+                sentinel_hook.remove()
+            if sentinel is not None and optimizer.state.get(sentinel) is placeholder and not placeholder:
+                optimizer.state.pop(sentinel, None)
+        return result
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -284,14 +479,23 @@ class MultiOptimizer(Optimizer, Stateful):
         for opt in self.optimizers_dict.values():
             opt.zero_grad()
 
+    def _validate_checkpoint_param_groups(self):
+        for name in self.key_names:
+            optimizer = self.optimizers_dict[name]
+            if any(not group["params"] for group in optimizer.param_groups):
+                raise RuntimeError(f"MultiOptimizer checkpoint cannot represent an empty parameter group in {name!r}")
+
     def state_dict(
         self,
+        *,
+        for_load=True,
     ) -> Dict[str, Any]:
+        self._validate_checkpoint_param_groups()
         # get the flatten state dict for multi-optimizer
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, for_load=for_load, flatten=True)
             # check for key clashes before merging
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
@@ -309,18 +513,15 @@ class MultiOptimizer(Optimizer, Stateful):
     ) -> Dict[str, Any]:
         """Return a flattened optimizer state dict without materializing state.
 
-        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
-        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
-        call ``_init_optim_state`` and synthesize default state for every
-        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
-        this rank), bloating the checkpoint.
+        State is saved only where it exists, while nonempty parameter groups
+        remain available for exact resume. The flattened representation cannot
+        encode a group with no parameters.
         """
+        self._validate_checkpoint_param_groups()
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            if not opt.state:
-                continue
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, flatten=True)
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(
@@ -332,7 +533,61 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
+    def validate_checkpoint_groups(self, state_dict: Dict[str, Any]) -> None:
+        # PyTorch's unflattening takes each group's first parameter as its
+        # representative. If distinct saved groups were merged, silently using
+        # that first parameter's learning rate/recipe changes training.
+        saved_groups = {}
+        for key, value in state_dict.items():
+            if key.startswith("param_groups."):
+                name, separator, field = key.removeprefix("param_groups.").rpartition(".")
+                if separator:
+                    saved_groups.setdefault(name, {})[field] = value
+        if saved_groups:
+            names_by_id = {}
+            for runtime_name, parameter in self.model.named_parameters():
+                names_by_id.setdefault(id(parameter), set()).update(_get_fqns(self.model, runtime_name))
+            for optimizer in self.optimizers_dict.values():
+                for group in optimizer.param_groups:
+                    names = set()
+                    for parameter in group["params"]:
+                        if id(parameter) not in names_by_id:
+                            raise RuntimeError("Cannot identify an optimizer parameter during DCP group restore")
+                        names.update(names_by_id[id(parameter)])
+                    rows = [saved_groups[name] for name in sorted(names) if name in saved_groups]
+                    if rows and len(rows) != len(names):
+                        raise RuntimeError("DCP optimizer parameter group metadata is incomplete")
+                    for row in rows[1:]:
+                        if row.keys() != rows[0].keys() or any(
+                            not _optimizer_group_values_equal(row[key], rows[0][key]) for key in row
+                        ):
+                            raise RuntimeError(
+                                "DCP cannot merge optimizer parameter groups with different saved hyperparameters"
+                            )
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.validate_checkpoint_groups(state_dict)
+        # DCP's unflattening only reads keys already present on the target
+        # group. Restore this optional field on older checkpoints before the
+        # unflattening so a saved value is not silently dropped.
+        names_by_id = {}
+        for runtime_name, parameter in self.model.named_parameters():
+            names_by_id.setdefault(id(parameter), set()).update(_get_fqns(self.model, runtime_name))
+        for opt in self.optimizers_dict.values():
+            for group in opt.param_groups:
+                if "differentiable" in group:
+                    continue
+                fields = [
+                    state_dict[f"param_groups.{name}.differentiable"]
+                    for parameter in group["params"]
+                    for name in names_by_id.get(id(parameter), ())
+                    if f"param_groups.{name}.differentiable" in state_dict
+                ]
+                if fields:
+                    validator = getattr(opt, "_validate_saved_group_semantics", None)
+                    if validator is not None:
+                        validator({"param_groups": [{"differentiable": fields[0]}]})
+                    group["differentiable"] = fields[0]
         # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
         # pick out only the entries for parameters that belong to that optimizer.
         for name in self.key_names:
@@ -426,6 +681,31 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _file_profile_group_signature(model, param_groups):
+    """Describe the common logical work, excluding owner-specific mesh members."""
+    if not param_groups:
+        raise ValueError("File-backed optimizer has no parameter groups")
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    rows = []
+    for group in param_groups:
+        parameters = []
+        for parameter in group["params"]:
+            name = names.get(id(parameter))
+            if name is None:
+                raise ValueError("File-backed optimizer contains an unnamed parameter")
+            if isinstance(parameter, DTensor):
+                layout = (tuple(parameter.device_mesh.mesh_dim_names or ()), tuple(map(str, parameter.placements)))
+            else:
+                layout = None
+            parameters.append((name, tuple(parameter.shape), str(parameter.dtype), layout))
+        options = tuple(
+            (key, repr(group.get(key)))
+            for key in ("qwen38_plan", "qwen38_ple_lookup", "cpu_offload", "lr", "weight_decay", "betas", "eps")
+        )
+        rows.append((tuple(parameters), options))
+    return tuple(rows)
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -439,17 +719,24 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
+    cpu_offload_param_patterns: Optional[List[str]] = None,
+    cpu_offload_resident_moment_dtype: Optional[str] = None,
+    cpu_offload_cpu_moment_dtype: Optional[str] = None,
+    ple_profile_receipt=None,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    that optimizer-specific knobs (Muon and CPU-offload precision fields) are read
     here rather than unpacked by every trainer. It does *not* supply ``lr``,
     ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
     because callers such as the VLM trainer drive the AdamW side from their own
     param groups. ``muon_kwargs`` overrides the config key by key, for callers
     that build Muon without an ``OptimizerConfig`` at all.
     """
+    from .ple_world_profile import validate_build_config
+
+    validate_build_config(optimizer_type, optimizer_config, ple_profile_receipt)
     if optimizer_type == "muon":
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
@@ -472,14 +759,117 @@ def build_optimizer(
             muon_kwargs=muon_kwargs,
         )
 
-    if param_groups is not None:
-        param_groups = filter_empty_param_groups(param_groups)
-        if not param_groups:
-            raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
+    def prepare_groups():
+        nonlocal param_groups
+        if param_groups is not None:
+            param_groups = filter_empty_param_groups(param_groups)
+            if not param_groups:
+                raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
-    if _should_build_extra_parallel_aware(model):
+        cpu_offload_kwargs = {}
+        if optimizer_type in ("cpu_offload_adamw", "qwen38_muon"):
+            for key, override in (
+                ("resident_moment_dtype", cpu_offload_resident_moment_dtype),
+                ("cpu_moment_dtype", cpu_offload_cpu_moment_dtype),
+            ):
+                value = (
+                    override if override is not None else getattr(optimizer_config, f"cpu_offload_{key}", "float32")
+                )
+                cpu_offload_kwargs[key] = resolve_moment_dtype(value)
+            patterns = cpu_offload_param_patterns
+            if patterns is None and optimizer_config is not None:
+                patterns = optimizer_config.cpu_offload_param_patterns
+            if param_groups is None:
+                param_groups = _make_param_groups_for_subset(
+                    model, model.parameters(), weight_decay, no_decay_modules, no_decay_params
+                )
+            if optimizer_type == "qwen38_muon":
+                if ple_profile_receipt is not None:
+                    cpu_offload_kwargs["ple_world_receipt"] = ple_profile_receipt
+                scratch_dir = getattr(optimizer_config, "qwen38_ple_moments_scratch_dir", None)
+                if scratch_dir is not None:
+                    cpu_offload_kwargs["ple_moments_scratch_dir"] = scratch_dir
+                if getattr(optimizer_config, "qwen38_ple_moments_world_profile", False):
+                    cpu_offload_kwargs["ple_moments_world_profile"] = True
+                # VLM groups may specify only per-tower learning rates. Resolve the
+                # configured decay policy before validating trainable PLE tables.
+                resolved_groups = []
+                for group in param_groups:
+                    if "weight_decay" in group:
+                        resolved_groups.append(group)
+                    else:
+                        for decay_group in _make_param_groups_for_subset(
+                            model, group["params"], weight_decay, no_decay_modules, no_decay_params
+                        ):
+                            resolved_groups.append({**group, **decay_group})
+                param_groups = resolved_groups
+            param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+            if optimizer_type == "qwen38_muon":
+                param_groups = add_qwen38_plans(model, param_groups)
+            selected = [p for group in param_groups if group["cpu_offload"] for p in group["params"]]
+            local_numel = sum(p.to_local().numel() if isinstance(p, DTensor) else p.numel() for p in selected)
+            logger.info_rank0(
+                "CPU optimizer offload: %d parameter tensors, %d local elements; CPU state %.3f GiB per rank; "
+                "master=float32, resident_moments=%s, cpu_moments=%s; compute weights and gradients remain resident.",
+                len(selected),
+                local_numel,
+                (4 + 2 * torch.empty((), dtype=cpu_offload_kwargs["cpu_moment_dtype"]).element_size())
+                * local_numel
+                / 2**30,
+                cpu_offload_kwargs["resident_moment_dtype"],
+                cpu_offload_kwargs["cpu_moment_dtype"],
+            )
+
+        return cpu_offload_kwargs
+
+    file_profile = ple_profile_receipt is not None
+    preparation_error = None
+    try:
+        cpu_offload_kwargs = prepare_groups()
+    except BaseException as exc:
+        preparation_error = exc
+    if file_profile:
+        raise_if_any_rank_failed(preparation_error, "preparing file-backed optimizer parameter groups")
+        signature, signature_error = None, None
+        try:
+            signature = _file_profile_group_signature(model, param_groups)
+        except BaseException as exc:
+            signature_error = exc
+        raise_if_any_rank_failed(signature_error, "inspecting file-backed optimizer groups")
+        require_same_rank_value(
+            (signature, lr, tuple(betas), eps, weight_decay, fused, no_decay_modules, no_decay_params),
+            "file-backed optimizer groups and hyperparameters",
+        )
+        from .ple_world_profile import _FactoryPermit
+
+        cpu_offload_kwargs["ple_factory_permit"] = _FactoryPermit(ple_profile_receipt)
+    elif preparation_error is not None:
+        raise preparation_error
+
+    extra_parallel_aware, branch_error = None, None
+    try:
+        extra_parallel_aware = _should_build_extra_parallel_aware(model)
+    except BaseException as exc:
+        branch_error = exc
+    if file_profile:
+        raise_if_any_rank_failed(branch_error, "selecting file-backed optimizer partitioning")
+        require_same_rank_value(extra_parallel_aware, "file-backed optimizer partitioning")
+    elif branch_error is not None:
+        raise branch_error
+
+    if extra_parallel_aware:
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            cpu_offload_kwargs=cpu_offload_kwargs,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -510,13 +900,26 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "qwen38_muon":
+        construction_error = None
+        try:
+            optim = Qwen38MuonAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
+        except BaseException as exc:
+            construction_error = exc
+        if file_profile:
+            raise_if_any_rank_failed(construction_error, "constructing file-backed Qwen3.8 optimizer")
+        elif construction_error is not None:
+            raise construction_error
+    elif optimizer_type == "cpu_offload_adamw":
+        optim = CPUOffloadAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
+    elif optimizer_type == "full_fp32_adamw":
+        optim = FullFP32AdamW(param_groups, lr, betas, eps, weight_decay)
+    elif optimizer_type == "master_fp32_adamw":
+        optim = MasterFP32AdamW(param_groups, lr, betas, eps, weight_decay)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
-        raise ValueError(
-            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
-            f"got optimizer_type={optimizer_type!r}."
-        )
+        raise ValueError(f"Unsupported optimizer selection; got optimizer_type={optimizer_type!r}.")
 
     return optim
 
@@ -752,6 +1155,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    cpu_offload_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -763,38 +1167,96 @@ def build_extra_parallel_fsdp2_optimizer(
     - Each group's params are automatically split into ExtraParallel1, ExtraParallel2, ... and non-ExtraParallel based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
-    parallel_state = get_parallel_state()
 
-    # Collect all ExtraParallel and non-ExtraParallel parameters across all groups
-    extra_parallel_groups = {
-        para: []  # List[Dict[str, Any]]
-        for para in parallel_state.extra_parallel_names
-    }
-    non_extra_parallel_groups: List[Dict[str, Any]] = []
+    def split_groups():
+        parallel_state = get_parallel_state()
 
-    # Process custom param_groups if provided
-    if param_groups is not None:
-        # Validate param_groups structure
-        assert isinstance(param_groups, list), "param_groups must be a list"
+        # Collect all ExtraParallel and non-ExtraParallel parameters across all groups
+        extra_parallel_groups = {
+            para: []  # List[Dict[str, Any]]
+            for para in parallel_state.extra_parallel_names
+        }
+        non_extra_parallel_groups: List[Dict[str, Any]] = []
 
-        # Process each parameter group
-        for group_config in param_groups:
-            assert "params" in group_config, (
-                f"Each group in param_groups must contain 'params' key, got: {group_config}"
-            )
+        # Process custom param_groups if provided
+        if param_groups is not None:
+            # Validate param_groups structure
+            assert isinstance(param_groups, list), "param_groups must be a list"
 
-            # Extract group-specific settings
-            group_lr = group_config.get("lr", lr)
-            group_params = group_config["params"]
+            # Process each parameter group
+            for group_config in param_groups:
+                assert "params" in group_config, (
+                    f"Each group in param_groups must contain 'params' key, got: {group_config}"
+                )
 
-            # Split this group's params into ExtraParallel and non-ExtraParallel
-            group_extra_parallel_params = {
+                # Extract group-specific settings
+                group_lr = group_config.get("lr", lr)
+                group_params = group_config["params"]
+
+                def split_decay(params, config=group_config):
+                    groups = _make_param_groups_for_subset(
+                        model, params, weight_decay, no_decay_modules, no_decay_params
+                    )
+                    if "weight_decay" in config:
+                        for subgroup in groups:
+                            subgroup["weight_decay"] = config["weight_decay"]
+                    return groups
+
+                # Split this group's params into ExtraParallel and non-ExtraParallel
+                group_extra_parallel_params = {
+                    para: []  # List[torch.nn.Parameter]
+                    for para in parallel_state.extra_parallel_names
+                }
+                group_non_extra_parallel_params: List[torch.nn.Parameter] = []
+
+                for p in group_params:
+                    if not p.requires_grad:
+                        continue
+
+                    # Check if this parameter is part of ExtraParallel
+                    is_extra_parallel_params = False
+                    if DTensor is not None and isinstance(p, DTensor):
+                        mesh = getattr(p, "device_mesh", None)
+                        names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+                        for para in parallel_state.extra_parallel_names:
+                            if f"{para}_fsdp" in names:
+                                group_extra_parallel_params[para].append(p)
+                                is_extra_parallel_params = True
+                                break
+
+                    if not is_extra_parallel_params:
+                        group_non_extra_parallel_params.append(p)
+
+                # Create subgroups with weight decay handling
+                for para in parallel_state.extra_parallel_names:
+                    if group_extra_parallel_params[para]:
+                        group_para_subgroups = split_decay(group_extra_parallel_params[para])
+                        for subgroup in group_para_subgroups:
+                            subgroup["lr"] = group_lr
+                            # Preserve other custom settings from original group
+                            for key, value in group_config.items():
+                                if key not in ["params", "lr", "weight_decay"]:
+                                    subgroup[key] = value
+                        extra_parallel_groups[para].extend(group_para_subgroups)
+
+                if group_non_extra_parallel_params:
+                    group_non_extra_parallel_subgroups = split_decay(group_non_extra_parallel_params)
+                    for subgroup in group_non_extra_parallel_subgroups:
+                        subgroup["lr"] = group_lr
+                        # Preserve other custom settings from original group
+                        for key, value in group_config.items():
+                            if key not in ["params", "lr", "weight_decay"]:
+                                subgroup[key] = value
+                    non_extra_parallel_groups.extend(group_non_extra_parallel_subgroups)
+        else:
+            # Default case (param_groups is None): all model parameters with uniform settings(lr)
+            extra_parallel_params = {
                 para: []  # List[torch.nn.Parameter]
                 for para in parallel_state.extra_parallel_names
             }
-            group_non_extra_parallel_params: List[torch.nn.Parameter] = []
+            non_extra_parallel_params: List[torch.nn.Parameter] = []
 
-            for p in group_params:
+            for name, p in model.named_parameters():
                 if not p.requires_grad:
                     continue
 
@@ -803,80 +1265,55 @@ def build_extra_parallel_fsdp2_optimizer(
                 if DTensor is not None and isinstance(p, DTensor):
                     mesh = getattr(p, "device_mesh", None)
                     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+                    logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
+
                     for para in parallel_state.extra_parallel_names:
                         if f"{para}_fsdp" in names:
-                            group_extra_parallel_params[para].append(p)
+                            logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
+                            extra_parallel_params[para].append(p)
                             is_extra_parallel_params = True
                             break
 
                 if not is_extra_parallel_params:
-                    group_non_extra_parallel_params.append(p)
+                    logger.debug_rank0(f"Adding {name} to non_extra_parallel_params in extra_parallel+fsdp2 optimizer")
+                    non_extra_parallel_params.append(p)
 
-            # Create subgroups with weight decay handling
-            for para in parallel_state.extra_parallel_names:
-                if group_extra_parallel_params[para]:
-                    group_para_subgroups = _make_param_groups_for_subset(
-                        model, group_extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
-                    )
-                    for subgroup in group_para_subgroups:
-                        subgroup["lr"] = group_lr
-                        # Preserve other custom settings from original group
-                        for key, value in group_config.items():
-                            if key not in ["params", "lr", "weight_decay"]:
-                                subgroup[key] = value
-                    extra_parallel_groups[para].extend(group_para_subgroups)
-
-            if group_non_extra_parallel_params:
-                group_non_extra_parallel_subgroups = _make_param_groups_for_subset(
-                    model, group_non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
+            # Build param groups with weight decay handling
+            extra_parallel_groups = {
+                para: _make_param_groups_for_subset(
+                    model, extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
                 )
-                for subgroup in group_non_extra_parallel_subgroups:
-                    subgroup["lr"] = group_lr
-                    # Preserve other custom settings from original group
-                    for key, value in group_config.items():
-                        if key not in ["params", "lr", "weight_decay"]:
-                            subgroup[key] = value
-                non_extra_parallel_groups.extend(group_non_extra_parallel_subgroups)
-    else:
-        # Default case (param_groups is None): all model parameters with uniform settings(lr)
-        extra_parallel_params = {
-            para: []  # List[torch.nn.Parameter]
-            for para in parallel_state.extra_parallel_names
-        }
-        non_extra_parallel_params: List[torch.nn.Parameter] = []
-
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-
-            # Check if this parameter is part of ExtraParallel
-            is_extra_parallel_params = False
-            if DTensor is not None and isinstance(p, DTensor):
-                mesh = getattr(p, "device_mesh", None)
-                names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
-
-                for para in parallel_state.extra_parallel_names:
-                    if f"{para}_fsdp" in names:
-                        logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
-                        extra_parallel_params[para].append(p)
-                        is_extra_parallel_params = True
-                        break
-
-            if not is_extra_parallel_params:
-                logger.debug_rank0(f"Adding {name} to non_extra_parallel_params in extra_parallel+fsdp2 optimizer")
-                non_extra_parallel_params.append(p)
-
-        # Build param groups with weight decay handling
-        extra_parallel_groups = {
-            para: _make_param_groups_for_subset(
-                model, extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
+                for para in parallel_state.extra_parallel_names
+            }
+            non_extra_parallel_groups = _make_param_groups_for_subset(
+                model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
             )
-            for para in parallel_state.extra_parallel_names
-        }
-        non_extra_parallel_groups = _make_param_groups_for_subset(
-            model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
-        )
+
+        return parallel_state, extra_parallel_groups, non_extra_parallel_groups
+
+    file_profile = (cpu_offload_kwargs or {}).get("ple_world_receipt") is not None
+    partition_error = None
+    try:
+        parallel_state, extra_parallel_groups, non_extra_parallel_groups = split_groups()
+    except BaseException as exc:
+        partition_error = exc
+    if file_profile:
+        raise_if_any_rank_failed(partition_error, "partitioning file-backed optimizer groups")
+        signature, signature_error = None, None
+        try:
+            signature = tuple(
+                (name, _file_profile_group_signature(model, groups))
+                for name, groups in extra_parallel_groups.items()
+                if groups
+            )
+            if non_extra_parallel_groups:
+                signature += (("non_extra_parallel", _file_profile_group_signature(model, non_extra_parallel_groups)),)
+        except BaseException as exc:
+            signature_error = exc
+        raise_if_any_rank_failed(signature_error, "inspecting file-backed optimizer partitions")
+        require_same_rank_value(signature, "file-backed optimizer partitions")
+    elif partition_error is not None:
+        raise partition_error
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         if optimizer_type == "adamw":
@@ -884,17 +1321,43 @@ def build_extra_parallel_fsdp2_optimizer(
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "qwen38_muon":
+            return Qwen38MuonAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "cpu_offload_adamw":
+            return CPUOffloadAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "full_fp32_adamw":
+            return FullFP32AdamW(groups, lr, betas, eps, weight_decay)
+        elif optimizer_type == "master_fp32_adamw":
+            return MasterFP32AdamW(groups, lr, betas, eps, weight_decay)
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError(f"Unsupported optimizer selection; got optimizer_type={optimizer_type!r}.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
-    for para in parallel_state.extra_parallel_names:
-        if extra_parallel_groups[para]:
-            optimizer_dict[para] = _build(extra_parallel_groups[para])
-    if non_extra_parallel_groups:
-        optimizer_dict["non_extra_parallel"] = _build(non_extra_parallel_groups)
+    world_profile = optimizer_type == "qwen38_muon" and (cpu_offload_kwargs or {}).get(
+        "ple_moments_world_profile", False
+    )
+    if world_profile:
+        keys = tuple(para for para in parallel_state.extra_parallel_names if extra_parallel_groups[para])
+        if non_extra_parallel_groups:
+            keys += ("non_extra_parallel",)
+        require_same_rank_value(
+            (keys, cpu_offload_kwargs.get("ple_moments_scratch_dir")), "file-backed Qwen3.8 optimizer partitions"
+        )
+    error = None
+    try:
+        for para in parallel_state.extra_parallel_names:
+            if extra_parallel_groups[para]:
+                optimizer_dict[para] = _build(extra_parallel_groups[para])
+        if non_extra_parallel_groups:
+            optimizer_dict["non_extra_parallel"] = _build(non_extra_parallel_groups)
+    except BaseException as exc:
+        error = exc
+    if world_profile:
+        raise_if_any_rank_failed(error, "constructing file-backed Qwen3.8 optimizer")
+    elif error is not None:
+        raise error
 
     # cache for ExtraParallel-aware grad clipping helpers
     model._extra_parallel_param_groups = {

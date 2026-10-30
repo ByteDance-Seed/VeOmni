@@ -11,6 +11,7 @@ Usage:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -114,6 +115,45 @@ class TestGetModelSaveState(unittest.TestCase):
         }
         result = _call_get_model_save_state(self.model, None, fake)
         self.assertEqual(set(result), set(fake))
+
+    def test_live_export_strips_extra_parallel_layout_metadata(self):
+        from torch.distributed.tensor import Shard
+
+        from veomni.checkpoint.dcp_checkpointer import _EXTRA_PARALLEL_LAYOUT_MARKER, ModelState
+        from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
+
+        self.model._fqn2spec_info = {"linear.weight": SimpleNamespace(placement=Shard(0), fsdp_shard_dim=0)}
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        # Keep real ModelState marker emission; only physical mesh restoration
+        # and writer I/O are replaced in this CPU unit test.
+        for mapping in (None, {"linear.weight": 0, _EXTRA_PARALLEL_LAYOUT_MARKER: 0}):
+            with (
+                self.subTest(mapping=mapping),
+                patch.object(
+                    ModelState,
+                    "get_state_dict_with_extra_parallel_dim_preprocess",
+                    side_effect=lambda state, mode: state,
+                ),
+                patch("torch.distributed.checkpoint.HuggingFaceStorageWriter") as writer,
+                patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch"),
+                patch(f"{_MOD}.dcp.save") as save,
+                patch(f"{_MOD}.dist.is_initialized", return_value=False),
+                patch(f"{_MOD}.save_model_assets"),
+                patch(f"{_MOD}.helper"),
+                patch(f"{_MOD}.synchronize"),
+            ):
+                emitted = ModelState(self.model, parallel_state=parallel_state).state_dict()
+                self.assertIs(emitted[_EXTRA_PARALLEL_LAYOUT_MARKER], True)
+                _save_hf_safetensor_distributed(self.model, "/unused/hf", mapping, None, parallel_state=parallel_state)
+                state = save.call_args.kwargs["state_dict"]
+                self.assertNotIn(_EXTRA_PARALLEL_LAYOUT_MARKER, state)
+                self.assertTrue(state)
+                self.assertTrue(all(isinstance(value, torch.Tensor) for value in state.values()))
+                self.assertTrue(all(value.dtype == torch.bfloat16 for value in state.values()))
+                self.assertTrue(all(value.dtype == torch.float32 for value in self.model.parameters()))
+                if mapping is not None:
+                    self.assertEqual(set(state), {"linear.weight"})
+                    self.assertEqual(writer.call_args.kwargs["fqn_to_index_mapping"], {"linear.weight": 0})
 
     def test_fp32_converted_to_bf16(self):
         fake = {
@@ -738,6 +778,65 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         self.assertEqual(getattr(model, "_veomni_fqn_to_index_mapping", None), mapping)
         self.assertEqual(getattr(model, "_veomni_prepared_fqn_to_index_mapping", None), mapping)
+
+
+def _lora_extra_parallel_export_worker(rank, rendezvous, output_dir, ep_dim, fsdp_dim):
+    import torch.distributed as dist
+    from safetensors.torch import load_file
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.distributed.parallel_plan import SpecInfo
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        fsdp_rank, ep_rank = mesh.get_coordinate()
+        shape = (6, 4, 4) if ep_dim == 0 else (4, 6, 4)
+        full = torch.arange(96, dtype=torch.bfloat16).reshape(shape)
+        ep_local = torch.tensor_split(full, 2, dim=ep_dim)[ep_rank].contiguous()
+        local = torch.tensor_split(ep_local, 2, dim=fsdp_dim)[fsdp_rank].contiguous()
+        tensor = DTensor.from_local(
+            local, mesh["ep_fsdp"], [Shard(fsdp_dim)], run_check=False, shape=ep_local.shape, stride=ep_local.stride()
+        )
+        name = "layers.0.experts.gate_proj.lora_A.weight"
+        spec_name = name.replace(".weight", ".default.weight")
+        spec = SpecInfo("ep", Shard(ep_dim), spec_name, mesh, tuple(full.shape), fsdp_dim)
+
+        class TinyAdapter:
+            _fqn2spec_info = {spec_name: spec}
+
+            def get_lora_config(self):
+                return self
+
+            def save_pretrained(self, path):
+                pass
+
+        with (
+            patch("veomni.lora.state_dict.get_lora_state_dict", return_value={name: tensor}),
+            patch("veomni.lora.is_veomni_lora_model", return_value=True),
+        ):
+            save_lora_adapter_with_dcp(TinyAdapter(), output_dir)
+        if rank == 0:
+            restored = load_file(f"{output_dir}/adapter_model.safetensors")
+            torch.testing.assert_close(restored[name], full, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+@pytest.mark.parametrize(("ep_dim", "fsdp_dim"), [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_lora_ep_export_preserves_global_shape(tmp_path, ep_dim, fsdp_dim):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _lora_extra_parallel_export_worker,
+        args=(str(tmp_path / "rdzv"), str(tmp_path / "adapter"), ep_dim, fsdp_dim),
+        nprocs=4,
+        join=True,
+        start_method="fork",
+    )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from transformers.initialization import no_init_weights
 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 from veomni.models.configuration_base import as_hf_config
+from veomni.models.qwen4_gdn_precision import prepare_qwen4_gdn_precision
 from veomni.models.registry import get_model_class
 from veomni.utils import logging
 from veomni.utils.env import get_env
@@ -75,9 +76,11 @@ class HuggingfaceLoader(BaseModelLoader):
                 with torch.device(init_device):
                     logger.info_rank0("Init empty model from config.")
                     model = self.model_cls.from_config(**init_kwargs)
+            prepare_qwen4_gdn_precision(model, initialize_materialized=init_device != "meta")
         else:
             with init_empty_weights():
                 model = self.model_cls.from_config(**init_kwargs)
+            prepare_qwen4_gdn_precision(model)
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
 
@@ -115,9 +118,12 @@ class CustomizedModelingLoader(BaseModelLoader):
                 with torch.device(init_device):
                     logger.info_rank0("Init empty model from config.")
                     model = self.model_cls._from_config(**init_kwargs)
+            prepare_qwen4_gdn_precision(model, initialize_materialized=init_device != "meta")
         else:
             with init_empty_weights(), no_init_weights():
                 model = self.model_cls._from_config(**init_kwargs)
+
+            prepare_qwen4_gdn_precision(model)
 
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)

@@ -1009,8 +1009,8 @@ class TestHeadSplitGuards:
         with pytest.raises(ValueError, match="does not evenly divide"):
             opt.add_param_group({"params": [nn.Parameter(torch.randn(6, 8))], "head_blocks": 4})
 
-    def test_configured_head_blocks_survives_resume(self):
-        """A checkpoint from a full-matrix run must not silently undo the split."""
+    def test_resume_rejects_different_head_blocks(self):
+        """Changing orthogonalization scope requires an explicit migration."""
         p = nn.Parameter(torch.randn(16, 8))
         opt = _head_split_muon(p, head_blocks=4)
         p.grad = torch.randn_like(p)
@@ -1018,8 +1018,21 @@ class TestHeadSplitGuards:
 
         stale = opt.state_dict()
         stale["param_groups"][0]["head_blocks"] = 1
-        opt.load_state_dict(stale)
+        with pytest.raises(RuntimeError, match="head_blocks=.*explicit checkpoint migration"):
+            opt.load_state_dict(stale)
+        assert opt.param_groups[0]["head_blocks"] == 4
 
+    def test_resume_validates_head_blocks_after_load_pre_hooks(self):
+        p = nn.Parameter(torch.randn(16, 8))
+        opt = _head_split_muon(p, head_blocks=4)
+        saved = opt.state_dict()
+
+        def alter(_optimizer, incoming):
+            incoming["param_groups"][0]["head_blocks"] = 1
+
+        opt.register_load_state_dict_pre_hook(alter)
+        with pytest.raises(RuntimeError, match="head_blocks=.*explicit checkpoint migration"):
+            opt.load_state_dict(saved)
         assert opt.param_groups[0]["head_blocks"] == 4
 
 

@@ -23,6 +23,7 @@ The per-group ``head_blocks`` option orthogonalizes a head-stacked attention
 projection in row blocks (one block per head group) instead of as one matrix.
 """
 
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -816,6 +817,12 @@ class DistributedMuon(Optimizer):
     the NS iteration needs to see the full ``[..., M, K]`` matrix.
     """
 
+    requires_exact_state_dtypes = True
+
+    @staticmethod
+    def checkpoint_state_fields(_param):
+        return ("momentum_buffer",)
+
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
@@ -902,31 +909,73 @@ class DistributedMuon(Optimizer):
         super().add_param_group(param_group)
         self._validate_group(self.param_groups[-1])
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:  # type: ignore[override]
-        """Restore optimizer state while keeping this run's head-split scope.
+    def __setstate__(self, state):
+        defaults = state.get("defaults", getattr(self, "defaults", {}))
+        had_differentiable = "differentiable" in defaults
+        super().__setstate__(state)
+        if not had_differentiable:
+            self.defaults.pop("differentiable", None)
 
-        ``head_blocks`` describes how a matrix is sliced for orthogonalization,
-        not resumable state. Torch restores every param-group option from the
-        checkpoint, so without this a DCP resume (which rebuilds groups from the
-        live optimizer and then delegates here) would silently drop back to
-        full-matrix updates.
-        """
-        # ``None`` where the group carries no ``head_blocks`` at all, so an unsplit
-        # run does not gain the key (and its state dict keys) on resume.
-        configured = [group.get("head_blocks") for group in self.param_groups]
-        super().load_state_dict(state_dict)
-        restored = [group.get("head_blocks") for group in self.param_groups]
-        for group, blocks in zip(self.param_groups, configured):
-            if blocks is None:
-                group.pop("head_blocks", None)
-            else:
-                group["head_blocks"] = blocks
-        if restored != configured:
-            logger.warning_rank0(
-                f"[Muon] checkpoint head_blocks={[1 if b is None else b for b in restored]} disagrees "
-                f"with the configured {[1 if b is None else b for b in configured]}; "
-                "keeping the configured value."
-            )
+    @staticmethod
+    def _validate_saved_group_semantics(state_dict):
+        if any(group.get("differentiable", False) is not False for group in state_dict["param_groups"]):
+            raise RuntimeError("Differentiable optimizer checkpoints are not supported by this no-grad optimizer")
+
+    @contextmanager
+    def checkpoint_state(self, *, load=False):
+        """Prepare local momentum targets without taking a synthetic Muon step."""
+        added = []
+        try:
+            if load:
+                for group in self.param_groups:
+                    for p in group["params"]:
+                        if not p.requires_grad:
+                            continue
+                        state = self.state.get(p)
+                        if state:
+                            momentum = state.get("momentum_buffer")
+                            if not torch.is_tensor(momentum) or momentum.dtype != p.dtype or momentum.shape != p.shape:
+                                raise RuntimeError("Incomplete DistributedMuon checkpoint target state")
+                            continue
+                        self.state[p] = {"momentum_buffer": torch.zeros_like(p, memory_format=torch.preserve_format)}
+                        added.append(p)
+            yield
+        except BaseException:
+            for p in added:
+                self.state.pop(p, None)
+            raise
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:  # type: ignore[override]
+        """Restore only a checkpoint with the same orthogonalization scope."""
+
+        def validate(_optimizer, incoming):
+            self._validate_saved_group_semantics(incoming)
+            configured = [int(group.get("head_blocks", 1)) for group in self.param_groups]
+            saved = [int(group.get("head_blocks", 1)) for group in incoming["param_groups"]]
+            if saved != configured:
+                raise RuntimeError(
+                    f"Muon checkpoint head_blocks={saved} differs from configured {configured}; "
+                    "explicit checkpoint migration is required"
+                )
+            for saved_group, group in zip(incoming["param_groups"], self.param_groups, strict=True):
+                for key, param in zip(saved_group["params"], group["params"], strict=True):
+                    state = incoming["state"].get(key, {})
+                    if state:
+                        momentum = state.get("momentum_buffer")
+                        if (
+                            not torch.is_tensor(momentum)
+                            or momentum.dtype != param.dtype
+                            or momentum.shape != param.shape
+                        ):
+                            raise RuntimeError(
+                                "DistributedMuon checkpoint momentum dtype/shape differs; migrate explicitly"
+                            )
+
+        hook = self.register_load_state_dict_pre_hook(validate)
+        try:
+            super().load_state_dict(state_dict)
+        finally:
+            hook.remove()
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]

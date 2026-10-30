@@ -79,7 +79,10 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
 
         checkpoint_dir = tmp_path / "ckpt"
         dcp.save(
-            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
+            {
+                "model": ModelState(source_model),
+                "optimizer": OptimizerState(source_model, source_optimizer, coordinated_group_validation=True),
+            },
             checkpoint_id=str(checkpoint_dir),
         )
         dist.barrier()
@@ -88,7 +91,9 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
         dcp.load(
             {
                 "model": ModelState(target_model),
-                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
+                "optimizer": OptimizerState(
+                    target_model, target_optimizer, load=True, coordinated_group_validation=True
+                ),
             },
             checkpoint_id=str(checkpoint_dir),
         )
@@ -1471,9 +1476,12 @@ class TestPromoteStagedCheckpoint:
         means; cases about *another* rank failing patch `any_rank_failed`
         directly.
         """
-        with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
-            with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None, group=None: None):
-                yield
+        with (
+            patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"),
+            patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+            patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None, group=None: None),
+        ):
+            yield
 
     @pytest.fixture
     def make_staged(self, tmp_path):
@@ -1906,16 +1914,42 @@ class TestPromoteStagedCheckpoint:
         gloo_group = object()
         with patch("veomni.utils.dist_utils.dist.is_initialized", return_value=True):
             with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=fake_all_reduce):
-                with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+                with (
+                    patch("veomni.utils.dist_utils.dist.get_backend", return_value="hccl"),
+                    patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"),
+                ):
                     assert any_rank_failed(False) is True
                 # gloo cannot reduce accelerator tensors (NPU included), so a gloo
                 # group must never ask for the accelerator's device.
-                with (
-                    patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
-                    patch("veomni.utils.dist_utils.get_device_type", side_effect=AssertionError("asked for a device")),
-                ):
-                    assert any_rank_failed(False, group=gloo_group) is True
-        assert seen_groups == [None, gloo_group], "the reduction must run on the group it was handed"
+                for backend in ("gloo", "cpu:gloo"):
+                    with (
+                        patch("veomni.utils.dist_utils.dist.get_backend", return_value=backend),
+                        patch(
+                            "veomni.utils.dist_utils.get_device_type", side_effect=AssertionError("asked for a device")
+                        ),
+                    ):
+                        assert any_rank_failed(False) is True
+                        assert any_rank_failed(False, group=gloo_group) is True
+        assert seen_groups == [None, None, gloo_group, None, gloo_group], (
+            "the reduction must run on the group it was handed"
+        )
+
+    @pytest.mark.parametrize(
+        "backend,preferred,expected",
+        [
+            ("hccl", "npu", "npu"),
+            ("nccl", "cuda", "cuda"),
+            ("cpu:gloo,npu:hccl", "npu", "npu"),
+            ("cpu:gloo,privateuseone:hccl", "npu", "npu"),
+            ("cpu:gloo,cuda:nccl", "cuda", "cuda"),
+            ("cpu:gloo,cuda:nccl", "npu", "cpu"),
+        ],
+    )
+    def test_control_device_respects_mixed_backend(self, backend, preferred, expected):
+        from veomni.utils.dist_utils import _control_collective_device
+
+        with patch("veomni.utils.dist_utils.get_device_type", return_value=preferred):
+            assert _control_collective_device(backend) == expected
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
@@ -2367,6 +2401,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False) as file_mode_gate,
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
@@ -2380,6 +2415,7 @@ class TestStageDirValidation:
 
         # A non-zero rank never touches the file, and still raises — and nothing
         # was written into a step whose markers may still be standing.
+        file_mode_gate.assert_called_once_with(False, group=None)
         execute_save.assert_not_called()
 
     def test_save_without_optimizer_writes_only_the_weights(self, tmp_path):

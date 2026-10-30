@@ -377,13 +377,34 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `model.optimizer.type`:
+`build_optimizer` supports seven optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `master_fp32_adamw` | FP32 master weights and updates with BF16 first/second moments, including for FP32 compute parameters. |
+| `full_fp32_adamw` | FP32 master weights, moments and updates, with compute weights kept in their original dtype. |
+| `cpu_offload_adamw` | Selective optimizer-only CPU offload: matched parameters' FP32 masters and moments live on CPU; model weights and gradients stay on the accelerator. |
+| `qwen38_muon` | Qwen4-Exp logical-matrix Muon + AdamW with FP32 master weights and states. See the [Qwen3.8 Muon recipe](qwen38_muon.md). |
+
+For `cpu_offload_adamw`, `cpu_offload_param_patterns` defaults to `[]` but must be nonempty. Each regex uses `re.search` against full parameter names; anchor it for exact matching. Every pattern must match a trainable parameter. Unmatched parameters keep resident optimizer state. `cpu_offload_resident_moment_dtype` and `cpu_offload_cpu_moment_dtype` independently select `float32` (default) or lossy `bfloat16` moment storage; masters and update arithmetic remain FP32. Resume does not silently change saved precision. See [optimizer CPU offload](../design/optimizer_cpu_offload.md).
+
+For a DCP process group with more than one rank, save rejects pre-existing
+optimizer state-dict hooks; restore rejects both state-dict and load-state-dict
+hooks because it first constructs the target state. This prevents a rank-local
+hook failure from mismatching another rank's collectives. Remove the hooks or
+materialize their state before checkpointing;
+single-process optimizer state-dict hooks remain supported. Exact resume also
+rejects duplicate optimizer parameters and precision-policy changes that need
+an explicit migration. DCP rejects empty optimizer parameter groups because the
+serialized representation cannot restore their hyperparameters faithfully.
+A coordinated save also rejects incompatible rank-local
+lazy states for a non-PLE parameter; genuinely empty local shards and the
+explicit PLE owner-grid layout remain supported. A legacy optimizer checkpoint
+missing group semantics such as AdamW's `decoupled_weight_decay` cannot prove
+which update rule produced it; restore requires an explicit, attested migration.
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
@@ -412,6 +433,8 @@ On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `ex
 Attention computes scores per head, but Muon's natural unit is the whole matrix.
 Setting `muon_head_group_size` splits a head-stacked projection into row blocks
 and gives each block its own polar factor — GLM-5's "Muon Split".
+Changing this scope changes the update rule; exact checkpoint resume rejects a
+different saved `head_blocks` value and requires an explicit migration.
 
 Both knobs are needed to turn it on; there is no built-in module list, because a
 default would quietly change the update math for every model whose attention uses

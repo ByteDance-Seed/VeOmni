@@ -28,6 +28,7 @@ load when an index mapping is supplied).
 
 import inspect
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Tuple, Union
 
@@ -248,10 +249,40 @@ def shard_index_from_filename(filename: str) -> int:
 
 
 def parse_fqn_to_index_mapping_from_json(safetensor_idx_path: str) -> Dict[str, int]:
-    """Load ``weight_map`` from a HuggingFace ``model.safetensors.index.json`` file."""
+    """Load a stable per-file shard mapping from a HuggingFace index.
+
+    Indexes may combine numbered shards with named auxiliary shards such as
+    ``model.visual.safetensors``. Preserve standard shard numbers and assign
+    unused numbers to the other files; this mapping controls export grouping,
+    not which source file the streaming loader reads.
+    """
     with open(safetensor_idx_path) as f:
         weight_map = json.load(f)["weight_map"]
-    return {fqn: shard_index_from_filename(filename) for fqn, filename in weight_map.items()}
+    # Give conventional model shards first claim on their original indices,
+    # even when an auxiliary numbered filename sorts before them.
+    filenames = sorted(
+        set(weight_map.values()),
+        key=lambda filename: (not bool(re.fullmatch(r"model-\d+-of-\d+\.safetensors", filename)), filename),
+    )
+    assigned = {}
+    used = set()
+    deferred = []
+    for filename in filenames:
+        try:
+            index = shard_index_from_filename(filename)
+        except (IndexError, ValueError):
+            deferred.append(filename)
+            continue
+        if index in used:
+            deferred.append(filename)
+            continue
+        assigned[filename] = index
+        used.add(index)
+    next_index = max(used, default=0) + 1
+    for filename in deferred:
+        assigned[filename] = next_index
+        next_index += 1
+    return {fqn: assigned[filename] for fqn, filename in weight_map.items()}
 
 
 def _unwrap_model_for_fqn_mapping(
