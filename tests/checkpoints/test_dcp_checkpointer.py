@@ -1471,7 +1471,10 @@ class TestPromoteStagedCheckpoint:
         means; cases about *another* rank failing patch `any_rank_failed`
         directly.
         """
-        with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+        with (
+            patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"),
+            patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+        ):
             with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None, group=None: None):
                 yield
 
