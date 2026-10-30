@@ -37,7 +37,6 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -50,6 +49,10 @@ config = PatchConfig(
     description="DeepseekV3 with VeomniOp RMS / RoPE / SwiGLU / MoE / fused loss",
 )
 
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
@@ -57,10 +60,6 @@ config.add_import(
     names=["prepare_dense_attention_inputs"],
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -81,10 +80,10 @@ FlashAttentionKwargs = None  # noqa: E305
 
 
 @config.add_helper
-def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
+def _deepseek_v3_rope_op(config, rope_interleave: bool = False) -> VeomniOp:
     if rope_interleave:
         return VeomniOp("rope", "interleave", "eager")
-    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    impl = config.ops_config.rotary_pos_emb_implementation
     return VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
 
 
@@ -92,11 +91,12 @@ def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
     "DeepseekV3RMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def deepseek_v3_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def deepseek_v3_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -110,7 +110,7 @@ def deepseek_v3_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> to
 @config.modify_init("DeepseekV3RotaryEmbedding", description="Capture rotary freq impl at construct time")
 def deepseek_v3_rotary_embedding_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope_use_triton = resolve_op_impl("rotary_pos_emb_implementation") == "triton"
+    self.veomni_rope_use_triton = self.config.ops_config.rotary_pos_emb_implementation == "triton"
 
 
 @config.override_method(
@@ -143,8 +143,11 @@ def deepseek_v3_rotary_embedding_forward_patched(self, x, position_ids):
 @config.modify_init("DeepseekV3Attention", description="Bind instance-local rope and attention VeomniOps")
 def deepseek_v3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = _deepseek_v3_rope_op(self.config.rope_interleave)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    if self.q_lora_rank is not None:
+        self.q_a_layernorm = DeepseekV3RMSNorm(self.config.q_lora_rank, config=self.config)  # noqa: F821
+    self.kv_a_layernorm = DeepseekV3RMSNorm(self.config.kv_lora_rank, config=self.config)  # noqa: F821
+    self.veomni_rope = _deepseek_v3_rope_op(self.config, self.config.rope_interleave)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -217,7 +220,43 @@ def deepseek_v3_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "DeepseekV3DecoderLayer.__init__",
+    description="Pass config to DeepseekV3RMSNorm instances",
+)
+def deepseek_v3_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)  # noqa: F821
+    if layer_idx >= config.first_k_dense_replace:
+        self.mlp = DeepseekV3MoE(config)  # noqa: F821
+    else:
+        self.mlp = DeepseekV3MLP(config)  # noqa: F821
+    self.input_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_attention_layernorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+
+
+@config.override_method(
+    "DeepseekV3Model.__init__",
+    description="Pass config to final DeepseekV3RMSNorm",
+)
+def deepseek_v3_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
+    )
+    self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)  # noqa: F821
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.override_method(
@@ -251,7 +290,7 @@ class PatchedDeepseekV3Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -336,7 +375,7 @@ def deepseek_v3_forcausallm_init_patched(self, config):
     self.model = DeepseekV3Model(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

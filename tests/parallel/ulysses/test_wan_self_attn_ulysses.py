@@ -38,15 +38,12 @@ from veomni.distributed.parallel_state import (
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
 from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
 from veomni.ops import resolve_op
-from veomni.ops.config import resolve_op_impl
 
 from .utils import SequenceParallelTest
 
 
 def rope_apply_ref(x, freqs, head_dim):
-    return resolve_op("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation")).wrapper(
-        x, freqs, head_dim=head_dim
-    )
+    return resolve_op("rope", "wan", "eager").wrapper(x, freqs, head_dim=head_dim)
 
 
 def _reference_out(self_attn, x_full, freqs_full, head_dim, attention_mask=None):
@@ -73,9 +70,11 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
         return 4
 
     def _synced_self_attn(self, group, *, dim=64, num_heads=4, dtype=torch.float32):
+        from tests.models.compare import eager_ops_config
+
         device = get_device_type()
         torch.manual_seed(42)
-        config = SimpleNamespace(_attn_implementation="eager")
+        config = SimpleNamespace(_attn_implementation="eager", ops_config=eager_ops_config())
         self_attn = SelfAttention(config, dim, num_heads).to(device=device, dtype=dtype)
         self._sync_model(self_attn.state_dict(), self.rank)
         for p in self_attn.parameters():

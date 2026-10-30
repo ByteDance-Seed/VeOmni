@@ -135,15 +135,17 @@ def test_qwen4_vlm_decoder_layers_are_fsdp_targets():
     import torch
     from transformers import Qwen4ExpConfig
 
-    from tests.models.compare import eager_ops_config, ops_config_scope
+    from tests.models.compare import eager_ops_config
     from veomni.distributed.torch_parallelize import _fsdp_target_classes, _is_fsdp_wrap_target
+    from veomni.models.configuration_base import as_veomni_config
     from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import (
         Qwen4ExpForConditionalGeneration,
     )
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json")
     config._attn_implementation = "eager"
-    with ops_config_scope(eager_ops_config()), torch.device("meta"):
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    with torch.device("meta"):
         model = Qwen4ExpForConditionalGeneration(config)
     targets = _fsdp_target_classes(model, [], True)
     blocks = {

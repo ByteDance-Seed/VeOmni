@@ -37,6 +37,10 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 class _StubConfig(OmniModuleConfig):
     model_type = "stub_omni_runtime_module"
 
+    def __init__(self, **kwargs):
+        kwargs.setdefault("ops_implementation", {"attn_implementation": "eager"})
+        super().__init__(**kwargs)
+
 
 class _Module(PretrainedOmniModule, TrainingModuleMixin, InferenceModuleMixin, BaseMixin):
     """Emits one artefact per ``generate`` and traces the generation hooks."""

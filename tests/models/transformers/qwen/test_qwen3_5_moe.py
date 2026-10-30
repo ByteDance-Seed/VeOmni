@@ -41,10 +41,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     pin_eager_attn_implementation,
     qwen_image_inputs,
-    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import (
     tiny_qwen3_5_moe_config as _tiny_vl_config,
@@ -76,18 +74,16 @@ def _qwen3_5_moe_classes():
 
 def _build_causal(config: Qwen3_5MoeTextConfig, ops: SimpleNamespace | None = None):
     ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        causal_cls, _ = _qwen3_5_moe_classes()
-        return causal_cls(config)
+    config._set_ops_implementation(ops)
+    causal_cls, _ = _qwen3_5_moe_classes()
+    return causal_cls(config)
 
 
 def _build_vlm(config: Qwen3_5MoeConfig, ops: SimpleNamespace | None = None):
     ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        _, vlm_cls = _qwen3_5_moe_classes()
-        return vlm_cls(config)
+    config._set_ops_implementation(ops)
+    _, vlm_cls = _qwen3_5_moe_classes()
+    return vlm_cls(config)
 
 
 def _empty_cu_seq_lens() -> torch.Tensor:
@@ -232,3 +228,28 @@ def test_qwen3_5_moe_eager_matches_hf_aux_loss():
     assert hf_out.aux_loss is not None
     torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
+
+
+def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
+    from veomni.models.transformers.qwen3_5_moe.generated import patched_modeling_qwen3_5_moe_npu as npu_modeling
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
+
+    monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", lambda **kwargs: ([0, 6], None, None))
+    torch.manual_seed(0)
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    config._set_ops_implementation(eager_ops_config())
+    model = npu_modeling.Qwen3_5MoeForCausalLM(config).eval()
+    attn = model.model.layers[0].self_attn
+    assert attn.veomni_rope.impl == "eager"
+    assert attn.veomni_attn.impl == "eager"
+    assert attn.q_norm.veomni_rms_norm.impl == "eager"
+    assert attn.k_norm.veomni_rms_norm.impl == "eager"
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            cu_seq_lens_q=torch.tensor([0, 6], dtype=torch.int32),
+            use_cache=False,
+        )
+    assert torch.isfinite(out.logits).all()

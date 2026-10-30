@@ -29,10 +29,10 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from transformers import PretrainedConfig
+from ...configuration_base import VeOmniPretrainedConfig
 
 
-class OmniModuleConfig(PretrainedConfig):
+class OmniModuleConfig(VeOmniPretrainedConfig):
     """Base for every ``modules/<family>/<sub>/configuration.py`` config class.
 
     Subclasses add the module's own hyperparameters and a ``model_type``. The
@@ -55,41 +55,11 @@ class OmniModuleConfig(PretrainedConfig):
         # external checkpoint). ``None`` on a module's own config.json, where
         # the file's own directory is the answer.
         self.model_path = model_path
-        # Sparse: only what this location explicitly selected. A composed load
-        # merges the file, the model's default, and the module entry per field.
-        self.ops_implementation: dict[str, Any] = {}
-        self._ops_config: Any = None
         # Overrides the composed model applies to the module: hyperparameters
         # for the model, kwargs for the preprocessor.
         self.model_config = dict(model_config or {})
         self.processor_config = dict(processor_config or {})
-        super().__init__(**kwargs)
-        self._set_ops_implementation(ops_implementation)
-
-    @property
-    def ops_config(self):
-        """Resolved :class:`~veomni.arguments.OpsImplementationConfig` for this module."""
-        if self._ops_config is None:
-            from ....arguments import OpsImplementationConfig
-
-            self._ops_config = OpsImplementationConfig(**dict(self.ops_implementation or {}))
-        return self._ops_config
-
-    def _set_ops_implementation(
-        self,
-        ops_implementation: dict[str, Any] | Any | None,
-    ) -> None:
-        if ops_implementation is not None and is_dataclass(ops_implementation):
-            self._ops_config = ops_implementation
-            self.ops_implementation = {k: v for k, v in asdict(ops_implementation).items() if v is not None}
-        else:
-            self._ops_config = None
-            self.ops_implementation = dict(ops_implementation or {})
-
-    def to_dict(self) -> dict[str, Any]:
-        output = super().to_dict()
-        output.pop("_ops_config", None)
-        return output
+        super().__init__(ops_implementation=ops_implementation, **kwargs)
 
     def to_diff_dict(self) -> dict[str, Any]:
         """Drop the composed-model fields this config never set.
@@ -146,12 +116,14 @@ class OmniModuleConfig(PretrainedConfig):
         ``base_ops_implementation`` is the composed model's default, passed in
         separately because an entry does not carry it. Per field, lowest to
         highest: what this file loaded, then ``base_ops_implementation``, then
-        the entry's ``ops_implementation``.
+        the entry's ``ops_implementation``. An explicit standalone
+        ``attn_implementation`` ranks above all of those layers.
         """
         model_config = kwargs.pop("model_config", None)
         processor_config = kwargs.pop("processor_config", None)
         entry_ops = kwargs.pop("ops_implementation", None)
         base_ops = kwargs.pop("base_ops_implementation", None)
+        attention = kwargs.pop("attn_implementation", None)
 
         if cls is OmniModuleConfig:
             from . import OMNI_MODEL_REGISTRY, read_model_type
@@ -165,6 +137,7 @@ class OmniModuleConfig(PretrainedConfig):
             local_files_only=local_files_only,
             token=token,
             revision=revision,
+            _validate_ops=False,
             **kwargs,
         )
         if not isinstance(hf_config, OmniModuleConfig):
@@ -178,6 +151,7 @@ class OmniModuleConfig(PretrainedConfig):
             ops_implementation=entry_ops,
             base_ops_implementation=base_ops,
         )
+        hf_config._apply_ops_overrides(attn_implementation=attention)
         return hf_config
 
     def _apply_composed_overwrites(
@@ -187,12 +161,15 @@ class OmniModuleConfig(PretrainedConfig):
         processor_config: dict[str, Any] | None,
         ops_implementation: dict[str, Any] | None,
         base_ops_implementation: dict[str, Any] | None,
+        validate_ops: bool = False,
     ) -> None:
         """Write a composed model's overwrites onto this module config."""
 
         def as_dict(field: str, value: Any) -> dict[str, Any] | None:
             if value is None:
                 return None
+            if hasattr(value, "to_dict") and callable(value.to_dict):
+                return value.to_dict()
             if is_dataclass(value):
                 return {k: v for k, v in asdict(value).items() if v is not None}
             if not isinstance(value, dict):
@@ -208,9 +185,12 @@ class OmniModuleConfig(PretrainedConfig):
         if processor_config:
             current = dict(getattr(self, "processor_config", None) or {})
             self.processor_config = {**current, **deepcopy(processor_config)}
-        if base_ops or entry_ops:
-            own = dict(getattr(self, "ops_implementation", None) or {})
-            self._set_ops_implementation({**own, **(base_ops or {}), **(entry_ops or {})})
+        if base_ops or entry_ops or validate_ops:
+            self._set_ops_implementation(
+                {**(base_ops or {}), **(entry_ops or {})},
+                _validate_tree=validate_ops,
+                _validate=validate_ops,
+            )
 
 
 __all__ = [

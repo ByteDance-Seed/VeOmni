@@ -31,13 +31,18 @@ from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import Qwen4ExpTextExperts
-from veomni.ops.config import set_ops_config
 
 
 class ToyDecoder(nn.Module):
     def __init__(self):
         super().__init__()
-        config = SimpleNamespace(num_experts=4, hidden_size=256, moe_intermediate_size=32, hidden_act="silu")
+        config = SimpleNamespace(
+            num_experts=4,
+            hidden_size=256,
+            moe_intermediate_size=32,
+            hidden_act="silu",
+            ops_config=SimpleNamespace(moe_implementation="fused_npu"),
+        )
         self.experts = Qwen4ExpTextExperts(config)
 
     def forward(self, x, indices, weights):
@@ -134,7 +139,6 @@ def run(rank, phase, output_dir, ep, endpoint=None):
             extra_parallel_names=("ep",),
             extra_parallel_placement_innermost=(False,),
         )
-        set_ops_config(SimpleNamespace(moe_implementation="fused_npu"))
         with torch.device("meta"):
             model = ToyQwen4()
         model = build_parallelize_model(
