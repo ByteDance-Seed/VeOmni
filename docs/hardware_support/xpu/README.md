@@ -19,7 +19,7 @@ Container images that already ship the XPU PyTorch stack, such as `vllm/vllm-ope
 
 ## Configuration
 
-Intel GPU runs every op on its `eager` backend: the per-op fields (`rms_norm_implementation`, `moe_implementation`, and so on) resolve to `eager` when left unset. Set the attention backend explicitly, since the default `flash_attention_2` has no Intel GPU build.:
+Intel GPU runs every op on its `eager` backend: the per-op fields (`rms_norm_implementation`, `moe_implementation`, and so on) resolve to `eager` when left unset. Set the attention backend explicitly, since the default `flash_attention_2` has no Intel GPU build:
 
 ```bash
 --model.ops_implementation.attn_implementation sdpa
@@ -42,5 +42,6 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 ## Known Limitations
 
 - **No fused kernels yet.** FlashAttention, Liger, fused MoE and the other CUDA kernels are not available; ops run on `eager` and attention on `sdpa`.
+- **No linear-attention models yet.** Models with gated delta net layers, such as Qwen3.5, need the `fla` kernels for packed sequences, and those are not registered for Intel GPU.
 - **No expert parallelism.** Set `model.accelerator.ep_size=1` until an XPU-compatible implementation is available.
 - **Low-precision ReduceScatter transport is CUDA-only.**
