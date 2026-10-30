@@ -552,15 +552,13 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
         # SP broadcast of micro_batches
         with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
+                micro_batches = None
                 if get_parallel_state().sp_rank == 0:
-                    micro_batches = next(data_iterator)
-                else:
-                    micro_batches = None
+                    # Broadcast None on exhaustion so every SP rank stops together instead of hanging.
+                    micro_batches = next(data_iterator, None)
 
                 obj_list = [micro_batches]
                 dist.broadcast_object_list(
@@ -569,8 +567,12 @@ class DiTTrainer:
                     group=get_parallel_state().sp_group,
                 )
                 micro_batches = obj_list[0]
+                if micro_batches is None:
+                    raise StopIteration
             else:
                 micro_batches = next(data_iterator)
+
+        self.base.state.global_step += 1
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
