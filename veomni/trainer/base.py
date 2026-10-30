@@ -760,11 +760,7 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
-    def train_step(
-        self,
-        data_iterator: Any,
-    ) -> Dict[str, float]:
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+    def _sft_step_preflight(self, micro_batches, callback_owner):
         initial_microbatch_count = len(micro_batches)
         self._step_preflight_start_time = time.time()
         reject_distributed_padding(micro_batches)
@@ -780,7 +776,7 @@ class BaseTrainer(Stateful, ABC):
             preflight_error = None
             try:
                 self._reset_async_activation_offload_if_enabled(self.model)
-                self.on_step_begin(micro_batches=micro_batches)
+                callback_owner.on_step_begin(micro_batches=micro_batches)
             except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
                 preflight_error = exc
             # Callbacks may adjust labels; normalize the inputs actually consumed.
@@ -811,6 +807,15 @@ class BaseTrainer(Stateful, ABC):
         except BaseException:
             self.state.global_step = previous_step
             raise
+
+        return real_micro_steps
+
+    def train_step(
+        self,
+        data_iterator: Any,
+    ) -> Dict[str, float]:
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        real_micro_steps = self._sft_step_preflight(micro_batches, self)
 
         # Forward and backward for each micro batch
         self.sync_before_train_step()

@@ -568,10 +568,8 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     marks = []
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token_synchronized", lambda *_: 1)
-    monkeypatch.setattr(
-        "veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count, **kwargs: token_count
-    )
+    monkeypatch.setattr("veomni.trainer.base.count_loss_token_synchronized", lambda *_: 1)
+    monkeypatch.setattr("veomni.trainer.base.reduce_global_loss_token", lambda token_count, **kwargs: token_count)
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     model_args = SimpleNamespace(
@@ -597,6 +595,9 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     )
     trainer.base._reset_async_activation_offload_if_enabled = lambda model: (
         BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
+    )
+    trainer.base._sft_step_preflight = lambda batches, on_step_begin: BaseTrainer._sft_step_preflight(
+        trainer.base, batches, on_step_begin
     )
 
     trainer.train_step(iter([[{}, {}]]))

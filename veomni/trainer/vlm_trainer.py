@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -33,12 +32,8 @@ from ..models.model_runtime import VeOmniModelRuntime
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
 from ..utils.loss_utils import (
-    contains_padding,
     count_loss_token,
-    count_loss_token_synchronized,
     is_padding_microbatch,
-    reduce_global_loss_token,
-    reject_distributed_padding,
 )
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
@@ -316,51 +311,7 @@ class VLMTrainer:
         data_iterator: Any,
     ) -> Dict[str, float]:
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        initial_microbatch_count = len(micro_batches)
-        self.base._step_preflight_start_time = time.time()
-        reject_distributed_padding(micro_batches)
-        initial_padding = [(batch, is_padding_microbatch(batch)) for batch in micro_batches]
-        if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
-            raise ValueError("Padding inside an unpacked micro-batch is unsupported")
-        real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
-        if not real_micro_steps:
-            raise ValueError("A training step must contain at least one real micro-batch")
-        previous_step = self.base.state.global_step
-        self.base.state.global_step += 1
-        try:
-            preflight_error = None
-            try:
-                self.base._reset_async_activation_offload_if_enabled(self.base.model)
-                self.on_step_begin(micro_batches=micro_batches)
-            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
-                preflight_error = exc
-            self.base.micro_batches_token_len = count_loss_token_synchronized(
-                micro_batches, initial_microbatch_count, preflight_error
-            )
-            self.base.global_micro_batches_token_len = reduce_global_loss_token(
-                self.base.micro_batches_token_len,
-                contains_padding_batch=(
-                    contains_padding(micro_batches)
-                    or not micro_batches
-                    or len(micro_batches) != initial_microbatch_count
-                ),
-            )
-            if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
-                raise ValueError("Padding inside an unpacked micro-batch is unsupported")
-            if (any(flag for _, flag in initial_padding) or contains_padding(micro_batches)) and (
-                len(initial_padding) != len(micro_batches)
-                or any(
-                    original is not current or was_padding != is_padding_microbatch(current)
-                    for (original, was_padding), current in zip(initial_padding, micro_batches, strict=False)
-                )
-            ):
-                raise ValueError("A callback changed a padded microbatch sequence after metrics were recorded")
-            real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
-            if not real_micro_steps:
-                raise ValueError("A training step must contain at least one real micro-batch")
-        except BaseException:
-            self.base.state.global_step = previous_step
-            raise
+        real_micro_steps = self.base._sft_step_preflight(micro_batches, self)
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()

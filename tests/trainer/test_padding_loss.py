@@ -451,7 +451,7 @@ def test_all_padding_step_does_not_advance_training_state(monkeypatch, trainer_n
         "vlm": (vlm_module, vlm_module.VLMTrainer),
     }[trainer_name]
     monkeypatch.setattr(
-        module,
+        base_module,
         "reduce_global_loss_token",
         lambda counts, **kwargs: {key: value.item() for key, value in counts.items()},
     )
@@ -466,7 +466,9 @@ def test_all_padding_step_does_not_advance_training_state(monkeypatch, trainer_n
         trainer.state = state
         trainer.model = model
     else:
-        trainer.base = SimpleNamespace(state=state, model=model)
+        trainer.base = object.__new__(base_module.BaseTrainer)
+        trainer.base.state = state
+        trainer.base.model = model
     with pytest.raises(ValueError, match="at least one real micro-batch"):
         trainer.train_step(iter([[{"labels": torch.tensor([1]), "padding_flag": True}]]))
     assert state.global_step == 3

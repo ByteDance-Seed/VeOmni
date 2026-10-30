@@ -237,7 +237,7 @@ def run_train_step(request, monkeypatch):
     monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
     # Single process: the all-reduce over the step's token denominators is the identity.
     monkeypatch.setattr(
-        module,
+        base_trainer_module,
         "reduce_global_loss_token",
         lambda token_len, **kwargs: {key: value.item() for key, value in token_len.items()},
     )
@@ -348,6 +348,54 @@ def test_step_begin_label_mask_is_reflected_in_global_loss_denominator(run_train
     run_train_step(trainer, batches)
     assert trainer.global_micro_batches_token_len["foundation_tokens"] == 3
     assert recorded["loss"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("owner", ["text", "vlm"])
+def test_composed_sft_preflight_uses_wrapper_callback(monkeypatch, owner, identity_loss):
+    module, wrapper_cls = _TRAIN_STEP_OWNERS[owner]
+    monkeypatch.setattr(
+        base_trainer_module, "reduce_global_loss_token", lambda counts, **_: {k: v.item() for k, v in counts.items()}
+    )
+    monkeypatch.setattr(module, "mark_compile_step_begin", lambda *_args, **_kwargs: None, raising=False)
+    recorded = {}
+    trainer = _accumulating_trainer([], recorded)
+    wrapper = object.__new__(wrapper_cls)
+    wrapper.base = trainer
+    calls = []
+    trainer.on_step_begin = lambda **_: calls.append("base")
+
+    def begin(micro_batches):
+        calls.append("wrapper")
+        micro_batches[0]["labels"][0, 1] = -100
+
+    wrapper.on_step_begin = begin
+    trainer.forward_backward_step = lambda _batch: (
+        trainer.micro_batch_token_len["foundation_tokens"]
+        / trainer.global_micro_batches_token_len["foundation_tokens"],
+        {},
+        {},
+    )
+    batches = [{"labels": torch.tensor([[-100, 2, 3]])}, {"labels": torch.tensor([[-100, 4, 5]])}]
+    wrapper.train_step(iter([batches]))
+    assert calls == ["wrapper"]
+    assert trainer.global_micro_batches_token_len["foundation_tokens"] == 3
+    assert recorded["loss"] == pytest.approx(1.0)
+
+    def fail(**_kwargs):
+        raise ValueError("wrapper callback failed")
+
+    wrapper.on_step_begin = fail
+    with pytest.raises(ValueError, match="wrapper callback failed"):
+        wrapper.train_step(iter([[{"labels": torch.tensor([[-100, 2]])}]]))
+    assert trainer.state.global_step == 1
+
+    def replace_hook(_model):
+        wrapper.on_step_begin = lambda **_kwargs: calls.append("replaced")
+
+    trainer._reset_async_activation_offload_if_enabled = replace_hook
+    wrapper.on_step_begin = lambda **_kwargs: calls.append("stale")
+    wrapper.train_step(iter([[{"labels": torch.tensor([[-100, 2]])}]]))
+    assert calls[-1] == "replaced"
 
 
 def test_callback_creating_all_padding_does_not_advance_step(run_train_step, identity_loss):
