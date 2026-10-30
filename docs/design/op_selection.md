@@ -325,7 +325,64 @@ model cannot be patched.
 - Registration: `veomni/ops/kernels/loss/__init__.py`
 - Implementations: `veomni/ops/kernels/loss/cross_entropy_loss/standard/`
 - Model policy: `veomni/models/loss_utils/cross_entropy_loss.py`
-- Log-probs/distillation side paths: `veomni/models/loss_utils/`
+
+### Per-Token Log-Probabilities and Chunked RL / Distillation (`token_logprobs`)
+
+When `ForCausalLMLoss` runs with `return_log_probs=True` (PPO/GRPO log-prob and
+entropy recompute, or top-k forward-KL distillation), it delegates to
+`chunk_logprobs_function` and `chunk_topk_distill_function` in
+`veomni/models/loss_utils/`. The tensor-level chunked `torch.autograd.Function`
+kernels (`_ChunkedLinearLogProbs`, `_ChunkedLinearTopkDistill`) live in
+`veomni/ops/kernels/loss/token_logprobs/chunked.py`, while the per-token
+log-probability step dispatches through the `("token_logprobs", "standard")`
+operation family on `OP_REGISTRY`:
+
+| Value | Implementation | Default device | Requirements |
+|-------|---------------|----------------|---|
+| `flash_attn` | `flash_attn.ops.triton.cross_entropy.cross_entropy_loss` | GPU (`cuda`) | `flash_attn.ops.triton.cross_entropy` on GPU |
+| `torch_npu` | `torch_npu.npu_cross_entropy_loss` | Ascend NPU (`npu`) | Ascend NPU |
+| `eager` | PyTorch `clamp + log_softmax + gather + where` | CPU / fallback | — |
+
+Selection and fallback semantics:
+
+- **Device defaults (`impl=None`)**: On GPU, automatic selection chooses
+  `flash_attn` when `flash_attn.ops.triton.cross_entropy` is available and
+  importable, and otherwise falls back to `eager` (including when the package is
+  discoverable via `find_spec` but its compiled extension raises `ImportError`
+  at runtime). On Ascend NPU, automatic selection chooses `torch_npu` and falls
+  back to `eager` if `torch_npu.npu_cross_entropy_loss` is unavailable.
+- **CPU tensor behavior**: When `impl=None` and the input tensor is on `"cpu"`,
+  `resolve_token_logprobs_op` selects `eager` directly so CPU unit tests and
+  host tensors on GPU/NPU machines do not dispatch into accelerator-only
+  kernels.
+- **Explicit implementation (`impl="flash_attn" | "torch_npu" | "eager"`)**:
+  Explicit selection is strict and never falls back. Unmet hardware or package
+  requirements raise `RuntimeError` during `OP_REGISTRY` resolution, and broken
+  runtime imports raise `ImportError`.
+
+```python
+from veomni.models.loss_utils import chunk_logprobs_function, chunk_topk_distill_function
+from veomni.ops.kernels.loss.token_logprobs.chunked import resolve_token_logprobs_op
+
+# Direct per-token log-probabilities op handle:
+token_logprobs_op = resolve_token_logprobs_op(device_type=logits.device.type)
+log_probs = token_logprobs_op(logits, labels, ignore_index=-100)
+
+# Model-facing chunked fused-linear helpers (optional impl or op override):
+log_probs, entropy = chunk_logprobs_function(
+    hidden_states, weights, labels, chunk_size=1024, impl=None
+)
+log_probs, entropy, distill, student_mass, teacher_mass = chunk_topk_distill_function(
+    hidden_states, weights, labels, teacher_topk_ids, teacher_topk_log_probs, chunk_size=1024, impl=None
+)
+```
+
+Key files:
+
+- Registration: `veomni/ops/kernels/loss/__init__.py`
+- Row implementations: `veomni/ops/kernels/loss/token_logprobs/standard/{eager,flash_attn,torch_npu}.py`
+- Chunked autograd kernels: `veomni/ops/kernels/loss/token_logprobs/chunked.py`
+- Model-facing policy (SP guard, causal shift, trailing zero pad): `veomni/models/loss_utils/{chunk_logprobs,chunk_topk_distill}.py`
 
 ---
 

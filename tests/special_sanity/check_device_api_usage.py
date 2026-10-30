@@ -62,6 +62,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # CPU-only argument tests pass an accelerator name to mocked builders to
     # exercise inherited FP8 policies without allocating accelerator tensors.
     "tests/arguments/test_model_arguments.py",
+    # EP option tests use literal backend names to verify cross-device rejection.
+    "tests/ci/test_ep_hccl_options.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on

@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1003),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1010),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 

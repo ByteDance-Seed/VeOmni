@@ -33,6 +33,7 @@ When restructuring code (same behavior, better structure):
 - Data collators in `veomni/data/data_collator.py` are coupled to `DEFAULT_DATA_COLLATE_INFO` — adding new tensor keys requires updating the collate info table.
 - `MainCollator` has **strict SP ordering** (pad → slice → FA kwargs → slice position_ids) — reordering breaks SP correctness.
 - `position_ids == 0` marks segment boundaries for FA varlen — any transform that produces position_ids must preserve this convention.
+- **Avoid the "AI self-inflicted defense loop"**: Do not add defensive code or synthetic unit tests for hypothetical scenarios outside VeOmni's runtime contract (e.g., `asyncio`/multi-threaded concurrency on synchronous trainer state, SP/DP ranks disagreeing on config or shared batch metadata, internal hooks maliciously mutating tensors, 0-token samples, `complex64`/`_neg_view` activations, or hostile OS/import-machinery tampering). Keep fixes minimal and proportional to the real bug or feature; see `/veomni-review`.
 
 ## Documentation
 
