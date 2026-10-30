@@ -1078,7 +1078,7 @@ def build_parallelize_model(
     # Layer selection and SAC are bound per block, after HF has set its own
     # function on every checkpointing layer and before FSDP shards them. Runs
     # outside the branch above: models whose block loops drive checkpointing
-    # themselves (MiniMax-H3) still need their blocks bound.
+    # themselves still need their blocks bound.
     if recompute_policy is not None:
         recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
 
