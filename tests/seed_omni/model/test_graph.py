@@ -466,6 +466,21 @@ def test_generate_keeps_every_artefact_a_body_pass_emits():
     assert [item["value"] for item in generated] == ["module_A", "module_B"]
 
 
+def _nonterminating_generation_graphs() -> dict:
+    """One state that never transitions, so the driver runs to the token cap."""
+    return {
+        "infer_gen": {
+            "initial": "run",
+            "states": {
+                "run": {
+                    "body": [{"from": "module_A", "to": "end"}],
+                    "transitions": [{"condition": {"type": "module_signal", "key": "unused"}, "next_state": "done"}],
+                }
+            },
+        }
+    }
+
+
 def test_max_new_tokens_does_not_count_the_prefill_pass():
     """Pass 1 only prefills the prompt; the budget is measured in emitted tokens.
 
@@ -487,25 +502,27 @@ def test_max_new_tokens_does_not_count_the_prefill_pass():
     config = OmniConfig(
         _module_entries={"module_A": {"model_path": "module_A"}},
         training_graphs={},
-        generation_graphs={
-            "infer_gen": {
-                "initial": "run",
-                "states": {
-                    "run": {
-                        "body": [{"from": "module_A", "to": "end"}],
-                        "transitions": [
-                            {"condition": {"type": "module_signal", "key": "unused"}, "next_state": "done"}
-                        ],
-                    }
-                },
-            }
-        },
+        generation_graphs=_nonterminating_generation_graphs(),
     )
     model = OmniModel(config, {"module_A": _PrefillThenToken()})
 
     model.reset()
     generated = model.generate({}, generation_kwargs={"max_new_tokens": 2})
     assert [item["value"] for item in generated] == ["2", "3"]
+
+
+def test_max_new_tokens_counts_an_immediately_generating_graph():
+    """A first pass that already emits is generation, not prefill: no free extra pass."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs=_nonterminating_generation_graphs(),
+    )
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A")})
+
+    model.reset()
+    generated = model.generate({}, generation_kwargs={"max_new_tokens": 2})
+    assert len(generated) == 2
 
 
 def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():
