@@ -283,7 +283,7 @@ def test_fa4_probe_rejects_missing_wrapper_arguments(primitive, missing):
     def backward():
         pass
 
-    parameters = {"forward": shared | {"return_lse"}, "backward": shared | {"dq", "dk", "dv"}}
+    parameters = {"forward": shared | {"return_lse"}, "backward": shared | {"dq", "dk", "dv", "deterministic"}}
 
     def set_signatures():
         for name, function in (("forward", forward), ("backward", backward)):

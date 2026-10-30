@@ -65,6 +65,7 @@ Core entry points:
    - Underlying primitive: `_SeqAllToAll` (autograd-aware `all_to_all_tensor`).
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
    - With USP (`cp_size > 1`), Ulysses runs first and zig-zag Ring Attention runs over the CP group. The unified entry and shared communication/layout helpers live under `sequence_parallel/ring_attention/`; CUDA uses `gpu.py` (FA2/FA4) and Ascend uses the guarded `npu.py` (`torch_npu.npu_fusion_attention`).
+   - FA2 Ring backward must read `FLASH_ATTENTION_DETERMINISTIC` at call time, matching the non-CP Transformers FA2 path. `train.enable_full_determinism` sets it after model modules are imported; do not cache it at import time or hardcode `False` in dense/zig-zag/varlen kernel calls.
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
    - Gradient scale: the data-parallel gradient reduction averages over the SP ranks too (FSDP2 over `dp_shard_sp`, DDP over `dp_sp` at clip time), so each SP rank's backward must produce `sp_size ×` its share of the gradient. `ReduceLoss.backward` multiplies by `sp_world_size`. A model that gathers its output and computes a loss replicated on every SP rank must call `_Gather` with `sum_grad=True` (the `gather_outputs()` default) or `grad_scale=True, sum_grad=False`. Plain `sum_grad=False` silently scales every gradient by `1/sp_size` while the loss still matches (MiniMax H3 had this bug); compare SP gradients, not only losses, against a single-rank reference.
@@ -271,6 +272,10 @@ Core files:
 - Ring detects FA2/FA4 independently and uses the configured backend, saved on
   the autograd context for backward. Package import order must not override an
   explicit implementation.
+- FA4 base interface support is independent of its optional deterministic
+  backward argument. Keep ordinary Ring execution available on older compatible
+  kernels; reject unsupported determinism before communication, including when
+  the environment flag changes between forward and backward.
 - Packed USP half indices and CP-local offsets are computed on CPU in the
   collator and passed with the batch; do not rebuild them using GPU scalar reads
   or dynamic boolean indexing in every attention layer.
