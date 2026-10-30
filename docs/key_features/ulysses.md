@@ -476,7 +476,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 
 ### Implementation Map
 
-- Ring kernel: `veomni/distributed/sequence_parallel/ring_attention.py`
+- Ring kernel: `veomni/distributed/sequence_parallel/ring_attention/`
+  (`gpu.py` for FA2/FA4, `npu.py` for Ascend fusion attention)
   (`zigzag_ring_flash_attn_func` for dense, `zigzag_ring_flash_attn_varlen_func`
   for packed, online-softmax `update_out_and_lse`, `RingComm`).
 - Data layout: `veomni/distributed/sequence_parallel/data.py`
@@ -493,7 +494,12 @@ layout preserves DeepSeek V4's model-specific CP and does not allow combining
 CP with Ulysses. CP cannot be combined with `model.accelerator.enable_async: true`;
 async Ulysses and Ring are not integrated yet. USP requires `MODELING_BACKEND=veomni`. This release enables
 USP for Qwen3 causal text training with
-VeOmni FlashAttention 2 or 4 (`Qwen3ForCausalLM` only). RL/DPO, sequence
+VeOmni FlashAttention 2 or 4 on CUDA (`Qwen3ForCausalLM` only).
+On Ascend, select `flash_attention_2`; the VeOmni adapter dispatches to
+`torch_npu.npu_fusion_attention` and its gradient operator. FA4 is CUDA-only.
+The Ascend layer remains experimental pending hardware numerical validation.
+Its packed kernel still normalizes local offsets on the host; the GPU path
+uses the precomputed collator indices without per-layer device scalar reads. RL/DPO, sequence
 classification, multimodal packing, sliding-window attention,
 softcap, attention sinks, nonzero attention dropout, and deterministic backward
 (`train.enable_full_determinism` / `FLASH_ATTENTION_DETERMINISTIC=1`) are unsupported and

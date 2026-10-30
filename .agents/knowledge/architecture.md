@@ -22,7 +22,7 @@ veomni/
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   ├── context_parallel/  DeepSeek-V4 sparse-attention CP: window sharding and collectives
-│   └── sequence_parallel/  Ulysses SP and opt-in zigzag CP Ring (USP)
+│   └── sequence_parallel/  Ulysses SP and opt-in zigzag CP Ring (USP); ring_attention/ shares layout/comm across GPU and NPU
 ├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries

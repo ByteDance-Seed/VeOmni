@@ -108,8 +108,11 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
         architectures = getattr(config, "architectures", None)
         if architectures and architectures != ["Qwen3ForCausalLM"]:
             raise NotImplementedError("USP currently supports Qwen3ForCausalLM training only.")
-        if state.device_type != "cuda" or IS_NPU_AVAILABLE:
-            raise NotImplementedError("GPU USP requires a CUDA parallel state.")
+        if state.device_type == "npu":
+            if implementation != "veomni_flash_attention_2":
+                raise NotImplementedError("Ascend USP requires the VeOmni FlashAttention 2 adapter.")
+        elif state.device_type != "cuda" or IS_NPU_AVAILABLE:
+            raise NotImplementedError("USP requires a CUDA or NPU parallel state.")
         if getattr(config, "attention_dropout", 0.0):
             raise NotImplementedError("USP requires attention_dropout=0.")
         return

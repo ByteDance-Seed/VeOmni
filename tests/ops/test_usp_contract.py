@@ -98,7 +98,7 @@ def test_dpo_rejects_zigzag_before_setup():
 
 @pytest.mark.parametrize("extra_outputs", [(), (None, None)])
 def test_fa4_forward_accepts_auxiliary_outputs(monkeypatch, extra_outputs):
-    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu as ring
 
     q = torch.zeros(1, 8, 2, 4)
     lse = torch.zeros(1, 2, 8)
@@ -192,7 +192,7 @@ def test_installed_ops_cannot_bypass_usp_with_plain_attention(monkeypatch, backe
 
 @pytest.mark.parametrize("kind", ["plain", "zigzag", "varlen"])
 def test_ring_pins_backend_through_interleaved_backward(monkeypatch, kind):
-    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu as ring
 
     monkeypatch.setattr(ring, "FA_BACKENDS", frozenset({"fa2", "fa4"}))
     monkeypatch.setattr(ring, "FA_BACKEND", "fa2")
@@ -229,12 +229,14 @@ def test_ring_pins_backend_through_interleaved_backward(monkeypatch, kind):
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_flash_selects_explicit_fa4_when_both_backends_exist(monkeypatch, packed):
-    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu as ring
 
     monkeypatch.setattr(ring, "FA_BACKENDS", frozenset({"fa2", "fa4"}))
     monkeypatch.setattr(ring, "FA_BACKEND", "fa2")
     monkeypatch.setattr(
-        flash, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", cp_group=object())
+        flash,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", cp_group=object(), cp_size=2, device_type="cuda"),
     )
     monkeypatch.setattr(flash, "should_apply_ulysses", lambda **kwargs: False)
     calls = []
@@ -262,7 +264,7 @@ def test_flash_selects_explicit_fa4_when_both_backends_exist(monkeypatch, packed
 def test_fa4_probe_rejects_missing_wrapper_arguments(primitive, missing):
     import inspect
 
-    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu as ring
 
     shared = {
         "softmax_scale",
@@ -294,6 +296,62 @@ def test_fa4_probe_rejects_missing_wrapper_arguments(primitive, missing):
     parameters[primitive].remove(missing)
     set_signatures()
     assert not ring._supports_fa4_interface(forward, backward)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_cuda_backend_rejects_dropout(packed):
+    from veomni.distributed.sequence_parallel.ring_attention import gpu
+
+    q = torch.zeros(1, 8, 2, 4)
+    with pytest.raises(NotImplementedError, match="dropout"):
+        if packed:
+            gpu.packed_forward(q, q, q, torch.tensor([0, 8], dtype=torch.int32), 8, dropout_p=0.1)
+        else:
+            gpu.forward(q, q, q, dropout_p=0.1)
+
+
+def test_npu_usp_model_gate(monkeypatch):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(
+        auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", device_type="npu")
+    )
+    auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_2")
+    with pytest.raises(NotImplementedError, match="Ascend USP"):
+        auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_4")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_npu_adapter_uses_shared_dispatch_without_cuda_backend(monkeypatch, packed):
+    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu
+
+    monkeypatch.setattr(gpu, "FA_BACKENDS", frozenset())
+    monkeypatch.setattr(
+        flash,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", cp_group=object(), cp_size=2, device_type="npu"),
+    )
+    monkeypatch.setattr(flash, "should_apply_ulysses", lambda **kwargs: False)
+    calls = []
+
+    def selected(query, *args, **kwargs):
+        calls.append(kwargs)
+        return query
+
+    monkeypatch.setattr(ring, "ring_attention", selected)
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2"), is_causal=True)
+    q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
+    kwargs = {}
+    if packed:
+        from veomni.distributed.sequence_parallel.data import prepare_usp_metadata
+
+        cu = torch.tensor([0, 8, 16], dtype=torch.int32)
+        kwargs.update(prepare_usp_metadata(cu, cp_size=2), cu_seq_lens_q=cu)
+    flash.flash_attention_forward(module, q, q, q, None, **kwargs)
+    assert calls[0]["device_type"] == "npu"
+    assert calls[0]["backend_name"] is None
+    assert (calls[0]["usp_metadata"] is not None) == packed
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "zigzag"])

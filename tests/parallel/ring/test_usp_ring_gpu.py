@@ -37,7 +37,11 @@ import torch.distributed as c10d
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from scripts.ci.accelerator.pytest_plugin import validate_launch
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.import_utils import is_torch_npu_available
 
+
+if is_torch_npu_available():
+    pytest.skip("CUDA Ring tests", allow_module_level=True)
 
 if not c10d.is_available():
     pytest.skip("torch.distributed unavailable", allow_module_level=True)
@@ -60,7 +64,7 @@ from veomni.distributed.sequence_parallel.data import (
     zigzag_reorder,
     zigzag_reorder_varlen,
 )
-from veomni.distributed.sequence_parallel.ring_attention import (
+from veomni.distributed.sequence_parallel.ring_attention.gpu import (
     FA_BACKENDS,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
