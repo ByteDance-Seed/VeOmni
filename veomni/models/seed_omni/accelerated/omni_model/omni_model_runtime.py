@@ -467,9 +467,12 @@ class OmniModelRuntime:
         model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        # The first pass is prompt prefill and emits no token, so it must not
+        # consume the token budget.
+        max_steps = max_new_tokens + 1
         total_steps = 0
 
-        while not model.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not model.generation_graph.is_done() and total_steps < max_steps:
             model._emit_progress(total_steps)
             state_name = model.generation_graph.current_state_name
             for node in model.generation_graph.iter_nodes(ctx):

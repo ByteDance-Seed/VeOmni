@@ -666,8 +666,11 @@ class OmniModel(PreTrainedModel):
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        # The first pass is prompt prefill and emits no token, so it must not
+        # consume the token budget.
+        max_steps = max_new_tokens + 1
         total_steps = 0
-        while not self.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not self.generation_graph.is_done() and total_steps < max_steps:
             self._emit_progress(total_steps)
             for node in self.generation_graph.iter_nodes(ctx):
                 module = getattr(self, node.module)

@@ -466,6 +466,48 @@ def test_generate_keeps_every_artefact_a_body_pass_emits():
     assert [item["value"] for item in generated] == ["module_A", "module_B"]
 
 
+def test_max_new_tokens_does_not_count_the_prefill_pass():
+    """Pass 1 only prefills the prompt; the budget is measured in emitted tokens.
+
+    The graph never signals ``done``, so it runs to the cap: exactly
+    ``max_new_tokens`` artefacts, not ``max_new_tokens - 1``.
+    """
+
+    class _PrefillThenToken(_ArtefactModule):
+        def __init__(self):
+            super().__init__("token")
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {}
+            return {"generated": {"type": "text", "value": str(self.calls)}}
+
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs={
+            "infer_gen": {
+                "initial": "run",
+                "states": {
+                    "run": {
+                        "body": [{"from": "module_A", "to": "end"}],
+                        "transitions": [
+                            {"condition": {"type": "module_signal", "key": "unused"}, "next_state": "done"}
+                        ],
+                    }
+                },
+            }
+        },
+    )
+    model = OmniModel(config, {"module_A": _PrefillThenToken()})
+
+    model.reset()
+    generated = model.generate({}, generation_kwargs={"max_new_tokens": 2})
+    assert [item["value"] for item in generated] == ["2", "3"]
+
+
 def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():
     """An inference-only checkpoint (``training_graph: []``) must still load."""
     config = OmniConfig(
