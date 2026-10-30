@@ -72,9 +72,10 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     same reason: a config that has nothing to refuse should not have to say so.
 
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
-    today. It refuses a Lightning Indexer KL objective configured without the TileLang
-    indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two op selections, which no single dataclass can see.
+    today. It refuses a Lightning Indexer KL objective configured without a
+    score-returning indexer and a fused attention that returns the full base-2 LSE
+    (TileLang on NVIDIA, Triton on ROCm) -- a disagreement between a model field
+    and two op selections, which no single dataclass can see.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):

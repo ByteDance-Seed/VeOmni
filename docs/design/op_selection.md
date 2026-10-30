@@ -18,8 +18,8 @@ If a field is not in this table, it is not an op-selection knob.
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` stored on the attention module |
-| DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4, ROCm), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4, ROCm), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -266,8 +266,16 @@ TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
 
 On AMD ROCm GPUs, `dsa_attention_implementation: triton` selects the same
-DeepSeek-V4 sparse MQA contract. The indexer and mHC remain independent;
-the optional indexer-loss teacher still requires both TileLang selections.
+DeepSeek-V4 sparse MQA contract and returns the base-2 LSE consumed by the
+indexer-loss teacher.
+
+On AMD ROCm GPUs, `dsa_indexer_implementation: triton` keeps the TileLang
+indexer's contract: one fused Triton kernel applies ReLU, the per-head weight,
+the head sum and each query's visible range without materializing per-head
+logits, `torch.topk` selects, and the backward recomputes only the selected
+logits. Its scores can train `dsa_indexer_loss` like the TileLang indexer's, with
+the teacher running as a Triton kernel on ROCm. The objective accepts the
+TileLang indexer/attention pair on NVIDIA or the Triton pair on ROCm.
 
 The same three fields select `cann` on Ascend, which requires
 `cann_ops_transformer`:

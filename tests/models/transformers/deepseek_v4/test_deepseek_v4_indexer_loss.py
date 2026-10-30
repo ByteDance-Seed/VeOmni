@@ -185,6 +185,15 @@ def test_indexer_loss_enabled_refuses_eager_attention(monkeypatch: pytest.Monkey
         _indexer_loss_enabled(_module_with_config(indexer="tilelang", dsa_indexer_loss=True))
 
 
+def test_indexer_loss_enabled_accepts_the_triton_pair(monkeypatch: pytest.MonkeyPatch):
+    """The ROCm pair returns differentiable scores and the full base-2 attention LSE."""
+    monkeypatch.setattr(
+        "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
+        lambda: ParallelState(dp_size=1, ulysses_size=1),
+    )
+    assert _indexer_loss_enabled(_module_with_config(indexer="triton", attention="triton", dsa_indexer_loss=True))
+
+
 @pytest.mark.parametrize(
     ("mode", "sizes", "expected"),
     [
