@@ -729,10 +729,14 @@ class ProfilerWithMem:
     def start(self):
         out = self._p.start()
         memory = get_torch_device().memory
-        if get_device_type() in ("cuda", "xpu"):
+        if get_device_type() == "cuda":
             # Keep stacks for live allocations; recording every free traceback
             # can crash profiler-enabled training during activation recomputation.
             memory._record_memory_history(context="state")
+        elif get_device_type() == "xpu":
+            # Recording starts at training start, so cap the event history
+            # for a late profiling window.
+            memory._record_memory_history(context="state", max_entries=100000)
         else:
             memory._record_memory_history()
         return out
