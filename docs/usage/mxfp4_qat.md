@@ -158,3 +158,29 @@ The multi-GPU test is prepared but has not yet been executed on physical
 GPUs for this change. Collection or a CPU skip is not a passing distributed
 acceptance result. Representative convergence, throughput, peak memory and
 deployment-format compatibility remain outside the current evidence.
+
+### Run on Modal
+
+The optional [Modal runner](../../scripts/run_mxfp4_modal.py#L50) runs the same
+two tests in one container with two A100 40 GB GPUs. Its Ubuntu 24.04 image
+uses Python 3.12 and uv 0.11.16 to install the locked `gpu` extra, `test` group
+and default `transformers-stable` group. The local Modal SDK stays separate
+from VeOmni's dependencies.
+
+After configuring a Modal account, run from the repository root:
+
+```bash
+uvx --python 3.12 --from modal==1.6.3 modal run -m scripts.run_mxfp4_modal
+```
+
+This command builds the cloud image and starts a billable GPU job. Importing
+the module or requesting `--help` only inspects the local definition. The
+image and GPU execution have not yet been validated on Modal.
+
+The runner uploads Git-tracked files from `veomni/`, `tests/` and `scripts/`,
+plus the dependency metadata; stage newly added source files before running.
+It uses the existing tiny random model and requires no model or dataset
+download. Test output streams to the terminal; `run.log` and `junit.xml`
+are also saved under `outputs/mxfp4-modal/<UTC timestamp>/`, including when
+pytest fails. Both tests must pass with no skips. The function has a
+15-minute timeout and no automatic test retries.
