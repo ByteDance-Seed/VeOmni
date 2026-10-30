@@ -36,7 +36,15 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     supports_gradient_checkpointing = True
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
-        # Attention is validated and executed by ``self.language_model``.
+        # Attention is validated and executed by ``self.language_model``, which
+        # receives a plain 2-D mask on this module's packed path. Flex would
+        # turn that into a causal ``BlockMask`` without the sample boundaries
+        # the packed conversations rely on.
+        if isinstance(attn_implementation, str) and "flex_attention" in attn_implementation:
+            raise ValueError(
+                "Qwen3Llm packs several conversations into one sequence and isolates them with a dense "
+                "mask, so `flex_attention` is not supported here; use `eager`, `sdpa`, or a flash backend."
+            )
         return attn_implementation
 
     def __init__(self, config: Qwen3LlmConfig):

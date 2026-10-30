@@ -178,6 +178,35 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert te2.config.vocab_size == 128
 
 
+def test_qwen3_llm_rejects_flex_attention():
+    """The packed path hands the backbone a 2-D mask, which Flex cannot isolate."""
+    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    with pytest.raises(ValueError, match="flex_attention"):
+        Qwen3Llm(
+            Qwen3LlmConfig(
+                text_config=_tiny_qwen3_cfg(),
+                ops_implementation={"attn_implementation": "flex_attention"},
+            )
+        )
+
+
+def test_qwen3_llm_generate_rejects_ulysses_sequence_parallel(monkeypatch):
+    import veomni.models.seed_omni.modules.base.llm_packing as llm_packing
+
+    monkeypatch.setattr(llm_packing, "get_parallel_state", lambda: SimpleNamespace(sp_size=2))
+    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation={"attn_implementation": "eager"},
+        )
+    )
+    with pytest.raises(ValueError, match="sp_size=1"):
+        llm.generate(conversation_list=[ConversationItem(type="text", value="hi", role="user")])
+
+
 @pytest.mark.parametrize("attn_impl", ["eager", "sdpa", "veomni_sdpa"])
 def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatch, attn_impl):
     import copy
