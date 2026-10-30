@@ -849,8 +849,7 @@ def _apply_extra_parallel_dim(
 
     * ``"exact"`` (model): the state-dict key IS the FQN,
       e.g. ``"model.layers.0.mlp.experts.gate_proj"``.
-    * ``"substring"`` (optimizer): the state-dict key contains the FQN
-      with extra prefix/suffix, e.g.
+    * ``"substring"`` (optimizer): the key starts with ``state.<FQN>.``, e.g.
       ``"state.model.layers.0.mlp.experts.gate_proj.exp_avg"``.
 
     Non-tensor values and 0-D tensors are skipped unconditionally — they
@@ -867,12 +866,18 @@ def _apply_extra_parallel_dim(
     extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys()) if key_match == "substring" else None
 
     for name in sorted(state_dict.keys()):
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor) or tensor.ndim == 0:
+            continue
+
         if key_match == "exact":
             if name not in extra_parallel_fqn2spec_info:
                 continue
             spec_info = extra_parallel_fqn2spec_info[name]
         else:  # "substring"
-            matches = [k for k in extra_parallel_keys if k in name]
+            # Anchor the optimizer namespace: a nested parameter may end with
+            # another parameter's FQN. Param-group fields are not tensor state.
+            matches = [k for k in extra_parallel_keys if name.startswith(f"state.{k}.")]
             if not matches:
                 continue
             assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
@@ -886,12 +891,6 @@ def _apply_extra_parallel_dim(
         # ``(ple_fsdp, ple)``). They are not managed by FSDP2, so there is no
         # temporary ExtraParallel dimension to drop or restore around DCP.
         if getattr(spec_info, "persistent_fsdp_shard_dim", None) is not None:
-            continue
-
-        tensor = state_dict[name]
-        if not torch.is_tensor(tensor):
-            continue
-        if tensor.ndim == 0:
             continue
 
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
