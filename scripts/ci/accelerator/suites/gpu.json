@@ -643,5 +643,23 @@
       "-x",
       "tests/models/test_omni_fsdp.py"
     ]
+  },
+  {
+    "name": "qwen38-profiler_config-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_profiler_config.py"
+    ]
+  },
+  {
+    "name": "qwen38-npu_offline_postprocess-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_npu_offline_postprocess.py"
+    ]
   }
 ]
