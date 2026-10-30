@@ -218,6 +218,49 @@ def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     assert sum(map(len, slices)) == len(set.union(*slices))  # No device is leased twice.
 
 
+def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
+    from scripts.ci.accelerator.runtime.devices import child_environment, probe
+    from veomni.utils import device
+
+    caps = RunnerCapabilities("xpu", ("2", "5"))
+    worker = child_environment(caps, ["5"], environ={"ZE_AFFINITY_MASK": "0,1"})
+    assert worker["ZE_AFFINITY_MASK"] == "5"
+    cpu = child_environment(caps, [], cpu=True, environ={"ZE_AFFINITY_MASK": "2,5"})
+    assert cpu["ZE_AFFINITY_MASK"] == ""
+
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "2,5")
+    monkeypatch.setattr(device, "get_device_type", lambda: "xpu")
+    monkeypatch.setattr(
+        device,
+        "get_torch_device",
+        lambda: SimpleNamespace(is_available=lambda: True, device_count=lambda: 2),
+    )
+    output = tmp_path / "capabilities.json"
+    probe(str(output))
+    assert json.loads(output.read_text()) == {"backend": "xpu", "devices": ["2", "5"]}
+
+
+def test_xpu_launch_validation_uses_affinity_mask(monkeypatch, tmp_path):
+    import json
+
+    from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, ResourcePlanError
+    from scripts.ci.accelerator.pytest_plugin import validate_launch
+
+    capabilities = tmp_path / "capabilities.json"
+    capabilities.write_text(json.dumps({"backend": "xpu", "devices": ["2", "5"]}))
+    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(capabilities))
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(nproc=2)).to_dict()))
+    monkeypatch.setenv("VEOMNI_CI_LEASE", json.dumps(["2", "5"]))
+
+    validate_launch(2, env={"ZE_AFFINITY_MASK": "2,5"})
+    with pytest.raises(ResourcePlanError, match="cannot run on lease"):
+        validate_launch(2, env={"ZE_AFFINITY_MASK": "0,1"})
+
+
 def test_case_batches_preserve_inventory_and_resource_requests():
     from scripts.ci.accelerator.batching import make_batches
 
