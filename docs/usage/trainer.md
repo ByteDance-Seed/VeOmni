@@ -195,7 +195,7 @@ To implement a specific training task (like VLM training), compose a `BaseTraine
    ```
 
 4. **`_build_collate_fn(self)`**:
-   Wire extra collate rules. Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`) over a trainer-side `model_type` switch.
+   Wire extra collate rules. Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`, `get_dyn_bsz_length_fn` -- the last reports the in-model expanded sequence length so dynamic batching budgets the true cost) over a trainer-side `model_type` switch.
 
 ### Extending Arguments
 

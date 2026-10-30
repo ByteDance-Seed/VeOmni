@@ -1518,6 +1518,23 @@ class OpsImplementationConfig:
             "matching backend raises when the model resolves its kernel."
         },
     )
+    situ_and_mul_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Kimi-K3 SituGLU activation (beta*tanh(gate/beta)*sigmoid(gate) * up). "
+            "'eager' uses the modeling's own SituAndMul. "
+            "'triton' uses the vendored Triton-ascend fused kernel (requires triton-ascend, NPU)."
+        },
+    )
+    chunk_kda_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Kimi-K3 KDA chunked linear attention. "
+            "'eager' uses the modeling's own chunk_kda_naive (pure PyTorch, slow). "
+            "'ascendc' uses the fused AscendC kernel from the flash-linear-attention-npu "
+            "package via the vendored wrapper (NPU; production default)."
+        },
+    )
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={
