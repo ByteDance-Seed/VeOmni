@@ -72,9 +72,12 @@ model:
     load_balancing_loss_implementation: eager
   optimizer:
     # NOTE: "adamw8bit" is not a supported OptimizerConfig.type in VeOmni.
-    # VeOmni supports: "adamw", "anyprecision_adamw", "muon".
-    # For memory-efficient training, consider "anyprecision_adamw" or reduce
-    # global_batch_size / use gradient checkpointing.
+    # VeOmni supports: "adamw", "anyprecision_adamw", "muon", "adamw_swap".
+    # For memory-efficient training, consider "anyprecision_adamw", "adamw_swap",
+    # or reduce global_batch_size / use gradient checkpointing.
+    # NOTE: "adamw_swap" requires model.accelerator.fsdp_config.offload: false
+    # (this config enables that offload below; the combination is rejected at
+    # config parse time because both move training state to host).
     type: adamw
     lr: 1.0e-4
     lr_decay_style: linear
