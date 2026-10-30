@@ -119,6 +119,11 @@ BaseRLTrainer (ABC)  subclasses BaseTrainer
 
 `VeOmniModelRuntime` contributes the model-bound half. `setup()` only registers this model's mesh. `__init__` then wraps the mesh-dependent build in `use_parallel_state(self.model_name)`:
 - `_build_model()` -> meta-init through the registry-aware loader
+- `build_foundation_model()` prepares opt-in Dense Qwen3 `torchao_mxfp4` QAT
+  projections before returning, for both meta training builds and eager HF
+  reloads. The recipe and target patterns live in the model's persisted ops
+  config; `veomni/models/qat.py` owns preparation and the separate offline
+  torchao artifact. See `docs/usage/mxfp4_qat.md`.
 - `_freeze_model_module()` / `_setup_lora()` -> trainable surface
 - `_build_parallelized_model()` -> FSDP2/DDP wrap + weight load
 - `_build_optimizer()` -> optimization

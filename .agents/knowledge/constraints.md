@@ -180,6 +180,11 @@ Core files:
 16. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
+    - Dense Qwen3 `torchao_mxfp4` QAT preserves ordinary parameter names and
+      derives quantization state per forward. Rebuild its persisted recipe and
+      targets before restoring DCP. Packed offline MXFP4 artifacts are a
+      separate inference format, not resumable training checkpoints or HF
+      quantized exports. See `docs/usage/mxfp4_qat.md`.
 
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.

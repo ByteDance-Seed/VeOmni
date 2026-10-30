@@ -287,7 +287,9 @@ def build_foundation_model(
             "you are missing sequence parallelism support. Please use a veomni_* attention implementation for SP."
         )
 
-    if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":
+    # Rank -1 means no process group: standalone CPU inference/export must load
+    # weights, just like rank 0. Only distributed nonzero ranks defer the load.
+    if (init_device == "cpu" and get_parallel_state().global_rank > 0) or init_device == "meta":
         empty_init = True
     else:
         empty_init = False
@@ -298,6 +300,12 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
+
+    from .qat import prepare_mxfp4_qat
+
+    # Replay the config-owned recipe for both eager reloads and meta-init before
+    # FSDP wrapping, keeping the checkpoint's original parameter names.
+    prepare_mxfp4_qat(model)
 
     if IS_NPU_AVAILABLE:
         logger.info_rank0(
