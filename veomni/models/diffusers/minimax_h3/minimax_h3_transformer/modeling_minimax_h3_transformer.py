@@ -215,6 +215,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         # Pop metadata keys (trainer may also pop them)
         skip_mask_out_condition = kwargs.pop("skip_mask_out_condition", False)
         cond_rows = kwargs.pop("cond_rows", 0)
+        audio_cond_rows = kwargs.pop("audio_cond_rows", 0)
         scheduler_video = kwargs.pop("scheduler_video", None)
         scheduler_audio = kwargs.pop("scheduler_audio", None)
         negative_inputs = kwargs.pop("unconditional_inputs", None)
@@ -248,6 +249,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             video_tokens,
             audio_tokens,
             cond_rows=cond_rows,
+            audio_cond_rows=audio_cond_rows,
             video_latent_shape=video_latent_shape,
             audio_latent_shape=audio_latent_shape,
             training_target=training_target,
@@ -264,6 +266,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         audio_tokens,
         *,
         cond_rows=0,
+        audio_cond_rows=0,
         video_latent_shape=None,
         audio_latent_shape=None,
         training_target=None,
@@ -276,10 +279,12 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_cfg_curvature_power=2.0,
         **kwargs,
     ):
+        """Remove reference rows, unpack target predictions, and compute target-only losses."""
         # Slice off condition rows (v_video_rows[cond_rows_count:])
         if cond_rows > 0:
             video_tokens = video_tokens[cond_rows:]
-            # No ref audio in FL2VA, so audio_tokens don't need slicing
+        if audio_cond_rows > 0:
+            audio_tokens = audio_tokens[audio_cond_rows:]
 
         # Unpatchify per-token output → dense latent tensors.
         # unpatchify_video expects patchify_video's input shape (full latent

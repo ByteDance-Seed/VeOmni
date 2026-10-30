@@ -1,7 +1,8 @@
-# Prepared visual Ref2VA + CFG-calibrated FM LoRA training.
+# Prepared Ref2VA + CFG-calibrated FM LoRA training.
 # See docs/examples/minimax_h3.md for the decoded cache contract.
 # Replace the model/cache paths before running:
 # bash train.sh tasks/train_dit.py configs/dit/minimax_h3_ref2va_cfg_offline.yaml
+# For NVIDIA CUDA BF16/SP, prefix the command with TORCH_BLAS_PREFER_CUBLASLT=1.
 model:
   model_path: /path/to/MiniMax-H3/Ref2VA/transformer
   config_path: /path/to/MiniMax-H3/Ref2VA/transformer/config.json
