@@ -46,34 +46,10 @@ scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
 that workflow. CPU tests checking device-name forwarding should use a mock
 backend sentinel when no real hardware API is involved.
 CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
-`cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
-fall back to the registered NPU and AMP capability queries can initialize a
-hidden device. Preserve this scope across fixture setup and teardown as well
-as the test body; accelerator plans and full-visibility collection stay unchanged.
-During that scope, optimizer foreach-capability queries use the canonical
-`torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
-alias with a device-name lookup that initializes NPU even for CPU parameters.
-Restore the prior alias on exit, preserving explicit foreach/fused options.
-The restoration scope includes setup itself, so partial initialization failures
-also undo changes already applied. Unsupported vendor isolation interfaces
-raise an explicit error before the test runs.
-torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
-with unconditional NPU synchronization/affinity calls, even for CPU datasets.
-CPU-planned cases temporarily use the vendor module's saved Torch constructor
-and restore the patch after teardown or failure. Only replace the known vendor
-wrapper; preserve unrelated constructor patches and all accelerator plans.
-The vendor Inductor wrapper also registers its NPU backend before compiling
-CPU graphs. CPU cases temporarily disable that registration through the loaded
-vendor registry and restore its prior disabled state after teardown or failure.
-Keep real CPU Inductor compilation and gradient checks enabled; do not replace
-compiled-mask coverage with eager execution to avoid hidden-device queries.
-CPU cases must also register Torch's built-in CPU device-op overrides when
-missing. torch_npu populates the override registry at import; Torch 2.10 then
-skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
-keys, so testing only that version misses the NPU CI failure. Preserve existing
-CPU/vendor entries and validate the pinned Torch version's startup state.
-A synthetic registered backend alone misses vendor monkeypatches: exercise
-the pinned wheel's optimizer patch in CPU isolation audits too.
+`cpu`, restore Torch's query-free optimizer foreach helper, register the built-in
+CPU device-op overrides when `torch_npu` left them out, and bypass `torch_npu`'s
+DataLoader affinity and Inductor NPU registration hooks while devices are hidden,
+restoring the prior settings afterward.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
@@ -81,6 +57,38 @@ PyTorch 2.11 CPU FP32 `torch.exp` was observed to return inaccurate values on
 its first parallel call, reproducing the original 757-element CI mismatch.
 Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
 independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
+
+CPU model tests must explicitly select eager implementations for every consumed
+op, rather than only setting attention to eager: host defaults can otherwise bind
+accelerator RMSNorm/MLP kernels to CPU inputs. FP32 accelerator parity tests
+must explicitly select SDPA when the default attention backend requires half
+precision. Attention-free wrapper construction tests should forbid HF kernel
+preloading, including the local FlashAttention loader, so they also cover
+CPU workers in NPU environments without `flash_attn`.
+The model-test autouse fixture rejects FlashAttention preloading for CPU launch
+plans and CPU-only hosts, even when the package is installed. It guards both
+HF's lazy entry and VeOmni's loader so process caches cannot hide a dependency.
+Local MLU hosts bypass this CI-specific fixture before plan resolution, since
+the CUDA/NPU scheduler does not support MLU; normal MLU model tests still run.
+Explicit availability-only mocks may replace the HF entry; real accelerator
+plans keep normal loading. Composite eager fixtures must set the root policy
+before constructing either reference or candidate, so otherwise unset
+vision/audio descendants inherit it. Do not rely on a later builder update or
+post-construction handle rebinding. Reuse `make_eager_ops_config()` for all-eager
+helpers, including LoRA, so GDN and vision fields cannot retain fused defaults.
+Standalone MLP/expert/attention fixtures and benchmarks must adapt native HF
+configs before passing them to patched leaf classes. Run the whole model suite without fail-fast
+when changing shared config semantics, then exercise FP32 distributed model
+comparisons with explicit config-owned SDPA.
+Tests asserting VeOmni kernel aliases or using the composed module registry must
+scope `MODELING_BACKEND=veomni` with a restoring fixture; they must not inherit
+the caller's backend or a previous test's environment. For handwritten Diffusers
+constructors, cover explicit attention overrides before HF initialization, plus
+omitted/None preservation and invalid selections; check the bound handles too.
+Plain-tensor checkpoint exports
+must not query an accelerator's current device; resolve the staging device only
+when a DTensor actually needs materialization. CPU-planned workers hide devices,
+so unnecessary device queries can initialize an unavailable vendor runtime.
 
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory
@@ -142,11 +150,6 @@ Consequences that cut both ways:
 The accelerator runner cancels running peers on the first failure by default;
 `--keep-going` continues all cases. Foreground logs must identify case progress,
 the original failure and cancelled peers without conflating their outcomes.
-Accelerator runner thread pools must cancel owned worker scopes before waiting
-for callbacks on interruption. Preserve scoped process cleanup and failure
-artifacts; do not terminate unrelated device users or rely on the batch timeout.
-Use future completion to prove callbacks drained: an interrupted `Thread.join`
-can report a stopped thread before its callback finishes cleanup.
 
 ## What the NPU job can actually run
 
@@ -227,12 +230,21 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- For API removals and config migrations, validate the result merged with the
+  latest target branch, including tests added upstream since the feature branch
+  diverged. GitHub PR CI checks out that merge result; passing tests on the branch
+  head alone does not cover newly added callers of the removed API.
 - Compiled backward can donate saved buffers and reject `retain_graph=True`.
   Numerical comparisons should use independent leaf tensors for the reference
   graph and differentiate each graph once without retaining it. Keep test inputs
   deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
   consumer reads, including `impl`.
+- Model selection tests that stub `VeomniOp` must still use valid implementation
+  names: module config validation runs before the stub receives the selection.
+  Cover legal eager and optimized selections under simulated GPU/NPU/MLU hosts
+  rather than using a synthetic backend name or bypassing validation. Config
+  mutations in handle-isolation tests must also remain valid on the host.
 - CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
   pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
   replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed

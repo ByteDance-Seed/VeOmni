@@ -234,7 +234,19 @@ config = PatchConfig(
     target_file="patched_modeling_<m>_gpu.py",
     description="<M> with LigerKernel GPU replacements + VeOmni SP/fused-loss patches",
 )
+config.drop_import_names("PreTrainedModel")
+config.add_import(
+    "veomni.models.modeling_base",
+    names=["VeOmniPreTrainedModel as PreTrainedModel"],
+)
 ```
+
+The VeOmni model base adapts `config_class` and direct native HF config inputs
+into real `VeOmniPretrainedConfig` subclasses. Do not monkey-patch HF config
+methods. Standalone leaf-module tests opt in with `get_veomni_config_class` or
+`as_veomni_config`; read `config.ops_config` when binding a local `VeomniOp`.
+`ops_implementation` owns attention state, including both HF attention accessors.
+See `docs/design/module_config.md`.
 
 **Patch primitives:**
 

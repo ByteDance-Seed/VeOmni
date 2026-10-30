@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,11 +8,12 @@ import torch
 import yaml
 from transformers import AutoConfig
 
-from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.compare import eager_ops_config
 from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 from veomni.distributed.utils import check_fqn_match
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen3_5_moe import (
     register_qwen3_5_moe_modeling,
     register_qwen3_5_moe_text_modeling,
@@ -36,8 +38,8 @@ INTERMEDIATE_DIM = 6
 
 
 def _eager_ops(config):
-    stamp_attn_implementation(config, "eager")
-    return ops_config_scope(eager_ops_config())
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return nullcontext()
 
 
 class _SumFusion(torch.nn.Module):
@@ -107,7 +109,7 @@ def test_qwen3_5_eval_text_model_returns_mtp_context_on_demand(
 ):
     config = deepcopy(AutoConfig.from_pretrained(config_path).text_config)
     config.num_hidden_layers = 0
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         text_model = text_model_cls(config)
     text_model.norm = torch.nn.Identity()
     text_model.rotary_emb = _EmptyRotary()

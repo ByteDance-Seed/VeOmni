@@ -38,6 +38,12 @@ FAKE_B = "fake_module_b"
 HIDDEN_SIZE = 8
 
 
+@pytest.fixture(autouse=True)
+def veomni_modeling_backend(monkeypatch):
+    """The fake-module registry and normalized attention assertions use VeOmni loading."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+
 def _chain_edges() -> list[dict]:
     return [{"from": FAKE_A, "to": FAKE_B}, {"from": FAKE_B, "to": "end"}]
 
@@ -137,6 +143,48 @@ def _build_omni_model() -> OmniModel:
             FAKE_B: FakeModuleB(FakeModuleBConfig(hidden_size=HIDDEN_SIZE)),
         },
     )
+
+
+@pytest.mark.parametrize("entrypoint", ["constructor", "from_config", "from_pretrained"])
+@pytest.mark.parametrize("override_all_modules", [False, True], ids=["invalid-module", "overridden-root"])
+def test_npu_load_validates_effective_module_ops(tmp_path, monkeypatch, entrypoint, override_all_modules):
+    from tests.tools.training_utils import make_eager_ops_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    model = _build_omni_model()
+    model.config._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
+    eager = make_eager_ops_config().to_dict()
+    for name in (FAKE_A, FAKE_B) if override_all_modules else (FAKE_A,):
+        model.config._module_entries[name]["ops_implementation"] = dict(eager)
+    model.save_pretrained(tmp_path)
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+
+    def load():
+        if entrypoint == "from_pretrained":
+            return OmniModel.from_pretrained(tmp_path, device_map="cpu")
+        config = OmniConfig.from_pretrained(tmp_path)
+        if entrypoint == "from_config":
+            return OmniModel.from_config(config)
+        return OmniModel(
+            config,
+            {FAKE_A: FakeModuleA(config._module_configs[FAKE_A]), FAKE_B: FakeModuleB(config._module_configs[FAKE_B])},
+        )
+
+    if not override_all_modules:
+        with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+            load()
+        return
+
+    loaded = load()
+    assert loaded.config.ops_implementation["rms_norm_implementation"] == "liger_kernel"
+    for name in (FAKE_A, FAKE_B):
+        module = getattr(loaded, name)
+        assert module.config.ops_config.rms_norm_implementation == "eager"
+    if entrypoint == "from_pretrained":
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(loaded.state_dict()[key], value)
 
 
 def test_omni_config_from_pretrained_hydrates_graph_sidecars(tmp_path):
@@ -276,30 +324,6 @@ def test_omni_model_from_pretrained_loads_the_fake_chain(tmp_path):
     assert torch.equal(loaded.get_module(FAKE_B).proj.weight, model.get_module(FAKE_B).proj.weight)
 
 
-@pytest.mark.parametrize("caller_has_ops", [False, True], ids=["no_base_ops", "base_ops"])
-def test_module_loading_restores_the_callers_ops_config(tmp_path, monkeypatch, caller_has_ops):
-    from veomni.arguments import OpsImplementationConfig
-    from veomni.ops.config import get_ops_config, set_ops_config
-
-    _build_omni_model().save_pretrained(tmp_path)
-    caller_ops = OpsImplementationConfig() if caller_has_ops else None
-    previous = get_ops_config()
-    set_ops_config(caller_ops)
-    try:
-        OmniModel.from_pretrained(tmp_path)
-        assert get_ops_config() is caller_ops
-
-        def fail_load(*args, **kwargs):
-            raise RuntimeError("module load failed")
-
-        monkeypatch.setattr(FakeModuleB, "from_pretrained", classmethod(fail_load))
-        with pytest.raises(RuntimeError, match="module load failed"):
-            OmniModel.from_pretrained(tmp_path)
-        assert get_ops_config() is caller_ops
-    finally:
-        set_ops_config(previous)
-
-
 def test_omni_model_from_pretrained_forwards_dtype_to_modules(tmp_path):
     _build_omni_model().save_pretrained(tmp_path)
 
@@ -326,7 +350,7 @@ def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_pat
     loaded = OmniModel.from_pretrained(tmp_path)
 
     assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
-    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
 def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
@@ -347,7 +371,7 @@ def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
     loaded = OmniModel.from_pretrained(tmp_path, attn_implementation="sdpa")
 
     assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
-    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
 def test_kernel_layers_merge_per_field_across_the_model_and_the_module(tmp_path):
@@ -493,7 +517,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     assert saved_root["_module_entries"][FAKE_A]["ops_implementation"] == {"attn_implementation": "eager"}
     # The saved module config is the resolved one: B's own attention plus the root default.
     assert json.loads((resaved / FAKE_B / "config.json").read_text(encoding="utf-8"))["ops_implementation"] == {
-        "attn_implementation": "sdpa",
+        "attn_implementation": "veomni_sdpa",
         "rms_norm_implementation": "eager",
     }
 
@@ -501,7 +525,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     assert reloaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
     assert reloaded.config._module_configs[FAKE_B].ops_implementation == {
         "rms_norm_implementation": "eager",
-        "attn_implementation": "sdpa",
+        "attn_implementation": "veomni_sdpa",
     }
 
 
@@ -527,7 +551,7 @@ def test_a_kernel_block_kwarg_merges_per_field_like_any_other_layer(tmp_path):
         "rms_norm_implementation": "eager",
         "attn_implementation": "sdpa",
     }
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
     assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "eager"
 
 
@@ -984,3 +1008,78 @@ def test_omni_model_rejects_missing_default_generate():
     model = OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
     with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
         model.generate({})
+
+
+def test_public_config_builder_applies_root_ops_before_loading_modules(tmp_path):
+    from veomni.models import build_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    overrides = {"rms_norm_implementation": "eager", "attn_implementation": "eager"}
+    direct = OmniConfig.from_pretrained(tmp_path, ops_implementation=overrides)
+    built = build_config(tmp_path, ops_implementation=overrides)
+    assert built.ops_implementation == direct.ops_implementation == overrides
+    for name in built.module_names:
+        assert built._module_configs[name].ops_implementation == direct._module_configs[name].ops_implementation
+        assert built._module_configs[name].ops_config.rms_norm_implementation == "eager"
+
+
+@pytest.mark.parametrize("entry", ["direct", "builder"])
+def test_omni_typed_ops_preserve_composed_merge_precedence(tmp_path, entry):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models import build_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    config_file = tmp_path / "config.json"
+    saved = json.loads(config_file.read_text())
+    saved["ops_implementation"] = {"rms_norm_implementation": "eager"}
+    saved["_module_entries"][FAKE_B]["ops_implementation"] = {"attn_implementation": "sdpa"}
+    config_file.write_text(json.dumps(saved))
+    selection = OpsImplementationConfig(attn_implementation="eager")
+    loader = OmniConfig.from_pretrained if entry == "direct" else build_config
+    loaded = loader(tmp_path, ops_implementation=selection)
+    assert loaded.ops_implementation == {"rms_norm_implementation": "eager", **selection.to_dict()}
+    assert loaded._module_configs[FAKE_A].ops_config.attn_implementation == "eager"
+    assert loaded._module_configs[FAKE_B].ops_config.attn_implementation == "veomni_sdpa"
+    assert loaded._module_configs[FAKE_B].ops_config.rms_norm_implementation == "eager"
+    loaded.save_pretrained(tmp_path / "resaved")
+    assert OmniConfig.from_pretrained(tmp_path / "resaved").ops_implementation == loaded.ops_implementation
+
+
+@pytest.mark.parametrize("entry", ["module_base", "direct", "builder"])
+@pytest.mark.parametrize("typed", [False, True], ids=["mapping", "typed"])
+@pytest.mark.parametrize(
+    ("entry_attention", "attention_kwargs", "expected_attention"),
+    [
+        pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="explicit-wins"),
+        pytest.param("eager", {}, "eager", id="preserve-omitted"),
+        pytest.param("eager", {"attn_implementation": None}, "eager", id="preserve-none"),
+    ],
+)
+def test_standalone_module_attention_applies_after_composed_ops(
+    tmp_path, entry, typed, entry_attention, attention_kwargs, expected_attention
+):
+    """Explicit standalone attention ranks above entry/root ops before final validation."""
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models import build_config
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+
+    FakeModuleAConfig(ops_implementation={"attn_implementation": "eager"}).save_pretrained(tmp_path)
+    selection = make_eager_ops_config()
+    selection.attn_implementation = entry_attention
+    loader = {
+        "module_base": OmniModuleConfig.from_pretrained,
+        "direct": FakeModuleAConfig.from_pretrained,
+        "builder": build_config,
+    }[entry]
+    loaded = loader(
+        tmp_path,
+        base_ops_implementation={"attn_implementation": "flash_attention_3", "rms_norm_implementation": "eager"},
+        ops_implementation=selection if typed else selection.to_dict(),
+        **attention_kwargs,
+    )
+    assert isinstance(loaded, FakeModuleAConfig)
+    assert loaded._attn_implementation == loaded.ops_config.attn_implementation == expected_attention
+    assert loaded.ops_config.rms_norm_implementation == "eager"
+    loaded.save_pretrained(tmp_path / "resaved")
+    saved = json.loads((tmp_path / "resaved" / "config.json").read_text())
+    assert saved["ops_implementation"]["attn_implementation"] == expected_attention
