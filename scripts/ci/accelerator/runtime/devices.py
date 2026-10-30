@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
+from scripts.ci.accelerator.launch_plan import XPU_HIDDEN_MASK, ResourcePlanError, RunnerCapabilities
 
 
 def child_environment(capabilities, assigned, *, cpu=False, environ=None):
@@ -20,6 +20,7 @@ def child_environment(capabilities, assigned, *, cpu=False, environ=None):
             CUDA_VISIBLE_DEVICES="",
             ASCEND_VISIBLE_DEVICES="",
             ASCEND_RT_VISIBLE_DEVICES="",
+            ZE_AFFINITY_MASK=XPU_HIDDEN_MASK,
             TORCH_DEVICE_BACKEND_AUTOLOAD="0",
             PYTORCH_HAL_BASED_NPU_CHECK="1",
         )
@@ -35,6 +36,8 @@ def child_environment(capabilities, assigned, *, cpu=False, environ=None):
         env.pop("ASCEND_DEVICE_ID", None)
         env.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
         env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+    elif capabilities.backend == "xpu":
+        env["ZE_AFFINITY_MASK"] = ",".join(assigned)
     return env
 
 
@@ -52,10 +55,16 @@ def probe(output, requested="auto"):
         count = device.device_count() if device.is_available() else 0
         if count < 1:
             raise ResourcePlanError(f"No available {backend} devices")
-        key = "CUDA_VISIBLE_DEVICES" if backend == "cuda" else "ASCEND_RT_VISIBLE_DEVICES"
+        key = {
+            "cuda": "CUDA_VISIBLE_DEVICES",
+            "npu": "ASCEND_RT_VISIBLE_DEVICES",
+            "xpu": "ZE_AFFINITY_MASK",
+        }[backend]
         visible = os.environ.get(key)
         if visible is None and backend == "npu":
             visible = os.environ.get("ASCEND_VISIBLE_DEVICES")
+        if visible == "" and backend == "xpu":
+            visible = None  # Level Zero treats an empty mask as unset.
         devices = tuple(visible.split(",")) if visible is not None else tuple(str(i) for i in range(count))
         if len(devices) != count or any(not value for value in devices):
             raise ResourcePlanError(f"Visibility {devices} disagrees with runtime device count {count}")

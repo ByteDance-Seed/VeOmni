@@ -219,13 +219,13 @@ Core files:
 ## Hardware
 
 22. **Non-CUDA accelerator code paths require guards**
-    - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
+    - There are four backends today: CUDA, Ascend NPU, Cambricon MLU and Intel GPU (XPU). Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE`, `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` or `IS_XPU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`). XPU support is in stock PyTorch, so it has no package check; it communicates over `xccl`.
     - Vendor kernels live in their op family under `veomni/ops/kernels/`. The HCCL compatibility patch lives in `veomni/distributed/hccl_premul_sum.py`. Vendor-only dependencies must not be imported on hosts without that runtime.
     - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
-   - Direct CUDA calls break NPU and MLU compatibility.
+   - Direct CUDA calls break NPU, MLU and XPU compatibility.
    - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 ## Trainer Extensions

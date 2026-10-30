@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Mapping
 
 
+# Level Zero treats an empty ZE_AFFINITY_MASK as unset and drops indices it does
+# not have, so an out-of-range index is what hides every XPU from a CPU worker.
+XPU_HIDDEN_MASK = "2147483647"
+
+
 class ResourcePlanError(RuntimeError):
     """A launch cannot run inside its declared device lease."""
 
@@ -18,7 +23,7 @@ class RunnerCapabilities:
     devices: tuple[str, ...] = ()
 
     def __post_init__(self):
-        if self.backend not in ("cpu", "cuda", "npu"):
+        if self.backend not in ("cpu", "cuda", "npu", "xpu"):
             raise ResourcePlanError(f"Unsupported accelerator: {self.backend}")
         if len(set(self.devices)) != len(self.devices):
             raise ResourcePlanError("Runner devices must be distinct")
