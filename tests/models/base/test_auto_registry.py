@@ -210,7 +210,34 @@ def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
     return tuple(item for item in model_case.eager_ops if item[0] not in _NPU_ABSENT_EAGER_OPS)
 
 
+def _tiny_hunyuanvideo15_config(architecture):
+    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+
+    config = HunyuanVideo15Config(
+        hidden_size=24,
+        heads_num=2,
+        rope_dim_list=[4, 4, 4],
+        in_channels=2,
+        out_channels=2,
+        mm_double_blocks_depth=1,
+        text_states_dim=16,
+        vision_states_dim=8,
+    )
+    config.architectures = [architecture]
+    return config
+
+
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="HunyuanVideo15Model",
+        config_factory=_tiny_hunyuanvideo15_config,
+        architectures=("HunyuanVideo15Model",),
+        has_registered_config=True,
+        registered_config_aliases=("HunyuanVideo15ConditionModel",),
+        registered_model_aliases=("HunyuanVideo15ConditionModel",),
+        stamps_hf_attn=False,
+        eager_ops=(),
+    ),
     _ModelCase(
         model_type="deepseek_v3",
         eager_ops=(
@@ -696,7 +723,11 @@ def test_build_foundation_model_requires_ops_config():
         build_foundation_model(config)
 
 
-@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
+@pytest.mark.launch_plan(
+    provider=lambda context: (
+        _CPU_LAUNCH if context.params["model_case"].model_type == "HunyuanVideo15Model" else _ACCELERATOR_LAUNCH
+    )
+)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
@@ -797,7 +828,11 @@ def test_model_registry_entries(model_case: _ModelCase):
         assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 
 
-@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
+@pytest.mark.launch_plan(
+    provider=lambda context: (
+        _CPU_LAUNCH if context.params["model_case"].model_type == "HunyuanVideo15Model" else _ACCELERATOR_LAUNCH
+    )
+)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_get_model_class_returns_registered_architectures(model_case: _ModelCase):
     for architecture in model_case.architectures:
@@ -875,6 +910,21 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
+    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    HunyuanVideo15Config().save_pretrained(tmp_path)
+    config = build_config(str(tmp_path))
+    assert isinstance(config, HunyuanVideo15Config)
+    assert get_model_class(config) is HunyuanVideo15Model
+    condition_config = MODEL_CONFIG_REGISTRY[config.condition_model_type]()
+    condition_model = MODELING_REGISTRY[config.condition_model_type]()
+    assert condition_model.config_class is condition_config
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_build_foundation_model_preserves_subconfig_independent_attention():
     """build_foundation_model must not flatten sub-config attention unless attn_implementation is passed."""
     from veomni.models.auto import build_foundation_model
@@ -948,7 +998,8 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize(
-    "family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"]
+    "family",
+    ["ltx", "minimax", "qwen_image", "wan", "hunyuanvideo15", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"],
 )
 @pytest.mark.parametrize("attention", [None, "eager", "sdpa", "flash_attention_2"])
 def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkeypatch, family, attention):
@@ -971,6 +1022,16 @@ def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkey
 
         def construct():
             return cls(config)
+    elif family == "hunyuanvideo15":
+        from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15_condition import (
+            HunyuanVideo15ConditionModel,
+        )
+
+        monkeypatch.setattr(HunyuanVideo15ConditionModel, "_load_components", lambda self, device: None)
+        config = HunyuanVideo15ConditionModel.config_class(generator_device="cpu", ops_implementation=ops)
+
+        def construct():
+            return HunyuanVideo15ConditionModel(config)
     elif family == "movqgan":
         from veomni.models.transformers.movqgan.modeling_movqgan import MoVQGAN
 
