@@ -559,14 +559,13 @@ def convert_with_hf_layout(
     module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
-    # The convert only copies weights, so a host that cannot run a module's own
-    # attention selection builds it under eager instead of failing on the kernel.
+    # The convert only copies weights: build under eager when this host cannot
+    # run the module config's attention selection.
     available_attention = OP_REGISTRY.list_available("attention", "standard")
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-        has_explicit_attn = "attn_implementation" in module_config.ops_implementation
-        use_eager = not has_explicit_attn and module_config.ops_config.attn_implementation not in available_attention
+        selected_attn = module_config.ops_config.attn_implementation
         module = load_module_from_hf_source(
             module_cls,
             module_config,
@@ -574,7 +573,7 @@ def convert_with_hf_layout(
             name,
             device_map="cpu",
             torch_dtype=dtype,
-            attn_implementation="eager" if use_eager else None,
+            attn_implementation=None if selected_attn in available_attention else "eager",
         )
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
