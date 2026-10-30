@@ -129,8 +129,22 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
     ops = _qat_ops(model)
     if ops is None:
         return
+
+    _validate_mxfp4_config(mixed_precision, compile_config, **kwargs)
+    _validate_mxfp4_device()
+    _, _, _, prepared_type = _torchao_api()
+    selected = _selected_projections(model, ops.qat_target_modules, prepared_type)
+    if any(type(module) is not prepared_type for module in selected.values()):
+        raise ValueError("Build the QAT model with build_foundation_model before applying FSDP2.")
+    if any(module.weight.dtype != torch.float32 for module in selected.values()):
+        raise ValueError(
+            "torchao_mxfp4 requires FP32 master parameters; use build_parallelize_model or model.float()."
+        )
+
+
+def _validate_mxfp4_config(mixed_precision, compile_config=None, **kwargs) -> None:
+    """Check topology, precision and runtime options for the initial QAT recipe."""
     from ..distributed.parallel_state import get_parallel_state
-    from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or ps.sp_enabled or ps.tp_enabled or ps.pp_enabled or ps.any_extra_parallel_enabled:
@@ -148,15 +162,13 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
         )
     if kwargs.get("is_peft_model") or kwargs.get("enable_fsdp_offload") or getattr(compile_config, "enable", False):
         raise ValueError("torchao_mxfp4 does not yet support LoRA, FSDP CPU offload or torch.compile.")
+
+
+def _validate_mxfp4_device() -> None:
+    """Require native BF16 on the current rank's NVIDIA GPU."""
+    from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
         raise ValueError("Distributed torchao_mxfp4 training requires NVIDIA CUDA.")
     if get_gpu_compute_capability() < 80:
         raise ValueError("Distributed torchao_mxfp4 training requires native BF16 support (SM80 or newer).")
-    _, _, _, prepared_type = _torchao_api()
-    selected = _selected_projections(model, ops.qat_target_modules, prepared_type)
-    if any(type(module) is not prepared_type for module in selected.values()):
-        raise ValueError("Build the QAT model with build_foundation_model before applying FSDP2.")
-    if any(module.weight.dtype != torch.float32 for module in selected.values()):
-        raise ValueError(
-            "torchao_mxfp4 requires FP32 master parameters; use build_parallelize_model or model.float()."
-        )
