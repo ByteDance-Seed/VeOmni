@@ -251,7 +251,7 @@ def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monk
 def test_xpu_launch_validation_uses_affinity_mask(monkeypatch, tmp_path):
     import json
 
-    from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, ResourcePlanError
+    from scripts.ci.accelerator.launch_plan import XPU_HIDDEN_MASK, CasePlan, LaunchSpec, ResourcePlanError
     from scripts.ci.accelerator.pytest_plugin import validate_launch
 
     capabilities = tmp_path / "capabilities.json"
@@ -263,6 +263,12 @@ def test_xpu_launch_validation_uses_affinity_mask(monkeypatch, tmp_path):
     validate_launch(2, env={"ZE_AFFINITY_MASK": "2,5"})
     with pytest.raises(ResourcePlanError, match="cannot run on lease"):
         validate_launch(2, env={"ZE_AFFINITY_MASK": "0,1"})
+
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(device="cpu")).to_dict()))
+    validate_launch(1, env={"ZE_AFFINITY_MASK": XPU_HIDDEN_MASK})
+    for env in ({"ZE_AFFINITY_MASK": ""}, {}):
+        with pytest.raises(ResourcePlanError, match="hidden mask"):
+            validate_launch(1, env=env)
 
 
 def test_case_batches_preserve_inventory_and_resource_requests():

@@ -62,8 +62,12 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         "npu": "ASCEND_RT_VISIBLE_DEVICES",
         "xpu": "ZE_AFFINITY_MASK",
     }.get(caps.backend, "ASCEND_RT_VISIBLE_DEVICES")
-    visible = [value for value in env.get(key, "").split(",") if value and value != XPU_HIDDEN_MASK]
+    mask = env.get(key, "")
+    visible = [value for value in mask.split(",") if value and value != XPU_HIDDEN_MASK]
     cpu = not visible and any(spec.device == "cpu" for spec in specs)
+    if cpu and caps.backend == "xpu" and mask != XPU_HIDDEN_MASK:
+        # An empty or missing ZE_AFFINITY_MASK exposes every XPU.
+        raise ResourcePlanError("A CPU launch on an XPU runner must set ZE_AFFINITY_MASK to the hidden mask")
     if not cpu and not any(spec.device == "accelerator" for spec in specs):
         raise ResourcePlanError("A CPU launch must not expose accelerator devices")
     if not cpu and (len(visible) < nproc or not set(visible) <= set(lease)):
