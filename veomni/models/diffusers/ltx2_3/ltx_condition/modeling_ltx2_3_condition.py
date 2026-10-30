@@ -473,7 +473,10 @@ class LTXVideoConditionModel(PreTrainedModel):
             packed_conditions["hidden_states"].append(noisy_latents)
             packed_conditions["timestep"].append(timestep)
             packed_conditions["encoder_hidden_states"].append(video_embeds)
-            packed_conditions["context_mask"].append(binary_mask)
+            # With learnable registers the connector fills every padded position, so the mask is
+            # all-valid by construction; passing none is exact and keeps DiT cross-attention unmasked.
+            registers = self.embeddings_processor.video_connector.num_learnable_registers
+            packed_conditions["context_mask"].append(None if registers else binary_mask)
             packed_conditions["training_target"].append(training_target)
             packed_conditions["latents"].append(latents_on_device.to(device=device))
             packed_conditions["video_loss_mask"].append(video_loss_mask)
