@@ -559,9 +559,18 @@ def convert_with_hf_layout(
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
+        has_explicit_attn = "attn_implementation" in module_config.ops_implementation
         module = load_module_from_hf_source(
-            module_cls, module_config, source, name, device_map="cpu", torch_dtype=dtype
+            module_cls,
+            module_config,
+            source,
+            name,
+            device_map="cpu",
+            torch_dtype=dtype,
+            attn_implementation=None if has_explicit_attn else "eager",
         )
+        if not has_explicit_attn:
+            module.config._attn_implementation = None
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
         training_graph=training_graph, generation_graph=generation_graph

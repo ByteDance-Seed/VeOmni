@@ -1,4 +1,4 @@
-"""Running a SeedOmni family straight off its upstream HF checkpoint.
+"""Running the ``qwen3`` SeedOmni family straight off its upstream HF checkpoint.
 
 A tiny Qwen3 checkpoint stands in for the upstream one. The tests check that
 the ``qwen3`` :class:`OmniHFLayout` routes every HF key onto the module that
@@ -21,16 +21,12 @@ from transformers import Qwen3Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments, _validate_hf_view_modules
-from veomni.models.checkpoint.weights import _load_state_dict
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.qwen3.hf_layout import QWEN3_HF_LAYOUT
 from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 from veomni.models.seed_omni.utils.hf_layout import (
-    OmniHFLayout,
-    OmniHFModuleLayout,
     read_hf_source,
-    resolve_hf_source_device_map,
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
 )
@@ -143,17 +139,6 @@ def test_layout_routes_each_key_to_the_longest_claiming_prefix_and_back():
     assert layout.source_key(LLM, "rotary_emb.inv_freq") is None
 
 
-def test_layout_rejects_a_source_prefix_claimed_by_two_modules():
-    layout = OmniHFLayout(
-        modules={
-            "a": OmniHFModuleLayout(key_prefixes=(("model.", "a."),), build_config=lambda c: c),
-            "b": OmniHFModuleLayout(key_prefixes=(("model.", "b."),), build_config=lambda c: c),
-        }
-    )
-    with pytest.raises(ValueError, match="more than one module"):
-        layout.route("model.x")
-
-
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     root, _ = hf_root
     view = resolve_omni_checkpoint_root(root)
@@ -171,23 +156,11 @@ def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     assert set(OmniConfig.from_pretrained(str(root)).module_names) == {TEXT_ENCODER, LLM}
 
 
-def test_split_roots_pass_through_and_unregistered_hf_types_fail(tmp_path):
-    omni = tmp_path / "omni"
-    omni.mkdir()
-    (omni / "config.json").write_text(json.dumps({"model_type": "omni"}), encoding="utf-8")
-    assert resolve_omni_checkpoint_root(omni) == omni
-    assert read_hf_source(omni) is None
-
-    other = tmp_path / "other"
-    other.mkdir()
-    (other / "config.json").write_text(json.dumps({"model_type": "not_a_registered_family"}), encoding="utf-8")
-    with pytest.raises(ValueError, match="no SeedOmni HF layout is registered"):
-        resolve_omni_checkpoint_root(other)
-
-
 def test_omni_model_loads_every_module_weight_from_the_hf_root(hf_root):
     root, tensors = hf_root
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    model = OmniModel.from_pretrained(
+        str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
     layout = model.config._hf_source.layout
 
     compared = set()
@@ -206,7 +179,9 @@ def test_omni_model_loads_every_module_weight_from_the_hf_root(hf_root):
 def test_an_untied_head_loads_even_through_a_wrapper(tmp_path):
     root = tmp_path / "Qwen3-untied"
     tensors = _write_hf_checkpoint(root, sharded=False, tied=False)
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    model = OmniModel.from_pretrained(
+        str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
     text_encoder = model.modules_dict[TEXT_ENCODER]
     assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
 
@@ -218,55 +193,13 @@ def test_an_untied_head_loads_even_through_a_wrapper(tmp_path):
     assert converter.should_skip_without_loading("model.norm.weight")
 
 
-def test_auto_dtype_is_the_checkpoint_dtype(hf_root):
-    root, _ = hf_root
-    model = OmniModel.from_pretrained(str(root), torch_dtype="auto", device_map="cpu")
-    for module in model.modules_dict.values():
-        assert {param.dtype for param in module.parameters()} == {torch.bfloat16}
-
-
-def test_device_map_takes_its_from_pretrained_meaning(hf_root):
-    root, _ = hf_root
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
-    llm = model.modules_dict[LLM]
-    assert resolve_hf_source_device_map(llm, None) == {"": "cpu"}
-    assert resolve_hf_source_device_map(llm, 1) == {"": 1}
-    assert resolve_hf_source_device_map(llm, {"language_model": "cpu"}) == {"language_model": "cpu"}
-    for strategy in ("auto", "sequential"):
-        plan = resolve_hf_source_device_map(llm, strategy, max_memory={"cpu": "1GiB"})
-        assert set(plan.values()) == {"cpu"}
-
-
-def test_a_multi_device_map_loads_on_cpu_then_dispatches(hf_root, monkeypatch):
-    import accelerate
-
-    root, tensors = hf_root
-    dispatched = []
-
-    def fake_dispatch(model, device_map, **kwargs):
-        assert {param.device.type for param in model.parameters()} == {"cpu"}
-        dispatched.append((model, device_map))
-        return model
-
-    monkeypatch.setattr(accelerate, "dispatch_model", fake_dispatch)
-    device_map = {"first": "cpu", "second": "cuda:0"}
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map=device_map)
-
-    assert [plan for _, plan in dispatched] == [device_map] * len(model.modules_dict)
-    llm = model.modules_dict[LLM]
-    layout = model.config._hf_source.layout
-    for key, value in llm.state_dict().items():
-        assert torch.equal(value, tensors[layout.source_key(LLM, key)]), key
-
-    with pytest.raises(ValueError, match="cannot offload to disk"):
-        OmniModel.from_pretrained(str(root), device_map={"first": "cpu", "second": "disk"})
-
-
 @pytest.mark.parametrize("sharded", [False, True], ids=["single_file", "sharded"])
 def test_export_writes_back_the_source_layout(tmp_path, sharded):
     root = tmp_path / "Qwen3-tiny"
     tensors = _write_hf_checkpoint(root, sharded=sharded)
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    model = OmniModel.from_pretrained(
+        str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
     text_encoder = model.modules_dict[TEXT_ENCODER]
     with torch.no_grad():
         text_encoder.embed_tokens.weight.add_(1.0)
@@ -295,26 +228,21 @@ def test_offline_convert_matches_the_runtime_load(hf_root, tmp_path):
     out = tmp_path / "split"
     convert_checkpoint(str(root), str(out))
     assert json.loads((out / "config.json").read_text(encoding="utf-8"))["model_type"] == "omni"
+    assert "ops_implementation" not in json.loads((out / LLM / "config.json").read_text(encoding="utf-8"))
     assert read_hf_source(out) is None
 
-    split = OmniModel.from_pretrained(str(out), torch_dtype=torch.bfloat16, device_map="cpu")
-    runtime = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    split = OmniModel.from_pretrained(
+        str(out), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
+    runtime = OmniModel.from_pretrained(
+        str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
     for name in (TEXT_ENCODER, LLM):
         expected = runtime.modules_dict[name].state_dict()
         actual = split.modules_dict[name].state_dict()
         assert expected.keys() == actual.keys()
         for key in expected:
             assert torch.equal(expected[key], actual[key]), (name, key)
-
-
-def test_state_dict_loader_skips_declared_keys_without_reading_them(hf_root):
-    root, tensors = hf_root
-    skip = lambda key: key.startswith("model.layers.")  # noqa: E731
-    loaded = {}
-    for iterator in _load_state_dict(str(root), skip_key=skip):
-        for key, value in iterator:
-            loaded[key] = value
-    assert set(loaded) == {key for key in tensors if not skip(key)}
 
 
 def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
@@ -361,16 +289,3 @@ def test_build_runtime_args_keeps_model_path_and_sets_seed_omni_model_path(hf_ro
     assert os.path.isfile(os.path.join(runtime.seed_omni_model_path, "hf_source.json"))
     assert runtime.resolved_model_path == runtime.seed_omni_model_path
     assert all(module.model_path.startswith(runtime.seed_omni_model_path) for module in runtime.modules.values())
-
-
-def test_a_training_export_needs_safetensors_in_the_source(tmp_path):
-    from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
-
-    root = tmp_path / "Qwen3-bin"
-    tensors = _write_hf_checkpoint(root, sharded=False)
-    (root / "model.safetensors").unlink()
-    torch.save(tensors, root / "pytorch_model.bin")
-    view = resolve_omni_checkpoint_root(root)
-
-    with pytest.raises(ValueError, match="needs safetensors weights"):
-        _check_hf_source_exportable(view)

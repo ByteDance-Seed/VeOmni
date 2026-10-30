@@ -35,6 +35,10 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     _no_split_modules = ["Qwen3DecoderLayer"]
     supports_gradient_checkpointing = True
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention is validated and executed by ``self.language_model``.
+        return attn_implementation
+
     def __init__(self, config: Qwen3LlmConfig):
         super().__init__(config)
         self.config = config

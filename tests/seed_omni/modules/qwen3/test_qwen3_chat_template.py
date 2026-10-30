@@ -10,6 +10,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
@@ -154,11 +155,18 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
     Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
 
-    llm = Qwen3Llm(Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": "eager"}))
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation={"attn_implementation": "eager", "rms_norm_implementation": "eager"},
+        )
+    )
     assert llm.config.text_config._attn_implementation == "eager"
+    assert llm.config.text_config.ops_config.rms_norm_implementation == "eager"
     save_as_omni(tmp_path / "llm", "qwen3_llm", llm)
     cfg, llm2 = load_from_omni(tmp_path / "llm", "qwen3_llm")
     assert cfg.model_type == "qwen3_llm"
+    assert cfg.text_config.ops_config.rms_norm_implementation == "eager"
     assert isinstance(llm2, Qwen3Llm)
     assert isinstance(llm2.language_model.get_input_embeddings(), torch.nn.Identity)
 
@@ -185,7 +193,10 @@ def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatc
     Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
     torch.manual_seed(42)
     llm_packed = Qwen3LlmAcc(
-        Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": attn_impl})
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation=attn_impl),
+        )
     ).eval()
     llm_sep = copy.deepcopy(llm_packed).eval()
 
