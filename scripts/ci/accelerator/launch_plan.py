@@ -13,7 +13,7 @@ class ResourcePlanError(RuntimeError):
 
 
 # Backends the scheduler can model; runner capabilities reject anything else.
-SCHEDULED_BACKENDS = ("cpu", "cuda", "npu")
+SCHEDULED_BACKENDS = ("cpu", "cuda", "npu", "xpu")
 
 
 @dataclass(frozen=True)
