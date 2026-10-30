@@ -7,10 +7,8 @@ import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
-
-
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 
 
 def _default_gloo_worker(rank, world_size, endpoint):
@@ -31,10 +29,34 @@ def _default_gloo_worker(rank, world_size, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_default_gloo_group_uses_cpu_even_when_accelerator_is_available():
     spawn_with_rendezvous(_default_gloo_worker, args=(2,), nprocs=2)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_any_rank_failed_without_process_group():
     assert any_rank_failed(True)
     assert not any_rank_failed(False)
+
+
+def _accelerator_group_worker(rank, world_size, endpoint):
+    device = get_torch_device()
+    device.set_device(rank)
+    backend = get_dist_comm_backend()
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=world_size)
+    try:
+        assert dist.get_backend() == backend
+        assert any_rank_failed(rank == 0)
+        assert not any_rank_failed(False)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="accelerator"))
+@pytest.mark.skipif(
+    get_device_type() == "cpu" or not get_torch_device().is_available() or get_torch_device().device_count() < 2,
+    reason="Requires two accelerator devices",
+)
+def test_default_accelerator_group_failure_propagation():
+    spawn_with_rendezvous(_accelerator_group_worker, args=(2,), nprocs=2)
