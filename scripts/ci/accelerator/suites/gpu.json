@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "01-unit",
     "suite": "unit",
     "conditional": false,
