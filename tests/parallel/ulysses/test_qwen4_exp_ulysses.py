@@ -26,6 +26,7 @@ from transformers import AutoConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
@@ -55,32 +56,29 @@ if get_device_type() == "cuda":
         pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
 
 
-def _install_qwen4_exp_ops_config(qsa_attention_implementation: str = "eager") -> None:
-    """Install the device's native GDN kernels; NPU CI selects the hybrid cases."""
-    from veomni.ops.config import set_ops_config
+def _install_qwen4_exp_ops_config(config, qsa_attention_implementation: str = "eager") -> None:
+    """Attach device-specific GDN selections to ``config``; other ops stay eager unless specified."""
+    from tests.models.compare import eager_ops_config
 
+    ops = eager_ops_config()
     npu = get_device_type() == "npu"
-    set_ops_config(
-        SimpleNamespace(
-            rms_norm_gated_implementation="eager" if npu else "fla",
-            causal_conv1d_implementation="triton" if npu else "fla",
-            chunk_gated_delta_rule_implementation="triton" if npu else "fla",
-            qsa_attention_implementation=qsa_attention_implementation,
-        )
-    )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _configured_qwen4_exp_kernels():
-    """Scope the default selections to this module's in-process tests."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
-    previous = get_ops_config()
-    _install_qwen4_exp_ops_config()
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
+    ops.rms_norm_gated_implementation = "eager" if npu else "fla"
+    ops.causal_conv1d_implementation = "triton" if npu else "fla"
+    ops.chunk_gated_delta_rule_implementation = "triton" if npu else "fla"
+    ops.qsa_attention_implementation = qsa_attention_implementation
+    if hasattr(config, "text_config") and hasattr(config, "vision_config"):
+        text_attn = getattr(config.text_config, "_attn_implementation", None)
+        vision_attn = getattr(config.vision_config, "_attn_implementation", None)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
+        if text_attn is not None:
+            config.text_config._attn_implementation = text_attn
+        if vision_attn is not None:
+            config.vision_config._attn_implementation = vision_attn
+    else:
+        attn = getattr(config, "_attn_implementation", None)
+        as_veomni_config(config, validate=False)._set_ops_implementation(ops)
+        if attn is not None:
+            config._attn_implementation = attn
 
 
 def _set_deterministic(seed: int = 42) -> None:
@@ -215,6 +213,7 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
             name="dp",
         )
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(17)
         device = torch.device(get_device_type(), rank)
         ple = qwen4_exp.Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).float().to(device)
@@ -342,7 +341,6 @@ def _run_qsa_equivalence(
             device_type=get_device_type(),
             name="dp",
         )
-        _install_qwen4_exp_ops_config(qsa_attention_implementation=qsa_implementation)
         device = torch.device(get_device_type(), rank)
         dtype = torch.bfloat16 if qsa_implementation == "tilelang" else torch.float32
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -351,6 +349,7 @@ def _run_qsa_equivalence(
         if qsa_implementation == "tilelang":
             config.head_dim = 64
             config.indexer_head_dim = 32
+        _install_qwen4_exp_ops_config(config, qsa_attention_implementation=qsa_implementation)
         torch.manual_seed(31)
         attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).to(device=device, dtype=dtype)
         _broadcast_module(attention)
@@ -450,7 +449,6 @@ def _run_qsa_equivalence(
                         msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                     )
     finally:
-        _install_qwen4_exp_ops_config()
         clear_parallel_state()
 
 
@@ -509,7 +507,6 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     """Local channels and weights reproduce the matching full-conv channels."""
     Qwen4ExpTextGatedDeltaNet = importlib.import_module(_PATCHED_MODULE).Qwen4ExpTextGatedDeltaNet
 
-    _install_qwen4_exp_ops_config()
     key_dim = num_k_heads * head_k_dim
     value_dim = num_v_heads * head_v_dim
     conv_dim = key_dim * 2 + value_dim
@@ -524,6 +521,7 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     config.linear_key_head_dim = head_k_dim
     config.linear_value_head_dim = head_v_dim
     config.linear_conv_kernel_dim = kernel_size
+    _install_qwen4_exp_ops_config(config)
     layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
     layer.conv1d.weight.data.copy_(weight_full.unsqueeze(1))
 
@@ -598,7 +596,7 @@ def _run_gated_deltanet_equivalence(
         if num_v_heads is not None:
             config.linear_num_value_heads = num_v_heads
         torch.manual_seed(43)
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         # Ascend's native GDN kernel rejects FP32 inputs. Keep CUDA's existing
         # FP32 checks and exercise the actual BF16 training kernel on NPU.
         dtype = torch.bfloat16 if get_device_type() == "npu" else torch.float32
@@ -696,6 +694,7 @@ def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
     config.linear_num_key_heads = num_k_heads
     config.linear_num_value_heads = num_v_heads
+    _install_qwen4_exp_ops_config(config)
     layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float()
     parallel_state = SimpleNamespace(ulysses_enabled=True, ulysses_group=None, ulysses_rank=0, ulysses_size=2)
     hidden_states = torch.randn(1, 4, config.hidden_size)
@@ -732,9 +731,9 @@ def _run_gated_deltanet_determinism() -> None:
             device_type=get_device_type(),
             name=None,
         )
-        _install_qwen4_exp_ops_config()
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+        _install_qwen4_exp_ops_config(config)
         for bsz, seq_len in shapes:
             _set_deterministic()
             layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
@@ -767,10 +766,10 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_sp() -> None:
 def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len: int) -> None:
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
-    _install_qwen4_exp_ops_config()
     _set_deterministic()
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+    _install_qwen4_exp_ops_config(config)
     layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
     inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device)
 
@@ -814,7 +813,7 @@ def _run_text_model_equivalence() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config._attn_implementation = "eager"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(59)
         model = qwen4_exp.Qwen4ExpTextModel(config).float().to(device)
         _broadcast_module(model)
@@ -918,7 +917,7 @@ def _run_router_aux_loss_equivalence() -> None:
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(67)
         model = qwen4_exp.Qwen4ExpForConditionalGeneration(config).float().to(device)
         model.model.visual.to(dtype=torch.bfloat16)
@@ -1048,7 +1047,7 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         torch.manual_seed(71)
         model = qwen4_exp.Qwen4ExpModel(config).to(device=device, dtype=torch.bfloat16)
         _broadcast_module(model)
@@ -1183,7 +1182,7 @@ def _run_vision_real_image_cp_non_fa_rejection() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
         config._attn_implementation = "veomni_sdpa"
-        _install_qwen4_exp_ops_config()
+        _install_qwen4_exp_ops_config(config)
         vision = qwen4_exp.Qwen4ExpVisionModel(config).to(device=device, dtype=torch.bfloat16)
         _broadcast_module(vision)
 
@@ -1226,7 +1225,7 @@ def test_qwen4_exp_text_attention_rejects_invalid_sp_attention_mask_before_colle
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
     config._attn_implementation = "eager"
-    _install_qwen4_exp_ops_config()
+    _install_qwen4_exp_ops_config(config)
     attn = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).float()
     hidden_states = torch.randn(1, 4, config.hidden_size)
     cos = torch.ones(1, 4, attn.head_dim)
@@ -1265,7 +1264,7 @@ def test_qwen4_exp_vision_attention_projects_cp_state_to_ulysses_parallel_state(
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
     config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
     config._attn_implementation = "veomni_flash_attention_2"
-    _install_qwen4_exp_ops_config()
+    _install_qwen4_exp_ops_config(config)
     attn = qwen4_exp.Qwen4ExpVisionAttention(config).float()
     hidden_states = torch.randn(4, config.hidden_size)
     head_dim = config.hidden_size // config.num_heads

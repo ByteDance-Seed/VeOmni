@@ -33,7 +33,6 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl, resolve_qat_impl
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 from veomni.ops.qat import fp8_fake_quant_act_prefix, qat_linear
@@ -226,12 +225,12 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         stage_config = _build_stage_config(config, layer_idx)
         self.self_attn = attention_cls(stage_config, layer_idx)
         self.mlp = moe_cls(stage_config, layer_idx)
-        self.input_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.attn_hc = hyper_connection_cls(config)
         self.ffn_hc = hyper_connection_cls(config)
-        self.veomni_mhc_post = VeomniOp("mhc", "post", resolve_op_impl("mhc_implementation"))
-        self.qat_implementation = resolve_qat_impl()
+        self.veomni_mhc_post = VeomniOp("mhc", "post", config.ops_config.mhc_implementation)
+        self.qat_implementation = config.ops_config.qat_implementation
 
         if stage_id == 0:
             target_ids = getattr(config, "dspark_target_layer_ids", None)
@@ -242,10 +241,10 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
                 config.hidden_size,
                 bias=False,
             )
-            self.main_norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+            self.main_norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
         if stage_id == config.num_nextn_predict_layers - 1:
             self.hc_head = hyper_head_cls(config)
-            self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
             markov_rank = getattr(config, "dspark_markov_rank", 256)
             self.markov_head = DSparkMarkovHead(config.vocab_size, markov_rank)
             self.confidence_head = DSparkConfidenceHead(config.hidden_size + markov_rank)

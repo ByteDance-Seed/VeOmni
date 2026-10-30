@@ -20,6 +20,18 @@ For a Qwen family, place the test under
 `tests/models/transformers/qwen/`; otherwise use a family file or
 subdirectory under `tests/models/transformers/`.
 
+Choose eager attention on the root tiny config before constructing the HF
+reference. In composite configs, an eager text child does not select the
+root or unset vision/audio branches. Candidate builders must also select eager
+implementations for every consumed op before construction; reuse
+`tests.tools.training_utils.make_eager_ops_config()` to include GDN and vision
+fields. Adapt configs for standalone patched MLP/expert/attention layers too,
+using `get_veomni_config_class` or `as_veomni_config`. The CPU model-test
+fixture rejects optional FlashAttention preloading even on hosts with the
+package installed; the registry constructor matrix covers native HF references.
+FP32 accelerator comparisons must explicitly select a portable backend in
+`config.ops_implementation`, as shown by the Flux, Wan T2V, and LTX Ulysses tests.
+
 Keep implementation assertions capability-based. A test may prove that eager
 and an optimized implementation can be selected, but it should not require a
 particular YAML file to choose one fixed implementation.

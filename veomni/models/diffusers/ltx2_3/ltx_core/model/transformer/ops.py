@@ -5,7 +5,6 @@ from ltx_core.model.transformer.rope import apply_rotary_emb
 from torch import nn
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
 class PreAttentionCallable(Protocol):
@@ -49,10 +48,9 @@ class AdaZeroCallable(Protocol):
 
 
 class PytorchAdaZeroFunction(AdaZeroCallable):
-    def __init__(self) -> None:
-        self.veomni_rms_norm = VeomniOp(
-            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
-        )
+    def __init__(self, config=None) -> None:
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def __call__(
         self,
@@ -76,11 +74,11 @@ class PostSACallable(Protocol):
 
 
 class PytorchPostSAFunction(PostSACallable):
-    def __init__(self) -> None:
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
-        self.veomni_rms_norm_unweighted = VeomniOp(
-            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
-        )
+    def __init__(self, config=None) -> None:
+        std_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", std_impl)
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def __call__(
         self,

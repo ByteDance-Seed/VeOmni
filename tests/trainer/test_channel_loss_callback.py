@@ -518,79 +518,6 @@ def test_channel_loss_ignores_pad_to_length_position_zero_segments():
     assert result == [{"source_id": "doc", "loss_sum": 6.0, "token_count": 3}]
 
 
-def test_channel_loss_filters_padding_tail_per_batch_row():
-    result = ChannelLossComputer._aggregate_by_source(
-        per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
-        source_ids=["row0", "row1"],
-        position_ids=torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0", "loss_sum": 3.0, "token_count": 2},
-        {"source_id": "row1", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_preserves_zero_supervision_tail_when_later_row_has_padding():
-    result = ChannelLossComputer._aggregate_by_source(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        position_ids=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0_normal", "loss_sum": 6.0, "token_count": 3},
-        {"source_id": "row0_zero", "loss_sum": 0.0, "token_count": 0},
-        {"source_id": "row1_normal", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_compute_uses_position_aligned_mask_for_padding_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_sp_state(monkeypatch, sp_size=1))
-    computer.strict = True
-    computer._source_ids = ["row0_normal", "row0_zero", "row1_normal"]
-    computer._position_ids = torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]])
-    labels = torch.tensor([[1, 2, 3, 4], [1, 2, IGNORE_INDEX, IGNORE_INDEX]])
-    logits = torch.randn(2, 4, 8)
-
-    result = computer._compute_channel_loss(
-        logits=logits,
-        labels=labels,
-        vocab_size=8,
-        hidden_states=None,
-        weights=None,
-        attention_mask=torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),
-        shift_labels=None,
-        ignore_index=IGNORE_INDEX,
-    )
-
-    assert [item["source_id"] for item in result] == ["row0_normal", "row0_zero", "row1_normal"]
-    assert [item["token_count"].item() for item in result] == [3, 0, 1]
-
-
-def test_channel_loss_rejects_ambiguous_per_row_padding_without_mask_evidence():
-    kwargs = dict(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.ones(8, dtype=torch.long),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        position_ids=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-    )
-
-    assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
-        ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
-
-
 def test_channel_loss_keeps_zero_supervision_segment_before_tail_padding():
     result = ChannelLossComputer._aggregate_by_source(
         per_token_loss=torch.tensor([100.0, 2.0, 100.0]),
@@ -624,67 +551,6 @@ def test_channel_loss_sp_ignores_padding_only_position_zero_segments(monkeypatch
     )
 
     assert result == [{"source_id": "doc", "loss_sum": 3.0, "token_count": 2}]
-
-
-def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
-    result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
-        per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
-        source_ids=["row0", "row1"],
-        positions=torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0", "loss_sum": 3.0, "token_count": 2},
-        {"source_id": "row1", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padding(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
-    result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0_normal", "loss_sum": 6.0, "token_count": 3},
-        {"source_id": "row0_zero", "loss_sum": 0.0, "token_count": 0},
-        {"source_id": "row1_normal", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_sp_rejects_ambiguous_per_row_padding_without_mask_evidence(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-    kwargs = dict(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.ones(8, dtype=torch.long),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        parallel_state=sp_state,
-    )
-
-    assert ChannelLossComputer._aggregate_sp(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
-        ChannelLossComputer._aggregate_sp(**kwargs, strict=True)
 
 
 def test_channel_loss_sp_keeps_zero_supervision_segment_before_tail_padding(monkeypatch):
@@ -1678,3 +1544,236 @@ def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch)
         assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
     finally:
         computer.uninstall()
+
+
+@pytest.mark.parametrize("padding", [1, 5])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_data_counts_packed_sources_and_padding(monkeypatch, padding):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    computer = callback.computer
+    positions = torch.tensor([list(range(5)) + list(range(7)) + list(range(3)) + [0] * padding])
+    labels = torch.tensor([[1] * 15 + [IGNORE_INDEX] * padding])
+    mask = torch.tensor([[1] * 15 + [0] * padding])
+    losses = torch.arange(labels.numel(), dtype=torch.float32)
+    computer.begin_step([[0, 1, 0]] * 2, [positions] * 2, [mask] * 2)
+    for _ in range(2):
+        computer.before_micro_step()
+        computer._result = computer._aggregate_by_source(
+            losses,
+            labels.flatten(),
+            mask.flatten(),
+            computer._source_ids,
+            positions,
+            IGNORE_INDEX,
+            include_data_stats=True,
+        )
+        computer.after_micro_step()
+    counts = callback._reduce_step_data_totals(computer.step_data_totals, [0, 1])
+    assert counts == {0: (4, 16), 1: (2, 14)}
+    totals, names = callback._reduce_step_totals(computer.step_totals)
+    metrics = callback._build_data_metrics(counts, totals, names)
+    assert metrics["label_tokens_per_sample/source-i-0__source_0"] == 4
+    assert metrics["label_tokens_per_sample/source-i-1__source_1"] == 7
+    computer.begin_step([], [], [])
+    assert computer.step_data_totals == {}
+
+
+@pytest.mark.parametrize("repeat", [1, 2])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_data_metrics_use_unrepeated_sample_counts(monkeypatch, repeat):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    callback.on_step_begin(TrainerState(global_step=10), micro_batches=[], source_repeat=repeat)
+    metrics = callback._build_data_metrics({1: (4 * repeat, 20)}, {1: (12.0, 12)}, {1: "train/a"})
+    assert metrics == {
+        "samples/source-i-1__train_a": 4,
+        "input_tokens/source-i-1__train_a": 20,
+        "label_tokens_per_sample/source-i-1__train_a": 3,
+    }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_data_totals_use_loss_device_when_empty(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    callback.computer.step_totals = {0: (torch.empty((), device="meta"), torch.empty((), device="meta"))}
+    assert callback._data_totals_device({}) == torch.device("meta")
+    assert callback._data_totals_device({0: torch.zeros(2)}) == torch.device("cpu")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_per_sample_count_is_independent_of_token_count_logging(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, log_token_count=False))
+            )
+        )
+    )
+    callback.on_step_begin(TrainerState(global_step=10), micro_batches=[])
+    totals, names = {1: (12.0, 12)}, {1: "train/a"}
+    metrics = callback._build_metrics(totals, names)
+    metrics.update(callback._build_data_metrics({1: (4, 20)}, totals, names))
+    assert "channel_tokens/source-i-1__train_a" not in metrics
+    assert "label_tokens/source-i-1__train_a" not in metrics
+    assert metrics["label_tokens_per_sample/source-i-1__train_a"] == 3
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_zero_supervised_tokens_keeps_sample_counts(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    callback = ChannelLossCallback(
+        SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True))))
+    )
+    callback.on_step_begin(TrainerState(global_step=10), micro_batches=[])
+    totals, names = {1: (0.0, 0)}, {1: "train/a"}
+    metrics = callback._build_metrics(totals, names)
+    metrics.update(callback._build_data_metrics({1: (4, 20)}, totals, names))
+    assert "channel_tokens/source-i-1__train_a" not in metrics
+    assert "label_tokens/source-i-1__train_a" not in metrics
+    assert metrics["samples/source-i-1__train_a"] == 4
+    assert metrics["input_tokens/source-i-1__train_a"] == 20
+    assert metrics["label_tokens_per_sample/source-i-1__train_a"] == 0
+
+
+@pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_data_metrics_preserve_accumulated_training_updates(monkeypatch, implementation, dtype):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+    torch.manual_seed(1006)
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.randn(11, 4, dtype=dtype))
+    model.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", implementation))
+    reference_weight = torch.nn.Parameter(model.weight.detach().clone())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    reference_optimizer = torch.optim.SGD([reference_weight], lr=0.01)
+    labels = torch.tensor(
+        [[IGNORE_INDEX, 1, 2, 3, 4, IGNORE_INDEX, 6, 7, 8, 9, 10, 0, IGNORE_INDEX, 2, 3, IGNORE_INDEX]]
+    )
+    positions = torch.tensor([list(range(5)) + list(range(7)) + list(range(3)) + [0]])
+    mask = torch.tensor([[1] * 15 + [0]])
+    metadata = {"ds_idx": [0, 1, 0], "position_ids": positions, "attention_mask": mask}
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, interval=1))),
+        model=model,
+    )
+    callback = ChannelLossCallback(trainer)
+    state = TrainerState(global_step=1)
+    callback.on_step_begin(state, micro_batches=[metadata, metadata])
+    original = model.loss_function
+    callback.computer.install(model)
+    try:
+        for _ in range(2):
+            hidden = torch.randn(1, 16, 4, dtype=dtype, requires_grad=True)
+            reference_hidden = hidden.detach().clone().requires_grad_()
+            kwargs = dict(logits=None, labels=labels, vocab_size=11, chunk_size=3)
+            reference = original(**kwargs, hidden_states=reference_hidden, weights=reference_weight)[0]
+            with callback.micro_step_context(state, metadata), callback.model_forward_context():
+                actual = model.loss_function(**kwargs, hidden_states=hidden, weights=model.weight)[0]
+            reference.backward()
+            actual.backward()
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=0, atol=0)
+        torch.testing.assert_close(model.weight.grad, reference_weight.grad, rtol=0, atol=0)
+        optimizer.step()
+        reference_optimizer.step()
+        torch.testing.assert_close(model.weight, reference_weight, rtol=0, atol=0)
+        callback.on_step_end(state, loss=0.0, loss_dict={}, grad_norm=0.0)
+        metrics = trainer.step_train_metrics
+        assert metrics["samples/source-i-0__source_0"] == 4
+        assert metrics["input_tokens/source-i-0__source_0"] == 16
+        assert metrics["channel_tokens/source-i-0__source_0"] == 12
+        assert metrics["label_tokens_per_sample/source-i-0__source_0"] == 3
+        assert metrics["samples/source-i-1__source_1"] == 2
+        assert metrics["input_tokens/source-i-1__source_1"] == 14
+        assert metrics["label_tokens_per_sample/source-i-1__source_1"] == 6
+    finally:
+        callback.computer.uninstall()
+
+
+def _gloo_channel_data_metrics_worker(rank, world_size, sp_size, endpoint):
+    from datetime import timedelta
+
+    torch.distributed.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=60)
+    )
+    try:
+        dp_size = world_size // sp_size
+        sp_groups = [torch.distributed.new_group(list(range(i * sp_size, (i + 1) * sp_size))) for i in range(dp_size)]
+        dp_groups = [torch.distributed.new_group(list(range(i, world_size, sp_size))) for i in range(sp_size)]
+        dp_rank, sp_rank = divmod(rank, sp_size)
+        ps = SimpleNamespace(
+            sp_enabled=True,
+            sp_size=sp_size,
+            sp_group=sp_groups[dp_rank],
+            dp_size=dp_size,
+            dp_group=dp_groups[sp_rank],
+        )
+        positions = torch.tensor([list(range(5)) + list(range(7)) + list(range(3)) + [0]])
+        mask = torch.tensor([[1] * 15 + [0]])
+        labels = torch.tensor(
+            [[IGNORE_INDEX, 1, 2, 3, 4, IGNORE_INDEX, 6, 7, 8, 9, 10, 0, IGNORE_INDEX, 2, 3, IGNORE_INDEX]]
+        )
+        targets = F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:]
+        width = 16 // sp_size
+        selection = slice(sp_rank * width, (sp_rank + 1) * width)
+        metadata = {
+            "ds_idx": [dp_rank, dp_rank + 1, dp_rank],
+            "position_ids": positions[:, selection],
+            "attention_mask": mask[:, selection],
+        }
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(callback_base_module, "get_parallel_state", lambda: ps)
+            trainer = SimpleNamespace(
+                args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, interval=1)))
+            )
+            callback = ChannelLossCallback(trainer)
+        state = TrainerState(global_step=1)
+        callback.on_step_begin(state, micro_batches=[metadata, metadata])
+        generator = torch.Generator().manual_seed(1006 + dp_rank)
+        logits = torch.randn(1, 16, 11, generator=generator)
+        for _ in range(2):
+            callback.on_micro_step_begin(state, micro_batch=metadata)
+            callback.computer.compute_side_channel(
+                logits[:, selection], labels[:, selection], 11, None, None, shift_labels=targets[:, selection]
+            )
+            callback.on_micro_step_end(state)
+        callback.on_step_end(state, loss=0.0, loss_dict={}, grad_norm=0.0)
+        expected = {}
+        for data_rank in range(dp_size):
+            ref_logits = torch.randn(1, 16, 11, generator=torch.Generator().manual_seed(1006 + data_rank))
+            losses = F.cross_entropy(ref_logits.reshape(-1, 11), targets.flatten(), reduction="none")
+            for source, start, end in [(data_rank, 0, 5), (data_rank + 1, 5, 12), (data_rank, 12, 15)]:
+                entry = expected.setdefault(source, [0, 0, 0, 0.0])
+                entry[0] += 2
+                entry[1] += 2 * (end - start)
+                entry[2] += 2 * int(targets[:, start:end].ne(IGNORE_INDEX).sum())
+                entry[3] += 2 * float(losses[start:end].sum())
+        for source, (samples, input_tokens, label_tokens, loss_sum) in expected.items():
+            suffix = f"source-i-{source}__source_{source}"
+            metrics = trainer.step_train_metrics
+            assert metrics[f"samples/{suffix}"] == samples
+            assert metrics[f"input_tokens/{suffix}"] == input_tokens
+            assert metrics[f"channel_tokens/{suffix}"] == label_tokens
+            assert metrics[f"label_tokens_per_sample/{suffix}"] == label_tokens / samples
+            assert metrics[f"channel_loss/{suffix}"] == pytest.approx(loss_sum / label_tokens, rel=1e-6)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("sp_size", [2, 4])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_channel_data_metrics_gloo_sp_and_dp(sp_size):
+    spawn_with_rendezvous(_gloo_channel_data_metrics_worker, args=(4, sp_size), nprocs=4)

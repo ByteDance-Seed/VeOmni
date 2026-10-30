@@ -43,7 +43,6 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
-from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
@@ -335,6 +334,7 @@ class OptimizerState(Stateful):
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
+        """Restore optimizer state from the loaded DCP state dict."""
         optim_state_from_dcp_load = state_dict
         if self.should_extra_parallel_aware:
             # we need to drop ExtraParallel dim before loading them into optimizers
@@ -343,14 +343,10 @@ class OptimizerState(Stateful):
             )
             # Delegate to MultiOptimizer (it will split/filter correctly)
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
-            # MultiOptimizer sub-optimizers can also lose param-group hyperparams
-            # (betas/...) for empty groups after load; restore recurses into them.
-            restore_optimizer_param_group_defaults(self.optimizer)
             return
 
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             self.optimizer.load_state_dict(optim_state_from_dcp_load)
-            restore_optimizer_param_group_defaults(self.optimizer)
             return
 
         # Single torch optimizer.
@@ -367,7 +363,6 @@ class OptimizerState(Stateful):
             optim_state_dict=optim_state_from_dcp_load,
             options=StateDictOptions(strict=False),
         )
-        restore_optimizer_param_group_defaults(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(

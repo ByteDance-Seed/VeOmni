@@ -29,7 +29,6 @@ from transformers import (
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -66,9 +65,10 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     models do, which is the point -- the alternative is a list of model names in the
     generic builder, and a list is a thing the next model has to be remembered into.
 
-    What a config cannot see on its own is the rest of the run, so the convention is
-    that the hook reads whatever singletons it needs (the installed ops config,
-    the parallel state) and takes no arguments. Kept as a plain ``getattr`` for the
+    A config already holds its own ``self.ops_config``, and for any run-wide state
+    it cannot see on its own (such as the parallel state) the convention is that
+    the hook reads ``self.ops_config`` and the parallel state directly and takes
+    no arguments. Kept as a plain ``getattr`` for the
     same reason: a config that has nothing to refuse should not have to say so.
 
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
@@ -136,6 +136,23 @@ def build_config(config_path: str, **config_kwargs) -> PretrainedConfig:
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
+def _iter_configs(config: PretrainedConfig) -> list[PretrainedConfig]:
+    seen: set[int] = set()
+    order: list[PretrainedConfig] = []
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if not isinstance(cfg, PretrainedConfig) or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        order.append(cfg)
+        for key in cfg.sub_configs:
+            sub = getattr(cfg, key, None)
+            if isinstance(sub, PretrainedConfig):
+                stack.append(sub)
+    return order
+
+
 def _validate_attention_parallelism(attn_implementation: str | None) -> None:
     if attn_implementation not in ("magi_attention", "veomni_magi_attention"):
         return
@@ -185,35 +202,53 @@ def build_foundation_model(
 ) -> PreTrainedModel:
     """Build a foundation model from the models registry.
 
-    Callers must pass ``ops_implementation`` or pre-install a config with
-    ``set_ops_config``. There is no silent all-eager fallback.
+    Callers must pass ``ops_implementation`` or a ``PretrainedConfig`` with
+    ``ops_implementation`` populated. There is no silent all-eager fallback.
     """
-    if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
-        _validate_attention_parallelism(attn_implementation)
-        set_ops_config(ops_implementation)
-    else:
-        installed = get_ops_config()
-        if installed is None:
-            raise ValueError(
-                "build_foundation_model requires `ops_implementation` (or a prior "
-                "`set_ops_config(...)` call). There is no silent all-eager fallback."
-            )
-        if attn_implementation is None:
-            attn_implementation = installed.attn_implementation
-        else:
-            from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.arguments.arguments_types import OpsImplementationConfig
 
-            attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
+    has_config_ops = isinstance(config_path, PretrainedConfig) and any(
+        bool(getattr(cfg, "ops_implementation", None)) for cfg in _iter_configs(config_path)
+    )
+    if ops_implementation is None and not has_config_ops:
+        raise ValueError(
+            "build_foundation_model requires `ops_implementation` (or a `PretrainedConfig` with "
+            "`ops_implementation` populated). There is no silent all-eager fallback."
+        )
+
+    from .configuration_base import as_veomni_config
+
+    if isinstance(config_path, PretrainedConfig):
+        config_path = as_veomni_config(config_path, validate=False)
+
+    if attn_implementation is not None:
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
+
+    if ops_implementation is not None:
+        effective_attn = (
+            attn_implementation if attn_implementation is not None else ops_implementation.attn_implementation
+        )
+        _validate_attention_parallelism(effective_attn)
+    else:
+        for cfg in _iter_configs(config_path):
+            _validate_attention_parallelism(
+                attn_implementation if attn_implementation is not None else cfg.ops_config.attn_implementation
+            )
 
     if config_kwargs is None:
         config_kwargs = {}
 
     if isinstance(config_path, PretrainedConfig):
         config = config_path
+        config._apply_ops_overrides(ops_implementation=ops_implementation, attn_implementation=attn_implementation)
     else:
-        config = build_config(config_path, **config_kwargs)
+        load_kwargs = {**config_kwargs, "ops_implementation": ops_implementation}
+        if attn_implementation is not None:
+            load_kwargs["attn_implementation"] = attn_implementation
+        config = build_config(config_path, **load_kwargs)
+
+    effective_attn = attn_implementation if attn_implementation is not None else config.ops_config.attn_implementation
 
     check_context_parallel_supported(config)
     check_model_build_prerequisites(config)
@@ -244,13 +279,14 @@ def build_foundation_model(
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
-        "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
+    if attn_implementation is not None:
+        init_kwargs["attn_implementation"] = attn_implementation
 
-    if attn_implementation not in _VEOMNI_SP_ATTN:
+    if effective_attn not in _VEOMNI_SP_ATTN:
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. "
+            f"building foundation model with attn_implementation: {effective_attn}.. "
             "you are missing sequence parallelism support. Please use a veomni_* attention implementation for SP."
         )
 

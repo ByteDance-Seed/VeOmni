@@ -21,6 +21,12 @@
 #      Always call the local rms_norm offset VeomniOp
 #    - init_modification: Gemma3MLP
 #      Bind instance-local geglu swiglu_mlp VeomniOp
+#    - method_override: Gemma3DecoderLayer.__init__
+#      Pass config to Gemma3RMSNorm instances
+#    - method_override: Gemma3TextModel.__init__
+#      Pass config to final Gemma3RMSNorm
+#    - method_override: Gemma3MultiModalProjector.__init__
+#      Pass config to Gemma3RMSNorm
 #    - method_override: Gemma3MLP.forward
 #      Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: Gemma3Attention
@@ -46,8 +52,6 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-
-# Additional imports for patches
 from functools import partial
 
 import torch
@@ -74,7 +78,6 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModel
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.processing_utils import Unpack
@@ -91,8 +94,10 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.constants import IGNORE_INDEX
@@ -265,7 +270,7 @@ class Gemma3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
         # Bind instance-local geglu swiglu_mlp VeomniOp
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", self.config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
@@ -290,11 +295,12 @@ class Gemma3MLP(nn.Module):
 
 
 class Gemma3RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -464,8 +470,10 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.q_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.k_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -508,18 +516,24 @@ class Gemma3Attention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3DecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class Gemma3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Gemma3TextConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)
-        self.mlp = Gemma3MLP(config)
-        self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)  # noqa: F821
+        self.mlp = Gemma3MLP(config)  # noqa: F821
+        self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.pre_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.post_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
 
     def forward(
         self,
@@ -608,7 +622,7 @@ def _bidirectional_window_overlay(sliding_window: int) -> Callable[[int, int, in
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3TextModel
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -617,23 +631,21 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
     config: Gemma3TextConfig
     input_modalities = ("text",)
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # Gemma3 downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+        self.embed_tokens = Gemma3TextScaledWordEmbedding(  # noqa: F821
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
         )
         self.layers = nn.ModuleList(
-            [Gemma3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Gemma3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
         )
-        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma3RotaryEmbedding(config)
+        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.rotary_emb = Gemma3RotaryEmbedding(config)  # noqa: F821
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -664,15 +676,14 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Mask builders must follow this instance's attention impl. Reading the
-            # global ops config would let SDPA return None while eager attention
-            # still needs a causal triangle.
-            attn_impl = resolve_op_impl("attn_implementation")
+            # Mask builders must follow this instance's attention impl.
             for layer in self.layers[: self.config.num_hidden_layers]:
                 handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
                 if handle is not None:
                     attn_impl = handle.impl
                     break
+            else:
+                attn_impl = self.config.ops_config.attn_implementation
             cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
             if cu_seq_lens_q is not None:
                 impl = attn_impl
@@ -767,7 +778,7 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         self.model = Gemma3TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
@@ -842,18 +853,23 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         )
 
 
-class Gemma3MultiModalProjector(nn.Module):
-    def __init__(self, config: Gemma3Config):
-        super().__init__()
+# ======================================================================
+# [MODIFIED CLASS] Gemma3MultiModalProjector
+# Methods patched: __init__
+# ======================================================================
 
+
+class Gemma3MultiModalProjector(nn.Module):
+    def __init__(self, config):
+        super().__init__()
         self.mm_input_projection_weight = nn.Parameter(
             torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
         )
-
-        self.mm_soft_emb_norm = Gemma3RMSNorm(
-            config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
+        self.mm_soft_emb_norm = Gemma3RMSNorm(  # noqa: F821
+            config.vision_config.hidden_size,
+            eps=config.vision_config.layer_norm_eps,
+            config=config.vision_config,
         )
-
         self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
         self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
         self.kernel_size = self.patches_per_image // self.tokens_per_side
@@ -1126,7 +1142,7 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
             r"^vision_tower\.vision_model\.": "model.vision_tower.",
             r"^multi_modal_projector\.": "model.multi_modal_projector.",
         }
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import prod
 from types import SimpleNamespace
@@ -18,11 +19,10 @@ from diffusers.models.transformers.transformer_qwenimage import (
     compute_text_seq_len_from_mask,
 )
 from diffusers.utils import apply_lora_scale
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -70,7 +70,7 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
-_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
 
 
 class QwenImageAttentionKernelModule:
@@ -155,8 +155,8 @@ class QwenImageSPAttnProcessor:
     attention mask stays valid without any reordering.
     """
 
-    def __init__(self):
-        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    def __init__(self, config=None):
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
             self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
@@ -472,12 +472,15 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     # dispatch table. Still declare support so PreTrainedModel accepts
     # ``attn_implementation=sdpa`` / ``veomni_sdpa`` at init.
     _supports_sdpa = True
+    _supports_flash_attn = True
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         if hasattr(self, "_internal_dict"):
             del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _QwenImageTransformer2DModel.__init__(self, **config.to_diffuser_dict())
         self.config: QwenImageTransformer2DModelConfig = config
@@ -485,7 +488,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
         # Install the Ulysses-SP joint-attention processor on every block. It is
         # a no-op (plain diffusers joint attention) when SP is disabled.
-        sp_processor = QwenImageSPAttnProcessor()
+        sp_processor = QwenImageSPAttnProcessor(config)
         for block in self.transformer_blocks:
             block.attn.set_processor(sp_processor)
 
@@ -666,7 +669,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
-        self.config = self.config.to_diffuser_dict()
+        self.config = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
         try:
             _QwenImageTransformer2DModel.save_pretrained(self, path, **kwargs)
         finally:
@@ -674,17 +677,58 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        diffusers_model = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
-        diffusers_model.__class__ = cls
+        ops_implementation = kwargs.pop("ops_implementation", None)
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        provided_config = kwargs.pop("config", None)
+
+        override_kwargs: dict[str, Any] = {}
+        if ops_implementation is not None:
+            override_kwargs["ops_implementation"] = ops_implementation
+        if attn_implementation is not None:
+            override_kwargs["attn_implementation"] = attn_implementation
 
         valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
-        diffusers_cfg = dict(diffusers_model.config)
-        veomni_cfg = cls.config_class(**{k: v for k, v in diffusers_cfg.items() if k in valid_keys})
+        caller_diffuser_overrides = {k: kwargs[k] for k in valid_keys if k in kwargs}
+
+        veomni_cfg = None
+        if provided_config is not None:
+            if isinstance(provided_config, cls.config_class):
+                veomni_cfg = copy.deepcopy(provided_config)
+                veomni_cfg._apply_ops_overrides(
+                    ops_implementation=ops_implementation,
+                    attn_implementation=attn_implementation,
+                )
+            elif isinstance(provided_config, Mapping):
+                veomni_cfg = cls.config_class.from_dict(dict(provided_config), **override_kwargs)
+            else:
+                raise TypeError(
+                    f"config must be a {cls.config_class.__name__} or Mapping, got {type(provided_config).__name__}."
+                )
+            kwargs = {**veomni_cfg.to_diffuser_dict(), **kwargs}
+
+        if veomni_cfg is None:
+            hub_kwargs = {
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "subfolder")
+                if key in kwargs
+            }
+            veomni_cfg = cls.config_class.from_pretrained(
+                path, **hub_kwargs, **caller_diffuser_overrides, **override_kwargs
+            )
+            kwargs = {**veomni_cfg.to_diffuser_dict(), **kwargs}
+
+        loaded = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
+        diffusers_model = loaded[0] if isinstance(loaded, tuple) else loaded
+        diffusers_model.__class__ = cls
+
+        for key, value in caller_diffuser_overrides.items():
+            setattr(veomni_cfg, key, value)
+
         diffusers_model.config = veomni_cfg
         diffusers_model.config.tie_word_embeddings = False
 
         # __init__ is bypassed by from_pretrained, so install the SP processor here too.
-        sp_processor = QwenImageSPAttnProcessor()
+        sp_processor = QwenImageSPAttnProcessor(veomni_cfg)
         for block in diffusers_model.transformer_blocks:
             block.attn.set_processor(sp_processor)
-        return diffusers_model
+        return loaded

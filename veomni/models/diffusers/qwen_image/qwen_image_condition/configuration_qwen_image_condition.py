@@ -1,9 +1,9 @@
 from typing import Optional
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class QwenImageConditionModelConfig(PretrainedConfig):
+class QwenImageConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "QwenImageConditionModel"
 
     def __init__(

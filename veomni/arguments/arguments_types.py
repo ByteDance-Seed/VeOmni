@@ -15,9 +15,9 @@
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -1364,12 +1364,6 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
 }
 
-# Compatibility aliases for explicit values on variants without that backend.
-# Unset values remain None and use the registry's per-variant default.
-_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
-}
-
 # Values that were never implementation names and have no implementation equivalent.
 _REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
     "rms_norm_implementation": {
@@ -1467,8 +1461,8 @@ class OpsImplementationConfig:
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend; the unweighted "
-            "variant has no Ascend kernel and uses 'eager') | "
+            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend weighted variants only; "
+            "unweighted requires 'eager' or an unset selection on Ascend) | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
@@ -1638,17 +1632,23 @@ class OpsImplementationConfig:
         """Validate Hub and AITER requests and resolve their registered VeOmni names."""
         OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
-        return {
+        return OpsImplementationConfig.normalize_attention_backend(implementation, veomni_names=False)
+
+    @staticmethod
+    def normalize_attention_backend(implementation: Optional[str], *, veomni_names: bool = True) -> Optional[str]:
+        """Normalize names without validating an intermediate config selection."""
+        aliases = _DEPRECATED_IMPLEMENTATION_ALIASES["attn_implementation"]
+        if implementation in aliases:
+            replacement = aliases[implementation]
+            OpsImplementationConfig._warn_deprecated("attn_implementation", implementation, replacement)
+            implementation = replacement
+        implementation = {
             "aiter": "veomni_flash_attention_aiter",
             "flash_attention_2_hub": "veomni_flash_attention_2_hub",
             "flash_attention_3_hub": "veomni_flash_attention_3_hub",
         }.get(implementation, implementation)
-
-    def __post_init__(self):
-        self._apply_deprecated_aliases()
-        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
-        if get_env("MODELING_BACKEND") == "veomni":
-            replacements = {
+        if veomni_names and get_env("MODELING_BACKEND") == "veomni":
+            return {
                 "flash_attention_2": "veomni_flash_attention_2",
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
@@ -1656,13 +1656,19 @@ class OpsImplementationConfig:
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
-            }
-            if self.attn_implementation in replacements:
-                new_impl = replacements[self.attn_implementation]
-                logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
-                self.attn_implementation = new_impl
+            }.get(implementation, implementation)
+        return implementation
 
+    def __post_init__(self):
+        self._apply_deprecated_aliases()
+        self.validate_attention_backend(self.attn_implementation)
+        self.validate_hub_attention_backend(self.attn_implementation)
+        self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize non-None op implementation selections to a dict."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""

@@ -19,13 +19,14 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
 )
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
-class DeepseekV4Config(_DeepseekV4Config):
+class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
     """DeepSeek-V4 config with Lightning Indexer KL and DSpark MTP fields.
 
     The objectives and DSpark draft-stage shape are configured on the model
@@ -175,8 +176,6 @@ class DeepseekV4Config(_DeepseekV4Config):
 
     def validate_build_prerequisites(self) -> None:
         """Refuse an invalid DSpark MTP or Lightning Indexer KL configuration before weight loading."""
-        from veomni.ops.config import get_ops_config
-
         self._validate_mtp_prerequisites()
 
         enabled = self.dsa_indexer_loss
@@ -227,9 +226,7 @@ class DeepseekV4Config(_DeepseekV4Config):
             )
             return
 
-        kernels_config = get_ops_config()
-        if kernels_config is None:
-            return
+        kernels_config = self.ops_config
 
         for field_name, reason in (
             ("dsa_indexer_implementation", "the eager indexer discards the per-slot scores the KL trains against"),
