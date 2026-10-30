@@ -218,11 +218,26 @@ class ModelState(Stateful):
             This is the LoRA / PEFT path: frozen base weights are skipped on save and
             ``set_model_state_dict`` runs in ``strict=False`` mode on load so the
             (already populated from ``model_path``) base params are left untouched.
+        crop_ple: when ``True``, Qwen4-Exp PLE weights are stored at their logical
+            row count. Load then pads the zero tail back onto the runtime parameter.
+            Old checkpoints that still contain the padded shape are loaded with
+            ``crop_ple=False``.
+        load_target: allocate empty logical PLE shards for DCP to fill, avoiding
+            communication of runtime weights while preparing a load.
     """
 
-    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
+    def __init__(
+        self,
+        model,
+        trainable_only: bool = False,
+        parallel_state=None,
+        crop_ple: bool = True,
+        load_target: bool = False,
+    ):
         self.model = model
         self.trainable_only = trainable_only
+        self.crop_ple = crop_ple
+        self.load_target = load_target
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
@@ -244,6 +259,11 @@ class ModelState(Stateful):
             # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
 
+        if self.crop_ple:
+            from .ple_rows import crop_ple_state_dict_for_dcp
+
+            model_state_dict = crop_ple_state_dict_for_dcp(self.model, model_state_dict, empty=self.load_target)
+
         return model_state_dict
 
     @torch.no_grad()
@@ -256,6 +276,11 @@ class ModelState(Stateful):
         model_state_dict = state_dict
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
+
+        if self.crop_ple:
+            from .ple_rows import pad_ple_state_dict_from_dcp
+
+            model_state_dict = pad_ple_state_dict_from_dcp(self.model, model_state_dict)
 
         options = StateDictOptions(strict=False) if self.trainable_only else None
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
@@ -999,8 +1024,14 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        def _model_state() -> "ModelState":
-            return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        def _model_state(crop_ple: bool) -> "ModelState":
+            return ModelState(
+                state["model"],
+                trainable_only=trainable_only,
+                parallel_state=parallel_state,
+                crop_ple=crop_ple,
+                load_target=True,
+            )
 
         def _optimizer_state() -> "OptimizerState":
             return OptimizerState(
@@ -1012,9 +1043,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         wants_optimizer = state.get("optimizer") is not None
 
+        from .ple_rows import ple_checkpoint_is_cropped
+
         fused_dir = cls._legacy_fused_dir(path, module)
         if fused_dir is not None:
-            load_state: Dict[str, Any] = {"model": _model_state()}
+            load_state: Dict[str, Any] = {"model": _model_state(ple_checkpoint_is_cropped(fused_dir, state["model"]))}
             if wants_optimizer:
                 load_state["optimizer"] = _optimizer_state()
             dcp.load(
@@ -1028,9 +1061,10 @@ class DistributedCheckpointer(CheckpointerBase):
             return state
 
         model_root = model_dir(path, module)
+        weights_path = weights_dir(path, module)
         dcp.load(
-            state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
+            state_dict={"model": _model_state(ple_checkpoint_is_cropped(weights_path, state["model"]))},
+            storage_reader=cls._create_storage_reader(weights_path),
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )

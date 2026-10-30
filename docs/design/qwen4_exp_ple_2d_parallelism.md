@@ -73,7 +73,7 @@ different data-parallel samples to those ranks.
   `ple_fsdp × ple` mesh.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
-- Hugging Face export of the complete 95 GiB PLE table.
+- Validation of full-size 95 GiB Hugging Face export on production hardware.
 
 Unsupported combinations must fail during argument or parallel-plan
 validation. They must not silently fall back to the current parameter
@@ -439,7 +439,15 @@ must measure bytes read and startup time as well as host materialization size.
 ## DCP model and optimizer state
 
 A persistent PLE parameter is already a DTensor on the complete mesh with
-placements `[Shard(1), Shard(0)]`. It should be passed to DCP in that form.
+placements `[Shard(1), Shard(0)]`. DCP and Hugging Face checkpoints save each
+PLE table at its own logical row count; runtime parameters and optimizer state
+retain their padded shapes. Row counts are tracked by the full weight name
+because different PLE layers can have different vocabulary sizes.
+
+DCP loading restores the runtime shape with a zero-filled tail for logical-row
+checkpoints and remains compatible with older padded checkpoints. Invalid row
+counts and mixed logical/padded formats are rejected. Models with
+`ple_layer_ids=[]` skip PLE row conversion.
 
 The existing ExtraParallel DCP adapter drops the ExtraParallel dimension before
 handing an FSDP-local tensor to DCP and restores it afterward. Extend
