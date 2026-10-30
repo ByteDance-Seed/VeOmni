@@ -195,6 +195,9 @@ def test_qwen3_image_mode_weight_decay_reaches_only_vision_rows(monkeypatch):
     other = nn.Parameter(torch.ones(2))
     optimizer = torch.optim.AdamW([text_encoder.embed_tokens.weight, other], lr=_LR, weight_decay=_WD, foreach=False)
     text_encoder.configure_optimizer(optimizer)
+    # The decayed-row hook keeps a plain reference; it must not register a
+    # duplicate parameter under ``state_dict()``.
+    assert "_decayed_weight" not in text_encoder.state_dict()
     saved = optimizer.state_dict()
     for group in saved["param_groups"]:
         group["weight_decay"] = _WD

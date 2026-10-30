@@ -136,7 +136,9 @@ class TrainingMixin(BaseTrainingMixin):
             local_rows = local_shape[0]
         rows = self._trainable_row_mask[start : start + local_rows].nonzero().flatten()
         self._decayed_rows = rows.to(weight.device)
-        self._decayed_weight = weight
+        # Plain attribute assignment would register the Parameter again and leak
+        # a duplicate ``_decayed_weight`` key into ``state_dict()``.
+        self.__dict__["_decayed_weight"] = weight
         optimizer.register_step_pre_hook(self._decay_trainable_rows)
 
     def _decay_trainable_rows(self, optimizer: torch.optim.Optimizer, args: tuple, kwargs: dict) -> None:
