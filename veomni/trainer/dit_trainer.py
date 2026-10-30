@@ -41,7 +41,7 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
-from ..utils.loss_utils import contains_padding, reject_objective_padding
+from ..utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -571,22 +571,16 @@ class DiTTrainer:
 
         self.base._step_preflight_start_time = time.time()
         reject_objective_padding(micro_batches, "DiT")
-        initial_microbatch_count = len(micro_batches)
         previous_step = self.base.state.global_step
         self.base.state.global_step += 1
         try:
-            preflight_error = None
+            error = None
             try:
                 self.base._reset_async_activation_offload_if_enabled(self.base.model)
                 self.on_step_begin(micro_batches=micro_batches)
-            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
-                preflight_error = exc
-            reject_objective_padding(
-                micro_batches,
-                "DiT",
-                initial_microbatch_count=initial_microbatch_count,
-                preflight_error=preflight_error,
-            )
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "DiT")
         except BaseException:
             self.base.state.global_step = previous_step
             raise

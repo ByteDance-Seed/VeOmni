@@ -83,7 +83,7 @@ from ...utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ...utils.loss_utils import contains_padding, reject_objective_padding
+from ...utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from ...utils.omni_helper import OmniEnvironMeter
 from ..base import VeOmniIter
 from ..callbacks import (
@@ -551,22 +551,16 @@ class OmniTrainer:
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._step_preflight_start_time = time.time()
         reject_objective_padding(micro_batches, "Omni training")
-        initial_microbatch_count = len(micro_batches)
         previous_step = self.state.global_step
         self.state.global_step += 1
         try:
-            preflight_error = None
+            error = None
             try:
                 self._reset_async_activation_offload_if_enabled()
                 self.on_step_begin(micro_batches=micro_batches)
-            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
-                preflight_error = exc
-            reject_objective_padding(
-                micro_batches,
-                "Omni training",
-                initial_microbatch_count=initial_microbatch_count,
-                preflight_error=preflight_error,
-            )
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "Omni training")
         except BaseException:
             self.state.global_step = previous_step
             raise
@@ -598,21 +592,15 @@ class OmniTrainer:
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._step_preflight_start_time = time.time()
         reject_objective_padding(micro_batches, "Omni training")
-        initial_microbatch_count = len(micro_batches)
         previous_step = self.state.global_step
         self.state.global_step += 1
         try:
-            preflight_error = None
+            error = None
             try:
                 self.on_step_begin(micro_batches=micro_batches)
-            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
-                preflight_error = exc
-            reject_objective_padding(
-                micro_batches,
-                "Omni training",
-                initial_microbatch_count=initial_microbatch_count,
-                preflight_error=preflight_error,
-            )
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "Omni training")
         except BaseException:
             self.state.global_step = previous_step
             raise

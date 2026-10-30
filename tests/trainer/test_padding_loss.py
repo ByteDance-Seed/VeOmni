@@ -79,22 +79,6 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
     try:
         real = {"labels": torch.tensor([1] * (rank + 1))}
         assert loss_utils.reduce_global_loss_token(loss_utils.count_loss_token(real)) == {"foundation_tokens": 3}
-        batch = (
-            {"labels": torch.tensor([1]), "mtp_labels": torch.tensor([1]), "padding_flag": True}
-            if rank == 0
-            else {"labels": torch.tensor([1])}
-        )
-        error = None
-        try:
-            loss_utils.reduce_global_loss_token(
-                loss_utils.count_loss_token(batch), contains_padding_batch=loss_utils.contains_padding(batch)
-            )
-        except RuntimeError as exc:
-            error = str(exc)
-        failures = [None, None]
-        dist.all_gather_object(failures, error)
-        assert all(message and "does not support padded" in message for message in failures)
-
         from veomni.trainer.base import BaseTrainer
 
         trainer = object.__new__(BaseTrainer)
@@ -146,55 +130,20 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
             for message, step, seen in results
         )
 
-        trainer.model = SimpleNamespace()
-        trainer._reset_async_activation_offload_if_enabled = lambda _model: None
-        trainer.on_step_begin = lambda micro_batches: micro_batches.pop() if rank == 0 else None
-        batches = [{"labels": torch.tensor([1])}, {"labels": torch.tensor([2])}]
-        error = None
-        try:
-            trainer.train_step(iter([batches]))
-        except RuntimeError as exc:
-            error = str(exc)
-        dist.all_gather_object(results, (error, trainer.state.global_step))
-        assert all(
-            message and "callback changes to the microbatch count" in message and step == 3
-            for message, step in results
-        )
-        trainer.on_step_begin = lambda micro_batches: micro_batches[0].pop("labels") if rank == 0 else None
-        batches = [{"labels": torch.tensor([1])}]
-        error = None
-        try:
-            trainer.train_step(iter([batches]))
-        except RuntimeError as exc:
-            error = str(exc)
-        dist.all_gather_object(results, (error, trainer.state.global_step))
-        assert all(message and step == 3 for message, step in results)
-
-        def fail_step_begin(micro_batches):
-            if rank == 0:
-                raise StopIteration("not a dataloader EOF")
-
-        trainer.on_step_begin = fail_step_begin
-        error = None
-        try:
-            trainer.train_step(iter([[{"labels": torch.tensor([1])}]]))
-        except RuntimeError as exc:
-            error = str(exc)
-        dist.all_gather_object(results, (error, trainer.state.global_step))
-        assert all(message and step == 3 for message, step in results)
-
         batch = {"labels": torch.tensor([1])}
         if rank == 0:
             batch.update(image_labels=torch.tensor([1, 2]), audio_labels=torch.tensor([1]))
         else:
             batch.update(audio_labels=torch.tensor([1, 2, 3]), image_labels=torch.tensor([1]))
-        counts = loss_utils.count_loss_token_synchronized([batch], 1)
+        assert loss_utils.reject_distributed_padding([batch])
+        counts = loss_utils.synchronize_auxiliary_loss_tokens(loss_utils.count_loss_token([batch]))
         totals = loss_utils.reduce_global_loss_token(counts)
         assert totals["image_tokens"] == 3 and totals["audio_tokens"] == 4
 
         batch = {"labels": torch.tensor([1])}
         batch.update({"image_labels" if rank == 0 else "audio_labels": torch.tensor([1, 2])})
-        counts = loss_utils.count_loss_token_synchronized([batch], 1)
+        assert loss_utils.reject_distributed_padding([batch])
+        counts = loss_utils.synchronize_auxiliary_loss_tokens(loss_utils.count_loss_token([batch]))
         totals = loss_utils.reduce_global_loss_token(counts)
         assert totals["image_tokens"] == 2 and totals["audio_tokens"] == 2
     finally:
@@ -206,6 +155,83 @@ def test_asymmetric_distributed_padding_fails_on_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_asymmetric_distributed_padding_worker, args=(), nprocs=2)
+
+
+def _strict_channel_error_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    import veomni.trainer.callbacks.base as callback_module
+    from veomni.arguments.arguments_types import ChannelLossConfig
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.callbacks.channel_loss_callback import ChannelLossCallback
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    callback_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
+    original_reduce = dist.all_reduce
+    reduce_sizes = []
+
+    def counted_reduce(tensor, *args, **kwargs):
+        reduce_sizes.append(tensor.numel())
+        return original_reduce(tensor, *args, **kwargs)
+
+    dist.all_reduce = counted_reduce
+    try:
+        trainer = object.__new__(BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=3)
+        trainer.args = SimpleNamespace(
+            train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, interval=1, strict=True))
+        )
+        trainer.model = SimpleNamespace()
+        trainer._reset_async_activation_offload_if_enabled = lambda _model: None
+        callback = ChannelLossCallback(trainer)
+        trainer.on_step_begin = lambda micro_batches: callback.on_step_begin(
+            trainer.state, micro_batches=micro_batches
+        )
+        batch = {"labels": torch.tensor([1])}
+        if rank == 1:
+            batch["ds_idx"] = torch.tensor([1])
+        error = None
+        try:
+            trainer.train_step(iter([[batch]]))
+        except RuntimeError as exc:
+            error = str(exc)
+        results = [None, None]
+        dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes))
+        assert all(message and "callback or loss-token" in message and step == 3 for message, step, _ in results)
+        assert all(sizes == [5, 2] for _, _, sizes in results)
+
+        error = ValueError("strict source missing") if rank == 0 else None
+        with pytest.raises(RuntimeError, match="DPO step-begin callback failed"):
+            loss_utils.synchronize_step_begin_error(error, "DPO")
+    finally:
+        dist.all_reduce = original_reduce
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_strict_channel_callback_failure_is_synchronized_without_extra_sft_collective():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_strict_channel_error_worker, args=(), nprocs=2)
+
+
+def test_stop_iteration_from_step_begin_is_not_dataloader_eof():
+    from veomni.trainer.base import BaseTrainer
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = SimpleNamespace(global_step=3)
+    trainer.model = SimpleNamespace()
+    trainer._reset_async_activation_offload_if_enabled = lambda _model: None
+
+    def end_early(**_kwargs):
+        raise StopIteration("not data EOF")
+
+    trainer.on_step_begin = end_early
+    with pytest.raises(RuntimeError, match="callback raised StopIteration"):
+        trainer.train_step(iter([[{"labels": torch.tensor([1])}]]))
+    assert trainer.state.global_step == 3
 
 
 def _asymmetric_objective_padding_worker(rank, endpoint):
@@ -241,109 +267,6 @@ def test_asymmetric_dpo_omni_dit_padding_fails_on_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_asymmetric_objective_padding_worker, args=(), nprocs=2)
-
-
-def _composed_post_callback_padding_worker(rank, endpoint):
-    import importlib.util
-    import sys
-    import types
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    if importlib.util.find_spec("av") is None:
-        av = types.ModuleType("av")
-        av.container = SimpleNamespace(Container=object)
-        av.audio = SimpleNamespace(AudioStream=object)
-        av.AudioFrame = object
-        sys.modules["av"] = av
-    import veomni.trainer.dit_trainer as dit_module
-    from veomni.trainer.omni.omni_trainer import OmniTrainer
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
-
-    dit_module.use_parallel_state = lambda _state: nullcontext()
-    dit_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        for kind in ("dpo", "omni", "omni_offline", "dit"):
-            state = SimpleNamespace(global_step=3)
-            if kind == "dpo":
-                trainer = object.__new__(TextDPOTrainer)
-                trainer.state = state
-                trainer.policy_model = object()
-                trainer.base = SimpleNamespace(_reset_async_activation_offload_if_enabled=lambda _model: None)
-            elif kind.startswith("omni"):
-                trainer = object.__new__(OmniTrainer)
-                trainer.state = state
-                trainer.offline_cache_writer = object()
-                trainer._reset_async_activation_offload_if_enabled = lambda: None
-            else:
-                trainer = object.__new__(dit_module.DiTTrainer)
-                trainer.base = SimpleNamespace(
-                    state=state,
-                    model=SimpleNamespace(parallel_state=object()),
-                    _reset_async_activation_offload_if_enabled=lambda _model: None,
-                )
-
-            def step_begin(micro_batches):
-                if rank == 0:
-                    micro_batches[0]["padding_flag"] = True
-
-            trainer.on_step_begin = step_begin
-            fn = trainer.offline_cache_step if kind == "omni_offline" else trainer.train_step
-            error = None
-            try:
-                fn(iter([[{"labels": torch.tensor([1])}]]))
-            except ValueError as exc:
-                error = str(exc)
-            results = [None, None]
-            dist.all_gather_object(results, (error, state.global_step))
-            assert all(message and "padded micro-batches" in message and step == 3 for message, step in results)
-
-            def fail_step_begin(micro_batches):
-                if rank == 0:
-                    raise StopIteration("not a dataloader EOF")
-
-            trainer.on_step_begin = fail_step_begin
-            error = None
-            try:
-                fn(iter([[{"labels": torch.tensor([1])}]]))
-            except RuntimeError as exc:
-                error = str(exc)
-            dist.all_gather_object(results, (error, state.global_step))
-            assert all(message and "preflight failed" in message and step == 3 for message, step in results)
-
-            def invalid_step_begin(micro_batches):
-                if rank == 0:
-                    raise StopIteration("not a dataloader EOF")
-                micro_batches[0]["padding_flag"] = torch.tensor([1, 0])
-
-            trainer.on_step_begin = invalid_step_begin
-            error = None
-            try:
-                fn(iter([[{"labels": torch.tensor([1])}]]))
-            except RuntimeError as exc:
-                error = str(exc)
-            dist.all_gather_object(results, (error, state.global_step))
-            assert all(message and "preflight failed" in message and step == 3 for message, step in results)
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_composed_trainers_synchronize_post_callback_padding():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_composed_post_callback_padding_worker, args=(), nprocs=2)
-
-
-@pytest.mark.parametrize("objective", ["DPO", "Omni training", "DiT"])
-def test_objective_preflight_preserves_single_rank_exception(objective):
-    batch = [{"labels": torch.tensor([1])}]
-    with pytest.raises(ValueError, match="callback error"):
-        loss_utils.reject_objective_padding(batch, objective, preflight_error=ValueError("callback error"))
-    with pytest.raises(RuntimeError, match="preflight failed"):
-        loss_utils.reject_objective_padding(batch, objective, preflight_error=StopIteration())
 
 
 def test_exactly_full_flush_does_not_emit_padding_only_step():

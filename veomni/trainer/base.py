@@ -73,7 +73,6 @@ from ..utils.device import (
 from ..utils.loss_utils import (
     contains_padding,
     count_loss_token,
-    count_loss_token_synchronized,
     is_padding_microbatch,
     mean_global_loss,
     reduce_global_loss_token,
@@ -761,10 +760,8 @@ class BaseTrainer(Stateful, ABC):
             synchronize()
 
     def _sft_step_preflight(self, micro_batches, callback_owner):
-        initial_microbatch_count = len(micro_batches)
         self._step_preflight_start_time = time.time()
-        reject_distributed_padding(micro_batches)
-        initial_padding = [(batch, is_padding_microbatch(batch)) for batch in micro_batches]
+        has_auxiliary_targets = reject_distributed_padding(micro_batches)
         if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
             raise ValueError("Padding inside an unpacked micro-batch is unsupported")
         real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
@@ -773,37 +770,18 @@ class BaseTrainer(Stateful, ABC):
         previous_step = self.state.global_step
         self.state.global_step += 1
         try:
-            preflight_error = None
+            error = None
             try:
                 self._reset_async_activation_offload_if_enabled(self.model)
                 callback_owner.on_step_begin(micro_batches=micro_batches)
-            except Exception as exc:  # noqa: BLE001 - all ranks must reach preflight validation
-                preflight_error = exc
-            # Callbacks may adjust labels; normalize the inputs actually consumed.
-            self.micro_batches_token_len = count_loss_token_synchronized(
-                micro_batches, initial_microbatch_count, preflight_error
-            )
+                # Callbacks may adjust labels; normalize the inputs actually consumed.
+                self.micro_batches_token_len = count_loss_token(micro_batches)
+            except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
+                error = exc
+                self.micro_batches_token_len = {"foundation_tokens": torch.tensor(0)}
             self.global_micro_batches_token_len = reduce_global_loss_token(
-                self.micro_batches_token_len,
-                contains_padding_batch=(
-                    contains_padding(micro_batches)
-                    or not micro_batches
-                    or len(micro_batches) != initial_microbatch_count
-                ),
+                self.micro_batches_token_len, error=error, sync_auxiliary=has_auxiliary_targets
             )
-            if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
-                raise ValueError("Padding inside an unpacked micro-batch is unsupported")
-            if (any(flag for _, flag in initial_padding) or contains_padding(micro_batches)) and (
-                len(initial_padding) != len(micro_batches)
-                or any(
-                    original is not current or was_padding != is_padding_microbatch(current)
-                    for (original, was_padding), current in zip(initial_padding, micro_batches, strict=False)
-                )
-            ):
-                raise ValueError("A callback changed a padded microbatch sequence after metrics were recorded")
-            real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
-            if not real_micro_steps:
-                raise ValueError("A training step must contain at least one real micro-batch")
         except BaseException:
             self.state.global_step = previous_step
             raise
