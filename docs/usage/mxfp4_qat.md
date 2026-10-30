@@ -4,7 +4,8 @@
 Qwen3 projections, using straight-through gradients and ordinary floating-point
 parameters. This initial [low-precision RFC](https://github.com/ByteDance-Seed/VeOmni/issues/1360)
 recipe uses torchao's **emulated** MXFP4, without native FP4 training GEMMs or a
-Blackwell requirement. Training requires NVIDIA CUDA devices with BF16 support.
+Blackwell requirement. Training requires NVIDIA CUDA devices with native BF16
+support (SM80 or newer).
 
 ## Recipe and scope
 

@@ -130,7 +130,7 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
     if ops is None:
         return
     from ..distributed.parallel_state import get_parallel_state
-    from ..utils.device import IS_CUDA_AVAILABLE
+    from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or ps.sp_enabled or ps.tp_enabled or ps.pp_enabled or ps.any_extra_parallel_enabled:
@@ -150,6 +150,8 @@ def validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config=None, 
         raise ValueError("torchao_mxfp4 does not yet support LoRA, FSDP CPU offload or torch.compile.")
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
         raise ValueError("Distributed torchao_mxfp4 training requires NVIDIA CUDA.")
+    if get_gpu_compute_capability() < 80:
+        raise ValueError("Distributed torchao_mxfp4 training requires native BF16 support (SM80 or newer).")
     _, _, _, prepared_type = _torchao_api()
     selected = _selected_projections(model, ops.qat_target_modules, prepared_type)
     if any(type(module) is not prepared_type for module in selected.values()):
