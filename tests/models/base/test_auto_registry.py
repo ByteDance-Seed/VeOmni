@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from operator import attrgetter
 
+import diffusers
 import pytest
 from transformers import PretrainedConfig
 
@@ -633,6 +634,33 @@ _MODEL_CASES = (
         eager_ops=(),
     ),
 )
+
+
+def _tiny_qwen_image21_config(architecture: str):
+    """Load the optional Qwen-Image-2.1 toy through the public registry."""
+    config = build_config("tests/toy_config/qwen_image21_toy")
+    config.architectures = [architecture]
+    return config
+
+
+_QWEN_IMAGE21_COMPONENTS = (
+    "AutoencoderKLQwenImage21",
+    "QwenImage21Pipeline",
+    "QwenImage21Transformer2DModel",
+)
+if all(hasattr(diffusers, component) for component in _QWEN_IMAGE21_COMPONENTS):
+    _MODEL_CASES += (
+        _ModelCase(
+            model_type="QwenImage21Transformer2DModel",
+            config_factory=_tiny_qwen_image21_config,
+            architectures=("QwenImage21Transformer2DModel",),
+            has_registered_config=True,
+            registered_config_aliases=("QwenImage21ConditionModel",),
+            registered_model_aliases=("QwenImage21ConditionModel",),
+            eager_ops=(),
+            stamps_hf_attn=False,
+        ),
+    )
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
