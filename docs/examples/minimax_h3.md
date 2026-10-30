@@ -291,10 +291,11 @@ packing; ordinary single-sample attention dispatch is preserved.
 ### Attention and validation
 
 The DiT and VAE attention backend comes from
-`model.ops_implementation.attn_implementation`. The
-`MINIMAX_H3_ATTENTION_IMPLEMENTATION` environment variable and the xformers path
-are removed. Masked attention and packed compatibility mode always use PyTorch
-SDPA, and every other call uses the configured kernel.
+`model.ops_implementation.attn_implementation`. Masked attention and packed
+compatibility mode use PyTorch SDPA; other calls use the configured kernel.
+The optional `MINIMAX_H3_ATTENTION_IMPLEMENTATION=torch_cudnn` override selects
+cuDNN only for H3 DiT/refiner SDPA calls, leaving VAE dispatch unchanged.
+The legacy xformers path is removed.
 
 - `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
   projections and MLPs still operate on compact cross-sample rows.
@@ -319,6 +320,26 @@ varlen layout; kernel correctness itself is covered by
 `tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
+
+For CUDA FP16/BF16, H3 can explicitly select cuDNN for its DiT/refiner SDPA calls:
+
+```shell
+export MINIMAX_H3_ATTENTION_IMPLEMENTATION=torch_cudnn
+export TORCH_BLAS_PREFER_CUBLASLT=1
+```
+
+Use this with `eager` or `sdpa` attention. The cuDNN option applies to H3's
+text refiner and main-transformer SDPA calls, restores the caller's backend
+settings afterwards, and leaves the default dispatch unchanged. It does not
+force cuDNN on the audio/video VAEs: they retain automatic backend selection
+when this option is set. Set it before constructing the model; only
+`torch_cudnn` is recognized here. Other backends use the ordinary ops configuration.
+This avoids forcing cuDNN on the audio VAE's
+256-dimensional heads, which are unsupported on some GPU/runtime combinations.
+The option does not override explicitly configured packed FA2/FA3 varlen kernels.
+Unsupported devices or dtypes fail explicitly. The separate cuBLASLt setting reduces
+GEMM shape-dependent rounding differences when using sequence parallelism.
+Keep FP32 gradient reduction and `cast_forward_inputs=false`.
 
 ## 5. Inference
 

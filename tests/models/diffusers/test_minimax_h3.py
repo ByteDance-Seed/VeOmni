@@ -210,16 +210,18 @@ def test_minimax_h3_packed_sdpa_matches_independent_segments():
 
 
 def test_minimax_h3_sdpa_packed_uses_host_slices_not_varlen_kwargs(monkeypatch):
+    """Keep SDPA on host-sliced segments rather than passing Flash varlen arguments."""
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit
 
     attn = _tiny_attention()
     captured: dict = {}
     orig = minimax_h3_dit._sdpa_varlen_attention
 
-    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False, *, use_cudnn=False):
+        """Capture segment metadata while forwarding the optional cuDNN selection."""
         captured["cu_seqlens"] = cu_seqlens
         captured["compatibility_mode"] = compatibility_mode
-        return orig(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
+        return orig(q, k, v, cu_seqlens, softmax_scale, compatibility_mode, use_cudnn=use_cudnn)
 
     monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
 
