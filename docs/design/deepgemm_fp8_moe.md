@@ -153,6 +153,11 @@ into whole-expert shards rejects unversioned checkpoints before loading tensors,
 including optimizer-only and trainable-only loads; such checkpoints require
 explicit migration. Existing dim-1-to-dim-1 resumes remain unchanged. Low-level
 DCP callers must use the VeOmni save/load planners for this version check.
+
+MoE-LoRA adapter export with a supported BF16 backend also preserves the
+actual EP and FSDP shard dimensions when consolidating the adapter into
+safetensors. Whole-expert shards therefore export the same global adapter
+shapes and expert order as hidden-dimension shards.
 This destination-based guard does not identify legacy dim-0 checkpoints when
 loading into dim-1 or plain tensors; those existing unsupported conversions
 also need migration. Master weights, optimizer state, and gradient
