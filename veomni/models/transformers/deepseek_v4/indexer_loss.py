@@ -92,15 +92,15 @@ def _indexer_loss_enabled(module) -> bool:
     if getattr(module.config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return False
     indexer_impls, attention_impls = _bound_dsa_impls(module)
-    if indexer_impls - {"tilelang"}:
+    if indexer_impls - {"tilelang", "triton"}:
         raise ValueError(
-            "dsa_indexer_loss requires dsa_indexer_implementation='tilelang'; the eager "
+            "dsa_indexer_loss requires dsa_indexer_implementation='tilelang' or 'triton'; the eager "
             "indexer discards its scores, so the loss would have nothing to train against"
         )
-    if attention_impls - {"tilelang"}:
+    if attention_impls - {"tilelang", "triton"}:
         raise ValueError(
-            "dsa_indexer_loss requires dsa_attention_implementation='tilelang'; the teacher "
-            "distribution is derived from the TileLang attention LSE"
+            "dsa_indexer_loss requires dsa_attention_implementation='tilelang' or 'triton'; the teacher "
+            "distribution requires the fused attention's full base-2 LSE"
         )
     state = get_parallel_state()
     if state.ulysses_size > 1:

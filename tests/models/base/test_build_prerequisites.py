@@ -325,8 +325,12 @@ def test_unsupported_indexer_objective_is_refused_before_the_model_is_built(monk
     assert loader.calls == 0, "the refusal must come before the model is constructed"
 
 
-def test_supported_indexer_objective_builds(monkeypatch: pytest.MonkeyPatch):
-    assert _build_with_indexer_objective(monkeypatch, "deepseek_v4_toy", _StubLoader()) == 1
+@pytest.mark.parametrize("implementation", ("tilelang", "triton"))
+def test_supported_indexer_objective_builds(monkeypatch: pytest.MonkeyPatch, implementation: str):
+    assert (
+        _build_with_indexer_objective(monkeypatch, "deepseek_v4_toy", _StubLoader(), implementation=implementation)
+        == 1
+    )
 
 
 def test_disabled_indexer_objective_admits_eager_kernels(monkeypatch: pytest.MonkeyPatch):

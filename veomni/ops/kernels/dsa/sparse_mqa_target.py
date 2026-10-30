@@ -14,8 +14,9 @@
 
 """Head-summed compressed-slice teacher for the DSA indexer loss.
 
-DeepSeek-V3.2 eq. 4. Not a registered kernel row. TileLang is optional
-and GPU-only; importing this module must not load the vendor kernel.
+DeepSeek-V3.2 eq. 4. Not a registered kernel row. SM90+ NVIDIA GPUs run
+the TileLang teacher and AMD ROCm GPUs its Triton counterpart; both are
+optional and GPU-only, and importing this module must not load either.
 """
 
 from __future__ import annotations
@@ -44,8 +45,11 @@ def sparse_mqa_target_fwd(
     including the sliding window and the folded attention sink. The returned
     tensor is unnormalised; L1-normalise in the caller.
     """
-    _require_tilelang_sm90()
-    from .vendor.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+    if torch.version.hip is not None and IS_CUDA_AVAILABLE:
+        from .vendor.triton_sparse_mla_target import sparse_mqa_target_fwd_interface
+    else:
+        _require_tilelang_sm90()
+        from .vendor.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
 
     return sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale)
 

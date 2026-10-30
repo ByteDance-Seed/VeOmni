@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSA indexer-loss teacher reference math and direct TileLang helper contract."""
+"""DSA indexer-loss teacher reference math and the direct TileLang / Triton helper contract."""
+
+import math
+import sys
+from types import ModuleType
 
 import pytest
 import torch
@@ -20,36 +24,68 @@ import torch
 from tests.ops.tol import ATTN_ATOL, ATTN_RTOL
 from tests.ops.utils import require_nvidia_cuda
 from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates
-from veomni.utils.device import get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 DEVICE = get_device_type()
 
 _VENDOR_TARGET = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target"
+_TRITON_TARGET = "veomni.ops.kernels.dsa.vendor.triton_sparse_mla_target"
 
 
-@pytest.mark.parametrize(
-    ("hip_version", "compute_capability", "match"),
-    (
-        (None, 89, "SM90 or later"),
-        ("6.0", 90, "NVIDIA CUDA"),
-    ),
-    ids=("pre-sm90", "rocm"),
-)
-def test_wrapper_rejects_unsupported_nvidia_platform_before_import(
-    monkeypatch, hip_version, compute_capability, match
-):
-    import sys
+def _require_teacher_gpu():
+    """Skip unless this GPU runs a teacher kernel: TileLang on SM90+ NVIDIA, Triton on AMD ROCm."""
+    if IS_CUDA_AVAILABLE and torch.version.hip is not None:
+        pytest.importorskip("triton")
+        return
+    require_nvidia_cuda("tilelang", min_cc=90)
 
+
+def _attention_lse(q, kv, attn_sink, topk_idxs, sm_scale):
+    """The base-2, sink-inclusive LSE the sparse attention forward hands the teacher.
+
+    NVIDIA takes it from the TileLang forward. ROCm has no TileLang, so it is
+    computed here in FP32 over ``[selected slots ‖ sink]``.
+    """
+    if torch.version.hip is None:
+        from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+
+        return sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)[1]
+    b, s, h, _ = q.shape
+    batch_index = torch.arange(b, device=kv.device).view(b, 1, 1)
+    gathered = kv[batch_index, topk_idxs.clamp_min(0)]
+    logits = torch.einsum("bshd,bskd->bshk", q.float(), gathered.float()) * sm_scale
+    logits = logits.masked_fill(~(topk_idxs >= 0).unsqueeze(2), float("-inf"))
+    sink = attn_sink.float().view(1, 1, h, 1).expand(b, s, h, 1)
+    return (torch.logsumexp(torch.cat([logits, sink], dim=-1), dim=-1) / math.log(2)).contiguous()
+
+
+def test_wrapper_rejects_pre_sm90_nvidia_before_import(monkeypatch):
     sys.modules.pop(_VENDOR_TARGET, None)
     import veomni.ops.kernels.dsa.sparse_mqa_target as target
 
-    monkeypatch.setattr(target.torch.version, "hip", hip_version, raising=False)
+    monkeypatch.setattr(target.torch.version, "hip", None, raising=False)
     monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: compute_capability)
+    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: 89)
 
-    with pytest.raises(RuntimeError, match=match):
+    with pytest.raises(RuntimeError, match="SM90 or later"):
         target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+    assert _VENDOR_TARGET not in sys.modules
+
+
+def test_wrapper_routes_rocm_to_the_triton_teacher(monkeypatch):
+    sys.modules.pop(_VENDOR_TARGET, None)
+    import veomni.ops.kernels.dsa.sparse_mqa_target as target
+
+    calls = []
+    vendor = ModuleType(_TRITON_TARGET)
+    vendor.sparse_mqa_target_fwd_interface = lambda *args: calls.append(args) or "target"
+    monkeypatch.setitem(sys.modules, _TRITON_TARGET, vendor)
+    monkeypatch.setattr(target.torch.version, "hip", "7.14", raising=False)
+    monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
+
+    assert target.sparse_mqa_target_fwd("q", "kv", "topk", "lse", 0.125) == "target"
+    assert calls == [("q", "kv", "topk", "lse", 0.125)]
     assert _VENDOR_TARGET not in sys.modules
 
 
@@ -164,9 +200,8 @@ def test_target_kernel_matches_reference(heads, c):
     it is the only case that runs the interface's ``-1``-sentinel padding and the
     final ``[:, :, :topk]`` slice that has to hide it again.
     """
-    require_nvidia_cuda("tilelang", min_cc=90)
+    _require_teacher_gpu()
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
     torch.manual_seed(0)
     b, s, d, w = 2, 8, 64, 64
@@ -179,7 +214,7 @@ def test_target_kernel_matches_reference(heads, c):
     topk[1, 0, w + c - 1] = -1  # and one in the last, which only NI > 1 reaches
     scale = d**-0.5
 
-    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    lse = _attention_lse(q, kv, sink, topk, scale)
     actual = sparse_mqa_target_fwd(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
     # The sentinel padding a non-multiple ``c`` needs must not survive into the
     # returned shape.
@@ -200,10 +235,34 @@ def test_target_kernel_matches_reference(heads, c):
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-2)
 
 
-def test_target_kernel_zeroes_invalid_slots():
-    require_nvidia_cuda("tilelang", min_cc=90)
+def test_rocm_attention_lse_feeds_the_triton_teacher():
+    """The #1271 attention LSE and the ROCm teacher share one base-2 contract."""
+    if not (IS_CUDA_AVAILABLE and torch.version.hip is not None):
+        pytest.skip("requires an AMD ROCm GPU")
+
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+    from veomni.ops.kernels.dsa.vendor.triton_sparse_mla import sparse_attn_triton
+
+    torch.manual_seed(5)
+    b, s, heads, dim, pool, window, compressed = 1, 4, 8, 512, 256, 64, 64
+    q = torch.randn(b, s, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(b, pool, dim, device=DEVICE, dtype=torch.bfloat16)
+    sink = torch.randn(heads, device=DEVICE, dtype=torch.float32)
+    topk = torch.randint(0, pool, (b, s, window + compressed), device=DEVICE, dtype=torch.int32)
+    topk[0, 0, window] = -1
+    scale = dim**-0.5
+
+    _, lse = sparse_attn_triton(q, kv, sink, topk, sm_scale=scale, return_lse=True)
+    actual = sparse_mqa_target_fwd(q, kv, topk[:, :, window:].contiguous(), lse, sm_scale=scale)
+    actual = actual / actual.sum(-1, keepdim=True).clamp_min(1e-20)
+    expected = reference_compressed_target(q, kv, sink, topk, window, scale)
+
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-2)
+
+
+def test_target_kernel_zeroes_invalid_slots():
+    _require_teacher_gpu()
+    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     torch.manual_seed(2)
     b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
@@ -214,7 +273,7 @@ def test_target_kernel_zeroes_invalid_slots():
     topk[:, :, w + 3] = -1
     scale = d**-0.5
 
-    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    lse = _attention_lse(q, kv, sink, topk, scale)
     target = sparse_mqa_target_fwd(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
     assert (target[:, :, 3] == 0).all()
 
@@ -225,9 +284,8 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
     compressed row comes back as exact zeros, and the caller's ``clamp_min``
     normalisation leaves it as zeros rather than turning it into a NaN or a
     uniform distribution."""
-    require_nvidia_cuda("tilelang", min_cc=90)
+    _require_teacher_gpu()
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
     torch.manual_seed(4)
     b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
@@ -238,7 +296,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
     topk[0, 0, w:] = -1  # query 0 keeps a valid window and loses every compressed slot
     scale = d**-0.5
 
-    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    lse = _attention_lse(q, kv, sink, topk, scale)
     raw = sparse_mqa_target_fwd(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
     assert (raw[0, 0] == 0).all()
 
@@ -253,7 +311,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
 
 
 def test_target_kernel_rejects_more_than_64_heads():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    _require_teacher_gpu()
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 128, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -269,7 +327,7 @@ def test_target_kernel_rejects_more_than_64_heads():
 def test_target_kernel_rejects_non_bfloat16_inputs():
     """The kernel hardcodes ``dtype = T.bfloat16``; the interface names that
     constraint instead of letting an fp16 caller fall into tilelang's lowering."""
-    require_nvidia_cuda("tilelang", min_cc=90)
+    _require_teacher_gpu()
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -288,7 +346,7 @@ def test_target_kernel_rejects_empty_kv():
     would clamp to row 0 of a tensor with no rows -- an out-of-bounds device read
     that the candidate mask cannot prevent, since it only zeroes the score after
     the gather. ``sparse_mqa_fwd_interface`` guards this; mirror it here."""
-    require_nvidia_cuda("tilelang", min_cc=90)
+    _require_teacher_gpu()
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
