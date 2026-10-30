@@ -605,6 +605,16 @@
     ]
   },
   {
+    "name": "native-dense-lora-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_native.py"
+    ]
+  },
+  {
     "name": "58-unit",
     "suite": "unit",
     "conditional": false,
