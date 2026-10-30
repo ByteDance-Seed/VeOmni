@@ -112,7 +112,7 @@ def _fsdp_worker(root: str):
     assert dist.get_backend() == dist.Backend.NCCL, "This acceptance case requires physical CUDA/NCCL execution."
     root = Path(root)
     base_path, dcp_path, hf_path = root / "base", root / "dcp", root / "hf"
-    init_parallel_state_from_config(AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2")))
+    init_parallel_state_from_config(AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2")), name="base")
     try:
         if dist.get_rank() == 0:
             torch.manual_seed(42)
