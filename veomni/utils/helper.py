@@ -729,7 +729,7 @@ class ProfilerWithMem:
     def start(self):
         out = self._p.start()
         memory = get_torch_device().memory
-        if get_device_type() == "cuda":
+        if get_device_type() in ("cuda", "xpu"):
             # Keep stacks for live allocations; recording every free traceback
             # can crash profiler-enabled training during activation recomputation.
             memory._record_memory_history(context="state")
@@ -795,8 +795,9 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        get_torch_device().memory._dump_snapshot(gpu_memory_file)
-        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        if hasattr(get_torch_device().memory, "_dump_snapshot"):
+            get_torch_device().memory._dump_snapshot(gpu_memory_file)
+            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
@@ -864,7 +865,9 @@ def create_profiler(
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE) and profile_memory:
+    # Older XPU builds of PyTorch have no allocator history API.
+    has_memory_history = hasattr(get_torch_device().memory, "_record_memory_history")
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE) and profile_memory and has_memory_history:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
