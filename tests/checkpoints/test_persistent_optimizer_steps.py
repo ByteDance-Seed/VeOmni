@@ -120,6 +120,71 @@ def test_frozen_persistent_parameter_with_state_is_rejected():
         checkpoint._persistent_optimizer_rows(model, optimizer)
 
 
+def _exact_optimizer_roundtrip_worker(rank, rendezvous, output_dir):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    timeout = timedelta(seconds=30)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timeout)
+    try:
+        first = dist.new_group([0], timeout=timeout)
+        second = dist.new_group([1], timeout=timeout)
+        subgroup = first if rank == 0 else second
+        model = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1)
+        optimizer = FullFP32AdamW(model.parameters())
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+        for group, suffix in ((dist.group.WORLD, "world"), (subgroup, f"rank{rank}")):
+            saved = checkpoint.OptimizerState(
+                model,
+                optimizer,
+                SimpleNamespace(dp_mode="ddp"),
+                coordinated_group_validation=True,
+                coordinated_group=group,
+            )
+            path = f"{output_dir}/{suffix}"
+            dcp.save({"optimizer": saved}, checkpoint_id=path, process_group=group)
+            target = torch.nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                target.weight.copy_(model.weight)
+            target_optimizer = FullFP32AdamW(target.parameters())
+            restored = checkpoint.OptimizerState(
+                target,
+                target_optimizer,
+                SimpleNamespace(dp_mode="ddp"),
+                load=True,
+                coordinated_group_validation=True,
+                coordinated_group=group,
+            )
+            dcp.load({"optimizer": restored}, checkpoint_id=path, process_group=group)
+            for name, expected in optimizer.state[model.weight].items():
+                torch.testing.assert_close(target_optimizer.state[target.weight][name], expected, rtol=0, atol=0)
+            model.weight.grad = torch.full_like(model.weight, 0.5)
+            target.weight.grad = torch.full_like(target.weight, 0.5)
+            optimizer.step()
+            target_optimizer.step()
+            torch.testing.assert_close(target.weight, model.weight, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_exact_optimizer_roundtrip_world_and_subgroups(tmp_path):
+    mp.start_processes(
+        _exact_optimizer_roundtrip_worker,
+        args=(str(tmp_path / "rdzv-exact"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
 def test_frozen_persistent_parameter_without_state_is_rejected():
     model = torch.nn.Linear(2, 2)
     model._fqn2spec_info = {"weight": SimpleNamespace(persistent_fsdp_shard_dim=1)}
