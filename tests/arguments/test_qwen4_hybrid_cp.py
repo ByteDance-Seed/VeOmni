@@ -9,6 +9,9 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import AcceleratorConfig
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 @pytest.mark.parametrize("cp_size,dp_shard", [(2, 2), (4, 1)])
 def test_hybrid_topology_requires_an_explicit_opt_in(monkeypatch, cp_size, dp_shard):
     monkeypatch.setenv("WORLD_SIZE", "32")
