@@ -30,6 +30,7 @@ from veomni.models.seed_omni.utils.hf_layout import (
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
 )
+from veomni.utils.device import get_device_type
 
 
 TEXT_ENCODER = "qwen3_text_encoder"
@@ -228,7 +229,12 @@ def test_offline_convert_matches_the_runtime_load(hf_root, tmp_path):
     out = tmp_path / "split"
     convert_checkpoint(str(root), str(out))
     assert json.loads((out / "config.json").read_text(encoding="utf-8"))["model_type"] == "omni"
-    assert "ops_implementation" not in json.loads((out / LLM / "config.json").read_text(encoding="utf-8"))
+    llm_config = json.loads((out / LLM / "config.json").read_text(encoding="utf-8"))
+    if get_device_type() in ("cuda", "npu"):
+        assert "ops_implementation" not in llm_config
+    else:
+        # No flash-attn on a CPU host, so the convert builds (and records) eager.
+        assert llm_config["ops_implementation"] == {"attn_implementation": "eager"}
     assert read_hf_source(out) is None
 
     split = OmniModel.from_pretrained(

@@ -54,6 +54,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from ....utils import helper
+from ....utils.device import get_device_type
 from ....utils.registry import Registry
 from ...checkpoint.convert import (
     ConvertedCheckpointTensor,
@@ -541,7 +542,9 @@ def convert_with_hf_layout(
     """Offline split through the family's :class:`OmniHFLayout` — the same key map the runtime load uses.
 
     Returns the kwargs :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
-    writes out. Modules load on CPU in the checkpoint's own ``dtype``.
+    writes out. Modules load on CPU in the checkpoint's own ``dtype``, built
+    under the config's attention backend on an accelerator and ``eager``
+    elsewhere (the convert never runs a forward).
     """
     from ..modules import OMNI_MODEL_REGISTRY
     from .convert_registry import attach_module_assets
@@ -556,10 +559,13 @@ def convert_with_hf_layout(
     module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
+    # The convert only copies weights, so build under a backend this host can
+    # run: accelerators keep the config's default, hosts without flash-attn
+    # (CPU) fall back to eager.
+    build_attn_implementation = None if get_device_type() in ("cuda", "npu") else "eager"
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-        has_explicit_attn = "attn_implementation" in module_config.ops_implementation
         module = load_module_from_hf_source(
             module_cls,
             module_config,
@@ -567,10 +573,8 @@ def convert_with_hf_layout(
             name,
             device_map="cpu",
             torch_dtype=dtype,
-            attn_implementation=None if has_explicit_attn else "eager",
+            attn_implementation=build_attn_implementation,
         )
-        if not has_explicit_attn:
-            module.config._attn_implementation = None
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
         training_graph=training_graph, generation_graph=generation_graph
