@@ -45,3 +45,4 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 - **No linear-attention models yet.** Models with gated delta net layers, such as Qwen3.5, need the `fla` kernels for packed sequences, and those are not registered for Intel GPU.
 - **No expert parallelism.** Set `model.accelerator.ep_size=1` until an XPU-compatible implementation is available.
 - **Low-precision ReduceScatter transport is CUDA-only.**
+- **No `torch.compile` or async activation offload.** `model.accelerator.torch_compile.enable` is CUDA-only and raises on Intel GPU; async activation offload runs only on CUDA and NPU and leaves activations on the Intel GPU.
