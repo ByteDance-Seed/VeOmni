@@ -62,10 +62,11 @@ class LTXModel(torch.nn.Module):
         caption_projection: torch.nn.Module | None = None,
         audio_caption_projection: torch.nn.Module | None = None,
         cross_attention_adaln: bool = False,
+        config=None,
     ):
         super().__init__()
         if ops is None:
-            ops = TransformerOpsConfig()
+            ops = TransformerOpsConfig.from_functions(config=config)
         self.gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
         self.use_middle_indices_grid = use_middle_indices_grid
@@ -117,6 +118,7 @@ class LTXModel(torch.nn.Module):
             norm_eps=norm_eps,
             ops=ops,
             apply_gated_attention=apply_gated_attention,
+            config=config,
         )
         self.block_input_processor = BlockPerturbationsProcessor()
 
@@ -277,6 +279,7 @@ class LTXModel(torch.nn.Module):
         norm_eps: float,
         ops: TransformerOpsConfig,
         apply_gated_attention: bool,
+        config=None,
     ) -> None:
         video_config = (
             TransformerConfig(
@@ -310,6 +313,7 @@ class LTXModel(torch.nn.Module):
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
                     ops=ops,
+                    config=config,
                 )
                 for _ in range(num_layers)
             ]

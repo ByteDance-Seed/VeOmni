@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Adapted from https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py"""
 
 import math
@@ -22,7 +23,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -33,8 +33,8 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor_scale_grad,
 )
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from ....utils import logging
 from .config_wan import WanConfig
@@ -135,11 +135,12 @@ def pad_freqs(original_tensor, target_len):
 class RMSNorm(nn.Module):
     """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
 
-    def __init__(self, dim, eps=1e-5):
+    def __init__(self, dim, eps=1e-5, config=None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
     def forward(self, x):
         """Apply the interned ``rms_norm`` handle."""
@@ -147,7 +148,7 @@ class RMSNorm(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    """``attention`` / ``standard``. Impl from the installed ops config.
+    """``attention`` / ``standard``. Impl from ``config.ops_config``.
 
     ``WanModel`` is not on the HuggingFace attention-interface path, so
     ``config._attn_implementation`` must stay ``eager``. ``sageattention``
@@ -159,7 +160,7 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        impl = resolve_op_impl("attn_implementation")
+        impl = config.ops_config.attn_implementation if config is not None else "eager"
         if impl in {"sageattention", "veomni_sage_attention"}:
             impl = "veomni_sage_attention"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
@@ -231,11 +232,12 @@ class SelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        self.norm_q = RMSNorm(dim, eps=eps, config=config)
+        self.norm_k = RMSNorm(dim, eps=eps, config=config)
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
-        self.veomni_rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
+        rope_impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
+        self.veomni_rope = VeomniOp("rope", "wan", rope_impl)
         self.sp_async = False
 
     def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
@@ -329,13 +331,13 @@ class CrossAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        self.norm_q = RMSNorm(dim, eps=eps, config=config)
+        self.norm_k = RMSNorm(dim, eps=eps, config=config)
         self.has_image_input = has_image_input
         if has_image_input:
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
-            self.norm_k_img = RMSNorm(dim, eps=eps)
+            self.norm_k_img = RMSNorm(dim, eps=eps, config=config)
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
 
@@ -451,8 +453,13 @@ def _rope_freqs_for_block(freqs_full: torch.Tensor, freqs_local: torch.Tensor, s
 class WanModel(PreTrainedModel):
     config_class = WanConfig
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["DiTBlock"]
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Wan dispatches attention exclusively through its local VeomniOp.
+        return attn_implementation
 
     def __init__(self, config: WanConfig, **kwargs):
         super().__init__(config, **kwargs)

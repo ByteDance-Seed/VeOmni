@@ -42,7 +42,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
     qwen_video_inputs,
 )
@@ -57,8 +56,8 @@ def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
         Qwen2_5_VLForConditionalGeneration,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return Qwen2_5_VLForConditionalGeneration(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return Qwen2_5_VLForConditionalGeneration(config)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:
@@ -84,17 +83,16 @@ def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch
     config.patch_size = patch
     config.spatial_merge_size = merge
     config.window_size = 4 * merge * patch
-    config._attn_implementation = "eager"
-    with ops_config_scope(eager_ops_config()):
-        model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
-        output = model.dummy_forward().pooler_output
-        assert torch.isfinite(output).all()
-        output.float().square().mean().backward()
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, name
-                assert torch.isfinite(param.grad).all(), name
-        assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
+    config._set_ops_implementation(eager_ops_config())
+    model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
+    output = model.dummy_forward().pooler_output
+    assert torch.isfinite(output).all()
+    output.float().square().mean().backward()
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, name
+            assert torch.isfinite(param.grad).all(), name
+    assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
 
 
 @pytest.mark.parametrize("attention", ["eager", "veomni_sdpa"])
@@ -102,27 +100,26 @@ def test_qwen2_5_vl_regular_vision_forward(attention):
     from veomni.models.transformers.qwen2_5vl.generated import patched_modeling_qwen2_5_vl_gpu as module
 
     config = _tiny_config().vision_config
-    config._attn_implementation = attention
     ops = eager_ops_config()
     ops.attn_implementation = attention
-    with ops_config_scope(ops):
-        torch.manual_seed(177)
-        model = module.Qwen2_5_VisionTransformerPretrainedModel(config).train()
-        merge = config.spatial_merge_size
-        patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
-        pixels = torch.randn(merge * merge, patch_dim, requires_grad=True)
-        grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.long)
-        metadata = module._qwen2_5_vit_metadata(grid_thw.tolist(), 0, model.window_size, merge, model.patch_size)
-        output = model(pixels, grid_thw, return_dict=True, vit_metadata=metadata).pooler_output
-        assert torch.isfinite(output).all()
-        output.float().square().mean().backward()
-        assert pixels.grad is not None and torch.isfinite(pixels.grad).all()
-        assert torch.count_nonzero(pixels.grad)
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, name
-                assert torch.isfinite(param.grad).all(), name
-        assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
+    config._set_ops_implementation(ops)
+    torch.manual_seed(177)
+    model = module.Qwen2_5_VisionTransformerPretrainedModel(config).train()
+    merge = config.spatial_merge_size
+    patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
+    pixels = torch.randn(merge * merge, patch_dim, requires_grad=True)
+    grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.long)
+    metadata = module._qwen2_5_vit_metadata(grid_thw.tolist(), 0, model.window_size, merge, model.patch_size)
+    output = model(pixels, grid_thw, return_dict=True, vit_metadata=metadata).pooler_output
+    assert torch.isfinite(output).all()
+    output.float().square().mean().backward()
+    assert pixels.grad is not None and torch.isfinite(pixels.grad).all()
+    assert torch.count_nonzero(pixels.grad)
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, name
+            assert torch.isfinite(param.grad).all(), name
+    assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
 
 
 def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
@@ -146,19 +143,18 @@ def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
         config.patch_size = 8
         config.spatial_merge_size = merge
         config.window_size = 4 * merge * config.patch_size
-        config._attn_implementation = "veomni_sdpa"
         ops = eager_ops_config()
         ops.attn_implementation = "veomni_sdpa"
-        with ops_config_scope(ops):
-            model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
-            output = model.dummy_forward().pooler_output
-            assert torch.isfinite(output).all()
-            output.float().square().mean().backward()
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    assert param.grad is not None, name
-                    assert torch.isfinite(param.grad).all(), name
-            assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
+        config._set_ops_implementation(ops)
+        model = Qwen2_5_VisionTransformerPretrainedModel(config).train()
+        output = model.dummy_forward().pooler_output
+        assert torch.isfinite(output).all()
+        output.float().square().mean().backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, name
+                assert torch.isfinite(param.grad).all(), name
+        assert any(param.grad is not None and torch.count_nonzero(param.grad) for param in model.parameters())
     finally:
         dist.destroy_process_group()
 

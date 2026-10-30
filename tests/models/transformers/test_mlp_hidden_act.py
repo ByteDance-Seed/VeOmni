@@ -26,7 +26,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts as HFQwen3MoeExperts
 
-from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config, ops_config_scope
+from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import (
     tiny_deepseek_v4_config,
     tiny_qwen2_config,
@@ -72,8 +72,8 @@ def _generated_cls(family: str, class_name: str):
 def _pair(ours_cls, hf_cls, config):
     hf = hf_cls(config)
     _init_parameters(hf)
-    with ops_config_scope(eager_ops_config()):
-        ours = ours_cls(config)
+    config._set_ops_implementation(eager_ops_config())
+    ours = ours_cls(config)
     ours.load_state_dict(hf.state_dict())
     counter = None
     if config.hidden_act in {"silu", "swish"}:

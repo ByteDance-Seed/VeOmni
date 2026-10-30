@@ -415,10 +415,10 @@ def test_weight_saved_state_avoids_temporary_bf16_storage(weight_kind):
     w1 = torch.nn.Parameter(torch.randn(2, 256, 256, device="cuda", dtype=torch.bfloat16) * 0.03)
     w2 = torch.nn.Parameter(torch.randn(2, 256, 128, device="cuda", dtype=torch.bfloat16) * 0.03)
     if weight_kind == "cast":
-        w1, w2 = [torch.nn.Parameter(w.float()) for w in (w1, w2)]
+        w1, w2 = (torch.nn.Parameter(w.float()) for w in (w1, w2))
         fc1, fc2 = w1.bfloat16(), w2.bfloat16()
     elif weight_kind == "strided":
-        w1, w2 = [torch.nn.Parameter(w.transpose(1, 2).contiguous().transpose(1, 2)) for w in (w1, w2)]
+        w1, w2 = (torch.nn.Parameter(w.transpose(1, 2).contiguous().transpose(1, 2)) for w in (w1, w2))
         fc1, fc2 = w1, w2
     else:
         fc1, fc2 = w1, w2

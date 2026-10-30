@@ -52,11 +52,13 @@ inference without any VeOmni code**.
 
 ### The Two Representations
 
-At runtime VeOmni uses a **VeOmni config** (a `PretrainedConfig` subclass) that
+At runtime VeOmni uses a **VeOmni config** (a `VeOmniPretrainedConfig` subclass) that
 holds both the diffusers model parameters and VeOmni-specific fields such as
-`model_type`, `condition_model_type`, and `_attn_implementation`.  
-On disk, only a **pure diffusers config** is ever written — those VeOmni fields
-are never serialized to `config.json`.
+`model_type`, `condition_model_type`, and `ops_implementation` (exposed as `config.ops_config`).  
+On disk, write a **diffusers-compatible config** plus sparse `ops_implementation`
+metadata so VeOmni can restore kernel selections. Runtime fields such as
+`model_type` and `condition_model_type` are omitted; the resolved `ops_config`
+cache is never serialized. Native diffusers loaders ignore the extra ops metadata.
 
 ```
 On disk (diffusers format)          In memory (VeOmni)
@@ -65,7 +67,7 @@ config.json                         WanTransformer3DModelConfig
   _class_name: WanTransformer3DModel   ├── all diffusers params (num_layers, ...)
   _diffusers_version: 0.x.x            ├── model_type: "WanTransformer3DModel"
   num_layers: 40                        ├── condition_model_type: "WanTransformer3DConditionModel"
-  ...                                   └── _attn_implementation: "flash_attention_2"
+  ...                                   └── ops_implementation / ops_config
 model.safetensors
   (identical key names)
 ```
@@ -86,8 +88,8 @@ no conversion, no VeOmni-specific JSON fields required in the checkpoint.
 
 After loading, `_WanTransformer3DModel.__init__` has already populated all
 layer weights. VeOmni's `__init__` then wraps the result in a `PreTrainedModel`
-shell and, if the SP attention implementation is configured, installs the
-`WanSPAttnProcessor`. The weights are not touched.
+shell and installs `WanSPAttnProcessor(config)` on each block so attention
+resolves from `config.ops_config`. The weights are not touched.
 
 ### Saving a Checkpoint Compatible with Diffusers Inference
 
@@ -96,7 +98,10 @@ shell and, if the SP attention implementation is configured, installs the
 ```python
 def save_pretrained(self, path, **kwargs):
     hf_config = copy.deepcopy(self.config)      # 1. stash VeOmni config
-    self.config = self.config.to_diffuser_dict() # 2. swap in pure diffusers dict
+    self.config = {                            # 2. preserve local ops metadata
+        **self.config.to_diffuser_dict(),
+        "ops_implementation": dict(self.config.ops_implementation),
+    }
     _WanTransformer3DModel.save_pretrained(self, path, **kwargs)  # 3. delegate
     self.config = hf_config                      # 4. restore VeOmni config
 ```
@@ -104,8 +109,10 @@ def save_pretrained(self, path, **kwargs):
 Step 2 calls `to_diffuser_dict()`, which returns **only the parameters that
 appear in the diffusers model's `__init__` signature** (inspected at import
 time via `inspect.signature`). VeOmni-only fields (`model_type`,
-`condition_model_type`, `_attn_implementation`, etc.) are automatically
-excluded because they are not in that signature.
+`condition_model_type`, etc.) are excluded because they are not in that
+signature. Persist the sparse `ops_implementation` separately in the saved
+config so a VeOmni reload retains the module's selected kernels. Diffusers
+ignores this extra metadata when constructing its native model.
 
 Step 3 delegates to the diffusers `save_pretrained`, which:
 - Writes `config.json` using `to_dict()` (overridden to inject `_class_name`
@@ -114,8 +121,7 @@ Step 3 delegates to the diffusers `save_pretrained`, which:
   key names are identical to the original diffusers model because VeOmni
   inherits all layers without renaming them.
 
-The resulting checkpoint directory is indistinguishable from one produced by
-diffusers directly. A downstream pipeline can load it without any knowledge of
+The weight layout remains compatible with checkpoints produced by diffusers. A downstream pipeline can load it without any knowledge of
 VeOmni:
 
 ```python
@@ -268,10 +274,10 @@ the diffusers `__init__` runs.
 | Aspect | How it works |
 |---|---|
 | Loading diffusers ckpt | `from_pretrained` fully delegates to `_DiffusersModel.from_pretrained`; reads standard `config.json` + `model.safetensors` |
-| Config in memory | `PretrainedConfig` subclass holding both diffusers params and VeOmni fields |
+| Config in memory | `VeOmniPretrainedConfig` subclass holding both diffusers params and VeOmni fields |
 | Weight key names | Unchanged — no layer renaming, weights are identical to diffusers |
 | Saving | Temporarily swaps config to `to_diffuser_dict()`, delegates to `_DiffusersModel.save_pretrained`, then restores |
-| Saved `config.json` | Pure diffusers format (`_class_name`, `_diffusers_version`, no VeOmni fields) |
+| Saved `config.json` | Diffusers-compatible fields (`_class_name`, `_diffusers_version`) plus persisted `ops_implementation`; no runtime config fields or resolved cache |
 | Saved `model.safetensors` | Identical format to original diffusers checkpoint |
 | Diffusers inference | Load saved ckpt directly with `WanTransformer3DModel.from_pretrained` or swap into any diffusers pipeline — no VeOmni required |
 | SP forward patch | Applied to the **base diffusers class** (not VeOmni subclass) so both code paths benefit |
@@ -313,15 +319,16 @@ placeholder diffusers packages are intentionally not public registry entries.
 
 ## Step 2: Condition Model Config
 
-Subclass `PretrainedConfig`. The config stores **paths to the checkpoint components**
-(text encoder, VAE, scheduler, etc.) that the condition model loads at init time.
+Subclass `VeOmniPretrainedConfig`. The config stores **paths to the checkpoint components**
+(text encoder, VAE, scheduler, etc.) that the condition model loads at init time,
+plus per-instance `ops_implementation` / `ops_config`.
 Override `get_config_dict` to inject the checkpoint directory as `base_model_path`
 so `from_pretrained(path)` works automatically.
 
 ```python
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
-class YourConditionModelConfig(PretrainedConfig):
+class YourConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "YourConditionModel"  # must be unique; used as registry key
 
     def __init__(
@@ -425,7 +432,7 @@ def register_modeling(architecture: str = None):
 
 ## Step 5: Transformer Model Config
 
-Subclass `PretrainedConfig` and mirror every parameter of the diffusers
+Subclass `VeOmniPretrainedConfig` and mirror every parameter of the diffusers
 model's `__init__`. Add `to_diffuser_dict()` to project back to the kwargs
 that the diffusers model expects, and override `to_dict()` so the saved
 `config.json` is compatible with `diffusers.from_pretrained`.
@@ -437,11 +444,11 @@ model class to instantiate.
 ```python
 import inspect
 from diffusers import YourDiffusersTransformerModel as _YourDiffusersModel
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 _DIFFUSERS_INIT_SIGNATURE = inspect.signature(_YourDiffusersModel.__init__)
 
-class YourTransformerConfig(PretrainedConfig):
+class YourTransformerConfig(VeOmniPretrainedConfig):
     model_type = "YourTransformerModel"             # registry key for this model
     condition_model_type = "YourConditionModel"     # registry key for companion
 
@@ -472,23 +479,29 @@ class YourTransformerConfig(PretrainedConfig):
 
 ## Step 6: Transformer Model — Class and Init
 
-Inherit from **both** `PreTrainedModel` (transformers) **and** the diffusers
-model. Call them in the right order and resolve the config-dict conflict.
+Inherit from **both** `VeOmniPreTrainedModel` (the HF model subclass) **and** the
+diffusers model. The VeOmni base validates final ops before HF initialization.
+Call them in the right order and resolve the config-dict conflict.
+Apply an explicit constructor attention override to the config before HF checks
+it or the model binds kernels. Omitted or `None` overrides preserve saved choices.
 
 ```python
 from diffusers import YourDiffusersTransformerModel as _YourDiffusersModel
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 class YourTransformerModel(PreTrainedModel, _YourDiffusersModel):
     config_class = YourTransformerConfig
     supports_gradient_checkpointing = True
 
     def __init__(self, config: YourTransformerConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         # diffusers stores model state in _internal_dict; remove the transformers one.
         del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _YourDiffusersModel.__init__(self, **config.to_diffuser_dict())
         self.config: YourTransformerConfig = config
@@ -637,44 +650,36 @@ Ulysses SP requires an AllToAll before and after the attention kernel.
 For diffusers models this is done via an **attention processor** installed with
 `attn.set_processor(...)`.
 
-### Pattern (uses the registered attention interfaces in `veomni/ops`)
+### Pattern (uses `VeomniOp("attention", "standard", ...)` from `config.ops_config`)
 
-1. Implement a `your_eager_attention_forward` function — the non-flash fallback.
-   It must follow the `ALL_ATTENTION_FUNCTIONS` calling convention:
-   - Inputs: `(module, query, key, value, attention_mask, ...)` where Q/K/V are
-     in `(B, heads, seq, head_dim)` format.
-   - Output: `((B, seq, heads, head_dim), None)`.
-
-2. In `YourSPAttnProcessor.__init__`, store the implementation name and expose
-   the attributes that `flash_attention_forward` (from
-   `veomni/ops/kernels/attention/standard/flash.py`)
-   reads from `module`:
+1. In `YourSPAttnProcessor.__init__(self, config=None)`, read the attention
+   implementation from `config.ops_config` and bind an instance-local `VeomniOp`
+   handle. The registered `eager` row forwards to `veomni_sdpa` when the module's
+   defining file has no local `eager_attention_forward`:
 
    ```python
    from types import SimpleNamespace
-   from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+   from veomni.ops import VeomniOp
 
    class YourSPAttnProcessor:
-       def __init__(self, attn_implementation: str):
-           self.attn_implementation = attn_implementation
-           self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+       def __init__(self, config=None):
+           impl = (
+               config.ops_config.attn_implementation
+               if config is not None
+               else "veomni_sdpa"
+           )
+           self.veomni_attn = VeomniOp("attention", "standard", impl)
+           self.config = SimpleNamespace(_attn_implementation=impl)
            self.is_causal = False
            self.layer_idx = None
    ```
 
-3. In `__call__`, resolve the attention function via `ALL_ATTENTION_FUNCTIONS`:
+2. In `__call__`, transpose Q/K/V to `(B, heads, seq, head_dim)` and invoke
+   `self.veomni_attn` with `skip_ulysses=True` (since SP AllToAll is handled
+   manually in the processor before RoPE):
 
    ```python
-   attention_interface: Callable = your_eager_attention_forward
-   if self.attn_implementation != "eager":
-       attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
-   ```
-
-4. Transpose Q/K/V to `(B, heads, seq, head_dim)` before calling and pass
-   `skip_ulysses=True` (SP is already handled by the manual AllToAll above):
-
-   ```python
-   hidden_states_out = attention_interface(
+   hidden_states_out = self.veomni_attn(
        self,
        query.transpose(1, 2),
        key.transpose(1, 2),
@@ -686,21 +691,15 @@ For diffusers models this is done via an **attention processor** installed with
    )[0]  # returns (B, seq, heads, head_dim)
    ```
 
-   The `veomni_flash_attention_*` functions registered in
-   `ALL_ATTENTION_FUNCTIONS` (see `veomni/ops/install.py`) will
-   select the correct FA2/FA3/FA4 kernel automatically.
-
-5. Install the processor on every attention block:
+3. Install the processor on every attention block in `YourTransformerModel.__init__`
+   (and in `from_pretrained` if `from_pretrained` constructs a `YourTransformerModel`
+   directly without calling `__init__`):
 
    ```python
-   def _setup_sp_attention(model, attn_implementation):
-       sp_processor = YourSPAttnProcessor(attn_implementation)
-       for block in model.blocks:
-           block.attn.set_processor(sp_processor)
+   sp_processor = YourSPAttnProcessor(config)
+   for block in self.blocks:
+       block.attn.set_processor(sp_processor)
    ```
-
-   Call `_setup_sp_attention` from `YourTransformerModel.__init__` when
-   `attn_implementation in _VEOMNI_SP_ATTN_IMPLS`.
 
 ---
 
@@ -796,9 +795,7 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 | `from_pretrained` (classmethod) | ✓ | Delegate to diffusers loader |
 | `YourDiffusersModel_forward` (module-level) | ✓ | SP-patched forward for the diffusers base class |
 | `apply_veomni_sp_patch()` | ✓ | Monkey-patch the diffusers base class at load time |
-| `wan_eager_attention_forward` (or equivalent) | ✓ | SDPA fallback following `ALL_ATTENTION_FUNCTIONS` convention |
-| `YourSPAttnProcessor` | ✓ (for SP) | Ulysses AllToAll + routes to `flash_attention_forward` |
-| `_setup_sp_attention(model, impl)` | ✓ (for SP) | Install the SP processor on every attention block |
+| `YourSPAttnProcessor(config)` | ✓ (for SP) | Ulysses AllToAll + dispatches through `self.veomni_attn` bound from `config.ops_config` |
 
 ---
 
@@ -809,10 +806,10 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 - [ ] `veomni/models/diffusers/your_dit/__init__.py` (imports sub-packages)
 - [ ] `veomni/models/diffusers/__init__.py` updated with `from . import your_dit`
 - [ ] `veomni/models/__init__.py` imports `diffusers` so registration runs
-- [ ] Condition model config: `PretrainedConfig` subclass with `get_config_dict` override
+- [ ] Condition model config: `VeOmniPretrainedConfig` subclass with `get_config_dict` override
 - [ ] Condition model: `get_condition()` and `process_condition()` implemented
 - [ ] Condition model registered in `MODEL_CONFIG_REGISTRY` and `MODELING_REGISTRY`
-- [ ] Transformer config: `to_diffuser_dict()`, `to_dict()`, and `condition_model_type` defined
+- [ ] Transformer config: `VeOmniPretrainedConfig` subclass with `to_diffuser_dict()`, `to_dict()`, and `condition_model_type` defined
 - [ ] Transformer model: dual-MRO `__init__` with `_internal_dict` cleanup
 - [ ] Transformer model: `config` property + setter
 - [ ] Transformer model: `forward()` iterating per-sample and returning `ModelOutput`
@@ -823,12 +820,10 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 ### If Supporting Ulysses SP
 
-- [ ] The model recognizes the three `veomni_flash_attention_*` names as SP-aware attention
-- [ ] `YourEagerAttentionForward` function with `ALL_ATTENTION_FUNCTIONS` convention
-- [ ] `YourSPAttnProcessor` with `SimpleNamespace` config, `is_causal=False`, `layer_idx=None`
-- [ ] SP guard in forward patch: slice/gather only when `ulysses_enabled and attn_impl in _VEOMNI_SP_ATTN_IMPLS`
+- [ ] `YourSPAttnProcessor(config)` binds `self.veomni_attn = VeomniOp("attention", "standard", impl)` from `config.ops_config`
+- [ ] SP guard in forward patch: slice/gather only when `sp_enabled`
 - [ ] RoPE embeddings sliced to the local rank's positions when SP is active
-- [ ] `_setup_sp_attention` installs the processor on every attention block
+- [ ] `YourSPAttnProcessor(config)` installed on every attention block in `__init__` (and in `from_pretrained` when applicable)
 
 ---
 
