@@ -1648,8 +1648,9 @@ class OpsImplementationConfig:
             "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
             "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
-            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+ or their "
+            "Triton FP8 port on AMD gfx942/gfx950 (FP4 experts stay NVIDIA-only); 'none' trains in the "
+            "model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
             "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
@@ -1832,15 +1833,16 @@ class OpsImplementationConfig:
 
         # ``qat_implementation`` selects a quantization recipe rather than an
         # op implementation, so registry resolution does not validate it. Its fake
-        # quantizers are the SM90-only TileLang kernels: without this check a
-        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
-        # inside the first fake-quant call.
+        # quantizers are the SM90-only TileLang kernels and, on AMD gfx942/gfx950,
+        # their Triton port: without this check a CPU, NPU, other ROCm or pre-SM90
+        # host trains for a while and then raises inside the first fake-quant call.
         if self.qat_implementation != "none":
             import torch
 
-            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+            from ..ops.qat._hardware import FP8_QUANTIZER_GPUS, TRITON_FP8_ARCHS
+            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
 
-            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
+            unsupported = not IS_CUDA_AVAILABLE
             if not unsupported:
                 # Reading the capability initializes CUDA, and parsing happens
                 # before the trainer calls ``set_device`` -- query this rank's
@@ -1848,12 +1850,15 @@ class OpsImplementationConfig:
                 # every rank. The count is NVML-based and needs no context.
                 local_rank = int(os.getenv("LOCAL_RANK", "0"))
                 device = local_rank if local_rank < torch.cuda.device_count() else 0
-                unsupported = get_gpu_compute_capability(device) < 90
+                if torch.version.hip is not None:
+                    unsupported = get_rocm_gcn_arch(device) not in TRITON_FP8_ARCHS
+                else:
+                    unsupported = get_gpu_compute_capability(device) < 90
             if unsupported:
                 raise ValueError(
-                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
-                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
-                    f"Set it to 'none' to train in the model dtype."
+                    f"qat_implementation={self.qat_implementation!r} requires {FP8_QUANTIZER_GPUS}, "
+                    f"because its fake quantizers are the DeepSeek V4 TileLang kernels or, on AMD, "
+                    f"their Triton port. Set it to 'none' to train in the model dtype."
                 )
 
 

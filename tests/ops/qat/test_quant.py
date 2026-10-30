@@ -12,17 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 TileLang activation and weight quantization numerics."""
+"""DeepSeek-V4 activation and weight quantization numerics.
+
+FP8 tests run against each backend the host supports: the TileLang kernels on
+SM90+ NVIDIA GPUs and their Triton port on AMD gfx942/gfx950. Both must match
+the same Torch reference bit for bit.
+"""
 
 import pytest
 import torch
 
 from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
 from tests.ops.utils import require_nvidia_cuda
-from veomni.utils.device import get_device_type
+from veomni.ops.qat._hardware import TRITON_FP8_ARCHS
+from veomni.utils.device import get_device_type, get_rocm_gcn_arch
 
 
 DEVICE = get_device_type()
+
+
+@pytest.fixture(params=("tilelang", "triton"))
+def fp8_quantizers(request):
+    """Module exposing ``act_quant`` / ``fp8_weight_quant`` for one backend."""
+    if request.param == "tilelang":
+        require_nvidia_cuda("tilelang", min_cc=90)
+        from veomni.ops.qat import quant
+
+        return quant
+    pytest.importorskip("triton")
+    if get_rocm_gcn_arch() not in TRITON_FP8_ARCHS:
+        pytest.skip("Triton FP8 quantizers require an AMD gfx942/gfx950 GPU")
+    from veomni.ops.qat import triton_quant
+
+    return triton_quant
 
 
 def test_fp8_scale_pairing_rejects_e8m0_without_format():
@@ -74,9 +96,8 @@ def test_tilelang_fp4_quant_matches_reference_and_dequantizes():
     ((None, torch.float32), ("ue8m0", torch.float8_e8m0fnu)),
     ids=("exact-scale", "ue8m0"),
 )
-def test_tilelang_act_quant_matches_reference_and_dequantizes(block_size, scale_fmt, scale_dtype):
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import act_quant
+def test_act_quant_matches_reference_and_dequantizes(fp8_quantizers, block_size, scale_fmt, scale_dtype):
+    act_quant = fp8_quantizers.act_quant
 
     torch.manual_seed(2)
     x = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
@@ -104,6 +125,29 @@ def test_tilelang_act_quant_matches_reference_and_dequantizes(block_size, scale_
     assert torch.equal(x, original)
 
 
+@pytest.mark.parametrize(
+    ("scale_fmt", "scale_dtype"),
+    ((None, torch.float32), ("ue8m0", torch.float8_e8m0fnu)),
+    ids=("exact-scale", "ue8m0"),
+)
+def test_act_quant_matches_reference_across_row_tiles(fp8_quantizers, scale_fmt, scale_dtype):
+    """Rows past a partial tile, mixed magnitudes and signed zeros all round like the reference."""
+    torch.manual_seed(3)
+    magnitudes = torch.logspace(-6, 4, 1001).unsqueeze(-1)
+    x = (torch.randn(1001, 384) * magnitudes).to(device=DEVICE, dtype=torch.bfloat16)
+    x[5, :128] = -0.0
+    x[6, 7] = -1e-30
+    kwargs = {"block_size": 128, "scale_fmt": scale_fmt, "scale_dtype": scale_dtype}
+
+    quantized, scales = fp8_quantizers.act_quant(x, **kwargs)
+    expected_quantized, expected_scales = reference_act_quant(x, **kwargs)
+    assert torch.equal(quantized.view(torch.uint8), expected_quantized.view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8))
+    assert torch.equal(
+        fp8_quantizers.act_quant(x, dequant=True, **kwargs), reference_act_quant(x, dequant=True, **kwargs)
+    )
+
+
 def _weight_quant_test_input():
     """A 2x3 grid of 128x128 tiles, each exercising a different scale regime."""
     torch.manual_seed(6)
@@ -129,9 +173,8 @@ def _tiles_above_amax_floor():
     return torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
 
 
-def test_tilelang_fp8_weight_quant_matches_reference():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+def test_fp8_weight_quant_matches_reference(fp8_quantizers):
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128)
@@ -165,9 +208,10 @@ def test_tilelang_fp8_weight_quant_matches_reference():
     ),
     ids=("exact-scale", "ue8m0"),
 )
-def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input(scale_fmt, scale_dtype, tolerance_divisor):
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+def test_fp8_weight_quant_round_trip_and_non_contiguous_input(
+    fp8_quantizers, scale_fmt, scale_dtype, tolerance_divisor
+):
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = _weight_quant_test_input()
     kwargs = {"scale_fmt": scale_fmt}
@@ -189,9 +233,8 @@ def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input(scale_fmt
     assert torch.equal(transposed_scales, scales)
 
 
-def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+def test_fp8_weight_quant_ue8m0_matches_reference(fp8_quantizers):
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
@@ -221,10 +264,9 @@ def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
     assert (tile_amax[_tiles_above_amax_floor()] >= 224.0).all()
 
 
-def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
+def test_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal(fp8_quantizers):
     """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = _weight_quant_test_input()
     _, exact_scales = fp8_weight_quant(x, block_size=128)
@@ -241,10 +283,9 @@ def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
     assert (rounded_scales < 2.0 * exact_scales).all()
 
 
-def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
+def test_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale(fp8_quantizers):
     """An amax that already divides to a power of two must not gain a binade."""
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
     x[3, 5] = 56.0  # 448 * 2**-3, exact in BF16, so ceil(log2(amax / 448)) == -3
@@ -255,9 +296,8 @@ def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
     assert quantized.float()[3, 5] == 448.0
 
 
-def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+def test_fp8_weight_quant_dequant_fuses_the_round_trip(fp8_quantizers):
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     x = _weight_quant_test_input()
     rows, cols = x.shape
@@ -282,9 +322,8 @@ def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
     )
 
 
-def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
+def test_fp8_weight_quant_rejects_unsupported_inputs(fp8_quantizers):
+    fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
     with pytest.raises(AssertionError, match="2D weight"):
         fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))
@@ -300,9 +339,8 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
 
 
-def test_tilelang_act_quant_rejects_e8m0_without_format():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import act_quant
-
+def test_act_quant_rejects_e8m0_without_format(fp8_quantizers):
     with pytest.raises(AssertionError, match="powers of two"):
-        act_quant(torch.empty(4, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
+        fp8_quantizers.act_quant(
+            torch.empty(4, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu
+        )

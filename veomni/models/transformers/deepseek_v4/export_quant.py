@@ -14,18 +14,43 @@
 
 """DSV4 checkpoint export quantization.
 
-TileLang is optional and GPU-only. Importing this module must not load
-``act_quant``. Callers go through the wrappers, which reject non-SM90 first.
+The quantizer kernels are optional and GPU-only. Importing this module must not
+load them. Callers go through the wrappers, which reject unsupported GPUs first:
+FP8 runs TileLang on SM90+ NVIDIA GPUs and its Triton port on AMD gfx942/gfx950,
+FP4 runs TileLang on SM90+ NVIDIA GPUs only.
 """
 
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
+
+
+_TRITON_FP8_ARCHS = ("gfx942", "gfx950")
 
 
 def _require_tilelang_sm90() -> None:
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
         raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
+
+
+def _fp8_quantizer_backend() -> str:
+    """Return ``"triton"`` on AMD gfx942/gfx950 and ``"tilelang"`` on SM90+ NVIDIA, rejecting other GPUs."""
+    if torch.version.hip is not None and IS_CUDA_AVAILABLE and get_rocm_gcn_arch() in _TRITON_FP8_ARCHS:
+        return "triton"
+    if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
+        raise RuntimeError(
+            "DeepSeek V4 FP8 export quantization requires an SM90 or later NVIDIA CUDA GPU "
+            "or an AMD ROCm gfx942/gfx950 GPU"
+        )
+    return "tilelang"
+
+
+def require_export_quantizers(*, fp4: bool) -> None:
+    """Reject this GPU unless it runs the FP8 quantizer, and the FP4 one when ``fp4`` is set."""
+    if fp4:
+        _require_tilelang_sm90()
+    else:
+        _fp8_quantizer_backend()
 
 
 def fp4_act_quant(
@@ -46,9 +71,11 @@ def fp8_weight_quant(
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2D bfloat16 weight tensor to block-scaled FP8 on SM90+ CUDA GPUs."""
-    _require_tilelang_sm90()
-    from veomni.ops.qat.quant import fp8_weight_quant as impl
+    """Quantize a 2D bfloat16 weight tensor to block-scaled FP8 on SM90+ CUDA or AMD gfx942/gfx950 GPUs."""
+    if _fp8_quantizer_backend() == "triton":
+        from veomni.ops.qat.triton_quant import fp8_weight_quant as impl
+    else:
+        from veomni.ops.qat.quant import fp8_weight_quant as impl
 
     return impl(x, block_size, scale_fmt, scale_dtype)
 
@@ -56,4 +83,5 @@ def fp8_weight_quant(
 __all__ = [
     "fp4_act_quant",
     "fp8_weight_quant",
+    "require_export_quantizers",
 ]

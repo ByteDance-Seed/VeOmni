@@ -35,7 +35,7 @@ from veomni.ops.qat import (
     fp8_fake_quant_weight,
     qat_linear,
 )
-from veomni.utils.device import get_device_type
+from veomni.utils.device import get_device_type, get_rocm_gcn_arch
 
 
 DEVICE = get_device_type()
@@ -44,9 +44,17 @@ DEVICE = get_device_type()
 @pytest.fixture(autouse=True)
 def clear_qat_hardware_gate_cache():
     """Keep process-level hardware caching isolated between QAT tests."""
-    qat_hardware.require_tilelang_sm90.cache_clear()
+    qat_hardware.quantizer_backend.cache_clear()
     yield
-    qat_hardware.require_tilelang_sm90.cache_clear()
+    qat_hardware.quantizer_backend.cache_clear()
+
+
+def _require_fp8_quantizer_gpu():
+    """Skip unless this GPU runs the TileLang or the Triton FP8 quantizers."""
+    if get_rocm_gcn_arch() in qat_hardware.TRITON_FP8_ARCHS:
+        pytest.importorskip("triton")
+        return
+    require_nvidia_cuda("tilelang", min_cc=90)
 
 
 def _qat_entry_calls():
@@ -68,8 +76,8 @@ def _qat_entry_calls():
     )
 
 
-def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
-    backend = ModuleType("veomni.ops.qat.quant")
+def _install_fake_quant_backend(monkeypatch, calls: list[str], module: str = "veomni.ops.qat.quant") -> None:
+    backend = ModuleType(module)
 
     def record(name):
         def fake_quant(tensor, *args, **kwargs):
@@ -81,14 +89,16 @@ def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
     backend.act_quant = record("act_quant")
     backend.fp4_act_quant = record("fp4_act_quant")
     backend.fp8_weight_quant = record("fp8_weight_quant")
-    monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
+    monkeypatch.setitem(sys.modules, module, backend)
 
 
 def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
     """Every quantizing QAT path checks hardware before entering TileLang."""
     vendor_calls = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
+    _install_fake_quant_backend(monkeypatch, vendor_calls, "veomni.ops.qat.triton_quant")
     monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
+    monkeypatch.setattr(qat_hardware, "get_rocm_gcn_arch", lambda: None)
 
     for name, call in _qat_entry_calls():
         with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
@@ -113,6 +123,27 @@ def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
         call()
         assert vendor_calls, f"{name} did not reach the vendor backend after the hardware check"
     assert hardware_checks == [True]
+
+
+def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkeypatch):
+    """gfx942/gfx950 route FP8 to the Triton port; FP4 exists only in TileLang."""
+    tilelang_calls, triton_calls = [], []
+    _install_fake_quant_backend(monkeypatch, tilelang_calls)
+    _install_fake_quant_backend(monkeypatch, triton_calls, "veomni.ops.qat.triton_quant")
+    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
+    monkeypatch.setattr(type(qat_hardware.ROCM_GPU), "matches", lambda self: True)
+    monkeypatch.setattr(qat_hardware, "get_rocm_gcn_arch", lambda: "gfx942")
+
+    for name, call in _qat_entry_calls():
+        triton_calls.clear()
+        if "fp4" in name:
+            with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
+                call()
+            assert triton_calls == [], f"{name} reached the FP8 backend"
+        else:
+            call()
+            assert triton_calls, f"{name} did not reach the Triton backend"
+    assert tilelang_calls == []
 
 
 @pytest.fixture
@@ -494,8 +525,8 @@ def test_qat_linear_restores_the_parameter_after_the_call(reference_quantizers):
     assert torch.equal(linear.weight.detach(), original)
 
 
-def test_qat_linear_runs_on_the_tilelang_kernels():
-    require_nvidia_cuda("tilelang", min_cc=90)
+def test_qat_linear_runs_on_the_gpu_quantizers():
+    _require_fp8_quantizer_gpu()
     torch.manual_seed(21)
     linear = nn.Linear(256, 128, bias=False, device=DEVICE, dtype=torch.bfloat16)
     x = torch.randn(8, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -526,8 +557,8 @@ def test_fp4_fake_quant_runs_on_tilelang_with_reference_forward_and_gradient():
     assert torch.equal(weight.grad, grad_output)
 
 
-def test_stacked_fp8_weight_runs_on_tilelang_with_per_expert_reference_and_gradient():
-    require_nvidia_cuda("tilelang", min_cc=90)
+def test_stacked_fp8_weight_runs_on_the_gpu_quantizers_with_per_expert_reference_and_gradient():
+    _require_fp8_quantizer_gpu()
     torch.manual_seed(23)
     weight = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
     grad_output = torch.randn_like(weight)

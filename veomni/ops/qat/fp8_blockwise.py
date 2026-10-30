@@ -19,7 +19,9 @@ would compute while the backward pass keeps updating BF16 master weights. Both
 halves come from reusing the DeepSeek-V4 TileLang quantizers for the
 quantize-dequantize round trip and wrapping them in a straight-through
 estimator, which keeps training bit-aligned with inference by construction
-instead of by a second, drifting reimplementation of the same numerics.
+instead of by a second, drifting reimplementation of the same numerics. AMD
+GPUs run a Triton port of the same quantizers, held bit-exact to the same
+reference.
 
 The backward pass is the usual straight-through approximation: a
 quantize-dequantize round trip is a step function whose true derivative is zero
@@ -29,16 +31,16 @@ Every scale is derived from its own block's amax, and ``ue8m0`` rounds that
 scale up, so ``x / scale`` stays inside the representable FP8 range and no
 element sits in a saturated region whose gradient would have to be masked.
 
-Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU.
-``qat_linear(..., enabled=False)`` calls the original module directly and
-bypasses quantization and those restrictions.
+Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU or an AMD
+gfx942/gfx950 GPU. ``qat_linear(..., enabled=False)`` calls the original module
+directly and bypasses quantization and those restrictions.
 """
 
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from ._hardware import require_tilelang_sm90
+from ._hardware import fp8_quantizer_backend
 
 
 # DeepSeek-V4 rounds every scale up to a power of two so that it survives
@@ -58,17 +60,21 @@ __all__ = [
 
 
 def act_quant(*args, **kwargs):
-    """Lazily call the TileLang activation quantizer."""
-    require_tilelang_sm90()
-    from .quant import act_quant as quantize
+    """Lazily call this GPU's FP8 activation quantizer."""
+    if fp8_quantizer_backend() == "triton":
+        from .triton_quant import act_quant as quantize
+    else:
+        from .quant import act_quant as quantize
 
     return quantize(*args, **kwargs)
 
 
 def fp8_weight_quant(*args, **kwargs):
-    """Lazily call the TileLang FP8 weight quantizer."""
-    require_tilelang_sm90()
-    from .quant import fp8_weight_quant as quantize
+    """Lazily call this GPU's FP8 weight quantizer."""
+    if fp8_quantizer_backend() == "triton":
+        from .triton_quant import fp8_weight_quant as quantize
+    else:
+        from .quant import fp8_weight_quant as quantize
 
     return quantize(*args, **kwargs)
 
