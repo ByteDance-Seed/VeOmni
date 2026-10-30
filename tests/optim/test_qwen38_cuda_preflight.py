@@ -295,3 +295,61 @@ def test_cuda_checkpoint_wrapper_rolls_back_all_ranks_on_rank_local_failure(tmp_
         strict=True,
     ):
         assert expected in result["message"]
+
+
+def _qwen_frozen_worker(rank, rendezvous, output_dir):
+    from types import SimpleNamespace
+
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+    from veomni.optim import optimizer as factory
+    from veomni.optim import qwen38_muon as implementation
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.ones(2, 2))
+        opt = implementation.Qwen38MuonAdamW(
+            [{"params": [model.weight], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+        )
+        combined = factory.MultiOptimizer(model, {"qwen": opt}, ["qwen"])
+        model.weight.grad = torch.ones_like(model.weight)
+        combined.step()
+        combined._qwen38_cuda_guard = True
+        combined._qwen38_cuda_group = dist.group.WORLD
+        before = model.weight.detach().clone()
+        if rank == 1:
+            model.weight.requires_grad_(False)
+        wrapper = OptimizerState(
+            model,
+            combined,
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+            coordinated_group_validation=True,
+            coordinated_group=dist.group.WORLD,
+        )
+        message = ""
+        try:
+            wrapper.state_dict()
+        except RuntimeError as exc:
+            message = str(exc)
+        torch.save(
+            {
+                "message": message,
+                "unchanged": torch.equal(model.weight, before),
+                "step": opt.state[model.weight]["step"],
+            },
+            Path(output_dir) / f"frozen-qwen-rank{rank}.pt",
+        )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_qwen_multioptimizer_freeze_rejected_on_all_checkpoint_ranks(tmp_path):
+    mp.spawn(_qwen_frozen_worker, args=(str(tmp_path / "rdzv-frozen-qwen"), str(tmp_path)), nprocs=2, join=True)
+    results = [torch.load(tmp_path / f"frozen-qwen-rank{rank}.pt", weights_only=True) for rank in range(2)]
+    assert "another rank" in results[0]["message"]
+    assert "frozen parameter still owned" in results[1]["message"]
+    assert all(result["unchanged"] and result["step"].item() == 1 for result in results)

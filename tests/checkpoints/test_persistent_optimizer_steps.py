@@ -158,14 +158,18 @@ def test_frozen_exact_optimizer_rejected_for_initialized_single_rank(monkeypatch
 
 
 def _exact_optimizer_checkpoint_worker(rank, rendezvous, output_dir):
+    from datetime import timedelta
+
     import torch.distributed as dist
 
     from veomni.optim.master_fp32_adamw import FullFP32AdamW
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
     try:
-        first = dist.new_group([0])
-        second = dist.new_group([1])
+        first = dist.new_group([0], timeout=timedelta(seconds=30))
+        second = dist.new_group([1], timeout=timedelta(seconds=30))
         subgroup = first if rank == 0 else second
         model = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():

@@ -75,7 +75,7 @@ def test_frozen_muon_parameter_save_fails_before_state_is_lost():
     optimizer.step()
     model.first.down_proj.weight.requires_grad_(False)
     wrapper = OptimizerState(model, optimizer, parallel_state=SimpleNamespace(dp_mode="ddp"))
-    with pytest.raises(RuntimeError, match="frozen Muon optimizer parameters"):
+    with pytest.raises(RuntimeError, match="frozen parameter still owned by a precision-sensitive optimizer"):
         wrapper.state_dict()
 
 
@@ -88,7 +88,7 @@ def test_frozen_muon_restore_target_is_rejected(tmp_path):
     target, target_optimizer = _make_model_and_optimizer()
     target.first.down_proj.weight.requires_grad_(False)
     wrapper = OptimizerState(target, target_optimizer, parallel_state=ps, load=True)
-    with pytest.raises(RuntimeError, match="frozen Muon optimizer parameters"):
+    with pytest.raises(RuntimeError, match="frozen parameter still owned by a precision-sensitive optimizer"):
         dcp.load({"optimizer": wrapper}, checkpoint_id=tmp_path)
 
 
