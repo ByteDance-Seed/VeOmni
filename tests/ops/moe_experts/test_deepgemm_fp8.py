@@ -615,3 +615,46 @@ def _non_current_device_worker(rank):
         # Reject a second device before reaching upstream's invalid-handle error.
         with pytest.raises(RuntimeError, match="one CUDA device per process"):
             GroupedLayout.from_counts(torch.tensor([129]), torch.device(f"cuda:{rank}"))
+
+
+def test_fp8_weight_transpose_preserves_every_byte():
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import transpose_fp8_weight
+
+    # Include all 256 bit patterns, including NaN encodings: a byte transpose
+    # must not decode, canonicalize or requantize even those payloads.
+    shape = (2, 256, 384)
+    raw = torch.randint(0, 256, shape, device="cuda", dtype=torch.uint8)
+    scale = torch.randn((shape[0], shape[1] // 128, shape[2] // 128), device="cuda")
+    qt, st = transpose_fp8_weight(raw.view(torch.float8_e4m3fn), scale)
+    assert qt.is_contiguous() and st.is_contiguous()
+    torch.testing.assert_close(qt.view(torch.uint8), raw.transpose(1, 2), rtol=0, atol=0)
+    torch.testing.assert_close(st, scale.transpose(1, 2), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8_weight", [False, True])
+def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_weight):
+    from contextlib import nullcontext
+
+    from veomni.distributed.offloading import custom_save_on_cpu
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear, quantize_weights
+    from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
+
+    torch.manual_seed(42)
+    x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(2, 256, 256, device="cuda", dtype=torch.bfloat16) * 0.03
+    grad = torch.randn_like(x)
+    layout = GroupedLayout.from_counts(torch.tensor([128, 128]), x.device)
+    results = []
+    for offload in (False, True):
+        xi = x.clone().requires_grad_()
+        wi = weight.clone()
+        if fp8_weight:
+            qdata, scale, _, _ = quantize_weights(wi, store_transpose=False)
+            wi = FP8ExpertWeight(qdata, scale)
+        wi = torch.nn.Parameter(wi)
+        with custom_save_on_cpu(pin_memory=True) if offload else nullcontext():
+            y = GroupedLinear.apply(xi, wi, layout)
+        dx, dw = torch.autograd.grad(y, (xi, wi), grad)
+        results.append((y.detach(), dx, dw))
+    for actual, expected in zip(results[1], results[0]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

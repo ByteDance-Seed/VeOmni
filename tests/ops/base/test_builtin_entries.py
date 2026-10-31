@@ -37,6 +37,7 @@ _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
 _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
+_GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
@@ -48,6 +49,8 @@ _MLU = ("mlu", ())
 
 
 _BUILTIN_ENTRIES = (
+    ("moe_unpermute", "standard", "eager", "any", _ANY, ()),
+    ("moe_unpermute", "standard", "triton", "cuda", _GPU_NVIDIA_SM70, ("triton",)),
     ("async_ulysses_qkv", "standard", "eager", "any", _ANY, ()),
     ("async_ulysses_qkv", "dit", "eager", "any", _ANY, ()),
     ("async_ulysses_o", "standard", "eager", "any", _ANY, ()),

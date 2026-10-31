@@ -183,6 +183,7 @@ def _weight_quant_kernel(
     USE_UE8M0: tl.constexpr,
     STORE_NORMAL: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
+    ROUND_BF16: tl.constexpr,
 ):
     mb, kb, expert = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     m = mb * BLOCK + tl.arange(0, BLOCK)
@@ -194,6 +195,8 @@ def _weight_quant_kernel(
         k = k.to(tl.int64)
     offsets = expert.to(tl.int64) * N * K + m[:, None] * K + k[None, :]
     w = tl.load(W + offsets).to(tl.float32)
+    if ROUND_BF16:
+        w = w.to(tl.bfloat16).to(tl.float32)
     scale = _quant_scale(tl.max(tl.max(tl.abs(w), 1), 0), USE_UE8M0)
     if STORE_NORMAL:
         tl.store(Q + offsets, w / scale)
@@ -205,9 +208,18 @@ def _weight_quant_kernel(
 
 
 def quantize_weights(
-    w: torch.Tensor, *, use_ue8m0: bool | None = None, store_normal: bool = True, store_transpose: bool = True
+    w: torch.Tensor,
+    *,
+    use_ue8m0: bool | None = None,
+    store_normal: bool = True,
+    store_transpose: bool = True,
+    round_bf16: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Quantize 128x128 weight tiles into the requested GEMM orientations."""
+    """Quantize 128x128 weight tiles into the requested GEMM orientations.
+
+    ``round_bf16`` preserves the FSDP BF16-cast recipe when the source is an
+    FP32 master shard, without materializing a separate BF16 temporary.
+    """
     if not (store_normal or store_transpose):
         raise ValueError("At least one quantized weight orientation must be requested.")
     e, n, k = w.shape
@@ -219,9 +231,33 @@ def quantize_weights(
         use_ue8m0 = _uses_ue8m0(w.device)
     with torch.cuda.device(w.device):
         _weight_quant_kernel[(n // 128, k // 128, e)](
-            w, q, qt, scales, scales_t, n, k, 128, use_ue8m0, store_normal, store_transpose, num_warps=8
+            w, q, qt, scales, scales_t, n, k, 128, use_ue8m0, store_normal, store_transpose, round_bf16, num_warps=8
         )
     return q, scales, qt, scales_t
+
+
+@triton.jit
+def _weight_transpose_kernel(Q, QT, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+    nb, kb, expert = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    n = nb * BLOCK + tl.arange(0, BLOCK)
+    k = kb * BLOCK + tl.arange(0, BLOCK)
+    base = expert.to(tl.int64) * N * K
+    if N * K > 2147483648:
+        n = n.to(tl.int64)
+        k = k.to(tl.int64)
+    values = tl.load(Q + base + n[:, None] * K + k[None, :])
+    tl.store(QT + base + k[None, :] * N + n[:, None], values)
+
+
+def transpose_fp8_weight(qdata: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose square-block FP8 weights without dequantization or requantization."""
+    e, n, k = qdata.shape
+    qt = torch.empty((e, k, n), device=qdata.device, dtype=qdata.dtype)
+    with torch.cuda.device(qdata.device):
+        _weight_transpose_kernel[(n // 128, k // 128, e)](
+            qdata.view(torch.uint8), qt.view(torch.uint8), n, k, 128, num_warps=8
+        )
+    return qt, scale.transpose(1, 2).contiguous()
 
 
 @triton.jit
@@ -450,6 +486,7 @@ class GroupedLinear(torch.autograd.Function):
     to the parameter dtype in the GEMM epilogue. Persistent BF16 parameters are
     requantized for dgrad; temporary weights retain an invocation-local FP8
     transpose instead. Neither path uses a module-level quantized cache.
+    Gathered FP8 parameters use a byte-exact tiled transpose for dgrad.
     Higher-order gradients are unsupported.
     """
 
@@ -459,9 +496,15 @@ class GroupedLinear(torch.autograd.Function):
         with torch.cuda.device(x.device):
             import deep_gemm
 
-            qw, sw, qwt, swt = quantize_weights(
-                weight, store_transpose=ctx.needs_input_grad[0] and not recompute_weight
-            )
+            from .fp8_weight import FP8ExpertWeight
+
+            if isinstance(weight, FP8ExpertWeight):
+                qw, sw, qwt, swt = weight.qdata, weight.scale, None, None
+                recompute_weight = True
+            else:
+                qw, sw, qwt, swt = quantize_weights(
+                    weight, store_transpose=ctx.needs_input_grad[0] and not recompute_weight
+                )
             ctx.layout = layout
             ctx.weight_shape = weight.shape
             ctx.weight_dtype = weight.dtype
@@ -512,7 +555,13 @@ class GroupedLinear(torch.autograd.Function):
             dx = dw = None
             if ctx.needs_input_grad[0]:
                 if source_weight is not None:
-                    _, _, qwt, swt = quantize_weights(source_weight, store_normal=False)
+                    from .fp8_weight import FP8ExpertWeight
+
+                    if isinstance(source_weight, FP8ExpertWeight):
+                        # Square blocks preserve the exact quantization under transpose.
+                        qwt, swt = transpose_fp8_weight(source_weight.qdata, source_weight.scale)
+                    else:
+                        _, _, qwt, swt = quantize_weights(source_weight, store_normal=False)
                 padded_dx = torch.empty(
                     (layout.rows.numel(), ctx.input_shape[1]), device=grad_output.device, dtype=ctx.input_dtype
                 )

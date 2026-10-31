@@ -610,6 +610,12 @@ def validate_low_precision_reduce_scatter_comm(
     return True
 
 
+def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
+    """Validate an explicit expert FSDP placement independently of its optimizer."""
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+        raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -666,6 +672,18 @@ class FSDPConfig:
             )
         },
     )
+    expert_fsdp_shard_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
+        },
+    )
+    expert_weight_fp8_all_gather: bool = field(
+        default=False,
+        metadata={
+            "help": "Use FP8 payloads plus block scales for FSDP2 all-gather of DeepGEMM routed expert weights. Does not change EP token communication, gradient reduction or other parameters. Ignored without matching experts; requires BF16 mixed precision, block-aligned shards and no parameter CPU offload."
+        },
+    )
     low_precision_reduce_scatter_comm: bool = field(
         default=False,
         metadata={
@@ -697,6 +715,9 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        if not isinstance(self.expert_weight_fp8_all_gather, bool):
+            raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
+        validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
