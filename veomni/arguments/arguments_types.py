@@ -1523,7 +1523,7 @@ class OpsImplementationConfig:
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
-            "delegates heavy GDN compute to torch.ops.npu.*). "
+            "delegates heavy GDN compute to the stable fla_npu.ops.ascendc entry). "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
