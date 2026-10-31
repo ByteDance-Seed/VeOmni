@@ -354,7 +354,7 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 
 ### DeepGEMM FP8 expert parameter transport
 
-`FSDPConfig.fp8_all_gather` flows through `VeOmniModelRuntime` and
+`FSDPConfig.expert_weight_fp8_all_gather` flows through `VeOmniModelRuntime` and
 `build_parallelize_model` into `parallelize_model_fsdp2`. After materialization,
 `distributed/fsdp2/fp8_all_gather.py` attaches native FSDP pre/post all-gather
 hooks to expert parameters selected by their actual DeepGEMM op handle.

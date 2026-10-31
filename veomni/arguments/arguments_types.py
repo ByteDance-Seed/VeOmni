@@ -678,10 +678,10 @@ class FSDPConfig:
             "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
         },
     )
-    fp8_all_gather: bool = field(
+    expert_weight_fp8_all_gather: bool = field(
         default=False,
         metadata={
-            "help": "All-gather DeepGEMM routed expert weights as block FP8 plus scales; ignored when no experts use deepgemm_fp8. Selected experts require FSDP2, BF16 mixed precision and block-aligned shards; no CPU offload."
+            "help": "Use FP8 payloads plus block scales for FSDP2 all-gather of DeepGEMM routed expert weights. Does not change EP token communication, gradient reduction or other parameters. Ignored without matching experts; requires BF16 mixed precision, block-aligned shards and no parameter CPU offload."
         },
     )
     low_precision_reduce_scatter_comm: bool = field(
@@ -715,8 +715,8 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
-        if not isinstance(self.fp8_all_gather, bool):
-            raise ValueError("fp8_all_gather must be a boolean.")
+        if not isinstance(self.expert_weight_fp8_all_gather, bool):
+            raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
         validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode

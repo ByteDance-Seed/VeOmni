@@ -64,7 +64,7 @@ def _deepgemm_experts(model):
 def resolve_fp8_all_gather(model, enabled, mixed_precision, *, fsdp_mode="fsdp2", offload=False):
     """Ignore the inherited policy without matching experts; validate it otherwise."""
     if not isinstance(enabled, bool):
-        raise ValueError("fp8_all_gather must be a boolean.")
+        raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
     if not enabled or next(_deepgemm_experts(model), None) is None:
         return False
     if (
@@ -74,7 +74,7 @@ def resolve_fp8_all_gather(model, enabled, mixed_precision, *, fsdp_mode="fsdp2"
         or not mixed_precision.enable
         or mixed_precision.param_dtype != "bfloat16"
     ):
-        raise ValueError("fp8_all_gather requires FSDP2, BF16 mixed precision and no CPU offload.")
+        raise ValueError("expert_weight_fp8_all_gather requires FSDP2, BF16 mixed precision and no CPU offload.")
     return True
 
 

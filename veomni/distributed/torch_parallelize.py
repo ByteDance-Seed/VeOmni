@@ -432,7 +432,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
-    fp8_all_gather: bool = False,
+    expert_weight_fp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
@@ -463,11 +463,14 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
-    if fp8_all_gather is not False:
+    if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
-        fp8_all_gather = resolve_fp8_all_gather(
-            model, fp8_all_gather, mixed_precision, offload=bool(kwargs.get("enable_fsdp_offload", False))
+        expert_weight_fp8_all_gather = resolve_fp8_all_gather(
+            model,
+            expert_weight_fp8_all_gather,
+            mixed_precision,
+            offload=bool(kwargs.get("enable_fsdp_offload", False)),
         )
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim)
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
@@ -498,8 +501,8 @@ def parallelize_model_fsdp2(
 
     model._veomni_compile_enabled = False
     compile_config = compile_config or CompileConfig()
-    if fp8_all_gather and compile_config.enable:
-        raise ValueError("fp8_all_gather does not support torch.compile.")
+    if expert_weight_fp8_all_gather and compile_config.enable:
+        raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
 
     # Step 1: Apply ExtraParallel
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
@@ -921,7 +924,7 @@ def parallelize_model_fsdp2(
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
 
-    if fp8_all_gather:
+    if expert_weight_fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
         count = register_deepgemm_fp8_all_gather(model)
@@ -1034,7 +1037,7 @@ def build_parallelize_model(
     recompute_policy: Optional[recompute_utils.RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
-    fp8_all_gather: bool = False,
+    expert_weight_fp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
@@ -1052,17 +1055,17 @@ def build_parallelize_model(
             EP-local dim is divisible by ``ep_fsdp_size``.
         recompute_policy: Per-block recomputation strategy, bound after HF has
             enabled gradient checkpointing and before FSDP2 shards the blocks.
-        fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
+        expert_weight_fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
             Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
-    if fp8_all_gather is not False:
+    if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
-        fp8_all_gather = resolve_fp8_all_gather(
+        expert_weight_fp8_all_gather = resolve_fp8_all_gather(
             model,
-            fp8_all_gather,
+            expert_weight_fp8_all_gather,
             mixed_precision,
             fsdp_mode=parallel_state.dp_mode,
             offload=bool(kwargs.get("enable_fsdp_offload", False)),
@@ -1073,8 +1076,8 @@ def build_parallelize_model(
             low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
         )
     compile_config = compile_config or CompileConfig()
-    if fp8_all_gather and compile_config.enable:
-        raise ValueError("fp8_all_gather does not support torch.compile.")
+    if expert_weight_fp8_all_gather and compile_config.enable:
+        raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
@@ -1137,7 +1140,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
-                fp8_all_gather=fp8_all_gather,
+                expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,

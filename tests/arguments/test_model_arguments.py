@@ -65,8 +65,8 @@ def test_fp8_all_gather_validates_policies_only_for_matching_experts(
     from veomni.distributed import torch_parallelize
     from veomni.distributed.torch_compile import CompileConfig
 
-    config = _instantiate_recursive(FSDPConfig, {"fp8_all_gather": True, **kwargs})
-    assert config.fp8_all_gather is True
+    config = _instantiate_recursive(FSDPConfig, {"expert_weight_fp8_all_gather": True, **kwargs})
+    assert config.expert_weight_fp8_all_gather is True
     model = nn.Sequential(nn.Linear(2, 2))
     if has_experts:
         model[0].veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
@@ -79,7 +79,7 @@ def test_fp8_all_gather_validates_policies_only_for_matching_experts(
     for builder in ("parallelize_model_fsdp2", "parallelize_model_ddp"):
         monkeypatch.setattr(torch_parallelize, builder, lambda **kw: calls.append(kw) or kw["model"])
     options = dict(
-        fp8_all_gather=True,
+        expert_weight_fp8_all_gather=True,
         mixed_precision=config.mixed_precision,
         enable_fsdp_offload=config.offload,
         init_device="cuda",
@@ -87,14 +87,14 @@ def test_fp8_all_gather_validates_policies_only_for_matching_experts(
         compile_config=CompileConfig(enable=compile_enabled),
     )
     if has_experts:
-        error = "does not support torch.compile" if compile_enabled else "fp8_all_gather requires"
+        error = "does not support torch.compile" if compile_enabled else "expert_weight_fp8_all_gather requires"
         with pytest.raises(ValueError, match=error):
             torch_parallelize.build_parallelize_model(model, **options)
         assert not calls
     else:
         assert torch_parallelize.build_parallelize_model(model, **options) is model
         if config.fsdp_mode == "fsdp2":
-            assert calls[0]["fp8_all_gather"] is False
+            assert calls[0]["expert_weight_fp8_all_gather"] is False
             assert calls[0]["mixed_precision"] is config.mixed_precision
             assert calls[0]["enable_fsdp_offload"] is config.offload
             assert calls[0]["compile_config"].enable is compile_enabled
@@ -104,14 +104,14 @@ def test_fp8_all_gather_requires_boolean():
     from veomni.arguments.arguments_types import FSDPConfig
 
     with pytest.raises(ValueError, match="boolean"):
-        FSDPConfig(fp8_all_gather="true")
+        FSDPConfig(expert_weight_fp8_all_gather="true")
 
 
 def test_fp8_all_gather_is_opt_in():
     from veomni.arguments.arguments_types import FSDPConfig
 
-    assert FSDPConfig().fp8_all_gather is False
-    assert FSDPConfig(fp8_all_gather=True).fp8_all_gather is True
+    assert FSDPConfig().expert_weight_fp8_all_gather is False
+    assert FSDPConfig(expert_weight_fp8_all_gather=True).expert_weight_fp8_all_gather is True
 
 
 def test_fp8_all_gather_rejects_non_swiglu_before_collectives():

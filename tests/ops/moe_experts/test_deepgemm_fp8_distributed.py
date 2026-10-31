@@ -53,7 +53,9 @@ class _Experts(nn.Module):
         )
 
 
-def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, use_offload, rendezvous):
+def _worker(
+    rank, world, ep_size, use_fsdp, repeated, use_checkpoint, expert_weight_fp8_all_gather, use_offload, rendezvous
+):
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor import Shard
 
@@ -95,12 +97,12 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
             )
             if ep_size > 1:
                 module.set_gradient_divide_factor(state.ep_gradient_divide_factor)
-        if fp8_all_gather:
+        if expert_weight_fp8_all_gather:
             from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
             assert register_deepgemm_fp8_all_gather(module) == 2
         expected_weights = []
-        if fp8_all_gather:
+        if expert_weight_fp8_all_gather:
             from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import quantize_weights
             from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
 
@@ -117,7 +119,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
         for step in range(2):
             xi, ri = x[rank].clone().requires_grad_(), routing[rank].clone().requires_grad_()
             opt.zero_grad(set_to_none=True)
-            if fp8_all_gather:
+            if expert_weight_fp8_all_gather:
                 expected_weights[:] = [
                     quantize_weights(p.full_tensor().bfloat16(), store_transpose=False)
                     for p in (module.fc1, module.fc2)
@@ -149,7 +151,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
                 if begin == 0:
                     assert torch.count_nonzero(actual[0]) == 0
             opt.step()
-            if fp8_all_gather:
+            if expert_weight_fp8_all_gather:
                 # Normal state-dict copy/load must retain the extensions and
                 # store only high precision shards, never the transport wrapper.
                 saved = {name: value.detach().clone() for name, value in module.state_dict().items()}
@@ -172,7 +174,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
 
 @pytest.mark.launch_plan(provider=from_parameter("world"))
 @pytest.mark.parametrize(
-    "world,ep_size,use_fsdp,repeated,use_checkpoint,fp8_all_gather,use_offload",
+    "world,ep_size,use_fsdp,repeated,use_checkpoint,expert_weight_fp8_all_gather,use_offload",
     [
         pytest.param(
             *case,
@@ -196,7 +198,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
     ],
 )
 def test_distributed_fp8_experts(
-    world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, use_offload, tmp_path
+    world, ep_size, use_fsdp, repeated, use_checkpoint, expert_weight_fp8_all_gather, use_offload, tmp_path
 ):
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("NVIDIA Hopper or Blackwell is required.")
@@ -213,7 +215,7 @@ def test_distributed_fp8_experts(
             use_fsdp,
             repeated,
             use_checkpoint,
-            fp8_all_gather,
+            expert_weight_fp8_all_gather,
             use_offload,
             f"file://{tmp_path / 'rdzv'}",
         ),
@@ -270,7 +272,7 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
         model = build_parallelize_model(
             model,
             init_device="meta",
-            fp8_all_gather=True,
+            expert_weight_fp8_all_gather=True,
             expert_fsdp_shard_dim=shard_dim,
             enable_gradient_checkpointing=False,
         )
@@ -330,7 +332,7 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
         restored = build_parallelize_model(
             restored,
             init_device="meta",
-            fp8_all_gather=True,
+            expert_weight_fp8_all_gather=True,
             expert_fsdp_shard_dim=1 - shard_dim,
             enable_gradient_checkpointing=False,
         )
