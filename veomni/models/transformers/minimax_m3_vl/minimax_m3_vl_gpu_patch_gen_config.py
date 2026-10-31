@@ -890,10 +890,15 @@ def minimax_m3_vl_text_model_forward_patched(
                 "produced by VeOmni's collator. Without them only a single unpadded sequence (batch size 1, no "
                 "sequence parallelism) is accepted; padded batches are not supported."
             )
-        # A lone sequence is a one-segment pack. The attention mask is assumed
-        # all-ones as in VeOmni's collator: reading it would cost a device sync.
-        # Metadata is built from shapes, on the device for CUDA FlashAttention
-        # and on the host for NPU's host-side varlen interface.
+        # A lone sequence is a one-segment pack, so its mask must be all ones.
+        # The check syncs, but only on this path: the collator always provides
+        # cu_seq_lens_q. Metadata is built from shapes, on the device for CUDA
+        # FlashAttention and on the host for NPU's host-side varlen interface.
+        if attention_mask is not None and (attention_mask.dim() != 2 or not bool(attention_mask.all())):
+            raise ValueError(
+                "MiniMax M3 VL language attention without cu_seq_lens_q/max_length_q only accepts an unpadded "
+                "sequence: attention_mask must be None or a [1, seq_len] all-ones mask."
+            )
         sequence_length = inputs_embeds.shape[1]
         cu_seq_lens = torch.tensor(
             [0, sequence_length],
