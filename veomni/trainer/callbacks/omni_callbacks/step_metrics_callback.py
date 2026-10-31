@@ -64,7 +64,9 @@ class OmniStepMetricsCallback(Callback):
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
-        self.start_time = time.time()
+        preflight_start = getattr(self.trainer, "_step_preflight_start_time", None)
+        self.start_time = preflight_start if preflight_start is not None else time.time()
+        self.trainer._step_preflight_start_time = None
 
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs

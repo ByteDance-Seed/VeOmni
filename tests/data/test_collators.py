@@ -68,6 +68,44 @@ def test_mtp_labels_pack_on_the_sequence_dim_without_crossing_samples(monkeypatc
     assert torch.equal(out["mtp_labels"], expected)
 
 
+def test_packing_does_not_mutate_samples_reused_in_later_batches(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    records = [
+        {"input_ids": torch.tensor([10, 11]), "attention_mask": torch.ones(2), "labels": torch.tensor([10, 11])},
+        {"input_ids": torch.tensor([20, 21]), "attention_mask": torch.ones(2), "labels": torch.tensor([20, 21])},
+    ]
+    collator = m.MainCollator()
+    packed = collator(records)
+    assert torch.equal(packed["labels"], torch.tensor([[10, 11, IGNORE_INDEX, 21]]))
+    assert "position_ids" not in records[0] and "position_ids" not in records[1]
+    assert torch.equal(records[1]["labels"], torch.tensor([20, 21]))
+    reordered = collator(list(reversed(records)))
+    assert torch.equal(reordered["labels"], torch.tensor([[20, 21, IGNORE_INDEX, 11]]))
+    repeated = collator([records[1], records[1]])
+    assert torch.equal(repeated["labels"], torch.tensor([[20, 21, IGNORE_INDEX, 21]]))
+    assert torch.equal(records[1]["labels"], torch.tensor([20, 21]))
+
+
+def test_packing_keeps_sequence_classification_and_matrix_label_semantics(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True))
+    labels = [torch.tensor([10, 11]), torch.tensor([20, 21])]
+    classified = m.PackingCollator(seq_classification=True)([{"labels": x} for x in labels])
+    assert torch.equal(classified["labels"], torch.tensor([[10, 11, 20, 21]]))
+
+    matrices = [torch.tensor([[1, 2], [3, 4]]), torch.tensor([[5, 6], [7, 8]])]
+    packed = m.PackingCollator()([{"labels": x} for x in matrices])
+    assert torch.equal(packed["labels"], torch.tensor([[[1, 2, -100, -100], [3, 4, 7, 8]]]))
+    assert torch.equal(matrices[1], torch.tensor([[5, 6], [7, 8]]))
+    collate_infos = {"labels": m.DataCollateInfo(pack_dim=0, sp_pad_scale=None)}
+    packed_by_row = m.PackingCollator(collate_infos=collate_infos)([{"labels": x} for x in matrices])
+    assert torch.equal(packed_by_row["labels"], torch.tensor([[1, 2], [3, 4], [-100, -100], [7, 8]]))
+    assert torch.equal(matrices[1], torch.tensor([[5, 6], [7, 8]]))
+
+
 def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):
     import veomni.data.data_collator as m
 

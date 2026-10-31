@@ -198,7 +198,8 @@
     "args": [
       "-s",
       "-x",
-      "tests/trainer/test_aux_metrics.py"
+      "tests/trainer/test_aux_metrics.py",
+      "tests/trainer/test_padding_loss.py"
     ]
   },
   {

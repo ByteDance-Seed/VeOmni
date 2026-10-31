@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
+from ..utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -385,6 +387,8 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if contains_padding(micro_batch):
+            raise ValueError("DPO does not support padded micro-batches")
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -446,12 +450,23 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.state.global_step += 1
-
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.base._step_preflight_start_time = time.time()
 
-        self.base._reset_async_activation_offload_if_enabled(self.policy_model)
-        self.on_step_begin(micro_batches=micro_batches)
+        reject_objective_padding(micro_batches, "DPO")
+        previous_step = self.state.global_step
+        self.state.global_step += 1
+        try:
+            error = None
+            try:
+                self.base._reset_async_activation_offload_if_enabled(self.policy_model)
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "DPO")
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
 
         self.base.sync_before_train_step()
 
