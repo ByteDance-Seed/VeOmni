@@ -21,7 +21,7 @@ import os
 import shutil
 import weakref
 from bisect import bisect_left
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import timedelta
@@ -58,6 +58,7 @@ from .layout import (
     OPTIMIZER_DIRNAME,
     WEIGHTS_DIRNAME,
     dcp_markers,
+    manifest_path,
     model_dir,
     optimizer_dir,
     step_dir,
@@ -927,7 +928,9 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             # optimizer.load_state_dict sees them. Validate original metadata
             # before any read can erase evidence of a precision-policy change.
             assert self.metadata is not None
-            if any(path and path[0] == "optimizer" for path in self.mappings.values()):
+            if not resume_zero_optimizer_state and any(
+                path and path[0] == "optimizer" for path in self.mappings.values()
+            ):
                 _validate_exact_optimizer_state_targets(self.optimizer)
             exact_names = _exact_optimizer_parameter_names(self.model, self.optimizer)
             missing_state_fields = []
@@ -1145,6 +1148,58 @@ def _apply_extra_parallel_dim(
     return state_dict
 
 
+def _cpu_offload_optimizer_has_state(optimizer):
+    # Accessing Optimizer.state[param] creates an empty dict without an update.
+    # Validate value types before a rank enters a state-presence collective.
+    has_state = False
+    for value in optimizer.state.values():
+        if type(value) not in (dict, OrderedDict, defaultdict):
+            raise RuntimeError("Unsupported CPU-offload optimizer state value type")
+        has_state = has_state or bool(value)
+    return has_state
+
+
+def _empty_cpu_offload_optimizer_state(model, optimizer):
+    """Serialize empty single-optimizer groups without PyTorch's synthetic step."""
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    from ..optim.cpu_offload_adamw import CPUOffloadAdamW
+
+    if type(optimizer) is not CPUOffloadAdamW or "state_dict" in vars(optimizer):
+        raise RuntimeError("Zero-step CPU-offload checkpoints require the standard optimizer implementation")
+    if any(isinstance(module, FullyShardedDataParallel) for module in model.modules()):
+        raise RuntimeError("Zero-step CPU-offload checkpoints do not support FSDP1 flattened parameters")
+    if any(
+        getattr(optimizer, name, None)
+        for name in ("_optimizer_state_dict_pre_hooks", "_optimizer_state_dict_post_hooks")
+    ):
+        raise RuntimeError("Zero-step CPU-offload checkpoints do not support optimizer state-dict hooks")
+    names = {}
+    for name, parameter in model.named_parameters():
+        fqns = _get_fqns(model, name)
+        if len(fqns) != 1:
+            raise RuntimeError(f"Cannot resolve a unique DCP parameter name for {name}")
+        names[id(parameter)] = next(iter(fqns))
+    raw = optimizer.state_dict()
+    raw_state = raw.get("state")
+    if (
+        not isinstance(raw_state, dict)
+        or any(type(value) not in (dict, OrderedDict, defaultdict) or bool(value) for value in raw_state.values())
+        or len(raw.get("param_groups", ())) != len(optimizer.param_groups)
+    ):
+        raise RuntimeError("Zero-step optimizer state changed while collecting the checkpoint")
+    groups = []
+    for saved, current in zip(raw["param_groups"], optimizer.param_groups, strict=True):
+        if len(saved["params"]) != len(current["params"]):
+            raise RuntimeError("Zero-step optimizer group changed while collecting the checkpoint")
+        try:
+            fqns = [names[id(parameter)] for parameter in current["params"]]
+        except KeyError as exc:
+            raise RuntimeError("Zero-step optimizer parameter is absent from the checkpoint model") from exc
+        groups.append({**saved, "params": fqns})
+    return {"state": {}, "param_groups": groups, _ZERO_OPTIMIZER_STATE_MARKER: True}
+
+
 class ModelState(Stateful):
     """A wrapper around a model to make it stateful.
 
@@ -1313,6 +1368,9 @@ class OptimizerState(Stateful):
         self._coordinated_group = coordinated_group
 
     def state_dict(self):
+        cpu_offload = bool(getattr(self.optimizer, "requires_checkpoint_group_preflight", False))
+        if not self._load and self._coordinated_group_validation:
+            _, _, cpu_offload = _coordinated_optimizer_policy(self.optimizer, group=self._coordinated_group)
         _validate_persistent_optimizer_ownership(
             self.model,
             self.optimizer,
@@ -1328,11 +1386,26 @@ class OptimizerState(Stateful):
                 self._coordinated_group,
                 coordinated=self._coordinated_group_validation,
             )
+        cpu_offload_has_state = None
+        if not self._load and self._coordinated_group_validation and cpu_offload:
+            state_error = None
+            try:
+                cpu_offload_has_state = _cpu_offload_optimizer_has_state(self.optimizer)
+            except BaseException as exc:
+                state_error = exc
+            raise_if_any_rank_failed(
+                state_error, "validating CPU-offload optimizer state", group=self._coordinated_group
+            )
+            cpu_offload_has_state = _coordinated_optimizer_flag(
+                cpu_offload_has_state,
+                "CPU-offload optimizer state presence before save",
+                group=self._coordinated_group,
+            )
         result, error = None, None
         try:
             _validate_dcp_optimizer_state_keys(self.optimizer)
             with _prevent_synthetic_owner_steps(self.model, self.optimizer, rows):
-                result = self._state_dict_impl()
+                result = self._state_dict_impl(cpu_offload_has_state)
                 _verify_serialized_persistent_steps(self.model, rows, result)
         except BaseException as exc:
             error = exc
@@ -1348,7 +1421,7 @@ class OptimizerState(Stateful):
                 result[_ZERO_OPTIMIZER_STATE_MARKER] = True
         return result
 
-    def _state_dict_impl(self):
+    def _state_dict_impl(self, cpu_offload_has_state=None):
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -1372,6 +1445,15 @@ class OptimizerState(Stateful):
                 sparse[_ZERO_OPTIMIZER_STATE_MARKER] = True
             return sparse
 
+        if not self._load and getattr(self.optimizer, "requires_checkpoint_group_preflight", False):
+            if not dist.is_initialized() or self._coordinated_group_validation:
+                has_state = (
+                    _cpu_offload_optimizer_has_state(self.optimizer)
+                    if cpu_offload_has_state is None
+                    else cpu_offload_has_state
+                )
+                if not has_state:
+                    return _empty_cpu_offload_optimizer_state(self.model, self.optimizer)
         state_dict = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
         if not self._load and not state_dict["state"]:
             state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
@@ -2068,19 +2150,70 @@ class DistributedCheckpointer(CheckpointerBase):
             raise ValueError("stage_dir cannot be combined with save_async")
 
         optimizer = state.get("optimizer")
-        wants_optimizer, exact, _ = _coordinated_optimizer_policy(optimizer)
+        initial_policy = _coordinated_optimizer_policy(optimizer)
+        wants_optimizer, exact, cpu_offload = initial_policy
         if wants_optimizer and exact:
             error = None
             try:
                 _reject_frozen_precision_sensitive_optimizer_state(state["model"], optimizer)
+                _validate_dcp_optimizer_state_keys(optimizer)
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "validating frozen optimizer history before checkpoint save")
+        if cpu_offload:
+            state_error = None
+            has_state = False
+            try:
+                has_state = _cpu_offload_optimizer_has_state(optimizer)
+            except BaseException as exc:
+                state_error = exc
+            raise_if_any_rank_failed(state_error, "validating CPU-offload optimizer state before checkpoint save")
+            has_state = _coordinated_optimizer_flag(has_state, "CPU-offload optimizer state presence before save")
+            if not has_state:
+                error = None
+                try:
+                    _empty_cpu_offload_optimizer_state(state["model"], optimizer)
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "validating zero-step optimizer before checkpoint save")
 
         # ``is not None`` rather than truthiness: step 0 is a step like any other, and
         # folding it onto ``path`` would write it over the run's own directory.
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
+        if wants_optimizer:
+            error = None
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                try:
+                    manifest_exists = True
+                    try:
+                        with open(manifest_path(checkpoint_dir)) as handle:
+                            manifest = json.load(handle)
+                    except FileNotFoundError:
+                        manifest_exists = False
+                        manifest = None
+                    if manifest_exists and not isinstance(manifest, dict):
+                        raise RuntimeError("Existing checkpoint manifest has an invalid format")
+                    if manifest is not None and not manifest.get("model_state", True):
+                        raise RuntimeError("Cannot overwrite a cursor-only checkpoint with optimizer state in place")
+                except BaseException as exc:
+                    error = exc
+            raise_if_any_rank_failed(error, "checking the previous checkpoint manifest")
+
+        # Old asynchronous writes can otherwise recreate a stale metadata
+        # marker after this save invalidates it. Drain both slots before any
+        # destination is touched, including when this save is synchronous.
+        pending_error = None
+        for slot in (WEIGHTS_DIRNAME, OPTIMIZER_DIRNAME):
+            try:
+                pending = _coordinated_optimizer_flag(slot in cls._save_futures, f"pending checkpoint slot {slot}")
+                if pending:
+                    cls._drain_slot(slot)
+            except BaseException as exc:
+                if pending_error is None:
+                    pending_error = exc
+        if pending_error is not None:
+            raise pending_error
 
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
@@ -2106,6 +2239,16 @@ class DistributedCheckpointer(CheckpointerBase):
             cls._remove_dcp_markers(checkpoint_dir, module)
 
         cls._create_checkpoint_dir(write_root)
+        if wants_optimizer:
+            # A failed model->optimizer transition must not look like a valid
+            # model-only checkpoint when a previous manifest exists. The
+            # completeness check requires optimizer metadata if this dir exists.
+            error = None
+            try:
+                cls._create_checkpoint_dir(os.path.join(write_root, OPTIMIZER_DIRNAME))
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "creating optimizer checkpoint directory")
 
         # Sidecar first, then the DCP directories. Ordering no longer carries the
         # completeness guarantee it used to — ``checkpoint_manifest.json`` does,
@@ -2115,9 +2258,12 @@ class DistributedCheckpointer(CheckpointerBase):
         cls._save_extra_state(checkpoint_dir=write_root, state=state)
 
         try:
+            model_state_type = _CoordinatedModelState if exact else ModelState
             cls.execute_save(
                 save_state={
-                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+                    "model": model_state_type(
+                        state["model"], trainable_only=trainable_only, parallel_state=parallel_state
+                    )
                 },
                 storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
                 save_async=save_async,
@@ -2126,6 +2272,31 @@ class DistributedCheckpointer(CheckpointerBase):
                 timeout_seconds=save_timeout_seconds,
             )
 
+            if any_rank_failed(state.get("optimizer") is not optimizer):
+                raise RuntimeError("Optimizer object changed while saving model state")
+            if _coordinated_optimizer_policy(optimizer) != initial_policy:
+                raise RuntimeError("Optimizer policy changed while saving model state")
+            if wants_optimizer and exact:
+                error = None
+                try:
+                    _reject_frozen_precision_sensitive_optimizer_state(state["model"], optimizer)
+                    _validate_dcp_optimizer_state_keys(optimizer)
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "rechecking optimizer after model save")
+            if cpu_offload:
+                state_error = None
+                current_has_state = False
+                try:
+                    current_has_state = _cpu_offload_optimizer_has_state(optimizer)
+                except BaseException as exc:
+                    state_error = exc
+                raise_if_any_rank_failed(state_error, "validating CPU-offload optimizer after model save")
+                current_has_state = _coordinated_optimizer_flag(
+                    current_has_state, "CPU-offload optimizer state presence after model save"
+                )
+                if any_rank_failed(current_has_state != has_state):
+                    raise RuntimeError("Optimizer state presence changed while saving model state")
             if "optimizer" in state and state["optimizer"] is not None:
                 cls.execute_save(
                     save_state={
@@ -2524,6 +2695,8 @@ class DistributedCheckpointer(CheckpointerBase):
             for value in save_state.values():
                 if isinstance(value, OptimizerState):
                     value._coordinated_group = cls._async_process_groups[slot]
+                elif isinstance(value, _CoordinatedModelState):
+                    value._checkpoint_group = cls._async_process_groups[slot]
 
             cls._save_futures[slot] = dcp.async_save(
                 state_dict=save_state,

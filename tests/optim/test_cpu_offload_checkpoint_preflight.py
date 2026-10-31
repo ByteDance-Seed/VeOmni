@@ -133,6 +133,578 @@ def test_preflight_does_not_initialize_fresh_optimizer_state(tmp_path):
     assert not target.state
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_saving_before_first_optimizer_step_does_not_change_first_update(tmp_path, dtype):
+    model, optimizer = _model_and_optimizer()
+    reference_model, reference = _model_and_optimizer()
+    model.to(dtype=dtype)
+    reference_model.to(dtype=dtype)
+    reference_model.load_state_dict(model.state_dict())
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert not optimizer.state
+    resumed_model, resumed = _model_and_optimizer()
+    resumed_model.to(dtype=dtype)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": resumed_model, "optimizer": resumed}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert not resumed.state
+    _step(model, optimizer, 1.0)
+    _step(reference_model, reference, 1.0)
+    _step(resumed_model, resumed, 1.0)
+    for first, second, restored in zip(
+        model.parameters(), reference_model.parameters(), resumed_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        torch.testing.assert_close(first, restored, rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.state[first]["step"], reference.state[second]["step"], rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.state[first]["step"], resumed.state[restored]["step"], rtol=0, atol=0)
+
+
+def test_zero_step_checkpoint_keeps_group_lrs_and_scheduler(tmp_path):
+    model, optimizer = _model_and_optimizer(split=True)
+    optimizer.param_groups[0]["lr"] = 0.01
+    optimizer.param_groups[1]["lr"] = 0.02
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lambda step: 0.5**step, lambda step: 0.8**step])
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert not optimizer.state
+    target_model, target = _model_and_optimizer(split=True)
+    target_scheduler = torch.optim.lr_scheduler.LambdaLR(target, [lambda step: 0.5**step, lambda step: 0.8**step])
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    target_scheduler.load_state_dict(scheduler.state_dict())
+    assert not target.state
+    assert [group["lr"] for group in target.param_groups] == [0.01, 0.02]
+    _step(model, optimizer, 1.0)
+    _step(target_model, target, 1.0)
+    scheduler.step()
+    target_scheduler.step()
+    assert scheduler.get_last_lr() == target_scheduler.get_last_lr()
+    for source, restored in zip(model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(source, restored, rtol=0, atol=0)
+
+
+def test_zero_step_resume_preserves_mixed_moment_precision_across_updates(tmp_path):
+    def build():
+        model = torch.nn.Linear(4, 3, dtype=torch.bfloat16)
+        optimizer = CPUOffloadAdamW(
+            [{"params": [model.weight], "cpu_offload": True}, {"params": [model.bias]}],
+            lr=0.01,
+            cpu_moment_dtype=torch.bfloat16,
+            resident_moment_dtype=torch.float32,
+        )
+        return model, optimizer
+
+    model, optimizer = build()
+    reference_model, reference = build()
+    reference_model.load_state_dict(model.state_dict())
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    target_model, target = build()
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    for gradient in (1.0, 0.3):
+        for current_model, current_optimizer in (
+            (model, optimizer),
+            (reference_model, reference),
+            (target_model, target),
+        ):
+            _step(current_model, current_optimizer, gradient)
+        for source, control, restored in zip(
+            model.parameters(), reference_model.parameters(), target_model.parameters(), strict=True
+        ):
+            torch.testing.assert_close(source, control, rtol=0, atol=0)
+            torch.testing.assert_close(source, restored, rtol=0, atol=0)
+            for key in ("master_weight", "exp_avg", "exp_avg_sq", "step"):
+                torch.testing.assert_close(optimizer.state[source][key], reference.state[control][key], rtol=0, atol=0)
+                torch.testing.assert_close(optimizer.state[source][key], target.state[restored][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_kind", ["dict", "ordered", "defaultdict"])
+def test_zero_step_with_preexisting_empty_parameter_state_resumes(tmp_path, state_kind):
+    from collections import OrderedDict, defaultdict
+
+    model, optimizer = _model_and_optimizer()
+    optimizer.state[model.weight] = {"dict": dict, "ordered": OrderedDict, "defaultdict": lambda: defaultdict(dict)}[
+        state_kind
+    ]()
+    assert optimizer.state[model.weight] == {}
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert optimizer.state[model.weight] == {}
+    target_model, target = _model_and_optimizer()
+    assert target.state[target_model.weight] == {}
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert not target.state
+    _step(model, optimizer, 1.0)
+    _step(target_model, target, 1.0)
+    for source, restored in zip(model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(source, restored, rtol=0, atol=0)
+
+
+def test_zero_step_resume_clears_an_already_initialized_target_optimizer(tmp_path):
+    model, optimizer = _model_and_optimizer()
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    target_model, target = _model_and_optimizer()
+    _step(target_model, target, 0.5)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    assert not target.state
+    _step(model, optimizer, 1.0)
+    _step(target_model, target, 1.0)
+    for source, restored in zip(model.parameters(), target_model.parameters(), strict=True):
+        torch.testing.assert_close(source, restored, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("change", ["initialize", "replace"])
+def test_model_save_hook_cannot_silently_change_optimizer_state(tmp_path, change):
+    model, optimizer = _model_and_optimizer()
+    _, replacement = _model_and_optimizer()
+    state = {"model": model, "optimizer": optimizer}
+
+    def mutate(_model, _state_dict, _prefix, _metadata):
+        if change == "initialize":
+            optimizer.state[model.weight]["step"] = torch.tensor(1)
+        else:
+            state["optimizer"] = replacement
+
+    model.register_state_dict_post_hook(mutate)
+    with pytest.raises(RuntimeError, match="Optimizer (state presence|object) changed"):
+        DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
+    assert not (tmp_path / "model" / "optimizer" / ".metadata").exists()
+
+
+def test_model_save_hook_cannot_freeze_parameter_with_optimizer_history(tmp_path):
+    model, optimizer = _model_and_optimizer()
+    _step(model, optimizer, 1.0)
+
+    def freeze(_model, _state_dict, _prefix, _metadata):
+        model.weight.requires_grad_(False)
+
+    model.register_state_dict_post_hook(freeze)
+    with pytest.raises(RuntimeError, match="frozen precision-sensitive optimizer state"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not (tmp_path / "model" / "optimizer" / ".metadata").exists()
+
+
+def _model_only_overwrite_failure_worker(rank, root, save_async):
+    import torch.distributed as dist
+
+    from veomni.checkpoint import layout
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        checkpoint = f"{root}/checkpoint"
+        parallel = SimpleNamespace(dp_mode="ddp")
+        DistributedCheckpointer.save(checkpoint, {"model": model}, parallel_state=parallel)
+        if rank == 0:
+            layout.write_manifest(checkpoint, global_step=1, world_size=2, model_state=True)
+        dist.barrier()
+        assert layout.checkpoint_is_complete(checkpoint)
+        if rank == 1:
+
+            def mutate(_model, _state_dict, _prefix, _metadata):
+                optimizer.state[model.weight]["step"] = torch.tensor(1)
+
+            model.register_state_dict_post_hook(mutate)
+        with pytest.raises(RuntimeError, match="state presence|ranks disagree"):
+            DistributedCheckpointer.save(
+                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel, save_async=save_async
+            )
+        if save_async:
+            DistributedCheckpointer.wait_for_pending_save()
+        dist.barrier()
+        assert not layout.checkpoint_is_complete(checkpoint)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("save_async", [False, True])
+def test_failed_overwrite_never_looks_like_a_complete_checkpoint(tmp_path, save_async):
+    torch.multiprocessing.spawn(
+        _model_only_overwrite_failure_worker, args=(str(tmp_path), save_async), nprocs=2, join=True
+    )
+
+
+def _pending_optimizer_overwrite_worker(rank, root):
+    import threading
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint import layout
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        checkpoint = f"{root}/checkpoint"
+        parallel = SimpleNamespace(dp_mode="ddp")
+        entered = threading.Event()
+        release = threading.Event()
+        real_writer = DistributedCheckpointer._create_storage_writer
+        optimizer_writers = 0
+
+        class GateWriter(dcp.FileSystemWriter):
+            def write_data(self, plan, planner):
+                entered.set()
+                if not release.wait(20):
+                    raise RuntimeError("timed out waiting to release optimizer writer")
+                return super().write_data(plan, planner)
+
+        def writer(path):
+            nonlocal optimizer_writers
+            if str(path).endswith("/optimizer"):
+                optimizer_writers += 1
+                if optimizer_writers == 1:
+                    return GateWriter(path)
+            return real_writer(path)
+
+        with patch.object(DistributedCheckpointer, "_create_storage_writer", side_effect=writer):
+            DistributedCheckpointer.save(
+                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel, save_async=True
+            )
+            assert entered.wait(20)
+            DistributedCheckpointer._drain_slot("ckpt")
+            if rank == 0:
+                layout.write_manifest(checkpoint, global_step=1, world_size=2, model_state=True)
+            dist.barrier()
+            with torch.no_grad():
+                model.weight.add_(1)
+            if rank == 1:
+
+                def mutate(_model, _state_dict, _prefix, _metadata):
+                    optimizer.state[model.weight]["step"] = torch.tensor(1)
+
+                model.register_state_dict_post_hook(mutate)
+            timer = threading.Timer(2, release.set)
+            timer.start()
+            try:
+                with pytest.raises(RuntimeError, match="state presence|ranks disagree"):
+                    DistributedCheckpointer.save(
+                        checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                    )
+            finally:
+                release.set()
+                timer.join()
+                DistributedCheckpointer.wait_for_pending_save()
+            dist.barrier()
+            assert not layout.checkpoint_is_complete(checkpoint)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_old_async_optimizer_write_cannot_revive_marker_during_failed_overwrite(tmp_path):
+    torch.multiprocessing.spawn(_pending_optimizer_overwrite_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def test_all_pending_slots_are_drained_before_propagating_save_error(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+
+    weight_future, optimizer_future = Future(), Future()
+    weight_future.set_exception(RuntimeError("previous weights failed"))
+    optimizer_future.set_result(None)
+    monkeypatch.setattr(
+        DistributedCheckpointer, "_save_futures", {"ckpt": weight_future, "optimizer": optimizer_future}
+    )
+    model, optimizer = _model_and_optimizer()
+    with pytest.raises(RuntimeError, match="previous weights failed"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not DistributedCheckpointer._save_futures
+    assert not (tmp_path / "model").exists()
+
+
+def _rank_pending_save_error_worker(rank, root):
+    from concurrent.futures import Future
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        weight_future, optimizer_future = Future(), Future()
+        if rank == 1:
+            weight_future.set_exception(RuntimeError("rank-local previous weights failed"))
+        else:
+            weight_future.set_result(None)
+        optimizer_future.set_result(None)
+        DistributedCheckpointer._save_futures = {"ckpt": weight_future, "optimizer": optimizer_future}
+        DistributedCheckpointer._async_process_groups = {"ckpt": dist.group.WORLD, "optimizer": dist.group.WORLD}
+        model, optimizer = _model_and_optimizer()
+        with pytest.raises(RuntimeError, match="previous weights failed|another rank"):
+            DistributedCheckpointer.save(
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+        assert not DistributedCheckpointer._save_futures
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_pending_error_drains_both_slots_before_save(tmp_path):
+    torch.multiprocessing.spawn(_rank_pending_save_error_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def test_cursor_only_manifest_cannot_be_overwritten_in_place_with_optimizer(tmp_path):
+    from veomni.checkpoint import layout
+
+    layout.write_manifest(str(tmp_path), global_step=1, world_size=1, model_state=False)
+    assert layout.checkpoint_is_complete(str(tmp_path))
+    model, optimizer = _model_and_optimizer()
+    with pytest.raises(RuntimeError, match="cursor-only checkpoint"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert layout.read_manifest(str(tmp_path))["model_state"] is False
+    assert not (tmp_path / "model").exists()
+    assert not optimizer.state
+
+
+@pytest.mark.parametrize("content", ["{invalid-json", "[]", "null"])
+def test_invalid_existing_manifest_rejects_checkpoint_overwrite(tmp_path, content):
+    from veomni.checkpoint.layout import manifest_path
+
+    path = manifest_path(str(tmp_path))
+    with open(path, "w") as handle:
+        handle.write(content)
+    model, optimizer = _model_and_optimizer()
+    with pytest.raises((ValueError, RuntimeError)):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    with open(path) as handle:
+        assert handle.read() == content
+    assert not (tmp_path / "model").exists()
+
+
+def test_unreadable_existing_manifest_rejects_checkpoint_overwrite(tmp_path, monkeypatch):
+    import builtins
+
+    from veomni.checkpoint.layout import manifest_path
+
+    path = manifest_path(str(tmp_path))
+    with open(path, "w") as handle:
+        handle.write('{"model_state": false}')
+    real_open = builtins.open
+
+    def deny_manifest(file, *args, **kwargs):
+        if str(file) == path:
+            raise PermissionError("manifest unavailable")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", deny_manifest)
+    model, optimizer = _model_and_optimizer()
+    with pytest.raises(PermissionError, match="manifest unavailable"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not (tmp_path / "model").exists()
+
+
+def _zero_step_checkpoint_worker(rank, root, save_async):
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        model = DistributedDataParallel(model)
+        if rank == 1:
+            assert optimizer.state[model.module.weight] == {}
+        checkpoint = f"{root}/checkpoint"
+        parallel = SimpleNamespace(dp_mode="ddp")
+        DistributedCheckpointer.save(
+            checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel, save_async=save_async
+        )
+        if save_async:
+            DistributedCheckpointer.wait_for_pending_save()
+        assert not any(optimizer.state.values())
+        target_model, target = _model_and_optimizer()
+        target_model = DistributedDataParallel(target_model)
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target_model, "optimizer": target},
+            parallel_state=parallel,
+            process_group=dist.group.WORLD,
+        )
+        assert not target.state
+        _step(model, optimizer, 1.0)
+        _step(target_model, target, 1.0)
+        for source, restored in zip(model.parameters(), target_model.parameters(), strict=True):
+            torch.testing.assert_close(source, restored, rtol=0, atol=0)
+            torch.testing.assert_close(optimizer.state[source]["step"], target.state[restored]["step"], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("save_async", [False, True])
+def test_zero_step_checkpoint_is_consistent_across_ranks(tmp_path, save_async):
+    torch.multiprocessing.spawn(_zero_step_checkpoint_worker, args=(str(tmp_path), save_async), nprocs=2, join=True)
+
+
+def _asymmetric_zero_step_worker(rank, root):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        if rank == 1:
+            _step(model, optimizer, 1.0)
+        with pytest.raises(RuntimeError, match="ranks disagree"):
+            DistributedCheckpointer.save(
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+        assert bool(optimizer.state) == (rank == 1)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_asymmetric_zero_step_state_is_rejected_before_save(tmp_path):
+    torch.multiprocessing.spawn(_asymmetric_zero_step_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def _rank_foreign_optimizer_state_worker(rank, root, wrapper_only):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        _step(model, optimizer, 1.0)
+        if rank == 1:
+            optimizer.state["foreign"] = {"step": torch.tensor(1)}
+        with pytest.raises(RuntimeError, match="non-parameter|another rank"):
+            if wrapper_only:
+                OptimizerState(
+                    model,
+                    optimizer,
+                    parallel_state=SimpleNamespace(dp_mode="ddp"),
+                    coordinated_group_validation=True,
+                    coordinated_group=dist.group.WORLD,
+                ).state_dict()
+            else:
+                DistributedCheckpointer.save(
+                    f"{root}/checkpoint",
+                    {"model": model, "optimizer": optimizer},
+                    parallel_state=SimpleNamespace(dp_mode="ddp"),
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("wrapper_only", [False, True])
+def test_rank_local_foreign_optimizer_state_fails_before_save(tmp_path, wrapper_only):
+    torch.multiprocessing.spawn(
+        _rank_foreign_optimizer_state_worker, args=(str(tmp_path), wrapper_only), nprocs=2, join=True
+    )
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def _rank_unsupported_optimizer_state_value_worker(rank, root):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        if rank == 1:
+            optimizer.state[model.weight] = []
+        with pytest.raises(RuntimeError, match="state value type|another rank"):
+            DistributedCheckpointer.save(
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_unsupported_optimizer_state_value_fails_before_save(tmp_path):
+    torch.multiprocessing.spawn(
+        _rank_unsupported_optimizer_state_value_worker, args=(str(tmp_path),), nprocs=2, join=True
+    )
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def _rank_optimizer_kind_mismatch_worker(rank, root):
+    import torch.distributed as dist
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        if rank == 1:
+            optimizer = FullFP32AdamW(model.parameters())
+        _step(model, optimizer, 1.0)
+        with pytest.raises(RuntimeError, match="ranks disagree"):
+            OptimizerState(
+                model,
+                optimizer,
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+                coordinated_group_validation=True,
+                coordinated_group=dist.group.WORLD,
+            ).state_dict()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_optimizer_kind_mismatch_is_coordinated(tmp_path):
+    torch.multiprocessing.spawn(_rank_optimizer_kind_mismatch_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def _rank_model_save_hook_failure_worker(rank, root, hook_phase, save_async):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2)
+    try:
+        model, optimizer = _model_and_optimizer()
+        if rank == 1:
+
+            def fail(*_args):
+                raise RuntimeError("rank-local model save hook failed")
+
+            if hook_phase == "pre":
+                model.register_state_dict_pre_hook(fail)
+            else:
+                model.register_state_dict_post_hook(fail)
+        with pytest.raises(RuntimeError, match="model save hook failed|another rank"):
+            DistributedCheckpointer.save(
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+                save_async=save_async,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("hook_phase", ["pre", "post"])
+@pytest.mark.parametrize("save_async", [False, True])
+def test_rank_local_model_save_hook_failure_is_coordinated(tmp_path, hook_phase, save_async):
+    torch.multiprocessing.spawn(
+        _rank_model_save_hook_failure_worker, args=(str(tmp_path), hook_phase, save_async), nprocs=2, join=True
+    )
+
+
 def test_policy_coordination_selects_accelerator_for_hccl(monkeypatch):
     import veomni.checkpoint.dcp_checkpointer as checkpoint
 

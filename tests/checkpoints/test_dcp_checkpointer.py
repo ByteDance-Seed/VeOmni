@@ -2377,6 +2377,10 @@ class TestStageDirValidation:
             patch(
                 "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_policy", return_value=(False, False, False)
             ),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_flag",
+                side_effect=lambda present, *_args, **_kwargs: present,
+            ),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,

@@ -52,6 +52,55 @@ def _fsdp2_worker(rank, root, endpoint):
             optimizer.step()
             optimizer.zero_grad()
 
+        for save_async in (False, True):
+            zero_model, zero_optimizer = build()
+            if rank == 1:
+                assert zero_optimizer.state[zero_model.weight] == {}
+            zero_checkpoint = f"{root}/zero-step-{save_async}"
+            zero_parallel = SimpleNamespace(dp_mode="fsdp2")
+            DistributedCheckpointer.save(
+                zero_checkpoint,
+                {"model": zero_model, "optimizer": zero_optimizer},
+                parallel_state=zero_parallel,
+                save_async=save_async,
+            )
+            if save_async:
+                DistributedCheckpointer.wait_for_pending_save()
+            assert not any(zero_optimizer.state.values())
+            zero_restored_model, zero_restored = build()
+            DistributedCheckpointer.load(
+                zero_checkpoint,
+                {"model": zero_restored_model, "optimizer": zero_restored},
+                parallel_state=zero_parallel,
+            )
+            assert not zero_restored.state
+            step(zero_model, zero_optimizer, 1.0)
+            step(zero_restored_model, zero_restored, 1.0)
+            for original, restored in zip(zero_model.parameters(), zero_restored_model.parameters(), strict=True):
+                torch.testing.assert_close(_local(original), _local(restored), rtol=0, atol=0)
+                torch.testing.assert_close(
+                    _local(zero_optimizer.state[original]["step"]),
+                    _local(zero_restored.state[restored]["step"]),
+                    rtol=0,
+                    atol=0,
+                )
+
+        for save_async in (False, True):
+            hook_model, hook_optimizer = build()
+            if rank == 1:
+
+                def fail_save(*_args):
+                    raise RuntimeError("rank-local FSDP2 model save hook failed")
+
+                hook_model.register_state_dict_pre_hook(fail_save)
+            with pytest.raises(RuntimeError, match="model save hook failed|another rank"):
+                DistributedCheckpointer.save(
+                    f"{root}/save-hook-{save_async}",
+                    {"model": hook_model, "optimizer": hook_optimizer},
+                    parallel_state=SimpleNamespace(dp_mode="fsdp2"),
+                    save_async=save_async,
+                )
+
         torch.manual_seed(123)
         source_model, source = build()
         step(source_model, source, 1.0)

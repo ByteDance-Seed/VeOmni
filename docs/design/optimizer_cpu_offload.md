@@ -14,7 +14,15 @@ optimizer also requires explicit migration if those parameters are later
 unfrozen. Do not use these freeze/unfreeze transitions across a checkpoint
 until a verified migration is available.
 
-Use the framework `DistributedCheckpointer.load` for resume: it clears temporary optimizer handoff markers if DCP loading fails. Calling `torch.distributed.checkpoint.load` directly bypasses that cleanup if an error occurs after planning. Saving a single empty optimizer, or an ExtraParallel-aware `MultiOptimizer` containing an empty child, is not yet safe: PyTorch can materialize synthetic optimizer state while collecting it. Avoid those save paths until they are fixed.
+Use the framework `DistributedCheckpointer` for checkpoint save and resume. For a single standard CPU-offload optimizer, zero-step save preserves empty state; ranks that disagree on whether the optimizer has any state fail before writing. This check does not compare state presence per parameter. With any initialized process group, a raw DCP `OptimizerState` without coordinated validation can still synthesize a step during zero-step save, including world size one. An ExtraParallel-aware `MultiOptimizer` containing an empty child is also not yet safe. Avoid those save paths until they are fixed. Failed framework loads clear temporary optimizer handoff markers.
+
+Before starting another save, the framework drains both pending asynchronous
+checkpoint slots before invalidating destination markers, even when the paths
+differ. This prevents an older write from reviving a marker but may reduce
+overlap between consecutive saves. If ranks disagree about which slots exist,
+the save fails before modifying its destination; a future on only one rank may
+still be running. A cursor-only manifest cannot be replaced in place by a save
+with optimizer state; use a different checkpoint path.
 
 The frozen-parameter checks below apply to `DistributedCheckpointer.save` and
 `DistributedCheckpointer.load`; direct `dcp.save`/`dcp.load` using
