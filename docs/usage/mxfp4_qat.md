@@ -85,7 +85,9 @@ For exact optimizer continuation, restore DCP after rebuilding the same recipe
 and targets. Fake-quant scales are derived each forward, not persisted state.
 Ordinary HF export retains recipe/target metadata in `config.json` and normally
 rounds FP32 parameters to BF16, without optimizer state or packed MXFP4 weights.
-Reloading through the model builder prepares the selected projections again.
+Reloading through the model builder or trainer preserves the saved recipe and
+targets when `qat_implementation` is unset. Set it explicitly to `none` to disable
+QAT and clear the saved targets; models without a saved recipe default to `none`.
 
 ## Validation
 
