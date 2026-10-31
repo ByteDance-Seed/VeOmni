@@ -717,7 +717,8 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
     ("impl", "seq", "dim", "repeats", "packed"),
     (
         pytest.param("triton", 64, 64, 1, False, id="triton-small-head"),
-        pytest.param("triton", 77, 128, 3, False, id="triton-repeated-partial-chunk"),
+        pytest.param("triton", 77, 128, 20, False, id="triton-repeated-partial-chunk"),
+        pytest.param("triton", 77, 256, 20, False, id="triton-repeated-partial-wide-head"),
         pytest.param("triton", 128, 64, 1, True, id="triton-packed-small-head"),
         pytest.param("triton", 128, 128, 1, True, id="triton-packed"),
         pytest.param("fla_npu", 64, 128, 1, False, id="fla-npu-supported-head"),
