@@ -160,8 +160,11 @@ for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
 > **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
-> `Ascend910_95` / `Ascend950` has been removed. Forward and backward parity on
-> arch35 should be verified on the target hardware and software stack.
+> `Ascend910_95` / `Ascend950` has been removed. On 2026-10-31, forward/backward
+> parity passed on Ascend950DT_9582 with CANN 9.2.0.B080, torch 2.10.0+cpu,
+> torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
+> and both ordinary sequences and packed boundaries at 61/128 tokens. This is
+> operator validation; it does not claim full-model training coverage.
 
 ### `fla_npu` — AscendC fused backend (`chunk_gated_delta_rule` only)
 
@@ -185,7 +188,7 @@ model:
 (`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
-arch35 (`Ascend910_95` / `Ascend950`); end-to-end arch35 validation remains necessary (see above).
+arch35 (`Ascend910_95` / `Ascend950`); the operator validation scope is recorded above.
 
 These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
 configured output-gate activation: selecting AscendC does not change sigmoid
@@ -218,7 +221,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu
 cd flash-linear-attention-npu
-git checkout a7c608f
+git checkout a7c608f2e3f828779ceeec1fcf155a6e37ede83c
 
 # Build dependencies of the operator library only.
 python -m pip install -r requirements.txt
@@ -238,12 +241,36 @@ python scripts/check_packaged_wheel_api.py
 (`build.sh --pkg`), no install into `$ASCEND_OPP_PATH/vendors` and no separate
 `torch_custom/fla_npu` build are needed any more.
 
-Coming from `a7c608f` or earlier, uninstall the old package and delete its leftovers under
-`site-packages` (`fla_npu/`, `custom_aclnn_extension_lib*.so`, any self-built `libopapi.so`)
-before running the steps above. The call entry moved from `torch.ops.npu.*` / `torch_npu.ops.*`
-to `fla_npu.ops.ascendc`, and the legacy `torch.ops.npu.*` path is no longer enabled by default;
-`FLA_NPU_INCREMENTAL_BUILD`, `FLA_NPU_SKIP_RUN_BUILD` and `FLA_NPU_SKIP_RUN_INSTALL` were
-removed with it.
+**Compatibility change:** migrating to the stable complete forward/backward API
+removes the legacy adapter's wider-value training domain, including V=256 on
+A2/A3. Some individual operators and forward-only paths in the library accept
+wider values or chunk sizes, but its composite backward explicitly requires
+K=V=128 and chunk_size=64. VeOmni intentionally exposes the complete pair's
+common domain, rather than allowing a forward that fails during backward.
+Use the `triton` backend for wider supported head dimensions, or `eager` when
+the fused backend cannot represent the requested configuration.
+
+| Target | Q/K/V dtype | K / V | Chunk size | Initial state |
+| --- | --- | --- | --- | --- |
+| A2 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| A3 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| A5 / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+
+A returned FP32 final state can be passed to the next inference call without a
+lossy conversion. State gradients remain unsupported. Q/K normalization uses
+the vendored Triton L2Norm forward/backward pair with FP32 reciprocal norms,
+so `triton-ascend` remains a real dependency even with the AscendC GDN backend.
+Packed calls reuse host boundary/chunk tables instead of uploading unused
+legacy metadata on every layer.
+
+The adapter fixes `disable_recompute=True` to obtain the cumulative gates and
+A matrix consumed by the stable backward API. It does not expose a second
+retain/recompute policy or the legacy `fla_npu_reuse` implementation from
+#1346. Any future policy option needs matching library support and independent
+correctness and memory/performance validation.
+
+The `fla_npu` backend requires manual installation and validation; it is not
+covered by the repository's GDN tests or NPU CI.
 
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle
