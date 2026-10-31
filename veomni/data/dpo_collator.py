@@ -37,6 +37,28 @@ from .data_collator import (
 from .dataset import get_length_fn
 
 
+@dataclass
+class DPOMicroBatchCollator:
+    """Split a fixed DPO batch, retaining an incomplete final batch."""
+
+    num_micro_batch: int
+    internal_data_collator: Any
+
+    def __call__(self, features):
+        if not features or self.num_micro_batch <= 0:
+            raise ValueError("DPO microbatching requires samples and a positive microbatch count")
+        unwrapped = [item[0] for item in features]
+        count = min(len(unwrapped), self.num_micro_batch)
+        size, remainder = divmod(len(unwrapped), count)
+        result = []
+        start = 0
+        for index in range(count):
+            end = start + size + (index < remainder)
+            result.append(self.internal_data_collator(unwrapped[start:end]))
+            start = end
+        return result
+
+
 def _source_id(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> tuple[bool, str | None]:
     digest = hashlib.sha256()
     found = False

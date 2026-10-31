@@ -16,6 +16,7 @@ import copy
 import hashlib
 import inspect
 import math
+import re
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -28,9 +29,9 @@ import torch.nn.functional as F
 
 from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
-from ..data.data_collator import PostCollator
+from ..data.data_collator import MakeMicroBatchCollator, PostCollator
 from ..data.data_transform import dpo_producer_identity
-from ..data.dpo_collator import DPOProvenanceCollator
+from ..data.dpo_collator import DPOMicroBatchCollator, DPOProvenanceCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -351,6 +352,14 @@ def _dpo_check_consistent_across_ranks(value: Any, *, context: str) -> None:
         raise RuntimeError(f"DPO {context} does not match across ranks")
 
 
+def _dpo_fixed_batch_steps(samples: int, dp_size: int, batch_size: int) -> int:
+    if samples <= 0 or dp_size <= 0 or batch_size <= 0:
+        raise ValueError("DPO fixed-batch training requires nonempty data and positive DP/batch sizes")
+    # StatefulDistributedSampler pads each DP rank to ceil(N / DP).
+    per_rank = (samples + dp_size - 1) // dp_size
+    return (per_rank + batch_size - 1) // batch_size
+
+
 def _dpo_recovery_geometry(args: Any) -> dict[str, Any]:
     train, data, accelerator = args.train, args.data, args.model.accelerator
     loader = data.dataloader
@@ -432,7 +441,13 @@ def _dpo_recovery_geometry(args: Any) -> dict[str, Any]:
             ),
         ),
     }
-    return {name: {key: copy.deepcopy(getattr(obj, key)) for key in keys} for name, (obj, keys) in fields.items()}
+    result = {name: {key: copy.deepcopy(getattr(obj, key)) for key in keys} for name, (obj, keys) in fields.items()}
+    result["data"]["resume_input_contract"] = getattr(data, "resume_input_contract", None)
+    result["data"]["resume_input_deterministic"] = getattr(data, "resume_input_deterministic", False)
+    result["reference_model"] = {
+        key: getattr(args.model, key, None) for key in ("model_path", "config_path", "tokenizer_path")
+    }
+    return result
 
 
 def _dpo_objective_parameters(config: Any) -> dict[str, Any]:
@@ -643,11 +658,45 @@ class TextDPOTrainer:
         _dpo_sync_step_begin_error(config_error, context="configuration")
         _dpo_check_consistent_across_ranks(self._dpo_objective_parameters, context="objective parameters")
         _dpo_check_consistent_across_ranks(self._dpo_recovery_geometry, context="recovery geometry")
+        source = self._dpo_recovery_geometry["data"]
+        contract = source["resume_input_contract"]
+        if (
+            not isinstance(contract, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", contract) is None
+            or source["resume_input_deterministic"] is not True
+        ):
+            logger.warning(
+                "DPO checkpoints require a trusted deterministic input/reference contract for exact resume."
+            )
         self.policy_model = self._build_policy_model_runtime()
 
         with use_parallel_state(self.policy_model.parallel_state):
             self._build_data_transform()
             self.base._build_dataset()
+            batch_error = None
+            try:
+                if (
+                    not args.train.dyn_bsz
+                    and not args.data.dataloader.drop_last
+                    and args.data.datasets_type == "mapping"
+                ):
+                    from ..data.dataset import InterleavedMappingDataset, MappingDataset
+
+                    if args.data.dataloader.type != "native" or type(self.base.train_dataset) not in (
+                        MappingDataset,
+                        InterleavedMappingDataset,
+                    ):
+                        raise ValueError("DPO incomplete fixed batches require the native mapping dataset and sampler")
+                    args._train_steps = _dpo_fixed_batch_steps(
+                        len(self.base.train_dataset),
+                        self.policy_model.parallel_state.dp_size,
+                        args.train.dataloader_batch_size,
+                    )
+                    self.base.train_steps = args.train_steps
+            except Exception as exc:  # noqa: BLE001 - synchronize dataset geometry errors
+                batch_error = exc
+            _dpo_sync_step_begin_error(batch_error, context="fixed-batch geometry")
+            _dpo_check_consistent_across_ranks(args.train_steps, context="training steps per epoch")
             self.base._build_collate_fn()
             if args.dpo_config.explicit_segment_provenance:
                 self.base.collate_fn = DPOProvenanceCollator(
@@ -660,10 +709,34 @@ class TextDPOTrainer:
                     ),
                 )
             self.base._build_dataloader()
+            from ..data.data_loader import DistributedDataloader
             from ..data.dynamic_batching import DynamicBatchSizeDataLoader
 
             if isinstance(self.base.train_dataloader, DynamicBatchSizeDataLoader):
                 self.base.train_dataloader._dpo_disallow_implicit_restart = True
+                self.base.train_dataloader._strict_resume_contract = True
+                source = self.base.train_dataloader._dataloader
+            else:
+                source = self.base.train_dataloader
+            loader_error = None
+            try:
+                if type(source) is DistributedDataloader:
+                    # DPO may consume multiple uneven microbatches per optimizer step.
+                    # A step-based interval cannot reliably identify its data cursor.
+                    source.snapshot_every_n_steps = 1
+                    if (
+                        not args.train.dyn_bsz
+                        and not args.data.dataloader.drop_last
+                        and args.data.datasets_type == "mapping"
+                    ):
+                        if type(source.collate_fn) is not MakeMicroBatchCollator:
+                            raise ValueError("DPO incomplete fixed batches require the native microbatch collator")
+                        source.collate_fn = DPOMicroBatchCollator(
+                            source.collate_fn.num_micro_batch, source.collate_fn.internal_data_collator
+                        )
+            except Exception as exc:  # noqa: BLE001 - synchronize collator configuration errors
+                loader_error = exc
+            _dpo_sync_step_begin_error(loader_error, context="fixed-batch collator")
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
         self.base._build_training_context(self.policy_model)
@@ -733,8 +806,56 @@ class TextDPOTrainer:
         return vocab_size
 
     def dpo_provenance_checkpoint_state(self) -> dict[str, Any]:
+        from ..data.data_loader import DistributedDataloader
+        from ..data.dynamic_batching import _resume_callable_identity
+
+        loader = getattr(self.base, "train_dataloader", None)
+        source = getattr(loader, "_dataloader", loader)
+        dataset = getattr(source, "dataset", None)
+        fingerprint = getattr(getattr(dataset, "_data", dataset), "_fingerprint", None)
+        source_identity = None
+        if type(source) is DistributedDataloader:
+            context = getattr(source, "multiprocessing_context", None)
+            sampler = source.sampler
+            batch_sampler = source.batch_sampler
+
+            def type_name(value):
+                return f"{type(value).__module__}.{type(value).__qualname__}"
+
+            source_identity = {
+                "worker_init": _resume_callable_identity(getattr(source, "worker_init_fn", None)),
+                "collate": _resume_callable_identity(getattr(source, "collate_fn", None)),
+                "collate_microbatches": getattr(source.collate_fn, "num_micro_batch", None),
+                "collate_inner": _resume_callable_identity(getattr(source.collate_fn, "internal_data_collator", None)),
+                "transform": _resume_callable_identity(getattr(dataset, "_transform", None)),
+                "dataset_type": type_name(dataset),
+                "dataset_seed": getattr(dataset, "seed", None),
+                "batch_size": source.batch_size,
+                "drop_last": source.drop_last,
+                "num_workers": source.num_workers,
+                "persistent_workers": source.persistent_workers,
+                "in_order": source.in_order,
+                "prefetch_factor": getattr(source, "prefetch_factor", None),
+                "start_method": context.get_start_method() if context is not None else None,
+                "snapshot_every_n_steps": source.snapshot_every_n_steps,
+                "generator_used": source.generator is not None,
+                "sampler": {
+                    "type": type_name(sampler),
+                    "dataset_matches": getattr(sampler, "dataset", None) is dataset,
+                    **{
+                        key: getattr(sampler, key, None)
+                        for key in ("num_replicas", "rank", "shuffle", "seed", "drop_last")
+                    },
+                },
+                "batch_sampler": {
+                    "type": type_name(batch_sampler),
+                    "sampler_matches": getattr(batch_sampler, "sampler", None) is sampler,
+                    "batch_size": getattr(batch_sampler, "batch_size", None),
+                    "drop_last": getattr(batch_sampler, "drop_last", None),
+                },
+            }
         return {
-            "version": 7,
+            "version": 9,
             "enabled": self.base.args.dpo_config.explicit_segment_provenance,
             "plaintext_transform_version": 1,
             "conversation_transform_version": 1,
@@ -745,6 +866,8 @@ class TextDPOTrainer:
             "transform_max_seq_len": self._dpo_transform_max_seq_len,
             "objective_parameters": self._dpo_objective_parameters,
             "recovery_geometry": self._dpo_recovery_geometry,
+            "dataset_fingerprint": fingerprint,
+            "source_identity": source_identity,
             "steps_per_epoch": self.base.args.train_steps,
         }
 
@@ -753,6 +876,13 @@ class TextDPOTrainer:
         if _dpo_recovery_geometry(self.base.args) != current["recovery_geometry"]:
             raise ValueError("DPO recovery geometry changed after initialization")
         loader = self.base.args.data.dataloader
+        contract = current["recovery_geometry"]["data"]["resume_input_contract"]
+        if not isinstance(contract, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", contract) is None:
+            raise ValueError("DPO exact resume requires an attested immutable input contract")
+        if current["recovery_geometry"]["data"]["resume_input_deterministic"] is not True:
+            raise ValueError("DPO exact resume requires deterministic input attestation")
+        if not isinstance(current["dataset_fingerprint"], str) or not current["dataset_fingerprint"]:
+            raise ValueError("DPO exact resume requires a dataset fingerprint")
         if loader.num_workers > 0 and loader.persistent_workers:
             raise ValueError("DPO exact recovery does not yet support persistent dataloader workers")
         if loader.use_background_prefetcher:
@@ -791,10 +921,12 @@ class TextDPOTrainer:
                 "transform_max_seq_len",
                 "objective_parameters",
                 "recovery_geometry",
+                "dataset_fingerprint",
+                "source_identity",
                 "steps_per_epoch",
             }
             or type(saved["version"]) is not int
-            or saved["version"] != 7
+            or saved["version"] != 9
             or type(saved["enabled"]) is not bool
             or type(saved["plaintext_transform_version"]) is not int
             or saved["plaintext_transform_version"] != 1
@@ -812,6 +944,8 @@ class TextDPOTrainer:
             or saved["transform_max_seq_len"] <= 0
             or type(saved["objective_parameters"]) is not dict
             or type(saved["recovery_geometry"]) is not dict
+            or type(saved["dataset_fingerprint"]) is not str
+            or (saved["source_identity"] is not None and type(saved["source_identity"]) is not dict)
             or type(saved["steps_per_epoch"]) is not int
             or saved["steps_per_epoch"] <= 0
         ):

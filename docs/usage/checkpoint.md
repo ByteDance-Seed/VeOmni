@@ -51,29 +51,56 @@ recovery geometry; `dpo_position` contains `epoch`, `step_in_epoch` and
 ranks; missing or incompatible state is rejected before training continues.
 Trainer-state recovery currently supports the native mapping dataset, native
 dataloader and standard stateful distributed sampler without persistent
-workers or background prefetch. Other configurations can still be used for
+workers, a custom loader generator, out-of-order workers or background prefetch.
+Native DPO loaders take a worker snapshot at every source step, including
+fixed-batch runs, because one optimizer step can consume uneven microbatches.
+Other configurations can still be used for
 fresh training where supported, but their trainer-state exact resume is
-rejected. Exact continuation also assumes unchanged source dataset contents;
-the recorded path is not a content hash. The reference model is rebuilt from
-the configured model source, so its weights must also remain unchanged; this
-protocol does not record a reference-weight content hash. Python, NumPy, and
+rejected. Set `data.resume_input_contract` and `data.resume_input_deterministic`
+as described below; the trusted input manifest must also cover the immutable
+DPO reference-model weights. The saved dataset fingerprint is checked as an
+additional guard, not as a substitute for the manifest. Python, NumPy, and
 custom-component random states are not captured by this callback; data and
 worker transforms must also be deterministic, since worker torch RNG is not
-restored by this protocol. The native
-multi-worker recovery checks were exercised with PyTorch 2.10 and torchdata
+restored by this protocol. Recovery may temporarily copy the buffered samples
+on the host. The native multi-worker recovery checks were exercised with PyTorch 2.10 and torchdata
 0.11; other versions require their own validation.
 
-Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
-a batch was yielded. Older cursors lack that phase and may resume with a
-different next batch; exact continuation from them requires an independently
-verified migration. Older code also cannot reliably resume a cursor written by
-this version. Worker-mode dynamic batching uses a separate cursor path.
-On restore, the loader deep-copies the saved cursor so consuming buffered
-samples cannot mutate the checkpoint state. Budget for one additional copy of
-the buffered samples in host memory per rank during restore; long-context and
-multimodal buffers can make that copy substantial.
-Restoring shuffled multi-worker inputs at a nonzero epoch and restoring across
-epoch boundaries are not yet guaranteed to reproduce the original samples.
+For native fixed-batch DPO on mapping datasets, `drop_last=False` includes a
+short final batch. Its optimizer step can contain fewer nonempty microbatches
+and is normalized by the actual pair count. The native distributed sampler may
+repeat samples to equalize DP ranks when the data size is not divisible by DP;
+the DPO microbatch collator does not add padding or replay.
+
+For main-process dynamic batching in the text and VLM trainers, exact resume
+requires a native mapping dataset with an unchanged dataset fingerprint, the
+native stateful and batch samplers, snapshots at every source step, no custom
+data-loader generator, in-order workers and disabled background prefetch.
+The checkpoint records the data/worker geometry, epoch length, source settings
+and input-parallel settings. A changed or missing cursor, geometry, source
+fingerprint or RNG state is rejected. Worker-mode batching and custom or
+iterable sources use separate paths and are not qualified by this contract.
+Exact continuation starts after a completed optimizer step; step-zero cursors
+are rejected because iterator initialization may advance CPU RNG.
+
+Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
+before training, and set `data.resume_input_deterministic=true` only when the
+input snapshot, tokenizer, chat template, processor, collator and transforms are
+immutable and deterministic. The digest is a **caller attestation**, not a
+hash that VeOmni independently computes from those inputs. It must identify a
+trusted manifest covering those components and their code/configuration. The
+same digest and settings are required on resume. A missing contract emits a
+startup warning; training and export can proceed, but its cursor cannot be
+resumed exactly under this contract.
+
+At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
+samples and start the next epoch with a fresh sampler. Persistent workers at an
+epoch boundary, stochastic transforms or independent worker RNG state are not
+qualified. Legacy cursors without the saved geometry, source contract and phase
+are rejected. No legacy migration tool is provided here: old releases differed
+in step accounting and batching behavior, so migration requires a separately
+verified producer-specific implementation. Starting a new data stream requires
+a new training run rather than claiming exact continuation from that cursor.
 Exhausted one-shot sources cannot be drained independently by each rank as a
 distributed continuation; use a restartable source or coordinated exhaustion.
 For safety, cursors written by the prior exhausted-source experiment with its

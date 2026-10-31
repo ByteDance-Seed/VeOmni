@@ -52,6 +52,7 @@ class TextTrainer:
             self.base._build_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context(self.base.model)
+        self.base._sft_dynamic_exact_resume = True
         self.base._init_callbacks()
 
     def _build_data_transform(self):

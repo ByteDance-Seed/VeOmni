@@ -62,7 +62,11 @@ def test_dpo_channel_loss_configuration_reaches_model_build(monkeypatch):
 
     monkeypatch.setattr(dpo.BaseTrainer, "_setup", lambda *_: "cpu")
     monkeypatch.setattr(dpo, "_dpo_objective_parameters", lambda _: {})
-    monkeypatch.setattr(dpo, "_dpo_recovery_geometry", lambda _: {})
+    monkeypatch.setattr(
+        dpo,
+        "_dpo_recovery_geometry",
+        lambda _: {"data": {"resume_input_contract": "sha256:" + "1" * 64, "resume_input_deterministic": True}},
+    )
     build = Mock(side_effect=RuntimeError("model build reached"))
     monkeypatch.setattr(dpo.TextDPOTrainer, "_build_policy_model_runtime", build)
     args = SimpleNamespace(

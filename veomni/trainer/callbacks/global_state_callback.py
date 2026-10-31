@@ -37,7 +37,10 @@ On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
 import copy
+import hashlib
+import json
 import os
+import re
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -45,7 +48,7 @@ import torch.distributed as dist
 
 from ...checkpoint import layout
 from ...utils import helper
-from ...utils.device import get_device_rng_state, get_device_type, set_device_rng_state
+from ...utils.device import get_device_rng_state, get_device_type, get_torch_device, set_device_rng_state
 from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
@@ -58,6 +61,58 @@ logger = helper.create_logger(__name__)
 
 # Keys of ``state_dict`` that belong to ``loader/`` rather than ``extra_state/``.
 _LOADER_KEYS = ("train_dataloader",)
+
+
+def _dynamic_resume_context(args, epoch):
+    """Capture the source and epoch settings needed for a dynamic cursor."""
+    data = getattr(args, "data", None)
+    dataloader = getattr(data, "dataloader", None)
+    train = getattr(args, "train", None)
+    model = getattr(args, "model", None)
+    accelerator = getattr(model, "accelerator", None)
+    fields = (
+        "train_path",
+        "data_type",
+        "datasets_type",
+        "dataset_repeat",
+        "text_keys",
+        "max_seq_len",
+        "dyn_bsz_buffer_size",
+        "resume_input_contract",
+        "resume_input_deterministic",
+    )
+    return {
+        "version": 1,
+        "epoch_steps": getattr(args, "train_steps", None),
+        "saved_epoch": epoch,
+        "data": {key: getattr(data, key, None) for key in fields},
+        "train": {
+            key: getattr(train, key, None)
+            for key in ("pad_to_length", "micro_batch_size", "global_batch_size", "seed")
+        },
+        "model": {key: getattr(model, key, None) for key in ("model_path", "config_path", "tokenizer_path")},
+        "parallel": {
+            key: getattr(accelerator, key, None)
+            for key in ("ulysses_size", "cp_size", "ep_size", "dp_shard_size", "dp_replicate_size")
+        },
+        "background_prefetch": getattr(dataloader, "use_background_prefetcher", None),
+    }
+
+
+def _json_signature(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).digest()
+
+
+def _agree_dynamic_resume_signature(signature, group):
+    if not dist.is_initialized():
+        return
+    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+    low = torch.tensor(list(signature), dtype=torch.int32, device=device)
+    high = low.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
+    if not torch.equal(low, high):
+        raise RuntimeError("Ranks disagree on dynamic loader resume context")
 
 
 class GlobalStateCallback(Callback):
@@ -86,6 +141,24 @@ class GlobalStateCallback(Callback):
         self.hf_every_n_steps = ckpt.hf_save_steps
         self.hf_every_n_epochs = ckpt.hf_save_epochs
         self._last_saved_step: int = -1
+        self._unadvanced_boundary_state = None
+        from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+        data = getattr(args, "data", None)
+        if (
+            getattr(trainer, "_sft_dynamic_exact_resume", False) is True
+            and type(getattr(trainer, "train_dataloader", None)) is DynamicBatchSizeDataLoader
+        ):
+            digest = getattr(data, "resume_input_contract", None)
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                or getattr(data, "resume_input_deterministic", False) is not True
+            ):
+                logger.warning(
+                    "Dynamic SFT data checkpoints will not support exact resume unless an input contract digest "
+                    "and deterministic-input attestation are configured before training."
+                )
 
     @property
     def rank(self) -> int:
@@ -93,6 +166,9 @@ class GlobalStateCallback(Callback):
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.load_global_state()
+
+    def on_step_begin(self, state: TrainerState, **kwargs) -> None:
+        self._unadvanced_boundary_state = None
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
@@ -127,6 +203,18 @@ class GlobalStateCallback(Callback):
                 )
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
+        pending = getattr(self, "_unadvanced_boundary_state", None)
+        if pending is not None and state.global_step == pending["global_step"]:
+            return pending.copy()
+        self._unadvanced_boundary_state = None
+        from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+        loader = self.trainer.train_dataloader
+        if (
+            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
+            and type(loader) is DynamicBatchSizeDataLoader
+        ):
+            loader._strict_resume_contract = True
         is_dpo = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         pending_cursor = getattr(self.trainer, "_dpo_pending_loader_state", None) if is_dpo else None
         pending_epoch = getattr(self.trainer, "_dpo_pending_epoch_end", None) if is_dpo else None
@@ -173,6 +261,13 @@ class GlobalStateCallback(Callback):
                     "step_in_epoch": self.trainer._dpo_epoch_step,
                     "epoch_complete": self.trainer._dpo_epoch_complete,
                 }
+        if (
+            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
+            and type(self.trainer.train_dataloader) is DynamicBatchSizeDataLoader
+        ):
+            result["_veomni_dynamic_context"] = _dynamic_resume_context(
+                self.trainer.args, getattr(state, "epoch", None)
+            )
         return result
 
     def save_global_state(self, state: TrainerState) -> None:
@@ -190,7 +285,14 @@ class GlobalStateCallback(Callback):
         """
         args: "VeOmniArguments" = self.trainer.args
         step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-        payload = self.state_dict(state)
+        payload = None
+        state_error = None
+        try:
+            payload = self.state_dict(state)
+        except BaseException as exc:
+            state_error = exc
+        group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(state_error, "collecting the trainer state", group=group)
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
@@ -254,9 +356,8 @@ class GlobalStateCallback(Callback):
 
         ``extra_state/`` is the one that decides whether a current-layout state
         exists: it holds ``global_step``, without which there is nothing to
-        resume. A missing ``loader/`` file is not an error — dropping it is how a
-        run resumes onto different data — so the cursor is simply absent and the
-        dataloader starts from the beginning.
+        resume. A missing ``loader/`` leaves the cursor absent; exact SFT resume
+        rejects it.
         """
         extra_path = layout.extra_state_path(load_path, self.rank)
         if not os.path.exists(extra_path):
@@ -267,12 +368,27 @@ class GlobalStateCallback(Callback):
         if os.path.exists(loader_file):
             merged.update(torch.load(loader_file, map_location="cpu", weights_only=False))
         else:
-            logger.warning(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
+            logger.warning(f"No dataloader cursor at {loader_file}; exact data continuation is unavailable.")
         return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
         args: "VeOmniArguments" = self.trainer.args
+        from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+        strict_sft = (
+            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
+            and type(getattr(self.trainer, "train_dataloader", None)) is DynamicBatchSizeDataLoader
+        )
         load_path = args.train.checkpoint.load_path
+        if dist.is_initialized():
+            group = dist.group.WORLD
+            device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+            low = torch.tensor([int(load_path is not None), int(strict_sft)], dtype=torch.int32, device=device)
+            high = low.clone()
+            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
+            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
+            if not torch.equal(low, high):
+                raise RuntimeError("Ranks disagree on trainer-state resume mode")
         if load_path is None:
             return None
 
@@ -309,6 +425,21 @@ class GlobalStateCallback(Callback):
                     )
                 if type(loaded_state.get("global_step")) is not int or loaded_state["global_step"] < 0:
                     raise ValueError("DPO checkpoint recovery requires a valid nonnegative global_step")
+                rng = loaded_state.get("torch_rng_state")
+                if not isinstance(rng, torch.Tensor):
+                    raise ValueError("DPO exact recovery requires the saved CPU RNG state")
+                try:
+                    torch.Generator(device="cpu").set_state(rng)
+                except (RuntimeError, TypeError) as exc:
+                    raise ValueError("DPO checkpoint has invalid CPU RNG state") from exc
+                device_rng = loaded_state.get("device_rng_state")
+                if get_device_type() == "cpu" and device_rng is not None:
+                    if not isinstance(device_rng, torch.Tensor) or not torch.equal(device_rng, rng):
+                        raise ValueError("DPO checkpoint has conflicting CPU and device RNG states")
+                if get_device_type() != "cpu" and (
+                    device_rng is None or not callable(getattr(get_torch_device(), "set_rng_state", None))
+                ):
+                    raise ValueError("DPO exact recovery requires a restorable accelerator RNG state")
                 position = loaded_state.get("dpo_position")
                 if (
                     type(position) is not dict
@@ -344,13 +475,25 @@ class GlobalStateCallback(Callback):
                         raise ValueError("DPO dynamic loader cursor step differs from the checkpoint position")
                     _check_dpo_cursor_fields(cursor)
                     _check_dpo_cursor_strategy(cursor, self.trainer.train_dataloader.batching_strategy)
+                    if self.trainer.train_dataloader._strict_resume_contract:
+                        self.trainer.train_dataloader.validate_resume_state(cursor)
+                    if position["step_in_epoch"] > 0 and cursor.get("_veomni_resume_phase") == "running":
+                        raise ValueError("DPO cursor was not captured at a completed training step")
+                    if not position["epoch_complete"] and cursor.get("_veomni_resume_phase") == "done":
+                        raise ValueError("DPO cursor cannot be exhausted before its epoch is complete")
+                    if (
+                        loaded_state["global_step"] > 0
+                        and position["step_in_epoch"] == 0
+                        and not position["epoch_complete"]
+                    ):
+                        raise ValueError("DPO cursor at an unconsumed epoch start is not an exact resume point")
 
                 # A restored worker iterator must be created with the saved
                 # epoch, not the sampler's freshly constructed epoch zero.
                 # Only the native, standard sampler has an idempotent epoch
                 # setter that we can safely invoke before loading its cursor.
                 loader = self.trainer.train_dataloader
-                from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+                from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
 
                 from ...data.data_loader import DistributedDataloader
                 from ...data.dataset import MappingDataset
@@ -370,13 +513,21 @@ class GlobalStateCallback(Callback):
                         inner.num_workers != loader_config.num_workers
                         or inner.persistent_workers != (loader_config.persistent_workers and inner.num_workers > 0)
                         or inner.in_order != loader_config.in_order
+                        or (inner.num_workers > 0 and inner.in_order is not True)
                         or inner.batch_size != args.train.dataloader_batch_size
                         or inner.drop_last != loader_config.drop_last
+                        or inner.generator is not None
+                        or inner.snapshot_every_n_steps != 1
+                        or type(inner.batch_sampler) is not BatchSampler
+                        or inner.batch_sampler.sampler is not inner.sampler
+                        or inner.batch_sampler.batch_size != inner.batch_size
+                        or inner.batch_sampler.drop_last != inner.drop_last
                         or (
                             isinstance(loader, DynamicBatchSizeDataLoader)
                             and loader._drop_last != loader_config.drop_last
                         )
                         or sampler.shuffle != loader_config.shuffle
+                        or sampler.drop_last is not False
                         or sampler.seed != args.train.seed
                         or inner.dataset.seed != args.train.seed
                         or sampler.dataset is not inner.dataset
@@ -391,40 +542,176 @@ class GlobalStateCallback(Callback):
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
-        raise_if_any_rank_failed(read_error, "reading the trainer state")
+        read_group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(read_error, "reading the trainer state", group=read_group)
 
         found = current_state is not None or legacy_state is not None
         if dist.is_initialized():
-            flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
+            device = "cpu" if dist.get_backend(dist.group.WORLD) == "gloo" else get_device_type()
+            flag = torch.tensor([int(found)], dtype=torch.int32, device=device)
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
             found = bool(flag.item())
             if not found:
+                if strict_sft:
+                    raise RuntimeError("Trainer state is missing on at least one rank; exact cursor resume is unsafe")
                 logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
                 return None
         elif not found:
+            if strict_sft:
+                raise RuntimeError("Trainer state is missing; exact cursor resume is unsafe")
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
         global_state = current_state if current_state is not None else legacy_state
+        dpo_recovery = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         # Reject an incompatible legacy cursor on every rank before any
         # loader or DPO position restoration can perform its own collectives.
         cursor = None
         global_step = None
         cursor_error = None
+        sft_next_epoch = False
+        prepared_sft_buffer = None
+        resume_signature = None
         try:
             cursor = global_state.get("train_dataloader")
             global_step = global_state["global_step"]
+            loader = self.trainer.train_dataloader
+            if type(loader) is DynamicBatchSizeDataLoader and strict_sft:
+                if cursor is None:
+                    raise ValueError("dynamic loader checkpoint cursor is missing; exact resume is unsafe")
+            if type(loader) is DynamicBatchSizeDataLoader and cursor is not None and strict_sft:
+                context = global_state.get("_veomni_dynamic_context")
+                if not isinstance(context, dict):
+                    raise RuntimeError(
+                        "Cannot safely restore dynamic batching at an epoch boundary or from a legacy cursor "
+                        "without saved source and epoch geometry; use a verified migration."
+                    )
+                epoch = context.get("saved_epoch")
+                if (
+                    type(global_step) is not int
+                    or global_step < 0
+                    or type(epoch) is not int
+                    or epoch < 0
+                    or type(args.train_steps) is not int
+                    or args.train_steps <= 0
+                    or _json_signature(context) != _json_signature(_dynamic_resume_context(args, epoch))
+                ):
+                    raise ValueError("dynamic loader checkpoint source or epoch geometry differs")
+                if global_step == 0:
+                    raise ValueError("exact dynamic loader resume requires a completed training step")
+                loader.validate_resume_state(cursor)
+                contract = context["data"]["resume_input_contract"]
+                if not isinstance(contract, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", contract) is None:
+                    raise ValueError(
+                        "exact dynamic loader resume requires an attested input contract digest covering the immutable "
+                        "data snapshot, tokenizer, collator and deterministic transforms"
+                    )
+                if context["data"]["resume_input_deterministic"] is not True:
+                    raise ValueError(
+                        "exact dynamic loader resume requires an explicit deterministic-input attestation"
+                    )
+                fingerprint = cursor["_veomni_resume_geometry"]["dataset_fingerprint"]
+                if not isinstance(fingerprint, str) or not fingerprint:
+                    raise ValueError("exact dynamic loader resume requires a source dataset fingerprint")
+                source = loader._dataloader
+                if getattr(source, "num_workers", 0) and getattr(source, "in_order", True) is not True:
+                    raise ValueError("exact dynamic loader resume requires in-order data workers")
+                from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
+
+                from ...data.data_loader import DistributedDataloader
+                from ...data.dataset import InterleavedMappingDataset, MappingDataset
+
+                if (
+                    type(source) is not DistributedDataloader
+                    or type(getattr(source, "sampler", None)) is not StatefulDistributedSampler
+                    or type(getattr(source, "dataset", None)) not in (MappingDataset, InterleavedMappingDataset)
+                    or type(getattr(source, "batch_sampler", None)) is not BatchSampler
+                    or source.batch_sampler.sampler is not source.sampler
+                    or source.batch_sampler.batch_size != source.batch_size
+                    or source.batch_sampler.drop_last != source.drop_last
+                    or source.snapshot_every_n_steps != 1
+                    or source.generator is not None
+                ):
+                    raise ValueError(
+                        "exact dynamic loader resume requires the standard native mapping source and sampler"
+                    )
+                rng = global_state.get("torch_rng_state")
+                if not isinstance(rng, torch.Tensor):
+                    raise ValueError("exact dynamic loader resume requires the saved CPU RNG state")
+                try:
+                    torch.Generator(device="cpu").set_state(rng)
+                except (RuntimeError, TypeError) as exc:
+                    raise ValueError("invalid CPU RNG state in dynamic loader checkpoint") from exc
+                device_rng = global_state.get("device_rng_state")
+                if get_device_type() == "cpu" and device_rng is not None:
+                    if not isinstance(device_rng, torch.Tensor) or not torch.equal(device_rng, rng):
+                        raise ValueError("conflicting CPU and device RNG states in dynamic loader checkpoint")
+                if get_device_type() != "cpu" and global_state.get("device_rng_state") is None:
+                    raise ValueError("exact dynamic loader resume requires the saved accelerator RNG state")
+                if get_device_type() != "cpu" and not callable(getattr(get_torch_device(), "set_rng_state", None)):
+                    raise ValueError("the accelerator runtime cannot restore its saved RNG state")
+                expected_step = global_step - epoch * args.train_steps
+                if expected_step < 0 or expected_step > args.train_steps or cursor.get("step") != expected_step:
+                    raise ValueError("dynamic loader cursor and saved epoch position differ")
+                if expected_step == 0 or cursor.get("_veomni_resume_phase") != "after_yield":
+                    raise ValueError("dynamic loader cursor was not captured at a completed training step")
+                if context["background_prefetch"] is not False:
+                    raise ValueError("exact dynamic loader resume requires background prefetch to be disabled")
+                if global_step > 0 and expected_step == args.train_steps:
+                    from datasets import Dataset as HFDataset
+
+                    source = loader._dataloader
+                    dataset = getattr(source, "dataset", None)
+                    sft_next_epoch = (
+                        strict_sft
+                        and type(source) is DistributedDataloader
+                        and type(getattr(source, "sampler", None)) is StatefulDistributedSampler
+                        and type(dataset) in (MappingDataset, InterleavedMappingDataset)
+                        and type(dataset._data) in (list, tuple, HFDataset)
+                        and not source.persistent_workers
+                        and (source.num_workers == 0 or source.in_order is True)
+                        and isinstance(cursor.get("dataloader_state"), dict)
+                        and bool(cursor["dataloader_state"])
+                    )
+                    if not sft_next_epoch:
+                        raise RuntimeError(
+                            "Cannot safely restore dynamic batching at this epoch boundary with the current source "
+                            "or worker configuration."
+                        )
+                    prepared_sft_buffer = loader.prepare_sft_next_epoch_buffer(cursor)
+            elif (
+                type(loader) is DynamicBatchSizeDataLoader
+                and not dpo_recovery
+                and cursor is not None
+                and global_step > 0
+                and args.train_steps > 0
+                and global_step % args.train_steps == 0
+            ):
+                raise RuntimeError(
+                    "Cannot safely restore main-process dynamic batching at an epoch boundary: "
+                    "the saved cursor cannot prove the next epoch's buffered samples and source position."
+                )
             if isinstance(cursor, dict) and "_veomni_source_exhausted" in cursor:
-                from ...data.dynamic_batching import DynamicBatchSizeDataLoader, _check_legacy_exhausted_cursor
+                from ...data.dynamic_batching import _check_legacy_exhausted_cursor
 
                 if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
                     _check_legacy_exhausted_cursor(cursor)
+            if strict_sft:
+                resume_signature = _json_signature(
+                    {
+                        "dynamic": type(loader) is DynamicBatchSizeDataLoader,
+                        "checkpoint_path": os.fspath(load_path),
+                        "global_step": global_step,
+                        "context": global_state.get("_veomni_dynamic_context") if cursor is not None else None,
+                    }
+                )
         except BaseException as exc:
             cursor_error = exc
         default_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
+        if strict_sft:
+            _agree_dynamic_resume_signature(resume_signature, default_group)
 
-        dpo_recovery = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         if dpo_recovery and dist.is_initialized():
             steps = [None] * dist.get_world_size()
             position = global_state["dpo_position"]
@@ -447,8 +734,19 @@ class GlobalStateCallback(Callback):
             except BaseException as exc:
                 epoch_error = exc
             raise_if_any_rank_failed(epoch_error, "preparing the DPO sampler epoch", group=default_group)
-        restore_error = None
-        try:
+
+        def restore_local(action, description):
+            if not (strict_sft or dpo_recovery):
+                action()
+                return
+            error = None
+            try:
+                action()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, description, group=default_group)
+
+        def restore_position():
             self.trainer.state.global_step = global_step
             self._restore_position(global_state)
             if dpo_recovery:
@@ -457,91 +755,93 @@ class GlobalStateCallback(Callback):
                 self.trainer._dpo_epoch_step = position["step_in_epoch"]
                 self.trainer._dpo_epoch_complete = position["epoch_complete"]
                 self.trainer._dpo_pending_loader_state = (
-                    global_state["train_dataloader"]
-                    if getattr(self.trainer, "_dpo_pending_epoch_end", None) is not None
-                    else None
+                    cursor if getattr(self.trainer, "_dpo_pending_epoch_end", None) is not None else None
                 )
-                self._dpo_finished_cursor = (
-                    global_state["train_dataloader"]
-                    if self.trainer.start_epoch >= args.train.num_train_epochs
-                    else None
-                )
+                self._dpo_finished_cursor = cursor if self.trainer.start_epoch >= args.train.num_train_epochs else None
                 save_path = getattr(args.train.checkpoint, "save_path", None)
-                save_step_path = layout.step_dir(save_path, global_state["global_step"]) if save_path else None
+                save_step_path = layout.step_dir(save_path, global_step) if save_path else None
                 self._last_saved_step = (
-                    global_state["global_step"]
-                    if save_step_path and os.path.normpath(save_step_path) == os.path.normpath(load_path)
-                    else -1
+                    global_step if save_step_path and save_step_path == os.fspath(load_path) else -1
                 )
-            # A cursor belongs to the saved epoch. At an epoch boundary it
-            # must not be applied to the new epoch's freshly seeded sampler:
-            # StatefulDataLoader would otherwise skip or replay samples.
-            dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]
-            if dpo_recovery:
-                self.trainer._dpo_restore_fixed_iterator_rng = bool(
-                    not dpo_new_epoch and not isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader)
-                )
-            channel_loss_state = global_state.get("channel_loss_callback")
-            channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
-            if channel_loss_state is not None and channel_loss_callback is not None:
-                channel_loss_callback.load_state_dict(channel_loss_state)
 
-            offline_cache_writer_state = global_state.get("offline_cache_writer")
-            offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
-            if offline_cache_writer_state is not None and offline_cache_writer is not None:
-                offline_cache_writer.load_state_dict(offline_cache_writer_state)
+        restore_local(restore_position, "restoring trainer position")
+        dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]
+        if dpo_recovery:
+            self.trainer._dpo_restore_fixed_iterator_rng = bool(
+                not dpo_new_epoch and not isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader)
+            )
+        channel_loss_state = global_state.get("channel_loss_callback")
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        restore_local(
+            lambda: channel_loss_callback.load_state_dict(channel_loss_state)
+            if channel_loss_state is not None and channel_loss_callback is not None
+            else None,
+            "restoring channel-loss state",
+        )
+        offline_cache_writer_state = global_state.get("offline_cache_writer")
+        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+        restore_local(
+            lambda: offline_cache_writer.load_state_dict(offline_cache_writer_state)
+            if offline_cache_writer_state is not None and offline_cache_writer is not None
+            else None,
+            "restoring offline-cache state",
+        )
 
-            if dpo_new_epoch and isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
-                self.trainer.train_dataloader.load_next_epoch_buffer(global_state["train_dataloader"])
-            if (
-                not dpo_new_epoch
-                and self.trainer.train_dataloader is not None
-                and global_state.get("train_dataloader") is not None
-            ):
-                cursor = global_state["train_dataloader"]
-                # For SFT, the native dynamic loader creates worker iterators
-                # while loading the cursor, so seed its sampler first. DPO has
-                # already done this above as part of its position protocol.
-                if not dpo_recovery and self.trainer.start_step:
-                    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+        def restore_loader():
+            loader = self.trainer.train_dataloader
+            if dpo_new_epoch and isinstance(loader, DynamicBatchSizeDataLoader):
+                loader.load_next_epoch_buffer(cursor)
+                return
+            if dpo_new_epoch or loader is None or cursor is None:
+                return
+            if strict_sft and type(loader) is DynamicBatchSizeDataLoader:
+                loader._strict_resume_contract = True
+            if not dpo_recovery and self.trainer.start_step:
+                from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
-                    from ...data.data_loader import DistributedDataloader
-                    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+                from ...data.data_loader import DistributedDataloader
 
-                    loader = self.trainer.train_dataloader
-                    if (
-                        type(loader) is DynamicBatchSizeDataLoader
-                        and type(loader._dataloader) is DistributedDataloader
-                        and type(loader._dataloader.sampler) is StatefulDistributedSampler
-                    ):
-                        loader.set_epoch(self.trainer.start_epoch)
-                # DynamicBatchSizeDataLoader copies its input itself. Avoid a
-                # redundant full buffer copy while preserving the saved cursor
-                # for the second, post-validation restore.
-                needs_copy = dpo_recovery and not isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader)
-                self.trainer.train_dataloader.load_state_dict(copy.deepcopy(cursor) if needs_copy else cursor)
+                if (
+                    type(loader) is DynamicBatchSizeDataLoader
+                    and type(loader._dataloader) is DistributedDataloader
+                    and type(loader._dataloader.sampler) is StatefulDistributedSampler
+                ):
+                    loader.set_epoch(self.trainer.start_epoch)
+            if sft_next_epoch:
+                loader.load_sft_next_epoch_buffer(prepared_sft_buffer)
+            else:
+                needs_copy = dpo_recovery and not isinstance(loader, DynamicBatchSizeDataLoader)
+                loader.load_state_dict(copy.deepcopy(cursor) if needs_copy else cursor)
                 if dpo_recovery:
-                    # Some loaders only validate their cursor lazily in __iter__.
-                    # Reapply the saved cursor so validation consumes no training samples.
-                    iter(self.trainer.train_dataloader)
-                    self.trainer.train_dataloader.load_state_dict(cursor)
-            # OmniTrainer checkpoints written before it had a meter store None here.
-            if global_state.get("environ_meter") is not None:
-                self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+                    # Validate deferred source errors without consuming a training sample.
+                    iter(loader)
+                    loader.load_state_dict(cursor)
+
+        restore_local(restore_loader, "restoring the training data cursor")
+        restore_local(
+            lambda: self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+            if global_state.get("environ_meter") is not None
+            else None,
+            "restoring training meter",
+        )
+
+        def restore_rng():
             rng_state = global_state.get("torch_rng_state")
             if rng_state is not None:
                 torch.set_rng_state(rng_state)
-            # ``.get`` keeps checkpoints written before these fields existed loadable;
-            # the device namespace may also not support RNG state at all.
             set_device_rng_state(global_state.get("device_rng_state"))
-            if self.trainer.start_step == 0 and not dpo_recovery and self.trainer.train_dataloader is not None:
-                iter(self.trainer.train_dataloader)
-        except Exception as exc:  # noqa: BLE001 - coordinate rank-local DPO restoration failures
-            restore_error = exc
-        if dpo_recovery:
-            raise_if_any_rank_failed(restore_error, "restoring the DPO trainer state")
-        elif restore_error is not None:
-            raise restore_error
+
+        restore_local(restore_rng, "restoring training RNG")
+        if sft_next_epoch:
+            self._unadvanced_boundary_state = global_state
+        if (
+            not strict_sft
+            and not dpo_recovery
+            and self.trainer.start_step == 0
+            and not sft_next_epoch
+            and self.trainer.train_dataloader is not None
+        ):
+            iter(self.trainer.train_dataloader)
 
         logger.info_rank0(
             f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "

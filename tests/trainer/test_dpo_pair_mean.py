@@ -920,6 +920,9 @@ def _install_recovery_geometry(trainer):
     trainer.base.args.data.enable_multisource = False
     trainer.base.args.model = geometry_args.model
     trainer.base.args.train_steps = geometry_args.train_steps
+    trainer.base.train_dataloader = SimpleNamespace(
+        dataset=SimpleNamespace(_data=SimpleNamespace(_fingerprint="pair-mean-fixture-v1"))
+    )
     trainer._dpo_recovery_geometry = dpo._dpo_recovery_geometry(trainer.base.args)
 
 
@@ -1259,7 +1262,13 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
         trainer._dpo_producer_identity = dpo_producer_identity(trainer.policy_model.tokenizer, None, None)
         trainer._dpo_transform_max_seq_len = 32
         _install_recovery_geometry(trainer)
-        dynamic = scenario in ("exhausted_marker", "cursor_step_mismatch", "unknown_cursor_field")
+        dynamic = scenario in (
+            "exhausted_marker",
+            "cursor_step_mismatch",
+            "unknown_cursor_field",
+            "early_done",
+            "early_flush",
+        )
         trainer.base.args.train.dyn_bsz = dynamic
         trainer._dpo_recovery_geometry = dpo._dpo_recovery_geometry(trainer.base.args)
         trainer.base.args.train.checkpoint = SimpleNamespace(load_path="/unused")
@@ -1272,6 +1281,8 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
             loader = DynamicBatchSizeDataLoader(
                 loader, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=10
             )
+            loader._strict_resume_contract = True
+            loader._dpo_disallow_implicit_restart = True
         cursor = loader.state_dict()
         if dynamic:
             cursor["step"] = 3
@@ -1281,6 +1292,11 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
                 cursor["step"] = 2
             if rank == 1 and scenario == "unknown_cursor_field":
                 cursor["_dpo_disallow_implicit_restart"] = False
+            if rank == 1 and scenario == "early_done":
+                cursor["_veomni_resume_phase"] = "done"
+            if rank == 1 and scenario == "early_flush":
+                cursor["_veomni_resume_phase"] = "flushing"
+                cursor["_veomni_flush_micro_batch"] = [{"id": 1}]
         original_load = loader.load_state_dict
         calls = {"load": 0, "iter": 0}
 
@@ -1306,7 +1322,10 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
             "global_step": 3,
             "dpo_position": {"epoch": 0, "step_in_epoch": 3, "epoch_complete": False},
             "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+            "torch_rng_state": torch.get_rng_state(),
         }
+        if native_npu:
+            checkpoint["device_rng_state"] = torch.npu.get_rng_state()
         if rank != 1 or scenario != "missing":
             checkpoint["train_dataloader"] = cursor
         if rank == 1 and scenario == "empty":
@@ -1339,6 +1358,8 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
                 "exhausted_marker": "exhausted one-shot",
                 "cursor_step_mismatch": "cursor step differs",
                 "unknown_cursor_field": "unsupported fields",
+                "early_done": "exhausted before its epoch is complete",
+                "early_flush": "cannot prove that its source was exhausted",
             }
             assert expected[scenario] in message
         else:
@@ -1377,6 +1398,8 @@ def test_rank_local_objective_mismatch_is_coordinated():
         "exhausted_marker",
         "cursor_step_mismatch",
         "unknown_cursor_field",
+        "early_done",
+        "early_flush",
     ],
 )
 def test_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(scenario):

@@ -179,6 +179,10 @@ def test_native_dpo_cursor_restores_epoch_samples_and_cpu_rng(
             "train_dataloader": cursor,
             "torch_rng_state": saved_rng,
         }
+        if dynamic and phase == "initial":
+            with pytest.raises(ValueError, match="unconsumed epoch start"):
+                callback.load_global_state()
+            return
         with patch("veomni.trainer.callbacks.global_state_callback.set_device_rng_state"):
             callback.load_global_state()
         restored.set_epoch(trainer.start_epoch)
