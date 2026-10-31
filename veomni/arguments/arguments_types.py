@@ -1564,19 +1564,28 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise"] = field(
-        default="none",
+    qat_implementation: Optional[Literal["none", "fp8_blockwise", "torchao_mxfp4"]] = field(
+        default=None,
         metadata={
-            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
+            "help": "Quantization-aware training recipe. 'fp8_blockwise' makes DeepSeek V4 training "
             "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
             "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
             "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
             "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "Unset preserves the saved recipe, defaulting to 'none'; explicit 'none' disables QAT. "
+            "Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
+            "VeomniOp -- see veomni/ops/qat/. 'torchao_mxfp4' selects emulated W4A4 QAT for "
+            "explicit Dense Qwen3 projections (see qat_target_modules). "
+            "Must be 'none' when moe_implementation='deepgemm_fp8'."
+        },
+    )
+    qat_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": "Full module-name glob patterns for torchao_mxfp4 QAT; each pattern must match a supported projection."
         },
     )
 
@@ -1703,7 +1712,19 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+        if self.qat_implementation not in (None, "none", "fp8_blockwise", "torchao_mxfp4"):
+            raise ValueError(f"Unknown qat_implementation={self.qat_implementation!r}.")
+        if self.qat_implementation == "torchao_mxfp4":
+            if (
+                not isinstance(self.qat_target_modules, list)
+                or not self.qat_target_modules
+                or any(not isinstance(pattern, str) or not pattern for pattern in self.qat_target_modules)
+            ):
+                raise ValueError("torchao_mxfp4 requires a nonempty qat_target_modules list of module-name patterns.")
+        elif self.qat_target_modules is not None:
+            raise ValueError("qat_target_modules is only supported with qat_implementation='torchao_mxfp4'.")
+
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation not in (None, "none"):
             raise ValueError(
                 "moe_implementation='deepgemm_fp8' cannot be combined with "
                 f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
@@ -1760,7 +1781,7 @@ class OpsImplementationConfig:
         # quantizers are the SM90-only TileLang kernels: without this check a
         # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
         # inside the first fake-quant call.
-        if self.qat_implementation != "none":
+        if self.qat_implementation == "fp8_blockwise":
             import torch
 
             from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability

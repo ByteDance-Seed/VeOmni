@@ -466,6 +466,10 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
+    from ..models.qat import validate_mxfp4_qat_parallelism
+
+    validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config, **kwargs)
+
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
     )
@@ -1032,6 +1036,9 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+
+    from ..models.qat import validate_mxfp4_qat_parallelism
+
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
@@ -1045,6 +1052,8 @@ def build_parallelize_model(
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
+
+    validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config, **kwargs)
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
