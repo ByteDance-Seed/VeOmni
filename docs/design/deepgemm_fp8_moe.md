@@ -157,24 +157,37 @@ Unsupported dim-0 layouts fail during wrapping.
 
 This option works with BF16 GEMMs and DeepGEMM FP8. Whole-expert shards avoid
 FSDP's hidden-dimension all-gather copy-out reorder and backward gradient
-concatenation. DCP metadata records the chosen dimension; checkpoint loading
-can reshard between layouts. Same-dimension EP/FSDP splits use strided
-placement metadata to preserve EP-first expert order. Older checkpoints
-written with the previous Muon dim-0 metadata encoded a permuted global expert
-order. VeOmni now versions EP-first ordering in DCP planner metadata. Resuming
-into whole-expert shards rejects unversioned checkpoints before loading tensors,
-including optimizer-only and trainable-only loads; such checkpoints require
-explicit migration. Existing dim-1-to-dim-1 resumes remain unchanged. Low-level
-DCP callers must use the VeOmni save/load planners for this version check.
+concatenation. Same-dimension EP/FSDP splits use strided placement metadata to
+preserve EP-first expert order. DCP planner metadata records each expert
+tensor's source EP/FSDP shard dimensions, group sizes, and global expert order
+under `__veomni_expert_layouts__` (format version 1). Entries use flattened
+state-dict keys, covering both model weights and optimizer tensors without
+adding model state keys or tensor collectives. Canonical checkpoints can
+reshard between dim 0 and dim 1; the load target need not match the saved layout.
+
+Older Muon dim-0 checkpoints used two ordinary shard placements and encoded a
+permuted global expert order. The load planner now checks the **source**
+ordering, including when loading into dim 1 or plain tensors. A source marked
+as noncanonical is rejected before tensor reads. For unmarked legacy EP
+checkpoints, saved chunks that split a matrix dimension identify safe
+different-axis sharding and can load into either target layout. Chunks spanning
+all experts are also unambiguous. Expert-only chunks cannot distinguish a
+valid EP-only save from the faulty same-axis layout: EP resumes reject these
+for both target dimensions and require migration using the original training
+layout, for model and optimizer together. Changing the target dimension or
+merely adding a canonical tag cannot repair a permuted checkpoint.
+
+Earlier checkpoints carrying the `__veomni_ep_first_layout__=1` marker remain
+readable. Low-level DCP callers must use the VeOmni planners to run these
+checks. Unmarked legacy exports to plain tensors still require external source
+layout information: neither tensor names nor shapes alone identify EP weights.
 
 MoE-LoRA adapter export with a supported BF16 backend also preserves the
 actual EP and FSDP shard dimensions when consolidating the adapter into
 safetensors. Whole-expert shards therefore export the same global adapter
 shapes and expert order as hidden-dimension shards.
-This destination-based guard does not identify legacy dim-0 checkpoints when
-loading into dim-1 or plain tensors; those existing unsupported conversions
-also need migration. Master weights, optimizer state, and gradient
-reduction dtypes are unchanged. FP32 reduce-scatter buffers can still dominate
+Master weights, optimizer state, and gradient reduction dtypes are unchanged.
+FP32 reduce-scatter buffers can still dominate
 peak memory, so FP8 parameter transport alone need not lower the step peak.
 
 The common EP combine path selects `moe_unpermute/standard/triton` on NVIDIA

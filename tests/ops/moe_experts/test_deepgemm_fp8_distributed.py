@@ -251,6 +251,7 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
     import torch.distributed.checkpoint as dcp
 
     from veomni.checkpoint.dcp_checkpointer import (
+        _EXPERT_LAYOUTS_KEY,
         ModelState,
         OptimizerState,
         _ExtraParallelSavePlanner,
@@ -266,6 +267,7 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
     )
     try:
         _init_parallel_state(dp_size=world, dp_shard_size=world, extra_parallel_sizes=(2,))
+        save_group = dist.new_group(backend="gloo") if shard_dim == 0 else None
         torch.manual_seed(401)
         with torch.device("meta"):
             model = _MetaModel()
@@ -304,11 +306,20 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
                     for param, state in sub.state.items()
                     for key, value in state.items()
                 }
-                dcp.save(
-                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt)},
-                    checkpoint_id=directory,
-                    planner=_ExtraParallelSavePlanner(),
-                )
+                save_kwargs = {
+                    "state_dict": {"model": ModelState(model), "optimizer": OptimizerState(model, opt)},
+                    "storage_writer": dcp.FileSystemWriter(directory),
+                    "planner": _ExtraParallelSavePlanner(),
+                }
+                if shard_dim == 0:
+                    # Metadata must also survive the production GPU -> CPU
+                    # async staging path, including optimizer tensors.
+                    dcp.async_save(**save_kwargs, process_group=save_group).result()
+                else:
+                    dcp.save(**save_kwargs)
+                layouts = dcp.FileSystemReader(directory).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+                assert any(key.startswith("optimizer.") for key in layouts)
+                assert all(layout["fsdp_shard_dim"] == shard_dim for layout in layouts.values())
             elif step == 1:
                 expected = y.detach().clone()
                 with torch.no_grad():

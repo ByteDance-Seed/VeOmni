@@ -16,6 +16,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from scripts.ci.accelerator.launch_plan import from_parameter
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.checkpoint.dcp_checkpointer import (
+    _EXPERT_LAYOUTS_KEY,
     _ExtraParallelSavePlanner,
     _ModelStrictLoadPlanner,
     drop_extra_parallel_dim,
@@ -47,13 +48,38 @@ def _layout_worker(rank, world, directory, rendezvous):
             source = wrap(source_dim)
             torch.testing.assert_close(source.full_tensor(), global_weight, rtol=0, atol=0)
             path = directory + str(source_dim)
-            dcp.save({"model": {"weight": source}}, checkpoint_id=path, planner=_ExtraParallelSavePlanner())
+            state = {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}}
+            dcp.save(state, checkpoint_id=path, planner=_ExtraParallelSavePlanner())
+            metadata = dcp.FileSystemReader(path).read_metadata()
+            layouts = metadata.planner_data[_EXPERT_LAYOUTS_KEY]
+            assert layouts == {
+                "version": 1,
+                "tensors": {
+                    key: {
+                        "ep_shard_dim": 0,
+                        "fsdp_shard_dim": source_dim,
+                        "ep_size": 2,
+                        "fsdp_size": 2,
+                        "expert_order": "canonical",
+                    }
+                    for key in ("model.weight", "optimizer.exp_avg")
+                },
+            }
             target = {"model": {"weight": wrap(1 - source_dim, empty=True)}}
             dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
             loaded = target["model"]["weight"]
             torch.testing.assert_close(loaded.full_tensor(), global_weight, rtol=0, atol=0)
             local_dt = drop_extra_parallel_dim(loaded, submesh, 1 - source_dim)
             torch.testing.assert_close(local_dt.full_tensor(), ep_weight, rtol=0, atol=0)
+
+        # Old row-sharded files are identifiable from the saved chunks, and
+        # can load into either target dimension without a source version tag.
+        path = directory + "legacy_rows"
+        dcp.save({"model": {"weight": wrap(1)}}, checkpoint_id=path)
+        for target_dim in (0, 1):
+            target = {"model": {"weight": wrap(target_dim, empty=True)}}
+            dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
+            torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
 
         # Legacy metadata used two ordinary Shards, recording the wrong order.
         local = ep_weight.chunk(2, 0)[fsdp_rank].contiguous()
@@ -62,10 +88,25 @@ def _layout_worker(rank, world, directory, rendezvous):
         for key, strict in [("model", True), ("model", False), ("optimizer", False)]:
             path = directory + key + str(strict)
             dcp.save({key: {"weight": legacy}}, checkpoint_id=path)
-            target = {key: {"weight": wrap(0, empty=True)}}
-            with pytest.raises(dcp.CheckpointException, match="unversioned checkpoint"):
-                dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=strict))
-            assert target[key]["weight"].to_local().count_nonzero() == 0
+            for target_dim in (0, 1):
+                target = {key: {"weight": wrap(target_dim, empty=True)}}
+                with pytest.raises(dcp.CheckpointException, match="unversioned checkpoint"):
+                    dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=strict))
+                assert target[key]["weight"].to_local().count_nonzero() == 0
+
+        # When the source layout is known, the guard also works for a plain
+        # tensor target. Never bless legacy ordinary Shard(0)/Shard(0) saves.
+        path = directory + "marked_legacy"
+        dcp.save({"model": {"weight": legacy}}, checkpoint_id=path, planner=_ExtraParallelSavePlanner())
+        for destination in (wrap(0, empty=True), wrap(1, empty=True), torch.zeros_like(global_weight)):
+            with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
+                dcp.load(
+                    {"model": {"weight": destination}},
+                    checkpoint_id=path,
+                    planner=_ModelStrictLoadPlanner(strict_model=True),
+                )
+            local = destination.to_local() if isinstance(destination, DTensor) else destination
+            assert local.count_nonzero() == 0
     finally:
         dist.destroy_process_group()
 
