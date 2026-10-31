@@ -30,9 +30,16 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
+import hashlib
+import os
 from typing import TYPE_CHECKING
 
+import torch
+import torch.distributed as dist
+
 from ...utils import helper
+from ...utils.device import get_device_type
+from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
 
@@ -41,6 +48,30 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+def _agree_checkpoint_load_path(path):
+    """Reject inconsistent checkpoint paths before any rank enters DCP."""
+    if not dist.is_initialized():
+        return
+    error = None
+    digest = None
+    try:
+        raw = None if path is None else os.fspath(path)
+        if raw is not None and not isinstance(raw, str):
+            raise TypeError("checkpoint load path must be a string")
+        encoded = b"\0" if raw is None else b"\1" + os.fsencode(raw)
+        digest = hashlib.sha256(encoded).digest()
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating checkpoint load path", group=dist.group.WORLD)
+    device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+    low = torch.tensor(list(digest), dtype=torch.int32, device=device)
+    high = low.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX)
+    if not torch.equal(low, high):
+        raise RuntimeError("Ranks disagree on checkpoint load path")
 
 
 class CheckpointCallback(Callback):
@@ -59,6 +90,7 @@ class CheckpointCallback(Callback):
         self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        _agree_checkpoint_load_path(self.trainer.args.train.checkpoint.load_path)
         self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()

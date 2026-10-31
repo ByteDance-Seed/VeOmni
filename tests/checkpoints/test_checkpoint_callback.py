@@ -555,8 +555,8 @@ class TestGlobalStateCallbackJobState:
         trainer.environ_meter.state_dict.return_value = {}
         cb = GlobalStateCallback(trainer)
 
-        def fail_the_write(_error, context):
-            if "trainer state" in context:
+        def fail_the_write(_error, context, group=None):
+            if context == "writing the trainer state":
                 raise RuntimeError("writing the trainer state failed on another rank")
 
         with patch(
@@ -672,8 +672,9 @@ class TestGlobalStateCallbackJobState:
         """A missing cursor on one rank must not leave the others at a different step."""
         mock_dist.is_initialized.return_value = True
 
-        def drop_presence(flag, op=None):
-            flag.zero_()
+        def drop_presence(flag, op=None, group=None):
+            if flag.numel() == 1:
+                flag.zero_()
 
         mock_dist.all_reduce.side_effect = drop_presence
         trainer = _make_mock_trainer()
@@ -695,7 +696,7 @@ class TestGlobalStateCallbackJobState:
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
+        assert mock_dist.all_reduce.call_count == 3
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
 
     def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):

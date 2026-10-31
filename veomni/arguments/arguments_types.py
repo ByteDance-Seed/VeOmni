@@ -2031,6 +2031,25 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Caller-attested SHA256 identity of the immutable input snapshot, tokenizer, collator and "
+                "deterministic data transforms. "
+                "Required to resume a main-process dynamic batching cursor exactly."
+            )
+        },
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Attest that input decoding, preprocessing and collation are deterministic and do not consume "
+                "untracked worker RNG state."
+            )
+        },
+    )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},

@@ -45,20 +45,35 @@ nothing else. The two exports are inference artifacts that resume never reads.
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
 
-Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
-a batch was yielded. Older cursors lack that phase and may resume with a
-different next batch; exact continuation from them requires an independently
-verified migration. Older code also cannot reliably resume a cursor written by
-this version. Worker-mode dynamic batching uses a separate cursor path.
-Restoring shuffled multi-worker inputs at a nonzero epoch is not generally
-guaranteed to reproduce the original samples. For main-process dynamic batching,
-trainer restore rejects an epoch boundary detected from the current epoch length:
-old cursors do not prove how to combine buffered samples with the next source
-epoch. Old checkpoints do not record the original epoch length, so changing that
-length can evade this guard. Use an independently verified mid-epoch checkpoint
-with unchanged data and training geometry until there is a versioned contract.
-Worker-mode and custom loader epoch-boundary behavior are not established by this
-guard. Dropping the dataloader cursor to train on new data remains supported.
+For main-process dynamic batching in the text and VLM trainers, exact resume
+requires a native mapping dataset with an unchanged dataset fingerprint, the
+native stateful and batch samplers, snapshots at every source step, no custom
+data-loader generator, in-order workers and disabled background prefetch.
+The checkpoint records the data/worker geometry, epoch length, source settings
+and input-parallel settings. A changed or missing cursor, geometry, source
+fingerprint or RNG state is rejected. Worker-mode batching and custom or
+iterable sources use separate paths and are not qualified by this contract.
+Exact continuation starts after a completed optimizer step; step-zero cursors
+are rejected because iterator initialization may advance CPU RNG.
+
+Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
+before training, and set `data.resume_input_deterministic=true` only when the
+input snapshot, tokenizer, chat template, processor, collator and transforms are
+immutable and deterministic. The digest is a **caller attestation**, not a
+hash that VeOmni independently computes from those inputs. It must identify a
+trusted manifest covering those components and their code/configuration. The
+same digest and settings are required on resume. A missing contract emits a
+startup warning; training and export can proceed, but its cursor cannot be
+resumed exactly under this contract.
+
+At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
+samples and start the next epoch with a fresh sampler. Persistent workers at an
+epoch boundary, stochastic transforms or independent worker RNG state are not
+qualified. Legacy cursors without the saved geometry, source contract and phase
+are rejected. No legacy migration tool is provided here: old releases differed
+in step accounting and batching behavior, so migration requires a separately
+verified producer-specific implementation. Starting a new data stream requires
+a new training run rather than claiming exact continuation from that cursor.
 Exhausted one-shot sources cannot be drained independently by each rank as a
 distributed continuation; use a restartable source or coordinated exhaustion.
 For safety, cursors written by the prior exhausted-source experiment with its

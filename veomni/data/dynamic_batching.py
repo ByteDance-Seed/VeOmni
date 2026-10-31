@@ -14,8 +14,12 @@
 
 
 import copy
+import functools
+import hashlib
+import marshal
 import sys
 import traceback
+import types
 from collections import deque
 from typing import Any, Callable, Dict, Generator, Iterator, Optional
 
@@ -24,6 +28,50 @@ from .dataset import get_length_fn
 
 
 logger = logging.get_logger(__name__)
+
+
+def _resume_callable_identity(value):
+    """Capture inspectable callable code; opaque state still needs an input attestation."""
+    if value is None:
+        return None
+    if isinstance(value, functools.partial):
+        return {
+            "partial": _resume_callable_identity(value.func),
+            "args": [_resume_simple_value(item) for item in value.args],
+            "keywords": {key: _resume_simple_value(item) for key, item in sorted((value.keywords or {}).items())},
+        }
+    function = value if hasattr(value, "__code__") else type(value).__call__ if callable(value) else None
+    code = getattr(function, "__code__", None)
+    result = {
+        "module": getattr(value, "__module__", type(value).__module__),
+        "name": getattr(value, "__qualname__", type(value).__qualname__),
+        "declared": getattr(value, "checkpoint_collator_identity", None),
+    }
+    if code is not None:
+
+        def normalize(current):
+            constants = tuple(
+                normalize(item) if isinstance(item, types.CodeType) else item for item in current.co_consts
+            )
+            return current.replace(co_filename="", co_firstlineno=0, co_consts=constants)
+
+        result["code_sha256"] = hashlib.sha256(marshal.dumps(normalize(code))).hexdigest()
+        result["defaults"] = _resume_simple_value(getattr(value, "__defaults__", None))
+        result["kwdefaults"] = _resume_simple_value(getattr(value, "__kwdefaults__", None))
+        closure = getattr(value, "__closure__", None)
+        if closure:
+            result["closure"] = [_resume_simple_value(cell.cell_contents) for cell in closure]
+    return result
+
+
+def _resume_simple_value(value, depth=0):
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    if depth < 3 and type(value) in (tuple, list) and len(value) <= 64:
+        return [_resume_simple_value(item, depth + 1) for item in value]
+    if depth < 3 and type(value) is dict and len(value) <= 64 and all(type(key) is str for key in value):
+        return {key: _resume_simple_value(item, depth + 1) for key, item in sorted(value.items())}
+    return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
 
 
 def _check_legacy_exhausted_cursor(state: Dict[str, Any]) -> None:
@@ -294,6 +342,7 @@ class DynamicBatchSizeDataLoader:
         self._drop_last = drop_last
         self._data_iter: Iterator
         self._resume = False
+        self._strict_resume_contract = False
         self._checkpoint_phase = "running"
         self._checkpoint_flush_micro_batch = None
         self._batch_data_iter: Generator
@@ -323,6 +372,148 @@ class DynamicBatchSizeDataLoader:
 
     def __next__(self):
         return next(self._batch_data_iter)
+
+    def _resume_geometry(self) -> Dict[str, Any]:
+        """Describe loader geometry that affects the next consumed sample."""
+        source = self._dataloader
+        sampler = getattr(source, "sampler", None)
+        dataset = getattr(source, "dataset", None)
+
+        def qualified_type(value):
+            if value is None:
+                return None
+            cls = type(value)
+            return f"{cls.__module__}.{cls.__qualname__}"
+
+        sampler_geometry = None
+        if sampler is not None:
+            sampler_geometry = {
+                "type": qualified_type(sampler),
+                **{
+                    key: getattr(sampler, key, None)
+                    for key in ("num_replicas", "rank", "shuffle", "seed", "drop_last")
+                },
+            }
+        try:
+            dataset_length = len(dataset) if dataset is not None else None
+        except (TypeError, NotImplementedError):
+            dataset_length = None
+        strategy = self.batching_strategy
+        strategy_geometry = {
+            "type": qualified_type(strategy),
+            **{
+                key: getattr(strategy, key, None)
+                for key in (
+                    "token_micro_bsz",
+                    "buffer_size",
+                    "bsz_warmup_steps",
+                    "bsz_warmup_init_mbtoken",
+                    "physical_token_cap",
+                )
+            },
+        }
+        buffer = getattr(strategy, "buffer", None)
+        strategy_geometry["get_length_fn"] = _resume_callable_identity(getattr(buffer, "_get_length_fn", None))
+        strategy_geometry["get_physical_length_fn"] = _resume_callable_identity(
+            getattr(buffer, "_get_physical_length_fn", None)
+        )
+        return {
+            "version": 1,
+            "length": self._length,
+            "num_micro_batch": self.num_micro_batch,
+            "drop_last": self._drop_last,
+            "source_type": qualified_type(source),
+            "source_batch_size": getattr(source, "batch_size", None),
+            "source_drop_last": getattr(source, "drop_last", None),
+            "num_workers": getattr(source, "num_workers", 0),
+            "persistent_workers": getattr(source, "persistent_workers", False),
+            "prefetch_factor": getattr(source, "prefetch_factor", None),
+            "in_order": getattr(source, "in_order", True),
+            "snapshot_every_n_steps": getattr(source, "snapshot_every_n_steps", None),
+            "multiprocessing_start_method": (
+                source.multiprocessing_context.get_start_method()
+                if getattr(source, "multiprocessing_context", None) is not None
+                else None
+            ),
+            "worker_init": _resume_callable_identity(getattr(source, "worker_init_fn", None)),
+            "dataset_type": qualified_type(dataset),
+            "dataset_length": dataset_length,
+            "dataset_seed": getattr(dataset, "seed", None),
+            "dataset_fingerprint": getattr(getattr(dataset, "_data", dataset), "_fingerprint", None),
+            "dataset_transform": _resume_callable_identity(getattr(dataset, "_transform", None)),
+            "source_collate": _resume_callable_identity(getattr(source, "collate_fn", None)),
+            "batch_collate": _resume_callable_identity(self._collate_fn),
+            "sampler": sampler_geometry,
+            "strategy": strategy_geometry,
+        }
+
+    def validate_resume_geometry(self, state: Dict[str, Any]) -> None:
+        """Reject cursors whose saved batching/worker geometry cannot be proven."""
+        saved = state.get("_veomni_resume_geometry")
+        current = self._resume_geometry()
+
+        def equal(left, right):
+            if type(left) is not type(right):
+                return False
+            if isinstance(right, dict):
+                return left.keys() == right.keys() and all(equal(left[key], value) for key, value in right.items())
+            return left == right
+
+        if not equal(saved, current) or not equal(state.get("num_micro_batch"), self.num_micro_batch):
+            raise ValueError("dynamic loader checkpoint geometry is missing or differs; use a verified migration")
+
+    def validate_resume_state(self, state: Dict[str, Any]) -> None:
+        """Validate the cursor before restoring either trainer or source state."""
+        self.validate_resume_geometry(state)
+        _check_legacy_exhausted_cursor(state)
+        if type(state.get("step")) is not int or state["step"] < 0:
+            raise ValueError("invalid dynamic loader checkpoint step")
+        phase = state.get("_veomni_resume_phase")
+        if phase not in ("running", "after_yield", "flushing", "done"):
+            raise ValueError("invalid dynamic loader resume phase or missing phase")
+        if phase == "flushing" and state.get("_veomni_flush_micro_batch") is None:
+            raise ValueError("dynamic loader flushing resume requires the preceding microbatch")
+        if phase == "after_yield" and not 0 < state["step"] <= self._length:
+            raise ValueError("dynamic loader checkpoint step is outside its epoch")
+        saved_strategy = state.get("batching_strategy")
+        if type(saved_strategy) is not type(self.batching_strategy) or any(
+            type(getattr(saved_strategy, key, None)) is not type(getattr(self.batching_strategy, key, None))
+            or getattr(saved_strategy, key, None) != getattr(self.batching_strategy, key, None)
+            for key in (
+                "token_micro_bsz",
+                "buffer_size",
+                "bsz_warmup_steps",
+                "bsz_warmup_init_mbtoken",
+                "physical_token_cap",
+            )
+        ):
+            raise ValueError("dynamic loader checkpoint strategy differs from the current strategy")
+
+    def prepare_sft_next_epoch_buffer(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and isolate the old buffer before any rank enters restore."""
+        self.validate_resume_state(state)
+        state = copy.deepcopy(state)
+        saved_strategy = state.get("batching_strategy")
+        if (
+            state.get("_veomni_resume_phase") != "after_yield"
+            or state["step"] != self._length
+            or type(saved_strategy) is not TextBatchingStrategy
+            or type(self.batching_strategy) is not TextBatchingStrategy
+            or not isinstance(state.get("dataloader_item_buffer"), deque)
+            or not isinstance(state.get("item_buffer"), deque)
+        ):
+            raise ValueError("dynamic loader cursor cannot prove a completed SFT epoch")
+        return state
+
+    def load_sft_next_epoch_buffer(self, state: Dict[str, Any]) -> None:
+        """Install a prevalidated buffer while allowing a fresh next-epoch sampler."""
+        self.batching_strategy = state["batching_strategy"]
+        self.dataloader_item_buffer = state["dataloader_item_buffer"]
+        self.item_buffer = state["item_buffer"]
+        self.step = 0
+        self._resume = False
+        self._checkpoint_phase = "running"
+        self._checkpoint_flush_micro_batch = None
 
     def batch_data_generator(self):
         batch = []
@@ -412,6 +603,12 @@ class DynamicBatchSizeDataLoader:
             if k.startswith("_"):
                 del state[k]
         state["_veomni_resume_phase"] = self._checkpoint_phase
+        if self._strict_resume_contract:
+            try:
+                state["_veomni_resume_geometry"] = self._resume_geometry()
+            except Exception as exc:  # Custom data sources need not expose inspectable geometry.
+                logger.warning("Exact dynamic data resume is unavailable: %s", exc)
+                state["_veomni_resume_geometry"] = None
         if self._checkpoint_phase == "flushing":
             state["_veomni_flush_micro_batch"] = self._checkpoint_flush_micro_batch
 
@@ -428,23 +625,26 @@ class DynamicBatchSizeDataLoader:
         return copy.deepcopy(state)
 
     def load_state_dict(self, state: Dict[str, Any]):
+        if self._strict_resume_contract:
+            self.validate_resume_state(state)
         state = copy.deepcopy(state)
+        state.pop("_veomni_resume_geometry", None)
         _check_legacy_exhausted_cursor(state)
         state.pop("_veomni_source_exhausted", None)
-        self._checkpoint_phase = state.pop("_veomni_resume_phase", None)
-        if self._checkpoint_phase is None:
+        phase = state.pop("_veomni_resume_phase", None)
+        if phase is None and not self._strict_resume_contract:
             logger.warning("Legacy dynamic loader cursor lacks its post-yield phase; exact resume is not guaranteed.")
-            self._checkpoint_phase = "running"
-        self._checkpoint_flush_micro_batch = state.pop("_veomni_flush_micro_batch", None)
-        if self._checkpoint_phase not in ("running", "after_yield", "flushing", "done"):
-            raise ValueError("invalid dynamic loader resume phase")
-        if self._checkpoint_phase == "flushing" and self._checkpoint_flush_micro_batch is None:
+            phase = "running"
+        if phase not in ("running", "after_yield", "flushing", "done"):
+            raise ValueError("invalid dynamic loader resume phase or missing phase")
+        flush_micro_batch = state.pop("_veomni_flush_micro_batch", None)
+        if phase == "flushing" and flush_micro_batch is None:
             raise ValueError("dynamic loader flushing resume requires the preceding microbatch")
         if state["num_micro_batch"] != self.num_micro_batch:
-            logger.warning(
-                f"num_micro_batch changed: [ {state['num_micro_batch']} -> {self.num_micro_batch} ], will clear prefetch buffer"
-            )
+            logger.warning("num_micro_batch changed while restoring a dynamic loader cursor")
             del state["num_micro_batch"]
+        self._checkpoint_phase = phase
+        self._checkpoint_flush_micro_batch = flush_micro_batch
         self.__dict__.update(state)
         self._resume = True
 
