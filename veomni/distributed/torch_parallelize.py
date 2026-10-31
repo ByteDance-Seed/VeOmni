@@ -1170,6 +1170,20 @@ def build_parallelize_model(
     if parallel_state.fsdp_enabled:
         logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
         if parallel_state.dp_mode == "fsdp2":
+            if (
+                os.environ.get("VEOMNI_DENSE_MLP_LAYERS")
+                and os.environ.get("VEOMNI_DENSE_MLP_PREFETCH", "1") == "1"
+                and kwargs.get("enable_forward_prefetch", True)
+                and recompute_policy is not None
+                and recompute_policy.enabled
+                and recompute_policy.context_fn is not None
+            ):
+                raise ValueError(
+                    "Dense MLP prefetch is not approved with selective activation checkpointing: "
+                    "nesting an FSDP2 group inside a selectively checkpointed block can fail during "
+                    "recomputation. Set selective_recompute_layers=0, or disable "
+                    "VEOMNI_DENSE_MLP_PREFETCH."
+                )
             model = parallelize_model_fsdp2(
                 model=model,
                 weights_path=weights_path,
