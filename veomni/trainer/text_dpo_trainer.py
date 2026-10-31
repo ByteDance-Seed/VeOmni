@@ -57,6 +57,14 @@ logger = logging.get_logger(__name__)
 _NON_MODEL_KEYS = set()
 
 
+def _dpo_training_iterator(dataloader, use_background_prefetcher: bool, preserve_cpu_rng: bool):
+    # A fixed-batch StatefulDataLoader creates its resumed iterator after the
+    # checkpoint RNG is restored. That extra construction draws a CPU base
+    # seed; it did not occur at this point in uninterrupted training.
+    with torch.random.fork_rng(devices=[], enabled=preserve_cpu_rng):
+        return VeOmniIter(dataloader, use_background_prefetcher=use_background_prefetcher)
+
+
 def _build_dpo_labels_list(
     all_labels: torch.Tensor,
     seq_lens: List[int],
@@ -744,6 +752,11 @@ class TextDPOTrainer:
         current = self.dpo_provenance_checkpoint_state()
         if _dpo_recovery_geometry(self.base.args) != current["recovery_geometry"]:
             raise ValueError("DPO recovery geometry changed after initialization")
+        loader = self.base.args.data.dataloader
+        if loader.num_workers > 0 and loader.persistent_workers:
+            raise ValueError("DPO exact recovery does not yet support persistent dataloader workers")
+        if loader.use_background_prefetcher:
+            raise ValueError("DPO exact recovery does not yet support background prefetch")
         if current["recovery_geometry"]["data"]["dataset_name"] != "mapping":
             raise ValueError(
                 "DPO trainer-state recovery requires a mapping dataset with a verified cursor; "
@@ -1190,9 +1203,12 @@ class TextDPOTrainer:
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.base.data_iterator = VeOmniIter(
-                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            self.base.data_iterator = _dpo_training_iterator(
+                self.base.train_dataloader,
+                use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
+                preserve_cpu_rng=getattr(self, "_dpo_restore_fixed_iterator_rng", False),
             )
+            self._dpo_restore_fixed_iterator_rng = False
 
             for _ in range(self.start_step, args.train_steps):
                 try:

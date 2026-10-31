@@ -283,6 +283,7 @@ class GlobalStateCallback(Callback):
         # before that reduction, so a rank that raised cannot strand its peers.
         read_error: Optional[Exception] = None
         current_state = legacy_state = None
+        dpo_sampler = None
         try:
             current_state = self._read_current(load_path)
             if current_state is None:
@@ -320,16 +321,73 @@ class GlobalStateCallback(Callback):
                     or position["step_in_epoch"] > loaded_state["global_step"]
                 ):
                     raise ValueError("DPO checkpoint recovery requires a valid epoch position")
-                from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+                from ...data.dynamic_batching import (
+                    DynamicBatchSizeDataLoader,
+                    _check_dpo_cursor_fields,
+                    _check_dpo_cursor_strategy,
+                )
 
                 if self.trainer.train_dataloader is None:
                     raise ValueError("DPO checkpoint recovery requires an initialized dataloader")
                 if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
+                    if type(self.trainer.train_dataloader) is not DynamicBatchSizeDataLoader:
+                        raise ValueError("DPO exact recovery does not support a custom dynamic loader")
                     cursor = loaded_state["train_dataloader"]
                     if "_veomni_resume_phase" not in cursor:
                         raise ValueError("DPO dynamic loader cursor predates the exact-resume phase protocol")
-                    if cursor.get("num_micro_batch") != self.trainer.train_dataloader.num_micro_batch:
+                    if (
+                        type(cursor.get("num_micro_batch")) is not int
+                        or cursor["num_micro_batch"] != self.trainer.train_dataloader.num_micro_batch
+                    ):
                         raise ValueError("DPO dynamic loader microbatch geometry differs from the checkpoint")
+                    if type(cursor.get("step")) is not int or cursor["step"] != position["step_in_epoch"]:
+                        raise ValueError("DPO dynamic loader cursor step differs from the checkpoint position")
+                    _check_dpo_cursor_fields(cursor)
+                    _check_dpo_cursor_strategy(cursor, self.trainer.train_dataloader.batching_strategy)
+
+                # A restored worker iterator must be created with the saved
+                # epoch, not the sampler's freshly constructed epoch zero.
+                # Only the native, standard sampler has an idempotent epoch
+                # setter that we can safely invoke before loading its cursor.
+                loader = self.trainer.train_dataloader
+                from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+                from ...data.data_loader import DistributedDataloader
+                from ...data.dataset import MappingDataset
+
+                if isinstance(loader, DynamicBatchSizeDataLoader) != args.train.dyn_bsz:
+                    raise ValueError("DPO dataloader batching mode differs from its saved recovery configuration")
+                inner = loader._dataloader if isinstance(loader, DynamicBatchSizeDataLoader) else loader
+                sampler = getattr(inner, "sampler", None)
+                if (
+                    type(inner) is DistributedDataloader
+                    and type(inner.dataset) is MappingDataset
+                    and type(sampler) is StatefulDistributedSampler
+                ):
+                    loader_config = args.data.dataloader
+                    parallel = self.trainer.policy_model.parallel_state
+                    if (
+                        inner.num_workers != loader_config.num_workers
+                        or inner.persistent_workers != (loader_config.persistent_workers and inner.num_workers > 0)
+                        or inner.in_order != loader_config.in_order
+                        or inner.batch_size != args.train.dataloader_batch_size
+                        or inner.drop_last != loader_config.drop_last
+                        or (
+                            isinstance(loader, DynamicBatchSizeDataLoader)
+                            and loader._drop_last != loader_config.drop_last
+                        )
+                        or sampler.shuffle != loader_config.shuffle
+                        or sampler.seed != args.train.seed
+                        or inner.dataset.seed != args.train.seed
+                        or sampler.dataset is not inner.dataset
+                        or sampler.num_replicas != parallel.dp_size
+                        or sampler.rank != parallel.dp_rank
+                    ):
+                        raise ValueError("DPO native dataloader runtime differs from its saved recovery configuration")
+                    if isinstance(loader, DynamicBatchSizeDataLoader):
+                        dpo_sampler = sampler
+                else:
+                    raise ValueError("DPO exact recovery requires the native dataloader and stateful sampler")
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
@@ -348,6 +406,24 @@ class GlobalStateCallback(Callback):
             return None
 
         global_state = current_state if current_state is not None else legacy_state
+        # Reject an incompatible legacy cursor on every rank before any
+        # loader or DPO position restoration can perform its own collectives.
+        cursor = None
+        global_step = None
+        cursor_error = None
+        try:
+            cursor = global_state.get("train_dataloader")
+            global_step = global_state["global_step"]
+            if isinstance(cursor, dict) and "_veomni_source_exhausted" in cursor:
+                from ...data.dynamic_batching import DynamicBatchSizeDataLoader, _check_legacy_exhausted_cursor
+
+                if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
+                    _check_legacy_exhausted_cursor(cursor)
+        except BaseException as exc:
+            cursor_error = exc
+        default_group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
+
         dpo_recovery = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         if dpo_recovery and dist.is_initialized():
             steps = [None] * dist.get_world_size()
@@ -361,9 +437,19 @@ class GlobalStateCallback(Callback):
             dist.all_gather_object(steps, local_position)
             if len(set(steps)) != 1:
                 raise ValueError(f"DPO checkpoint position differs across ranks: {steps}")
+        if dpo_recovery:
+            epoch_error = None
+            try:
+                position = global_state["dpo_position"]
+                same_epoch = not position["epoch_complete"] and position["step_in_epoch"] != args.train_steps
+                if same_epoch and dpo_sampler is not None:
+                    dpo_sampler.set_epoch(position["epoch"])
+            except BaseException as exc:
+                epoch_error = exc
+            raise_if_any_rank_failed(epoch_error, "preparing the DPO sampler epoch", group=default_group)
         restore_error = None
         try:
-            self.trainer.state.global_step = global_state["global_step"]
+            self.trainer.state.global_step = global_step
             self._restore_position(global_state)
             if dpo_recovery:
                 position = global_state["dpo_position"]
@@ -391,7 +477,10 @@ class GlobalStateCallback(Callback):
             # must not be applied to the new epoch's freshly seeded sampler:
             # StatefulDataLoader would otherwise skip or replay samples.
             dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]
-
+            if dpo_recovery:
+                self.trainer._dpo_restore_fixed_iterator_rng = bool(
+                    not dpo_new_epoch and not isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader)
+                )
             channel_loss_state = global_state.get("channel_loss_callback")
             channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
             if channel_loss_state is not None and channel_loss_callback is not None:
@@ -420,7 +509,6 @@ class GlobalStateCallback(Callback):
                     # Reapply the saved cursor so validation consumes no training samples.
                     iter(self.trainer.train_dataloader)
                     self.trainer.train_dataloader.load_state_dict(cursor)
-
             # OmniTrainer checkpoints written before it had a meter store None here.
             if global_state.get("environ_meter") is not None:
                 self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
@@ -430,7 +518,7 @@ class GlobalStateCallback(Callback):
             # ``.get`` keeps checkpoints written before these fields existed loadable;
             # the device namespace may also not support RNG state at all.
             set_device_rng_state(global_state.get("device_rng_state"))
-            if self.trainer.start_step == 0 and not dpo_new_epoch and self.trainer.train_dataloader is not None:
+            if self.trainer.start_step == 0 and not dpo_recovery and self.trainer.train_dataloader is not None:
                 iter(self.trainer.train_dataloader)
         except Exception as exc:  # noqa: BLE001 - coordinate rank-local DPO restoration failures
             restore_error = exc

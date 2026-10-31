@@ -15,10 +15,12 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.data.data_loader import DistributedDataloader
 from veomni.data.data_transform import dpo_producer_identity, process_dpo_example
-from veomni.data.dataset import DynamicBatchingSizeDataset, get_length_fn
+from veomni.data.dataset import DynamicBatchingSizeDataset, MappingDataset, get_length_fn
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer, _dpo_objective_parameters, _dpo_recovery_geometry
@@ -26,6 +28,15 @@ from veomni.utils.dpo_provenance import DPO_FEATURE_KEY, dpo_tokenizer_fingerpri
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _native_map_loader(samples, *, workers=0, shuffle=False, collate_fn=None):
+    dataset = MappingDataset(samples)
+    sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, shuffle=shuffle, seed=42)
+    options = {"multiprocessing_context": "fork", "prefetch_factor": 1} if workers else {}
+    return DistributedDataloader(
+        dataset, sampler=sampler, batch_size=1, num_workers=workers, collate_fn=collate_fn, drop_last=True, **options
+    )
 
 
 class _DeclaredTokenizer:
@@ -115,7 +126,9 @@ def _trainer(enabled, allow_legacy=False, allow_legacy_objective=False):
         args=args,
         train_dataloader=MagicMock(),
     )
-    trainer.policy_model = SimpleNamespace(tokenizer=_DeclaredTokenizer(), chat_template=None)
+    trainer.policy_model = SimpleNamespace(
+        tokenizer=_DeclaredTokenizer(), chat_template=None, parallel_state=SimpleNamespace(dp_size=1, dp_rank=0)
+    )
     trainer._dpo_producer_identity = dpo_producer_identity(trainer.policy_model.tokenizer, None, None)
     trainer._dpo_transform_max_seq_len = 64
     trainer._dpo_objective_parameters = _dpo_objective_parameters(config)
@@ -287,17 +300,9 @@ def test_dpo_config_rejects_malformed_versioned_audit(fingerprint):
     ],
 )
 def test_dpo_epoch_boundary_resume_starts_fresh_sampler(monkeypatch, dynamic, ending):
-    from torchdata.stateful_dataloader import StatefulDataLoader
-    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-
-    class Loader(StatefulDataLoader):
-        def set_epoch(self, epoch):
-            self.sampler.set_epoch(epoch)
-
     def build():
         data = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in range(6)]
-        sampler = StatefulDistributedSampler(data, num_replicas=1, rank=0, shuffle=True, seed=11)
-        loader = Loader(data, sampler=sampler, batch_size=1, num_workers=0, collate_fn=lambda x: x[0])
+        loader = _native_map_loader(data, shuffle=True, collate_fn=lambda x: x[0])
         if dynamic:
             return DynamicBatchSizeDataLoader(
                 loader,
@@ -331,6 +336,7 @@ def test_dpo_epoch_boundary_resume_starts_fresh_sampler(monkeypatch, dynamic, en
     trainer.base.args.train.num_train_epochs = 2
     trainer.base.args.train.dyn_bsz = dynamic
     trainer.base.args.train_steps = 10 if ending == "early_eof" else 3
+    trainer.base.args.data.dataloader.shuffle = True
     trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
     trainer.base.train_dataloader = build()
     trainer.base.state = SimpleNamespace(global_step=0, epoch=0)
@@ -372,11 +378,10 @@ def test_dpo_epoch_end_refreshes_checkpoint_position_without_changing_sft_behavi
 
 @pytest.mark.parametrize("same_output", [False, True])
 def test_finished_dpo_resume_preserves_position_at_train_end(monkeypatch, same_output):
-    from torchdata.stateful_dataloader import StatefulDataLoader
-
     trainer = _trainer(True)
     trainer.base.state = SimpleNamespace(global_step=0, epoch=0)
-    trainer.base.train_dataloader = StatefulDataLoader(list(range(6)), batch_size=1, num_workers=0)
+    trainer.base.args.train.dyn_bsz = False
+    trainer.base.train_dataloader = _native_map_loader(list(range(6)))
     trainer.base.environ_meter = MagicMock()
     trainer.base.args.train.checkpoint.save_path = "/output/checkpoints"
     trainer.base.args.train.checkpoint.load_path = (
@@ -410,21 +415,13 @@ def test_finished_dpo_resume_preserves_position_at_train_end(monkeypatch, same_o
 
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_pending_epoch_end_does_not_prefetch_the_previous_epoch(monkeypatch, dynamic):
-    from torchdata.stateful_dataloader import StatefulDataLoader
-    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-
-    class Loader(StatefulDataLoader):
-        def set_epoch(self, epoch):
-            self.sampler.set_epoch(epoch)
-
     def build():
-        data = [{"id": i} for i in range(12)]
-        sampler = StatefulDistributedSampler(data, num_replicas=1, rank=0, shuffle=True, seed=11)
-        loader = Loader(data, sampler=sampler, batch_size=1, num_workers=2, collate_fn=lambda x: x[0])
+        data = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in range(12)]
+        loader = _native_map_loader(data, workers=2, shuffle=True, collate_fn=lambda x: x[0])
         if dynamic:
             return DynamicBatchSizeDataLoader(
                 loader,
-                TextBatchingStrategy(token_micro_bsz=1, buffer_size=2, get_length_fn=lambda _: 1),
+                TextBatchingStrategy(token_micro_bsz=1, buffer_size=2),
                 num_micro_batch=1,
                 length=3,
             )
@@ -448,6 +445,7 @@ def test_pending_epoch_end_does_not_prefetch_the_previous_epoch(monkeypatch, dyn
     trainer.base.args.train_steps = 3
     trainer.base.args.train.dyn_bsz = dynamic
     trainer.base.args.data.dataloader.num_workers = 2
+    trainer.base.args.data.dataloader.shuffle = True
     trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
     trainer.base.train_dataloader = build()
     trainer.base.state = SimpleNamespace(global_step=0, epoch=0)
@@ -569,6 +567,23 @@ def test_dpo_rejects_unsupported_exact_resume_data_loader(case):
         _dpo_recovery_geometry(trainer.base.args)
 
 
+@pytest.mark.parametrize("case", ["persistent_workers", "background_prefetch"])
+def test_dpo_unsupported_rng_recovery_does_not_disable_fresh_training(case):
+    trainer = _trainer(True)
+    loader = trainer.base.args.data.dataloader
+    if case == "persistent_workers":
+        loader.num_workers = 2
+        loader.persistent_workers = True
+    else:
+        loader.use_background_prefetcher = True
+        loader.drop_last = True
+    # These settings can still run fresh training and be described in a save.
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
+    saved = trainer.dpo_provenance_checkpoint_state()
+    with pytest.raises(ValueError, match="DPO exact recovery does not yet support"):
+        trainer.validate_dpo_provenance_checkpoint(saved)
+
+
 def test_dpo_recovery_rejects_changed_dynamic_microbatch_count(monkeypatch):
     from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
@@ -591,14 +606,191 @@ def test_dpo_recovery_rejects_changed_dynamic_microbatch_count(monkeypatch):
         callback.load_global_state()
 
 
-@pytest.mark.parametrize("cursor", [{}, {"bogus": 7}])
-def test_real_stateful_loader_rejects_empty_or_lazy_invalid_cursor(monkeypatch, cursor):
-    from torchdata.stateful_dataloader import StatefulDataLoader
+def test_dpo_recovery_rejects_boolean_dynamic_microbatch_count(monkeypatch):
+    trainer = _trainer(True)
+    trainer.base.train_dataloader = DynamicBatchSizeDataLoader(
+        list(range(8)), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=8
+    )
+    cursor = trainer.base.train_dataloader.state_dict()
+    cursor["num_micro_batch"] = True
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="microbatch geometry"):
+        callback.load_global_state()
 
+
+@pytest.mark.parametrize("cursor_step", [0, 2, True])
+def test_dpo_recovery_rejects_cursor_and_position_step_mismatch(monkeypatch, cursor_step):
+    trainer = _trainer(True)
+    trainer.base.train_dataloader = DynamicBatchSizeDataLoader(
+        list(range(8)), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=8
+    )
+    cursor = trainer.base.train_dataloader.state_dict()
+    cursor["step"] = cursor_step
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="cursor step differs"):
+        callback.load_global_state()
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_dpo_recovery_rejects_private_cursor_fields(monkeypatch, boundary):
+    trainer = _trainer(True)
+    loader = DynamicBatchSizeDataLoader([], TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    trainer.base.train_dataloader = loader
+    cursor = loader.state_dict()
+    cursor["step"] = 1
+    cursor["_dpo_disallow_implicit_restart"] = False
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": boundary},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="unsupported fields"):
+        callback.load_global_state()
+    with pytest.raises(ValueError, match="unsupported fields"):
+        loader.load_next_epoch_buffer(cursor)
+    loader._dpo_disallow_implicit_restart = True
+    with pytest.raises(ValueError, match="unsupported fields"):
+        loader.load_state_dict(cursor)
+
+
+@pytest.mark.parametrize("mutation", ["missing_strategy", "token_budget", "buffer_size", "missing_source"])
+def test_dpo_recovery_rejects_incomplete_or_incompatible_dynamic_cursor(monkeypatch, mutation):
+    trainer = _trainer(True)
+    loader = DynamicBatchSizeDataLoader([], TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    trainer.base.train_dataloader = loader
+    cursor = loader.state_dict()
+    cursor["step"] = 1
+    cursor["dataloader_state"] = {"cursor": 1}
+    if mutation == "missing_strategy":
+        cursor.pop("batching_strategy")
+    elif mutation == "token_budget":
+        cursor["batching_strategy"].token_micro_bsz = 2
+    elif mutation == "buffer_size":
+        cursor["batching_strategy"].buffer_size = 2
+    else:
+        cursor.pop("dataloader_state")
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="batching configuration differs|missing required fields|exactly one"):
+        callback.load_global_state()
+
+
+def test_dpo_custom_dynamic_source_is_rejected_before_set_epoch_or_restore(monkeypatch):
+    class CustomSource:
+        def __init__(self):
+            self.epoch_calls = 0
+            self.restore_calls = 0
+
+        def state_dict(self):
+            return {"cursor": 1}
+
+        def set_epoch(self, _epoch):
+            self.epoch_calls += 1
+
+        def load_state_dict(self, _state):
+            self.restore_calls += 1
+
+    trainer = _trainer(True)
+    source = CustomSource()
+    loader = DynamicBatchSizeDataLoader(source, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    trainer.base.train_dataloader = loader
+    cursor = loader.state_dict()
+    cursor["step"] = 1
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="native dataloader and stateful sampler"):
+        callback.load_global_state()
+    assert source.epoch_calls == source.restore_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["shuffle", "seed", "workers", "in_order", "batch_size", "drop_last", "dp_size", "dp_rank", "batching_mode"],
+)
+def test_dpo_recovery_rejects_native_loader_configuration_mismatch(monkeypatch, mismatch):
+    trainer = _trainer(True)
+    trainer.base.args.train.dyn_bsz = False
+    trainer.base.state = SimpleNamespace(global_step=0)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
+    cursor = trainer.base.train_dataloader.state_dict()
+    config = trainer.base.args.data.dataloader
+    if mismatch == "shuffle":
+        config.shuffle = True
+    elif mismatch == "seed":
+        trainer.base.args.train.seed = 43
+    elif mismatch == "workers":
+        config.num_workers = 1
+    elif mismatch == "in_order":
+        config.in_order = False
+    elif mismatch == "batch_size":
+        trainer.base.args.train.dataloader_batch_size = 2
+    elif mismatch == "drop_last":
+        config.drop_last = False
+    elif mismatch == "dp_size":
+        trainer.policy_model.parallel_state.dp_size = 2
+    elif mismatch == "dp_rank":
+        trainer.policy_model.parallel_state.dp_rank = 1
+    else:
+        trainer.base.args.train.dyn_bsz = True
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
+        "train_dataloader": cursor,
+        "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
+    with pytest.raises(ValueError, match="runtime differs|batching mode differs"):
+        callback.load_global_state()
+    assert trainer.state.global_step == 0
+
+
+@pytest.mark.parametrize(
+    ("cursor", "expected"), [({}, "rank-local dataloader cursor"), ({"bogus": 7}, "_num_yielded")]
+)
+def test_real_stateful_loader_rejects_empty_or_lazy_invalid_cursor(monkeypatch, cursor, expected):
     trainer = _trainer(True)
     trainer.base.state = SimpleNamespace(global_step=0)
     trainer.base.start_step = 1
-    trainer.base.train_dataloader = StatefulDataLoader(list(range(8)), batch_size=1, num_workers=0)
+    trainer.base.args.train.dyn_bsz = False
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: {
@@ -608,14 +800,12 @@ def test_real_stateful_loader_rejects_empty_or_lazy_invalid_cursor(monkeypatch, 
         "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
     }
     monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
-    with pytest.raises((ValueError, RuntimeError, AssertionError)):
+    with pytest.raises((ValueError, RuntimeError, AssertionError), match=expected):
         callback.load_global_state()
 
 
 def test_real_stateful_loader_eager_validation_preserves_next_item(monkeypatch):
-    from torchdata.stateful_dataloader import StatefulDataLoader
-
-    original = StatefulDataLoader(list(range(8)), batch_size=1, num_workers=0)
+    original = _native_map_loader(list(range(8)))
     iterator = iter(original)
     next(iterator)
     next(iterator)
@@ -625,7 +815,9 @@ def test_real_stateful_loader_eager_validation_preserves_next_item(monkeypatch):
     trainer.base.state = SimpleNamespace(global_step=0)
     trainer.base.start_step = 1
     trainer.base.start_epoch = 0
-    trainer.base.train_dataloader = StatefulDataLoader(list(range(8)), batch_size=1, num_workers=0)
+    trainer.base.args.train.dyn_bsz = False
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: {
@@ -662,9 +854,17 @@ def test_dpo_recovery_rejects_legacy_dynamic_cursor_without_phase(monkeypatch):
 
 
 def test_dpo_recovery_eager_validation_preserves_dynamic_loader_cursor(monkeypatch):
-    from tests.data.test_dynamic_batching_resume import _loader
+    def build():
+        samples = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in range(100)]
+        source = _native_map_loader(samples, collate_fn=lambda x: x[0])
+        return DynamicBatchSizeDataLoader(
+            source,
+            TextBatchingStrategy(token_micro_bsz=4, buffer_size=1, bsz_warmup_steps=3, bsz_warmup_init_mbtoken=1),
+            num_micro_batch=1,
+            length=10,
+        )
 
-    original = _loader()
+    original = build()
     iterator = iter(original)
     next(iterator)
     cursor = original.state_dict()
@@ -673,7 +873,7 @@ def test_dpo_recovery_eager_validation_preserves_dynamic_loader_cursor(monkeypat
     trainer.base.state = SimpleNamespace(global_step=0)
     trainer.base.start_step = 1
     trainer.base.start_epoch = 0
-    trainer.base.train_dataloader = _loader()
+    trainer.base.train_dataloader = build()
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: {
@@ -778,6 +978,20 @@ def test_full_sample_buffer_serialization_keeps_typed_provenance():
     marker = restored[DPO_FEATURE_KEY]
     assert (marker.chosen, marker.rejected, marker.producer_contract_version) == (3, 1, 1)
     assert len(marker.feature_digest) == 64
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_next_epoch_buffer_validates_legacy_exhaustion_marker(exhausted):
+    loader = DynamicBatchSizeDataLoader([], TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    state = loader.state_dict()
+    state["dataloader_state"] = {"cursor": 0}
+    state["_veomni_source_exhausted"] = exhausted
+    if exhausted:
+        with pytest.raises(RuntimeError, match="exhausted one-shot"):
+            loader.load_next_epoch_buffer(state)
+    else:
+        loader.load_next_epoch_buffer(state)
+        assert "_veomni_source_exhausted" not in vars(loader)
 
 
 @pytest.mark.parametrize("save_by_idx", [False, True])

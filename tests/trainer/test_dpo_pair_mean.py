@@ -1233,6 +1233,11 @@ def _different_objectives_worker(rank, world_size, native_npu, endpoint):
 
 
 def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint):
+    from unittest.mock import patch
+
+    from tests.data.test_dpo_provenance_checkpoint import _native_map_loader
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
     if native_npu:
@@ -1243,7 +1248,9 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
         "hccl" if native_npu else "gloo", store=endpoint.connect(), rank=rank, world_size=world_size
     )
     try:
-        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
+        state = SimpleNamespace(
+            sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD, dp_size=1, dp_rank=0
+        )
         trainer, _ = _build_trainer(state, distributed=True, device=f"npu:{rank}" if native_npu else "cpu")
         trainer.base.args.dpo_config.explicit_segment_provenance = True
         trainer._dpo_objective_parameters = dpo._dpo_objective_parameters(trainer.base.args.dpo_config)
@@ -1252,25 +1259,47 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
         trainer._dpo_producer_identity = dpo_producer_identity(trainer.policy_model.tokenizer, None, None)
         trainer._dpo_transform_max_seq_len = 32
         _install_recovery_geometry(trainer)
+        dynamic = scenario in ("exhausted_marker", "cursor_step_mismatch", "unknown_cursor_field")
+        trainer.base.args.train.dyn_bsz = dynamic
+        trainer._dpo_recovery_geometry = dpo._dpo_recovery_geometry(trainer.base.args)
         trainer.base.args.train.checkpoint = SimpleNamespace(load_path="/unused")
         trainer.base.args.train.global_rank = rank
         trainer.base.start_step = 1
 
-        class Loader:
-            def load_state_dict(self, cursor):
-                if rank == 1 and scenario == "malformed":
-                    raise ValueError("injected malformed cursor")
-                self.cursor = cursor
+        samples = [{"id": i, "attention_mask": torch.ones(1, dtype=torch.int64)} for i in range(8)]
+        loader = _native_map_loader(samples)
+        if dynamic:
+            loader = DynamicBatchSizeDataLoader(
+                loader, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=10
+            )
+        cursor = loader.state_dict()
+        if dynamic:
+            cursor["step"] = 3
+            cursor["_veomni_resume_phase"] = "after_yield"
+            cursor["_veomni_source_exhausted"] = rank == 1 and scenario == "exhausted_marker"
+            if rank == 1 and scenario == "cursor_step_mismatch":
+                cursor["step"] = 2
+            if rank == 1 and scenario == "unknown_cursor_field":
+                cursor["_dpo_disallow_implicit_restart"] = False
+        original_load = loader.load_state_dict
+        calls = {"load": 0, "iter": 0}
 
-            def __iter__(self):
-                if rank == 1 and scenario == "lazy":
-                    raise ValueError("injected lazy cursor failure")
-                return self
+        def injected_load(saved):
+            calls["load"] += 1
+            if rank == 1 and scenario == "malformed":
+                raise ValueError("injected malformed cursor")
+            return original_load(saved)
 
-            def __next__(self):
-                raise StopIteration
+        loader.load_state_dict = injected_load
+        original_iter = DistributedDataloader.__iter__
 
-        trainer.base.train_dataloader = Loader()
+        def injected_iter(instance):
+            calls["iter"] += 1
+            if rank == 1 and scenario == "lazy":
+                raise ValueError("injected lazy cursor failure")
+            return original_iter(instance)
+
+        trainer.base.train_dataloader = loader
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
         checkpoint = {
@@ -1279,7 +1308,7 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
             "dpo_provenance_protocol": trainer.dpo_provenance_checkpoint_state(),
         }
         if rank != 1 or scenario != "missing":
-            checkpoint["train_dataloader"] = {"cursor": 7}
+            checkpoint["train_dataloader"] = cursor
         if rank == 1 and scenario == "empty":
             checkpoint["train_dataloader"] = {}
         if rank == 1 and scenario == "global_missing":
@@ -1291,8 +1320,33 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
         if rank == 1 and scenario == "position_mismatch":
             checkpoint["dpo_position"]["step_in_epoch"] = 2
         callback._read_current = lambda _: checkpoint
-        with pytest.raises((ValueError, RuntimeError)):
+        with (
+            patch.object(DistributedDataloader, "__iter__", injected_iter),
+            pytest.raises((ValueError, RuntimeError)) as failure,
+        ):
             callback.load_global_state()
+        message = str(failure.value)
+        if scenario in ("global_mismatch", "position_mismatch"):
+            assert "position differs across ranks" in message
+        elif rank == 1:
+            expected = {
+                "missing": "rank-local dataloader cursor",
+                "empty": "rank-local dataloader cursor",
+                "malformed": "injected malformed cursor",
+                "lazy": "injected lazy cursor failure",
+                "global_missing": "nonnegative global_step",
+                "global_invalid": "nonnegative global_step",
+                "exhausted_marker": "exhausted one-shot",
+                "cursor_step_mismatch": "cursor step differs",
+                "unknown_cursor_field": "unsupported fields",
+            }
+            assert expected[scenario] in message
+        else:
+            assert "another rank" in message
+        if rank == 1 and scenario in ("malformed", "lazy"):
+            assert calls["load"] > 0
+            if scenario == "lazy":
+                assert calls["iter"] > 0
         assert trainer.policy_model.optimizer.steps == 0
     finally:
         dist.destroy_process_group()
@@ -1320,6 +1374,9 @@ def test_rank_local_objective_mismatch_is_coordinated():
         "global_invalid",
         "global_mismatch",
         "position_mismatch",
+        "exhausted_marker",
+        "cursor_step_mismatch",
+        "unknown_cursor_field",
     ],
 )
 def test_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(scenario):
@@ -1370,6 +1427,9 @@ def test_native_hccl_rank_local_objective_mismatch_is_coordinated():
         "global_invalid",
         "global_mismatch",
         "position_mismatch",
+        "exhausted_marker",
+        "cursor_step_mismatch",
+        "unknown_cursor_field",
     ],
 )
 def test_native_hccl_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(scenario):

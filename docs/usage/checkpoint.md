@@ -49,19 +49,42 @@ DPO's `dpo_provenance_protocol` records the producer contract, objective and
 recovery geometry; `dpo_position` contains `epoch`, `step_in_epoch` and
 `epoch_complete`. Resume requires both fields and matching positions across
 ranks; missing or incompatible state is rejected before training continues.
+Trainer-state recovery currently supports the native mapping dataset, native
+dataloader and standard stateful distributed sampler without persistent
+workers or background prefetch. Other configurations can still be used for
+fresh training where supported, but their trainer-state exact resume is
+rejected. Exact continuation also assumes unchanged source dataset contents;
+the recorded path is not a content hash. The reference model is rebuilt from
+the configured model source, so its weights must also remain unchanged; this
+protocol does not record a reference-weight content hash. Python, NumPy, and
+custom-component random states are not captured by this callback; data and
+worker transforms must also be deterministic, since worker torch RNG is not
+restored by this protocol. The native
+multi-worker recovery checks were exercised with PyTorch 2.10 and torchdata
+0.11; other versions require their own validation.
 
 Main-process `DynamicBatchSizeDataLoader` cursors now record the phase at which
 a batch was yielded. Older cursors lack that phase and may resume with a
 different next batch; exact continuation from them requires an independently
-verified migration. Worker-mode dynamic batching uses a separate cursor path.
+verified migration. Older code also cannot reliably resume a cursor written by
+this version. Worker-mode dynamic batching uses a separate cursor path.
 On restore, the loader deep-copies the saved cursor so consuming buffered
 samples cannot mutate the checkpoint state. Budget for one additional copy of
 the buffered samples in host memory per rank during restore; long-context and
 multimodal buffers can make that copy substantial.
+Restoring shuffled multi-worker inputs at a nonzero epoch and restoring across
+epoch boundaries are not yet guaranteed to reproduce the original samples.
+Exhausted one-shot sources cannot be drained independently by each rank as a
+distributed continuation; use a restartable source or coordinated exhaustion.
+For safety, cursors written by the prior exhausted-source experiment with its
+exhaustion flag set are rejected instead of reopening the source. This does
+not coordinate ordinary input exhaustion across ranks.
 With background prefetch enabled, exact resume of `drop_last=False` flush
 batches assumes consumers do not mutate yielded microbatches; prefetch can
-snapshot the cursor before such a mutation. Validate the loader and prefetch
-configuration used by a training profile.
+snapshot the cursor before such a mutation. Prefetching can also advance a
+restarted source's CPU RNG ahead of the consumed cursor, so model RNG may
+diverge after resume even when the text samples are deterministic. Validate
+the loader and prefetch configuration used by a training profile.
 
 Three splits in the tree above are deliberate:
 

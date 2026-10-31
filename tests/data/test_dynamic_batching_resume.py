@@ -43,6 +43,80 @@ class _StatefulSamples:
         self.cursor = state["cursor"]
 
 
+def test_empty_source_fails_with_actionable_restart_error():
+    loader = DynamicBatchSizeDataLoader(iter(()), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=1)
+    with pytest.raises(RuntimeError, match="exhausted.*could not restart"):
+        next(iter(loader))
+
+
+def test_exhausted_iterator_fails_before_replaying_a_sample():
+    sample = {"id": 7, "attention_mask": torch.ones(1, dtype=torch.int64)}
+    loader = DynamicBatchSizeDataLoader(
+        iter([sample]), TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=2
+    )
+    iterator = iter(loader)
+    assert [item["id"] for item in next(iterator)[0]] == [7]
+    with pytest.raises(RuntimeError, match="exhausted.*could not restart"):
+        next(iterator)
+
+
+def test_restartable_finite_source_repeats_until_requested_length():
+    samples = [{"id": 7, "attention_mask": torch.ones(1, dtype=torch.int64)}]
+    loader = DynamicBatchSizeDataLoader(samples, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=2)
+    iterator = iter(loader)
+    assert [[item["id"] for item in next(iterator)[0]] for _ in range(2)] == [[7], [7]]
+
+
+def test_oneshot_both_sources_exhausted_does_not_drain_buffer():
+    """In this specific EOF layout, neither rank drains its remaining buffer."""
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    class OneShot(torch.utils.data.IterableDataset):
+        def __init__(self, count):
+            self.source = iter([[{"id": index} for index in range(count)]])
+
+        def __iter__(self):
+            return self.source
+
+    def identity(item):
+        return item
+
+    def loader(count):
+        source = StatefulDataLoader(OneShot(count), batch_size=None, num_workers=0, collate_fn=identity)
+        strategy = TextBatchingStrategy(token_micro_bsz=1, buffer_size=1, get_length_fn=lambda _: 1)
+        return DynamicBatchSizeDataLoader(source, strategy, num_micro_batch=1, length=3, drop_last=True)
+
+    iterators = [iter(loader(count)) for count in (3, 1)]
+    for iterator in iterators:
+        assert next(iterator)[0][0]["id"] == 0
+    for iterator in iterators:
+        with pytest.raises(RuntimeError, match="source exhausted and could not restart"):
+            next(iterator)
+
+
+@pytest.mark.parametrize("value", [True, "invalid"])
+def test_exhausted_cursor_cannot_restart_source_silently(value):
+    source = _loader()
+    next(iter(source))
+    state = source.state_dict()
+    state["_veomni_source_exhausted"] = value
+    resumed = _loader()
+    with pytest.raises((RuntimeError, ValueError), match="exhausted"):
+        resumed.load_state_dict(state)
+    assert resumed._dataloader.cursor == 0
+
+
+def test_unexhausted_cursor_from_previous_head_remains_loadable():
+    source = _loader()
+    iterator = iter(source)
+    next(iterator)
+    state = source.state_dict()
+    state["_veomni_source_exhausted"] = False
+    resumed = _loader()
+    resumed.load_state_dict(state)
+    assert next(iter(resumed)) == next(iterator)
+
+
 def _loader():
     return DynamicBatchSizeDataLoader(
         _StatefulSamples(),
@@ -112,14 +186,14 @@ def test_restore_copies_tensor_buffer(dpo_recovery):
     next(iter(original))
     state = original.state_dict()
     marker = torch.arange(8)
-    state["payload_marker"] = marker
+    state["item_buffer"].append({"payload": marker})
     resumed = _loader()
     resumed._dpo_disallow_implicit_restart = dpo_recovery
 
     resumed.load_state_dict(state)
 
-    assert torch.equal(resumed.payload_marker, marker)
-    assert resumed.payload_marker.data_ptr() != marker.data_ptr()
+    assert torch.equal(resumed.item_buffer[0]["payload"], marker)
+    assert resumed.item_buffer[0]["payload"].data_ptr() != marker.data_ptr()
     assert state["_veomni_resume_phase"] == "after_yield"
 
 

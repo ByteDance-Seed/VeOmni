@@ -26,6 +26,65 @@ from .dataset import get_length_fn
 logger = logging.get_logger(__name__)
 
 
+def _check_legacy_exhausted_cursor(state: Dict[str, Any]) -> None:
+    """Reject an experimental cursor that can no longer be resumed safely."""
+    exhausted = state.get("_veomni_source_exhausted", False)
+    if type(exhausted) is not bool:
+        raise ValueError("invalid dynamic loader source-exhausted state")
+    if exhausted:
+        raise RuntimeError("Cannot safely restore an exhausted one-shot source cursor")
+
+
+def _check_dpo_cursor_fields(state: Dict[str, Any]) -> None:
+    allowed = {
+        "batching_strategy",
+        "batching_strategy_state",
+        "dataloader_item_buffer",
+        "dataloader_state",
+        "item_buffer",
+        "num_micro_batch",
+        "step",
+        "_veomni_resume_phase",
+        "_veomni_flush_micro_batch",
+        "_veomni_source_exhausted",
+    }
+    if any(key not in allowed for key in state):
+        raise ValueError("DPO dynamic loader cursor contains unsupported fields")
+    required = {
+        "dataloader_item_buffer",
+        "dataloader_state",
+        "item_buffer",
+        "num_micro_batch",
+        "step",
+        "_veomni_resume_phase",
+    }
+    if not required.issubset(state):
+        raise ValueError("DPO dynamic loader cursor is missing required fields")
+    if ("batching_strategy" in state) == ("batching_strategy_state" in state):
+        raise ValueError("DPO dynamic loader cursor must contain exactly one batching strategy state")
+    if not isinstance(state["dataloader_state"], dict) or not state["dataloader_state"]:
+        raise ValueError("DPO dynamic loader cursor requires a nonempty dataloader state")
+
+
+def _check_dpo_cursor_strategy(state: Dict[str, Any], expected: "BaseBatchingStrategy") -> None:
+    saved = state.get("batching_strategy")
+    if type(saved) is not TextBatchingStrategy or type(expected) is not TextBatchingStrategy:
+        raise ValueError("DPO exact recovery requires the native text batching strategy")
+    fields = ("token_micro_bsz", "buffer_size", "bsz_warmup_steps", "bsz_warmup_init_mbtoken", "physical_token_cap")
+    if any(
+        type(getattr(saved, field)) is not type(getattr(expected, field))
+        or getattr(saved, field) != getattr(expected, field)
+        for field in fields
+    ):
+        raise ValueError("DPO dynamic loader batching configuration differs from the checkpoint")
+    if (
+        saved.buffer._get_length_fn is not expected.buffer._get_length_fn
+        or saved.buffer._get_physical_length_fn is not expected.buffer._get_physical_length_fn
+        or saved.get_physical_length_fn is not expected.get_physical_length_fn
+    ):
+        raise ValueError("DPO dynamic loader length functions differ from the checkpoint")
+
+
 # TODO: add state dict for buffer to resume training.
 class DynBszBuffer:
     """
@@ -355,7 +414,13 @@ class DynamicBatchSizeDataLoader:
                     if self.step < self._length:
                         # call iter until reach length
                         self._data_iter = iter(self._dataloader)
-                        processing_item = next(self._data_iter)
+                        try:
+                            processing_item = next(self._data_iter)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "Dynamic batching source exhausted and could not restart before the requested "
+                                "number of steps; check for an empty or non-restartable input."
+                            ) from exc
                     elif not self._drop_last and not self.batching_strategy.empty():
                         yield from self._flush_remaining(batch, None)
                         return
@@ -437,6 +502,11 @@ class DynamicBatchSizeDataLoader:
         # The resumed loader mutates its batching buffer; isolate the saved
         # cursor so it can be safely reused by another restore.
         state = copy.deepcopy(state)
+        if getattr(self, "_dpo_disallow_implicit_restart", False):
+            _check_dpo_cursor_fields(state)
+            _check_dpo_cursor_strategy(state, self.batching_strategy)
+        _check_legacy_exhausted_cursor(state)
+        state.pop("_veomni_source_exhausted", None)
         self._checkpoint_phase = state.pop("_veomni_resume_phase", None)
         if self._checkpoint_phase is None:
             logger.warning("Legacy dynamic loader cursor lacks its post-yield phase; exact resume is not guaranteed.")
@@ -471,6 +541,10 @@ class DynamicBatchSizeDataLoader:
     def load_next_epoch_buffer(self, state: Dict[str, Any]) -> None:
         """Keep buffered samples while leaving the new epoch's sampler fresh."""
         state = copy.deepcopy(state)
+        _check_dpo_cursor_fields(state)
+        _check_dpo_cursor_strategy(state, self.batching_strategy)
+        _check_legacy_exhausted_cursor(state)
+        state.pop("_veomni_source_exhausted", None)
         if state.get("num_micro_batch") != self.num_micro_batch:
             raise ValueError("dynamic loader microbatch geometry differs from the checkpoint")
         if state.get("_veomni_resume_phase") not in ("running", "after_yield", "flushing", "done"):
