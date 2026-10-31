@@ -313,6 +313,22 @@ class GlobalStateCallback(Callback):
             offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
         if self.trainer.train_dataloader is not None and cursor is not None:
+            # DynamicBatchSizeDataLoader.load_state_dict immediately creates
+            # the wrapped iterator. Stateful worker snapshots need the saved
+            # sampler epoch before that iterator starts prefetching.
+            if self.trainer.start_step:
+                from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+                from ...data.data_loader import DistributedDataloader
+                from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+                loader = self.trainer.train_dataloader
+                if (
+                    type(loader) is DynamicBatchSizeDataLoader
+                    and type(loader._dataloader) is DistributedDataloader
+                    and type(loader._dataloader.sampler) is StatefulDistributedSampler
+                ):
+                    loader.set_epoch(self.trainer.start_epoch)
             self.trainer.train_dataloader.load_state_dict(cursor)
 
         # OmniTrainer checkpoints written before it had a meter store None here.

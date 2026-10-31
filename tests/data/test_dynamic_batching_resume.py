@@ -346,3 +346,87 @@ def test_background_prefetch_resume_preserves_next_unmutated_group():
     resumed.load_state_dict(state)
     actual = [[sample["id"] for sample in batch] for batch in next(iter(resumed))]
     assert actual == expected
+
+
+def _epoch_test_collate(items):
+    return items[0]
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_native_sft_mid_epoch_resume_restores_sampler_before_worker_prefetch(monkeypatch, workers):
+    from types import SimpleNamespace
+
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.data.dataset import MappingDataset
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    def make_loader():
+        samples = MappingDataset(
+            [
+                {
+                    "id": i,
+                    "attention_mask": torch.ones(1, dtype=torch.int64),
+                    "labels": torch.ones(1, dtype=torch.int64),
+                }
+                for i in range(60)
+            ],
+            seed=7,
+        )
+        sampler = StatefulDistributedSampler(samples, num_replicas=1, rank=0, shuffle=True, seed=7)
+        options = {"multiprocessing_context": "fork", "prefetch_factor": 1} if workers else {}
+        source = DistributedDataloader(
+            samples,
+            batch_size=1,
+            sampler=sampler,
+            num_workers=workers,
+            collate_fn=_epoch_test_collate,
+            drop_last=True,
+            snapshot_every_n_steps=1,
+            **options,
+        )
+        return DynamicBatchSizeDataLoader(
+            source, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=6, drop_last=True
+        )
+
+    def trace(iterator):
+        return [(next(iterator)[0][0]["id"], torch.rand(()).item()) for _ in range(3)]
+
+    def close(loader):
+        iterator = getattr(loader, "_data_iter", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+
+    torch.manual_seed(12345)
+    original = make_loader()
+    try:
+        original.set_epoch(2)
+        iterator = iter(original)
+        for _ in range(2):
+            next(iterator)
+        cursor, rng = original.state_dict(), torch.get_rng_state()
+        expected = trace(iterator)
+    finally:
+        close(original)
+
+    restored = make_loader()
+    try:
+        checkpoint = SimpleNamespace(load_path="/unused")
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(train=SimpleNamespace(global_rank=0, checkpoint=checkpoint), train_steps=6),
+            state=SimpleNamespace(global_step=0, epoch=0),
+            train_dataloader=restored,
+            channel_loss_callback=None,
+            offline_cache_writer=None,
+            environ_meter=None,
+        )
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: {"global_step": 14, "train_dataloader": cursor, "torch_rng_state": rng}
+        monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.set_device_rng_state", lambda _: None)
+        callback.load_global_state()
+        restored.set_epoch(trainer.start_epoch)
+        assert trace(iter(restored)) == expected
+    finally:
+        close(restored)
