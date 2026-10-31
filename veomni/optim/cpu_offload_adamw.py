@@ -62,6 +62,8 @@ class CPUOffloadAdamW(FullFP32AdamW):
     """
 
     requires_exact_state_dtypes = True
+    # A placement change may split groups and alter scheduler semantics.
+    requires_checkpoint_group_preflight = True
 
     def __init__(
         self,

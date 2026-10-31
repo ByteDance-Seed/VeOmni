@@ -4,9 +4,39 @@ Opt in with optimizer type `master_fp32_adamw`, `full_fp32_adamw` or `cpu_offloa
 
 In a mixed optimizer, strict checkpoint dtype and shape checks apply to the parameters owned by precision-sensitive optimizer leaves. Unknown saved fields on those parameters require an explicit migration; ordinary AdamW leaves retain their existing loading policy.
 
-Checkpointing parameters that remain owned by an optimizer while frozen, followed by unfreezing, is not yet supported safely: persistent PLE parameters may be rejected at save, while restoring other frozen parameters can silently lose optimizer history. Previously accumulated optimizer history for parameters omitted from a rebuilt target optimizer requires explicit migration if those parameters are later unfrozen. Do not use these freeze/unfreeze transitions across a checkpoint until a verified migration is available.
+Checkpointing parameters that remain owned by a precision-sensitive optimizer
+while frozen, followed by unfreezing, is not yet supported safely. The save
+rejects frozen parameters with existing optimizer history rather than silently
+discarding it; restore also rejects frozen parameters still owned by such an
+optimizer. Persistent PLE parameters may be rejected even without history.
+Previously accumulated history for parameters omitted from a rebuilt target
+optimizer also requires explicit migration if those parameters are later
+unfrozen. Do not use these freeze/unfreeze transitions across a checkpoint
+until a verified migration is available.
 
 Use the framework `DistributedCheckpointer.load` for resume: it clears temporary optimizer handoff markers if DCP loading fails. Calling `torch.distributed.checkpoint.load` directly bypasses that cleanup if an error occurs after planning. Saving a single empty optimizer, or an ExtraParallel-aware `MultiOptimizer` containing an empty child, is not yet safe: PyTorch can materialize synthetic optimizer state while collecting it. Avoid those save paths until they are fixed.
+
+The frozen-parameter checks below apply to `DistributedCheckpointer.save` and
+`DistributedCheckpointer.load`; direct `dcp.save`/`dcp.load` using
+`OptimizerState` bypass them and must not be used for freeze/unfreeze resumes.
+
+For a single non-EP `cpu_offload_adamw`, `DistributedCheckpointer.load` also reads
+the saved group names before model tensors and again after model load hooks,
+before optimizer tensors. Legacy fused checkpoints are read in two phases for
+precision-sensitive optimizers. The check rejects a
+changed group membership or order, because a different offload selection can
+change optimizer and scheduler groups; those changes require an explicit
+migration. This check requires an immutable checkpoint during both reads. It
+does not cover direct `dcp.load` or `MultiOptimizer`/EP. The checked single
+optimizer path rejects FSDP1 flat parameters and custom optimizer state-dict
+hooks or optimizer implementations. It also rejects step hooks on an uninitialized optimizer because PyTorch
+may invoke them during synthetic optimizer-state initialization. A regular
+load pre-hook still runs after the
+preflight and is responsible for any changes it makes. The preflight does not
+make later tensor I/O transactional: a failure can leave the model or optimizer
+partially modified, so reconstruct them before another load attempt. In the
+precision-sensitive path, rank-local model state hook failures are propagated
+before peers continue; failures inside a model's own collective are not covered.
 
 For CPU offload, `cpu_offload_param_patterns` selects parameters by full parameter-name regex. `cpu_offload_cpu_moment_dtype` and `cpu_offload_resident_moment_dtype` independently choose `float32` or `bfloat16`; both default to FP32. Run optimizer steps after gradient synchronization and global clipping. Parameters and gradients stay on the accelerator; selected master/moment states are stored and updated on CPU using bounded staging.
 

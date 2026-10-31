@@ -37,7 +37,7 @@ from torch.distributed.checkpoint import (
     load,
 )
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, BytesStorageMetadata, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     _get_fqns,
@@ -50,7 +50,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.device import empty_cache, synchronize
+from ..utils.device import empty_cache, get_device_type, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from .checkpointer import CheckpointerBase
 from .layout import (
@@ -493,6 +493,217 @@ def _dcp_parameter_name_map(model) -> dict[str, torch.nn.Parameter]:
     return names
 
 
+def _reject_frozen_precision_sensitive_optimizer_state(model, optimizer):
+    """Do not silently lose saved Adam history when a parameter is frozen."""
+    names = {id(param): name for name, param in model.named_parameters()}
+    for leaf in _iter_optimizer_leaves(getattr(optimizer, "optimizer", optimizer)):
+        if not getattr(leaf, "requires_exact_state_dtypes", False):
+            continue
+        for group in leaf.param_groups:
+            for param in group["params"]:
+                if not param.requires_grad and leaf.state.get(param):
+                    name = names.get(id(param), "<unknown>")
+                    raise RuntimeError(
+                        f"Cannot checkpoint frozen precision-sensitive optimizer state for {name}; "
+                        "unfreeze the parameter or explicitly migrate its optimizer history"
+                    )
+
+
+def _reject_frozen_precision_sensitive_optimizer_targets(model, optimizer):
+    """Frozen optimizer targets cannot receive their saved state through DCP."""
+    names = {id(param): name for name, param in model.named_parameters()}
+    for leaf in _iter_optimizer_leaves(getattr(optimizer, "optimizer", optimizer)):
+        if not getattr(leaf, "requires_exact_state_dtypes", False):
+            continue
+        for group in leaf.param_groups:
+            for param in group["params"]:
+                if not param.requires_grad:
+                    name = names.get(id(param), "<unknown>")
+                    raise RuntimeError(
+                        f"Cannot restore frozen precision-sensitive optimizer parameter {name}; "
+                        "unfreeze before restoring or explicitly migrate its optimizer history"
+                    )
+
+
+def _coordinated_optimizer_flag(present, description, group=None):
+    """DCP participants must agree before taking optimizer-specific branches."""
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        return present
+    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+    flags = torch.tensor([int(present), int(not present)], dtype=torch.int32, device=device)
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+    any_present, any_absent = map(bool, flags.tolist())
+    if any_present and any_absent:
+        raise RuntimeError(f"DCP ranks disagree about {description}")
+    return any_present
+
+
+def _coordinated_optimizer_policy(optimizer, group=None):
+    present = optimizer is not None
+    exact = _requires_exact_optimizer_state_dtypes(optimizer) if present else False
+    preflight = (
+        bool(getattr(optimizer, "requires_checkpoint_group_preflight", False))
+        and not getattr(optimizer, "_is_multi_optimizer", False)
+        if present
+        else False
+    )
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        return present, exact, preflight
+    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+    flags = torch.tensor(
+        [int(present), int(not present), int(exact), int(not exact), int(preflight), int(not preflight)],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+    values = flags.tolist()
+    for index, description in (
+        (0, "whether optimizer state is present"),
+        (2, "optimizer precision policy"),
+        (4, "CPU-offload optimizer policy"),
+    ):
+        if values[index] and values[index + 1]:
+            raise RuntimeError(f"DCP ranks disagree about {description}")
+    return bool(values[0]), bool(values[2]), bool(values[4])
+
+
+def _is_standard_scheduler_step(optimizer):
+    """Recognize PyTorch's own scheduler wrapper, not copied marker flags."""
+    step = vars(optimizer).get("step")
+    if step is None:
+        return True
+    if (
+        not getattr(step, "_wrapped_by_lr_sched", False)
+        or getattr(step, "__wrapped__", None) is not type(optimizer).step
+    ):
+        return False
+    code = getattr(step, "__code__", None)
+    root = getattr(torch.optim.lr_scheduler.LRScheduler.__init__, "__code__", None)
+    pending = [root] if root is not None else []
+    found = False
+    while pending:
+        candidate = pending.pop()
+        if candidate is code:
+            found = True
+            break
+        pending.extend(value for value in candidate.co_consts if hasattr(value, "co_consts"))
+    if not found:
+        return False
+    cells = dict(zip(code.co_freevars, (cell.cell_contents for cell in (step.__closure__ or ())), strict=True))
+    reference = cells.get("opt_ref")
+    return (
+        isinstance(reference, weakref.ReferenceType)
+        and reference() is optimizer
+        and cells.get("func") is type(optimizer).step
+    )
+
+
+def _preflight_cpu_offload_groups(model, optimizer, reader_factory, checkpoint_path, group=None, policy_checked=False):
+    """Check saved group FQNs before DCP can write model/optimizer tensors.
+
+    Group membership is stored as byte entries rather than in DCP metadata, so
+    read only those entries into a scratch dict and synchronize errors before
+    starting the normal checkpoint load. MultiOptimizer uses a different flat
+    format and is deliberately outside this check's scope.
+    """
+    eligible = getattr(optimizer, "requires_checkpoint_group_preflight", False) and not getattr(
+        optimizer, "_is_multi_optimizer", False
+    )
+    if not policy_checked:
+        eligible = _coordinated_optimizer_flag(eligible, "CPU-offload optimizer group preflight", group=group)
+    if not eligible:
+        return None
+
+    metadata = None
+    scratch_reader = None
+    expected_groups = []
+    keys = []
+    error = None
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        from ..optim.cpu_offload_adamw import CPUOffloadAdamW
+
+        if type(optimizer) is not CPUOffloadAdamW or "state_dict" in vars(optimizer):
+            raise RuntimeError("CPU-offload group preflight requires the standard optimizer state_dict implementation")
+        if not _is_standard_scheduler_step(optimizer):
+            raise RuntimeError("CPU-offload group preflight cannot verify a custom optimizer step implementation")
+        if any(isinstance(module, FullyShardedDataParallel) for module in model.modules()):
+            raise RuntimeError("CPU-offload group preflight does not support FSDP1 flattened parameters")
+        for name in (
+            "_optimizer_state_dict_pre_hooks",
+            "_optimizer_state_dict_post_hooks",
+        ):
+            if getattr(optimizer, name, None):
+                raise RuntimeError("CPU-offload group preflight cannot verify custom optimizer state-dict hooks")
+        if not optimizer.state:
+            from torch.optim import optimizer as torch_optimizer
+
+            if any(
+                (
+                    getattr(optimizer, "_optimizer_step_pre_hooks", {}),
+                    getattr(optimizer, "_optimizer_step_post_hooks", {}),
+                    getattr(torch_optimizer, "_global_optimizer_pre_hooks", {}),
+                    getattr(torch_optimizer, "_global_optimizer_post_hooks", {}),
+                )
+            ):
+                raise RuntimeError(
+                    "A fresh CPU-offload optimizer with step hooks cannot be restored safely: "
+                    "DCP may run a synthetic step before loading"
+                )
+        names = {}
+        for name, param in model.named_parameters():
+            fqns = _get_fqns(model, name)
+            if len(fqns) != 1:
+                raise RuntimeError(f"Cannot resolve a unique DCP parameter name for {name}")
+            names[id(param)] = next(iter(fqns))
+        for param_group in optimizer.param_groups:
+            if any(id(param) not in names for param in param_group["params"]):
+                raise RuntimeError("CPU-offload optimizer contains a parameter absent from the checkpoint model")
+            expected_groups.append([names[id(param)] for param in param_group["params"]])
+
+        metadata = reader_factory(checkpoint_path).read_metadata()
+        prefix, suffix = "optimizer.param_groups.", ".params"
+        saved_indices = set()
+        for key, value in metadata.state_dict_metadata.items():
+            if not (key.startswith(prefix) and key.endswith(suffix)):
+                continue
+            index = key[len(prefix) : -len(suffix)]
+            if not index.isdecimal() or not isinstance(value, BytesStorageMetadata):
+                raise RuntimeError(f"Unsupported CPU-offload optimizer group encoding: {key}")
+            saved_indices.add(int(index))
+        if saved_indices != set(range(len(expected_groups))):
+            raise RuntimeError(
+                "CPU-offload optimizer checkpoint parameter group count differs; restore the original policy "
+                "or explicitly migrate optimizer and scheduler state"
+            )
+        keys = [f"{prefix}{index}{suffix}" for index in range(len(expected_groups))]
+        scratch_reader = reader_factory(checkpoint_path)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "inspecting CPU-offload checkpoint groups", group=group)
+
+    scratch = dict.fromkeys(keys)
+    dcp.load(
+        state_dict=scratch,
+        storage_reader=scratch_reader,
+        process_group=group,
+        planner=DefaultLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False, allow_partial_load=False),
+    )
+    error = None
+    try:
+        for key, expected in zip(keys, expected_groups, strict=True):
+            if scratch[key] != expected:
+                raise RuntimeError(
+                    "CPU-offload optimizer checkpoint parameter groups differ; restore the original policy "
+                    "or explicitly migrate optimizer and scheduler state"
+                )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating CPU-offload checkpoint groups", group=group)
+    return getattr(getattr(metadata, "storage_meta", None), "save_id", None)
+
+
 def _drop_absent_optimizer_state(model, optimizer) -> None:
     """Remove DCP-created placeholders for parameters with no saved state.
 
@@ -655,6 +866,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         strict_optimizer_recipe: bool = False,
         optimizer=None,
         model=None,
+        expected_optimizer_save_id=None,
     ):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
@@ -662,6 +874,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.strict_optimizer_recipe = strict_optimizer_recipe
         self.optimizer = optimizer
         self.model = model
+        self.expected_optimizer_save_id = expected_optimizer_save_id
 
     def create_local_plan(self):
         # The marker is an ephemeral handoff from planning to load_state_dict.
@@ -670,6 +883,10 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         if self.optimizer is not None:
             _reset_absent_optimizer_state(self.optimizer)
         metadata = self.metadata.state_dict_metadata if self.metadata is not None else {}
+        if self.expected_optimizer_save_id is not None:
+            actual_id = getattr(getattr(self.metadata, "storage_meta", None), "save_id", None)
+            if actual_id != self.expected_optimizer_save_id:
+                raise RuntimeError("Optimizer checkpoint changed after group preflight")
         for key, path in self.mappings.items():
             if path and path[-1] == _EXTRA_PARALLEL_LAYOUT_MARKER and key not in metadata:
                 raise RuntimeError(
@@ -996,6 +1213,37 @@ class ModelState(Stateful):
         )
 
 
+class _CoordinatedModelState(ModelState):
+    """Propagate rank-local model state hook failures around a DCP load.
+
+    DCP invokes ``state_dict`` before its read collectives and invokes
+    ``load_state_dict`` after those collectives. A local hook exception at
+    either point must be shared before peers continue to the next collective.
+    This cannot recover from failures *inside* a model's own collectives.
+    """
+
+    def __init__(self, *args, group=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._checkpoint_group = group
+
+    def state_dict(self):
+        value, error = None, None
+        try:
+            value = super().state_dict()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "building model checkpoint state", group=self._checkpoint_group)
+        return value
+
+    def load_state_dict(self, state_dict):
+        error = None
+        try:
+            super().load_state_dict(state_dict)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "applying model checkpoint state", group=self._checkpoint_group)
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -1185,6 +1433,18 @@ class OptimizerState(Stateful):
             action,
             key_match="substring",
         )
+
+
+class _CoordinatedOptimizerState(OptimizerState):
+    """Propagate rank-local optimizer load-hook failures after DCP reads."""
+
+    def load_state_dict(self, state_dict):
+        error = None
+        try:
+            super().load_state_dict(state_dict)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "applying optimizer checkpoint state", group=self._coordinated_group)
 
 
 def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
@@ -1807,6 +2067,16 @@ class DistributedCheckpointer(CheckpointerBase):
         if stage_dir and save_async:
             raise ValueError("stage_dir cannot be combined with save_async")
 
+        optimizer = state.get("optimizer")
+        wants_optimizer, exact, _ = _coordinated_optimizer_policy(optimizer)
+        if wants_optimizer and exact:
+            error = None
+            try:
+                _reject_frozen_precision_sensitive_optimizer_state(state["model"], optimizer)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating frozen optimizer history before checkpoint save")
+
         # ``is not None`` rather than truthiness: step 0 is a step like any other, and
         # folding it onto ``path`` would write it over the run's own directory.
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
@@ -1961,10 +2231,15 @@ class DistributedCheckpointer(CheckpointerBase):
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
         def _model_state() -> "ModelState":
+            if exact:
+                return _CoordinatedModelState(
+                    state["model"], trainable_only=trainable_only, parallel_state=parallel_state, group=process_group
+                )
             return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
 
         def _optimizer_state() -> "OptimizerState":
-            return OptimizerState(
+            state_type = _CoordinatedOptimizerState if exact else OptimizerState
+            return state_type(
                 model=state["model"],
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
@@ -1973,10 +2248,23 @@ class DistributedCheckpointer(CheckpointerBase):
                 coordinated_group=process_group,
             )
 
-        wants_optimizer = state.get("optimizer") is not None
+        optimizer = state.get("optimizer")
+        initial_policy = _coordinated_optimizer_policy(optimizer, group=process_group)
+        wants_optimizer, exact, _ = initial_policy
 
+        def _validate_frozen_targets():
+            if not (wants_optimizer and exact):
+                return
+            error = None
+            try:
+                _reject_frozen_precision_sensitive_optimizer_targets(state["model"], optimizer)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating frozen optimizer targets", group=process_group)
+
+        _validate_frozen_targets()
         fused_dir = cls._legacy_fused_dir(path, module)
-        if fused_dir is not None:
+        if fused_dir is not None and not exact:
             load_state: Dict[str, Any] = {"model": _model_state()}
             if wants_optimizer:
                 load_state["optimizer"] = _optimizer_state()
@@ -1987,41 +2275,90 @@ class DistributedCheckpointer(CheckpointerBase):
                     process_group=process_group,
                     planner=_ModelStrictLoadPlanner(
                         strict_model=not trainable_only,
-                        strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
-                        strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
-                        optimizer=state.get("optimizer"),
+                        strict_optimizer_dtype=False,
+                        strict_optimizer_recipe=_requires_exact_optimizer_recipe(optimizer),
+                        optimizer=optimizer,
                         model=state["model"],
                     ),
                 )
             finally:
-                _reset_zero_optimizer_state_resume(state.get("optimizer"))
-                _reset_absent_optimizer_state(state.get("optimizer"))
+                _reset_zero_optimizer_state_resume(optimizer)
+                _reset_absent_optimizer_state(optimizer)
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
-
+        optimizer_path = fused_dir if fused_dir is not None else optimizer_dir(path, module)
+        optimizer_save_id = None
+        if wants_optimizer:
+            optimizer_save_id = _preflight_cpu_offload_groups(
+                state["model"],
+                optimizer,
+                cls._create_storage_reader,
+                optimizer_path,
+                group=process_group,
+                policy_checked=True,
+            )
         model_root = model_dir(path, module)
+        model_path = fused_dir if fused_dir is not None else weights_dir(path, module)
+        model_state, model_reader, model_setup_error = None, None, None
+        try:
+            model_state = _model_state()
+            model_reader = cls._create_storage_reader(model_path)
+        except BaseException as exc:
+            model_setup_error = exc
+        if exact:
+            raise_if_any_rank_failed(model_setup_error, "preparing model checkpoint read", group=process_group)
+        elif model_setup_error is not None:
+            raise model_setup_error
         try:
             dcp.load(
-                state_dict={"model": _model_state()},
-                storage_reader=cls._create_storage_reader(weights_dir(path, module)),
+                state_dict={"model": model_state},
+                storage_reader=model_reader,
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(
                     strict_model=not trainable_only,
-                    strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
-                    strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
-                    optimizer=state.get("optimizer"),
+                    strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(optimizer),
+                    strict_optimizer_recipe=_requires_exact_optimizer_recipe(optimizer),
+                    optimizer=optimizer,
                     model=state["model"],
+                    expected_optimizer_save_id=optimizer_save_id if fused_dir is not None else None,
                 ),
             )
         finally:
-            _reset_zero_optimizer_state_resume(state.get("optimizer"))
-            _reset_absent_optimizer_state(state.get("optimizer"))
+            _reset_zero_optimizer_state_resume(optimizer)
+            _reset_absent_optimizer_state(optimizer)
         if wants_optimizer:
+            changed = state.get("optimizer") is not optimizer
+            if any_rank_failed(changed, group=process_group):
+                raise RuntimeError("Optimizer object changed while loading model state")
+            if _coordinated_optimizer_policy(optimizer, group=process_group) != initial_policy:
+                raise RuntimeError("Optimizer policy changed while loading model state")
+            _validate_frozen_targets()
+            second_save_id = _preflight_cpu_offload_groups(
+                state["model"],
+                optimizer,
+                cls._create_storage_reader,
+                optimizer_path,
+                group=process_group,
+                policy_checked=True,
+            )
+            changed_error = (
+                RuntimeError("Optimizer checkpoint changed while loading model state")
+                if second_save_id != optimizer_save_id
+                else None
+            )
+            raise_if_any_rank_failed(changed_error, "rechecking optimizer checkpoint identity", group=process_group)
+            optimizer_state, optimizer_reader, optimizer_setup_error = None, None, None
+            try:
+                optimizer_state = _optimizer_state()
+                optimizer_reader = cls._create_storage_reader(optimizer_path)
+            except BaseException as exc:
+                optimizer_setup_error = exc
+            raise_if_any_rank_failed(optimizer_setup_error, "preparing optimizer checkpoint read", group=process_group)
             try:
                 dcp.load(
-                    state_dict={"optimizer": _optimizer_state()},
-                    storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
+                    state_dict={"optimizer": optimizer_state},
+                    storage_reader=optimizer_reader,
                     process_group=process_group,
                     # The strict check looks for missing ``model`` keys; there are none
                     # in an optimizer-only load, so strictness has nothing to say here.
@@ -2031,13 +2368,14 @@ class DistributedCheckpointer(CheckpointerBase):
                         strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
                         optimizer=state.get("optimizer"),
                         model=state["model"],
+                        expected_optimizer_save_id=optimizer_save_id,
                     ),
                 )
             finally:
-                _reset_zero_optimizer_state_resume(state.get("optimizer"))
-                _reset_absent_optimizer_state(state.get("optimizer"))
+                _reset_zero_optimizer_state_resume(optimizer)
+                _reset_absent_optimizer_state(optimizer)
 
-        cls._load_extra_state(checkpoint_dir=model_root, state=state)
+        cls._load_extra_state(checkpoint_dir=fused_dir if fused_dir is not None else model_root, state=state)
 
         logger.info_rank0(f"Loaded checkpoint from {model_root}")
 

@@ -188,6 +188,7 @@ def test_distributed_checkpointer_clears_lazy_handoff_on_load_failure(monkeypatc
     optimizer = CPUOffloadAdamW(model.parameters(), lr=0.001)
     monkeypatch.setattr(DistributedCheckpointer, "_legacy_fused_dir", lambda *_args: "/unused")
     monkeypatch.setattr(DistributedCheckpointer, "_create_storage_reader", lambda *_args: object())
+    monkeypatch.setattr("veomni.checkpoint.dcp_checkpointer._preflight_cpu_offload_groups", lambda *_args, **_kw: None)
 
     def fail_after_plan(**_kwargs):
         optimizer._veomni_absent_optimizer_state_bases = {"optimizer.state.weight"}

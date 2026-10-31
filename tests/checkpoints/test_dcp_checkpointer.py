@@ -1926,7 +1926,11 @@ class TestPromoteStagedCheckpoint:
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         stage_path, final_path = staged
-        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+            patch("veomni.utils.dist_utils.dist.all_reduce"),
+        ):
             with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier"):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=3):
                     with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
@@ -2370,6 +2374,9 @@ class TestStageDirValidation:
         final = tmp_path / "ckpt"
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_policy", return_value=(False, False, False)
+            ),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,

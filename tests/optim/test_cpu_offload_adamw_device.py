@@ -2,11 +2,15 @@
 
 import contextlib
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
+from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, ModelState, OptimizerState
+from veomni.checkpoint.layout import optimizer_dir, weights_dir
 from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
@@ -70,6 +74,93 @@ def test_accelerator_offload_large_chunk_staging_matches_reference():
     _check_offload_staging_reuse(
         torch.bfloat16, nondefault_stream=True, chunk_size=1_048_576, sizes=(524_287, 2_097_153, 262_143), steps=3
     )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
+def test_accelerator_offload_checkpoint_group_preflight(tmp_path):
+    device = _require_native_device()
+    parallel = SimpleNamespace(dp_mode="ddp")
+
+    def build(reverse=False):
+        model = torch.nn.Linear(4, 3, dtype=torch.bfloat16, device=device)
+        params = list(model.parameters())
+        if reverse:
+            params.reverse()
+        optimizer = CPUOffloadAdamW([{"params": params, "cpu_offload": True}], lr=0.01)
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        return model, optimizer
+
+    source_model, source = build()
+    dcp.save({"model": ModelState(source_model, parallel_state=parallel)}, checkpoint_id=weights_dir(str(tmp_path)))
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel)},
+        checkpoint_id=optimizer_dir(str(tmp_path)),
+    )
+    optimizer_metadata = (tmp_path / "model" / "optimizer" / ".metadata").read_bytes()
+    source_model.weight.requires_grad_(False)
+    with pytest.raises(RuntimeError, match="frozen precision-sensitive optimizer state"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": source_model, "optimizer": source}, parallel_state=parallel
+        )
+    assert (tmp_path / "model" / "optimizer" / ".metadata").read_bytes() == optimizer_metadata
+    source_model.weight.requires_grad_(True)
+    target_model, target = build(reverse=True)
+    weights = [parameter.detach().clone() for parameter in target_model.parameters()]
+    states = [
+        {key: value.clone() for key, value in target.state[parameter].items()}
+        for parameter in target_model.parameters()
+    ]
+    with pytest.raises(RuntimeError, match="parameter groups"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target}, parallel_state=parallel
+        )
+    for index, parameter in enumerate(target_model.parameters()):
+        torch.testing.assert_close(parameter, weights[index], rtol=0, atol=0)
+        for key, value in states[index].items():
+            torch.testing.assert_close(target.state[parameter][key], value, rtol=0, atol=0)
+
+    restored_model, restored = build()
+    restored_model.weight.requires_grad_(False)
+    with pytest.raises(RuntimeError, match="restore frozen precision-sensitive optimizer parameter"):
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+        )
+    restored_model.weight.requires_grad_(True)
+    before_states = [
+        {key: value.clone() for key, value in restored.state[parameter].items()}
+        for parameter in restored_model.parameters()
+    ]
+
+    def freeze_weight(module, _incompatible):
+        module.weight.requires_grad_(False)
+
+    hook = restored_model.register_load_state_dict_post_hook(freeze_weight)
+    try:
+        with pytest.raises(RuntimeError, match="restore frozen precision-sensitive optimizer parameter"):
+            DistributedCheckpointer.load(
+                str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+            )
+    finally:
+        hook.remove()
+    for index, parameter in enumerate(restored_model.parameters()):
+        for key, value in before_states[index].items():
+            torch.testing.assert_close(restored.state[parameter][key], value, rtol=0, atol=0)
+    restored_model.weight.requires_grad_(True)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+    )
+    for original, recovered in zip(source_model.parameters(), restored_model.parameters(), strict=True):
+        torch.testing.assert_close(original, recovered, rtol=0, atol=0)
+        for key in source.state[original]:
+            torch.testing.assert_close(source.state[original][key], restored.state[recovered][key], rtol=0, atol=0)
+        original.grad = torch.full_like(original, 0.5)
+        recovered.grad = torch.full_like(recovered, 0.5)
+    source.step()
+    restored.step()
+    for original, recovered in zip(source_model.parameters(), restored_model.parameters(), strict=True):
+        torch.testing.assert_close(original, recovered, rtol=0, atol=0)
 
 
 def _check_offload_staging_reuse(dtype, nondefault_stream, chunk_size, sizes, steps):
