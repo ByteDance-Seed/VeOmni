@@ -62,13 +62,20 @@ class LTXModel(torch.nn.Module):
         caption_projection: torch.nn.Module | None = None,
         audio_caption_projection: torch.nn.Module | None = None,
         cross_attention_adaln: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
         config=None,
     ):
+        """Initialize modality branches, preprocessing and transformer blocks from architecture settings."""
         super().__init__()
         if ops is None:
             ops = TransformerOpsConfig.from_functions(config=config)
         self.gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
+        self.ff_bias = ff_bias
+        self.audio_ff_bias = audio_ff_bias
+        self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type
         self.double_precision_rope = double_precision_rope
@@ -133,7 +140,11 @@ class LTXModel(torch.nn.Module):
         norm_eps: float,
         caption_projection: torch.nn.Module | None = None,
     ) -> None:
+        """Create video projections, adaptive normalization and optional keyframe embeddings."""
         self.patchify_proj = torch.nn.Linear(in_channels, self.inner_dim, bias=True)
+        self.keyframes_abs_pos_embedding = (
+            torch.nn.Parameter(torch.zeros(1, self.inner_dim)) if self.use_keyframes_abs_pos_embedding else None
+        )
         if caption_projection is not None:
             self.caption_projection = caption_projection
 
@@ -195,13 +206,19 @@ class LTXModel(torch.nn.Module):
             embedding_coefficient=1,
         )
 
+    def _keyframes_embedding(self):
+        """Return the current keyframe parameter so preprocessing follows parameter materialization."""
+        return self.keyframes_abs_pos_embedding
+
     def _init_preprocessors(
         self,
         cross_pe_max_pos: int | None = None,
     ) -> None:
+        """Connect modality projections and positional settings to the argument preprocessors."""
         if self.model_type.is_video_enabled() and self.model_type.is_audio_enabled():
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
+                keyframes_embedding_provider=self._keyframes_embedding,
                 adaln=self.adaln_single,
                 cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
@@ -241,6 +258,7 @@ class LTXModel(torch.nn.Module):
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
+                keyframes_embedding_provider=self._keyframes_embedding,
                 adaln=self.adaln_single,
                 inner_dim=self.inner_dim,
                 max_pos=self.positional_embedding_max_pos,
@@ -281,9 +299,11 @@ class LTXModel(torch.nn.Module):
         apply_gated_attention: bool,
         config=None,
     ) -> None:
+        """Construct transformer blocks with independent audio and video feed-forward biases."""
         video_config = (
             TransformerConfig(
                 dim=self.inner_dim,
+                ff_bias=self.ff_bias,
                 heads=self.num_attention_heads,
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
@@ -296,6 +316,7 @@ class LTXModel(torch.nn.Module):
         audio_config = (
             TransformerConfig(
                 dim=self.audio_inner_dim,
+                ff_bias=self.audio_ff_bias,
                 heads=self.audio_num_attention_heads,
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,

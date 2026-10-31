@@ -66,6 +66,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/transformers/test_model_forward_no_implicit_sync.py",
+    # LTX smoke-harness regressions inspect SDPA backend enable/restore flags.
+    # PyTorch exposes these through its CUDA backend namespace even on CPU;
+    # veomni.utils.device has no equivalent for these backend controls.
+    "tests/models/test_ltx25.py",
     # Precision and async-offload tests explicitly select CUDA/NPU devices by
     # name to exercise accelerator-specific code paths; the literal "cuda" is
     # a test fixture, not a production device-API call.
