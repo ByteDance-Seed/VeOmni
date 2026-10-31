@@ -1906,7 +1906,10 @@ class TestPromoteStagedCheckpoint:
         gloo_group = object()
         with patch("veomni.utils.dist_utils.dist.is_initialized", return_value=True):
             with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=fake_all_reduce):
-                with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+                with (
+                    patch("veomni.utils.dist_utils.dist.get_backend", return_value="hccl"),
+                    patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"),
+                ):
                     assert any_rank_failed(False) is True
                 # gloo cannot reduce accelerator tensors (NPU included), so a gloo
                 # group must never ask for the accelerator's device.
@@ -1915,14 +1918,19 @@ class TestPromoteStagedCheckpoint:
                     patch("veomni.utils.dist_utils.get_device_type", side_effect=AssertionError("asked for a device")),
                 ):
                     assert any_rank_failed(False, group=gloo_group) is True
-        assert seen_groups == [None, gloo_group], "the reduction must run on the group it was handed"
+                    assert any_rank_failed(False) is True
+        assert seen_groups == [None, gloo_group, None], "the reduction must run on the group it was handed"
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         stage_path, final_path = staged
-        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+            patch("veomni.utils.dist_utils.dist.all_reduce"),
+        ):
             with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier"):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=3):
                     with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
@@ -2366,6 +2374,13 @@ class TestStageDirValidation:
         final = tmp_path / "ckpt"
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_policy", return_value=(False, False, False)
+            ),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_flag",
+                side_effect=lambda present, *_args, **_kwargs: present,
+            ),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
