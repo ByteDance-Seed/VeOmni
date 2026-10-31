@@ -8,6 +8,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
+from veomni.utils.device import get_device_type, is_nvidia_cuda_device
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -32,27 +33,29 @@ def test_unpermute_registration_and_eager_empty():
     ],
 )
 def test_unpermute_forward_backward(dtype, weight_dtype, rows, hidden):
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        pytest.skip("Requires NVIDIA CUDA.")
+    device = get_device_type()
+    if device == "cpu":
+        pytest.skip("Requires an accelerator.")
+    impl = "triton" if is_nvidia_cuda_device(device) else "eager"
     torch.manual_seed(237)
-    x = torch.randn(rows, hidden, device="cuda", dtype=dtype, requires_grad=True)
-    w = torch.randn(rows, device="cuda", dtype=weight_dtype, requires_grad=True)
+    x = torch.randn(rows, hidden, device=device, dtype=dtype, requires_grad=True)
+    w = torch.randn(rows, device=device, dtype=weight_dtype, requires_grad=True)
     # Deliberately repeated destinations and unused output rows.
-    index = torch.randint(0, 23, (rows,), device="cuda")
+    index = torch.randint(0, 23, (rows,), device=device)
     reference_x, reference_w = x.detach().clone().requires_grad_(), w.detach().clone().requires_grad_()
     weighted = reference_x * reference_w[:, None]
-    expected = torch.zeros(31, hidden, device="cuda", dtype=torch.float32)
+    expected = torch.zeros(31, hidden, device=device, dtype=torch.float32)
     expected.scatter_add_(0, index[:, None].expand_as(weighted), weighted.float())
     expected = expected.to(weighted.dtype)
-    actual = VeomniOp("moe_unpermute", "standard", "triton")(x, w, index, num_tokens=31)
+    actual = VeomniOp("moe_unpermute", "standard", impl)(x, w, index, num_tokens=31)
     grad = torch.randn_like(expected)
     expected.backward(grad)
     actual.backward(grad)
     for a, b in [(actual, expected), (x.grad, reference_x.grad), (w.grad, reference_w.grad)]:
         assert a.dtype == b.dtype and a.shape == b.shape and torch.isfinite(a).all()
-        diff = (a.double() - b.double()).square().sum() / (
-            a.double().square().sum() + b.double().square().sum()
-        ).clamp_min(1e-30)
+        # Keep the FP64 diagnostic on CPU, including when kernels run on NPU.
+        a64, b64 = a.detach().cpu().double(), b.detach().cpu().double()
+        diff = (a64 - b64).square().sum() / (a64.square().sum() + b64.square().sum()).clamp_min(1e-30)
         assert diff < (1e-10 if a.dtype == torch.float32 else 1e-6), diff.item()
 
 
