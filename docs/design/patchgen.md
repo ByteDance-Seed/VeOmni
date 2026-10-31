@@ -375,7 +375,7 @@ after `original_init(...)` are inlined into the upstream body:
 @config.modify_init("Qwen2Attention")
 def bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 ```
 
 ## CLI Reference

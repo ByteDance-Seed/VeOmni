@@ -220,7 +220,7 @@ warning. To make a backbone eligible, stash exactly one length per conversation.
 - [`tests/seed_omni/mixins/test_metric_meter_mixin.py`](../../../tests/seed_omni/mixins/test_metric_meter_mixin.py):
   the mixin's stash/accumulate/reset contract and the `OmniEnvironMeter` roll-up,
   including a two-rank gloo run.
-- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L395):
+- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L399):
   the runtime drain.
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   the callback wiring.

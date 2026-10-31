@@ -202,27 +202,24 @@ optional packages raise `RuntimeError` during resolution.
 
 ## Calling an op from modeling
 
-Models construct a local handle once and call it directly:
+Models construct a local handle once from `config.ops_config` and call it directly:
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
-self.veomni_rms_norm = VeomniOp(
-    "rms_norm",
-    "standard",
-    resolve_op_impl("rms_norm_implementation"),
-)
+rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 ```
 
 `VeomniOp` resolves its row at construction, is interned by the resolved
 triple, and always calls the row's wrapper. `models.build_foundation_model`
-installs the `OpsImplementationConfig` object in `ops/config.py` before
-constructing the model. Changing the installed config later does not
-retarget handles that already exist.
+attaches `ops_implementation` onto the model `PretrainedConfig` (exposed as
+`config.ops_config: OpsImplementationConfig`) before constructing the model.
+Changing `config.ops_implementation` later does not retarget handles that
+already exist.
 
 Unset fields on `OpsImplementationConfig` remain `None`, and
 `resolve_op(op, variant, None)` / `VeomniOp(op, variant, None)` selects the
@@ -235,10 +232,14 @@ requirements are unmet. For example, `rms_norm/unweighted` has no Ascend kernel,
 so an unset `rms_norm_implementation` resolves `rms_norm/standard` to
 `torch_npu` and `rms_norm/unweighted` to `eager` on NPU.
 
-For compatibility, consumers pass `resolve_op_impl(field, variant=...)`
-for variants with explicit-value aliases. In particular, an explicit
-`rms_norm_implementation='torch_npu'` (or the deprecated `npu`) still maps to
-`eager` for `unweighted`, while weighted variants retain `torch_npu`.
+Consumers read `config.ops_config.<field>` directly. On NPU, `unweighted`
+RMSNorm supports only `eager`; an explicit `torch_npu` or deprecated `npu`
+selection raises at module construction. Leave the selection unset to use each
+variant's device default.
+
+The registered attention `eager` row calls the modeling file's local
+`eager_attention_forward` when present. Otherwise it forwards to `veomni_sdpa`,
+so modules without local eager math use the same config field without remapping.
 
 Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
 query dtype for backward. Forward computation still receives the original

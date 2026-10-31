@@ -127,7 +127,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
             assert y.dtype == xi.dtype
             with backward_context:
                 y.backward(grad[rank])
-            xr, rr, wr1, wr2 = [a.detach().clone().requires_grad_() for a in (x, routing, w1, w2)]
+            xr, rr, wr1, wr2 = (a.detach().clone().requires_grad_() for a in (x, routing, w1, w2))
             gate, up = wr1.bfloat16().chunk(2, dim=1)
             yr = standard_ep_reference(
                 xr.flatten(0, 1),

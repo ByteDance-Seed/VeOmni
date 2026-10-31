@@ -24,10 +24,12 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
 
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    qwen3_5_attention_bind_ops,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_init_patched,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -53,6 +55,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_attention_forward_patched,
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
+    qwen3_5_moe_decoder_layer_init_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forcausallm_init_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -79,6 +82,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_moe_npu.py",
     description="Qwen3_5Moe with mojo_opset NPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
@@ -109,10 +116,6 @@ config.add_import(
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.attention_utils",
     names=["prepare_dense_attention_inputs"],
@@ -176,6 +179,17 @@ config.override_method(
     "Qwen3_5MoeMLP.forward",
     replacement=qwen3_5_moe_mlp_forward_patched,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.override_method(
+    "Qwen3_5MoeDecoderLayer.__init__",
+    replacement=qwen3_5_moe_decoder_layer_init_patched,
+    description="Pass config to Qwen3_5MoeRMSNorm instances",
+)
+config.override_method(
+    "Qwen3_5MoeTextModel.__init__",
+    replacement=qwen3_5_text_model_init_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Pass config to final Qwen3_5MoeRMSNorm",
 )
 
 # ── Construct generated vision / text towers ──────────────────────────────────
@@ -445,6 +459,12 @@ config.override_method(
         "the per-block host sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D device tensors."
     ),
+)
+config.override_method(
+    "Qwen3_5MoeAttention.__init__",
+    replacement=qwen3_5_attention_bind_ops,
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3_5MoeRMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3_5MoeAttention.forward",
