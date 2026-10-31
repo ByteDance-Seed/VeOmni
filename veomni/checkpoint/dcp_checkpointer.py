@@ -15,8 +15,10 @@
 
 import gc
 import hashlib
+import json
 import os
 import shutil
+import uuid
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -53,11 +55,29 @@ from .layout import (
     OPTIMIZER_DIRNAME,
     WEIGHTS_DIRNAME,
     dcp_markers,
+    manifest_path,
     model_dir,
     optimizer_dir,
     step_dir,
     weights_dir,
 )
+from .multi_optimizer_checkpoint import (
+    _MULTI_GENERATION_MARKER,
+    _MULTI_INVENTORY_MARKER,
+    _check_model_serialization_hooks,
+    _check_qwen_omni_checkpoint_keys,
+    _coordinated_optimizer_flag,
+    _dcp_parameter_name_map,
+    _inventory_digests,
+    _iter_optimizer_leaves,
+    _multi_extra_snapshot,
+    _optimizer_payload_digest,
+    _preflight_multi_optimizer_layout,
+    _prepare_multi_optimizer_saved_states,
+    _validate_source_optimizer_states,
+    _verify_replicated_optimizer_metadata,
+)
+from .optimizer_resume_layout import MULTI_LAYOUT_MARKER, coordinated_multi_layout, frozen_parameter_digest
 
 
 logger = logging.get_logger(__name__)
@@ -70,9 +90,10 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
-    def __init__(self, strict_model: bool):
+    def __init__(self, strict_model: bool, expected_save_id=None):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
+        self.expected_save_id = expected_save_id
 
     def create_local_plan(self):
         assert self.metadata is not None
@@ -101,6 +122,10 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     raise RuntimeError(
                         f"ExtraParallel checkpoint dtype differs for {key}; explicit conversion required"
                     )
+        if self.expected_save_id is not None:
+            actual = getattr(getattr(self.metadata, "storage_meta", None), "save_id", None)
+            if actual != self.expected_save_id:
+                raise RuntimeError("Checkpoint changed between identity preflight and tensor load")
         plan = super().create_local_plan()
         if not self.strict_model:
             return plan
@@ -206,10 +231,33 @@ def _check_canonical_spec_coverage(model, specs, state_keys, *, trainable_only):
             raise RuntimeError(f"ExtraParallel checkpoint spec is not present in the canonical state dict: {name}")
 
 
-def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=None, trainable_only=False):
+def _validate_optimizer_model_layout(model):
+    specs = getattr(model, "_fqn2spec_info", None)
+    parameters = dict(model.named_parameters(remove_duplicate=False))
+    for name, spec in (specs or {}).items():
+        if (
+            isinstance(spec.placement, Shard)
+            and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+            and not getattr(spec, "checkpoint_layout_v2", False)
+            and spec.para_fsdp_mesh is not None
+            and spec.para_fsdp_mesh.size(-2) > 1
+            and name in parameters
+            and spec.placement.dim % parameters[name].ndim == spec.fsdp_shard_dim % parameters[name].ndim
+        ):
+            raise RuntimeError(
+                f"ExtraParallel tensor {name} requires train.checkpoint.extra_parallel_canonical_layout=true "
+                "when EP and FSDP shard the same axis"
+            )
+
+
+def _reject_unproven_extra_parallel_optimizer(
+    state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False
+):
     error, signature = None, None
     try:
         specs = getattr(state.get("model"), "_fqn2spec_info", None)
+        if allow_proven_optimizer:
+            _validate_optimizer_model_layout(state["model"])
         if _needs_extra_parallel_layout_marker(specs):
             _extra_parallel_layout_key(specs)
             signature = _runtime_extra_parallel_layout_signature(specs)
@@ -218,7 +266,7 @@ def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=No
         else:
             ps = None
         if state.get("optimizer") is not None and getattr(ps, "dp_mode", None) == "fsdp2":
-            if _needs_extra_parallel_layout_marker(specs):
+            if _needs_extra_parallel_layout_marker(specs) and not allow_proven_optimizer:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
     except BaseException as exc:
         error = exc
@@ -645,6 +693,17 @@ class ModelState(Stateful):
         )
 
 
+def _requires_rank_local_optimizer_checkpoint(optimizer):
+    # A registered adapter declares an exact, rank-local state contract even
+    # when the underlying optimizer does not expose a marker attribute.
+    from ..optim.checkpoint_adapter import rank_local_adamw_adapter
+
+    return (
+        getattr(optimizer, "requires_exact_state_dtypes", False) is True
+        or rank_local_adamw_adapter(optimizer) is not None
+    )
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -694,12 +753,19 @@ class OptimizerState(Stateful):
         self._load = load
 
     def state_dict(self):
+        if _requires_rank_local_optimizer_checkpoint(self.optimizer):
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
             self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         ):
             raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
             raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            raise RuntimeError(
+                "Raw DCP MultiOptimizer does not prove parameter groups or scheduler identity; "
+                "use DistributedCheckpointer with the live scheduler."
+            )
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -726,6 +792,8 @@ class OptimizerState(Stateful):
 
     def load_state_dict(self, state_dict):
         """Restore optimizer state from the loaded DCP state dict."""
+        if _requires_rank_local_optimizer_checkpoint(self.optimizer):
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
             raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
@@ -774,6 +842,203 @@ class OptimizerState(Stateful):
             action,
             key_match="substring",
         )
+
+
+class _ProvenModelState(ModelState):
+    def __init__(self, *args, optimizer, group, writing=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.optimizer = optimizer
+        self.group = group
+        self.writing = writing
+
+    def state_dict(self):
+        result, error = None, None
+        try:
+            _check_model_serialization_hooks(self.model)
+            result = super().state_dict()
+            _check_model_serialization_hooks(self.model)
+            logical_keys = {key for raw in result if (key := _export_extra_parallel_layout_key(raw)) is not None}
+            _check_qwen_omni_checkpoint_keys(self.model, logical_keys)
+            if self.trainable_only:
+                names = _dcp_parameter_name_map(self.model)
+                for leaf in _iter_optimizer_leaves(self.optimizer):
+                    for param, saved in leaf.state.items():
+                        aliases = [name for name, owned in names.items() if owned is param]
+                        if saved and not any(name in logical_keys for name in aliases):
+                            raise RuntimeError("trainable-only save would omit a parameter with optimizer history")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "constructing proven model state", group=self.group)
+        if self.writing:
+            from .rank_local_optimizer import verify_replicated_model_shards
+
+            verify_replicated_model_shards(result, group=self.group)
+        return result
+
+    def load_state_dict(self, state_dict):
+        error = None
+        try:
+            super().load_state_dict(state_dict)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "applying proven model state", group=self.group)
+
+
+class _ProvenMultiOptimizerState(OptimizerState):
+    """High-level DCP adapter; direct optimizer APIs retain their own contract."""
+
+    def __init__(
+        self,
+        *args,
+        generation,
+        scheduler_snapshot,
+        scheduler_object,
+        extra_digest,
+        expected_layout,
+        group,
+        frozen_digest=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.generation = generation
+        self.scheduler_snapshot = scheduler_snapshot
+        self.scheduler_object = scheduler_object
+        self.extra_digest = extra_digest
+        self.expected_layout = expected_layout
+        self.group = group
+        self.frozen_digest = frozen_digest
+
+    def state_dict(self):
+        result, error = None, None
+        try:
+            result = self.optimizer._sparse_state_dict(coordinate=True, group=self.group)
+            if self.should_extra_parallel_aware:
+                from .rank_local_optimizer import (
+                    current_rank,
+                    local_optimizer_state,
+                    rank_inventory,
+                    rank_inventory_key,
+                )
+
+                inventory = rank_inventory(result, current_rank())
+                result = local_optimizer_state(result, current_rank())
+                result[rank_inventory_key(current_rank())] = "" if self._load else json.dumps(inventory)
+            else:
+                from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+
+                flattened, _ = flatten_state_dict({"optimizer": result})
+                inventory = sorted(flattened)
+                result[_MULTI_INVENTORY_MARKER] = "" if self._load else json.dumps(inventory)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "constructing proven MultiOptimizer state", group=self.group)
+        if self._load:
+            result[MULTI_LAYOUT_MARKER] = ""
+            return result
+        initial = coordinated_multi_layout(
+            self.model,
+            self.optimizer,
+            self.scheduler_snapshot,
+            self.scheduler_object,
+            writing=True,
+            group=self.group,
+            frozen_digest=self.frozen_digest,
+        )
+        if initial != self.expected_layout:
+            raise RuntimeError("MultiOptimizer layout changed while saving checkpoint")
+        current = coordinated_multi_layout(
+            self.model,
+            self.optimizer,
+            self.scheduler_snapshot,
+            self.scheduler_object,
+            self.extra_digest,
+            writing=True,
+            group=self.group,
+            frozen_digest=self.frozen_digest,
+        )
+        result[MULTI_LAYOUT_MARKER] = json.dumps(
+            {
+                "generation": self.generation,
+                "layout": current,
+                "inventory_digests": _inventory_digests(inventory, group=self.group),
+            },
+            sort_keys=True,
+        )
+        return result
+
+    def load_state_dict(self, state_dict):
+        error = None
+        try:
+            state_dict = dict(state_dict)
+            marker = json.loads(state_dict.pop(MULTI_LAYOUT_MARKER))
+            if (
+                not isinstance(marker, dict)
+                or set(marker) != {"generation", "layout", "inventory_digests"}
+                or marker["generation"] != self.generation
+                or marker["layout"] != self.expected_layout
+            ):
+                raise RuntimeError("MultiOptimizer identity changed during tensor loading")
+            if self.should_extra_parallel_aware:
+                from .rank_local_optimizer import (
+                    current_rank,
+                    rank_inventory,
+                    rank_inventory_key,
+                    restore_optimizer_state,
+                )
+
+                inventory = json.loads(state_dict.pop(rank_inventory_key(current_rank())))
+                template = self.optimizer._sparse_state_dict()
+                if inventory != rank_inventory(template, current_rank()):
+                    raise RuntimeError("rank-local optimizer checkpoint inventory changed during loading")
+                state_dict = restore_optimizer_state(state_dict, template, current_rank())
+            else:
+                from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+
+                inventory = json.loads(state_dict.pop(_MULTI_INVENTORY_MARKER))
+                flattened, _ = flatten_state_dict({"optimizer": state_dict})
+                if inventory != sorted(flattened):
+                    raise RuntimeError("MultiOptimizer checkpoint inventory changed during loading")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "validating loaded MultiOptimizer state", group=self.group)
+        if marker["inventory_digests"] != _inventory_digests(inventory, group=self.group):
+            raise RuntimeError("MultiOptimizer inventory identity changed during tensor loading")
+        current = coordinated_multi_layout(
+            self.model,
+            self.optimizer,
+            self.scheduler_snapshot,
+            self.scheduler_object,
+            self.extra_digest,
+            group=self.group,
+            frozen_digest=self.frozen_digest,
+        )
+        if current != self.expected_layout:
+            raise RuntimeError("MultiOptimizer layout changed while loading optimizer state")
+        from ..optim.checkpoint_adapter import rank_local_adamw_adapter
+
+        has_adapter = _coordinated_optimizer_flag(
+            any(rank_local_adamw_adapter(leaf) is not None for leaf in _iter_optimizer_leaves(self.optimizer)),
+            "registered optimizer checkpoint adapter presence",
+            group=self.group,
+        )
+        expected_payload = None
+        if has_adapter:
+            error = None
+            try:
+                expected_payload = _optimizer_payload_digest(state_dict)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "fingerprinting loaded MultiOptimizer state", group=self.group)
+        error = None
+        try:
+            self.optimizer._dcp_load_state_dict(state_dict, group=self.group)
+            if has_adapter:
+                restored_payload = self.optimizer._sparse_state_dict(coordinate=True, group=self.group)
+                if _optimizer_payload_digest(restored_payload) != expected_payload:
+                    raise RuntimeError("MultiOptimizer load changed or omitted checkpoint state")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "applying proven MultiOptimizer state", group=self.group)
 
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
@@ -1135,8 +1400,11 @@ def _prepare_stage_dir(stage_dir: str, path: str, group: Optional[Any] = None) -
     error: Optional[BaseException] = None
     if _local_rank() == 0:
         try:
-            shutil.rmtree(stage_path, ignore_errors=True)
-            os.makedirs(stage_path, exist_ok=True)
+            if os.path.lexists(stage_path):
+                shutil.rmtree(stage_path)
+            # Failing rather than reusing an uncleared directory prevents a
+            # previous checkpoint's sidecars from joining this transaction.
+            os.makedirs(stage_path, exist_ok=False)
         except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
             # ``BaseException`` for the reason ``_promotion_phase`` documents:
             # anything that escapes here skips the reduction below, and the ranks
@@ -1412,20 +1680,105 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             None
         """
-        if "model" not in state:
+        has_model = _coordinated_optimizer_flag(
+            isinstance(state, dict) and "model" in state, "checkpoint model presence"
+        )
+        if not has_model:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
-        _reject_unproven_extra_parallel_optimizer(state, parallel_state, trainable_only=trainable_only)
-
-        # Rejected up front, before anything reaches disk: an async write is still
-        # running when save() returns and drops the staged copy, so it would write
-        # straight to the slow destination staging was meant to avoid.
+        optimizer = state.get("optimizer")
+        multi = _coordinated_optimizer_flag(
+            getattr(optimizer, "_is_multi_optimizer", False) is True, "MultiOptimizer save policy"
+        )
+        if multi:
+            _coordinated_optimizer_flag(tuple(optimizer.key_names), "optimizer leaf order")
+            trainable_only = _coordinated_optimizer_flag(trainable_only, "MultiOptimizer trainable-only save")
+            _coordinated_optimizer_flag(bool(save_async), "MultiOptimizer asynchronous save mode")
+            _coordinated_optimizer_flag(os.path.abspath(stage_dir) if stage_dir else None, "MultiOptimizer stage path")
+            _coordinated_optimizer_flag(module, "MultiOptimizer module")
+            _coordinated_optimizer_flag("extra_state" in state, "MultiOptimizer extra-state presence")
+        # An async write may outlive a staged copy, so the modes cannot combine.
         if stage_dir and save_async:
             raise ValueError("stage_dir cannot be combined with save_async")
+        single_exact = _coordinated_optimizer_flag(
+            not multi and _requires_rank_local_optimizer_checkpoint(optimizer),
+            "exact-precision optimizer save policy",
+        )
+        if single_exact:
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+        _reject_unproven_extra_parallel_optimizer(
+            state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi
+        )
+        scheduler_object = state.get("_veomni_scheduler_object") if multi else None
+        source_model = state.get("model")
+        extra = state.get("extra_state") if multi else None
+        snapshot = extra.get("lr_scheduler") if isinstance(extra, dict) else None
+        initial_layout, generation = None, None
+        if multi:
+            error = None
+            try:
+                parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+                if save_async:
+                    raise RuntimeError("Proven MultiOptimizer checkpoints currently require synchronous DCP save")
+                _check_model_serialization_hooks(source_model)
+                _validate_source_optimizer_states(optimizer, source_model)
+                if "extra_state" in state and not isinstance(extra, dict):
+                    raise RuntimeError("MultiOptimizer extra_state must be a mapping")
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy")
+            frozen_digest = frozen_parameter_digest(state["model"], enabled=trainable_only)
+            initial_layout = coordinated_multi_layout(
+                state["model"], optimizer, snapshot, scheduler_object, writing=True, frozen_digest=frozen_digest
+            )
+            rank_local = _coordinated_optimizer_flag(
+                getattr(state["model"], "_fqn2spec_info", None) is not None
+                and getattr(parallel_state, "dp_mode", None) == "fsdp2",
+                "rank-local MultiOptimizer checkpoint mode",
+            )
+            if not rank_local:
+                _verify_replicated_optimizer_metadata(state["model"], optimizer)
+                from .rank_local_optimizer import verify_replicated_model_shards
+
+                optimizer_snapshot, error = None, None
+                try:
+                    optimizer_snapshot = optimizer._sparse_state_dict(coordinate=True)
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "constructing replicated optimizer snapshot")
+                verify_replicated_model_shards(optimizer_snapshot)
+            error, generation_value = None, None
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                try:
+                    generation_value = str(uuid.uuid4())
+                except BaseException as exc:
+                    error = exc
+            raise_if_any_rank_failed(error, "generating MultiOptimizer checkpoint identity")
+            values = [generation_value]
+            if dist.is_initialized():
+                dist.broadcast_object_list(values, src=0)
+            generation = values[0]
 
         # ``is not None`` rather than truthiness: step 0 is a step like any other, and
         # folding it onto ``path`` would write it over the run's own directory.
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
+        if multi:
+            _coordinated_optimizer_flag(os.path.abspath(checkpoint_dir), "MultiOptimizer checkpoint path")
+            error = (
+                RuntimeError("Cannot overwrite a completed checkpoint transaction with MultiOptimizer state")
+                if os.path.exists(manifest_path(checkpoint_dir))
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")
+        if multi and extra is None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            extra_path = os.path.join(model_root, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
+            error = (
+                RuntimeError("Existing checkpoint sidecar cannot be reused when extra_state is omitted")
+                if os.path.exists(extra_path)
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking for stale MultiOptimizer extra state")
 
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
@@ -1438,50 +1791,108 @@ class DistributedCheckpointer(CheckpointerBase):
         stage_path = _prepare_stage_dir(stage_dir, stage_key_path, group=stage_group) if stage_dir else None
         write_root = stage_path or model_root
 
-        if stage_path is None:
-            # Nothing stands between this save and the previous checkpoint's
-            # shards, so its markers have to go before the first byte lands --
-            # otherwise a save that dies part-way leaves one describing shards
-            # that are half this step and half the last. A staged save invalidates
-            # its destination in ``_promote_staged_checkpoint`` instead, at the
-            # point where it is about to overwrite it for real.
-            #
-            # The manifest is not ours either way; ``GlobalStateCallback`` clears
-            # the one it writes.
-            cls._remove_dcp_markers(checkpoint_dir, module)
+        error = None
+        try:
+            if stage_path is None:
+                # Invalidate stale metadata before writing any new shards.
+                cls._remove_dcp_markers(checkpoint_dir, module)
+            cls._create_checkpoint_dir(write_root)
+            if multi:
+                os.makedirs(os.path.join(write_root, OPTIMIZER_DIRNAME), exist_ok=True)
+            cls._save_extra_state(checkpoint_dir=write_root, state=state)
+        except BaseException as exc:
+            error = exc
+        if multi:
+            raise_if_any_rank_failed(error, "preparing MultiOptimizer checkpoint")
+        elif error is not None:
+            raise error
+        extra_digest = None
+        if multi:
+            error = None
+            try:
+                extra_digest, _ = _multi_extra_snapshot(write_root, read_state=False)
+                if (extra is None) != (extra_digest == "absent"):
+                    raise RuntimeError("MultiOptimizer checkpoint sidecar presence does not match this save")
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "hashing MultiOptimizer extra state")
 
-        cls._create_checkpoint_dir(write_root)
-
-        # Sidecar first, then the DCP directories. Ordering no longer carries the
-        # completeness guarantee it used to — ``checkpoint_manifest.json`` does,
-        # and it is written only after every module's save has returned — but
-        # writing the small replicated file first still means a save that dies
-        # part-way leaves less behind.
-        cls._save_extra_state(checkpoint_dir=write_root, state=state)
+        def prepare_writer_state(factory, what):
+            result, error = None, None
+            try:
+                result = factory()
+            except BaseException as exc:
+                error = exc
+            if multi:
+                raise_if_any_rank_failed(error, what)
+            elif error is not None:
+                raise error
+            return result
 
         try:
+            model_state, model_writer = prepare_writer_state(
+                lambda: (
+                    _ProvenModelState(
+                        state["model"],
+                        trainable_only=trainable_only,
+                        parallel_state=parallel_state,
+                        optimizer=optimizer,
+                        group=None,
+                        writing=True,
+                    )
+                    if multi
+                    else ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state),
+                    cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
+                ),
+                "preparing model DCP writer",
+            )
+            model_payload = {"model": model_state}
+            if multi:
+                model_payload[_MULTI_GENERATION_MARKER] = generation
             cls.execute_save(
-                save_state={
-                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
-                },
-                storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
+                save_state=model_payload,
+                storage_writer=model_writer,
                 save_async=save_async,
                 save_to_lowest_rank=save_to_lowest_rank,
                 slot=WEIGHTS_DIRNAME,
                 timeout_seconds=save_timeout_seconds,
             )
 
+            if multi:
+                error = None
+                if state.get("model") is not source_model or state.get("optimizer") is not optimizer:
+                    error = RuntimeError("Model or optimizer object changed while saving model state")
+                elif (
+                    state.get("extra_state") is not extra
+                    or state.get("_veomni_scheduler_object") is not scheduler_object
+                ):
+                    error = RuntimeError("Scheduler or extra-state object changed while saving model state")
+                raise_if_any_rank_failed(error, "rechecking MultiOptimizer checkpoint ownership")
+
             if "optimizer" in state and state["optimizer"] is not None:
-                cls.execute_save(
-                    save_state={
-                        "optimizer": OptimizerState(
+                optim_state, optim_writer = prepare_writer_state(
+                    lambda: (
+                        _ProvenMultiOptimizerState(
                             model=state["model"],
-                            optimizer=state["optimizer"],
+                            optimizer=optimizer,
                             parallel_state=parallel_state,
-                            load=False,
+                            generation=generation,
+                            scheduler_snapshot=snapshot,
+                            scheduler_object=scheduler_object,
+                            extra_digest=extra_digest,
+                            expected_layout=initial_layout,
+                            group=None,
+                            frozen_digest=frozen_digest,
                         )
-                    },
-                    storage_writer=cls._create_storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
+                        if multi
+                        else OptimizerState(model=state["model"], optimizer=optimizer, parallel_state=parallel_state),
+                        cls._create_storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
+                    ),
+                    "preparing optimizer DCP writer",
+                )
+                cls.execute_save(
+                    save_state={"optimizer": optim_state},
+                    storage_writer=optim_writer,
                     save_async=save_async,
                     save_to_lowest_rank=save_to_lowest_rank,
                     slot=OPTIMIZER_DIRNAME,
@@ -1496,6 +1907,7 @@ class DistributedCheckpointer(CheckpointerBase):
             _promote_staged_checkpoint(stage_path, model_root, step_root=checkpoint_dir, group=stage_group)
 
         logger.info_rank0(f"Saved checkpoint to {model_root}")
+        return generation if multi else None
 
     @classmethod
     def _remove_dcp_markers(cls, checkpoint_dir: str, module: str) -> None:
@@ -1568,13 +1980,38 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             state: state loaded
         """
-        if state is None:
-            raise ValueError("State dict must be provided to load a distributed checkpoint.")
-
-        if "model" not in state:
+        if isinstance(state, dict):
+            state.pop("_veomni_optimizer_identity_verified", None)
+            state.pop("_veomni_optimizer_checkpoint_generation", None)
+        has_model = _coordinated_optimizer_flag(
+            isinstance(state, dict) and "model" in state, "checkpoint model presence", group=process_group
+        )
+        if not has_model:
+            if state is None:
+                raise ValueError("State dict must be provided to load a distributed checkpoint.")
             raise ValueError("Model must be provided to load a distributed checkpoint.")
+        optimizer = state.get("optimizer")
+        multi = _coordinated_optimizer_flag(
+            getattr(optimizer, "_is_multi_optimizer", False) is True, "MultiOptimizer load policy", group=process_group
+        )
+        if multi:
+            _coordinated_optimizer_flag(tuple(optimizer.key_names), "optimizer leaf order", group=process_group)
+            trainable_only = _coordinated_optimizer_flag(
+                trainable_only, "MultiOptimizer trainable-only load", group=process_group
+            )
+            _coordinated_optimizer_flag(module, "MultiOptimizer module", group=process_group)
+            _coordinated_optimizer_flag(
+                "extra_state" in state, "MultiOptimizer extra-state presence", group=process_group
+            )
+        single_exact = _coordinated_optimizer_flag(
+            not multi and _requires_rank_local_optimizer_checkpoint(optimizer),
+            "exact-precision optimizer load policy",
+            group=process_group,
+        )
+        if single_exact:
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         _reject_unproven_extra_parallel_optimizer(
-            state, parallel_state, group=process_group, trainable_only=trainable_only
+            state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
 
         def _model_state() -> "ModelState":
@@ -1590,7 +2027,12 @@ class DistributedCheckpointer(CheckpointerBase):
 
         wants_optimizer = state.get("optimizer") is not None
 
-        fused_dir = cls._legacy_fused_dir(path, module)
+        fused_dir, error = None, None
+        try:
+            fused_dir = cls._legacy_fused_dir(path, module)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "inspecting checkpoint layout", group=process_group)
         specs = getattr(state["model"], "_fqn2spec_info", None)
         if _needs_extra_parallel_layout_marker(specs):
             marker_error = None
@@ -1600,6 +2042,122 @@ class DistributedCheckpointer(CheckpointerBase):
             except BaseException as exc:
                 marker_error = exc
             raise_if_any_rank_failed(marker_error, "validating ExtraParallel checkpoint marker", group=process_group)
+        if multi:
+            _coordinated_optimizer_flag(os.path.abspath(path), "MultiOptimizer checkpoint path", group=process_group)
+            error = None
+            try:
+                parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy", group=process_group)
+            _coordinated_optimizer_flag(
+                getattr(state["model"], "_fqn2spec_info", None) is not None
+                and getattr(parallel_state, "dp_mode", None) == "fsdp2",
+                "rank-local MultiOptimizer checkpoint mode",
+                group=process_group,
+            )
+            error = (
+                RuntimeError("Fused MultiOptimizer checkpoints require an explicitly verified migration")
+                if fused_dir is not None
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint layout", group=process_group)
+            scheduler_object = state.get("_veomni_scheduler_object")
+            optimizer_path = optimizer_dir(path, module)
+            model_path = weights_dir(path, module)
+            root = model_dir(path, module)
+            optimizer_id, extra, model_id, generation, expected_layout, extra_digest, frozen_digest = (
+                _preflight_multi_optimizer_layout(
+                    state["model"],
+                    optimizer,
+                    cls._create_storage_reader,
+                    optimizer_path,
+                    model_path,
+                    root,
+                    "extra_state" in state,
+                    scheduler_object,
+                    parallel_state=parallel_state,
+                    trainable_only=trainable_only,
+                    group=process_group,
+                )
+            )
+            _prepare_multi_optimizer_saved_states(
+                state["model"],
+                optimizer,
+                cls._create_storage_reader,
+                optimizer_path,
+                optimizer_id,
+                group=process_group,
+                parallel_state=parallel_state,
+                validate_only=True,
+            )
+            model_state = _ProvenModelState(
+                state["model"],
+                trainable_only=trainable_only,
+                parallel_state=parallel_state,
+                optimizer=optimizer,
+                group=process_group,
+            )
+            dcp.load(
+                state_dict={"model": model_state},
+                storage_reader=cls._create_storage_reader(model_path),
+                process_group=process_group,
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=not trainable_only,
+                    expected_save_id=model_id,
+                ),
+            )
+            error = (
+                RuntimeError("Optimizer object changed while loading model state")
+                if state.get("optimizer") is not optimizer
+                else None
+            )
+            raise_if_any_rank_failed(error, "rechecking MultiOptimizer identity", group=process_group)
+            snapshot = extra.get("lr_scheduler") if extra is not None else None
+            current = coordinated_multi_layout(
+                state["model"],
+                optimizer,
+                snapshot,
+                scheduler_object,
+                extra_digest,
+                group=process_group,
+                frozen_digest=frozen_digest,
+            )
+            if current != expected_layout:
+                raise RuntimeError("MultiOptimizer layout changed while loading model state")
+            _prepare_multi_optimizer_saved_states(
+                state["model"],
+                optimizer,
+                cls._create_storage_reader,
+                optimizer_path,
+                optimizer_id,
+                group=process_group,
+                parallel_state=parallel_state,
+            )
+            optimizer_state = _ProvenMultiOptimizerState(
+                model=state["model"],
+                optimizer=optimizer,
+                parallel_state=parallel_state,
+                load=True,
+                generation=generation,
+                scheduler_snapshot=snapshot,
+                scheduler_object=scheduler_object,
+                extra_digest=extra_digest,
+                expected_layout=expected_layout,
+                group=process_group,
+                frozen_digest=frozen_digest,
+            )
+            dcp.load(
+                state_dict={"optimizer": optimizer_state},
+                storage_reader=cls._create_storage_reader(optimizer_path),
+                process_group=process_group,
+                planner=_ModelStrictLoadPlanner(strict_model=False, expected_save_id=optimizer_id),
+            )
+            if extra is not None:
+                state["extra_state"].update(extra)
+            state["_veomni_optimizer_identity_verified"] = True
+            state["_veomni_optimizer_checkpoint_generation"] = generation
+            return state
         if fused_dir is not None:
             load_state: Dict[str, Any] = {"model": _model_state()}
             if wants_optimizer:
@@ -1791,9 +2349,14 @@ class DistributedCheckpointer(CheckpointerBase):
             )
             if dist.is_initialized():
                 dist.barrier()
-            gc.collect()
-            empty_cache()
-            synchronize()
+            error = None
+            try:
+                gc.collect()
+                empty_cache()
+                synchronize()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "finalizing DCP save")
 
     # Private helper methods
     @classmethod

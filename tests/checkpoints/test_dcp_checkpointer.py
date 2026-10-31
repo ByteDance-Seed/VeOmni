@@ -41,7 +41,7 @@ _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
-    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -75,25 +75,17 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
         x = torch.randn(2, 4, device=device)
         source_model(x).sum().backward()
         source_optimizer.step()
-        expected = source_optimizer.state_dict()
+        source_optimizer.zero_grad()
+        expected = source_optimizer._sparse_state_dict()
 
         checkpoint_dir = tmp_path / "ckpt"
-        dcp.save(
-            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
-            checkpoint_id=str(checkpoint_dir),
-        )
+        DistributedCheckpointer.save(str(checkpoint_dir), {"model": source_model, "optimizer": source_optimizer})
         dist.barrier()
 
         target_model, target_optimizer = build_model_and_optimizer()
-        dcp.load(
-            {
-                "model": ModelState(target_model),
-                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
-            },
-            checkpoint_id=str(checkpoint_dir),
-        )
+        DistributedCheckpointer.load(str(checkpoint_dir), {"model": target_model, "optimizer": target_optimizer})
 
-        actual = target_optimizer.state_dict()
+        actual = target_optimizer._sparse_state_dict()
         assert expected.keys() == actual.keys()
         for key in expected:
             expected_value = expected[key]
@@ -164,7 +156,7 @@ class TestMultiOptimizerState:
     """Non-ExtraParallel MultiOptimizer must use its own DCP protocol."""
 
     def test_single_process_dcp_roundtrip(self, tmp_path):
-        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
         from veomni.optim.optimizer import MultiOptimizer
 
         def build_model_and_optimizer():
@@ -184,21 +176,20 @@ class TestMultiOptimizerState:
         for param in source_model.parameters():
             param.grad = torch.randn_like(param)
         source_optimizer.step()
-        expected = source_optimizer.state_dict()
+        source_optimizer.zero_grad()
+        expected = source_optimizer._sparse_state_dict()
         assert any("exp_avg" in key for key in expected)
         assert any("step" in key for key in expected)
 
         target_model, target_optimizer = build_model_and_optimizer()
-        dcp.save(
-            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": source_model, "optimizer": source_optimizer}, parallel_state=parallel_state
         )
-        dcp.load(
-            {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.load(
+            str(tmp_path), {"model": target_model, "optimizer": target_optimizer}, parallel_state=parallel_state
         )
 
-        actual = target_optimizer.state_dict()
+        actual = target_optimizer._sparse_state_dict()
         assert expected.keys() == actual.keys()
         for key, expected_value in expected.items():
             actual_value = actual[key]
@@ -219,7 +210,7 @@ class TestMultiOptimizerState:
         from torch.distributed.checkpoint import FileSystemReader
         from torch.distributed.checkpoint.metadata import Metadata
 
-        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
         from veomni.optim.optimizer import MultiOptimizer
 
         model = nn.Linear(4, 4)
@@ -234,16 +225,16 @@ class TestMultiOptimizerState:
         # Only bias gets a gradient; the adamw_w sub-optimizer remains empty.
         model.bias.grad = torch.randn_like(model.bias)
         optimizer.step()
+        optimizer.zero_grad()
         assert optimizer.optimizers_dict["adamw_b"].state
         assert not optimizer.optimizers_dict["adamw_w"].state
 
         parallel_state = SimpleNamespace(dp_mode="fsdp2")
-        dcp.save(
-            {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel_state
         )
 
-        reader = FileSystemReader(tmp_path)
+        reader = FileSystemReader(tmp_path / "model" / "optimizer")
         metadata = reader.read_metadata()
         assert isinstance(metadata, Metadata)
         keys = list(metadata.state_dict_metadata.keys())
@@ -2368,6 +2359,10 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
             patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._coordinated_optimizer_flag",
+                side_effect=lambda value, *_a, **_k: value,
+            ),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):

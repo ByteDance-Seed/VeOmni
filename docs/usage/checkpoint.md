@@ -246,14 +246,70 @@ identifies canonical global values independently of source geometry, so DCP can
 reshard a model checkpoint across supported FSDP shard axes. Use
 `DistributedCheckpointer` for save and resume: it rejects old/unversioned
 layouts before copying model tensors. Migrating a legacy checkpoint requires
-verified source layout information. Canonical v2 optimizer save and resume are
-rejected until an owner-aware codec can preserve rank-specific optimizer
-states; this opt-in therefore does not yet support resuming training. The
-standard VeOmni HF export strips the namespace.
+verified source layout information. Canonical v2 optimizer save and resume use
+the rank-local codec described below. The standard VeOmni HF export strips the
+namespace.
 
 Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
 supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
+## MultiOptimizer recovery identity
+
+Use `DistributedCheckpointer` for training checkpoints containing a
+`MultiOptimizer`. The save is synchronous and requires a completed optimizer
+step with no pending gradients. Its identity records parameter ownership,
+group structure, scheduler recipe and checkpoint generation. Loading rejects an
+unversioned checkpoint, a changed optimizer layout, or a model/optimizer/sidecar
+from different saves. An old checkpoint whose original group and scheduler
+identity cannot be established needs a verified offline migration.
+
+The generic codec supports AdamW, AnyPrecisionAdamW and DistributedMuon
+without ExtraParallel when every checkpoint rank has the same logical parameter
+inventory and replicated values already agree. For the ExtraParallel candidate,
+optimizer state is stored under rank-specific keys and recovery requires the
+identical rank-to-mesh mapping. This avoids merging distinct expert-owner steps
+and uninitialized states, but increases checkpoint storage for replicated
+optimizer shards and does not support elastic resharding. Model replica shards
+are checked for bitwise equality before DCP deduplication. The check streams
+bounded chunks to CPU and adds work during checkpoint save. Unknown model
+or optimizer hooks, asynchronous saves and unsupported layouts fail closed;
+callers should validate these constraints before starting a long run. Synchronous
+staged saves are supported.
+Partially overlapping shards with different geometries are rejected, even when
+their shared values agree; exact replicas and disjoint shards remain supported.
+Group/state inventory and generation mismatches are rejected before model
+copying. If an I/O or optimizer-application error occurs after model copying,
+the load fails and clears its receipt but does not roll back in-memory objects;
+discard and rebuild that runtime before retrying.
+`MultiOptimizer.state_dict()` returns a detached inspection snapshot for
+supported leaves, but `load_state_dict()` alone cannot prove group/scheduler
+identity and rejects restoration; use the proven DCP path instead.
+The codec also rejects tensor learning rates shared between groups and
+overlapping storage between distinct model or optimizer tensors. Its byte-range
+check is conservative for non-contiguous interleaved views.
+Mutable optimizer options must not be shared between groups or optimizer
+defaults: ordinary YAML `betas` are normalized to a tuple; custom shared lists,
+dictionaries and tensor-valued learning rates require explicitly independent
+copies. This avoids changing aliasing semantics on resume.
+The model implementation and training program must also be the same trusted
+version on save and resume; custom `state_dict`/`load_state_dict` overrides or
+other user code can change training semantics outside this identity check.
+Do not use raw DCP `OptimizerState` or `MultiOptimizer.load_state_dict` to
+resume: they cannot establish scheduler and group provenance. The standalone
+`MultiOptimizer.state_dict()` returns a snapshot and copies tensor states on
+their current devices, which can temporarily require as much extra device
+memory as the optimizer tensors themselves. That raw snapshot supports the
+built-in AdamW, AnyPrecisionAdamW and DistributedMuon leaves, as well as
+registered adapters, provided they have no unsupported serialization hooks.
+It does not prove the identity needed for raw restoration. Use the high-level
+`DistributedCheckpointer` for save and restore; its save path avoids this copy.
+
+For the base and DPO policy ExtraParallel runtimes, a versioned checkpoint's rank inventory is
+used to temporarily include its previously owned frozen parameters while building
+the optimizer. Their frozen flags are restored before the first forward and the
+complete source group and scheduler identity is still checked on load. Frozen
+parameters can be intentionally unfrozen after recovery. Unproven legacy
+checkpoints and changed freeze configurations require verified migration.
 
 ## Related pages
 

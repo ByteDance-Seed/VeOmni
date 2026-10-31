@@ -166,7 +166,7 @@ def test_sparse_leaf_learning_rate_survives_dcp_roundtrip(tmp_path):
     assert restored_bias.param_groups[0]["lr"] == 0.0025
 
 
-def test_sparse_leaf_post_hook_live_reorder_survives_dcp_roundtrip(tmp_path):
+def test_sparse_leaf_post_hook_live_reorder_is_rejected_before_dcp_save(tmp_path):
     def build():
         model = torch.nn.Linear(2, 2)
         leaf = torch.optim.AdamW([{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}])
@@ -175,13 +175,11 @@ def test_sparse_leaf_post_hook_live_reorder_survives_dcp_roundtrip(tmp_path):
     model, leaf, optimizer = build()
     leaf.register_state_dict_post_hook(lambda opt, state: (opt.param_groups.reverse(), state)[1])
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
-    restored_model, restored_leaf, restored = build()
-    DistributedCheckpointer.load(
-        str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
-    )
-    assert restored_leaf.param_groups[0]["lr"] == 0.01
-    assert restored_leaf.param_groups[1]["lr"] == 0.02
+    with pytest.raises(RuntimeError, match="cannot prove custom optimizer serialization hooks"):
+        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    assert leaf.param_groups[0]["params"][0] is model.weight
+    assert leaf.param_groups[1]["params"][0] is model.bias
+    assert not list(tmp_path.iterdir())
 
 
 def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
@@ -207,20 +205,32 @@ def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
             second = torch.optim.AdamW(model[1].parameters(), lr=0.01)
             return model, first, second, MultiOptimizer(model, {"first": first, "second": second}, ["first", "second"])
 
+        from veomni.optim.lr_scheduler import build_lr_scheduler
+
         model, first, second, optimizer = build(42)
-        scheduler = torch.optim.lr_scheduler.StepLR(second, step_size=1, gamma=0.25)
+        scheduler = build_lr_scheduler(optimizer, train_steps=4, lr=0.01, lr_decay_style="linear", lr_warmup_ratio=0)
         model(torch.ones(2, 4)).sum().backward()
         for param in model[1].parameters():
             param.grad = None
         first.step()
         first.zero_grad()
-        second.step()
-        scheduler.step()
+        for _ in range(3):
+            second.step()
+            scheduler.step()
         assert second.param_groups[0]["lr"] == 0.0025
         assert first.state
         assert not second.state
         source_shards = [param.to_local().detach().clone() for param in model.parameters()]
-        DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {
+                "model": model,
+                "optimizer": optimizer,
+                "extra_state": {"lr_scheduler": scheduler.state_dict()},
+                "_veomni_scheduler_object": scheduler,
+            },
+            parallel_state=parallel,
+        )
         assert not second.state
         for expected, param in zip(source_shards, model.parameters(), strict=True):
             torch.testing.assert_close(expected, param.to_local(), rtol=0, atol=0)
@@ -230,9 +240,17 @@ def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
             not torch.equal(saved, param.to_local())
             for saved, param in zip(source_shards, restored_model.parameters(), strict=True)
         )
-        DistributedCheckpointer.load(
-            checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+        restored_scheduler = build_lr_scheduler(
+            restored, train_steps=4, lr=0.01, lr_decay_style="linear", lr_warmup_ratio=0
         )
+        recovered = {
+            "model": restored_model,
+            "optimizer": restored,
+            "extra_state": {},
+            "_veomni_scheduler_object": restored_scheduler,
+        }
+        DistributedCheckpointer.load(checkpoint, recovered, parallel_state=parallel)
+        restored_scheduler.load_state_dict(recovered["extra_state"]["lr_scheduler"])
         assert restored_second.param_groups[0]["lr"] == 0.0025
         for expected, param in zip(source_shards, restored_model.parameters(), strict=True):
             torch.testing.assert_close(expected, param.to_local(), rtol=0, atol=0)

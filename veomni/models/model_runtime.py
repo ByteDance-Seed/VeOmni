@@ -143,7 +143,54 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
-            self._build_optimizer()
+            from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            specs = getattr(self.model, "_fqn2spec_info", None)
+            has_specs = _coordinated_optimizer_flag(specs is not None, "ExtraParallel model plan presence")
+            canonical = _coordinated_optimizer_flag(
+                getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False),
+                "canonical ExtraParallel checkpoint policy",
+            )
+            layout_error = None
+            try:
+                if canonical:
+                    from torch.distributed.tensor import Shard
+
+                    if not has_specs:
+                        raise RuntimeError(
+                            "Canonical ExtraParallel checkpointing requires an ExtraParallel model plan"
+                        )
+                    for spec in specs.values():
+                        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
+                            spec.checkpoint_layout_v2 = True
+            except BaseException as exc:
+                layout_error = exc
+            raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")
+            if has_specs:
+                from ..checkpoint.dcp_checkpointer import _validate_optimizer_model_layout
+
+                layout_error = None
+                try:
+                    _validate_optimizer_model_layout(self.model)
+                except BaseException as exc:
+                    layout_error = exc
+                raise_if_any_rank_failed(layout_error, "validating optimizer model checkpoint layout")
+            checkpoint_path = self.train_args.checkpoint.load_path
+            recover_ownership = bool(
+                checkpoint_path
+                and self.model_name in ("base", "policy")
+                and (getattr(self.model, "_fqn2spec_info", None) is not None or self.args.optimizer.type in ("muon",))
+            )
+            recover_ownership = _coordinated_optimizer_flag(recover_ownership, "frozen optimizer ownership policy")
+            if recover_ownership:
+                _coordinated_optimizer_flag(checkpoint_path, "frozen optimizer checkpoint path")
+                from ..checkpoint.rank_local_optimizer import recover_frozen_optimizer_ownership
+
+                with recover_frozen_optimizer_ownership(self.model, checkpoint_path):
+                    self._build_optimizer()
+            else:
+                self._build_optimizer()
         self._build_model_assets()
         self.build_checkpoint()
 

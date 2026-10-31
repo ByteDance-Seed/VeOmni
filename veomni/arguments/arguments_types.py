@@ -248,6 +248,12 @@ class OptimizerConfig:
         },
     )
 
+    def __post_init__(self):
+        # YAML sequences arrive as lists; the declared tuple also prevents
+        # optimizer defaults and groups from sharing mutable beta options.
+        if isinstance(self.betas, list):
+            self.betas = tuple(self.betas)
+
 
 @dataclass
 class WandbConfig:
@@ -931,6 +937,13 @@ class AcceleratorConfig:
 @dataclass
 class CheckpointConfig:
     """train.checkpoint.* — Checkpoint saving and loading."""
+
+    extra_parallel_canonical_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
+        },
+    )
 
     output_dir: str = field(
         default="output",
