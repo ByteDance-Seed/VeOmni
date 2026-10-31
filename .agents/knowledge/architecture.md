@@ -364,7 +364,7 @@ model scopes. Selected experts still require BF16 FSDP2 without CPU offload
 or compilation. Config parsing always validates the flag's boolean type.
 The pre-hook quantizes local shards and separately gathers compact scales;
 native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
-`GroupedLinear`, preserving BF16-facing autograd and high precision master
+`GroupedLinear`, preserving BF16-facing autograd and high-precision master
 shards. Native FSDP manages both payload and scale storage on reshard.
 Synchronous activation offload skips the opaque weight container and leaves
 that lifecycle to FSDP, while ordinary saved activations still offload.

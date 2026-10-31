@@ -846,7 +846,7 @@ Temporary packing storage trades memory traffic for fewer collective launches.
 projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
 CPU tests do not establish native throughput or numerical acceptance.
 
-### EP weighted token combine
+### EP-weighted token combine
 
 The shared EP dispatcher uses `moe_unpermute/standard/triton` on NVIDIA GPUs
 and `moe_unpermute/standard/eager` elsewhere or when deterministic algorithms
