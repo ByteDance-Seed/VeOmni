@@ -4189,7 +4189,9 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
         # distinguish them from HF's canonical axis-first layout.
         # Precompute image/video ViT varlen metadata after SP padding so the local
         # VisionModel path does not synchronize GPU tensors back to the host.
-        return qwen4_exp_collate_metadata
+        from veomni.data.data_collator import SerializablePureCollatorHook
+
+        return SerializablePureCollatorHook(qwen4_exp_collate_metadata, "veomni:qwen4-exp-metadata-v1")
         # --- Patch.1 ---
 
     def get_parallel_plan(self):
