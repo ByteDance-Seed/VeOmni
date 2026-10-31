@@ -107,18 +107,6 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
         dist.all_gather_object(results, (error, trainer.state.global_step, entered))
         assert all(message and "empty step" in message and step == 3 and not seen for message, step, seen in results)
 
-        batch = {"padding_flag": torch.tensor([1, 0])} if rank == 0 else {"labels": torch.tensor([1])}
-        error = None
-        try:
-            trainer.train_step(iter([[batch]]))
-        except RuntimeError as exc:
-            error = str(exc)
-        dist.all_gather_object(results, (error, trainer.state.global_step, entered))
-        assert all(
-            message and "Invalid padding metadata" in message and step == 3 and not seen
-            for message, step, seen in results
-        )
-
         batches = [{"labels": torch.tensor([1])} for _ in range(rank + 1)]
         error = None
         try:

@@ -568,7 +568,7 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     marks = []
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
-    monkeypatch.setattr("veomni.trainer.base.count_loss_token_synchronized", lambda *_: 1)
+    monkeypatch.setattr("veomni.trainer.base.count_loss_token", lambda *_: 1)
     monkeypatch.setattr("veomni.trainer.base.reduce_global_loss_token", lambda token_count, **kwargs: token_count)
 
     trainer = VLMTrainer.__new__(VLMTrainer)

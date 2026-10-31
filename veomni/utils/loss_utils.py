@@ -90,20 +90,12 @@ def _has_auxiliary_labels(batch) -> bool:
 def reject_distributed_padding(batch) -> bool:
     """Reject unequal/padded steps and return whether any rank has auxiliary labels."""
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        error = None
-        try:
-            invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
-            has_auxiliary_targets = _has_auxiliary_labels(batch)
-        except Exception as exc:  # noqa: BLE001 - peers must reach the validation collective
-            error = exc
-            invalid = True
-            has_auxiliary_targets = False
-        found, has_error, has_auxiliary_targets = _distributed_batch_status(
-            batch, invalid, error is not None, has_auxiliary_targets
+        invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+        has_auxiliary_targets = _has_auxiliary_labels(batch)
+        found, _, has_auxiliary_targets = _distributed_batch_status(
+            batch, invalid, has_auxiliary_targets=has_auxiliary_targets
         )
         if found:
-            if has_error:
-                raise RuntimeError("Invalid padding metadata on a rank") from error
             raise RuntimeError(
                 "Distributed training does not support padded micro-batches, an empty step, "
                 "or unequal microbatch counts across ranks"
@@ -228,4 +220,4 @@ def reduce_global_loss_token(
         if isinstance(error, StopIteration):
             raise RuntimeError("Step-begin callback raised StopIteration") from error
         raise error
-    return {key: all_reduce(value.item(), op="sum") for key, value in sorted(micro_batches_token_len.items())}
+    return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
