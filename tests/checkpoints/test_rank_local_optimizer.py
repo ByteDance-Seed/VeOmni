@@ -20,6 +20,7 @@ from veomni.checkpoint.rank_local_optimizer import (
     verify_replicated_model_shards,
 )
 from veomni.distributed.parallel_plan import SpecInfo
+from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
 from veomni.optim.muon import DistributedMuon
 from veomni.optim.optimizer import MultiOptimizer
 
@@ -156,10 +157,14 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
         )
         model = torch.nn.Module()
         values = torch.arange(16, dtype=torch.float32).reshape(4, 4) + 100 * owner
+        if kind == "offload":
+            values = values.to(torch.bfloat16)
         fsdp_axis = 0 if same_axis else 1
         model.register_parameter("weight", torch.nn.Parameter(distribute_tensor(values, fsdp, [Shard(fsdp_axis)])))
         model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", mesh, fsdp_axis, None, (8, 4), canonical)}
-        if kind == "muon":
+        if kind == "offload":
+            leaf = CPUOffloadAdamW([{"params": [model.weight], "cpu_offload": True}], lr=0.01)
+        elif kind == "muon":
             leaf = DistributedMuon([model.weight], lr=0.01, ns_implementation="std")
         else:
             leaf = torch.optim.AdamW([model.weight], lr=0.01)
@@ -220,7 +225,7 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
 
 
 @pytest.mark.parametrize("inactive_owner", [False, True])
-@pytest.mark.parametrize("kind", ["adam", "muon"])
+@pytest.mark.parametrize("kind", ["adam", "offload", "muon"])
 @pytest.mark.parametrize("canonical", [False, True])
 def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kind, canonical):
     mp.spawn(

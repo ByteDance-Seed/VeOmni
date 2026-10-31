@@ -180,7 +180,11 @@ class VeOmniModelRuntime:
             recover_ownership = bool(
                 checkpoint_path
                 and self.model_name in ("base", "policy")
-                and (getattr(self.model, "_fqn2spec_info", None) is not None or self.args.optimizer.type in ("muon",))
+                and (
+                    getattr(self.model, "_fqn2spec_info", None) is not None
+                    or self.args.optimizer.type
+                    in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "muon")
+                )
             )
             recover_ownership = _coordinated_optimizer_flag(recover_ownership, "frozen optimizer ownership policy")
             if recover_ownership:

@@ -85,7 +85,9 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal[
+        "adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw"
+    ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -248,7 +250,20 @@ class OptimizerConfig:
         },
     )
 
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master and moments for optimizer offload."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "Resident Adam moment precision; master remains FP32."}
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "CPU-offloaded Adam moment precision; master remains FP32."}
+    )
+
     def __post_init__(self):
+        if isinstance(self.lr, (list, tuple)):
+            raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
         # YAML sequences arrive as lists; the declared tuple also prevents
         # optimizer defaults and groups from sharing mutable beta options.
         if isinstance(self.betas, list):

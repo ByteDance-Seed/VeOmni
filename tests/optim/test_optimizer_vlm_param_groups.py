@@ -9,6 +9,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments.arguments_types import OptimizerConfig
 from veomni.optim.optimizer import (
     build_optimizer,
     filter_empty_param_groups,
@@ -25,6 +26,44 @@ class _TinyModel(torch.nn.Module):
 
     def forward(self, x):
         return self.backbone(x)
+
+
+def test_optimizer_config_positional_learning_rate_preserves_adamw_update():
+    config = OptimizerConfig("adamw", 0.02, 0.003, 0.001)
+    assert (config.lr, config.lr_min, config.lr_start) == (0.02, 0.003, 0.001)
+
+    model = _TinyModel()
+    reference = _TinyModel()
+    reference.load_state_dict(model.state_dict())
+    optimizer = build_optimizer(model, lr=config.lr, betas=config.betas, weight_decay=0.0, optimizer_type=config.type)
+    expected = torch.optim.AdamW(reference.parameters(), lr=0.02, betas=config.betas, weight_decay=0.0)
+    for actual_param, reference_param in zip(model.parameters(), reference.parameters(), strict=True):
+        actual_param.grad = torch.ones_like(actual_param)
+        reference_param.grad = torch.ones_like(reference_param)
+    optimizer.step()
+    expected.step()
+    for actual_param, reference_param in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(actual_param, reference_param, rtol=0, atol=0)
+
+
+def test_optimizer_config_offload_options_remain_keyword_compatible():
+    config = OptimizerConfig(
+        "cpu_offload_adamw",
+        0.02,
+        cpu_offload_param_patterns=["backbone.weight"],
+        cpu_offload_resident_moment_dtype="bfloat16",
+        cpu_offload_cpu_moment_dtype="float32",
+    )
+    assert config.lr == 0.02
+    assert config.cpu_offload_param_patterns == ["backbone.weight"]
+    assert config.cpu_offload_resident_moment_dtype == "bfloat16"
+    assert config.cpu_offload_cpu_moment_dtype == "float32"
+
+
+@pytest.mark.parametrize("optimizer_type", ["cpu_offload_adamw", "adamw", "anyprecision_adamw"])
+def test_optimizer_config_rejects_old_draft_offload_positional_options(optimizer_type):
+    with pytest.raises(TypeError, match="CPU-offload options by keyword"):
+        OptimizerConfig(optimizer_type, ["backbone.weight"], "bfloat16", "float32")
 
 
 def test_filter_empty_param_groups_drops_frozen_vit_group():
