@@ -29,6 +29,15 @@
     ]
   },
   {
+    "name": "dpo-pair-normalization-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_dpo_pair_mean.py"
+    ]
+  },
+  {
     "name": "npu-unit-03",
     "suite": "unit",
     "args": [

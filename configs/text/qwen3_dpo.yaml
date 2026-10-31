@@ -49,6 +49,8 @@ train:
     name: Qwen3-0.6B-dpo-ultrafeedback
 
 dpo_config:
+  # Audit this model's tokenizer backend and chat template, then set its fingerprint.
+  audited_unpadded_tokenizer_sha256: null
   beta: 0.1
   label_smoothing: 0.0
   loss_type: sigmoid
