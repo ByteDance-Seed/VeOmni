@@ -280,7 +280,26 @@ class GlobalStateCallback(Callback):
             return None
 
         global_state = current_state if current_state is not None else legacy_state
-        self.trainer.state.global_step = global_state["global_step"]
+        # This cursor format cannot be resumed after the one-shot drain path
+        # was removed. Check it before *any* rank enters loader restoration;
+        # custom loaders may perform their own collectives during restore.
+        cursor = None
+        global_step = None
+        cursor_error = None
+        try:
+            cursor = global_state.get("train_dataloader")
+            global_step = global_state["global_step"]
+            if isinstance(cursor, dict) and "_veomni_source_exhausted" in cursor:
+                from ...data.dynamic_batching import DynamicBatchSizeDataLoader, _check_legacy_exhausted_cursor
+
+                if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
+                    _check_legacy_exhausted_cursor(cursor)
+        except BaseException as exc:
+            cursor_error = exc
+        default_group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
+
+        self.trainer.state.global_step = global_step
         self._restore_position(global_state)
 
         channel_loss_state = global_state.get("channel_loss_callback")
@@ -293,8 +312,24 @@ class GlobalStateCallback(Callback):
         if offline_cache_writer_state is not None and offline_cache_writer is not None:
             offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
-        if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
-            self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
+        if self.trainer.train_dataloader is not None and cursor is not None:
+            # DynamicBatchSizeDataLoader.load_state_dict immediately creates
+            # the wrapped iterator. Stateful worker snapshots need the saved
+            # sampler epoch before that iterator starts prefetching.
+            if self.trainer.start_step:
+                from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+                from ...data.data_loader import DistributedDataloader
+                from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+                loader = self.trainer.train_dataloader
+                if (
+                    type(loader) is DynamicBatchSizeDataLoader
+                    and type(loader._dataloader) is DistributedDataloader
+                    and type(loader._dataloader.sampler) is StatefulDistributedSampler
+                ):
+                    loader.set_epoch(self.trainer.start_epoch)
+            self.trainer.train_dataloader.load_state_dict(cursor)
 
         # OmniTrainer checkpoints written before it had a meter store None here.
         if global_state.get("environ_meter") is not None:
