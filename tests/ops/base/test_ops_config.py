@@ -95,7 +95,32 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
 
     config = OpsImplementationConfig(**values)
     assert config.moe_implementation == values["moe_implementation"]
-    assert config.qat_implementation == values.get("qat_implementation", "none")
+    assert config.qat_implementation == values.get("qat_implementation")
+
+
+@pytest.mark.parametrize("recipe", [None, "none"])
+def test_qat_reload_with_trainer_ops_override(tmp_path, recipe):
+    from transformers import Qwen3Config
+
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.arguments.parser import _instantiate_recursive
+    from veomni.models import build_config
+
+    targets = ["model.layers.*.mlp.*_proj"]
+    Qwen3Config(
+        ops_implementation={
+            "qat_implementation": "torchao_mxfp4",
+            "qat_target_modules": targets,
+            "rms_norm_implementation": "eager",
+        }
+    ).save_pretrained(tmp_path)
+    values = {} if recipe is None else {"qat_implementation": recipe}
+    ops = _instantiate_recursive(OpsImplementationConfig, values)
+    reloaded = build_config(str(tmp_path), ops_implementation=ops)
+    expected = "torchao_mxfp4" if recipe is None else "none"
+    assert reloaded.ops_config.qat_implementation == expected
+    assert reloaded.ops_config.qat_target_modules == (targets if recipe is None else None)
+    assert reloaded.ops_config.rms_norm_implementation is None
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):

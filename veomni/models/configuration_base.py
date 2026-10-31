@@ -180,6 +180,17 @@ class VeOmniPretrainedConfig(PretrainedConfig):
 
         def collect(config, incoming):
             merged = dict(incoming) if replace and not _is_post_init else {**config.ops_implementation, **incoming}
+            # Kernel replacement must not implicitly disable a saved QAT recipe.
+            if replace and not _is_post_init and "qat_implementation" not in incoming:
+                for key in ("qat_implementation", "qat_target_modules"):
+                    if key in config.ops_implementation:
+                        merged[key] = config.ops_implementation[key]
+            if (
+                "qat_implementation" in incoming
+                and incoming["qat_implementation"] != "torchao_mxfp4"
+                and "qat_target_modules" not in incoming
+            ):
+                merged.pop("qat_target_modules", None)
             proposed = dict(merged)
             if proposed.get("attn_implementation") is not None:
                 proposed["attn_implementation"] = OpsImplementationConfig.normalize_attention_backend(
@@ -285,7 +296,9 @@ def _resolve_ops(selections):
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
 
-    resolved = OpsImplementationConfig(**{key: value for key, value in selections.items() if value is not None})
+    resolved = OpsImplementationConfig(
+        **{"qat_implementation": "none", **{key: value for key, value in selections.items() if value is not None}}
+    )
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:
         resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(

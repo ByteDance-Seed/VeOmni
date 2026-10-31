@@ -1564,8 +1564,8 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise", "torchao_mxfp4"] = field(
-        default="none",
+    qat_implementation: Optional[Literal["none", "fp8_blockwise", "torchao_mxfp4"]] = field(
+        default=None,
         metadata={
             "help": "Quantization-aware training recipe. 'fp8_blockwise' makes DeepSeek V4 training "
             "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
@@ -1574,7 +1574,8 @@ class OpsImplementationConfig:
             "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "Unset preserves the saved recipe, defaulting to 'none'; explicit 'none' disables QAT. "
+            "Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
             "VeomniOp -- see veomni/ops/qat/. 'torchao_mxfp4' selects emulated W4A4 QAT for "
             "explicit Dense Qwen3 projections (see qat_target_modules). "
@@ -1711,7 +1712,7 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        if self.qat_implementation not in ("none", "fp8_blockwise", "torchao_mxfp4"):
+        if self.qat_implementation not in (None, "none", "fp8_blockwise", "torchao_mxfp4"):
             raise ValueError(f"Unknown qat_implementation={self.qat_implementation!r}.")
         if self.qat_implementation == "torchao_mxfp4":
             if (
@@ -1723,7 +1724,7 @@ class OpsImplementationConfig:
         elif self.qat_target_modules is not None:
             raise ValueError("qat_target_modules is only supported with qat_implementation='torchao_mxfp4'.")
 
-        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation not in (None, "none"):
             raise ValueError(
                 "moe_implementation='deepgemm_fp8' cannot be combined with "
                 f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
