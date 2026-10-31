@@ -2367,6 +2367,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):

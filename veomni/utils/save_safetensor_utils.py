@@ -53,7 +53,7 @@ def get_model_save_state(
     """
     from contextlib import nullcontext
 
-    from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.checkpoint.dcp_checkpointer import ModelState, _export_extra_parallel_layout_key
     from veomni.distributed.parallel_state import use_parallel_state
     from veomni.models.checkpoint import get_checkpoint_tensor_converter
 
@@ -132,6 +132,10 @@ def get_model_save_state(
     # so the original model parameters remain unchanged.
     converted_state = {}
     for k, v in save_state.items():
+        # Translate versioned DCP-only names back to their HuggingFace FQNs.
+        k = _export_extra_parallel_layout_key(k)
+        if k is None:
+            continue
         if v.dtype == torch.float32:
             logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
             converted_state[k] = v.to(torch.bfloat16)
@@ -171,14 +175,23 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
+    from veomni.checkpoint.dcp_checkpointer import _reject_unproven_extra_parallel_optimizer
+
     # Apply DCP consolidation patch just-in-time for HDFS FUSE compatibility
     # This patches torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
     # to use append mode instead of r+b mode, which is required for append-only file systems
     from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    from veomni.utils.dist_utils import raise_if_any_rank_failed
 
     apply_dcp_consolidation_patch()
 
-    save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
+    _reject_unproven_extra_parallel_optimizer({"model": model}, parallel_state)
+    save_state, error = None, None
+    try:
+        save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "preparing distributed HF checkpoint")
 
     # Filter fqn_to_index_mapping to only include keys that exist in save_state.
     # This is necessary when training excludes certain modules (e.g., MTP) but the original
@@ -357,6 +370,8 @@ def save_lora_adapter_with_dcp(
     MoE-LoRA adapter instead of every rank reading the whole gathered ``[E, ...]``
     tensor. ``load_adapter_state_dict`` already prefers ``adapter_model.safetensors``.
     """
+    from torch.distributed.tensor import Shard
+
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict
 
@@ -366,16 +381,62 @@ def save_lora_adapter_with_dcp(
             "LoRA is served exclusively by the native veomni.lora stack."
         )
 
+    from ..checkpoint.dcp_checkpointer import (
+        _extra_parallel_layout_key,
+        _needs_extra_parallel_layout_marker,
+        _runtime_extra_parallel_layout_signature,
+        _validate_extra_parallel_tensor_v2,
+    )
+    from .dist_utils import raise_if_any_rank_failed
+
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    error, signature = None, None
+    try:
+        if _needs_extra_parallel_layout_marker(fqn2spec_info):
+            _extra_parallel_layout_key(fqn2spec_info)
+            signature = _runtime_extra_parallel_layout_signature(fqn2spec_info)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking LoRA ExtraParallel layout")
+    if dist.is_initialized():
+        signatures = [None] * dist.get_world_size()
+        dist.all_gather_object(signatures, signature)
+        if any(item != signature for item in signatures):
+            raise RuntimeError("Ranks disagree on LoRA ExtraParallel checkpoint layout")
+
     synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     os.makedirs(save_path, exist_ok=True)
     dcp_save_path = os.path.join(save_path, dcp_subdir)
+    lora_state, error = None, None
+    try:
+        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
+        lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+        for name, value in lora_state.items():
+            spec = (fqn2spec_info or {}).get(name)
+            if spec is None and name.endswith(".weight"):
+                spec = (fqn2spec_info or {}).get(f"{name[: -len('.weight')]}.{adapter_name}.weight")
+            if (
+                spec is not None
+                and getattr(spec, "checkpoint_layout_v2", False)
+                and isinstance(spec.placement, Shard)
+                and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+            ):
+                mesh = spec.para_fsdp_mesh
+                _validate_extra_parallel_tensor_v2(
+                    value,
+                    mesh,
+                    mesh[mesh.mesh_dim_names[:-1]],
+                    spec.placement.dim,
+                    spec.fsdp_shard_dim,
+                    spec.global_shape,
+                )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking LoRA ExtraParallel runtime tensors")
     os.makedirs(dcp_save_path, exist_ok=True)
-
-    lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
-    lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
 
     # Restore the EP shard dim before DCP sees the LoRA tensors. After
     # ``ParallelPlan.apply`` the EP-sharded params are stored as plain
@@ -388,11 +449,10 @@ def save_lora_adapter_with_dcp(
     # as a 2-D (FSDP+EP) DTensor so DCP gathers both dimensions.
     # Mirrors what ``ModelState.get_state_dict_with_extra_parallel_dim_preprocess``
     # does for the regular checkpoint path.
-    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
     if fqn2spec_info is not None:
         from torch.distributed._tensor import Shard as _ShardPlacement
 
-        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim, restore_extra_parallel_dim_v2
 
         # ``get_peft_model_state_dict`` strips the adapter name from keys
         # (``...gate_proj.lora_A.default.weight`` -> ``...gate_proj.lora_A.weight``)
@@ -405,12 +465,27 @@ def save_lora_adapter_with_dcp(
             if spec is None and name.endswith(".weight"):
                 spec_key = f"{name[: -len('.weight')]}.{adapter_name}.weight"
                 spec = fqn2spec_info.get(spec_key)
-            if spec is not None and isinstance(spec.placement, _ShardPlacement) and spec.para_fsdp_mesh is not None:
-                lora_state[name] = restore_extra_parallel_dim(
-                    lora_state[name],
-                    spec.para_fsdp_mesh,
-                    spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
-                )
+            if (
+                spec is not None
+                and isinstance(spec.placement, _ShardPlacement)
+                and spec.para_fsdp_mesh is not None
+                and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+            ):
+                if getattr(spec, "checkpoint_layout_v2", False):
+                    lora_state[name] = restore_extra_parallel_dim_v2(
+                        lora_state[name],
+                        spec.para_fsdp_mesh,
+                        spec.para_fsdp_mesh[spec.para_fsdp_mesh.mesh_dim_names[:-1]],
+                        ep_shard_dim=spec.placement.dim,
+                        fsdp_shard_dim=spec.fsdp_shard_dim,
+                        global_shape=spec.global_shape,
+                    )
+                else:
+                    lora_state[name] = restore_extra_parallel_dim(
+                        lora_state[name],
+                        spec.para_fsdp_mesh,
+                        spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                    )
 
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
     # Prefix LoRA keys temporarily for DCP save so consolidation can reuse existing conversion logic.

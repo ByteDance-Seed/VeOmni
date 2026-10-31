@@ -235,6 +235,26 @@ To drop legacy resume, delete `veomni/checkpoint/legacy_v0_1_12.py` and the
 imports that load it (search for `legacy_v0_1_12`). An old checkpoint then fails
 resume instead of falling back.
 
+## Versioned ExtraParallel layout
+
+The EP-outer layout is opt-in through `SpecInfo.checkpoint_layout_v2`; existing
+plans remain on their original layout. A plan enabling it must retain the
+original `global_shape` and must use FSDP DTensor parameters. Every
+non-persistent ExtraParallel shard in a checkpoint must use the canonical
+layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
+identifies canonical global values independently of source geometry, so DCP can
+reshard a model checkpoint across supported FSDP shard axes. Use
+`DistributedCheckpointer` for save and resume: it rejects old/unversioned
+layouts before copying model tensors. Migrating a legacy checkpoint requires
+verified source layout information. Canonical v2 optimizer save and resume are
+rejected until an owner-aware codec can preserve rank-specific optimizer
+states; this opt-in therefore does not yet support resuming training. The
+standard VeOmni HF export strips the namespace.
+
+Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
+supported migration API: it can return success without reading any tensor when
+the namespaces differ. Replicated values must already agree across ranks.
+
 ## Related pages
 
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
