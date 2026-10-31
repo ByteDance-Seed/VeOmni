@@ -499,6 +499,22 @@ class GlobalStateCallback(Callback):
                 and global_state.get("train_dataloader") is not None
             ):
                 cursor = global_state["train_dataloader"]
+                # For SFT, the native dynamic loader creates worker iterators
+                # while loading the cursor, so seed its sampler first. DPO has
+                # already done this above as part of its position protocol.
+                if not dpo_recovery and self.trainer.start_step:
+                    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+                    from ...data.data_loader import DistributedDataloader
+                    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+                    loader = self.trainer.train_dataloader
+                    if (
+                        type(loader) is DynamicBatchSizeDataLoader
+                        and type(loader._dataloader) is DistributedDataloader
+                        and type(loader._dataloader.sampler) is StatefulDistributedSampler
+                    ):
+                        loader.set_epoch(self.trainer.start_epoch)
                 # DynamicBatchSizeDataLoader copies its input itself. Avoid a
                 # redundant full buffer copy while preserving the saved cursor
                 # for the second, post-validation restore.
