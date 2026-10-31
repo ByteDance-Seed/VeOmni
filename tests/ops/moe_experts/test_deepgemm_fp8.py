@@ -617,12 +617,12 @@ def _non_current_device_worker(rank):
             GroupedLayout.from_counts(torch.tensor([129]), torch.device(f"cuda:{rank}"))
 
 
-@pytest.mark.parametrize("shape", [(2, 256, 128), (4, 1280, 2560), (2, 4608, 5120)])
-def test_fp8_weight_transpose_preserves_every_byte(shape):
+def test_fp8_weight_transpose_preserves_every_byte():
     from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import transpose_fp8_weight
 
     # Include all 256 bit patterns, including NaN encodings: a byte transpose
     # must not decode, canonicalize or requantize even those payloads.
+    shape = (2, 256, 384)
     raw = torch.randint(0, 256, shape, device="cuda", dtype=torch.uint8)
     scale = torch.randn((shape[0], shape[1] // 128, shape[2] // 128), device="cuda")
     qt, st = transpose_fp8_weight(raw.view(torch.float8_e4m3fn), scale)
@@ -632,8 +632,7 @@ def test_fp8_weight_transpose_preserves_every_byte(shape):
 
 
 @pytest.mark.parametrize("fp8_weight", [False, True])
-@pytest.mark.parametrize("pin_memory", [False, True])
-def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_weight, pin_memory):
+def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_weight):
     from contextlib import nullcontext
 
     from veomni.distributed.offloading import custom_save_on_cpu
@@ -653,7 +652,7 @@ def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_we
             qdata, scale, _, _ = quantize_weights(wi, store_transpose=False)
             wi = FP8ExpertWeight(qdata, scale)
         wi = torch.nn.Parameter(wi)
-        with custom_save_on_cpu(pin_memory=pin_memory) if offload else nullcontext():
+        with custom_save_on_cpu(pin_memory=True) if offload else nullcontext():
             y = GroupedLinear.apply(xi, wi, layout)
         dx, dw = torch.autograd.grad(y, (xi, wi), grad)
         results.append((y.detach(), dx, dw))

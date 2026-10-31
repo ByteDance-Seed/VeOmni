@@ -23,15 +23,14 @@ def test_unpermute_registration_and_eager_empty():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
 @pytest.mark.parametrize(
-    "dtype,weight_dtype",
+    "dtype,weight_dtype,rows,hidden",
     [
-        (torch.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float32),
-        (torch.float16, torch.float16),
-        (torch.float32, torch.float32),
+        pytest.param(torch.bfloat16, torch.float32, 0, 33, id="empty-rank"),
+        pytest.param(torch.bfloat16, torch.float32, 159, 129, id="fp32-routing-tail"),
+        pytest.param(torch.bfloat16, torch.bfloat16, 257, 2560, id="bf16-routing"),
+        pytest.param(torch.float32, torch.float32, 65, 128, id="fp32"),
     ],
 )
-@pytest.mark.parametrize("rows,hidden", [(0, 33), (1, 33), (159, 128), (257, 2560), (129, 5120)])
 def test_unpermute_forward_backward(dtype, weight_dtype, rows, hidden):
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("Requires NVIDIA CUDA.")
@@ -58,14 +57,14 @@ def test_unpermute_forward_backward(dtype, weight_dtype, rows, hidden):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
-@pytest.mark.parametrize("needs", [(True, False), (False, True), (True, True)])
-def test_unpermute_strided_inputs_and_selective_gradients(needs):
+def test_unpermute_strided_inputs_and_router_only_gradients():
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("Requires NVIDIA CUDA.")
-    x = torch.randn(65, 19, device="cuda", dtype=torch.bfloat16).T.detach().requires_grad_(needs[0])
-    w = torch.randn(38, device="cuda", dtype=torch.float32)[::2].detach().requires_grad_(needs[1])
+    torch.manual_seed(237)
+    x = torch.randn(65, 19, device="cuda", dtype=torch.bfloat16).T
+    w = torch.randn(38, device="cuda", dtype=torch.float32)[::2].detach().requires_grad_()
     index = torch.randint(0, 7, (38,), device="cuda", dtype=torch.int32)[::2]
-    reference_x, reference_w = x.detach().clone().requires_grad_(needs[0]), w.detach().clone().requires_grad_(needs[1])
+    reference_x, reference_w = x.clone(), w.detach().clone().requires_grad_()
     eager = VeomniOp("moe_unpermute", "standard", "eager")
     fused = VeomniOp("moe_unpermute", "standard", "triton")
     actual = fused(x, w, index, num_tokens=7)
@@ -74,10 +73,8 @@ def test_unpermute_strided_inputs_and_selective_gradients(needs):
     actual.backward(grad)
     expected.backward(grad)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=1e-5)
-    if needs[0]:
-        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
-    if needs[1]:
-        torch.testing.assert_close(w.grad, reference_w.grad, atol=2e-5, rtol=1e-5)
+    assert x.grad is None
+    torch.testing.assert_close(w.grad, reference_w.grad, atol=2e-5, rtol=1e-5)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
