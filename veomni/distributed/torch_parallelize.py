@@ -15,6 +15,7 @@
 
 import types
 from collections.abc import Collection, Mapping
+from contextlib import nullcontext
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -130,6 +131,21 @@ def _has_extra_parallel_plan(model: nn.Module) -> bool:
             if para in getattr(parallel_state, "extra_parallel_sizes", ())
         )
     return True
+
+
+def _hf_loading_models(model, weights_path, should_skip_hf_weight_load, module_skip_hf_weight_load):
+    """Identify modules whose HF weights will be loaded by the materializer."""
+    if weights_path is None:
+        return ()
+    if not isinstance(weights_path, Mapping):
+        return () if should_skip_hf_weight_load else (model,)
+    children = dict(model.named_children())
+    skip_map = module_skip_hf_weight_load or {}
+    return tuple(
+        children[name]
+        for name, path in weights_path.items()
+        if name in children and path is not None and not skip_map.get(name, should_skip_hf_weight_load)
+    )
 
 
 def _materialize_and_load_weights(
@@ -938,22 +954,34 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    _materialize_and_load_weights(
-        model,
-        weights_path,
-        materialize_device,
-        should_skip_hf_weight_load=should_skip_hf_weight_load,
-        is_peft_model=kwargs.pop("is_peft_model", False),
-        adapter_path=kwargs.pop("adapter_path", None),
-        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
-        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
-        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
-        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
-        module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
-        module_is_peft_model=kwargs.pop("module_is_peft_model", None),
-        module_adapter_path=kwargs.pop("module_adapter_path", None),
-    )
+    source_policy = nullcontext()
+    if weights_path is not None and not kwargs.get("broadcast_model_weights_from_rank0"):
+        from ..models.qwen4_gdn_precision import qwen4_gdn_bf16_source_policy
+
+        loading_models = _hf_loading_models(
+            model, weights_path, should_skip_hf_weight_load, kwargs.get("module_skip_hf_weight_load")
+        )
+        policy_group = getattr(parallel_state, "fsdp_group", None)
+        if loading_models and policy_group is not None:
+            source_policy = qwen4_gdn_bf16_source_policy(loading_models, group=policy_group)
+
+    with source_policy:
+        _materialize_and_load_weights(
+            model,
+            weights_path,
+            materialize_device,
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            is_peft_model=kwargs.pop("is_peft_model", False),
+            adapter_path=kwargs.pop("adapter_path", None),
+            broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+            cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+            max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+            fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+            ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+            module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
+            module_is_peft_model=kwargs.pop("module_is_peft_model", None),
+            module_adapter_path=kwargs.pop("module_adapter_path", None),
+        )
 
     if materialize_device == "cpu":
         _move_buffers_to_device(model, get_device_type())

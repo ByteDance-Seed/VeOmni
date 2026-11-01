@@ -64,6 +64,8 @@ from veomni.models.qwen4_gdn_precision import (
     is_qwen4_exp_config,
     is_qwen4_gdn_parameter,
     preserve_qwen4_gdn_fp32,
+    qwen4_bf16_hf_source_allowed,
+    qwen4_gdn_bf16_source_policy,
     validate_qwen4_gdn_pairs,
 )
 from veomni.utils import logging
@@ -413,10 +415,24 @@ def _dispatch_parameter(
     # alias can fail when native CPU offload pins a DTensor's local shard.
     orig_tensor = module._parameters[local_name]
     if strict_gdn:
+        if tensor.dtype == torch.bfloat16 and orig_tensor.dtype == torch.float32 and qwen4_bf16_hf_source_allowed():
+            logger.warning_once(
+                "Loading BF16 Qwen4 GDN source values as FP32 by explicit opt-in. "
+                "The BF16 values are represented exactly; any precision lost before loading is not recoverable."
+            )
+            tensor = tensor.float()
         if tensor.dtype != torch.float32 or orig_tensor.dtype != torch.float32:
+            hint = ""
+            if (
+                tensor.dtype == torch.bfloat16
+                and orig_tensor.dtype == torch.float32
+                and dist.is_initialized()
+                and os.environ.get("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE") == "1"
+            ):
+                hint = " Distributed BF16 source opt-in requires a coordinated FSDP2 or rank-0 broadcast load."
             raise RuntimeError(
                 f"Qwen4 GDN {full_param_name} requires FP32 source and target; "
-                f"got source={tensor.dtype}, target={orig_tensor.dtype}"
+                f"got source={tensor.dtype}, target={orig_tensor.dtype}.{hint}"
             )
         if not tensor_is_local_dtensor_shard and tuple(tensor.shape) != tuple(orig_tensor.shape):
             raise RuntimeError(f"Qwen4 GDN {full_param_name} source and target shapes differ")
@@ -1351,8 +1367,18 @@ def _stream_lora_adapter_ep_sharded(
     )
 
 
+def _coordinated_qwen4_gdn_source_policy(loader):
+    @wraps(loader)
+    def wrapped(model, *args, **kwargs):
+        with qwen4_gdn_bf16_source_policy(model):
+            return loader(model, *args, **kwargs)
+
+    return wrapped
+
+
 @torch.no_grad()
 @_advise_after_hf_load("broadcast")
+@_coordinated_qwen4_gdn_source_policy
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,

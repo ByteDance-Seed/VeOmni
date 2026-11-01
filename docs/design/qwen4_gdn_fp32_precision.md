@@ -7,9 +7,17 @@ first forward or before constructing the FP32 optimizer master weights.
 
 The supported pretrained path constructs the model on `meta`, promotes these
 parameters before any HF tensors are loaded, and verifies the source dtype,
-shape and presence. A BF16 source is rejected: widening a rounded value cannot
-recover the original FP32 value. A materialized scratch model is initialized
-anew in FP32 before training. Parameter names remain unchanged.
+shape and presence. A BF16 HF source is rejected by default. To intentionally
+start a new run from a BF16 HF checkpoint, set
+`VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE=1` on every rank. BF16 values are exactly
+representable in FP32, so this opt-in preserves the supplied values but cannot
+recover precision discarded before the checkpoint was written. The target
+parameters, gradients and master weights remain FP32. The opt-in applies only
+to HF weight loading. Distributed opt-in is supported through the coordinated
+FSDP2 meta-init or rank-0 broadcast loading paths; other distributed loading
+paths continue to reject BF16 GDN sources. The opt-in does not permit BF16 DCP
+resume or optimizer-state migration. A materialized scratch model is
+initialized anew in FP32 before training. Parameter names remain unchanged.
 
 FSDP2 manages each layer's GDN scalar pair separately on the same FSDP mesh as
 the rest of that layer. Other parameters retain their existing FSDP, expert,

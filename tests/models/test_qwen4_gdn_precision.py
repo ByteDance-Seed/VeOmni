@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -19,7 +19,12 @@ from veomni.checkpoint.dcp_checkpointer import (
     _ModelStrictLoadPlanner,
 )
 from veomni.models.checkpoint.convert import parse_fqn_to_index_mapping_from_json
-from veomni.models.checkpoint.weights import _dispatch_parameter, post_process_after_weight_loading, save_model_weights
+from veomni.models.checkpoint.weights import (
+    _dispatch_parameter,
+    load_model_weights,
+    post_process_after_weight_loading,
+    save_model_weights,
+)
 from veomni.models.loader import CustomizedModelingLoader
 from veomni.models.qwen4_gdn_precision import (
     is_qwen4_exp_config,
@@ -197,10 +202,58 @@ def test_customized_loader_prepares_meta_before_pretrained_load(monkeypatch):
     assert observed == [("meta", torch.float32, "fp32-source", "cpu")]
 
 
-def test_hf_bf16_scalar_source_rejected():
+def test_hf_bf16_scalar_source_rejected(monkeypatch):
+    monkeypatch.delenv("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE", raising=False)
     model = ToyQwen4()
     prepare_qwen4_gdn_precision(model)
     model.to_empty(device="cpu")
+    with pytest.raises(RuntimeError, match="requires FP32 source and target"):
+        _dispatch_parameter(model, "linear_attn.A_log", _source_values().bfloat16())
+
+
+@pytest.mark.parametrize("name", ["A_log", "dt_bias"])
+def test_hf_bf16_gdn_source_opt_in_preserves_exact_input(monkeypatch, name):
+    monkeypatch.setenv("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE", "1")
+    model = ToyQwen4()
+    prepare_qwen4_gdn_precision(model)
+    model.to_empty(device="cpu")
+    source = _source_values().bfloat16()
+    _dispatch_parameter(model, f"linear_attn.{name}", source)
+    actual = getattr(model.linear_attn, name)
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, source.float())
+    assert not torch.equal(actual, _source_values())
+
+
+def test_hf_bf16_gdn_opt_in_loads_complete_checkpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE", "1")
+    source = _source_values().bfloat16()
+    save_file(
+        {
+            "linear_attn.A_log": source,
+            "linear_attn.dt_bias": source.clone(),
+            "linear_attn.proj.weight": torch.ones(4, 4, dtype=torch.bfloat16),
+            "linear_attn.proj.bias": torch.zeros(4, dtype=torch.bfloat16),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    model = ToyQwen4()
+    prepare_qwen4_gdn_precision(model)
+    load_model_weights(model, str(tmp_path), init_device="cpu")
+    for name in ("A_log", "dt_bias"):
+        actual = getattr(model.linear_attn, name)
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, source.float())
+
+
+def test_hf_gdn_opt_in_still_rejects_float16_and_bf16_target(monkeypatch):
+    monkeypatch.setenv("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE", "1")
+    model = ToyQwen4()
+    prepare_qwen4_gdn_precision(model)
+    model.to_empty(device="cpu")
+    with pytest.raises(RuntimeError, match="requires FP32 source and target"):
+        _dispatch_parameter(model, "linear_attn.A_log", _source_values().half())
+    model.linear_attn.A_log.data = model.linear_attn.A_log.data.bfloat16()
     with pytest.raises(RuntimeError, match="requires FP32 source and target"):
         _dispatch_parameter(model, "linear_attn.A_log", _source_values().bfloat16())
 
@@ -284,7 +337,8 @@ def test_dcp_to_hf_export_preserves_fp32(tmp_path, assets):
     assert exported["model.layers.0.linear_attn.proj.weight"].dtype == torch.bfloat16
 
 
-def test_old_bf16_dcp_rejected_before_restore(tmp_path):
+def test_old_bf16_dcp_rejected_before_restore(tmp_path, monkeypatch):
+    monkeypatch.setenv("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE", "1")
     key = "model.layers.0.linear_attn.A_log"
     dcp.save({"model": {key: _source_values().bfloat16()}}, checkpoint_id=tmp_path / "dcp")
     with pytest.raises(BaseException, match="GDN parameter.*not FP32"):

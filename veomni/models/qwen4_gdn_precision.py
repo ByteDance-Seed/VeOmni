@@ -4,7 +4,10 @@ These parameters are small but sensitive.  They must be promoted on the meta
 model *before* loading a checkpoint, not after its values have been rounded.
 """
 
+import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 from torch import nn
@@ -13,6 +16,7 @@ from torch import nn
 _GDN_CLASS_NAME = "Qwen4ExpTextGatedDeltaNet"
 _GDN_PARAMETER_NAMES = ("A_log", "dt_bias")
 _GDN_FQN = re.compile(r"(?:^|\.)linear_attn\.(?:A_log|dt_bias)$")
+_BF16_HF_SOURCE_APPROVED = ContextVar("qwen4_bf16_hf_source_approved", default=False)
 
 
 def is_qwen4_exp_config(config) -> bool:
@@ -37,6 +41,41 @@ def qwen4_exp_model_config(model):
 
 def is_qwen4_exp_model(model) -> bool:
     return qwen4_exp_model_config(model) is not None
+
+
+@contextmanager
+def qwen4_gdn_bf16_source_policy(model, group=None):
+    """Agree on and scope opt-in before collective HF weight loading.
+
+    Only call from an entry point whose full process group already participates
+    in model loading. Ordinary CPU eager loading can be rank-zero only.
+    """
+    models = model if isinstance(model, (tuple, list)) else (model,)
+    configs = (qwen4_exp_model_config(item) for item in models)
+    relevant = any(config is not None and expected_qwen4_gdn_layer_ids(config) != set() for config in configs)
+    enabled = os.environ.get("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE") == "1"
+    if relevant and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size(group=group)
+        if world_size > 1:
+            from veomni.utils.device import get_device_type
+
+            backend = str(torch.distributed.get_backend(group)).lower()
+            device = "cpu" if backend == "gloo" else get_device_type()
+            count = torch.tensor(int(enabled), dtype=torch.int32, device=device)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM, group=group)
+            if count.item() not in (0, world_size):
+                raise RuntimeError("Qwen4 BF16 GDN HF source policy differs across loading ranks")
+    token = _BF16_HF_SOURCE_APPROVED.set(relevant and enabled)
+    try:
+        yield
+    finally:
+        _BF16_HF_SOURCE_APPROVED.reset(token)
+
+
+def qwen4_bf16_hf_source_allowed() -> bool:
+    if not torch.distributed.is_initialized():
+        return os.environ.get("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE") == "1"
+    return _BF16_HF_SOURCE_APPROVED.get()
 
 
 def is_qwen4_gdn_parameter(name: str) -> bool:
