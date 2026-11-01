@@ -953,13 +953,6 @@ class AcceleratorConfig:
 class CheckpointConfig:
     """train.checkpoint.* — Checkpoint saving and loading."""
 
-    extra_parallel_canonical_layout: bool = field(
-        default=False,
-        metadata={
-            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
-        },
-    )
-
     output_dir: str = field(
         default="output",
         metadata={"help": "Path to save model checkpoints."},
@@ -1045,6 +1038,12 @@ class CheckpointConfig:
     save_hf_weights: bool = field(
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
+    )
+    extra_parallel_canonical_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
+        },
     )
 
     def __post_init__(self):
