@@ -128,6 +128,36 @@ def test_multi_optimizer_async_checkpoint_rejected_before_writes(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_failed_final_load_barrier_does_not_certify_multi_optimizer():
+    from unittest.mock import patch
+
+    from veomni.models.checkpoint.manager import ModelCheckpointManager, _scheduler_recipe
+
+    model, optimizer = _model_and_optimizer()
+    manager = object.__new__(ModelCheckpointManager)
+    manager.runtime = SimpleNamespace(
+        model=model, optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None
+    )
+    manager.load_dir = lambda: "/checkpoint/global_step_2"
+    manager.wait_for_pending_save = lambda: None
+    manager._checkpointer_kwargs = lambda: {}
+
+    def load(_path, state, **_kwargs):
+        state["_veomni_optimizer_identity_verified"] = True
+        state["_veomni_optimizer_checkpoint_generation"] = "generation"
+        state["extra_state"].update(
+            _veomni_optimizer_global_step=2,
+            _veomni_scheduler_recipe={"status": "supported", "value": _scheduler_recipe(None, optimizer)},
+        )
+
+    manager.checkpointer = SimpleNamespace(load=load)
+    with patch("torch.distributed.barrier", side_effect=RuntimeError("injected final barrier failure")):
+        with pytest.raises(RuntimeError, match="final barrier failure"):
+            manager.load()
+    assert manager._loaded_optimizer_global_step is None
+    assert manager._loaded_optimizer_generation is None
+
+
 @pytest.mark.parametrize("mode", ["betas", "list", "nested"])
 def test_shared_mutable_group_options_rejected_before_save(tmp_path, mode):
     model = torch.nn.Linear(2, 2)
