@@ -18,11 +18,11 @@ model:
         enable: true
     offload_config:
       enable_activation: false
+  chat_template: chatml
 
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 2048
   train_size: 750000
   text_keys: messages

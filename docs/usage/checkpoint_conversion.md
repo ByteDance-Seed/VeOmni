@@ -34,7 +34,7 @@ python scripts/merge_dcp_to_hf.py \
 |----------|------|----------|---------|-------------|
 | `--load-dir` | str | Yes | - | A `global_step_{N}` directory, or a DCP directory directly |
 | `--save-dir` | str | No | `<load-dir>/hf_ckpt` | Output directory for HuggingFace format checkpoint |
-| `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer) |
+| `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer). For a multi-module run, point this at `output_dir/model_assets/<module>/`. |
 | `--shard-size` | int | No | 2000000000 | Maximum shard size in bytes (default: 2GB) |
 
 ## Examples

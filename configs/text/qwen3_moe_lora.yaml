@@ -3,7 +3,7 @@
 # `Qwen3MoeExperts` stores fused `gate_up_proj` (3D, [num_experts, 2*intermediate, hidden])
 # and `down_proj` (3D, [num_experts, hidden, intermediate]).
 #
-# `lora_config` schema (`veomni/trainer/base.py::_setup_lora`):
+# `lora_config` schema (`veomni/models/model_runtime.py::_setup_lora`):
 #   - `lora_modules`         — LoRA targets by module name. `q/k/v/o` etc. install a dense
 #                              `LoraLinear`; the fused-MoE expert names `gate_proj` /
 #                              `up_proj` / `down_proj` are auto-mapped to the experts'
@@ -50,11 +50,11 @@ model:
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
+  chat_template: chatml
 
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 2048
   train_size: 750000
   text_keys: messages

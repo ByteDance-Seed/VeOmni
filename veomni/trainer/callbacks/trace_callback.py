@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 from tqdm import trange
 
@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
+    import torch
+
     from ..base import BaseTrainer, VeOmniArguments
 
 
@@ -47,7 +49,7 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
 
-        config = self.trainer.model_config
+        config = self.trainer.model.model_config
         if not hasattr(config, "num_experts"):
             logger.warning_rank0(
                 "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
@@ -212,10 +214,12 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
-        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        # LoRA config lives on VeOmniLoraModel, which DDP does not forward.
+        module = getattr(trainer.model, "unwrapped_module", None)
+        self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
-            config=trainer.model_config,
+            config=trainer.model.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,
@@ -235,7 +239,7 @@ class EnvironMeterCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: Dict[str, float],
-        grad_norm: float,
+        grad_norm: Union[float, "torch.Tensor"],
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:
@@ -264,8 +268,8 @@ class EnvironMeterCallback(Callback):
             f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
         }
 
-        if self.trainer.lr_scheduler is not None:
-            lr = max(self.trainer.lr_scheduler.get_last_lr())
+        if self.trainer.model.lr_scheduler is not None:
+            lr = max(self.trainer.model.lr_scheduler.get_last_lr())
             step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)

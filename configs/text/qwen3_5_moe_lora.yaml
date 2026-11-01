@@ -8,13 +8,13 @@ model:
     attn_implementation: flash_attention_2
     moe_implementation: fused_npu
     cross_entropy_loss_implementation: chunk_loss
-    rms_norm_implementation: npu
-    rotary_pos_emb_implementation: npu
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
     swiglu_mlp_implementation: eager
     load_balancing_loss_implementation: eager
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: triton
   lora_config:
     rank: 16
     alpha: 32
@@ -55,11 +55,11 @@ model:
       offload: false
       mixed_precision:
         enable: true
+  chat_template: chatml
 
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 1024
   train_size: 750000
   text_keys: messages

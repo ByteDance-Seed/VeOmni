@@ -7,8 +7,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
 from torch.utils.data import Dataset, IterableDataset
+from transformers import PretrainedConfig
 
 from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.trainer.callbacks import GlobalStateCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -29,6 +31,9 @@ def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests.
 
     Returns the device and the ``ParallelState``.
+
+    Registers under ``"base"`` because callers stand in for ``BaseTrainer._setup``,
+    and ``BaseTrainer`` scopes its build under ``use_parallel_state("base")``.
     """
     device_type = get_device_type()
     if device_type != "cpu":
@@ -58,6 +63,7 @@ def setup_test_distributed(args):
         extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
         extra_parallel_names=args.model.accelerator.extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
+        name="base",
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     return device, parallel_state
@@ -97,11 +103,13 @@ class StepAwareResumeGlobalStateCallback(StepAwareTestGlobalStateCallback):
     """Shared global-state callback for step-aware resume tests."""
 
     def on_step_end(self, state: TrainerState, **kwargs):
+        # logger.error(f"[END][rank{self.trainer.args.train.global_rank}][epoch{state.epoch}][step{state.curr_step}][global_step{state.global_step}] metrics {getattr(getattr(self.trainer, 'step_env_metrics', None), 'consume_tokens(M)', None)}")
         if (
             not getattr(self.trainer, "is_resume_train", False)
             and state.epoch == self.trainer.save_epoch
             and state.curr_step == self.trainer.save_step
         ):
+            # logger.error(f"save checkpoint {state.global_step} {state.epoch} {state.curr_step} {self.trainer.environ_meter.state_dict()}")
             self.save_global_state(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
@@ -359,6 +367,23 @@ class FakeModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.ffn = nn.Linear(1, 1)
+
+
+class FakeModelRuntime(VeOmniModelRuntime):
+    """A runtime that installs a toy module instead of loading a real checkpoint.
+
+    Data-pipeline tests only need something the trainer can hold and step; going
+    through ``build_foundation_model`` would make them slow and network-bound.
+    """
+
+    def _build_model(self) -> None:
+        self.model = FakeModel().to(get_device_type())
+        self.model_config = PretrainedConfig()
+
+    def _build_model_assets(self) -> None:
+        # ``config_path=test`` is a stub, not a Hub repo. Skip the preprocessor
+        # load the parent would otherwise attempt.
+        self.model_assets = [self.model_config]
 
 
 def compare_items(item, rank, group_size, group):

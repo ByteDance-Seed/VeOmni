@@ -1,5 +1,5 @@
 {
-  "architectures": "FluxModel",
+  "architectures": ["FluxModel"],
   "_class_name": "FluxModel",
   "_diffusers_version": "0.30.0.dev0",
   "attention_head_dim": 128,

@@ -7,7 +7,12 @@ from ltx_core.model.transformer.rope import (
     generate_freq_grid_pytorch,
     precompute_freqs_cis,
 )
-from ltx_core.utils import rms_norm
+
+from veomni.ops import VeomniOp
+
+
+# The raw unweighted RMSNorm row requires keyword-only ``eps``.
+_UNWEIGHTED_RMS_NORM_EPS = 1e-6
 
 
 class _BasicTransformerBlock1D(torch.nn.Module):
@@ -18,6 +23,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         apply_gated_attention: bool = False,
+        config=None,
     ):
         super().__init__()
 
@@ -27,12 +33,15 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             dim_head=dim_head,
             rope_type=rope_type,
             apply_gated_attention=apply_gated_attention,
+            config=config,
         )
 
         self.ff = FeedForward(
             dim,
             dim_out=dim,
         )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def forward(
         self,
@@ -40,7 +49,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         additive_attention_mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        norm_hidden_states = rms_norm(hidden_states)
+        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
         norm_hidden_states = norm_hidden_states.squeeze(1)
 
         attn_output = self.attn1(norm_hidden_states, mask=additive_attention_mask, pe=pe)
@@ -49,7 +58,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        norm_hidden_states = rms_norm(hidden_states)
+        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
         ff_output = self.ff(norm_hidden_states)
 
         hidden_states = ff_output + hidden_states
@@ -76,6 +85,7 @@ class Embeddings1DConnector(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        config=None,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -95,6 +105,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
                     apply_gated_attention=apply_gated_attention,
+                    config=config,
                 )
                 for _ in range(num_layers)
             ]
@@ -105,6 +116,8 @@ class Embeddings1DConnector(torch.nn.Module):
             self.learnable_registers = torch.nn.Parameter(
                 torch.rand(self.num_learnable_registers, self.inner_dim, dtype=torch.bfloat16) * 2.0 - 1.0
             )
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
     def _replace_padded_with_learnable_registers(
         self, hidden_states: torch.Tensor, additive_attention_mask: torch.Tensor
@@ -161,7 +174,7 @@ class Embeddings1DConnector(torch.nn.Module):
         for block in self.transformer_1d_blocks:
             hidden_states = block(hidden_states, additive_attention_mask=additive_attention_mask, pe=freqs_cis)
 
-        hidden_states = rms_norm(hidden_states)
+        hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
 
         return hidden_states, additive_attention_mask
 
@@ -170,7 +183,7 @@ class Embeddings1DConnectorConfigurator:
     """Configurator for video embeddings connector."""
 
     @classmethod
-    def from_config(cls, config: dict) -> Embeddings1DConnector:
+    def from_config(cls, config: dict, model_config=None) -> Embeddings1DConnector:
         transformer_config = config.get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
@@ -189,6 +202,7 @@ class Embeddings1DConnectorConfigurator:
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            config=model_config,
         )
         return connector
 
@@ -197,7 +211,7 @@ class AudioEmbeddings1DConnectorConfigurator:
     """Configurator for audio embeddings connector with separate dimension settings."""
 
     @classmethod
-    def from_config(cls, config: dict) -> Embeddings1DConnector:
+    def from_config(cls, config: dict, model_config=None) -> Embeddings1DConnector:
         transformer_config = config.get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
@@ -225,5 +239,6 @@ class AudioEmbeddings1DConnectorConfigurator:
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            config=model_config,
         )
         return connector

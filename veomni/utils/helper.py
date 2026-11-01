@@ -111,7 +111,9 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         return [0]
 
 
-def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+def _compute_image_seqlens(
+    micro_batch: Dict[str, "torch.Tensor"], config: Optional["PretrainedConfig"] = None
+) -> List[int]:
     image_shape_keys = ["image_grid_thw", "video_grid_thw", "audio_grid_thw"]
     image_seqlens = []
     for key in image_shape_keys:
@@ -119,6 +121,12 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
             grid_thw = micro_batch[key]
             seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
             image_seqlens.extend(seqlens)
+    if not image_seqlens and config is not None and getattr(config, "model_type", None) == "gemma3":
+        pixel_values = micro_batch.get("pixel_values")
+        if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 4:
+            patch_size = config.vision_config.patch_size
+            tokens_per_image = (pixel_values.shape[-2] // patch_size) * (pixel_values.shape[-1] // patch_size)
+            image_seqlens.extend([tokens_per_image] * pixel_values.shape[0])
     return image_seqlens
 
 
@@ -150,11 +158,55 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
     if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch
+        # packed micro batch (e.g. PackingCollator)
         return ds_idx.tolist()
-    else:
-        # unpacked sample
-        return [ds_idx]
+    if isinstance(ds_idx, list):
+        # SeedOmniCollator gathers per-sample ds_idx into a list
+        return [int(idx) for idx in ds_idx]
+    # single-sample micro batch
+    return [int(ds_idx)]
+
+
+def compute_device_memory_metrics() -> Dict[str, Any]:
+    """Device + host memory metrics, reduced to the worst rank across all ranks.
+
+    Shared by :class:`EnvironMeter` (single model) and
+    :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel) — these are
+    module-agnostic and depend only on the device, so both meters report them
+    identically. Used memory and usage take the max over ranks, available host
+    memory the min, so rank 0's log shows the host closest to running out.
+    """
+    allocated_memory = get_torch_device().max_memory_allocated()
+    reserved_memory = get_torch_device().max_memory_reserved()
+    num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
+    cpu_memory_info = psutil.virtual_memory()
+    # One max-reduce: the min of available memory is the max of its negation.
+    (
+        allocated_memory,
+        reserved_memory,
+        num_alloc_retries,
+        cpu_used_memory,
+        cpu_memory_usage,
+        neg_cpu_available_memory,
+    ) = all_reduce(
+        (
+            allocated_memory,
+            reserved_memory,
+            num_alloc_retries,
+            cpu_memory_info.used,
+            cpu_memory_info.percent,
+            -cpu_memory_info.available,
+        ),
+        op="max",
+    )
+    return {
+        "max_memory_allocated(GB)": allocated_memory / (1024**3),
+        "max_memory_reserved(GB)": reserved_memory / (1024**3),
+        "cpu_used_memory(GB)": cpu_used_memory / (1024**3),
+        "cpu_available_memory(GB)": -neg_cpu_available_memory / (1024**3),
+        "cpu_memory_usage(%)": cpu_memory_usage,
+        "num_alloc_retries": num_alloc_retries,
+    }
 
 
 class EnvironMeter:
@@ -236,12 +288,12 @@ class EnvironMeter:
             if isinstance(micro_batch, List):
                 for sample in micro_batch:
                     self.batch_seqlens.extend(_compute_seqlens(sample))
-                    self.images_seqlens.extend(_compute_image_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
                     if self.enable_multisource:
                         self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
             else:
                 self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch, self.config))
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:  # dit diffusers model
@@ -291,17 +343,6 @@ class EnvironMeter:
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 
-        # cuda memory
-        allocated_memory = get_torch_device().max_memory_allocated()
-        reserved_memory = get_torch_device().max_memory_reserved()
-        num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
-        allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
-            (allocated_memory, reserved_memory, num_alloc_retries), op="max"
-        )
-
-        # cpu memory
-        cpu_memory_info = psutil.virtual_memory()
-
         metrics = {
             "flops_achieved(T)": flops_achieved,
             "flops_promised(T)": flops_promised,
@@ -312,13 +353,8 @@ class EnvironMeter:
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
             "consumed_chunk_num": self.consume_chunks,
-            "max_memory_allocated(GB)": allocated_memory / (1024**3),
-            "max_memory_reserved(GB)": reserved_memory / (1024**3),
-            "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-            "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-            "cpu_memory_usage(%)": cpu_memory_info.percent,
-            "num_alloc_retries": num_alloc_retries,
         }
+        metrics.update(compute_device_memory_metrics())
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
@@ -430,7 +466,7 @@ class MultiSourceInfoTracker:
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
                     f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / step_consumed_tokens,
+                    / max(step_consumed_tokens, 1),
                 }
             )
 
@@ -686,7 +722,13 @@ class ProfilerWithMem:
 
     def start(self):
         out = self._p.start()
-        get_torch_device().memory._record_memory_history()
+        memory = get_torch_device().memory
+        if get_device_type() == "cuda":
+            # Keep stacks for live allocations; recording every free traceback
+            # can crash profiler-enabled training during activation recomputation.
+            memory._record_memory_history(context="state")
+        else:
+            memory._record_memory_history()
         return out
 
     def stop(self):

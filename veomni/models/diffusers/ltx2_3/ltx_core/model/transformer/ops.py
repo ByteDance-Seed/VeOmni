@@ -2,8 +2,9 @@ from typing import List, Protocol
 
 import torch
 from ltx_core.model.transformer.rope import apply_rotary_emb
-from ltx_core.utils import rms_norm
 from torch import nn
+
+from veomni.ops import VeomniOp
 
 
 class PreAttentionCallable(Protocol):
@@ -47,6 +48,10 @@ class AdaZeroCallable(Protocol):
 
 
 class PytorchAdaZeroFunction(AdaZeroCallable):
+    def __init__(self, config=None) -> None:
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "unweighted", unweighted_impl)
+
     def __call__(
         self,
         x: torch.Tensor,
@@ -54,7 +59,7 @@ class PytorchAdaZeroFunction(AdaZeroCallable):
         scale: torch.Tensor,
         shift: torch.Tensor,
     ) -> torch.Tensor:
-        return rms_norm(x, eps=eps) * (1 + scale) + shift
+        return self.veomni_rms_norm(x, eps=eps) * (1 + scale) + shift
 
 
 class PostSACallable(Protocol):
@@ -69,6 +74,12 @@ class PostSACallable(Protocol):
 
 
 class PytorchPostSAFunction(PostSACallable):
+    def __init__(self, config=None) -> None:
+        std_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", std_impl)
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
+
     def __call__(
         self,
         x: torch.Tensor,
@@ -78,7 +89,9 @@ class PytorchPostSAFunction(PostSACallable):
         gate: torch.Tensor,
     ) -> List[torch.Tensor]:
         x_fma = x + y * gate
-        return x_fma, rms_norm(x_fma, norm_weights, eps=eps)
+        if norm_weights is None:
+            return x_fma, self.veomni_rms_norm_unweighted(x_fma, eps=eps)
+        return x_fma, self.veomni_rms_norm(x_fma, norm_weights, eps=eps)
 
 
 class GatedAttentionCallable(Protocol):

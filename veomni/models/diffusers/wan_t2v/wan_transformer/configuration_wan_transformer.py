@@ -18,16 +18,16 @@ from typing import Optional, Tuple
 
 import diffusers
 from diffusers import WanTransformer3DModel
-from transformers import PretrainedConfig
+
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
 WAN_INIT_SIGNATURE = inspect.signature(WanTransformer3DModel.__init__)
 
-
 diffusers_version = diffusers.__version__
 
 
-class WanTransformer3DModelConfig(PretrainedConfig):
+class WanTransformer3DModelConfig(VeOmniPretrainedConfig):
     model_type = "WanTransformer3DModel"
     condition_model_type = "WanTransformer3DConditionModel"
 
@@ -52,7 +52,6 @@ class WanTransformer3DModelConfig(PretrainedConfig):
         **kwargs,
     ):
         self.patch_size = patch_size
-
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.in_channels = in_channels
@@ -68,6 +67,7 @@ class WanTransformer3DModelConfig(PretrainedConfig):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.rope_max_seq_len = rope_max_seq_len
         self.pos_embed_seq_len = pos_embed_seq_len
+
         super().__init__(**kwargs)
 
     def to_diffuser_dict(self):
@@ -77,5 +77,6 @@ class WanTransformer3DModelConfig(PretrainedConfig):
         return_dict = super().to_dict()
         return_dict["_class_name"] = "WanTransformer3DModel"
         return_dict["_diffusers_version"] = diffusers_version
-        del return_dict["dtype"]
+        if "dtype" in return_dict:
+            del return_dict["dtype"]
         return return_dict

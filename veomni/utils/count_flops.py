@@ -107,6 +107,8 @@ class VeomniFlopsCounter:
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "qwen4_exp": self._estimate_qwen4_exp_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
+            "gemma3": self._estimate_gemma3_flops,
+            "gemma3_text": self._estimate_gemma3_flops,
         }
 
         self.config = config
@@ -591,6 +593,72 @@ class VeomniFlopsCounter:
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
+
+    def _estimate_gemma3_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        images_seqlens=None,
+        freeze_vit=False,
+    ):
+        """Estimate dominant Gemma 3 text and optional SigLIP vision FLOPs."""
+        config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        hidden_size = config.hidden_size
+        head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+        q_size = config.num_attention_heads * head_dim
+        kv_size = config.num_key_value_heads * head_dim
+
+        mlp_params = hidden_size * config.intermediate_size * 3
+        attention_projection_params = hidden_size * (2 * q_size + 2 * kv_size)
+        lm_head_params = self._compute_lm_head_params(hidden_size, config.vocab_size)
+        linear_params = (mlp_params + attention_projection_params) * config.num_hidden_layers + lm_head_params
+        linear_flops = 6 * linear_params * tokens_sum
+
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            full_attention_layers = config.num_hidden_layers
+            sliding_attention_layers = 0
+        else:
+            full_attention_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
+            sliding_attention_layers = sum(layer_type == "sliding_attention" for layer_type in layer_types)
+            if full_attention_layers + sliding_attention_layers != config.num_hidden_layers:
+                raise ValueError("Gemma 3 layer_types contains an unsupported attention type.")
+
+        full_attention_scores = sum(seqlen * seqlen for seqlen in batch_seqlens)
+        sliding_attention_scores = 0
+        if sliding_attention_layers:
+            if config.sliding_window is None:
+                raise ValueError("Gemma 3 has sliding-attention layers but no sliding_window.")
+            sliding_attention_scores = self._compute_sliding_attention_score_sum(batch_seqlens, config.sliding_window)
+        attention_scores = (
+            full_attention_scores * full_attention_layers + sliding_attention_scores * sliding_attention_layers
+        )
+        attention_flops = 12 * attention_scores * head_dim * config.num_attention_heads
+
+        vision_flops = 0
+        if images_seqlens:
+            vision_config = self.config.vision_config
+            vision_tokens = sum(images_seqlens)
+            vision_hidden_size = vision_config.hidden_size
+            # Patch embedding and pooling are small relative to the encoder body.
+            vision_linear_params = vision_config.num_hidden_layers * (
+                2 * vision_hidden_size * vision_config.intermediate_size + 4 * vision_hidden_size**2
+            )
+            vision_factor = 2 if freeze_vit else 6
+            vision_flops = vision_factor * vision_linear_params * vision_tokens
+            vision_attention_factor = 4 if freeze_vit else 12
+            vision_flops += (
+                vision_attention_factor
+                * sum(seqlen * seqlen for seqlen in images_seqlens)
+                * (vision_hidden_size // vision_config.num_attention_heads)
+                * vision_config.num_attention_heads
+                * vision_config.num_hidden_layers
+            )
+            projected_tokens = len(images_seqlens) * self.config.mm_tokens_per_image
+            vision_flops += 6 * projected_tokens * vision_hidden_size * config.hidden_size
+
+        return (linear_flops + attention_flops + vision_flops) * (1.0 / delta_time) / 1e12
 
     def _estimate_qwen2_flops(
         self,

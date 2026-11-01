@@ -15,10 +15,10 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --model.accelerator.ulysses_size 4
 ```
 
-Currently, we have supported Ulysses on the following models:
+VeOmni currently supports Ulysses on the following models:
 
 Language models:
-- LlaMa
+- LLaMA
 - Qwen2.5
 - Qwen3.5 (hybrid softmax + linear attention, requires transformers v5)
 
@@ -27,25 +27,25 @@ Multimodal models:
 - Qwen2.5-VL
 
 ## 🔍 Dive into Ulysses Sequence Parallelism
-Sequence Parallel (SP) serves as a prevalent strategy to handle long sequences that exceed the memory limit of a single GPU. Ulysses use all-to-all collective communication operations to implement SP with attention.
+Sequence Parallel (SP) is a common strategy for handling sequences that exceed the memory limit of a single GPU. Ulysses uses all-to-all collective communication operations to implement SP for attention.
 
 ### What is all_to_all?
 
-Suppose we have P GPUs and a sequence whose shape is [S, H], where N denotes the sequence length and d represents the hidden size (head num \* head dim). Each GPU initially holds the sequence's [S/P, H] partition. After performing an all_to_all communication, each GPU will get a head-splitting sequence whose shape is [S, H/P]. An illustration figure when P = 4 is as follows:
+Suppose we have P GPUs and a sequence whose shape is [S, H], where S denotes the sequence length and H represents the hidden size (number of heads \* head dimension). Each GPU initially holds an [S/P, H] partition. After an all_to_all operation, each GPU holds a head-partitioned sequence whose shape is [S, H/P]. The following figure illustrates the case where P = 4:
 
 ![all_to_all communication](../assets/all_2_all.jpg)
 
 ### DeepSpeed-Ulysses
-We use the all_to_all based sequence parallelism which is proposed by DeepSpeed, named DeepSpeed-Ulysses.
+We use the all-to-all-based sequence parallelism proposed by DeepSpeed, named DeepSpeed-Ulysses.
 
 ![DeepSpeed-Ulysses](../assets/ulysses.png)
 
 (Image source: [DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models](https://arxiv.org/abs/2309.14509))
 
-The figure above shows the overall architecture of DeepSpeed-Ulysses. It only introduces two extra all_to_all communications in the attention module while it does not modify other parts such as normalization and MLP. The input sequence is first evenly divided across the GPUs. The first all_to_all communication gathers the query, key, and value ([S/P, H]) along the sequence dimension and scatters the sequence in the head dimension ([S, H/P]). After the attention part, another all_to_all is performed to transfer the attention output ([S, H/P]) from head-sliced back to sequence-sliced ([S/P, H]). DeepSpeed-Ulysses is attention agnostic since it gathers the whole sequence dimension during attention computation. Thus, it can be easily used with FlashAttention. However, it is constrained by the number of attention heads since the sp size should be divided evenly by head_num. Note that DeepSpeed-Ulysses does not impact the memory consumed by the model states. To support large sequence-length training with a large language model, DeepSpeed-Ulysses can be integrated with ZeRO and FSDP.
+The figure above shows the overall architecture of DeepSpeed-Ulysses. It introduces only two additional all_to_all communications in the attention module and does not modify other components such as normalization and MLP. The input sequence is first divided evenly across the GPUs. The first all_to_all communication gathers the query, key, and value ([S/P, H]) along the sequence dimension and scatters them along the head dimension ([S, H/P]). After attention, another all_to_all transfers the output ([S, H/P]) from head-partitioned form back to sequence-partitioned form ([S/P, H]). DeepSpeed-Ulysses is attention-agnostic because it gathers the entire sequence during attention computation, so it can be used with FlashAttention. However, the number of query heads must be divisible by the Ulysses parallel size; grouped-query attention has additional key/value head constraints. DeepSpeed-Ulysses does not affect memory consumed by model states. For long-sequence training with a large language model, it can be combined with ZeRO or FSDP.
 
 ### Communication Analysis
-The communication volume transmitted per link for an all-to-all for aggregate message of size M over P GPUs can be estimated as $M(P-1)/P^2$. For a transformer model with hidden size H, the sequence length of S, and parallelism degree of P, and let $\mu = (P-1)/P$. DeepSpeed-Ulysses performs all-to-all for the QKV projections with an aggregate message size of $3SH$ before the attention computation, which introduces $3SH\mu/P$ communication volume; and another all-to-all for output context projection with a size Nh for each transformer layer, which introduces $SH\mu/P$ communication volume. Therefore, DeepSpeed sequence parallelism incurs an aggregate communication volume per link of $4SH\mu/P = 4M(P-1)/P^2$.
+The communication volume transmitted per link for an all-to-all operation with an aggregate message of size M over P GPUs can be estimated as $M(P-1)/P^2$. For a transformer model with hidden size H, sequence length S, and parallelism degree P, let $\mu = (P-1)/P$. Before attention, DeepSpeed-Ulysses performs an all-to-all for the QKV projections with an aggregate message size of $3SH$, introducing a communication volume of $3SH\mu/P$. Each transformer layer performs another all-to-all for the output context projection with an aggregate message size of $SH$, introducing $SH\mu/P$. Therefore, DeepSpeed sequence parallelism incurs an aggregate communication volume per link of $4SH\mu/P = 4M(P-1)/P^2$.
 
 ## ⚙️ Core API
 
@@ -188,7 +188,7 @@ After the collator, the model receives:
 
 For standard softmax attention layers (e.g., `Qwen3_5Attention`), Ulysses SP is handled
 **internally** by `flash_attention_forward` in
-`veomni/ops/kernels/attention/__init__.py`.
+`veomni/ops/kernels/attention/standard/flash.py`.
 
 The flow through a softmax attention layer:
 
@@ -198,7 +198,7 @@ hidden_states [B, S_local, D]           # already local from collator
   -> apply_rotary_pos_emb(q, k, cos, sin)  # RoPE on local-length q/k
   -> flash_attention_forward:
        gather_seq_scatter_heads(q,k,v)   # [B, S_full, local_heads, head_dim]
-       flash_attention_kernel(...)       # attention on full sequence, local heads
+       flash_attention_op(...)       # attention on full sequence, local heads
        gather_heads_scatter_seq(output)  # [B, S_local, num_heads, head_dim]
   -> output projection                   # [B, S_local, D]
 ```
@@ -338,91 +338,70 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
 
 ### API
 
-1. async_ulysses_qkv_projection
+Async Ulysses is two registered ops. Modeling constructs a local handle and
+calls it; there is no public `async_ulysses_qkv_projection` /
+`async_ulysses_output_projection` function.
 
-An asynchronous method to perform QKV projection and all-to-all communication, overlapping computation and communication.
+| Op | Variants | Implementation |
+|---|---|---|
+| `async_ulysses_qkv` | `standard`, `dit` | `eager` |
+| `async_ulysses_o` | `standard`, `dit` | `eager` |
 
-```Python
-def async_ulysses_qkv_projection(
-    hidden_states: torch.Tensor,
-    seq_dimension: int,
-    head_dimension: int,
-    q_weight: torch.Tensor,
-    q_bias: Optional[torch.Tensor],
-    k_weight: torch.Tensor,
-    k_bias: Optional[torch.Tensor],
-    v_weight: torch.Tensor,
-    v_bias: Optional[torch.Tensor],
-    norm_type: Optional[str] = None,
-    norm_q_weight: Optional[torch.Tensor] = None,
-    norm_q_bias: Optional[torch.Tensor] = None,
-    norm_k_weight: Optional[torch.Tensor] = None,
-    norm_k_bias: Optional[torch.Tensor] = None,
-    normalized_shape: Optional[Union[int, torch.Size]] = None,
-    eps: float = 1e-5,
-    unpadded_dim_size: int = 0,
-    head_dim: int = 0,
-    group: Optional[ProcessGroup] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+`standard` is the transformer path (Qwen3-VL / Qwen3-VL-MoE). `dit` is the
+diffusion path (Wan). Nested RMSNorm uses a raw inner pair; LayerNorm still
+goes through the fused CUDA helper in `veomni/ops/kernels/async_ulysses/shared/`.
+
+```python
+from veomni.ops import VeomniOp
+
+q, k, v = VeomniOp("async_ulysses_qkv", "standard")(
+    hidden_states=hidden_states,
+    seq_dimension=1,
+    head_dimension=2,
+    q_weight=self.q_proj.weight,
+    q_bias=self.q_proj.bias,
+    k_weight=self.k_proj.weight,
+    k_bias=self.k_proj.bias,
+    v_weight=self.v_proj.weight,
+    v_bias=self.v_proj.bias,
+    norm_type="rmsnorm",
+    norm_q_weight=self.q_norm.weight,
+    norm_k_weight=self.k_norm.weight,
+    normalized_shape=self.head_dim,
+    eps=self.config.rms_norm_eps,
+    unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
+    head_dim=self.head_dim,
+)
+
+attn_output = VeomniOp("async_ulysses_o", "standard")(
+    hidden_states=attn_output,
+    seq_dimension=1,
+    head_dimension=2,
+    proj_weight=self.o_proj.weight,
+    proj_bias=self.o_proj.bias,
+    unpadded_dim_size=attn_output.shape[1],
+)
 ```
 
-Args:
-- hidden_states: Input hidden states
-- seq_dimension: Sequence dimension
-- head_dimension: Head dimension
-- q_weight: Query projection weight
-- q_bias: Query projection bias
-- k_weight: Key projection weight
-- k_bias: Key projection bias
-- v_weight: Value projection weight
-- v_bias: Value projection bias
-- norm_type: Normalization type ("rmsnorm" or "layernorm")
-- norm_q_weight: Query normalization weight
-- norm_q_bias: Query normalization bias
-- norm_k_weight: Key normalization weight
-- norm_k_bias: Key normalization bias
-- normalized_shape: Normalization shape
-- eps: Normalization epsilon
-- unpadded_dim_size: Unpadded dimension size
-- head_dim: Head dimension size
-- group: Process group (optional)
-
-2. async_ulysses_output_projection
-
-An asynchronous method to perform output projection and all-to-all communication.
-
-```Python
-def async_ulysses_output_projection(
-    hidden_states: torch.Tensor,
-    seq_dimension: int,
-    head_dimension: int,
-    proj_weight: torch.Tensor,
-    proj_bias: Optional[torch.Tensor],
-    unpadded_dim_size: int = 0,
-    group: Optional[ProcessGroup] = None,
-) -> torch.Tensor
-```
-
-Args:
-- hidden_states: Input hidden states
-- seq_dimension: Sequence dimension
-- head_dimension: Head dimension
-- proj_weight: Projection weight
-- proj_bias: Projection bias
-- unpadded_dim_size: Unpadded dimension size
-- group: Process group (optional)
-
+See `veomni/models/transformers/qwen3_vl/qwen3_vl_gpu_patch_gen_config.py` for
+the live transformer consume, and `veomni/models/transformers/wan/modeling_wan.py`
+for the `dit` consume. Registry rows live in
+`veomni/ops/kernels/async_ulysses/`.
 
 ### Enabling Async Ulysses
 
 To enable Async Ulysses for an existing model, you need to:
 
-1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL Dense)
+1. Check that the model consumes `async_ulysses_qkv` / `async_ulysses_o`
 2. Set `accelerator.enable_async=True` in your training configuration
-3. Ensure you're using Flash Attention 2.0 and Ulysses Context Parallelism is **enabled**
-4. Verify that your hardware supports asynchronous operations
+3. Keep Ulysses sequence parallelism enabled (`accelerator.ulysses_size > 1`)
+4. For the transformer path, use a flash-attention implementation; the async
+   consume requires the packed-varlen contract
 
-Async Ulysses is currently available for the following models:
-- Qwen3VL Dense
+Async Ulysses is currently consumed by:
+
+- Qwen3-VL
+- Qwen3-VL-MoE
+- Wan
 
 Support for more models will be added in future releases.

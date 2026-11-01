@@ -22,7 +22,7 @@ weights to the reference broadcast loader.
 What ``ep_sharded_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
-``veomni/models/module_utils.py``):
+``veomni/models/checkpoint/weights.py``):
 
   * **Base experts** — the fused ``...experts.gate_up_proj`` /
     ``down_proj`` tensors are streamed from the base checkpoint straight
@@ -52,36 +52,50 @@ Run (2 GPUs):
 
 from __future__ import annotations
 
+import argparse
+import gc
 import os
-import shutil
+import subprocess
+import sys
 
 import pytest
+import torch
+import torch.distributed as dist
 import yaml
 
-# Reuse the battle-tested trainer harness. The trainer subprocess entry
-# point + snapshot comparator + CLI helpers are shared; the base-model
-# fixture is *not* -- see ``fused_toy_base_dir`` below for why.
-from .test_moe_lora_ep2 import _torchrun_capture
-from .test_moe_lora_trainer import (
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.lora.test_moe_lora_ep2 import (
+    _expected_qwen3_moe_toy_adapter_shapes,
+    _load_adapter,
+)
+from tests.lora.test_moe_lora_trainer import (
     _TOY_CONFIG_PATH,
     SNAPSHOT_PRE,
+    MoeLoraTrainer,
     _compare_snapshots_bit_exact,
     _gpu_count_or_skip,
-    _writer_adapter_path,
     _yaml_for_mode,
 )
+from veomni.arguments import VeOmniArguments, parse_args
+from veomni.distributed.parallel_state import clear_parallel_state
+
+
+_CI_EP_LAUNCH = LaunchSpec(nproc=2)
 
 
 __all__ = [
     "fused_toy_base_dir",
+    "seeded_lora_adapters_dir",
     "test_peft_ep_sharded_stream_load_matches_broadcast",
 ]
 
 
 # EP requires a fused MoE-LoRA kernel: the wrappers only implement the EP
-# dispatch on the fused path. The backend is device-specific — ``fused_triton``
-# on GPU, ``fused_npu`` on NPU (selecting the wrong one raises a hard error in
-# ``apply_veomni_fused_moe_patch``), so pick it from the active accelerator.
+# dispatch on the fused path. The backend is device-specific — ``triton``
+# on GPU, ``npu`` on NPU — so pick it from the active accelerator.
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
@@ -92,7 +106,6 @@ def _fused_ops_override() -> str:
 # Seeder trains this many steps, then writes the HF adapter at the final
 # step. Kept tiny -- we only need a *non-trivial* adapter on disk, not a
 # converged one.
-_SEED_STEPS = 2
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -100,36 +113,32 @@ _SEED_STEPS = 2
 # ──────────────────────────────────────────────────────────────────────
 #
 # ``ep_sharded_stream_load`` streams each rank's dim-0 expert slice
-# straight from the checkpoint. That is only possible when the on-disk
-# expert layout *is* the model's fused layout
-# (``...experts.gate_up_proj`` / ``down_proj`` with shape ``[E, ...]``).
-# The shared ``toy_base_dir`` fixture in ``test_moe_lora_trainer`` writes
-# the standard HF **per-expert** layout (``...experts.<e>.gate_proj.weight``),
-# which needs the ``Qwen3MoeCheckpointTensorConverter`` per-expert->fused
-# fusion at load time -- a transform the stream loader explicitly refuses
-# (``NotImplementedError``; covered by the non-PEFT bail case in
-# ``tests/utils/test_moe_ep_sharded_load_matrix.py``).
+# straight from the checkpoint when the on-disk expert layout *is* the
+# model's fused layout (``...experts.gate_up_proj`` / ``down_proj`` with
+# shape ``[E, ...]``). The shared ``toy_base_dir`` fixture in
+# ``test_moe_lora_trainer`` writes the standard HF **per-expert** layout
+# (``...experts.<e>.gate_proj.weight``), which instead goes through the
+# ``Qwen3MoeCheckpointTensorConverter`` per-rank expert stacking (covered
+# by ``tests/utils/test_moe_ep_sharded_load_matrix.py`` and
+# ``tests/utils/test_ep_sharded_expert_stream_load.py``).
 #
-# So this test builds its *own* base by dumping the fused
+# This test builds its *own* base by dumping the fused
 # ``model.state_dict()`` directly (no ``save_pretrained`` re-split),
-# giving a converter-free, streamable checkpoint.
+# so it exercises the converter-free dim-0 slice path under PEFT. The
+# ``per_expert`` case loads ``toy_base_dir`` instead, so the converter's
+# per-rank expert stacking runs with experts under ``base_layer``.
 
 
-def _build_and_save_fused_toy_base(dest_dir: str) -> None:
-    """Single-process (spawned): build the toy and save its **fused** state_dict.
-
-    Unlike ``test_moe_lora_trainer._build_and_save_toy_base`` (which uses
-    ``save_pretrained`` and therefore emits the per-expert HF layout), this
-    writes ``model.state_dict()`` verbatim via safetensors so the expert
-    tensors stay fused ``[E, ...]`` -- the layout the stream loader can
-    slice per-rank without a converter.
-    """
+def _build_and_save_stream_load_assets(root_dir: str) -> None:
+    """Single-process (spawned): build fused base, per-expert base, and non-zero LoRA adapters in one pass."""
+    import copy
     import shutil as _shutil
 
     from safetensors.torch import save_file
 
+    from tests.lora.utils import build_lora_test_model
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
     from veomni.utils import helper as _helper
 
     _helper.set_seed(42)
@@ -141,74 +150,92 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
         init_device="cpu",
         ops_implementation=ops,
     )
-    # ``.clone()`` breaks any tied-weight storage sharing (e.g.
-    # lm_head/embed_tokens) that safetensors refuses to serialise.
+
+    # 1. Fused base layout
+    fused_dir = os.path.join(root_dir, "fused_base")
+    os.makedirs(fused_dir, exist_ok=True)
     state = {k: v.detach().clone().contiguous() for k, v in model.state_dict().items()}
-    os.makedirs(dest_dir, exist_ok=True)
-    save_file(state, os.path.join(dest_dir, "model.safetensors"))
-    _shutil.copy(_TOY_CONFIG_PATH, os.path.join(dest_dir, "config.json"))
+    save_file(state, os.path.join(fused_dir, "model.safetensors"))
+    _shutil.copy(_TOY_CONFIG_PATH, os.path.join(fused_dir, "config.json"))
+
+    # 2. Per-expert HF base layout
+    per_expert_dir = os.path.join(root_dir, "per_expert_base")
+    os.makedirs(per_expert_dir, exist_ok=True)
+    model.save_pretrained(per_expert_dir, safe_serialization=True)
+
+    # 3. Seeded non-zero adapters for independent and shared modes
+    adapters_dir = os.path.join(root_dir, "adapters")
+    for mode in ("independent", "shared"):
+        with open(_yaml_for_mode(mode)) as f:
+            ycfg = yaml.safe_load(f)
+        lcfg = VeOmniLoraConfig.from_yaml(ycfg["model"]["lora_config"])
+        peft_model = VeOmniLoraModel(copy.deepcopy(model), lcfg)
+        with torch.no_grad():
+            for idx, (name, p) in enumerate(peft_model.named_parameters()):
+                if "lora_A" not in name and "lora_B" not in name:
+                    continue
+                numel = p.numel()
+                vals = (
+                    (torch.arange(1, numel + 1, dtype=torch.float32).remainder(997) + 1.0) / 1024.0
+                    + (idx + 1) * 0.03125
+                ).reshape(p.shape)
+                if p.ndim == 3:
+                    expert_offset = torch.arange(1, p.shape[0] + 1, dtype=torch.float32).view(-1, 1, 1) * 0.125
+                    vals = vals + expert_offset
+                p.copy_(vals.to(p.dtype))
+                assert bool((p != 0).all().item()), f"Expected all non-zero adapter values for {name}"
+        mode_dir = os.path.join(adapters_dir, mode)
+        peft_model.save_pretrained(mode_dir, safe_serialization=True)
 
 
 @pytest.fixture(scope="module")
-def fused_toy_base_dir(tmp_path_factory):
-    """Module-scoped fused Qwen3-MoE toy base (streamable expert layout).
-
-    Built in a spawned child process so the pytest collection process
-    stays free of foundation-model imports / singleton state, matching
-    the ``toy_base_dir`` fixture's isolation rationale.
-    """
+def _stream_load_assets_root(tmp_path_factory):
+    import json
     import multiprocessing as mp
 
-    base_dir = tmp_path_factory.mktemp("fused_toy_base") / "qwen3_moe_toy"
-    base_dir_str = str(base_dir)
-
+    root_dir = str(tmp_path_factory.mktemp("stream_load_assets"))
     ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_build_and_save_fused_toy_base, args=(base_dir_str,))
+    proc = ctx.Process(target=_build_and_save_stream_load_assets, args=(root_dir,))
     proc.start()
     proc.join()
     if proc.exitcode != 0:
-        raise RuntimeError(f"fused toy base-model build subprocess exited with code {proc.exitcode}")
-    return base_dir_str
+        raise RuntimeError(f"stream load assets build subprocess exited with code {proc.exitcode}")
+
+    adapters_dir = os.path.join(root_dir, "adapters")
+    for mode in ("independent", "shared"):
+        mode_dir = os.path.join(adapters_dir, mode)
+        with open(os.path.join(mode_dir, "adapter_config.json")) as f:
+            acfg = json.load(f)
+        assert acfg.get("veomni_lora", {}).get("moe_mode") == mode
+        sd = _load_adapter(mode_dir)
+        expected_shapes = _expected_qwen3_moe_toy_adapter_shapes(mode)
+        assert set(sd) == set(expected_shapes)
+        for k, exp_shape in expected_shapes.items():
+            assert tuple(sd[k].shape) == exp_shape
+            assert bool((sd[k] != 0).all().item()), f"{mode}/{k} has zero elements in fixture"
+
+    return root_dir
 
 
-def _fused_model_path_overrides(fused_base: str) -> list[str]:
-    """Point ``model.model_path`` / ``config_path`` at the fused base dir."""
-    return [
-        f"--model.model_path={fused_base}",
-        f"--model.config_path={fused_base}",
-    ]
+@pytest.fixture(scope="module")
+def fused_toy_base_dir(_stream_load_assets_root):
+    return os.path.join(_stream_load_assets_root, "fused_base")
 
 
-def _make_seeder_yaml(base_yaml: str, dest: str, *, max_steps: int) -> str:
-    """Clone a mode yaml into an EP=2 seeder that emits the HF adapter."""
-    with open(base_yaml) as f:
-        cfg = yaml.safe_load(f)
-    cfg["train"]["max_steps"] = max_steps
-    cfg["train"]["checkpoint"]["save_steps"] = max_steps
-    cfg["train"]["checkpoint"]["save_hf_weights"] = True
-    cfg["train"]["checkpoint"]["hf_save_steps"] = max_steps
-    cfg["train"]["checkpoint"].pop("load_path", None)
-    with open(dest, "w") as f:
-        yaml.safe_dump(cfg, f)
-    return dest
+@pytest.fixture(scope="module")
+def seeded_lora_adapters_dir(_stream_load_assets_root):
+    return os.path.join(_stream_load_assets_root, "adapters")
 
 
 def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> str:
-    """Clone a mode yaml to resume from ``adapter_path`` for a single step.
-
-    ``max_steps=1`` is enough to reach ``on_train_begin`` -> the
-    ``_SnapshotCallback`` post-load dump (``lora_snapshot_pre.pt``); all
-    saves are disabled so the resumers only produce that snapshot.
-    ``lora_config`` is an opaque ``Dict`` (its nested keys can't be set
-    via the CLI), so the adapter path is materialised into a yaml.
-    """
+    """Clone a mode yaml to resume from ``adapter_path`` for a single step."""
     with open(base_yaml) as f:
         cfg = yaml.safe_load(f)
     cfg["model"]["lora_config"]["lora_adapter"] = adapter_path
@@ -222,81 +249,137 @@ def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> s
     return dest
 
 
-@pytest.mark.parametrize("mode", ["independent", "shared"])
-def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_dir, mode):
-    """Streaming a LoRA-wrapped MoE checkpoint == broadcast loader, bit-exact.
+_STREAM_LOAD_SCENARIOS: tuple[tuple[str, str], ...] = (
+    ("independent", "fused"),
+    ("shared", "fused"),
+    ("independent", "per_expert"),
+)
 
-    Three EP=2 subprocesses on the Qwen3-MoE toy:
 
-    1. **Seeder** (default broadcast loader) trains ``_SEED_STEPS`` steps
-       and writes the HF adapter (``adapter_model.safetensors``) at the
-       final step.
-    2. **Reference resumer** loads base + adapter via the broadcast loader
-       (``broadcast_model_weights_from_rank0=True``) and dumps its
-       post-load LoRA snapshot.
-    3. **Stream resumer** loads base + adapter via
-       ``ep_sharded_stream_load=True``
-       (``broadcast_model_weights_from_rank0=False``) and dumps its
-       post-load LoRA snapshot.
-
-    The two snapshots must be **bit-exact** (bf16): both start from the
-    same base checkpoint and the same on-disk adapter, so the only
-    difference is *how* each rank obtained its local slice. For
-    ``independent`` the adapter's per-expert LoRA is EP-streamed; for
-    ``shared`` the adapter LoRA is read whole while the base experts are
-    still EP-streamed.
-    """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
-    yaml_path = _yaml_for_mode(mode)
-    base_overrides = _fused_model_path_overrides(fused_toy_base_dir) + [
+def _scenario_argv(yaml_path: str, output_dir: str, base_dir: str, *, stream_load: bool) -> list[str]:
+    argv = [
+        "tests/lora/test_moe_lora_ep_sharded_stream_load.py",
+        yaml_path,
+        f"--train.checkpoint.output_dir={output_dir}",
+        f"--model.model_path={base_dir}",
+        f"--model.config_path={base_dir}",
         _fused_ops_override(),
         "--model.accelerator.ep_size=2",
     ]
+    if stream_load:
+        argv.extend(
+            [
+                "--model.broadcast_model_weights_from_rank0=False",
+                "--model.ep_sharded_stream_load=True",
+            ]
+        )
+    else:
+        argv.extend(
+            [
+                "--model.broadcast_model_weights_from_rank0=True",
+                "--model.ep_sharded_stream_load=False",
+            ]
+        )
+    return argv
 
-    # ── 1. Seeder: produce the HF adapter (adapter_model.safetensors) ───
-    seeder_dir = str(tmp_path / "seeder")
-    seeder_yaml = _make_seeder_yaml(yaml_path, str(tmp_path / "seeder.yaml"), max_steps=_SEED_STEPS)
-    _torchrun_capture(seeder_yaml, seeder_dir, extra_overrides=base_overrides, nproc=nproc)
 
-    adapter_dir = _writer_adapter_path(seeder_dir, save_step=_SEED_STEPS)
-    adapter_file = os.path.join(adapter_dir, "adapter_model.safetensors")
-    assert os.path.isfile(adapter_file), (
-        f"{mode}: seeder did not write a safetensors adapter at {adapter_file} "
-        f"(dir contents: {sorted(os.listdir(adapter_dir)) if os.path.isdir(adapter_dir) else 'MISSING'}). "
-        "ep_sharded adapter streaming requires the safetensors format."
-    )
+def _load_and_snapshot(
+    yaml_path: str, output_dir: str, base_dir: str, *, stream_load: bool
+) -> dict[str, torch.Tensor]:
+    sys.argv = _scenario_argv(yaml_path, output_dir, base_dir, stream_load=stream_load)
+    args = parse_args(VeOmniArguments)
+    trainer = MoeLoraTrainer(args)
+    trainer.snapshot_callback._dump("pre")
+    base_local = {
+        n: (p.to_local() if hasattr(p, "to_local") else p).detach().cpu().clone()
+        for n, p in trainer.model.named_parameters()
+        if ".base_layer.weight" in n
+    }
+    del trainer
+    gc.collect()
+    if dist.is_initialized():
+        dist.barrier()
+    return base_local
 
-    resume_yaml = _make_adapter_resume_yaml(yaml_path, adapter_dir, str(tmp_path / "resume.yaml"))
 
-    # ── 2. Reference resumer (broadcast loader) ─────────────────────────
-    ref_dir = str(tmp_path / "ref")
-    _torchrun_capture(resume_yaml, ref_dir, extra_overrides=base_overrides, nproc=nproc)
+def _run_stream_load_worker() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--fused-base-dir", required=True)
+    parser.add_argument("--per-expert-base-dir", required=True)
+    parser.add_argument("--adapters-dir", required=True)
+    parser.add_argument("--reverse-scenarios", action="store_true")
+    cli_args = parser.parse_args()
 
-    # ── 3. Stream resumer (ep_sharded_stream_load) ──────────────────────
-    stream_dir = str(tmp_path / "stream")
-    _torchrun_capture(
-        resume_yaml,
-        stream_dir,
-        extra_overrides=base_overrides
-        + [
-            "--model.broadcast_model_weights_from_rank0=False",
-            "--model.ep_sharded_stream_load=True",
-        ],
-        nproc=nproc,
-    )
+    scenarios = list(_STREAM_LOAD_SCENARIOS)
+    if cli_args.reverse_scenarios or os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        scenarios = list(reversed(scenarios))
 
-    # ── 4. Post-load LoRA weights must be bit-identical ─────────────────
-    _compare_snapshots_bit_exact(
-        actual_path=os.path.join(stream_dir, SNAPSHOT_PRE),
-        ref_path=os.path.join(ref_dir, SNAPSHOT_PRE),
-        label=f"{mode}/ep_sharded_stream_vs_broadcast",
-    )
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    try:
+        for mode, base_layout in scenarios:
+            label = f"{mode}_{base_layout}"
+            base_dir = cli_args.fused_base_dir if base_layout == "fused" else cli_args.per_expert_base_dir
+            adapter_dir = os.path.join(cli_args.adapters_dir, mode)
+            resume_yaml = _make_adapter_resume_yaml(
+                _yaml_for_mode(mode),
+                adapter_dir,
+                os.path.join(cli_args.work_dir, f"resume_{label}_rank{local_rank}.yaml"),
+            )
+            ref_dir = os.path.join(cli_args.work_dir, f"ref_{label}")
+            stream_dir = os.path.join(cli_args.work_dir, f"stream_{label}")
 
-    for d in (ref_dir, stream_dir):
-        shutil.rmtree(d, ignore_errors=True)
+            ref_base_local = _load_and_snapshot(resume_yaml, ref_dir, base_dir, stream_load=False)
+            stream_base_local = _load_and_snapshot(resume_yaml, stream_dir, base_dir, stream_load=True)
+
+            assert set(ref_base_local) == set(stream_base_local)
+            for name, ref_t in ref_base_local.items():
+                assert torch.equal(stream_base_local[name], ref_t), (
+                    f"[{label}] base expert local shard mismatch for {name}"
+                )
+
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                _compare_snapshots_bit_exact(
+                    actual_path=os.path.join(stream_dir, SNAPSHOT_PRE),
+                    ref_path=os.path.join(ref_dir, SNAPSHOT_PRE),
+                    label=f"{mode}/{base_layout}/ep_sharded_stream_vs_broadcast",
+                )
+            if dist.is_initialized():
+                dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_CI_EP_LAUNCH)
+def test_peft_ep_sharded_stream_load_matches_broadcast(
+    tmp_path, _stream_load_assets_root, fused_toy_base_dir, seeded_lora_adapters_dir
+):
+    """Fused 2-rank worker comparing streaming vs broadcast PEFT MoE-LoRA load across all 3 layouts."""
+    nproc = _gpu_count_or_skip(min_count=_CI_EP_LAUNCH.nproc, max_count=_CI_EP_LAUNCH.nproc)
+    work_dir = str(tmp_path / "stream_load_work")
+    os.makedirs(work_dir, exist_ok=True)
+    per_expert_base_dir = os.path.join(_stream_load_assets_root, "per_expert_base")
+
+    cmd = [
+        "torchrun",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc}",
+        "--standalone",
+        os.path.abspath(__file__),
+        f"--work-dir={work_dir}",
+        f"--fused-base-dir={fused_toy_base_dir}",
+        f"--per-expert-base-dir={per_expert_base_dir}",
+        f"--adapters-dir={seeded_lora_adapters_dir}",
+    ]
+    res = subprocess.run(cmd, check=True)
+    assert res.returncode == 0
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    _run_stream_load_worker()

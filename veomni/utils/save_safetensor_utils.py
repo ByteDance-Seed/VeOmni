@@ -24,7 +24,7 @@ import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
-from veomni.models.module_utils import _save_state_dict
+from veomni.models.checkpoint.weights import _save_state_dict
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
@@ -41,11 +41,88 @@ def get_model_save_state(
 ) -> Dict[str, torch.Tensor]:
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
+    If the model's checkpoint tensor converter defines ``export_weights(model)``,
+    delegates directly to it (so online RL weight export and HF checkpoint save share
+    the exact same key/dtype/quantization conversion) and partitions non-DTensor
+    outputs across ranks by shard index when distributed is initialized.
+
+    Otherwise:
     1. Extracts a flat state dict via ``ModelState`` (FQNs match HF weight_map keys).
     2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
     3. Filters out tied weights not present in ``fqn_to_index_mapping``.
     """
+    from contextlib import nullcontext
+
     from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.distributed.parallel_state import use_parallel_state
+    from veomni.models.checkpoint import get_checkpoint_tensor_converter
+
+    converter = get_checkpoint_tensor_converter(model) if model is not None else None
+    if converter is not None and callable(getattr(converter, "export_weights", None)):
+        import inspect
+
+        effective_mapping = (
+            fqn_to_index_mapping
+            if fqn_to_index_mapping is not None
+            else getattr(model, "_veomni_fqn_to_index_mapping", None)
+        )
+        if effective_mapping is not None:
+            model._veomni_fqn_to_index_mapping = effective_mapping
+        is_dist = dist.is_initialized()
+        rank = dist.get_rank() if is_dist else 0
+        world_size = dist.get_world_size() if is_dist else 1
+        use_shard_owner = effective_mapping is not None and len(set(effective_mapping.values())) > 1
+
+        def _owner_rank(key: str, tensor_idx: int) -> int:
+            """Return the rank responsible for quantizing and holding ``key`` during distributed save."""
+            if use_shard_owner and effective_mapping is not None and key in effective_mapping:
+                return effective_mapping[key] % world_size
+            return tensor_idx % world_size
+
+        quant_tensor_idx = 0
+
+        def _should_quantize(origin: str) -> bool:
+            """Predicate passed to ``converter.export_weights`` so only the owner rank quantizes ``origin``."""
+            nonlocal quant_tensor_idx
+            idx = quant_tensor_idx
+            quant_tensor_idx += 1
+            return rank == _owner_rank(origin, idx)
+
+        sig = inspect.signature(converter.export_weights)
+        accepts_should_quantize = "should_quantize" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        save_state = {}
+        ps_ctx = use_parallel_state(parallel_state) if parallel_state is not None else nullcontext()
+        with ps_ctx:
+            exported_iter = (
+                converter.export_weights(model, should_quantize=_should_quantize)
+                if (is_dist and accepts_should_quantize)
+                else converter.export_weights(model)
+            )
+            tensor_idx = -1
+            for k, v in exported_iter:
+                if not k.endswith(".scale"):
+                    tensor_idx += 1
+                if fqn_to_index_mapping is not None and k not in fqn_to_index_mapping:
+                    logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
+                    continue
+                if is_dist and not accepts_should_quantize:
+                    base_key = f"{k.removesuffix('.scale')}.weight" if k.endswith(".scale") else k
+                    owner = (
+                        effective_mapping[k] % world_size
+                        if (use_shard_owner and effective_mapping is not None and k in effective_mapping)
+                        else _owner_rank(base_key, max(tensor_idx, 0))
+                    )
+                    if rank != owner:
+                        continue
+                save_state[k] = v.detach().cpu()
+        if fqn_to_index_mapping is None:
+            logger.warning_rank0(
+                "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
+                "all model weights into a single safetensors file."
+            )
+        return save_state
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
@@ -111,7 +188,13 @@ def _save_hf_safetensor_distributed(
     # weights, resulting in corrupted safetensors output.
     if fqn_to_index_mapping is not None:
         original_mapping_size = len(fqn_to_index_mapping)
-        fqn_to_index_mapping = {k: v for k, v in fqn_to_index_mapping.items() if k in save_state}
+        if dist.is_initialized():
+            gathered_keys = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_keys, list(save_state.keys()))
+            global_keys = {k for rank_keys in gathered_keys if rank_keys is not None for k in rank_keys}
+        else:
+            global_keys = set(save_state.keys())
+        fqn_to_index_mapping = {k: v for k, v in fqn_to_index_mapping.items() if k in global_keys}
         if len(fqn_to_index_mapping) < original_mapping_size:
             logger.info_rank0(
                 f"Filtered fqn_to_index_mapping from {original_mapping_size} to {len(fqn_to_index_mapping)} keys "
@@ -166,6 +249,20 @@ def _save_hf_safetensor_legacy(
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
+def should_use_distributed_hf_safetensor_save(ckpt_manager: Optional[str]) -> bool:
+    """Return whether ``save_hf_safetensor`` routes through the distributed writer and converter export.
+
+    Disable the distributed ``HuggingFaceStorageWriter`` path on NPU. Under
+    HSDP replicate ranks independently cast fp32->bf16 on-device and write
+    per-rank safetensors files. When the casts are not bit-exact (~1 ULP on
+    Ascend 910B) the consolidation step bakes in whichever rank's data it
+    reads last, causing an intermittent mismatch against the fp32 DCP
+    checkpoint. Route through the legacy rank-0 path until the underlying
+    fp32->bf16 determinism issue is resolved in the NPU stack.
+    """
+    return is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
+
+
 def save_hf_safetensor(
     save_hf_safetensor_path: Optional[str] = None,
     ckpt_manager: Optional[str] = None,
@@ -208,14 +305,7 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-    # Disable the distributed `HuggingFaceStorageWriter` path on NPU.  Under
-    # HSDP replicate ranks independently cast fp32->bf16 on-device and write
-    # per-rank safetensors files.  When the casts are not bit-exact (~1 ULP on
-    # Ascend 910B) the consolidation step bakes in whichever rank's data it
-    # reads last, causing an intermittent mismatch against the fp32 DCP
-    # checkpoint.  Route through the legacy rank-0 path until the underlying
-    # fp32->bf16 determinism issue is resolved in the NPU stack.
-    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
+    use_distributed = should_use_distributed_hf_safetensor_save(ckpt_manager)
 
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
@@ -225,14 +315,14 @@ def save_hf_safetensor(
         DistributedCheckpointer.wait_for_pending_save()
 
     if use_distributed:
-        from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
+        from veomni.models.checkpoint import resolve_fqn_to_index_mapping_for_save
 
         fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
         _save_hf_safetensor_distributed(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
+        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
             _save_hf_safetensor_legacy(
                 save_checkpoint_path,

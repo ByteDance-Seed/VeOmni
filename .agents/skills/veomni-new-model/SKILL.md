@@ -72,11 +72,32 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 3. **Exception — non-transformers architectures.** Diffusion models under
    `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
-   directories, have no `generated/` output and no patchgen config: they patch
-   through `device_patch.py` or direct modeling. Copy the closest existing one
+   directories, have no `generated/` output and no patchgen config: their modeling
+   binds `VeomniOp` handles directly. Copy the closest existing one
    and skip to Phase 3.
 
-Come back here once the model loads and its registry / patch tests pass.
+4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
+
+5. **Configuration ownership** — custom configs inherit `VeOmniPretrainedConfig`
+   (inherit `(VeOmniPretrainedConfig, HFConfig)` when extending an HF schema;
+   declared `sub_configs` are adapted recursively at class creation). Generated
+   specs drop the HF `PreTrainedModel` import and import
+   `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
+   Handwritten models use the same base. It adapts direct model inputs and the
+   model's `config_class` recursively, validating final ops before HF initialization.
+   Standalone attention/MLP tests must use `get_veomni_config_class(HFConfig)` or
+   `as_veomni_config(config)` explicitly; native HF classes have no `ops_config`.
+   Read `docs/design/module_config.md`. Never patch HF config base methods or
+   maintain a separate attention field beside `ops_implementation`.
+   Handwritten Diffusers constructors that accept `attn_implementation` must
+   apply it to the config before HF initialization and kernel binding; preserve
+   existing choices when it is omitted or `None`.
+
+6. **Patch patterns** — follow existing models:
+   - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.
+   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module.
+   - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`.
+   - Register the model class in the model package `__init__.py`; transformers models register through their per-model `MODELING_REGISTRY` decorators.
 
 ## Phase 3: Write Training Config
 
@@ -118,17 +139,26 @@ Come back here once the model loads and its registry / patch tests pass.
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: add cases to the existing enumerated tables rather than new
-   files — `tests/models/test_model_registry.py` and
-   `tests/models/test_models_patch.py` (`TEST_CASES`) already cover loading via
-   `veomni.models.auto`, forward output shape, and patch application. See
-   `.agents/knowledge/testing.md` for the full landing-spot table and for why a
-   new file outside `tests/ops/` / `tests/data/` will not run in CI unless it is
-   wired into the unit-test workflows.
+2. **Model tests**: follow
+   [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).
+   Set eager attention on composite roots before constructing HF references;
+   text-only eager settings leave root and vision/audio defaults unresolved.
+   CPU model tests reject optional attention preloading even when installed.
+   Use config-owned SDPA for FP32 accelerator comparisons.
+   Add the canonical tiny-config factory, registry/build case, eager family
+   forward/backward parity, and reference coverage for one supported
+   accelerator training configuration. Shape checks and a successful import
+   do not establish model parity. Distinct optimized operator implementations
+   need their own numerical/backward coverage under `tests/ops/`.
 
-3. **E2e tests** (if feasible): add a `pytest.param` to
-   `tests/e2e/test_e2e_parallel.py` using the toy config, rather than a new
-   e2e file.
+3. **E2E tests**: extend the matching family table in
+   `tests/e2e/test_e2e_parallel.py`. Use the SOP's default four-process matrix:
+   dense `(SP1, EP1)` / `(SP2, EP1)`, ordinary MoE `(SP1, EP1)` / `(SP2, EP2)`.
+   Add modes only for a justified implementation/topology representative.
+   Document unsupported SP/EP and any smoke-only gap. Alignment must compare
+   loss and grad norm; process success alone is smoke coverage. Check
+   `.agents/knowledge/testing.md` for launch plans and GPU/NPU manifest
+   collection, and record actual hardware execution and skips.
 
 4. Run `make quality` and `pytest tests/models/`.
 

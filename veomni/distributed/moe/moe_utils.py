@@ -60,6 +60,7 @@ def unpermute(
     Returns:
         torch.Tensor: The unpermuted token tensor, [num_tokens, hidden_dim].
     """
+    out_dtype = tokens.dtype
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
 
     tokens = tokens * tokens_weight.unsqueeze(-1)
@@ -69,7 +70,7 @@ def unpermute(
     # accumulation internally, reducing top-k rounding error from BF16 scatter_add_.
     unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
     unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_dim), tokens.float())
-    return unpermuted_tokens.to(tokens.dtype)
+    return unpermuted_tokens.to(out_dtype)
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

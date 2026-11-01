@@ -7,6 +7,11 @@ This guide explains how VeOmni processes image and video inputs for vision-langu
 The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 1. **Preprocessing** (`preprocess.py`) — converts raw data samples into a unified conversation format via the [Preprocessor Registry](../key_features/preprocessor_registry.md).
+
+> **SeedOmni (Janus / Bagel):** uses `data_type: seedomni` and a flat
+> chat JSON with `type="image"` routed by `role`. See
+> [SeedOmni Data Format](../seed_omni/usage/data_format.md) for the full schema and
+> I2T / T2I / interleave examples.
 2. **Image processing** (`image_utils.py`) — loads images, resizes them to fit pixel budgets while preserving aspect ratio and ViT patch alignment.
 3. **Video processing** (`video_utils.py`) — loads videos (via torchcodec), samples frames by FPS, resizes spatially, and optionally extracts audio.
 4. **Transform** (`veomni/data/data_transform.py`) — orchestrates the above into tokenized model inputs with proper masking.
@@ -25,6 +30,8 @@ Images are resized by `smart_resize` to satisfy three constraints simultaneously
 | `max_ratio` | Maximum allowed aspect ratio (max_dim / min_dim) |
 
 The resize preserves aspect ratio: it scales H and W by the same factor, then rounds to `scale_factor` multiples.
+
+`mm_configs` sets the pixel budget and resizes before the processor. Set `scale_factor` to the model's patch alignment (28 for Qwen-VL) so the processor has nothing left to round.
 
 **Example config:**
 ```yaml
@@ -91,6 +98,12 @@ and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
 `frames_indices / fps` and average the first/last frame times within each temporal
 patch. This uses the source's average FPS; exact timing for variable-frame-rate
 containers would require retaining decoder presentation timestamps separately.
+
+The Qwen-Omni transform also forwards this metadata with `do_sample_frames=False`.
+Its processors use Hugging Face `VideoMetadata.sampled_fps` to calculate
+`video_second_per_grid = temporal_patch_size / sampled_fps` for audio/video token
+interleaving and position precomputation. This accounts for frame-count limits
+without adding fields to VeOmni metadata.
 
 ### Spatial Resize Parameters
 

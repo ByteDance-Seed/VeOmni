@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1122" viewBox="0 0 1280 1122" role="img" aria-labelledby="title desc">
+  <title id="title">Lower-precision transport with FP32 ReduceScatter input, accumulation and output</title>
+  <desc id="desc">With reduce_dtype set to FP32, native FSDP2 uses FP32 ReduceScatter. Enabling low_precision_reduce_scatter_comm infers BF16 or FP16 wire precision from mixed_precision.param_dtype. The custom path casts the FP32 input to that wire precision, exchanges destination shards through a verified node-local all-to-all, then sums and scales locally into the FP32 ReduceScatter output. It requires enabled mixed precision and FP32 reduction. Cross-node, unknown and singleton shard groups retain native communication. HSDP replica-linked shard groups must agree on eligibility and scaling; its subsequent AllReduce remains native FP32. On the custom path, replica AllReduce uses SUM because full-mesh scaling is applied in the ReduceScatter hook. Parameter AllGather and later gradient dtype casts are unchanged. FP32 addition order can differ from native ReduceScatter, so bitwise identity is not guaranteed. This diagram makes no performance claim.</desc>
+  <defs>
+    <style>
+      text { font-family: 'DejaVu Sans', sans-serif; fill: #172c3f; }
+      .title { font-size: 38px; font-weight: 700; letter-spacing: -1px; }
+      .body { font-size: 22px; }
+      .small { font-size: 20px; }
+      .label { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+      .stage { font-size: 24px; font-weight: 700; }
+      .muted { fill: #4e6374; }
+      .blue { fill: #205d8e; }
+      .teal { fill: #09675d; }
+      .amber { fill: #945111; }
+      .arrow { fill: none; stroke: #46677f; stroke-width: 3; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#46677f"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="1122" fill="#ffffff"/>
+  <rect x="1" y="1" width="1278" height="1120" rx="18" fill="none" stroke="#dce5eb" stroke-width="2"/>
+  <text x="32" y="58" class="title">Lower-precision transport. FP32 reduction.</text>
+  <text x="34" y="96" class="body muted">FSDP2: change the communication step, not the ReduceScatter dtype contract.</text>
+
+  <rect x="32" y="124" width="1216" height="90" rx="12" fill="#fff7e9" stroke="#ecd5ae" stroke-width="1.5"/>
+  <text x="52" y="156" class="label amber">OPT IN: low_precision_reduce_scatter_comm = true</text>
+  <text x="52" y="190" class="body">Mixed precision on / reduce_dtype = FP32 / wire dtype follows param_dtype (BF16 or FP16)</text>
+
+  <rect x="32" y="238" width="1216" height="178" rx="14" fill="#eff5fa" stroke="#c9dce9" stroke-width="1.5"/>
+  <text x="52" y="275" class="label blue">01  NATIVE FP32 REDUCESCATTER</text>
+  <rect x="52" y="300" width="212" height="90" rx="10" fill="#ffffff" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="158" y="337" text-anchor="middle" class="stage blue">FP32 RS input</text>
+  <text x="158" y="368" text-anchor="middle" class="small muted">all shard chunks</text>
+  <path d="M 264 345 H 352" class="arrow"/>
+  <rect x="366" y="300" width="540" height="90" rx="10" fill="#dcebf6" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="636" y="337" text-anchor="middle" class="stage blue">Native ReduceScatter</text>
+  <text x="636" y="368" text-anchor="middle" class="body">FP32 collective + native scaling</text>
+  <path d="M 906 345 H 996" class="arrow"/>
+  <rect x="1010" y="300" width="218" height="90" rx="10" fill="#ffffff" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="1119" y="337" text-anchor="middle" class="stage blue">FP32 RS output</text>
+  <text x="1119" y="368" text-anchor="middle" class="small muted">one reduced shard</text>
+
+  <rect x="32" y="440" width="1216" height="296" rx="14" fill="#eff8f5" stroke="#acd3c9" stroke-width="1.5"/>
+  <text x="52" y="478" class="label teal">02  CUSTOM PATH</text>
+  <text x="294" y="478" class="body teal">Only for a verified node-local, multi-rank RS group</text>
+
+  <rect x="52" y="514" width="168" height="146" rx="10" fill="#ffffff" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="136" y="560" text-anchor="middle" class="stage blue">FP32</text>
+  <text x="136" y="592" text-anchor="middle" class="stage blue">RS input</text>
+  <text x="136" y="634" text-anchor="middle" class="small muted">unscaled</text>
+  <path d="M 220 585 H 244" class="arrow"/>
+
+  <rect x="254" y="514" width="160" height="146" rx="10" fill="#fff2dc" stroke="#dcb374" stroke-width="1.5"/>
+  <text x="334" y="556" text-anchor="middle" class="stage amber">Cast</text>
+  <text x="334" y="590" text-anchor="middle" class="body">wire buffer</text>
+  <text x="334" y="631" text-anchor="middle" class="small amber">BF16 / FP16</text>
+  <path d="M 414 585 H 438" class="arrow"/>
+
+  <rect x="448" y="514" width="266" height="146" rx="10" fill="#fff2dc" stroke="#dcb374" stroke-width="1.5"/>
+  <text x="581" y="550" text-anchor="middle" class="stage amber">All-to-all exchange</text>
+  <text x="581" y="582" text-anchor="middle" class="small">BF16 / FP16 transport</text>
+  <rect x="466" y="606" width="48" height="32" rx="4" fill="#e8ba78"/>
+  <rect x="526" y="606" width="48" height="32" rx="4" fill="#e8ba78"/>
+  <rect x="586" y="606" width="48" height="32" rx="4" fill="#e8ba78"/>
+  <rect x="646" y="606" width="48" height="32" rx="4" fill="#e8ba78"/>
+  <text x="490" y="629" text-anchor="middle" class="small">s0</text>
+  <text x="550" y="629" text-anchor="middle" class="small">s1</text>
+  <text x="610" y="629" text-anchor="middle" class="small">s2</text>
+  <text x="670" y="629" text-anchor="middle" class="small">s3</text>
+  <path d="M 714 585 H 738" class="arrow"/>
+
+  <rect x="748" y="514" width="228" height="146" rx="10" fill="#dcebf6" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="862" y="560" text-anchor="middle" class="stage blue">Local FP32</text>
+  <text x="862" y="592" text-anchor="middle" class="stage blue">SUM + scale</text>
+  <text x="862" y="634" text-anchor="middle" class="small muted">at the destination</text>
+  <path d="M 976 585 H 1000" class="arrow"/>
+
+  <rect x="1010" y="514" width="218" height="146" rx="10" fill="#ffffff" stroke="#91b4cf" stroke-width="1.5"/>
+  <text x="1119" y="560" text-anchor="middle" class="stage blue">FP32</text>
+  <text x="1119" y="592" text-anchor="middle" class="stage blue">RS output</text>
+  <text x="1119" y="634" text-anchor="middle" class="small muted">one reduced shard</text>
+  <text x="52" y="702" class="body teal">Each destination receives its shard from every source (s0-s3 shown), then sums in FP32.</text>
+
+  <rect x="32" y="760" width="1216" height="136" rx="12" fill="#f3f6f8" stroke="#d2dde5" stroke-width="1.5"/>
+  <text x="52" y="794" class="label">AFTER EITHER PATH</text>
+  <text x="325" y="794" class="stage blue">HSDP only: native FP32 AllReduce over replicas</text>
+  <text x="52" y="834" class="body muted">Replica-linked shard groups must agree on path and scaling before backward.</text>
+  <text x="52" y="868" class="body muted">Custom path: replica SUM; full-mesh scaling is applied in the RS hook.</text>
+
+  <rect x="32" y="920" width="592" height="140" rx="12" fill="#ffffff" stroke="#d2dde5" stroke-width="1.5"/>
+  <text x="52" y="954" class="label">WHEN THE CUSTOM PATH IS NOT USED</text>
+  <text x="52" y="989" class="small muted">Cross-node / unknown placement / singleton:</text>
+  <text x="52" y="1018" class="small muted">native communication and scaling remain.</text>
+  <text x="52" y="1047" class="small muted">Also native: off or param_dtype = reduce_dtype.</text>
+
+  <rect x="648" y="920" width="600" height="140" rx="12" fill="#ffffff" stroke="#d2dde5" stroke-width="1.5"/>
+  <text x="668" y="954" class="label">UNCHANGED BOUNDARIES</text>
+  <text x="668" y="989" class="small muted">Parameter AllGather and later gradient dtype casts.</text>
+  <text x="668" y="1018" class="small muted">FP32 addition order may differ from native RS:</text>
+  <text x="668" y="1047" class="small muted">bitwise identity is not guaranteed.</text>
+
+  <text x="34" y="1095" class="small muted">Mechanism only. Node-local placement does not guarantee acceleration.</text>
+</svg>
