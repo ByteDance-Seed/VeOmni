@@ -189,14 +189,49 @@ class VeOmniModelRuntime:
             recover_ownership = _coordinated_optimizer_flag(recover_ownership, "frozen optimizer ownership policy")
             if recover_ownership:
                 _coordinated_optimizer_flag(checkpoint_path, "frozen optimizer checkpoint path")
+            self._build_optimizer_checked(checkpoint_path if recover_ownership else None)
+        self._build_model_assets()
+        self.build_checkpoint()
+
+    def _build_optimizer_checked(self, checkpoint_path: Optional[str] = None) -> None:
+        """Coordinate local build failures before entering checkpoint preflight."""
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if checkpoint_path is not None:
                 from ..checkpoint.rank_local_optimizer import recover_frozen_optimizer_ownership
 
                 with recover_frozen_optimizer_ownership(self.model, checkpoint_path):
                     self._build_optimizer()
             else:
                 self._build_optimizer()
-        self._build_model_assets()
-        self.build_checkpoint()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "building model optimizer")
+        self._validate_optimizer_checkpoint_mode()
+
+    def _validate_optimizer_checkpoint_mode(self) -> None:
+        """Reject unsupported checkpoint modes on all ranks before training."""
+        from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        checkpoint = getattr(self.train_args, "checkpoint", None)
+        _, manager, asynchronous = _coordinated_optimizer_flag(
+            (
+                self.model_name,
+                getattr(checkpoint, "manager", "dcp"),
+                bool(getattr(checkpoint, "save_async", False)),
+            ),
+            "optimizer checkpoint mode",
+        )
+        if manager == "dcp" and asynchronous:
+            error = (
+                RuntimeError("MultiOptimizer checkpoints currently require synchronous DCP save")
+                if getattr(self.optimizer, "_is_multi_optimizer", False) is True
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint mode")
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""

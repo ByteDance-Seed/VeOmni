@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -445,7 +450,8 @@
       "-s",
       "-x",
       "tests/optim/test_cpu_offload_adamw.py",
-      "tests/optim/test_cpu_offload_adamw_device.py"
+      "tests/optim/test_cpu_offload_adamw_device.py",
+      "tests/optim/test_master_fp32_adamw.py"
     ]
   }
 ]
