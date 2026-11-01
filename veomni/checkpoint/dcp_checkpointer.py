@@ -2033,8 +2033,15 @@ class DistributedCheckpointer(CheckpointerBase):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "inspecting checkpoint layout", group=process_group)
-        specs = getattr(state["model"], "_fqn2spec_info", None)
-        if _needs_extra_parallel_layout_marker(specs):
+        specs, needs_marker, error = None, False, None
+        try:
+            specs = getattr(state["model"], "_fqn2spec_info", None)
+            needs_marker = _needs_extra_parallel_layout_marker(specs)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "checking ExtraParallel marker policy", group=process_group)
+        needs_marker = _coordinated_optimizer_flag(needs_marker, "ExtraParallel marker policy", group=process_group)
+        if needs_marker:
             marker_error = None
             try:
                 source_path = fused_dir if fused_dir is not None else weights_dir(path, module)
@@ -2091,21 +2098,25 @@ class DistributedCheckpointer(CheckpointerBase):
                 parallel_state=parallel_state,
                 validate_only=True,
             )
-            model_state = _ProvenModelState(
-                state["model"],
-                trainable_only=trainable_only,
-                parallel_state=parallel_state,
-                optimizer=optimizer,
-                group=process_group,
-            )
+            model_state, reader, planner, error = None, None, None, None
+            try:
+                model_state = _ProvenModelState(
+                    state["model"],
+                    trainable_only=trainable_only,
+                    parallel_state=parallel_state,
+                    optimizer=optimizer,
+                    group=process_group,
+                )
+                reader = cls._create_storage_reader(model_path)
+                planner = _ModelStrictLoadPlanner(strict_model=not trainable_only, expected_save_id=model_id)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "preparing proven model checkpoint state", group=process_group)
             dcp.load(
                 state_dict={"model": model_state},
-                storage_reader=cls._create_storage_reader(model_path),
+                storage_reader=reader,
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(
-                    strict_model=not trainable_only,
-                    expected_save_id=model_id,
-                ),
+                planner=planner,
             )
             error = (
                 RuntimeError("Optimizer object changed while loading model state")
@@ -2123,8 +2134,12 @@ class DistributedCheckpointer(CheckpointerBase):
                 group=process_group,
                 frozen_digest=frozen_digest,
             )
-            if current != expected_layout:
-                raise RuntimeError("MultiOptimizer layout changed while loading model state")
+            error = (
+                RuntimeError("MultiOptimizer layout changed while loading model state")
+                if current != expected_layout
+                else None
+            )
+            raise_if_any_rank_failed(error, "rechecking MultiOptimizer layout", group=process_group)
             _prepare_multi_optimizer_saved_states(
                 state["model"],
                 optimizer,
@@ -2134,24 +2149,31 @@ class DistributedCheckpointer(CheckpointerBase):
                 group=process_group,
                 parallel_state=parallel_state,
             )
-            optimizer_state = _ProvenMultiOptimizerState(
-                model=state["model"],
-                optimizer=optimizer,
-                parallel_state=parallel_state,
-                load=True,
-                generation=generation,
-                scheduler_snapshot=snapshot,
-                scheduler_object=scheduler_object,
-                extra_digest=extra_digest,
-                expected_layout=expected_layout,
-                group=process_group,
-                frozen_digest=frozen_digest,
-            )
+            optimizer_state, reader, planner, error = None, None, None, None
+            try:
+                optimizer_state = _ProvenMultiOptimizerState(
+                    model=state["model"],
+                    optimizer=optimizer,
+                    parallel_state=parallel_state,
+                    load=True,
+                    generation=generation,
+                    scheduler_snapshot=snapshot,
+                    scheduler_object=scheduler_object,
+                    extra_digest=extra_digest,
+                    expected_layout=expected_layout,
+                    group=process_group,
+                    frozen_digest=frozen_digest,
+                )
+                reader = cls._create_storage_reader(optimizer_path)
+                planner = _ModelStrictLoadPlanner(strict_model=False, expected_save_id=optimizer_id)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "preparing proven optimizer checkpoint state", group=process_group)
             dcp.load(
                 state_dict={"optimizer": optimizer_state},
-                storage_reader=cls._create_storage_reader(optimizer_path),
+                storage_reader=reader,
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=False, expected_save_id=optimizer_id),
+                planner=planner,
             )
             if extra is not None:
                 state["extra_state"].update(extra)
