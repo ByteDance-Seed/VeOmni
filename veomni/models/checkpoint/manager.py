@@ -408,7 +408,20 @@ class ModelCheckpointManager:
             raise_if_any_rank_failed(error, "checking restored MultiOptimizer generation")
         elif error is not None:
             raise error
-        dist.barrier()
+        try:
+            dist.barrier()
+        except BaseException:
+            optimizer = state.get("optimizer")
+            leaves = getattr(optimizer, "optimizers_dict", {})
+            targets = [optimizer, *(leaves.values() if isinstance(leaves, dict) else ())]
+            for leaf in targets:
+                abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        pass  # Keep the original barrier error.
+            raise
         if multi:
             self._loaded_optimizer_global_step = step
             self._loaded_optimizer_generation = generation
