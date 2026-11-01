@@ -89,7 +89,7 @@ def smart_resize(
 
 def load_image_from_path(image: str, **kwargs):
     if image.startswith("http://") or image.startswith("https://"):
-        response = requests.get(image, stream=True)
+        response = requests.get(image, timeout=(5, 30))
         # ``raise_for_status`` surfaces a 404 / 5xx with the URL + status code
         # instead of letting PIL raise a downstream ``UnidentifiedImageError``
         # on the HTML error body, which obscures the real failure.

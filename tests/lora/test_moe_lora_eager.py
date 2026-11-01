@@ -70,6 +70,7 @@ from unittest import mock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora import resolve_fused_moe_lora_targets
 from veomni.lora.moe_layers import (
     _LORA_SPEC_KEYS,
@@ -331,6 +332,35 @@ def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str,
     base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl))
 
     assert _moe_lora_op(base_layer, mode).impl == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_rejects_deepgemm_fp8_before_moving_parameters(mode: str):
+    from types import SimpleNamespace
+
+    base_layer = torch.nn.Module()
+    base_layer.num_experts = 2
+    base_layer.hidden_dim = 8
+    base_layer.intermediate_dim = 8
+    base_layer.act_fn = torch.nn.SiLU()
+    base_layer.gate_up_proj = torch.nn.Parameter(torch.empty(2, 16, 8))
+    base_layer.down_proj = torch.nn.Parameter(torch.empty(2, 8, 8))
+    base_layer.register_buffer("residual_mask", torch.ones(2))
+    base_layer.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    original_parameters = dict(base_layer.named_parameters())
+    original_buffers = dict(base_layer.named_buffers())
+
+    with pytest.raises(ValueError, match="deepgemm_fp8.*does not support MoE-LoRA"):
+        _wrapper_cls(mode)(base_layer, r=2, lora_alpha=4)
+
+    assert dict(base_layer.named_parameters()).keys() == original_parameters.keys()
+    assert dict(base_layer.named_buffers()).keys() == original_buffers.keys()
+    for name, parameter in base_layer.named_parameters():
+        assert parameter is original_parameters[name]
+        assert parameter.requires_grad
+    for name, buffer in base_layer.named_buffers():
+        assert buffer is original_buffers[name]
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)

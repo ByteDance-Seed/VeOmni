@@ -77,20 +77,18 @@ def get_or_prepare_attn_arg(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
-    metadata_head_dim: int | None = None,
 ) -> object:
     """Reuse prepared FA4 mask metadata across layers with matching inputs."""
     global _cache_entry
 
-    metadata_head_dim = query.shape[-1] if metadata_head_dim is None else metadata_head_dim
     bounds_key = _make_bounds_key(query, key, q_ranges, k_ranges)
-    attn_arg_key = _make_cache_key(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
+    attn_arg_key = _make_cache_key(query, key, q_ranges, k_ranges, attn_type_map)
     with _CACHE_LOCK:
         if _attn_arg_hit(attn_arg_key):
             return _cache_entry.attn_arg
         if not _bounds_hit(bounds_key):
             _validate_range_bounds(query, key, q_ranges, k_ranges)
-        attn_arg = _prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
+        attn_arg = _prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
         if attn_arg_key is None and bounds_key is None:
             _cache_entry = None
             return attn_arg
@@ -139,7 +137,6 @@ def _prepare_attn_arg(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
-    metadata_head_dim: int,
 ) -> object:
     """Build upstream FA4 metadata once for a new mask and attention shape."""
     from ._fa4_cuda import cuda_device_context
@@ -159,7 +156,7 @@ def _prepare_attn_arg(
             attn_type_map=attn_type_map_list,
             seqlen_q=query.shape[0],
             seqlen_k=key.shape[0],
-            headdim=metadata_head_dim,
+            headdim=query.shape[-1],
         )
 
 
@@ -199,7 +196,6 @@ def _make_cache_key(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
-    metadata_head_dim: int,
 ) -> tuple[object, ...] | None:
     """Identify unchanged FA4 metadata inputs without reading tensor values."""
     identities = _tensor_identities((q_ranges, k_ranges, attn_type_map))
@@ -210,6 +206,5 @@ def _make_cache_key(
         query.dtype,
         tuple(query.shape),
         tuple(key.shape),
-        metadata_head_dim,
         *identities,
     )

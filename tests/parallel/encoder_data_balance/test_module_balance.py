@@ -9,8 +9,20 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.utils.data_balance.module_balance import ModuleDataBalancer, greedy_cost_assignment
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_QWEN_VISION_LAUNCH = LaunchSpec(nproc=4)
+
+
+def _roundtrip_world(device_count):
+    return 8 if device_count >= 8 else 4
+
+
+def _roundtrip_launch(context):
+    return LaunchSpec(nproc=_roundtrip_world(len(context.capabilities.devices)))
 
 
 @pytest.mark.parametrize("costs,size", [([], 4), ([9], 4), ([0, 0], 4), ([4, 4, 4, 4], 2), ([100, 9, 4, 1], 2)])
@@ -401,9 +413,9 @@ def distributed_worker():
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_roundtrip_launch)
 def test_distributed_roundtrip_and_backward():
-    count = 0 if get_device_type() == "cpu" else get_torch_device().device_count()
-    world = 8 if count >= 8 else 4
+    world = _roundtrip_world(runner_device_count())
     subprocess.run(
         [
             sys.executable,
@@ -574,8 +586,9 @@ def qwen_vision_worker():
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_QWEN_VISION_LAUNCH)
 def test_qwen_vision_fsdp_on_off_parity():
-    if get_device_type() == "cpu" or get_torch_device().device_count() < 4:
+    if get_device_type() == "cpu" or runner_device_count() < _QWEN_VISION_LAUNCH.nproc:
         pytest.skip("Actual toy vision FSDP2/SP parity requires four accelerators.")
     subprocess.run(
         [
@@ -583,7 +596,7 @@ def test_qwen_vision_fsdp_on_off_parity():
             "-m",
             "torch.distributed.run",
             "--standalone",
-            "--nproc-per-node=4",
+            f"--nproc-per-node={_QWEN_VISION_LAUNCH.nproc}",
             __file__,
             "--model-worker",
         ],

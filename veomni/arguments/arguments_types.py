@@ -115,7 +115,7 @@ class OptimizerConfig:
     )
     weight_decay: float = field(
         default=0,
-        metadata={"help": "Weight decay. AdamW applies it decoupled, outside the gradient."},
+        metadata={"help": "L2 regularization strength."},
     )
     no_decay_modules: List[str] = field(
         default_factory=list,
@@ -871,6 +871,12 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         self.dp_size = self.world_size // non_dp_size
 
@@ -1405,7 +1411,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
@@ -1498,14 +1504,16 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
             "help": "Qwen4-Exp QSA sparse attention. 'eager' expands the compact global token "
             "selection to a dense mask and runs quadratic PyTorch attention (numerical reference). "
-            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA); "
-            "it covers training forward/backward only, no KV cache, and raises on an attention mask. "
-            "Nonzero attention dropout falls back to eager with a warning."
+            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA). "
+            "'torch_npu' prunes per-query-chunk KV intervals with an int8 scatter mask and runs "
+            "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
+            "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
@@ -1545,7 +1553,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1633,13 +1641,20 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
@@ -1880,10 +1895,6 @@ class ModelArguments(BaseModelArguments):
                 )
 
 
-# Omni modules inherit this same training-unit shape.
-ModelRuntimeArguments = ModelArguments
-
-
 # ================================ Data Arguments ======================================
 #
 # Hierarchy:
@@ -1964,15 +1975,10 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal[
-        "plaintext",
-        "conversation",
-        "diffusion",
-        "classification",
-        "dpo",
-        "seedomni",
-        "seedomni_cached",
-    ] = field(default="conversation", metadata={"help": "Type of the training data."})
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+        default="conversation",
+        metadata={"help": "Type of the training data."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -2029,11 +2035,6 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
-            elif self.data_type in {"seedomni", "seedomni_cached"}:
-                # SeedOmni modules own their own tokenization; the transform
-                # reads ``conversations`` / ``images`` columns directly and
-                # cached rows carry ``conversation_list`` directly. Leave it unset.
-                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

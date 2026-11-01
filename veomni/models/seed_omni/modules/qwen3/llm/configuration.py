@@ -19,11 +19,14 @@ class Qwen3LlmConfig(OmniModuleConfig):
 
     def __init__(
         self,
-        text_config: Optional[Dict[str, Any]] = None,
+        text_config: Optional[Dict[str, Any] | Qwen3Config] = None,
         freeze: bool = False,
         **kwargs,
     ):
-        self.text_config = Qwen3Config(**text_config) if text_config else Qwen3Config()
+        if isinstance(text_config, Qwen3Config):
+            self.text_config = text_config
+        else:
+            self.text_config = Qwen3Config(**text_config) if text_config else Qwen3Config()
         # When True, ``Qwen3Llm.freeze_model`` freezes the whole backbone
         # (used to bootstrap a frozen LLM into a multimodal model).
         self.freeze = freeze

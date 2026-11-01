@@ -15,7 +15,7 @@ import torch
 
 from .....auto import build_tokenizer
 from ....utils.conversation import ConversationItem
-from ...base.text_encoder.processing import TextEncoderPreprocessor
+from ...text_encoder.processing import TextEncoderPreprocessor
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 
 

@@ -1,7 +1,7 @@
 """Janus text-encoder packed training hooks (wte + causal CE).
 
 Parallel to the conversation ``encode`` / ``decode`` hooks in
-:mod:`....base.text_encoder.accelerated`. Janus-only: do not put this mixin on
+:mod:`....text_encoder.accelerated`. Janus-only: do not put this mixin on
 the shared text-encoder base.
 """
 

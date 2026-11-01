@@ -39,14 +39,13 @@ Assertions:
       streaming loader stacks only each rank's experts.
 
 Run directly (2 GPUs):
-    torchrun --nproc_per_node=2 --master_port=4331 \
+    torchrun --standalone --nproc_per_node=2 \
         tests/utils/test_moe_ep_sharded_load_matrix.py
 """
 
 from __future__ import annotations
 
 import os
-import random
 import subprocess
 import sys
 from pathlib import Path
@@ -58,12 +57,16 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor, Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.utils import helper
 from veomni.utils.device import get_dist_comm_backend, get_torch_device
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -332,17 +335,17 @@ def run_worker() -> None:
 _ACCEL = get_torch_device()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
-    not _ACCEL.is_available() or _ACCEL.device_count() < 2,
+    not _ACCEL.is_available() or runner_device_count() < 2,
     reason="requires >= 2 accelerator devices (CUDA or NPU)",
 )
 def test_moe_ep_sharded_load_matrix(tmp_path):
-    port = 12345 + random.randint(0, 500)
     env = dict(os.environ, MOE_MATRIX_TMP=str(tmp_path))
     cmd = [
         "torchrun",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         os.path.abspath(__file__),
     ]
     subprocess.run(cmd, check=True, env=env)

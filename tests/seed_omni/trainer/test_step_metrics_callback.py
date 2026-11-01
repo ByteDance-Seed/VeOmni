@@ -12,10 +12,15 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.trainer.callbacks.omni_callbacks.step_metrics_callback import OmniStepMetricsCallback
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 _LOSS_DICTS = [{"node_a": 1.0, "node_b": 2.0}, {"node_b": 4.0}]
@@ -57,8 +62,9 @@ def _rank_main(rank: int, rendezvous: str, out_dir: str, with_lr_scheduler: bool
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_ranks_reduce_the_same_step_metrics(tmp_path):
-    mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_CI_CPU_2.nproc, join=True)
 
     metrics = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
     train = metrics[0]["train"]
@@ -79,9 +85,10 @@ def test_ranks_reduce_the_same_step_metrics(tmp_path):
     assert train["training/lr"] == 1e-4
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_offline_cache_logs_no_lr_without_an_lr_scheduler(tmp_path):
     """An ``offline_embedding`` run freezes every module, so the composed model has no lr scheduler."""
-    mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path), False), nprocs=2, join=True)
+    mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path), False), nprocs=_CI_CPU_2.nproc, join=True)
 
     train = json.loads((tmp_path / "rank0.json").read_text())["train"]
     assert "training/lr" not in train

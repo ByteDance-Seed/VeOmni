@@ -19,7 +19,13 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
 import torch
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

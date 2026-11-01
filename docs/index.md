@@ -108,6 +108,7 @@ seed_omni/usage/adding_a_model.md
 seed_omni/usage/hf_layout.md
 seed_omni/distributed/per_module_parallelism.md
 seed_omni/distributed/sequence_parallel.md
+seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/module_data_balance.md
@@ -129,8 +130,10 @@ seed_omni/models/bagel.md
 :maxdepth: 1
 :caption: Design
 
+design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md
+design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
 design/encoder_balance_costs.md
 design/patchgen.md

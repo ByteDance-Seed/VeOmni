@@ -25,9 +25,10 @@ Empty batches and fewer items than replicas produce empty per-rank tables with
 the same column count, dtype, and device. This does not by itself make a legacy
 exchange caller empty-rank-safe; that caller must support empty payloads too.
 
-The existing distributed reverse test defaults to eight ranks, as in CI. For a
-smaller test machine, set `VEOMNI_BALANCE_WORLD_SIZE=4` when invoking pytest;
-the worker derives its DP topology from the torchrun world size.
+The existing distributed reverse test defaults to the four ranks declared by
+its CI launch plan. Set `VEOMNI_BALANCE_WORLD_SIZE` when invoking pytest to use
+a different number of ranks; the worker derives its DP topology from the
+torchrun world size.
 
 This is the independent shared-cost step of
 [#1074](https://github.com/ByteDance-Seed/VeOmni/issues/1074), following the

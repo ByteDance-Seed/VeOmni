@@ -8,7 +8,7 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, iter_desired_items, maybe_merge_outputs
-from ...base.text_encoder.modeling import TextEncoder
+from ...text_encoder.modeling import TextEncoder
 from ..sources import BAGEL_FLOW_QUERY, BAGEL_PHASE_KEY, BAGEL_START_TOKEN
 from .configuration import BagelTextEncoderConfig
 from .processing import BagelTextEncoderPreprocessor, apply_image_marker

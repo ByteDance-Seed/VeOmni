@@ -56,6 +56,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -214,6 +215,13 @@ class SeedOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=self.veomni_attn.impl,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -222,7 +230,7 @@ class SeedOssAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **kwargs,
+            **attn_kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

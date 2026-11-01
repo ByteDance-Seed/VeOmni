@@ -64,10 +64,11 @@ def standard_fused_reference(
     num_experts: int,
     swiglu_limit: float | None = None,
 ) -> Tensor:
-    """Evaluate standard MoE with github/main fused-kernel order.
+    """Evaluate standard MoE with pre-fc2 routing-weight order.
 
-    Non-EP Triton and Quack multiply routing onto the SwiGLU intermediate,
-    then apply ``fc2``. Use this only for fused-kernel tests.
+    Non-EP Quack multiplies routing onto the SwiGLU intermediate, then
+    applies ``fc2``. Non-EP Triton uses ``standard_ep_reference`` (post-``fc2``
+    routing order) to match EP combine and Hugging Face eager.
     """
     return _standard_expert_loop(
         hidden,

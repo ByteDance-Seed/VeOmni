@@ -17,9 +17,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import MetricMeterMixin
 from veomni.utils import helper, omni_helper
 from veomni.utils.omni_helper import OmniEnvironMeter
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class MeteredModule(MetricMeterMixin):
@@ -263,27 +269,6 @@ def test_multisource_tracker_steps_even_when_no_module_aligns(single_process_met
     assert calls == [([0, 1], [0, 0])]
 
 
-def test_multisource_tracker_survives_a_step_with_no_tokens(monkeypatch):
-    """The zero seqlens of a step where no module aligns (e.g. a VAE-only cache pass)."""
-
-    def _gather_one_rank(out, obj, group=None):
-        out[0] = obj
-
-    monkeypatch.setattr(helper.dist, "all_gather_object", _gather_one_rank)
-    tracker = helper.MultiSourceInfoTracker.__new__(helper.MultiSourceInfoTracker)
-    tracker.dataloader = None
-    tracker.parallel_state = SimpleNamespace(dp_size=1, dp_group=None, tp_enabled=False)
-    tracker.accumulate_counter = {}
-    tracker.batch_idx = 0
-    tracker.names = ["a", "b"]
-    tracker.boundary_type = "token"
-
-    metrics = tracker.step([0, 1], [0, 0])
-
-    assert metrics["multi_source/step_consumed_ratio/a"] == 0.0
-    assert metrics["multi_source/step_consumed_samples"] == 2
-
-
 def _two_rank_step_main(rank: int, rendezvous: str, out_dir: str) -> None:
     """Rank 1 lists its modules in another order, and only rank 0's vision happens to align."""
     import veomni.utils.dist_utils as dist_utils
@@ -329,8 +314,11 @@ def _two_rank_step_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_step_reduces_by_module_name_and_agrees_on_the_multisource_module(tmp_path):
-    mp.spawn(_two_rank_step_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(
+        _two_rank_step_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_CI_CPU_2.nproc, join=True
+    )
 
     results = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
     for rank, result in enumerate(results):

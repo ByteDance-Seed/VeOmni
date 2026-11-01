@@ -393,7 +393,7 @@ def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
     Asserted on the ACCELERATED class: it overrides ``decode``, so the fused
     dispatch has to live there to be what training actually runs.
     """
-    import veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated as text_encoder_accelerated
+    import veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated as text_encoder_accelerated
 
     reduction_group = object()
     captured = {}

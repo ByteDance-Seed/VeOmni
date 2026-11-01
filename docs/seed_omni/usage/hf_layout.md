@@ -100,19 +100,20 @@ Framework-provided, not to be overridden:
 
 Training from an upstream root:
 
-- [`build_omni_model_runtime_args`](../../../veomni/arguments/omni_arguments_types.py#L173) calls
+- [`build_omni_model_runtime_args`](../../../veomni/arguments/omni_arguments_types.py#L188) calls
   [`_resolve_hf_checkpoint_view`](../../../veomni/arguments/omni_arguments_types.py#L97):
   - [`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L320) reads the root `model_type`, and
     [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L350) writes the weight-free view once per process (module configs, assets, root config, graphs, `hf_source.json`);
   - `model.seed_omni_model_path` is set to the view; `model.model_path` is unchanged.
 - [`_validate_hf_view_modules`](../../../veomni/arguments/omni_arguments_types.py#L141) checks every module comes from the layout; with `save_hf_weights`,
-  [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121) checks the source has safetensors.
+  [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121) checks the source has safetensors
+  (skipped for `train.training_task: offline_embedding`, which exports nothing).
 - [`OmniConfig.load_checkpoint_sidecars`](../../../veomni/models/seed_omni/configuration_omni.py#L419) records the `HFSource`, which each `ModuleRuntime` receives.
 - `ModuleRuntime._build_model` builds the module on meta and
-  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L385);
+  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L347);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L233) is the upstream root.
-- The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
-  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1228) skip keys the converter declares, without reading them;
+- The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L296)) loads weights:
+  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1236) skip keys the converter declares, without reading them;
   - [`load_model_weights_ep_sharded`](../../../veomni/models/checkpoint/weights.py#L660) (`ep_sharded_stream_load`) renames each source key with the converter before planning its rank's slice, so per-expert source keys are read only by the rank that owns the expert, and dispatches the layout's `generated_tensors` last;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L380) renames the module's own keys and hands them to the module's converter.
 

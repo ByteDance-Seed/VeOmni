@@ -11,6 +11,7 @@ from torch.distributed.fsdp import FSDPModule
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import CheckpointPolicy, noop_context_fn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
 from veomni.distributed.checkpoint import CheckpointFunction
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -19,6 +20,9 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_min
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from veomni.utils import recompute_utils
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _CheckpointingModel(nn.Module):

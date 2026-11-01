@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
     MultiLRScheduler,
     OmniModelRuntime,
@@ -28,6 +29,9 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _StubConfig(OmniModuleConfig):

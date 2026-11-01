@@ -211,22 +211,11 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
     # precomputed multimodal metadata (fast path) — so the ViT's own
-    # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
-    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
-    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
-    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
-    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
-    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
-    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
-    #    a path production bypasses → tagged HF-eager-only.
-    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    # `.tolist()` + host-side cu_seqlens build do not appear here, and the
+    # single-segment SDPA wrapper drops single-segment `cu_seqlens` without
+    # splitting or `.tolist()`-syncing. What remains:
+    #  - get_rope_index / get_vision_position_ids: the HF-verbatim mrope algorithm.
     "qwen3_5_vl-sdpa": {
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
-            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
-            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
-            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
-            "case runs SDPA only because FA2 NaNs on the toy config."
-        ),
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },

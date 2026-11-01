@@ -23,11 +23,15 @@ import veomni.ops.platform.requirement as requirement_mod
 import veomni.ops.registry as registry_mod
 import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import ops_config_scope
 from veomni.arguments import OpsImplementationConfig
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.platform import GpuKernelRequirement
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _HOST_FIELDS = (

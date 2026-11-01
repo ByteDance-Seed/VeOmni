@@ -88,6 +88,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],

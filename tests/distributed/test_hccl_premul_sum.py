@@ -16,15 +16,20 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.hccl_premul_sum import (
     _WRAPPED_MARKER,
     apply_hccl_premul_sum_patch,
     hccl_premul_sum_wrapper,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _MockPremulSum:

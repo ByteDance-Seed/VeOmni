@@ -19,5 +19,3 @@ Each sub-module lives in its own folder named after the module
 name in every filename.  See :mod:`veomni.models.seed_omni.modules`
 for the registry that wires them up.
 """
-
-from . import text_encoder  # noqa: F401
