@@ -147,6 +147,13 @@ otherwise keep the step discoverable through the legacy fallback below), and
 the step is correctly rejected throughout, including in the window where one
 half has been invalidated and the other has not.
 
+For a `MultiOptimizer`, a completed checkpoint is not overwritten in place:
+the save fails before changing its manifest or shards. When rewinding to an
+earlier checkpoint, write the new run to a different output directory to avoid
+colliding with checkpoints from the previous run. A same-step export can
+reuse an existing checkpoint only when its model, optimizer and trainer state
+have been proven to belong to the same completed save.
+
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
 instead of at the start. A staged save that fails leaves the previous checkpoint
@@ -257,7 +264,9 @@ the namespaces differ. Replicated values must already agree across ranks.
 
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
-step with no pending gradients. Its identity records parameter ownership,
+step with no pending gradients. Setting `save_async: true` for a runtime whose
+checkpoint uses `MultiOptimizer` is rejected before training begins. Its
+identity records parameter ownership,
 group structure, scheduler recipe and checkpoint generation. Loading rejects an
 unversioned checkpoint, a changed optimizer layout, or a model/optimizer/sidecar
 from different saves. An old checkpoint whose original group and scheduler
