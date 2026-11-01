@@ -88,6 +88,122 @@ def _worker(rank, rendezvous, dtype, backend, world_size):
         dist.destroy_process_group()
 
 
+def _trainability_worker(rank, rendezvous, backend, mode):
+    from datetime import timedelta
+
+    _configure_cpu_worker()
+    model_module = _model_module(backend)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1, 2), mesh_dim_names=("ple_fsdp", "ple"))
+        state = SimpleNamespace(
+            extra_parallel_sizes={"ple": 2}, extra_parallel_flat_group=lambda name: dist.group.WORLD
+        )
+        model_module.get_parallel_state = lambda: state
+        tables = torch.nn.ModuleDict({f"shard_{i}": torch.nn.Embedding(4, 4) for i in range(2)})
+        for index, table in enumerate(tables.values()):
+            weight = torch.arange(16, dtype=torch.float32).reshape(4, 4).add_(100 * index)
+            table.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(1), Shard(0)]))
+            trainable = mode != "all_frozen" and (
+                (mode == "partial_agreed" and index == 0)
+                or (mode != "partial_agreed" and (rank == 0 or (mode == "partial_mismatch" and index == 1)))
+            )
+            table.weight.requires_grad_(trainable)
+        fixture = SimpleNamespace(ngram_embedding=tables)
+        lookup = model_module.Qwen4ExpTextNGramEmbedding._lookup_local_rows
+        selected_shard = 1 if mode == "partial_agreed" and rank == 1 else 0
+        shard_ids, row_ids = torch.tensor([selected_shard, selected_shard]), torch.tensor([0, 1])
+        if mode in ("all_frozen", "partial_agreed"):
+            actual = lookup(fixture, shard_ids, row_ids)
+            expected = tables[f"shard_{selected_shard}"].weight.to_local().detach()[row_ids]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert actual.requires_grad == (mode == "partial_agreed")
+            if mode == "partial_agreed":
+                actual.sum().backward()
+                torch.testing.assert_close(
+                    tables["shard_0"].weight.grad.to_local(),
+                    torch.full_like(tables["shard_0"].weight.to_local(), 1.0 if rank == 0 else 0.0),
+                    rtol=0,
+                    atol=0,
+                )
+                assert tables["shard_1"].weight.grad is None
+        else:
+            with pytest.raises(RuntimeError, match="shard trainability must agree"):
+                lookup(fixture, shard_ids, row_ids)
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+@pytest.mark.parametrize("mode", ["all_frozen", "partial_agreed", "owner_mismatch", "partial_mismatch"])
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
+def test_ple_shard_trainability_agreement(tmp_path, monkeypatch, backend, mode):
+    _isolate_cpu_spawn(monkeypatch)
+    mp.spawn(_trainability_worker, args=(str(tmp_path / "gloo"), backend, mode), nprocs=2, join=True)
+
+
+def _distributed_partly_frozen_worker(rank, rendezvous, backend):
+    from datetime import timedelta
+
+    _configure_cpu_worker()
+    model_module = _model_module(backend)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1, 2), mesh_dim_names=("ple_fsdp", "ple"))
+        state = SimpleNamespace(
+            extra_parallel_sizes={"ple": 2},
+            extra_parallel_flat_group=lambda name: dist.group.WORLD,
+            extra_parallel_fsdp_device_mesh={"ple": mesh},
+            extra_parallel_2d_rank_table=lambda name: ((0, 1),),
+            extra_parallel_gradient_divide_factor=lambda name: 2,
+        )
+        model_module.get_parallel_state = lambda: state
+        for mode in ("plain", "non_reentrant", "reentrant"):
+            tables = torch.nn.ModuleDict({f"shard_{i}": torch.nn.Embedding(4, 4) for i in range(2)})
+            for index, table in enumerate(tables.values()):
+                values = torch.arange(16, dtype=torch.float32).reshape(4, 4).add_(100 * index)
+                table.weight = torch.nn.Parameter(distribute_tensor(values, mesh, [Shard(1), Shard(0)]))
+                table.weight.requires_grad_(index == 0)
+            fixture = SimpleNamespace(ngram_embedding=tables, padded_rows_per_shard=4)
+            fixture._lookup_local_rows = MethodType(
+                model_module.Qwen4ExpTextNGramEmbedding._lookup_local_rows, fixture
+            )
+            fixture._distributed_lookup = MethodType(
+                model_module.Qwen4ExpTextNGramEmbedding._distributed_lookup, fixture
+            )
+            shard_ids = torch.tensor([rank, rank])
+            row_ids = torch.tensor([2 * rank, 2 * rank + 1])
+            anchor = torch.ones((), requires_grad=True)
+
+            def run(a, fixture=fixture, shard_ids=shard_ids, row_ids=row_ids):
+                return fixture._distributed_lookup(shard_ids, row_ids) + a * 0
+
+            output = run(anchor) if mode == "plain" else checkpoint(run, anchor, use_reentrant=mode == "reentrant")
+            expected = torch.arange(16, dtype=torch.float32).reshape(4, 4)[row_ids] + 100 * rank
+            torch.testing.assert_close(output.detach(), expected, rtol=0, atol=0)
+            output.sum().backward()
+            grad = tables["shard_0"].weight.grad
+            assert grad is not None
+            torch.testing.assert_close(grad.to_local(), torch.full_like(grad.to_local(), 0.5 if rank == 0 else 0.0))
+            assert tables["shard_1"].weight.grad is None
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
+def test_distributed_ple_partly_frozen_backward(tmp_path, monkeypatch, backend):
+    _isolate_cpu_spawn(monkeypatch)
+    mp.spawn(_distributed_partly_frozen_worker, args=(str(tmp_path / "gloo"), backend), nprocs=2, join=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)

@@ -1245,20 +1245,32 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
             and persistent_weight.placements[1].dim == 0
         )
         state = get_parallel_state() if persistent_2d else None
-        attach_zero_grad = bool(
-            state is not None
-            and state.extra_parallel_sizes.get("ple", 1) > 1
-            and torch.is_grad_enabled()
-            and any(embedding.weight.requires_grad for embedding in self.ngram_embedding.values())
+        # All owners must participate, including fully frozen owners. Otherwise
+        # inconsistent trainability can desynchronize the lookup backward A2A.
+        check_distributed_grad = bool(
+            state is not None and state.extra_parallel_sizes.get("ple", 1) > 1 and torch.is_grad_enabled()
         )
+        attach_zero_grad = False
         global_counts = None
-        if attach_zero_grad:
+        if check_distributed_grad:
             group = state.extra_parallel_flat_group("ple")
             if not dist.is_initialized() or group is None:
-                raise RuntimeError("Trainable persistent PLE lookup requires its initialized process group.")
-            global_counts = local_counts.clone()
-            dist.all_reduce(global_counts, group=group)
-            shard_counts, global_counts = torch.stack((local_counts, global_counts)).tolist()
+                raise RuntimeError(
+                    "Persistent PLE lookup requires its initialized process group when gradients are enabled."
+                )
+            local_trainability = local_counts.new_tensor(
+                [int(embedding.weight.requires_grad) for embedding in self.ngram_embedding.values()]
+            )
+            group_counts = torch.cat((local_counts, local_trainability))
+            dist.all_reduce(group_counts, group=group)
+            global_counts, trainable_counts = group_counts.split(len(self.ngram_embedding))
+            shard_counts, global_counts, trainable_counts = torch.stack(
+                (local_counts, global_counts, trainable_counts)
+            ).tolist()
+            world_size = dist.get_world_size(group)
+            if any(count not in (0, world_size) for count in trainable_counts):
+                raise RuntimeError("Persistent PLE shard trainability must agree across its process group.")
+            attach_zero_grad = any(count == world_size for count in trainable_counts)
         else:
             shard_counts = local_counts.tolist()
         shard_start = 0

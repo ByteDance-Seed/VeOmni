@@ -47,6 +47,13 @@ Supported in this correctness stage:
     PLE mesh, so every rank may process a different sample.
 - Explicitly discarding `mtp.*` checkpoint tensors; MTP loss is not supported.
 
+With persistent two-dimensional PLE and gradients enabled, each table must
+have the same `requires_grad` value on every rank in its flattened PLE group.
+The lookup checks this collectively and rejects mismatched freezing before the
+forward/backward collectives can diverge. This requires one small metadata
+all-reduce per lookup, including when every PLE table is frozen; activation
+recomputation repeats it. Inference under `torch.no_grad()` skips this check.
+
 The internal example uses `ple_size=8`, `ep_size=4`,
 `broadcast_model_weights_from_rank0=false`, and
 `ep_sharded_stream_load=true`. The world size and every padded PLE shard row
