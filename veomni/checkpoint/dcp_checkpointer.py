@@ -767,6 +767,9 @@ class DistributedCheckpointer(CheckpointerBase):
     # first, which is what draining before each save used to do.
     _save_futures: Dict[str, Any] = {}
     _async_process_groups: Dict[str, Any] = {}
+    # Async slots are shared by model managers. A failure poisons this
+    # process so another manager cannot certify a missing checkpoint.
+    _async_save_failed = False
     # The gloo group a staged save's own collectives run on, created on first use.
     _stage_process_group: Optional[Any] = None
     # Both group caches live as long as the process: a run initialises distributed
@@ -843,6 +846,8 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             None
         """
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
@@ -1094,6 +1099,8 @@ class DistributedCheckpointer(CheckpointerBase):
         leaving the remaining slots running and their futures unreachable.
         """
         if not cls._save_futures:
+            if cls._async_save_failed:
+                raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
         futures = cls._save_futures
@@ -1113,10 +1120,16 @@ class DistributedCheckpointer(CheckpointerBase):
         # that owned that group has stopped issuing collectives on it. The lookup
         # misses only when the save ran without a process group at all, in a
         # single process, where the reduction is a no-op anyway.
-        for slot in futures:
-            raise_if_any_rank_failed(
-                errors.get(slot), f"a pending async DCP save ({slot})", group=cls._async_process_groups.get(slot)
-            )
+        try:
+            for slot in futures:
+                raise_if_any_rank_failed(
+                    errors.get(slot), f"a pending async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+                )
+        except BaseException:
+            cls._async_save_failed = True
+            raise
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
 
     @classmethod
     def _drain_slot(cls, slot: str) -> None:
@@ -1145,9 +1158,13 @@ class DistributedCheckpointer(CheckpointerBase):
         except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {rank}] previous async DCP save ({slot}) raised; propagating", exc_info=True)
             error = e
-        raise_if_any_rank_failed(
-            error, f"the previous async DCP save ({slot})", group=cls._async_process_groups.get(slot)
-        )
+        try:
+            raise_if_any_rank_failed(
+                error, f"the previous async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+            )
+        except BaseException:
+            cls._async_save_failed = True
+            raise
 
     @classmethod
     def _get_stage_process_group(cls, timeout_seconds: Optional[int]) -> Optional[Any]:
@@ -1183,6 +1200,8 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
+        if cls._async_save_failed:
+            raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
         planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a

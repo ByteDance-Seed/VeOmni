@@ -69,8 +69,11 @@ immutable and deterministic. The digest is a **caller attestation**, not a
 hash that VeOmni independently computes from those inputs. It must identify a
 trusted manifest covering those components and their code/configuration. The
 same digest and settings are required on resume. A missing contract emits a
-startup warning; training and export can proceed, but its cursor cannot be
-resumed exactly under this contract.
+startup warning; training and export can proceed, but dynamic SFT trainer-state
+resume is rejected because its cursor cannot be proven exact. To start a new
+data stream, load the model weights as a new run instead of resuming its trainer
+state. Other trainer paths keep their existing resume contracts, including
+their own strict optimizer and data-codec checks where applicable.
 
 At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
 samples and start the next epoch with a fresh sampler. Persistent workers at an

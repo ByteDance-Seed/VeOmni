@@ -1161,6 +1161,7 @@ def _dynamic_restore_failure_worker(rank, failure, endpoint):
             trainer.args.data.train_path = "test://different-source"
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
+        callback._last_saved_step = -1
         if failure == "save_collection":
             trainer.args.train.checkpoint.save_path = "/unused"
 

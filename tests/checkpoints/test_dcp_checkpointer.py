@@ -911,6 +911,7 @@ class TestWaitForPendingSave:
 
         DistributedCheckpointer._save_futures = {}
         DistributedCheckpointer._async_process_groups = {}
+        DistributedCheckpointer._async_save_failed = False
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
