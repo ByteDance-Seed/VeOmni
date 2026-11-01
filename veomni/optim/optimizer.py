@@ -832,7 +832,16 @@ def _coordinate_qwen_builder(builder):
         try:
             bound = inspect.signature(builder).bind(*args, **kwargs)
             bound.apply_defaults()
-            config = bound.arguments["optimizer_config"]
+            config = bound.arguments.get("optimizer_config")
+            # The lower-level ExtraParallel builder has no optimizer_config.
+            # It may be called directly for ordinary Muon, but file-backed PLE
+            # must enter through build_optimizer's all-rank profile preflight.
+            direct_options = bound.arguments.get("cpu_offload_kwargs") or {}
+            if (
+                direct_options.get("ple_moments_world_profile")
+                or direct_options.get("ple_moments_scratch_dir") is not None
+            ):
+                raise RuntimeError("File-backed PLE requires the certified build_optimizer factory")
             profile = bool(getattr(config, "qwen38_ple_moments_world_profile", False))
         except BaseException as exc:
             error = exc

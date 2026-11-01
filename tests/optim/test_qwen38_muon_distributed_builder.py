@@ -78,3 +78,37 @@ def test_optimizer_type_mismatch_stops_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_type_mismatch_worker, args=(), nprocs=2)
+
+
+def _direct_extra_parallel_worker(rank, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = torch.nn.Module()
+        model.o_proj = torch.nn.Linear(4, 4, bias=False)
+        factory.get_parallel_state = lambda: SimpleNamespace(extra_parallel_names=(), device_mesh=None)
+        groups = factory.add_qwen38_plans(model, [{"params": [model.o_proj.weight], "weight_decay": 0.0}])
+        # A direct EP factory must not bypass the WORLD preflight required by
+        # file-backed PLE, even if only one rank requests that profile.
+        profile = {"ple_moments_world_profile": True} if rank == 1 else {}
+        with pytest.raises(RuntimeError, match="(?i)file-backed|certified"):
+            factory.build_extra_parallel_fsdp2_optimizer(
+                model, optimizer_type="qwen38_muon", param_groups=groups, cpu_offload_kwargs=profile
+            )
+
+        optimizer = factory.build_extra_parallel_fsdp2_optimizer(
+            model, optimizer_type="qwen38_muon", param_groups=groups
+        )
+        model.o_proj.weight.grad = torch.ones_like(model.o_proj.weight)
+        optimizer.step()
+        done = torch.tensor(1)
+        dist.all_reduce(done)
+        assert done.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_direct_extra_parallel_muon_builder_and_file_profile_guard():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_direct_extra_parallel_worker, args=(), nprocs=2)

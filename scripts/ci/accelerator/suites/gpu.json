@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "01-unit",
     "suite": "unit",
     "conditional": false,
@@ -651,7 +656,8 @@
       "-s",
       "-x",
       "tests/optim/test_cpu_offload_adamw.py",
-      "tests/optim/test_cpu_offload_adamw_device.py"
+      "tests/optim/test_cpu_offload_adamw_device.py",
+      "tests/optim/test_master_fp32_adamw.py"
     ]
   },
   {
@@ -664,7 +670,10 @@
       "tests/optim/test_qwen38_muon_device.py",
       "tests/optim/test_qwen38_muon_dormant_checkpoint.py",
       "tests/optim/test_qwen38_cuda_preflight.py",
-      "tests/optim/test_qwen38_muon_distributed_builder.py"
+      "tests/optim/test_qwen38_muon_distributed_builder.py",
+      "tests/optim/test_ple_world_profile.py",
+      "tests/optim/test_qwen38_fileback_current_dcp.py",
+      "tests/optim/test_file_backed_state.py"
     ]
   },
   {
