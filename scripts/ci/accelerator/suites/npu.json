@@ -447,5 +447,19 @@
       "tests/optim/test_cpu_offload_adamw.py",
       "tests/optim/test_cpu_offload_adamw_device.py"
     ]
+  },
+  {
+    "name": "qwen38-muon-checkpoint-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_qwen38_muon.py",
+      "tests/optim/test_qwen38_muon_device.py",
+      "tests/optim/test_qwen38_muon_dormant_checkpoint.py",
+      "tests/optim/test_qwen38_cuda_preflight.py",
+      "tests/optim/test_qwen38_muon_distributed_builder.py",
+      "tests/optim/test_optimizer_vlm_param_groups.py"
+    ]
   }
 ]

@@ -34,6 +34,8 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
+    # Muon validates CUDA matmul precision with backend-specific APIs.
+    "veomni/optim/qwen38_muon.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",

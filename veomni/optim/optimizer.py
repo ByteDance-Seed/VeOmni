@@ -15,7 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -37,6 +39,7 @@ from ..utils import logging
 from .cpu_offload_adamw import CPUOffloadAdamW, resolve_moment_dtype, select_cpu_offload_groups
 from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+from .qwen38_muon import Qwen38MuonAdamW, _cuda_step_preflight, _optimizer_uses_cuda, add_qwen38_plans
 
 
 if TYPE_CHECKING:
@@ -260,6 +263,60 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+@contextmanager
+def _qwen_rank_local_state(optimizer):
+    if getattr(optimizer, "_veomni_rank_local_checkpoint", False):
+        raise RuntimeError("Reentrant rank-local optimizer checkpoint context")
+    optimizer._veomni_rank_local_checkpoint = True
+    try:
+        yield
+    finally:
+        del optimizer._veomni_rank_local_checkpoint
+
+
+def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
+    """Keep exact-recipe lazy state untouched while saving its parameter groups."""
+    exact_lazy = getattr(optimizer, "requires_exact_recipe", False) and getattr(
+        optimizer, "requires_exact_state_dtypes", False
+    )
+    if exact_lazy and any(not group["params"] for group in optimizer.param_groups):
+        raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
+    prepare = getattr(optimizer, "checkpoint_state", None)
+    with prepare(load=for_load) if prepare is not None else nullcontext():
+        # PyTorch initializes a wholly empty optimizer by calling step(). A
+        # temporary empty entry makes its getter serialize parameter groups
+        # without performing that update or materializing optimizer state.
+        sentinel = None
+        placeholder = None
+        sentinel_hook = None
+        sentinel_hook_called = False
+        if not for_load and not optimizer.state and exact_lazy:
+            sentinel = next((p for group in optimizer.param_groups for p in group["params"]), None)
+            if sentinel is not None:
+                placeholder = {}
+                optimizer.state[sentinel] = placeholder
+
+                def remove_sentinel(optim):
+                    nonlocal sentinel_hook_called
+                    sentinel_hook_called = True
+                    if optim.state.get(sentinel) is placeholder and not placeholder:
+                        optim.state.pop(sentinel, None)
+
+                sentinel_hook = optimizer.register_state_dict_pre_hook(remove_sentinel, prepend=True)
+        try:
+            result = get_optimizer_state_dict(
+                model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+            )
+            if sentinel_hook is not None and not sentinel_hook_called:
+                raise RuntimeError("Optimizer state_dict did not run registered pre-hooks during checkpoint save")
+        finally:
+            if sentinel_hook is not None:
+                sentinel_hook.remove()
+            if sentinel is not None and optimizer.state.get(sentinel) is placeholder and not placeholder:
+                optimizer.state.pop(sentinel, None)
+        return result
+
+
 def _verify_registered_adapter_snapshot(model, optimizer, snapshot):
     """Require a registered adapter to serialize each live state without alteration."""
     from ..checkpoint.optimizer_resume_layout import _group_option_value
@@ -437,19 +494,37 @@ class MultiOptimizer(Optimizer, Stateful):
         root_model: nn.Module,
         optimizers: dict,  # {"para_1": opt_1, "para_2": opt_2, ..., "parak": opt_k, "non_extra_parallel": opt_{k+1}}
         key_names: list[str],
+        *,
+        qwen38_cuda_guard=False,
+        qwen38_cuda_group=None,
     ):
         self.model = root_model
         self.optimizers_dict = optimizers
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
+        self._qwen38_cuda_guard = qwen38_cuda_guard
+        self._qwen38_cuda_group = qwen38_cuda_group
 
     def step(self, closure=None):
+        children = tuple(self.optimizers_dict.values())
+        qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
+        uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
+        if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
+            raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")
+        if self._qwen38_cuda_guard or uses_cuda:
+            _cuda_step_preflight(children, self._qwen38_cuda_group, closure=closure is not None)
+            for opt in qwen_children:
+                opt._cuda_parent_preflight = True
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for opt in self.optimizers_dict.values():
-            opt.step()
+        try:
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for opt in children:
+                opt.step()
+        finally:
+            for opt in qwen_children:
+                opt._cuda_parent_preflight = False
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -583,6 +658,84 @@ class MultiOptimizer(Optimizer, Stateful):
         return len(self.optimizers_dict)
 
 
+def _qwen38_cuda_training_group(parallel_state):
+    if parallel_state.tp_size != 1 or parallel_state.pp_size != 1:
+        raise ValueError("Distributed Qwen3.8 Muon CUDA preflight requires TP=PP=1")
+    group = parallel_state.fsdp_group
+    if torch.distributed.get_world_size() > 1:
+        if group is None or torch.distributed.get_world_size(group) != torch.distributed.get_world_size():
+            raise ValueError("Qwen3.8 Muon CUDA preflight requires the complete training process group")
+    return group
+
+
+def _qwen38_cuda_domain(optimizer_type, parallel_state, optimizers):
+    if optimizer_type != "qwen38_muon":
+        return False
+    local, error = False, None
+    try:
+        mesh = getattr(parallel_state, "device_mesh", None)
+        local = (mesh is not None and mesh.device_type == "cuda") or any(
+            _optimizer_uses_cuda(opt) for opt in optimizers
+        )
+    except BaseException as exc:
+        error = exc
+    if torch.distributed.is_initialized():
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        raise_if_any_rank_failed(error, "inspecting Qwen3.8 CUDA optimizer domain")
+        flags = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(flags, local)
+        return any(flags) or torch.distributed.get_backend() == "nccl"
+    if error is not None:
+        raise error
+    return local
+
+
+_QWEN_BUILD_DEFER_CUDA = ContextVar("qwen_build_defer_cuda", default=False)
+
+
+def _coordinate_qwen_builder(builder):
+    @wraps(builder)
+    def coordinated(*args, **kwargs):
+        optimizer_type = kwargs.get("optimizer_type", args[6] if len(args) > 6 else "adamw")
+        if optimizer_type != "qwen38_muon" or not torch.distributed.is_initialized() or _QWEN_BUILD_DEFER_CUDA.get():
+            return builder(*args, **kwargs)
+        token = _QWEN_BUILD_DEFER_CUDA.set(True)
+        result, error = None, None
+        try:
+            result = builder(*args, **kwargs)
+        except BaseException as exc:
+            error = exc
+        finally:
+            _QWEN_BUILD_DEFER_CUDA.reset(token)
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        raise_if_any_rank_failed(error, "building Qwen3.8 Muon optimizer")
+        parallel_state, error = None, None
+        try:
+            parallel_state = get_parallel_state()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "getting Qwen3.8 optimizer parallel state")
+        children = tuple(result.optimizers_dict.values())
+        cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
+        cuda_group, error = None, None
+        try:
+            if cuda_guard:
+                cuda_group = _qwen38_cuda_training_group(parallel_state)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "configuring Qwen3.8 CUDA training group")
+        result._qwen38_cuda_guard = cuda_guard
+        result._qwen38_cuda_group = cuda_group
+        for child in children:
+            if isinstance(child, Qwen38MuonAdamW):
+                child._cuda_precision_group = cuda_group
+        return result
+
+    return coordinated
+
+
 def _should_build_extra_parallel_aware(model: "nn.Module") -> bool:
     ps = get_parallel_state()
     if ps.dp_mode == "fsdp2" and ps.any_extra_parallel_enabled:
@@ -658,6 +811,7 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+@_coordinate_qwen_builder
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -715,7 +869,7 @@ def build_optimizer(
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     cpu_offload_kwargs = {}
-    if optimizer_type == "cpu_offload_adamw":
+    if optimizer_type in ("cpu_offload_adamw", "qwen38_muon"):
         for key, override in (
             ("resident_moment_dtype", cpu_offload_resident_moment_dtype),
             ("cpu_moment_dtype", cpu_offload_cpu_moment_dtype),
@@ -729,7 +883,20 @@ def build_optimizer(
             param_groups = _make_param_groups_for_subset(
                 model, model.parameters(), weight_decay, no_decay_modules, no_decay_params
             )
+        if optimizer_type == "qwen38_muon":
+            resolved_groups = []
+            for group in param_groups:
+                if "weight_decay" in group:
+                    resolved_groups.append(group)
+                else:
+                    for decay_group in _make_param_groups_for_subset(
+                        model, group["params"], weight_decay, no_decay_modules, no_decay_params
+                    ):
+                        resolved_groups.append({**group, **decay_group})
+            param_groups = resolved_groups
         param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+        if optimizer_type == "qwen38_muon":
+            param_groups = add_qwen38_plans(model, param_groups)
 
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
@@ -774,6 +941,19 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "qwen38_muon":
+        cuda_group = None
+        local_cuda = any(param.device.type == "cuda" for group in param_groups for param in group["params"])
+        cuda_guard = local_cuda
+        if torch.distributed.is_initialized() and not _QWEN_BUILD_DEFER_CUDA.get():
+            flags = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(flags, local_cuda)
+            cuda_guard = any(flags) or torch.distributed.get_backend() == "nccl"
+        if cuda_guard and torch.distributed.is_initialized():
+            cuda_group = _qwen38_cuda_training_group(get_parallel_state())
+        optim = Qwen38MuonAdamW(
+            param_groups, lr, betas, eps, weight_decay, cuda_precision_group=cuda_group, **cpu_offload_kwargs
+        )
     elif optimizer_type == "cpu_offload_adamw":
         optim = CPUOffloadAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
     elif optimizer_type == "full_fp32_adamw":
@@ -785,7 +965,15 @@ def build_optimizer(
     else:
         raise ValueError(f"Unsupported optimizer selection: {optimizer_type!r}.")
 
-    if optimizer_type in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw"):
+    if optimizer_type in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "qwen38_muon"):
+        if optimizer_type == "qwen38_muon":
+            return MultiOptimizer(
+                model,
+                {"qwen38_muon": optim},
+                ["qwen38_muon"],
+                qwen38_cuda_guard=cuda_guard,
+                qwen38_cuda_group=cuda_group,
+            )
         return MultiOptimizer(model, {"adamw": optim}, ["adamw"])
     return optim
 
@@ -1010,6 +1198,7 @@ def _build_muon_with_adamw(
     return MultiOptimizer(model, optimizer_dict, key_names=list(optimizer_dict.keys()))
 
 
+@_coordinate_qwen_builder
 def build_extra_parallel_fsdp2_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -1145,6 +1334,8 @@ def build_extra_parallel_fsdp2_optimizer(
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "qwen38_muon":
+            return Qwen38MuonAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
         elif optimizer_type == "cpu_offload_adamw":
             return CPUOffloadAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
         elif optimizer_type == "full_fp32_adamw":
@@ -1190,6 +1381,18 @@ def build_extra_parallel_fsdp2_optimizer(
     key_names = list(optimizer_dict.keys())
 
     # Build MultiOptimizer and attach a pre-step hook to sanitize DTensor states
-    multi_opt = MultiOptimizer(model, optimizer_dict, key_names=key_names)
+    cuda_group = None
+    cuda_guard = (
+        False
+        if _QWEN_BUILD_DEFER_CUDA.get()
+        else _qwen38_cuda_domain(optimizer_type, parallel_state, optimizer_dict.values())
+    )
+    if optimizer_type == "qwen38_muon" and torch.distributed.is_initialized() and not _QWEN_BUILD_DEFER_CUDA.get():
+        cuda_guard = cuda_guard or torch.distributed.get_backend() == "nccl"
+        if cuda_guard:
+            cuda_group = _qwen38_cuda_training_group(parallel_state)
+    multi_opt = MultiOptimizer(
+        model, optimizer_dict, key_names=key_names, qwen38_cuda_guard=cuda_guard, qwen38_cuda_group=cuda_group
+    )
 
     return multi_opt

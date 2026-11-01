@@ -86,7 +86,13 @@ class OptimizerConfig:
     """
 
     type: Literal[
-        "adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw"
+        "adamw",
+        "anyprecision_adamw",
+        "muon",
+        "master_fp32_adamw",
+        "full_fp32_adamw",
+        "cpu_offload_adamw",
+        "qwen38_muon",
     ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},

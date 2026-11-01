@@ -146,6 +146,7 @@ class VeOmniModelRuntime:
             from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
             from ..utils.dist_utils import raise_if_any_rank_failed
 
+            _coordinated_optimizer_flag(self.args.optimizer.type, "optimizer type")
             specs = getattr(self.model, "_fqn2spec_info", None)
             has_specs = _coordinated_optimizer_flag(specs is not None, "ExtraParallel model plan presence")
             canonical = _coordinated_optimizer_flag(
@@ -183,7 +184,7 @@ class VeOmniModelRuntime:
                 and (
                     getattr(self.model, "_fqn2spec_info", None) is not None
                     or self.args.optimizer.type
-                    in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "muon")
+                    in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "muon", "qwen38_muon")
                 )
             )
             recover_ownership = _coordinated_optimizer_flag(recover_ownership, "frozen optimizer ownership policy")
