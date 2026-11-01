@@ -63,6 +63,30 @@ def _confirmed_export_optimizer(checkpoint, step):
     return callable(saved_ref) and saved_ref() is optimizer
 
 
+def _check_same_step_receipt(trainer, step, same_step):
+    """Never skip a same-step save after optimizer identity has changed."""
+    if dist.is_initialized():
+        decisions = [None] * dist.get_world_size()
+        dist.all_gather_object(decisions, (step, same_step))
+        if any(decision != (step, same_step) for decision in decisions):
+            raise RuntimeError("Same-step checkpoint save decision differs across ranks")
+    if not same_step:
+        return
+    root = getattr(trainer, "model", None)
+    modules = getattr(root, "module_runtimes", None)
+    runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
+    error = None
+    try:
+        for runtime in runtimes:
+            checkpoint = getattr(runtime, "checkpoint", None)
+            check = getattr(type(checkpoint), "checkpoint_receipt_is_current", None)
+            if callable(check) and not check(checkpoint, step):
+                raise RuntimeError("Optimizer or checkpoint changed after the same-step DCP save")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating the same-step checkpoint")
+
+
 def _export_wrote_dcp(trainer, step):
     """Only reuse an export's DCP when every model manager confirms its step."""
     root = getattr(trainer, "model", None)
@@ -168,7 +192,18 @@ class CheckpointCallback(Callback):
             self._save_hf(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
+        dcp_due = bool(self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0)
+        hf_due = bool(
+            self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
+        )
+        if dist.is_initialized():
+            decisions = [None] * dist.get_world_size()
+            local = (state.epoch, state.global_step, dcp_due, hf_due)
+            dist.all_gather_object(decisions, local)
+            if any(decision != local for decision in decisions):
+                raise RuntimeError("Checkpoint epoch schedule differs across ranks")
+        if dcp_due:
+            _check_same_step_receipt(self.trainer, state.global_step, state.global_step == self._last_dcp_step)
             if state.global_step != self._last_dcp_step:
                 self._save_dcp(state)
             else:
@@ -176,7 +211,7 @@ class CheckpointCallback(Callback):
                     f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
                     f"already saved at step_end)."
                 )
-        if self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0:
+        if hf_due:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state)
             else:

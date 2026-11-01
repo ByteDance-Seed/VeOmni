@@ -29,6 +29,7 @@ Two blobs, two owners:
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
 """
 
+import os
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -89,6 +90,8 @@ class ModelCheckpointManager:
         self._last_saved_step: int = -1
         self._last_legacy_export_dcp_step = None
         self._last_saved_optimizer_ref = None
+        self._loaded_optimizer_ref = None
+        self._last_saved_without_optimizer = False
         self._last_export_validated_step = None
         self._last_export_released_optimizer = False
         self.checkpointer: CheckpointerBase = build_checkpointer(
@@ -184,6 +187,7 @@ class ModelCheckpointManager:
             self._last_saved_step = -1
             self._last_legacy_export_dcp_step = None
             self._last_saved_optimizer_ref = None
+            self._last_saved_without_optimizer = False
             self._last_export_validated_step = None
             if hasattr(self, "_last_saved_optimizer_generation"):
                 self._last_saved_optimizer_generation = None
@@ -212,22 +216,64 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
-        load_dir = self.load_dir()
+        self._loaded_optimizer_ref = None
+        load_dir, error = None, None
+        try:
+            load_dir = self.load_dir()
+            if load_dir is not None:
+                load_dir = os.fspath(load_dir)
+                if not isinstance(load_dir, str):
+                    raise TypeError("Checkpoint load path must be a string")
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint load path")
+        if dist.is_initialized():
+            paths = [None] * dist.get_world_size()
+            dist.all_gather_object(paths, load_dir)
+            if any(path != load_dir for path in paths):
+                raise RuntimeError("Checkpoint load path differs across ranks")
         if load_dir is None:
             return
 
-        self.wait_for_pending_save()
-        state: Dict[str, Any] = {
-            "model": self.runtime.model,
-            "optimizer": self.runtime.optimizer,
-            "extra_state": {},
-        }
-        self.checkpointer.load(
-            load_dir,
-            state,
-            **self._checkpointer_kwargs(),
-        )
-        self._load_extra_state(state["extra_state"])
+        optimizer, state, kwargs, error = None, None, None, None
+        try:
+            optimizer = self.runtime.optimizer
+            state = {"model": self.runtime.model, "optimizer": optimizer, "extra_state": {}}
+            kwargs = self._checkpointer_kwargs()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint load arguments")
+        error = None
+        try:
+            self.wait_for_pending_save()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "waiting before checkpoint load")
+        error = None
+        try:
+            self.checkpointer.load(load_dir, state, **kwargs)
+            self._load_extra_state(state["extra_state"])
+            if self.runtime.optimizer is not optimizer:
+                raise RuntimeError("Optimizer changed while restoring the checkpoint")
+        except BaseException as exc:
+            error = exc
+        try:
+            raise_if_any_rank_failed(error, "checking restored optimizer identity")
+        except BaseException:
+            leaves = getattr(optimizer, "optimizers_dict", {})
+            for leaf in leaves.values() if isinstance(leaves, dict) else ():
+                abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        pass  # Keep the original coordinated restore error.
+            raise
+        if optimizer is not None:
+            try:
+                self._loaded_optimizer_ref = weakref.ref(optimizer)
+            except TypeError:
+                self._loaded_optimizer_ref = None
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
@@ -240,16 +286,23 @@ class ModelCheckpointManager:
         self._last_legacy_export_dcp_step = None
         self._last_saved_step = -1
         self._last_saved_optimizer_ref = None
+        self._last_saved_without_optimizer = False
         self._last_export_validated_step = None
         self._last_export_released_optimizer = False
-        optimizer = self.runtime.optimizer
+        optimizer, optimizer_ref, error, extra_state, kwargs = None, None, None, None, None
         try:
-            optimizer_ref = weakref.ref(optimizer) if optimizer is not None else None
-        except TypeError:
-            # A non-weakrefable custom optimizer cannot certify a legacy save.
-            optimizer_ref = None
-        extra_state = self._extra_state(state)
-        helper.empty_cache()
+            optimizer = self.runtime.optimizer
+            try:
+                optimizer_ref = weakref.ref(optimizer) if optimizer is not None else None
+            except TypeError:
+                # A non-weakrefable custom optimizer cannot certify a legacy save.
+                optimizer_ref = None
+            extra_state = self._extra_state(state)
+            kwargs = self._checkpointer_kwargs()
+            helper.empty_cache()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint save arguments")
         self.checkpointer.save(
             self.config.save_path,
             {
@@ -262,12 +315,13 @@ class ModelCheckpointManager:
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
             stage_dir=self.config.stage_dir,
             save_timeout_seconds=self.config.save_timeout_seconds,
-            **self._checkpointer_kwargs(),
+            **kwargs,
         )
         helper.empty_cache()
         dist.barrier()
         self._last_saved_step = state.global_step
         self._last_saved_optimizer_ref = optimizer_ref
+        self._last_saved_without_optimizer = optimizer is None
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
     def prepare_export(self, state: "TrainerState", stage: str) -> str:
@@ -284,13 +338,20 @@ class ModelCheckpointManager:
         self._last_legacy_export_dcp_step = None
         self._last_export_validated_step = None
         self._last_export_released_optimizer = False
-        optimizer_before = self.runtime.optimizer
-        changed_optimizer = (
-            self._last_saved_step == state.global_step
-            and optimizer_before is not None
-            and (self._last_saved_optimizer_ref is None or self._last_saved_optimizer_ref() is not optimizer_before)
-        )
-        needs_save = self._last_saved_step != state.global_step or changed_optimizer
+        optimizer_before, changed_optimizer, needs_save, error = None, False, False, None
+        try:
+            optimizer_before = self.runtime.optimizer
+            changed_optimizer = (
+                self._last_saved_step == state.global_step
+                and optimizer_before is not None
+                and (
+                    self._last_saved_optimizer_ref is None or self._last_saved_optimizer_ref() is not optimizer_before
+                )
+            )
+            needs_save = self._last_saved_step != state.global_step or changed_optimizer
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint export decision")
         if dist.is_initialized():
             decisions = [None] * dist.get_world_size()
             local = (state.global_step, needs_save, optimizer_before is None)
@@ -352,6 +413,42 @@ class ModelCheckpointManager:
             self.runtime.lr_scheduler = None
 
         return self.weights_dir(state)
+
+    def checkpoint_receipt_is_current(self, step: int) -> bool:
+        """Check that a same-step DCP still represents this optimizer."""
+        if self._last_saved_step != step or getattr(self.checkpointer, "_async_save_failed", False) is True:
+            return False
+        optimizer = self.runtime.optimizer
+        if optimizer is None:
+            return self._last_saved_without_optimizer or self._last_export_released_optimizer
+        return self._last_saved_optimizer_ref is not None and self._last_saved_optimizer_ref() is optimizer
+
+    def confirm_loaded_checkpoint_for_reuse(self, step: int, generation: str) -> None:
+        """Bind a proven same-output resume to the freshly restored optimizer."""
+        optimizer = self.runtime.optimizer
+        if (
+            type(step) is not int
+            or not isinstance(generation, str)
+            or not generation
+            or getattr(self, "_loaded_optimizer_global_step", None) != step
+            or getattr(self, "_loaded_optimizer_generation", None) != generation
+            or getattr(optimizer, "_is_multi_optimizer", False) is not True
+            or self._loaded_optimizer_ref is None
+            or self._loaded_optimizer_ref() is not optimizer
+            or getattr(self.checkpointer, "_async_save_failed", False) is True
+        ):
+            raise RuntimeError("Cannot reuse an unproven optimizer checkpoint receipt")
+        try:
+            optimizer_ref = weakref.ref(optimizer)
+        except TypeError as exc:
+            raise RuntimeError("Restored optimizer cannot be bound to the checkpoint receipt") from exc
+        self._last_saved_step = step
+        self._last_saved_optimizer_ref = optimizer_ref
+        self._last_saved_without_optimizer = False
+        self._last_saved_optimizer_generation = generation
+        self._last_legacy_export_dcp_step = None
+        self._last_export_validated_step = None
+        self._last_export_released_optimizer = False
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ...utils.save_safetensor_utils import save_hf_safetensor

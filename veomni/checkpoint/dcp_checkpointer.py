@@ -67,6 +67,26 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
+class _PreparedLoadState:
+    """Expose a rank-coordinated Stateful snapshot to DCP exactly once."""
+
+    def __init__(self, owner, snapshot, group):
+        self.owner = owner
+        self.snapshot = snapshot
+        self.group = group
+
+    def state_dict(self):
+        return self.snapshot
+
+    def load_state_dict(self, state_dict):
+        error = None
+        try:
+            self.owner.load_state_dict(state_dict)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "applying checkpoint state", group=self.group)
+
+
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
@@ -1003,11 +1023,12 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             state: state loaded
         """
+        error = None
         if state is None:
-            raise ValueError("State dict must be provided to load a distributed checkpoint.")
-
-        if "model" not in state:
-            raise ValueError("Model must be provided to load a distributed checkpoint.")
+            error = ValueError("State dict must be provided to load a distributed checkpoint.")
+        elif "model" not in state:
+            error = ValueError("Model must be provided to load a distributed checkpoint.")
+        raise_if_any_rank_failed(error, "checking checkpoint load state", group=process_group)
 
         def _model_state() -> "ModelState":
             return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
@@ -1020,16 +1041,50 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=True,
             )
 
-        wants_optimizer = state.get("optimizer") is not None
+        wants_optimizer, fused_dir, model_state, optimizer_state, model_reader, optimizer_reader, error = (
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        try:
+            wants_optimizer = state.get("optimizer") is not None
+            fused_dir = cls._legacy_fused_dir(path, module)
+            model_state = _model_state()
+            optimizer_state = _optimizer_state() if wants_optimizer else None
+            model_reader = cls._create_storage_reader(fused_dir or weights_dir(path, module))
+            if wants_optimizer and fused_dir is None:
+                optimizer_reader = cls._create_storage_reader(optimizer_dir(path, module))
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)
+        if dist.is_initialized():
+            decisions = [None] * dist.get_world_size(group=process_group)
+            local = (fused_dir, wants_optimizer)
+            dist.all_gather_object(decisions, local, group=process_group)
+            if any(decision != local for decision in decisions):
+                raise RuntimeError("Checkpoint load format differs across ranks")
 
-        fused_dir = cls._legacy_fused_dir(path, module)
+        def prepared(owner, description):
+            snapshot, error = None, None
+            try:
+                snapshot = owner.state_dict()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, description, group=process_group)
+            return _PreparedLoadState(owner, snapshot, process_group)
+
+        model_state = prepared(model_state, "preparing model checkpoint state")
         if fused_dir is not None:
-            load_state: Dict[str, Any] = {"model": _model_state()}
+            load_state: Dict[str, Any] = {"model": model_state}
             if wants_optimizer:
-                load_state["optimizer"] = _optimizer_state()
+                load_state["optimizer"] = prepared(optimizer_state, "preparing optimizer checkpoint state")
             dcp.load(
                 state_dict=load_state,
-                storage_reader=cls._create_storage_reader(fused_dir),
+                storage_reader=model_reader,
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
             )
@@ -1039,15 +1094,19 @@ class DistributedCheckpointer(CheckpointerBase):
 
         model_root = model_dir(path, module)
         dcp.load(
-            state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
+            state_dict={"model": model_state},
+            storage_reader=model_reader,
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
         if wants_optimizer:
+            # Preserve the split-checkpoint ordering: some optimizers lazily
+            # initialize during state_dict(), so model weights must already be
+            # restored before the optimizer snapshot is constructed.
+            optimizer_state = prepared(optimizer_state, "preparing optimizer checkpoint state")
             dcp.load(
-                state_dict={"optimizer": _optimizer_state()},
-                storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
+                state_dict={"optimizer": optimizer_state},
+                storage_reader=optimizer_reader,
                 process_group=process_group,
                 # The strict check looks for missing ``model`` keys; there are none
                 # in an optimizer-only load, so strictness has nothing to say here.
