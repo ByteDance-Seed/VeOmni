@@ -8,10 +8,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.lr_scheduler import build_lr_scheduler
 from veomni.optim.muon import DistributedMuon
 from veomni.optim.optimizer import AnyPrecisionAdamW, MultiOptimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _model_and_optimizer(*, split=True):
@@ -107,6 +111,7 @@ def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize(
     "failure", ["model_reader", "optimizer_reader", "model_state", "optimizer_state", "layout_policy"]
 )
@@ -274,6 +279,7 @@ def _leaf_order_mismatch_worker(rank, mode, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mode", ["save", "load"])
 def test_optimizer_leaf_order_mismatch_stops_all_ranks(mode):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -321,6 +327,7 @@ def _high_level_leaf_mismatch_worker(rank, checkpoint, mismatch, mode, endpoint)
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mode", ["save", "load"])
 @pytest.mark.parametrize("mismatch", ["count", "order"])
 def test_high_level_leaf_mismatch_rejected_before_model_mutation(tmp_path, mismatch, mode):
@@ -414,6 +421,7 @@ def _proven_staged_resume_worker(rank, checkpoint, stage, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_proven_staged_checkpoint_restores_and_updates_on_two_ranks(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -449,6 +457,7 @@ def _writer_error_worker(rank, checkpoint, target, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("target", ["ckpt", "optimizer"])
 def test_writer_factory_failure_propagates_before_dcp_collective(tmp_path, target):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -509,6 +518,7 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("rank_local", [False, True])
 def test_inventory_reader_failure_propagates_before_collective(tmp_path, rank_local):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -563,6 +573,7 @@ def _checkpoint_cache_failure_worker(rank, fail_at, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("fail_at", [1, 2])
 def test_checkpoint_cache_failure_propagates_before_next_collective(fail_at):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -596,6 +607,7 @@ def _inventory_hash_failure_worker(rank, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_inventory_hash_failure_propagates_before_collective():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -623,6 +635,7 @@ def _trainability_mismatch_worker(rank, checkpoint, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_rank_asymmetric_trainability_is_rejected_before_save(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -651,6 +664,7 @@ def _tied_parameter_order_worker(rank, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_tied_parameter_registration_order_does_not_change_trainability():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -690,6 +704,7 @@ def _save_config_mismatch_worker(rank, checkpoint, mismatch, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mismatch", ["model", "extra", "stage", "stage_path", "module", "async"])
 def test_checkpoint_save_rank_config_mismatch_fails_all_ranks(tmp_path, mismatch):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -725,6 +740,7 @@ def _finalize_error_worker(rank, checkpoint, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_save_finalize_error_propagates_to_all_ranks(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -771,6 +787,7 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mode", ["plan", "flag", "missing"])
 def test_runtime_checkpoint_plan_mismatch_fails_all_ranks(mode):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -778,6 +795,7 @@ def test_runtime_checkpoint_plan_mismatch_fails_all_ranks(mode):
     spawn_with_rendezvous(_runtime_plan_mismatch_worker, args=(mode,), nprocs=2)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mode", ["save", "load"])
 def test_trainable_only_mismatch_fails_all_ranks(tmp_path, mode):
     from tests.tools.launch_utils import spawn_with_rendezvous
@@ -1925,6 +1943,7 @@ def _replicated_optimizer_metadata_worker(rank, checkpoint, divergent_field, end
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("field", ["lr", "step"])
 def test_replicated_optimizer_metadata_must_agree_before_save(tmp_path, field):
     from tests.tools.launch_utils import spawn_with_rendezvous
