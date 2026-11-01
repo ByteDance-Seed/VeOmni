@@ -1016,11 +1016,56 @@ class GlobalStateCallback(Callback):
         ):
             restore_local(lambda: iter(self.trainer.train_dataloader), "initializing the restored data iterator")
 
+        if strict_optimizer:
+            self._confirm_same_output_checkpoint(global_step, load_path, checkpoints, generations)
+
         logger.info_rank0(
             f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "
             f"start_epoch={self.trainer.start_epoch}, start_step={self.trainer.start_step})."
         )
         return global_state
+
+    def _confirm_same_output_checkpoint(self, step, load_path, checkpoints, generations):
+        """Reuse a proven checkpoint only at its original output location."""
+        same_output, error = False, None
+        try:
+            save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
+            same_output = bool(save_root and layout.same_checkpoint_path(layout.step_dir(save_root, step), load_path))
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "checking restored checkpoint output path")
+        if dist.is_initialized():
+            decisions = [None] * dist.get_world_size()
+            dist.all_gather_object(decisions, same_output)
+            if any(decision != same_output for decision in decisions):
+                raise RuntimeError("Restored checkpoint output path differs across ranks")
+        if not same_output:
+            return
+        error = None
+        try:
+            for name, checkpoint in checkpoints:
+                confirm = getattr(type(checkpoint), "confirm_loaded_checkpoint_for_reuse", None)
+                if not callable(confirm):
+                    raise RuntimeError("Strict checkpoint provider cannot confirm restored optimizer identity")
+                confirm(checkpoint, step, generations[name])
+        except BaseException as exc:
+            error = exc
+        try:
+            raise_if_any_rank_failed(error, "confirming restored optimizer checkpoint")
+        except BaseException:
+            for _, checkpoint in checkpoints:
+                checkpoint._last_saved_step = -1
+                checkpoint._last_saved_optimizer_generation = None
+                if hasattr(checkpoint, "_last_saved_optimizer_ref"):
+                    checkpoint._last_saved_optimizer_ref = None
+            raise
+        self._last_saved_step = step
+        self._last_saved_optimizer_generations = dict(generations)
+        from .checkpoint_callback import CheckpointCallback
+
+        callback = getattr(self.trainer, "checkpoint_callback", None)
+        if isinstance(callback, CheckpointCallback):
+            callback._last_dcp_step = step
 
     def _restore_position(self, global_state: Dict[str, Any]) -> None:
         args: "VeOmniArguments" = self.trainer.args

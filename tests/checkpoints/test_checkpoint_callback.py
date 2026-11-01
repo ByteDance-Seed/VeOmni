@@ -356,6 +356,7 @@ class TestModelCheckpointManagerSaveContract:
         assert saved["optimizer"] is runtime.optimizer
 
     def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        mock_dist.is_initialized.return_value = False
         runtime = _make_mock_runtime()
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()

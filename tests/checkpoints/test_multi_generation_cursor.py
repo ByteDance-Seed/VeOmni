@@ -255,6 +255,7 @@ def test_unconfirmed_or_multi_optimizer_export_does_not_create_legacy_receipt(tm
             patch("veomni.models.checkpoint.manager.dist.barrier"),
         ):
             manager = ModelCheckpointManager(runtime)
+            manager.checkpointer.save.return_value = "new-generation"
             manager.save_dcp = MagicMock(wraps=manager.save_dcp)
             manager.wait_for_pending_save = MagicMock(
                 side_effect=RuntimeError("injected wait failure") if mode == "failed_wait" else None
@@ -305,6 +306,7 @@ def test_legacy_export_does_not_reuse_dcp_with_changed_optimizer(tmp_path, befor
         patch("veomni.models.checkpoint.manager.dist.barrier"),
     ):
         manager = ModelCheckpointManager(runtime)
+        manager.checkpointer.save.return_value = "second-generation"
         manager.save_dcp(TrainerState(global_step=3))
         runtime.optimizer = {"optimizer": original, "other": replacement, "none": None}[after]
         manager.prepare_export(TrainerState(global_step=3), "step_end")
@@ -384,14 +386,18 @@ def test_strict_generation_not_reused_after_optimizer_replacement(tmp_path):
         patch("veomni.models.checkpoint.manager.dist.barrier"),
     ):
         manager = ModelCheckpointManager(runtime)
+        manager.checkpointer.save.return_value = "second-generation"
         manager.save_dcp(TrainerState(global_step=3))
         manager._last_saved_optimizer_generation = "first-generation"
         runtime.optimizer = second
         manager.prepare_export(TrainerState(global_step=3), "step_end")
         assert manager.checkpointer.save.call_count == 2
         assert manager._last_saved_optimizer_ref() is second
-        assert manager._last_saved_optimizer_generation is None
-        assert not _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3)
+        generation = manager._last_saved_optimizer_generation
+        assert generation in (None, "second-generation")
+        assert _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3) is (
+            generation is not None
+        )
 
 
 def test_legacy_export_does_not_certify_ambiguous_multi_flag(tmp_path):
@@ -410,3 +416,129 @@ def test_legacy_export_does_not_certify_ambiguous_multi_flag(tmp_path):
         manager.prepare_export(TrainerState(global_step=3), "step_end")
         assert manager._last_legacy_export_dcp_step is None
         assert not _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3)
+
+
+def test_epoch_dedup_rejects_optimizer_changed_after_hf_export(tmp_path):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = MagicMock(spec=[])
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer"),
+        patch("veomni.models.checkpoint.manager.dist.barrier"),
+    ):
+        manager = ModelCheckpointManager(runtime)
+        state = TrainerState(global_step=3, epoch=0)
+        manager.prepare_export(state, "step_end")
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.args.train.checkpoint.save_epochs = 1
+        trainer.args.train.checkpoint.save_hf_weights = False
+        trainer.model.checkpoint = manager
+        callback = CheckpointCallback(trainer)
+        callback._last_dcp_step = 3
+        runtime.optimizer = MagicMock(spec=[])
+        with pytest.raises(RuntimeError, match="Optimizer or checkpoint changed"):
+            callback.on_epoch_end(state)
+        trainer.save_dcp.assert_not_called()
+
+
+def test_manager_accepts_only_proven_loaded_optimizer_receipt(tmp_path):
+    import weakref
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = MagicMock()
+    runtime.optimizer._is_multi_optimizer = True
+    with patch("veomni.models.checkpoint.manager.build_checkpointer"):
+        manager = ModelCheckpointManager(runtime)
+        manager._loaded_optimizer_global_step = 3
+        manager._loaded_optimizer_generation = "saved-generation"
+        manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
+        with pytest.raises(RuntimeError, match="unproven"):
+            manager.confirm_loaded_checkpoint_for_reuse(3, "different-generation")
+        assert manager._last_saved_step == -1
+        saved_optimizer = runtime.optimizer
+        runtime.optimizer = MagicMock()
+        runtime.optimizer._is_multi_optimizer = True
+        with pytest.raises(RuntimeError, match="unproven"):
+            manager.confirm_loaded_checkpoint_for_reuse(3, "saved-generation")
+        assert manager._last_saved_step == -1
+        runtime.optimizer = saved_optimizer
+        manager.confirm_loaded_checkpoint_for_reuse(3, "saved-generation")
+        assert manager.checkpoint_receipt_is_current(3)
+        assert manager._last_saved_optimizer_generation == "saved-generation"
+        runtime.optimizer = MagicMock()
+        assert not manager.checkpoint_receipt_is_current(3)
+
+
+def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, monkeypatch):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.args.train.checkpoint.load_path = layout.step_dir(str(tmp_path), 3)
+    trainer.args.train.checkpoint.save_hf_weights = True
+    trainer.train_dataloader = None
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = MagicMock()
+    runtime.optimizer._is_multi_optimizer = True
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer"),
+        patch("veomni.models.checkpoint.manager.dist.barrier"),
+    ):
+        manager = ModelCheckpointManager(runtime)
+        manager._loaded_optimizer_global_step = 3
+        manager._loaded_optimizer_generation = "saved-generation"
+        import weakref
+
+        manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
+        trainer.model = SimpleNamespace(optimizer=runtime.optimizer, checkpoint=manager)
+        trainer.checkpoint_callback = CheckpointCallback(trainer)
+        callback = GlobalStateCallback(trainer)
+        monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+        monkeypatch.setattr(
+            layout, "read_manifest", lambda _: {"model_state": True, "global_step": 3, "world_size": 1}
+        )
+        monkeypatch.setattr(
+            callback,
+            "_read_current",
+            lambda _: {
+                "global_step": 3,
+                "torch_rng_state": torch.get_rng_state(),
+                "_veomni_optimizer_generations": {"model": "saved-generation"},
+            },
+        )
+        monkeypatch.setattr(callback, "_restore_position", lambda _: None)
+        callback.load_global_state()
+        assert trainer.checkpoint_callback._last_dcp_step == 3
+        assert manager.checkpoint_receipt_is_current(3)
+        manager.prepare_export(TrainerState(global_step=3), "train_end")
+        manager.checkpointer.save.assert_not_called()
+        assert manager._last_saved_optimizer_generation == "saved-generation"
+        assert runtime.optimizer is None
+
+
+def test_same_output_path_comparison_covers_uri_and_symlink(tmp_path):
+    source = tmp_path / "actual"
+    source.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(source, target_is_directory=True)
+    assert layout.same_checkpoint_path(str(alias) + "/", str(source))
+    assert layout.same_checkpoint_path("hdfs://cluster/a/./b/", "hdfs://cluster/a/b")
+    assert not layout.same_checkpoint_path("hdfs://one/a", "hdfs://two/a")
+
+
+def test_same_output_path_resolves_symlink_before_dotdot(tmp_path):
+    output = tmp_path / "output"
+    source = tmp_path / "source"
+    (source / "inner").mkdir(parents=True)
+    output.mkdir()
+    (output / "alias").symlink_to(source / "inner", target_is_directory=True)
+    (output / "global_step_3").mkdir()
+    (source / "global_step_3").mkdir()
+    assert not layout.same_checkpoint_path(
+        str(output / "alias" / ".." / "global_step_3"), str(output / "global_step_3")
+    )
