@@ -51,18 +51,47 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 
+def _confirmed_export_optimizer(checkpoint, step):
+    if not hasattr(checkpoint, "_last_export_validated_step"):
+        return True  # Compatibility with checkpoint providers that only expose a receipt.
+    if checkpoint._last_export_validated_step != step:
+        return False
+    optimizer = getattr(getattr(checkpoint, "runtime", None), "optimizer", None)
+    if optimizer is None:
+        return getattr(checkpoint, "_last_export_released_optimizer", False) is True
+    saved_ref = getattr(checkpoint, "_last_saved_optimizer_ref", None)
+    return callable(saved_ref) and saved_ref() is optimizer
+
+
 def _export_wrote_dcp(trainer, step):
     """Only reuse an export's DCP when every model manager confirms its step."""
     root = getattr(trainer, "model", None)
     modules = getattr(root, "module_runtimes", None)
     runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
-    checkpoints = [getattr(runtime, "checkpoint", None) for runtime in runtimes]
+    # Omni intentionally has no manager for fully frozen modules; unknown or
+    # trainable modules with no manager must still prevent deduplication.
+    checkpoints = [
+        getattr(runtime, "checkpoint", None)
+        for runtime in runtimes
+        if getattr(runtime, "checkpoint", None) is not None
+        or getattr(runtime, "has_trainable_parameters", None) is not False
+    ]
     saved = bool(checkpoints) and all(
         checkpoint is not None
+        and getattr(getattr(checkpoint, "checkpointer", None), "_async_save_failed", False) is not True
+        and _confirmed_export_optimizer(checkpoint, step)
         and type(getattr(checkpoint, "_last_saved_step", None)) is int
         and checkpoint._last_saved_step == step
-        and isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
-        and bool(checkpoint._last_saved_optimizer_generation)
+        and (
+            (
+                isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
+                and bool(checkpoint._last_saved_optimizer_generation)
+            )
+            or (
+                type(getattr(checkpoint, "_last_legacy_export_dcp_step", None)) is int
+                and checkpoint._last_legacy_export_dcp_step == step
+            )
+        )
         for checkpoint in checkpoints
     )
     if dist.is_initialized():

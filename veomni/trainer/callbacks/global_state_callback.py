@@ -227,8 +227,9 @@ class GlobalStateCallback(Callback):
                 or getattr(data, "resume_input_deterministic", False) is not True
             ):
                 logger.warning(
-                    "Dynamic SFT data checkpoints will not support exact resume unless an input contract digest "
-                    "and deterministic-input attestation are configured before training."
+                    "Dynamic SFT trainer-state resume will be rejected unless an input contract digest and "
+                    "deterministic-input attestation are configured before training. To start a new data stream, "
+                    "load model weights as a new run instead of resuming the trainer state."
                 )
 
     @property
