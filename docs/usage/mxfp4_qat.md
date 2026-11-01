@@ -76,7 +76,7 @@ The example's learning rate and duration are starting settings, not a validated 
 ## Construction and checkpoints
 
 [The model builder](../../veomni/models/auto.py#L164) applies
-[QAT preparation](../../veomni/models/qat.py#L109) before FSDP2, including on meta.
+[QAT preparation](../../veomni/models/qat.py#L113) before FSDP2, including on meta.
 Weight names stay unchanged; SwiGLU calls the fake-quant projections' forwards.
 [The parallel builder](../../veomni/distributed/torch_parallelize.py#L1011) validates
 topology and precision before sharding/loading. AdamW updates FP32 master shards.

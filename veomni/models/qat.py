@@ -46,14 +46,18 @@ def _qat_ops(model):
     config = getattr(model, "config", None)
     if _nested_mxfp4(config):
         raise ValueError("torchao_mxfp4 currently supports only standalone Dense Qwen3, not nested model configs.")
+
     ops = getattr(config, "ops_config", None)
-    # The HF backend restores native config classes, retaining their selections.
-    if ops is None and (getattr(config, "ops_implementation", None) or {}).get("qat_implementation") == _RECIPE:
+    selections = getattr(config, "ops_implementation", None) or {}
+    recipe = getattr(ops, "qat_implementation", None) if ops is not None else selections.get("qat_implementation")
+    if recipe != _RECIPE:
+        return None
+
+    if ops is None:
+        # The HF backend retains selections on its native config class.
         from ..arguments.arguments_types import OpsImplementationConfig
 
-        ops = OpsImplementationConfig(**config.ops_implementation)
-    if getattr(ops, "qat_implementation", None) != _RECIPE:
-        return None
+        ops = OpsImplementationConfig(**selections)
     if config.model_type != "qwen3":
         raise ValueError("torchao_mxfp4 currently supports only standalone Dense Qwen3.")
     return ops
