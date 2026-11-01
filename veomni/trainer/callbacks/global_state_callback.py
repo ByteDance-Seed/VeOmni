@@ -40,11 +40,9 @@ import copy
 import hashlib
 import json
 import os
-import posixpath
 import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, Optional
-from urllib.parse import urlsplit, urlunsplit
 
 import torch
 import torch.distributed as dist
@@ -64,31 +62,6 @@ logger = helper.create_logger(__name__)
 
 # Keys of ``state_dict`` that belong to ``loader/`` rather than ``extra_state/``.
 _LOADER_KEYS = ("train_dataloader",)
-
-
-def _same_checkpoint_path(left, right):
-    """Compare logical URIs or existing local directories, including symlinks."""
-
-    def normalize(path):
-        raw = os.fspath(path)
-        if not isinstance(raw, str):
-            raise TypeError("Checkpoint paths must be strings")
-        parsed = urlsplit(raw)
-        if parsed.scheme and parsed.netloc:
-            return urlunsplit(
-                (parsed.scheme.lower(), parsed.netloc, posixpath.normpath(parsed.path), parsed.query, parsed.fragment)
-            )
-        return os.path.abspath(raw)
-
-    left_normalized, right_normalized = normalize(left), normalize(right)
-    if left_normalized == right_normalized:
-        return True
-    left_uri, right_uri = urlsplit(os.fspath(left)), urlsplit(os.fspath(right))
-    if (left_uri.scheme and left_uri.netloc) or (right_uri.scheme and right_uri.netloc):
-        return False
-    if os.path.exists(left_normalized) and os.path.exists(right_normalized):
-        return os.path.samefile(left_normalized, right_normalized)
-    return False
 
 
 def _agree_dpo_output_checkpoint(value, group=None):
@@ -404,7 +377,7 @@ class GlobalStateCallback(Callback):
                     and refresh_epoch_state
                     and getattr(self.trainer, "_dpo_pending_epoch_end", None) is not None
                     and load_path is not None
-                    and _same_checkpoint_path(load_path, step_root)
+                    and layout.same_checkpoint_path(load_path, step_root)
                     and getattr(checkpoint, "_loaded_optimizer_global_step", None) == state.global_step
                 ):
                     generation = getattr(checkpoint, "_loaded_optimizer_generation", None)
@@ -929,7 +902,9 @@ class GlobalStateCallback(Callback):
             try:
                 save_path = getattr(args.train.checkpoint, "save_path", None)
                 save_step_path = layout.step_dir(save_path, global_step) if save_path else None
-                same_output_checkpoint = bool(save_step_path and _same_checkpoint_path(save_step_path, load_path))
+                same_output_checkpoint = bool(
+                    save_step_path and layout.same_checkpoint_path(save_step_path, load_path)
+                )
             except BaseException as exc:
                 path_error = exc
             raise_if_any_rank_failed(path_error, "checking DPO output checkpoint path", group=default_group)
@@ -961,12 +936,6 @@ class GlobalStateCallback(Callback):
                 self._last_saved_step = global_step if same_output_checkpoint else -1
                 if self._last_saved_step == global_step and strict_optimizer:
                     self._last_saved_optimizer_generations = dict(generations)
-                    # This exact output checkpoint has just been verified and
-                    # restored; an epoch-boundary callback must reuse it until
-                    # another optimizer step advances global_step.
-                    for name, checkpoint in checkpoints:
-                        checkpoint._last_saved_step = global_step
-                        checkpoint._last_saved_optimizer_generation = generations[name]
 
         restore_local(restore_position, "restoring trainer position")
         dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]

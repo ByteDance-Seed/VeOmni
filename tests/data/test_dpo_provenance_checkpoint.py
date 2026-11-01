@@ -1245,7 +1245,15 @@ def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path,
         trainer._dpo_pending_epoch_end = None
         trainer._dpo_pending_loader_state = None
         trainer.policy_model.optimizer = SimpleNamespace(_is_multi_optimizer=True)
-        trainer.policy_model.checkpoint = SimpleNamespace(
+
+        class CheckpointStub(SimpleNamespace):
+            def confirm_loaded_checkpoint_for_reuse(self, step, generation):
+                if (step, generation) != (self._loaded_optimizer_global_step, self._loaded_optimizer_generation):
+                    raise RuntimeError("Unproven test checkpoint")
+                self._last_saved_step = step
+                self._last_saved_optimizer_generation = generation
+
+        trainer.policy_model.checkpoint = CheckpointStub(
             _last_saved_step=-1 if loaded else 3,
             _last_saved_optimizer_generation=None if loaded else "source",
             _loaded_optimizer_global_step=3 if loaded else None,
