@@ -399,7 +399,6 @@ class ModelCheckpointManager:
             error = exc
         if multi:
             raise_if_any_rank_failed(error, "restoring MultiOptimizer trainer step and scheduler")
-            self._loaded_optimizer_global_step = step
             generation = state.get("_veomni_optimizer_checkpoint_generation")
             error = (
                 RuntimeError("MultiOptimizer checkpoint generation is missing")
@@ -407,10 +406,12 @@ class ModelCheckpointManager:
                 else None
             )
             raise_if_any_rank_failed(error, "checking restored MultiOptimizer generation")
-            self._loaded_optimizer_generation = generation
         elif error is not None:
             raise error
         dist.barrier()
+        if multi:
+            self._loaded_optimizer_global_step = step
+            self._loaded_optimizer_generation = generation
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
