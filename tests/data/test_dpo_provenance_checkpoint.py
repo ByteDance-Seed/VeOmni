@@ -10,6 +10,7 @@
 
 import copy
 import io
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -430,10 +431,13 @@ def test_dpo_epoch_end_refreshes_checkpoint_position_without_changing_sft_behavi
     callback.dcp_every_n_epochs = 0
     callback.save_hf_weights = False
     callback._last_saved_step = 3
+    callback._last_saved_optimizer_generations = {}
     callback.save_global_state = MagicMock()
     state = SimpleNamespace(epoch=0, global_step=3)
     callback.on_epoch_end(state)
-    callback.save_global_state.assert_called_once_with(state)
+    callback.save_global_state.assert_called_once_with(
+        state, require_optimizer_checkpoint=False, refresh_epoch_state=True
+    )
 
     callback.trainer = SimpleNamespace()
     callback.save_global_state.reset_mock()
@@ -457,6 +461,7 @@ def test_finished_dpo_resume_preserves_position_at_train_end(monkeypatch, same_o
     position = {"epoch": 0, "step_in_epoch": 2, "epoch_complete": True}
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
+    callback._last_saved_optimizer_generations = {}
     callback._read_current = lambda _: {
         "global_step": 2,
         "torch_rng_state": torch.get_rng_state(),
@@ -532,7 +537,7 @@ def test_pending_epoch_end_does_not_prefetch_the_previous_epoch(monkeypatch, dyn
     callback.dcp_every_n_epochs = 1
     callback.save_hf_weights = False
     saved_states = []
-    callback.save_global_state = lambda state: saved_states.append(callback.state_dict(state))
+    callback.save_global_state = lambda state, **_: saved_states.append(callback.state_dict(state))
     callback.on_epoch_end(trainer.state)
     assert saved_states[0]["dpo_position"]["epoch_complete"] is True
     trainer._dpo_pending_epoch_end = None
@@ -1180,3 +1185,110 @@ def test_dynamic_batch_buffer_restore_preserves_provenance(save_by_idx):
     marker = resumed._buffer[0][0][DPO_FEATURE_KEY]
     assert (marker.chosen, marker.rejected, marker.producer_contract_version) == (3, 1, 1)
     assert len(marker.feature_digest) == 64
+
+
+@pytest.mark.parametrize("path_style", ["trailing_slash", "relative", "symlink"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path, monkeypatch, path_style, dynamic):
+    from tests.data.test_dpo_epoch_resume import _unpack
+    from veomni.checkpoint import layout
+    from veomni.trainer.callbacks.base import TrainerState
+
+    root = layout.step_dir(str(tmp_path), 3)
+
+    def make_trainer(loaded):
+        trainer = _trainer(True)
+        train = trainer.base.args.train
+        train.dyn_bsz = dynamic
+        train.num_train_epochs = 2
+        trainer.base.args.train_steps = 3
+        train.checkpoint.save_path = str(tmp_path)
+        if not loaded:
+            train.checkpoint.load_path = None
+        elif path_style == "trailing_slash":
+            train.checkpoint.load_path = root + "/"
+        elif path_style == "symlink":
+            alias = tmp_path / "loaded-checkpoint"
+            if not alias.exists():
+                alias.symlink_to(root, target_is_directory=True)
+            train.checkpoint.load_path = str(alias)
+        else:
+            train.checkpoint.load_path = os.path.relpath(root)
+        train.checkpoint.save_steps = 0
+        train.checkpoint.save_epochs = 0
+        train.checkpoint.save_hf_weights = False
+        train.checkpoint.hf_save_steps = 0
+        train.checkpoint.hf_save_epochs = 0
+        samples = [
+            {"id": i, "attention_mask": torch.ones(1, dtype=torch.int64), "labels": torch.ones(1, dtype=torch.int64)}
+            for i in range(6)
+        ]
+        loader = _native_map_loader(samples, collate_fn=_unpack)
+        if dynamic:
+            loader = DynamicBatchSizeDataLoader(
+                loader,
+                TextBatchingStrategy(token_micro_bsz=1, buffer_size=1),
+                num_micro_batch=1,
+                length=3,
+                drop_last=True,
+            )
+            loader._dpo_disallow_implicit_restart = True
+            loader._strict_resume_contract = True
+        trainer.base.train_dataloader = loader
+        trainer.base.data_iterator = None
+        trainer.base.environ_meter = MagicMock()
+        trainer.base.environ_meter.state_dict.return_value = {}
+        trainer.base.channel_loss_callback = None
+        trainer.base.offline_cache_writer = None
+        trainer.base.state = TrainerState()
+        trainer._dpo_recovery_geometry = _dpo_recovery_geometry(trainer.base.args)
+        trainer._dpo_pending_epoch_end = None
+        trainer._dpo_pending_loader_state = None
+        trainer.policy_model.optimizer = SimpleNamespace(_is_multi_optimizer=True)
+        trainer.policy_model.checkpoint = SimpleNamespace(
+            _last_saved_step=-1 if loaded else 3,
+            _last_saved_optimizer_generation=None if loaded else "source",
+            _loaded_optimizer_global_step=3 if loaded else None,
+            _loaded_optimizer_generation="source" if loaded else None,
+        )
+        return trainer
+
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(layout, "read_manifest", lambda _: {"model_state": True, "global_step": 3, "world_size": 1})
+    original = make_trainer(False)
+    iterator = iter(original.train_dataloader)
+    for _ in range(3):
+        next(iterator)
+    original._dpo_epoch_step = 3
+    original._dpo_epoch_complete = False
+    callback = GlobalStateCallback(original)
+    callback.save_global_state(TrainerState(global_step=3, epoch=0), require_optimizer_checkpoint=True)
+    original.train_dataloader.set_epoch(1)
+    expected_iterator = iter(original.train_dataloader)
+    expected = [next(expected_iterator) for _ in range(3)]
+
+    resumed = make_trainer(True)
+    first = GlobalStateCallback(resumed)
+    first.load_global_state()
+    assert resumed._dpo_pending_epoch_end == (0, 3)
+    assert resumed.model.checkpoint._last_saved_optimizer_generation == "source"
+    resumed._dpo_epoch_complete = True
+    first.on_epoch_end(resumed.state)
+    extra = torch.load(layout.extra_state_path(root, 0), map_location="cpu", weights_only=False)
+    assert extra["_veomni_optimizer_generations"] == {"model": "source"}
+    assert extra["dpo_position"]["epoch_complete"] is True
+
+    second = make_trainer(True)
+    GlobalStateCallback(second).load_global_state()
+    assert (second.start_epoch, second.start_step) == (1, 0)
+    assert second.model.checkpoint._last_saved_optimizer_generation == "source"
+    second.train_dataloader.set_epoch(second.start_epoch)
+    restored_iterator = iter(second.train_dataloader)
+    actual = [next(restored_iterator) for _ in range(3)]
+
+    def sample_ids(items):
+        if dynamic:
+            return [tuple(micro[0]["id"] for micro in item) for item in items]
+        return [item["id"] for item in items]
+
+    assert sample_ids(actual) == sample_ids(expected)

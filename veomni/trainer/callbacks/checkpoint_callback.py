@@ -32,6 +32,7 @@ here. It has its own schedule and its own files, in
 
 import hashlib
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,6 +49,29 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+def _export_wrote_dcp(trainer, step):
+    """Only reuse an export's DCP when every model manager confirms its step."""
+    root = getattr(trainer, "model", None)
+    modules = getattr(root, "module_runtimes", None)
+    runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
+    checkpoints = [getattr(runtime, "checkpoint", None) for runtime in runtimes]
+    saved = bool(checkpoints) and all(
+        checkpoint is not None
+        and type(getattr(checkpoint, "_last_saved_step", None)) is int
+        and checkpoint._last_saved_step == step
+        and isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
+        and bool(checkpoint._last_saved_optimizer_generation)
+        for checkpoint in checkpoints
+    )
+    if dist.is_initialized():
+        group = dist.group.WORLD
+        device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+        flag = torch.tensor([int(saved)], dtype=torch.int32, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+        saved = bool(flag.item())
+    return saved
 
 
 def _agree_checkpoint_load_path(path):
@@ -116,7 +140,8 @@ class CheckpointCallback(Callback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
-            if state.global_step != self._last_dcp_step:
+            current_dcp = _export_wrote_dcp(self.trainer, state.global_step)
+            if state.global_step != self._last_dcp_step and not current_dcp:
                 self._save_dcp(state)
             else:
                 logger.info_rank0(
@@ -139,6 +164,8 @@ class CheckpointCallback(Callback):
     def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         self.trainer.save_hf_or_lora(state, stage=stage)
         self._last_hf_step = state.global_step
+        if _export_wrote_dcp(self.trainer, state.global_step):
+            self._last_dcp_step = state.global_step
 
 
 __all__ = ["CheckpointCallback"]

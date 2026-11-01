@@ -83,6 +83,12 @@ iterable sources use separate paths and are not qualified by this contract.
 Exact continuation starts after a completed optimizer step; step-zero cursors
 are rejected because iterator initialization may advance CPU RNG.
 
+When the model checkpoint manager provides strict MultiOptimizer generation
+receipts, the trainer sidecar records that generation and recovery requires it
+to match the optimizer checkpoint and step. Checkpoint managers without this
+protocol retain their existing behavior; their optimizer-to-cursor identity is
+not established by the dynamic-batching cursor checks alone.
+
 Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
 before training, and set `data.resume_input_deterministic=true` only when the
 input snapshot, tokenizer, chat template, processor, collator and transforms are
