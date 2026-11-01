@@ -129,11 +129,13 @@ def test_multi_optimizer_async_checkpoint_rejected_before_writes(tmp_path):
 
 
 def test_failed_final_load_barrier_does_not_certify_multi_optimizer():
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
 
     from veomni.models.checkpoint.manager import ModelCheckpointManager, _scheduler_recipe
 
     model, optimizer = _model_and_optimizer()
+    leaf = next(iter(optimizer.optimizers_dict.values()))
+    leaf.checkpoint_abort_file_backed_state = MagicMock()
     manager = object.__new__(ModelCheckpointManager)
     manager.runtime = SimpleNamespace(
         model=model, optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None
@@ -156,6 +158,7 @@ def test_failed_final_load_barrier_does_not_certify_multi_optimizer():
             manager.load()
     assert manager._loaded_optimizer_global_step is None
     assert manager._loaded_optimizer_generation is None
+    leaf.checkpoint_abort_file_backed_state.assert_called_once()
 
 
 @pytest.mark.parametrize("mode", ["betas", "list", "nested"])
