@@ -112,6 +112,12 @@ class CPUOffloadAdamW(FullFP32AdamW):
             return torch.float32
         return self.cpu_moment_dtype if id(param) in self._offloaded else self.resident_moment_dtype
 
+    def _allocate_moment(self, param, master, name):
+        return torch.zeros_like(master, dtype=self._state_dtype(param, name))
+
+    def _finish_state_chunk(self, param, state, start, count):
+        pass
+
     def _restore_parameter_state(self, param, saved, group):
         if not saved:
             return saved
@@ -213,8 +219,8 @@ class CPUOffloadAdamW(FullFP32AdamW):
                     state.update(
                         step=torch.tensor(0.0, dtype=torch.float32, device="cpu"),
                         master_weight=master,
-                        exp_avg=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg")),
-                        exp_avg_sq=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg_sq")),
+                        exp_avg=self._allocate_moment(param, master, "exp_avg"),
+                        exp_avg_sq=self._allocate_moment(param, master, "exp_avg_sq"),
                     )
                 tensors = [_local(state[key]) for key in ("master_weight", "exp_avg", "exp_avg_sq")]
                 target = torch.device("cpu") if offload else weight.device
@@ -254,6 +260,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
                         w[section].copy_(staging, non_blocking=True)
                     else:
                         w[section].copy_(effective)
+                    self._finish_state_chunk(param, state, start, min(group["chunk_size"], w.numel() - start))
                 # H2D and the next D2H are enqueued in order on the same
                 # current stream. The next event wait completes the previous
                 # H2D before the CPU overwrites its reusable staging buffer;

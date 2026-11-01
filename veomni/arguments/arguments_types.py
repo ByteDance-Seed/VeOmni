@@ -266,6 +266,14 @@ class OptimizerConfig:
     cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
         default="float32", metadata={"help": "CPU-offloaded Adam moment precision; master remains FP32."}
     )
+    qwen38_ple_moments_scratch_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local scratch directory for FP32 PLE moments; rebuilt from DCP on resume."},
+    )
+    qwen38_ple_moments_world_profile: bool = field(
+        default=False,
+        metadata={"help": "Declare that all world ranks participate in the PLE scratch optimizer profile."},
+    )
 
     def __post_init__(self):
         if isinstance(self.lr, (list, tuple)):

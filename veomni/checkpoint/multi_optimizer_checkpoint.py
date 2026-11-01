@@ -17,7 +17,7 @@ from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
-from torch.distributed.checkpoint.state_dict import StateDictOptions, _get_fqns, get_model_state_dict
+from torch.distributed.checkpoint.state_dict import _get_fqns
 
 from ..utils.dist_utils import raise_if_any_rank_failed
 from .optimizer_resume_layout import (
@@ -63,7 +63,7 @@ def _coordinated_storage_reader(reader_factory, path, *, group=None):
     return reader
 
 
-def _optimizer_payload_digest(payload, *, chunk_bytes=4 << 20):
+def _optimizer_payload_digest(payload, *, chunk_bytes=4 << 20, after_chunk=None):
     """Fingerprint a loaded sparse payload before or after optimizer restore."""
     digest = hashlib.sha256()
 
@@ -87,8 +87,12 @@ def _optimizer_payload_digest(payload, *, chunk_bytes=4 << 20):
             from .tensor_bytes import tensor_byte_chunks
 
             digest.update((local.numel() * local.element_size()).to_bytes(8, "big"))
+            offset = 0
             for chunk in tensor_byte_chunks(local, chunk_bytes=chunk_bytes):
                 digest.update(chunk)
+                if after_chunk is not None:
+                    after_chunk(local, offset, len(chunk))
+                offset += len(chunk)
         elif type(value) is dict:
             write(b"dict")
             for key in sorted(value):
@@ -612,16 +616,13 @@ def _preflight_multi_optimizer_layout(
         model_metadata = model_reader.read_metadata()
         if not isinstance(model_metadata.state_dict_metadata.get(model_key), BytesStorageMetadata):
             raise RuntimeError("MultiOptimizer model checkpoint generation is missing")
-        options = StateDictOptions(ignore_frozen_params=True) if trainable_only else None
-        if rank_local:
-            from .dcp_checkpointer import ModelState
+        from .dcp_checkpointer import ModelState, _export_extra_parallel_layout_key
 
-            current_model_state = ModelState(
-                model, trainable_only=trainable_only, parallel_state=parallel_state
-            ).state_dict()
-        else:
-            current_model_state = get_model_state_dict(model, options=options)
-        from .dcp_checkpointer import _export_extra_parallel_layout_key
+        # Save always uses ModelState. Its extra precision inventories and
+        # ExtraParallel namespaces must also be present during preflight.
+        current_model_state = ModelState(
+            model, trainable_only=trainable_only, parallel_state=parallel_state
+        ).state_dict()
 
         _check_model_serialization_hooks(model)
         logical_keys = {
@@ -864,7 +865,35 @@ def _prepare_multi_optimizer_saved_states(
                         if tuple(entry.size) != tuple(local_param.shape):
                             raise RuntimeError(f"MultiOptimizer checkpoint shape mismatch for {candidates[0]}.{field}")
                         if not validate_only:
-                            if adapter is not None and adapter.state_is_offloaded(leaf, param):
+                            allocated = (
+                                adapter.allocate_state(leaf, param, field, dtype)
+                                if adapter is not None and adapter.allocate_state is not None
+                                else None
+                            )
+                            if allocated is not None:
+                                local = allocated.to_local() if isinstance(allocated, DTensor) else allocated
+                                parameter_local = param.to_local() if isinstance(param, DTensor) else param
+                                expected_device = (
+                                    "cpu" if adapter.state_is_offloaded(leaf, param) else param.device.type
+                                )
+                                if (
+                                    not torch.is_tensor(allocated)
+                                    or isinstance(allocated, DTensor) != isinstance(param, DTensor)
+                                    or local.shape != parameter_local.shape
+                                    or allocated.dtype != dtype
+                                    or local.device.type != expected_device
+                                    or (
+                                        isinstance(allocated, DTensor)
+                                        and (
+                                            allocated.shape != param.shape
+                                            or allocated.placements != param.placements
+                                            or allocated.device_mesh != param.device_mesh
+                                        )
+                                    )
+                                ):
+                                    raise RuntimeError("Registered optimizer allocated an invalid checkpoint state")
+                                state[field] = allocated
+                            elif adapter is not None and adapter.state_is_offloaded(leaf, param):
                                 from .rank_local_optimizer import zeros_like_parameter_on_cpu
 
                                 state[field] = zeros_like_parameter_on_cpu(param, dtype=dtype)

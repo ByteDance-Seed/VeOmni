@@ -20,9 +20,11 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from ..utils.dist_utils import raise_if_any_rank_failed
 from .checkpoint_adapter import register_rank_local_adamw
 from .cpu_offload_adamw import CPUOffloadAdamW
-from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW, _local
+from .file_backed_state import FileBackedFP32State
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW, _local, _wrap_local_like_parameter
 
 
 # Generated with the Polar Express author's optimal_composition(l=1e-3,
@@ -255,6 +257,70 @@ def _matrix_placements(param):
     return tuple(placements)
 
 
+def _validate_file_muon_gradient_traffic(groups, state=None):
+    """Check Muon communication participants without entering untrusted subgroups."""
+    if not torch.distributed.is_initialized():
+        return
+    plans, preparation_error = [], None
+    try:
+        for index, group in enumerate(groups):
+            if not any(algorithm == "muon" for algorithm, _, _ in json.loads(group["qwen38_plan"])):
+                continue
+            param = group["params"][0]
+            if not isinstance(param, DTensor):
+                continue
+            target = _matrix_placements(param)
+            local_cpu_matrix = param.device.type == "cpu" and hasattr(param, "_veomni_optimizer_compute_device")
+            grad = param.grad
+            signature = (
+                index,
+                grad is not None,
+                str(param.device.type),
+                param.device.type,
+                local_cpu_matrix,
+                tuple(map(str, param.placements)),
+                tuple(map(str, target)),
+                tuple(map(str, grad.placements))
+                if isinstance(grad, DTensor)
+                else ("none" if grad is None else "plain"),
+                float(_local(state[param]["step"]).item()) if state is not None and grad is not None else None,
+            )
+            for axis, (placement, wanted) in enumerate(zip(param.placements, target, strict=True)):
+                if placement == wanted:
+                    continue
+                process_group = param.device_mesh.get_group(axis)
+                ranks = tuple(torch.distributed.get_process_group_ranks(process_group))
+                if len(ranks) <= 1:
+                    continue
+                # Rank membership alone does not identify a process group:
+                # two groups may have the same members but different channels.
+                # group_name is assigned collectively when the group is created.
+                group_name = process_group.group_name
+                if not isinstance(group_name, str) or not group_name:
+                    raise RuntimeError("Muon communication group has no stable identity")
+                plans.append((index, axis, ranks, group_name, signature))
+    except BaseException as exc:
+        preparation_error = exc
+    raise_if_any_rank_failed(preparation_error, "preparing Muon communication checks")
+    world_plans = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(world_plans, tuple(plans))
+    group_error = None
+    try:
+        by_rank = [{(row[0], row[1]): row for row in entries} for entries in world_plans]
+        for rank, entries in enumerate(world_plans):
+            if len(by_rank[rank]) != len(entries):
+                raise RuntimeError("Duplicate Muon communication plan")
+            for row in entries:
+                index, axis, ranks, _, _ = row
+                if rank not in ranks or len(set(ranks)) != len(ranks):
+                    raise RuntimeError("Invalid Muon communication group membership")
+                if any(peer < 0 or peer >= len(by_rank) or by_rank[peer].get((index, axis)) != row for peer in ranks):
+                    raise RuntimeError("Muon gradient participation or communication group differs across ranks")
+    except BaseException as exc:
+        group_error = exc
+    raise_if_any_rank_failed(group_error, "checking Muon gradient participation")
+
+
 class Qwen38MuonAdamW(CPUOffloadAdamW):
     """Mixed logical-slice updates; never orthogonalize an FSDP matrix fragment.
 
@@ -281,7 +347,15 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 _cuda_step_preflight(
                     [optimizer], getattr(optimizer, "_cuda_precision_group", None), closure=closure is not None
                 )
-            return wrapped_step(optimizer, *args, **kwargs)
+            direct_file_profile = optimizer._ple_world_profile and not optimizer._ple_parent_preflight
+            if direct_file_profile:
+                optimizer._prepare_file_step(closure)
+                optimizer._ple_parent_preflight = True
+            try:
+                return wrapped_step(optimizer, *args, **kwargs)
+            finally:
+                if direct_file_profile:
+                    optimizer._ple_parent_preflight = False
 
         guarded_step._qwen38_outer_preflight = guarded_step
         cls.step = guarded_step
@@ -293,8 +367,17 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         max_matrix_parameter_numel=134217728,
         max_logical_matrix_numel=33554432,
         cuda_precision_group=None,
+        ple_moments_scratch_dir=None,
+        ple_moments_world_profile=False,
+        ple_world_receipt=None,
+        ple_factory_permit=None,
         **kwargs,
     ):
+        from .ple_world_profile import validate_constructor
+
+        validate_constructor(ple_moments_scratch_dir, ple_moments_world_profile, ple_world_receipt, ple_factory_permit)
+        if ple_moments_scratch_dir is not None and not ple_moments_world_profile:
+            raise ValueError("File-backed PLE moments require an explicitly enabled full-world optimizer profile")
         super().__init__(*args, **kwargs)
         self._cuda_precision_group = cuda_precision_group
         self._cuda_parent_preflight = False
@@ -304,6 +387,21 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             raise ValueError("Invalid Muon momentum")
         self.max_matrix_parameter_numel = max_matrix_parameter_numel
         self.max_logical_matrix_numel = max_logical_matrix_numel
+        self._ple_lookup_ids = {
+            id(group["params"][0])
+            for group in self.param_groups
+            if group.get("qwen38_ple_lookup") and len(group["params"]) == 1
+        }
+        self._ple_file_mode_enabled = ple_moments_scratch_dir is not None
+        self._ple_world_profile = ple_moments_world_profile
+        self._ple_scratch_root = ple_moments_scratch_dir
+        self._ple_parent_preflight = False
+        self._ple_moment_storage = (
+            FileBackedFP32State(ple_moments_scratch_dir)
+            if self._ple_file_mode_enabled and self._ple_lookup_ids
+            else None
+        )
+        self._ple_state_poisoned = False
         for group in self.param_groups:
             if group.get("qwen38_recipe") != RECIPE or len(group["params"]) != 1:
                 raise ValueError("Use add_qwen38_plans to construct exact logical-slice groups")
@@ -311,6 +409,8 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 raise ValueError("Trainable PLE lookup tables require zero weight decay in the final optimizer groups")
             if group.get("qwen38_ple_lookup"):
                 p = group["params"][0]
+                if self._ple_file_mode_enabled and id(p) not in self._offloaded and p.device.type != "cpu":
+                    raise ValueError("File-backed PLE moments require CPU optimizer offload")
                 # Owner-local lazy counters cannot be checkpointed as replicated scalars.
                 mesh = p.device_mesh.mesh.tolist() if isinstance(p, DTensor) else None
                 group["qwen38_ple_step_layout"] = json.dumps(["owner-grid-v1", mesh])
@@ -337,6 +437,72 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 if any((stop - start) * p.shape[-1] > max_logical_matrix_numel for _, start, stop in plan):
                     raise ValueError("Muon logical matrix exceeds the explicit workspace limit")
 
+    def _allocate_moment(self, param, master, name):
+        if self._ple_moment_storage is None or id(param) not in self._ple_lookup_ids:
+            return super()._allocate_moment(param, master, name)
+        local = _local(master)
+        if local.device.type != "cpu" or local.dtype != torch.float32:
+            raise RuntimeError("File-backed PLE moments require an FP32 CPU master")
+        return _wrap_local_like_parameter(self._ple_moment_storage.zeros(local.shape), param)
+
+    def _allocate_checkpoint_state(self, param, field, dtype):
+        if (
+            self._ple_moment_storage is None
+            or id(param) not in self._ple_lookup_ids
+            or field not in ("exp_avg", "exp_avg_sq")
+        ):
+            return None
+        if dtype != torch.float32:
+            raise RuntimeError("File-backed PLE moments require FP32 checkpoint state")
+        local = _local(param)
+        return _wrap_local_like_parameter(self._ple_moment_storage.zeros(local.shape), param)
+
+    def _finish_state_chunk(self, param, state, start, count):
+        if self._ple_moment_storage is None or id(param) not in self._ple_lookup_ids:
+            return
+        try:
+            for field in ("exp_avg", "exp_avg_sq"):
+                if not self._ple_moment_storage.evict_range(_local(state[field]), start, count):
+                    raise RuntimeError("PLE moment lost its file-backed storage: " + field)
+        except BaseException:
+            self._ple_state_poisoned = True
+            raise
+
+    def checkpoint_commit_tensor(self, tensor):
+        if self._ple_moment_storage is None:
+            return
+        try:
+            self._ple_moment_storage.evict(_local(tensor))
+        except BaseException:
+            self._ple_state_poisoned = True
+            raise
+
+    def checkpoint_evict_tensor_chunk(self, tensor, offset_bytes, size_bytes):
+        if self._ple_moment_storage is None or not self._ple_moment_storage.owns(tensor):
+            return
+        if not tensor.is_contiguous() or offset_bytes % tensor.element_size() or size_bytes % tensor.element_size():
+            raise RuntimeError("Cannot safely evict an irregular file-backed optimizer state")
+        try:
+            self._ple_moment_storage.evict_range(
+                tensor, offset_bytes // tensor.element_size(), size_bytes // tensor.element_size()
+            )
+        except BaseException:
+            self._ple_state_poisoned = True
+            raise
+
+    def checkpoint_evict_file_backed_state(self):
+        if self._ple_moment_storage is None:
+            return
+        try:
+            self._ple_moment_storage.evict_all()
+        except BaseException:
+            self._ple_state_poisoned = True
+            raise
+
+    def checkpoint_abort_file_backed_state(self):
+        if self._ple_file_mode_enabled:
+            self._ple_state_poisoned = True
+
     @property
     def checkpoint_save_requires_state(self):
         return any(group.get("qwen38_ple_lookup") for group in self.param_groups)
@@ -362,8 +528,8 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                         self.state[p] = dict(
                             step=torch.tensor(0.0, dtype=torch.float32, device="cpu"),
                             master_weight=master,
-                            exp_avg=torch.zeros_like(master),
-                            exp_avg_sq=torch.zeros_like(master),
+                            exp_avg=self._allocate_moment(p, master, "exp_avg"),
+                            exp_avg_sq=self._allocate_moment(p, master, "exp_avg_sq"),
                         )
                         added.append(p)
             yield
@@ -466,7 +632,77 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         return state_dict
 
     @torch.no_grad()
+    def _prepare_file_step(self, closure=None):
+        """Validate and allocate before any parent optimizer mutates state."""
+        from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
+
+        error = None
+        try:
+            if self._ple_state_poisoned:
+                raise RuntimeError("File-backed optimizer state failed; resume from a complete checkpoint")
+            if (
+                closure is not None
+                or _global_optimizer_pre_hooks
+                or _global_optimizer_post_hooks
+                or self._optimizer_step_pre_hooks
+                or self._optimizer_step_post_hooks
+            ):
+                raise ValueError("File-backed PLE optimizer does not support closures or step hooks")
+            for group in self.param_groups:
+                if not any(algorithm == "muon" for algorithm, _, _ in json.loads(group["qwen38_plan"])):
+                    continue
+                p = group["params"][0]
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse or p.dtype not in (torch.bfloat16, torch.float32):
+                    raise RuntimeError("Muon requires dense BF16/FP32 compute parameters")
+                if isinstance(p, DTensor) and (not isinstance(p.grad, DTensor) or p.grad.placements != p.placements):
+                    raise RuntimeError("Muon requires gradients reduced to the parameter shard layout")
+                if tuple(_local(p.grad).shape) != tuple(_local(p).shape):
+                    raise RuntimeError("Muon gradient shard shape differs from its parameter")
+                target = torch.device("cpu") if id(p) in self._offloaded else p.device
+                state = self.state[p]
+                if not state:
+                    master = p.detach().to(device=target, copy=True).float()
+                    state.update(
+                        step=torch.tensor(0.0, dtype=torch.float32, device="cpu"),
+                        master_weight=master,
+                        exp_avg=torch.zeros_like(master),
+                        exp_avg_sq=torch.zeros_like(master),
+                    )
+                for field in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+                    tensor = _local(state.get(field))
+                    if not torch.is_tensor(tensor) or tensor.dtype != torch.float32:
+                        raise RuntimeError("Invalid Muon optimizer state: " + field)
+                    if field == "step":
+                        value = float(tensor.item()) if tensor.ndim == 0 else float("nan")
+                        if not math.isfinite(value) or value < 0 or not value.is_integer():
+                            raise RuntimeError("Invalid Muon optimizer step")
+                    elif tensor.device != target or tuple(tensor.shape) != tuple(_local(p).shape):
+                        raise RuntimeError("Invalid Muon state placement or shard shape: " + field)
+                    elif isinstance(p, DTensor) and (
+                        not isinstance(state[field], DTensor) or state[field].placements != p.placements
+                    ):
+                        raise RuntimeError("Invalid Muon state shard layout: " + field)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing file-backed Muon state")
+        _validate_file_muon_gradient_traffic(self.param_groups, self.state)
+
+    @torch.no_grad()
     def step(self, closure=None):
+        try:
+            if self._ple_world_profile and not self._ple_parent_preflight:
+                self._prepare_file_step(closure)
+            elif self._ple_state_poisoned:
+                raise RuntimeError("File-backed optimizer state failed; resume from a complete checkpoint")
+            return self._step_impl(closure)
+        except BaseException:
+            if self._ple_file_mode_enabled:
+                self._ple_state_poisoned = True
+            raise
+
+    def _step_impl(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -480,11 +716,19 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         for group in all_groups:
             plan = json.loads(group["qwen38_plan"])
             (muon_groups if any(a == "muon" for a, _, _ in plan) else adam_groups).append(group)
+        adam_error = None
         try:
             self.param_groups = adam_groups
-            super().step()
+            try:
+                super().step()
+            except BaseException as exc:
+                adam_error = exc
         finally:
             self.param_groups = all_groups
+        if self._ple_world_profile:
+            raise_if_any_rank_failed(adam_error, "updating file-backed PLE optimizer state")
+        elif adam_error is not None:
+            raise adam_error
         for group in muon_groups:
             p = group["params"][0]
             if p.grad is None:
@@ -576,7 +820,17 @@ def _rank_local_checkpoint_context(optimizer):
 register_rank_local_adamw(
     Qwen38MuonAdamW,
     _rank_local_checkpoint_context,
-    lambda optimizer: ("qwen38-polar8-v1", optimizer.max_matrix_parameter_numel, optimizer.max_logical_matrix_numel),
+    lambda optimizer: (
+        (
+            "qwen38-polar8-v1",
+            optimizer.max_matrix_parameter_numel,
+            optimizer.max_logical_matrix_numel,
+            "file-backed-ple-v1",
+        )
+        if optimizer._ple_file_mode_enabled
+        else ("qwen38-polar8-v1", optimizer.max_matrix_parameter_numel, optimizer.max_logical_matrix_numel)
+    ),
     lambda optimizer, param, field: torch.float32 if field == "step" else optimizer._state_dtype(param, field),
     lambda optimizer, param: id(param) in optimizer._offloaded,
+    lambda optimizer, param, field, dtype: optimizer._allocate_checkpoint_state(param, field, dtype),
 )

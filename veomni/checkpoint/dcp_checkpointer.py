@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import uuid
 import weakref
 from collections import OrderedDict
@@ -46,9 +47,16 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
+from ..models.qwen4_gdn_precision import (
+    is_qwen4_exp_model,
+    is_qwen4_gdn_parameter,
+    qwen4_exp_model_config,
+    validate_qwen4_gdn_pairs,
+)
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from .bounded_writer import BoundedFileSystemWriter
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -85,18 +93,81 @@ logger = logging.get_logger(__name__)
 _EXTRA_STATE_KEY = "extra_state"
 _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
+_QWEN4_GDN_FP32_LEGACY_MARKER = "__veomni_qwen4_gdn_fp32_v1__"
+_QWEN4_GDN_FP32_MARKER = "__veomni_qwen4_gdn_fp32_v2__"
+
+
+class _FileBackedSavePlanner(DefaultSavePlanner):
+    """Reclaim consumed file-backed pages after a writer resolves its next item."""
+
+    def __init__(self, *, optimizers, **kwargs):
+        super().__init__(**kwargs)
+        self._optimizers = optimizers
+        self._thread_previous = threading.local()
+
+    def resolve_data(self, write_item):
+        previous = getattr(self._thread_previous, "value", None)
+        if torch.is_tensor(previous):
+            for optimizer in self._optimizers:
+                optimizer.checkpoint_commit_tensor(previous)
+        value = super().resolve_data(write_item)
+        self._thread_previous.value = value
+        return value
+
+
+def read_qwen4_gdn_manifest(checkpoint_path) -> Optional[set[str]]:
+    """Read the persisted GDN precision inventory, including EP namespaces."""
+    reader = FileSystemReader(checkpoint_path)
+    keys = []
+    for key in reader.read_metadata().state_dict_metadata:
+        if not key.startswith("model."):
+            continue
+        logical = _export_extra_parallel_layout_key(key.removeprefix("model."))
+        if logical == _QWEN4_GDN_FP32_MARKER:
+            keys.append(key)
+    if not keys:
+        return None
+    if len(keys) != 1:
+        raise RuntimeError("Qwen4 GDN checkpoint has multiple precision inventories")
+    state = {keys[0]: ""}
+    load(state, storage_reader=reader, no_dist=True)
+    try:
+        payload = json.loads(state[keys[0]])
+        names = payload["parameter_names"]
+        if payload["version"] != 1 or not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ValueError("invalid schema")
+        if len(set(names)) != len(names) or any(not is_qwen4_gdn_parameter(name) for name in names):
+            raise ValueError("invalid parameter inventory")
+        validate_qwen4_gdn_pairs(names)
+        return set(names)
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Invalid Qwen4 GDN FP32 checkpoint precision inventory") from exc
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
-    def __init__(self, strict_model: bool, expected_save_id=None):
+    def __init__(self, strict_model: bool, expected_save_id=None, strict_gdn_fp32: bool = False):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
         self.expected_save_id = expected_save_id
+        self.strict_gdn_fp32 = strict_gdn_fp32
 
     def create_local_plan(self):
         assert self.metadata is not None
+        if self.strict_gdn_fp32:
+            for key, path in self.mappings.items():
+                if not path or path[0] != "model":
+                    continue
+                logical = _export_extra_parallel_layout_key(key.removeprefix("model."))
+                if logical is None or not is_qwen4_gdn_parameter(logical):
+                    continue
+                source = self.metadata.state_dict_metadata.get(key)
+                if source is not None and getattr(getattr(source, "properties", None), "dtype", None) != torch.float32:
+                    raise RuntimeError(f"Qwen4 GDN parameter {logical} in DCP is not FP32")
+                target = self.state_dict.get(key)
+                if torch.is_tensor(target) and target.dtype != torch.float32:
+                    raise RuntimeError(f"Qwen4 GDN target {logical} must be FP32")
         target = {key for key, path in self.mappings.items() if path and _is_extra_parallel_layout_marker(path[-1])}
         source = {
             key for key in self.metadata.state_dict_metadata if _is_extra_parallel_layout_marker(key.split(".")[-1])
@@ -134,7 +205,10 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         missing_model_keys = sorted(
             key
             for key, path in self.mappings.items()
-            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
+            if path
+            and path[0] == "model"
+            and _export_extra_parallel_layout_key(key.removeprefix("model.")) != _QWEN4_GDN_FP32_MARKER
+            and key not in self.metadata.state_dict_metadata
         )
         if missing_model_keys:
             preview = ", ".join(missing_model_keys[:10])
@@ -656,6 +730,13 @@ class ModelState(Stateful):
             # As fsdp+extra parallel and pure extra parallel have different placements, e.g. [Shard(0), Shard(1)] and [Shard(0)],
             # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
+        if is_qwen4_exp_model(self.model) and not self.trainable_only:
+            validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(self.model))
+            names = sorted(name for name in model_state_dict if is_qwen4_gdn_parameter(name))
+            if any(model_state_dict[name].dtype != torch.float32 for name in names):
+                raise RuntimeError("Qwen4 full checkpoint requires FP32 GDN parameters")
+            if names:
+                model_state_dict[_QWEN4_GDN_FP32_MARKER] = json.dumps({"version": 1, "parameter_names": names})
         if self.should_extra_parallel_aware and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
             model_state_dict = _namespace_extra_parallel_layout_state(model_state_dict, self._layout_marker_key)
         return model_state_dict
@@ -677,6 +758,8 @@ class ModelState(Stateful):
             and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
             self._layout_marker_key,
         )
+        model_state_dict.pop(_QWEN4_GDN_FP32_MARKER, None)
+        model_state_dict.pop(_QWEN4_GDN_FP32_LEGACY_MARKER, None)
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
@@ -1021,11 +1104,21 @@ class _ProvenMultiOptimizerState(OptimizerState):
             "registered optimizer checkpoint adapter presence",
             group=self.group,
         )
+        file_leaves = [
+            leaf for leaf in _iter_optimizer_leaves(self.optimizer) if getattr(leaf, "_ple_file_mode_enabled", False)
+        ]
+
+        def evict_file_chunk(tensor, offset_bytes, size_bytes):
+            for leaf in file_leaves:
+                leaf.checkpoint_evict_tensor_chunk(tensor, offset_bytes, size_bytes)
+
         expected_payload = None
         if has_adapter:
             error = None
             try:
-                expected_payload = _optimizer_payload_digest(state_dict)
+                expected_payload = _optimizer_payload_digest(
+                    state_dict, after_chunk=evict_file_chunk if file_leaves else None
+                )
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "fingerprinting loaded MultiOptimizer state", group=self.group)
@@ -1034,7 +1127,10 @@ class _ProvenMultiOptimizerState(OptimizerState):
             self.optimizer._dcp_load_state_dict(state_dict, group=self.group)
             if has_adapter:
                 restored_payload = self.optimizer._sparse_state_dict(coordinate=True, group=self.group)
-                if _optimizer_payload_digest(restored_payload) != expected_payload:
+                if (
+                    _optimizer_payload_digest(restored_payload, after_chunk=evict_file_chunk if file_leaves else None)
+                    != expected_payload
+                ):
                     raise RuntimeError("MultiOptimizer load changed or omitted checkpoint state")
         except BaseException as exc:
             error = exc
@@ -1689,8 +1785,14 @@ class DistributedCheckpointer(CheckpointerBase):
         multi = _coordinated_optimizer_flag(
             getattr(optimizer, "_is_multi_optimizer", False) is True, "MultiOptimizer save policy"
         )
+        file_optimizers = []
+        file_mode = False
         if multi:
             _coordinated_optimizer_flag(tuple(optimizer.key_names), "optimizer leaf order")
+            file_optimizers = [
+                leaf for leaf in _iter_optimizer_leaves(optimizer) if getattr(leaf, "_ple_file_mode_enabled", False)
+            ]
+            file_mode = _coordinated_optimizer_flag(bool(file_optimizers), "file-backed optimizer checkpoint mode")
             trainable_only = _coordinated_optimizer_flag(trainable_only, "MultiOptimizer trainable-only save")
             _coordinated_optimizer_flag(bool(save_async), "MultiOptimizer asynchronous save mode")
             _coordinated_optimizer_flag(os.path.abspath(stage_dir) if stage_dir else None, "MultiOptimizer stage path")
@@ -1829,6 +1931,20 @@ class DistributedCheckpointer(CheckpointerBase):
                 raise error
             return result
 
+        def storage_writer(path):
+            writer = cls._create_storage_writer(path)
+            if file_mode:
+                if type(writer) is not FileSystemWriter:
+                    raise TypeError("File-backed checkpoint requires the standard filesystem writer")
+                writer = BoundedFileSystemWriter(
+                    writer.path,
+                    sync_files=writer.sync_files,
+                    overwrite=writer.overwrite,
+                    release_page_cache=True,
+                )
+                writer._veomni_file_optimizers = file_optimizers
+            return writer
+
         try:
             model_state, model_writer = prepare_writer_state(
                 lambda: (
@@ -1842,7 +1958,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     )
                     if multi
                     else ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state),
-                    cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
+                    storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
                 ),
                 "preparing model DCP writer",
             )
@@ -1886,7 +2002,7 @@ class DistributedCheckpointer(CheckpointerBase):
                         )
                         if multi
                         else OptimizerState(model=state["model"], optimizer=optimizer, parallel_state=parallel_state),
-                        cls._create_storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
+                        storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
                     ),
                     "preparing optimizer DCP writer",
                 )
@@ -1948,6 +2064,31 @@ class DistributedCheckpointer(CheckpointerBase):
 
     @classmethod
     def load(
+        cls,
+        path: str,
+        state: Dict[str, Any],
+        process_group=None,
+        module: str = "",
+        trainable_only: bool = False,
+        parallel_state=None,
+    ) -> Dict[str, Any]:
+        """Load a checkpoint, invalidating file-backed state after any failure."""
+        try:
+            return cls._load_impl(path, state, process_group, module, trainable_only, parallel_state)
+        except BaseException:
+            try:
+                optimizer = state.get("optimizer") if isinstance(state, dict) else None
+                if getattr(optimizer, "_is_multi_optimizer", False):
+                    for leaf in _iter_optimizer_leaves(optimizer):
+                        if getattr(leaf, "_ple_file_mode_enabled", False):
+                            leaf.checkpoint_abort_file_backed_state()
+            except Exception:
+                # Preserve the original load failure, not a cleanup exception.
+                pass
+            raise
+
+    @classmethod
+    def _load_impl(
         cls,
         path: str,
         state: Dict[str, Any],
@@ -2105,6 +2246,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 planner=_ModelStrictLoadPlanner(
                     strict_model=not trainable_only,
                     expected_save_id=model_id,
+                    strict_gdn_fp32=is_qwen4_exp_model(state["model"]),
                 ),
             )
             error = (
@@ -2166,7 +2308,9 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=not trainable_only, strict_gdn_fp32=is_qwen4_exp_model(state["model"])
+                ),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
@@ -2177,7 +2321,9 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_dir(path, module)),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            planner=_ModelStrictLoadPlanner(
+                strict_model=not trainable_only, strict_gdn_fp32=is_qwen4_exp_model(state["model"])
+            ),
         )
         if wants_optimizer:
             dcp.load(
@@ -2323,7 +2469,14 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
+        if file_optimizers is not None and save_async:
+            raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
+        planner = (
+            _FileBackedSavePlanner(optimizers=file_optimizers, dedup_save_to_lowest_rank=save_to_lowest_rank)
+            if file_optimizers is not None
+            else DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        )
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save
@@ -2342,11 +2495,29 @@ class DistributedCheckpointer(CheckpointerBase):
                 planner=planner,
             )
         else:
-            dcp.save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-                planner=planner,
-            )
+            try:
+                dcp.save(
+                    state_dict=save_state,
+                    storage_writer=storage_writer,
+                    planner=planner,
+                )
+            except BaseException:
+                for optimizer in file_optimizers or ():
+                    optimizer.checkpoint_abort_file_backed_state()
+                raise
+            if file_optimizers is not None:
+                error = None
+                try:
+                    for optimizer in file_optimizers:
+                        optimizer.checkpoint_evict_file_backed_state()
+                except BaseException as exc:
+                    error = exc
+                try:
+                    raise_if_any_rank_failed(error, "evicting file-backed optimizer checkpoint state")
+                except BaseException:
+                    for optimizer in file_optimizers:
+                        optimizer.checkpoint_abort_file_backed_state()
+                    raise
             if dist.is_initialized():
                 dist.barrier()
             error = None
@@ -2426,7 +2597,7 @@ def _normalize_key(key: str) -> Optional[str]:
     if not key.startswith("model."):
         return None
     normalized = _export_extra_parallel_layout_key(key[6:])
-    if normalized is None:
+    if normalized is None or normalized in (_QWEN4_GDN_FP32_MARKER, _QWEN4_GDN_FP32_LEGACY_MARKER):
         return None
     key = "model." + normalized
 
@@ -2458,6 +2629,7 @@ def _get_sharding_plan(
     shard_size: int = None,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
     drop_hf_keys: Optional[Set[str]] = None,
+    preserve_fp32_keys: Optional[Set[str]] = None,
 ):
     """
     Create sharding plan from checkpoint metadata without loading weights.
@@ -2506,7 +2678,11 @@ def _get_sharding_plan(
                     f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
                 )
             source_dtype = tensor_meta.properties.dtype
-            if save_dtype and source_dtype.is_floating_point:
+            if (
+                save_dtype
+                and source_dtype.is_floating_point
+                and not (preserve_fp32_keys and hf_key in preserve_fp32_keys)
+            ):
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
                 dtype = source_dtype
@@ -2558,6 +2734,7 @@ def _process_shard(
     shard_keys: Dict[str, str],
     checkpoint_path: str,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
+    preserve_fp32_keys: Optional[Set[str]] = None,
 ) -> str:
     reader = FileSystemReader(checkpoint_path)
     metadata = reader.read_metadata()
@@ -2596,7 +2773,7 @@ def _process_shard(
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        if target_dtype and tensor.is_floating_point():
+        if target_dtype and tensor.is_floating_point() and not (preserve_fp32_keys and hf_key in preserve_fp32_keys):
             tensor = tensor.to(dtype=target_dtype)
 
         # Explicitly move to CPU and detach to avoid memory retention

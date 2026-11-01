@@ -18,9 +18,12 @@ class RankLocalAdamWAdapter:
     algorithm_identity: object
     state_dtype: object
     state_is_offloaded: object
+    allocate_state: object = None
 
 
-def register_rank_local_adamw(optimizer_type, context_factory, algorithm_identity, state_dtype, state_is_offloaded):
+def register_rank_local_adamw(
+    optimizer_type, context_factory, algorithm_identity, state_dtype, state_is_offloaded, allocate_state=None
+):
     """Register a trusted exact optimizer type and its sparse checkpoint context.
 
     The context must expose only actually initialized AdamW master/moment state,
@@ -41,10 +44,12 @@ def register_rank_local_adamw(optimizer_type, context_factory, algorithm_identit
         raise TypeError("Rank-local AdamW adapter algorithm identity must be callable")
     if not callable(state_dtype) or not callable(state_is_offloaded):
         raise TypeError("Rank-local AdamW state dtype and offload policies must be callable")
+    if allocate_state is not None and not callable(allocate_state):
+        raise TypeError("Rank-local AdamW state allocator must be callable")
     if optimizer_type in _RANK_LOCAL_ADAMW_ADAPTERS:
         raise ValueError(f"Optimizer checkpoint adapter already registered: {optimizer_type!r}")
     _RANK_LOCAL_ADAMW_ADAPTERS[optimizer_type] = RankLocalAdamWAdapter(
-        context_factory, algorithm_identity, state_dtype, state_is_offloaded
+        context_factory, algorithm_identity, state_dtype, state_is_offloaded, allocate_state
     )
 
 
