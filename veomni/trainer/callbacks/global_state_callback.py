@@ -106,6 +106,46 @@ def _multi_optimizer_checkpoints(trainer):
     return result
 
 
+def _legacy_optimizer_checkpoints(trainer):
+    """Find built-in legacy managers that can prove a completed load."""
+    from ...checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    root = getattr(trainer, "model", None)
+    runtimes = [("model", root)]
+    modules = getattr(root, "module_runtimes", None)
+    if isinstance(modules, Mapping) and modules:
+        if getattr(root, "checkpoint", None) is None and getattr(root, "optimizer", None) is None:
+            runtimes = []
+        runtimes.extend((f"module:{name}", module) for name, module in sorted(modules.items()))
+    result, unknown, seen = [], [], set()
+    for name, runtime in runtimes:
+        if runtime is None:
+            continue
+        optimizer = getattr(runtime, "optimizer", None)
+        checkpoint = getattr(runtime, "checkpoint", None)
+        confirm = getattr(type(checkpoint), "confirm_legacy_loaded_checkpoint_for_reuse", None)
+        if checkpoint is not None and id(checkpoint) in seen:
+            continue
+        if optimizer is None:
+            if getattr(runtime, "has_trainable_parameters", None) is not False:
+                unknown.append(name)
+            continue
+        multi = getattr(optimizer, "_is_multi_optimizer", False)
+        if (
+            multi is False
+            and checkpoint is not None
+            and callable(confirm)
+            and getattr(checkpoint, "checkpointer", None) is DistributedCheckpointer
+        ):
+            result.append((name, checkpoint))
+            seen.add(id(checkpoint))
+        elif multi is True and checkpoint is not None and hasattr(checkpoint, "_loaded_optimizer_generation"):
+            seen.add(id(checkpoint))
+        else:
+            unknown.append(name)
+    return result, unknown
+
+
 def _dynamic_resume_context(args, epoch):
     """Capture the source and epoch settings needed for a dynamic cursor."""
     data = getattr(args, "data", None)
@@ -510,6 +550,20 @@ class GlobalStateCallback(Callback):
         if load_path is None:
             return None
 
+        legacy_checkpoints, unknown_checkpoints, error = [], [], None
+        try:
+            legacy_checkpoints, unknown_checkpoints = _legacy_optimizer_checkpoints(self.trainer)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        if dist.is_initialized():
+            names = (tuple(name for name, _ in legacy_checkpoints), tuple(unknown_checkpoints))
+            all_names = [None] * dist.get_world_size()
+            dist.all_gather_object(all_names, names)
+            if any(item != names for item in all_names):
+                raise RuntimeError("Legacy optimizer checkpoint managers differ across ranks")
+        coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
+
         if strict_optimizer:
             completeness_error = None
             try:
@@ -685,15 +739,34 @@ class GlobalStateCallback(Callback):
             flag = torch.tensor([int(found)], dtype=torch.int32, device=device)
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
             found = bool(flag.item())
-            if not found:
-                if strict_resume:
-                    raise RuntimeError("Trainer state is missing on at least one rank; exact cursor resume is unsafe")
-                logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
-                return None
-        elif not found:
+        if not found:
             if strict_resume:
-                raise RuntimeError("Trainer state is missing; exact cursor resume is unsafe")
-            logger.warning(f"No trainer state at {state_path}; resuming weights only.")
+                raise RuntimeError("Trainer state is missing on at least one rank; exact cursor resume is unsafe")
+            same_output, error = False, None
+            try:
+                save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
+                source_path = os.fspath(load_path)
+                if "://" not in source_path:
+                    source_path = os.path.realpath(source_path)
+                name = os.path.basename(os.path.normpath(source_path))
+                prefix = "global_step_"
+                if save_root and name.startswith(prefix) and name[len(prefix) :].isdecimal():
+                    source_step = int(name[len(prefix) :])
+                    same_output = layout.same_checkpoint_path(layout.step_dir(save_root, source_step), load_path)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking weights-only checkpoint output path")
+            if dist.is_initialized():
+                decisions = [None] * dist.get_world_size()
+                dist.all_gather_object(decisions, same_output)
+                if any(decision != same_output for decision in decisions):
+                    raise RuntimeError("Weights-only checkpoint output path differs across ranks")
+            if same_output and (legacy_checkpoints or unknown_checkpoints):
+                raise RuntimeError(
+                    "Cannot safely reuse a checkpoint without trainer state in its output directory; "
+                    "use a different output directory."
+                )
+            logger.warning_rank0("Trainer state is missing; resuming weights only.")
             return None
 
         global_state = current_state if current_state is not None else legacy_state
@@ -911,7 +984,7 @@ class GlobalStateCallback(Callback):
             same_output_checkpoint = _agree_dpo_output_checkpoint(same_output_checkpoint, group=default_group)
 
         def restore_local(action, description):
-            if not (strict_resume or dpo_recovery):
+            if not (coordinated_resume or dpo_recovery):
                 action()
                 return
             error = None
@@ -1016,8 +1089,45 @@ class GlobalStateCallback(Callback):
         ):
             restore_local(lambda: iter(self.trainer.train_dataloader), "initializing the restored data iterator")
 
-        if strict_optimizer:
-            self._confirm_same_output_checkpoint(global_step, load_path, checkpoints, generations)
+        legacy_cursor_proven = True
+        if legacy_checkpoints:
+            error = None
+            try:
+                cpu_rng = global_state.get("torch_rng_state")
+                device_rng = global_state.get("device_rng_state")
+                if get_device_type() == "cpu":
+                    device_proven = device_rng is None or (
+                        torch.is_tensor(cpu_rng) and torch.is_tensor(device_rng) and torch.equal(cpu_rng, device_rng)
+                    )
+                else:
+                    device_proven = device_rng is not None and callable(
+                        getattr(get_torch_device(), "set_rng_state", None)
+                    )
+                loader = self.trainer.train_dataloader
+                cursor_proven = loader is None or (isinstance(cursor, dict) and (global_step == 0 or bool(cursor)))
+                legacy_cursor_proven = torch.is_tensor(cpu_rng) and device_proven and cursor_proven
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking legacy trainer state completeness")
+            if dist.is_initialized():
+                proofs = [None] * dist.get_world_size()
+                dist.all_gather_object(proofs, legacy_cursor_proven)
+                legacy_cursor_proven = all(proofs)
+            if not legacy_cursor_proven:
+                self._last_saved_step = -1
+                self._last_saved_optimizer_generations = {}
+                if strict_optimizer:
+                    raise RuntimeError("Mixed optimizer resume lacks proven legacy trainer RNG or cursor state")
+        if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
+            self._confirm_same_output_checkpoint(
+                global_step,
+                load_path,
+                checkpoints,
+                generations,
+                legacy_checkpoints,
+                unknown_checkpoints,
+                legacy_cursor_proven,
+            )
 
         logger.info_rank0(
             f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "
@@ -1025,7 +1135,16 @@ class GlobalStateCallback(Callback):
         )
         return global_state
 
-    def _confirm_same_output_checkpoint(self, step, load_path, checkpoints, generations):
+    def _confirm_same_output_checkpoint(
+        self,
+        step,
+        load_path,
+        checkpoints,
+        generations,
+        legacy_checkpoints=(),
+        unknown_checkpoints=(),
+        legacy_cursor_proven=True,
+    ):
         """Reuse a proven checkpoint only at its original output location."""
         same_output, error = False, None
         try:
@@ -1041,19 +1160,54 @@ class GlobalStateCallback(Callback):
                 raise RuntimeError("Restored checkpoint output path differs across ranks")
         if not same_output:
             return
+        if legacy_checkpoints:
+            if not legacy_cursor_proven:
+                raise RuntimeError(
+                    "Cannot safely reuse a legacy checkpoint without proven trainer RNG and cursor state; "
+                    "use a different output directory."
+                )
+            complete, error = False, None
+            try:
+                manifest = layout.read_manifest(load_path)
+                complete = bool(
+                    isinstance(manifest, dict)
+                    and layout.checkpoint_is_complete(load_path)
+                    and manifest.get("model_state") is True
+                    and manifest.get("global_step") == step
+                    and manifest.get("world_size") == self.trainer.args.train.world_size
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking legacy checkpoint completeness")
+            if dist.is_initialized():
+                decisions = [None] * dist.get_world_size()
+                dist.all_gather_object(decisions, complete)
+                if any(decision != complete for decision in decisions):
+                    raise RuntimeError("Legacy checkpoint completeness differs across ranks")
+            if not complete:
+                self._last_saved_step = -1
+                self._last_saved_optimizer_generations = {}
+                raise RuntimeError(
+                    "Cannot safely reuse an incomplete legacy checkpoint in its output directory; "
+                    "use a different output directory."
+                )
         error = None
         try:
+            if unknown_checkpoints:
+                raise RuntimeError(f"Checkpoint providers cannot confirm optimizer identity: {unknown_checkpoints}")
             for name, checkpoint in checkpoints:
                 confirm = getattr(type(checkpoint), "confirm_loaded_checkpoint_for_reuse", None)
                 if not callable(confirm):
                     raise RuntimeError("Strict checkpoint provider cannot confirm restored optimizer identity")
                 confirm(checkpoint, step, generations[name])
+            for _, checkpoint in legacy_checkpoints:
+                checkpoint.confirm_legacy_loaded_checkpoint_for_reuse(step, load_path)
         except BaseException as exc:
             error = exc
         try:
             raise_if_any_rank_failed(error, "confirming restored optimizer checkpoint")
         except BaseException:
-            for _, checkpoint in checkpoints:
+            for _, checkpoint in (*checkpoints, *legacy_checkpoints):
                 checkpoint._last_saved_step = -1
                 checkpoint._last_saved_optimizer_generation = None
                 if hasattr(checkpoint, "_last_saved_optimizer_ref"):

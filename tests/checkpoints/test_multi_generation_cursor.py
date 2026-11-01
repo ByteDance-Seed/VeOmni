@@ -3,6 +3,7 @@
 
 """The trainer cursor must belong to the same optimizer checkpoint generation."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -528,6 +529,269 @@ def test_same_output_path_comparison_covers_uri_and_symlink(tmp_path):
     alias.symlink_to(source, target_is_directory=True)
     assert layout.same_checkpoint_path(str(alias) + "/", str(source))
     assert layout.same_checkpoint_path("hdfs://cluster/a/./b/", "hdfs://cluster/a/b")
+
+
+@pytest.mark.parametrize("stage", ["epoch", "train_end"])
+@pytest.mark.parametrize("incomplete", ["none", "manifest", "rng", "rng_conflict"])
+def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage, incomplete):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime, _make_mock_trainer
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    def runtime(load_path=None):
+        obj = _make_mock_runtime(save_path=str(tmp_path))
+        obj.model = torch.nn.Linear(2, 2)
+        obj.optimizer = torch.optim.AdamW(obj.model.parameters(), lr=0.01)
+        obj.lr_scheduler = None
+        obj.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp")
+        obj.train_args.checkpoint.load_path = load_path
+        return obj
+
+    def trainer(obj, manager, load_path=None):
+        result = _make_mock_trainer(save_path=str(tmp_path))
+        result.args.train.checkpoint.load_path = load_path
+        result.args.train.checkpoint.save_epochs = 1
+        result.args.train.checkpoint.save_hf_weights = False
+        result.args.train_steps = 2
+        result.train_dataloader = None
+        result.data_iterator = None
+        result.environ_meter.state_dict.return_value = {}
+        result.channel_loss_callback = None
+        result.offline_cache_writer = None
+        result.model = SimpleNamespace(optimizer=obj.optimizer, checkpoint=manager)
+        result.save_dcp.side_effect = manager.save_dcp
+        return result
+
+    step = TrainerState(global_step=2, epoch=0)
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
+        patch("torch.distributed.barrier"),
+    ):
+        source = runtime()
+        for param in source.model.parameters():
+            param.grad = torch.ones_like(param)
+        source.optimizer.step()
+        manager = ModelCheckpointManager(source)
+        manager.save_dcp(step)
+        GlobalStateCallback(trainer(source, manager)).save_global_state(step)
+        load_path = layout.step_dir(str(tmp_path), 2)
+        assert layout.checkpoint_is_complete(load_path)
+        if incomplete == "manifest":
+            os.remove(layout.manifest_path(load_path))
+        elif incomplete in ("rng", "rng_conflict"):
+            state_path = layout.extra_state_path(load_path, 0)
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            if incomplete == "rng":
+                state.pop("torch_rng_state")
+            else:
+                alternate = torch.Generator().manual_seed(0).get_state()
+                if torch.equal(alternate, state["torch_rng_state"]):
+                    alternate = torch.Generator().manual_seed(1).get_state()
+                state["device_rng_state"] = alternate
+            torch.save(state, state_path)
+        target = runtime(load_path)
+        restored = ModelCheckpointManager(target)
+        restored.load()
+        resumed = trainer(target, restored, load_path)
+        resumed.checkpoint_callback = CheckpointCallback(resumed)
+        cursor = GlobalStateCallback(resumed)
+        if incomplete != "none":
+            with pytest.raises(RuntimeError, match="Cannot safely reuse"):
+                cursor.load_global_state()
+            assert restored._last_saved_step == -1
+            assert resumed.checkpoint_callback._last_dcp_step == -1
+            assert cursor._last_saved_step == -1
+            return
+        cursor.load_global_state()
+        with patch.object(DistributedCheckpointer, "_create_storage_writer", side_effect=OSError("must not rewrite")):
+            if stage == "epoch":
+                resumed.checkpoint_callback.on_epoch_end(step)
+            else:
+                restored.prepare_export(step, "train_end")
+        assert layout.checkpoint_is_complete(load_path)
+        resumed.save_dcp.assert_not_called()
+
+
+def test_legacy_receipt_rejects_unknown_checkpoint_provider(tmp_path):
+    import weakref
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    class NoOpCheckpointer:
+        pass
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    load_path = layout.step_dir(str(tmp_path), 2)
+    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=NoOpCheckpointer):
+        manager = ModelCheckpointManager(runtime)
+    manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
+    manager._loaded_checkpoint_path = load_path
+    manager._loaded_checkpointer = NoOpCheckpointer
+    with pytest.raises(RuntimeError, match="unproven legacy"):
+        manager.confirm_legacy_loaded_checkpoint_for_reuse(2, load_path)
+    assert manager._last_saved_step == -1
+
+
+def test_unproven_legacy_can_use_a_different_output_directory(tmp_path):
+    trainer = _make_mock_trainer(save_path=str(tmp_path / "new_output"))
+    callback = GlobalStateCallback(trainer)
+    checkpoint = SimpleNamespace(_last_saved_step=-1)
+    callback._confirm_same_output_checkpoint(
+        2,
+        str(tmp_path / "old_output" / "global_step_2"),
+        [],
+        {},
+        [("model", checkpoint)],
+        [],
+        False,
+    )
+    assert checkpoint._last_saved_step == -1
+    assert callback._last_saved_step == -1
+
+
+def test_same_output_unknown_provider_cannot_be_certified(tmp_path, monkeypatch):
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.args.train.checkpoint.load_path = layout.step_dir(str(tmp_path), 2)
+    trainer.train_dataloader = None
+    trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(
+        callback, "_read_current", lambda _: {"global_step": 2, "torch_rng_state": torch.get_rng_state()}
+    )
+    monkeypatch.setattr(callback, "_restore_position", lambda _: None)
+    with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
+        callback.load_global_state()
+
+
+@pytest.mark.parametrize("mode", ["different", "same", "symlink", "symlink_dotdot"])
+def test_weights_only_resume_does_not_overwrite_source_step_zero(tmp_path, monkeypatch, mode):
+    save_root = tmp_path / ("new" if mode == "different" else "old")
+    trainer = _make_mock_trainer(save_path=str(save_root))
+    source = tmp_path / "old" / "global_step_0"
+    if mode == "symlink":
+        source.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(source, target_is_directory=True)
+        source = alias
+    elif mode == "symlink_dotdot":
+        nested = tmp_path / "old" / "nested"
+        nested.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        source = alias / ".." / "global_step_0"
+    trainer.args.train.checkpoint.load_path = str(source)
+    trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(callback, "_read_current", lambda _: None)
+    with patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None):
+        if mode != "different":
+            with pytest.raises(RuntimeError, match="without trainer state"):
+                callback.load_global_state()
+        else:
+            assert callback.load_global_state() is None
+
+
+def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    load_path = layout.step_dir(str(tmp_path), 2)
+    runtime.train_args.checkpoint.load_path = load_path
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
+        patch.object(DistributedCheckpointer, "load"),
+        patch("torch.distributed.barrier", side_effect=RuntimeError("barrier failed")),
+    ):
+        manager = ModelCheckpointManager(runtime)
+        with pytest.raises(RuntimeError, match="barrier failed"):
+            manager.load()
+    assert manager._loaded_optimizer_ref is None
+    assert manager._loaded_checkpoint_path is None
+    with pytest.raises(RuntimeError, match="unproven legacy"):
+        manager.confirm_legacy_loaded_checkpoint_for_reuse(2, load_path)
+
+
+def test_legacy_omni_missing_trainable_provider_is_not_certified(tmp_path, monkeypatch):
+    import weakref
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.trainer.callbacks.global_state_callback import _legacy_optimizer_checkpoints
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    load_path = layout.step_dir(str(tmp_path), 2)
+    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
+        manager = ModelCheckpointManager(runtime)
+    manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
+    manager._loaded_checkpoint_path = load_path
+    manager._loaded_checkpointer = DistributedCheckpointer
+    present = SimpleNamespace(optimizer=runtime.optimizer, checkpoint=manager, has_trainable_parameters=True)
+    missing = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=True)
+    frozen = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+    root = SimpleNamespace(
+        optimizer=None, checkpoint=None, module_runtimes={"yes": present, "missing": missing, "frozen": frozen}
+    )
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.model = root
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert [name for name, _ in known] == ["module:yes"]
+    assert unknown == ["module:missing"]
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(
+        layout,
+        "read_manifest",
+        lambda _: {"model_state": True, "global_step": 2, "world_size": trainer.args.train.world_size},
+    )
+    with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
+        callback._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
+    assert manager._last_saved_step == -1
+
+
+def test_mixed_omni_receipt_confirms_every_optimizer(tmp_path, monkeypatch):
+    import weakref
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+
+    load_path = layout.step_dir(str(tmp_path), 2)
+    strict_runtime = _make_mock_runtime(save_path=str(tmp_path))
+    strict_runtime.optimizer = MagicMock()
+    strict_runtime.optimizer._is_multi_optimizer = True
+    legacy_runtime = _make_mock_runtime(save_path=str(tmp_path))
+    legacy_runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
+        strict = ModelCheckpointManager(strict_runtime)
+        legacy = ModelCheckpointManager(legacy_runtime)
+    strict._loaded_optimizer_ref = weakref.ref(strict_runtime.optimizer)
+    strict._loaded_optimizer_global_step = 2
+    strict._loaded_optimizer_generation = "test-generation"
+    legacy._loaded_optimizer_ref = weakref.ref(legacy_runtime.optimizer)
+    legacy._loaded_checkpoint_path = load_path
+    legacy._loaded_checkpointer = DistributedCheckpointer
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.checkpoint_callback = CheckpointCallback(trainer)
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(
+        layout,
+        "read_manifest",
+        lambda _: {"model_state": True, "global_step": 2, "world_size": trainer.args.train.world_size},
+    )
+    callback._confirm_same_output_checkpoint(
+        2, load_path, [("module:strict", strict)], {"module:strict": "test-generation"}, [("module:legacy", legacy)]
+    )
+    assert strict.checkpoint_receipt_is_current(2)
+    assert legacy.checkpoint_receipt_is_current(2)
+    assert trainer.checkpoint_callback._last_dcp_step == 2
     assert not layout.same_checkpoint_path("hdfs://one/a", "hdfs://two/a")
 
 

@@ -138,7 +138,10 @@ def _trainer(enabled, allow_legacy=False, allow_legacy_objective=False):
     )
     trainer.base.train_dataloader._dataloader.dataset._data._fingerprint = "mock-fingerprint"
     trainer.policy_model = SimpleNamespace(
-        tokenizer=_DeclaredTokenizer(), chat_template=None, parallel_state=SimpleNamespace(dp_size=1, dp_rank=0)
+        tokenizer=_DeclaredTokenizer(),
+        chat_template=None,
+        parallel_state=SimpleNamespace(dp_size=1, dp_rank=0),
+        has_trainable_parameters=False,
     )
     trainer._dpo_producer_identity = dpo_producer_identity(trainer.policy_model.tokenizer, None, None)
     trainer._dpo_transform_max_seq_len = 64
