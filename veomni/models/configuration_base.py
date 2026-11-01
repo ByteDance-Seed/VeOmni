@@ -296,9 +296,9 @@ def _resolve_ops(selections):
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
 
-    resolved = OpsImplementationConfig(
-        **{"qat_implementation": "none", **{key: value for key, value in selections.items() if value is not None}}
-    )
+    ops_kwargs = {key: value for key, value in selections.items() if value is not None}
+    ops_kwargs.setdefault("qat_implementation", "none")
+    resolved = OpsImplementationConfig(**ops_kwargs)
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:
         resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(
