@@ -292,13 +292,45 @@ def _ops_dict(value):
     return dict(value or {})
 
 
-def _resolve_ops(selections):
+def _resolve_ops(selections: Mapping[str, Any]) -> tuple[dict[str, Any], OpsImplementationConfig]:
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
 
-    ops_kwargs = {key: value for key, value in selections.items() if value is not None}
-    ops_kwargs.setdefault("qat_implementation", "none")
-    resolved = OpsImplementationConfig(**ops_kwargs)
+    values = {key: value for key, value in selections.items() if value is not None}
+    for key in values:
+        if key not in OpsImplementationConfig.__dataclass_fields__:
+            raise TypeError(f"OpsImplementationConfig.__init__() got an unexpected keyword argument {key!r}")
+    resolved = OpsImplementationConfig(
+        attn_implementation=values.get("attn_implementation", OpsImplementationConfig.attn_implementation),
+        moe_implementation=values.get("moe_implementation"),
+        cross_entropy_loss_implementation=values.get("cross_entropy_loss_implementation"),
+        rms_norm_implementation=values.get("rms_norm_implementation"),
+        swiglu_mlp_implementation=values.get("swiglu_mlp_implementation"),
+        rotary_pos_emb_implementation=values.get("rotary_pos_emb_implementation"),
+        rotary_pos_emb_vision_implementation=values.get("rotary_pos_emb_vision_implementation"),
+        load_balancing_loss_implementation=values.get("load_balancing_loss_implementation"),
+        rms_norm_gated_implementation=values.get(
+            "rms_norm_gated_implementation", OpsImplementationConfig.rms_norm_gated_implementation
+        ),
+        causal_conv1d_implementation=values.get(
+            "causal_conv1d_implementation", OpsImplementationConfig.causal_conv1d_implementation
+        ),
+        chunk_gated_delta_rule_implementation=values.get(
+            "chunk_gated_delta_rule_implementation", OpsImplementationConfig.chunk_gated_delta_rule_implementation
+        ),
+        qsa_attention_implementation=values.get(
+            "qsa_attention_implementation", OpsImplementationConfig.qsa_attention_implementation
+        ),
+        dsa_indexer_implementation=values.get(
+            "dsa_indexer_implementation", OpsImplementationConfig.dsa_indexer_implementation
+        ),
+        dsa_attention_implementation=values.get(
+            "dsa_attention_implementation", OpsImplementationConfig.dsa_attention_implementation
+        ),
+        mhc_implementation=values.get("mhc_implementation", OpsImplementationConfig.mhc_implementation),
+        qat_implementation=values.get("qat_implementation", "none"),
+        qat_target_modules=values.get("qat_target_modules"),
+    )
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:
         resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(
