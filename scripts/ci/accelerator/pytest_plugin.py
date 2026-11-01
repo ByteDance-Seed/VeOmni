@@ -1,0 +1,302 @@
+"""Collect launch plans and validate distributed launches inside pytest workers."""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from scripts.ci.accelerator.launch_plan import (
+    CasePlan,
+    PlanContext,
+    ResourcePlanError,
+    as_case_plan,
+    default_plan,
+    runner_capabilities,
+)
+
+
+def resolve_plan(item):
+    instance = item.instance
+    cls = getattr(item, "cls", None)
+    if instance is None and cls is not None and hasattr(cls, "ci_launch_plan"):
+        # Pytest 7 exposes unittest methods unbound until setup. Plan resolution
+        # reads pure class properties without constructing or setting up a test.
+        instance = object.__new__(cls)
+    context = PlanContext(getattr(getattr(item, "callspec", None), "params", {}), runner_capabilities(), instance)
+    marker = item.get_closest_marker("launch_plan")
+    if marker:
+        value = marker.kwargs["provider"]
+        plan = as_case_plan(value(context) if callable(value) else value)
+    elif hasattr(instance, "ci_launch_plan"):
+        plan = as_case_plan(instance.ci_launch_plan())
+    else:
+        plan = default_plan(context.capabilities)
+    if not isinstance(plan, CasePlan):
+        raise ResourcePlanError(f"Invalid launch plan for {item.nodeid}: {plan!r}")
+    return plan
+
+
+def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
+    """Reject underdeclared launches before a skip, fallback, or worker start."""
+    encoded = os.environ.get("VEOMNI_CI_ACTIVE_PLAN")
+    if not encoded:
+        return
+    plan = CasePlan.from_dict(json.loads(encoded))
+    if nnodes != 1 or nproc not in {spec.nproc for spec in plan.launches}:
+        raise ResourcePlanError(f"Launch nproc={nproc}, nnodes={nnodes} disagrees with {plan.to_dict()}")
+    env = os.environ if env is None else env
+    caps = runner_capabilities()
+    encoded_lease = os.environ.get("VEOMNI_CI_LEASE")
+    if encoded_lease is None:
+        raise ResourcePlanError("VEOMNI_CI_ACTIVE_PLAN is set without VEOMNI_CI_LEASE")
+    lease = json.loads(encoded_lease)
+    specs = [spec for spec in plan.launches if spec.nproc == nproc]
+    key = "CUDA_VISIBLE_DEVICES" if caps.backend == "cuda" else "ASCEND_RT_VISIBLE_DEVICES"
+    visible = [value for value in env.get(key, "").split(",") if value]
+    cpu = not visible and any(spec.device == "cpu" for spec in specs)
+    if not cpu and not any(spec.device == "accelerator" for spec in specs):
+        raise ResourcePlanError("A CPU launch must not expose accelerator devices")
+    if not cpu and (len(visible) < nproc or not set(visible) <= set(lease)):
+        raise ResourcePlanError(f"nproc={nproc} cannot run on lease {lease}, child visibility {visible}")
+    event = dict(
+        nodeid=os.environ.get("VEOMNI_CI_ACTIVE_NODEID"),
+        nproc=nproc,
+        device="cpu" if cpu else caps.backend,
+        backend="gloo" if cpu else {"cuda": "nccl", "npu": "hccl"}.get(caps.backend),
+        assigned=visible,
+        command=command,
+        timestamp=time.time(),
+    )
+    output = os.environ.get("CI_LAUNCH_EVENTS")
+    if output and record:
+        with open(output, "a") as handle:
+            handle.write(json.dumps(event) + "\n")
+
+
+def _validate_command(command, env):
+    if isinstance(command, str):
+        args = shlex.split(command.replace("\\\n", " "))
+    elif isinstance(command, (list, tuple)):
+        args = [str(value) for value in command]
+    else:
+        return
+    if not any(Path(arg).name == "torchrun" or arg == "torch.distributed.run" for arg in args):
+        return
+    options = {}
+    for index, arg in enumerate(args):
+        if not arg.startswith("--"):
+            continue
+        key, separator, value = arg.partition("=")
+        options[key.replace("-", "_")] = value if separator else (args[index + 1] if index + 1 < len(args) else "")
+    try:
+        nproc = int(options["__nproc_per_node"])
+        nnodes = int(options.get("__nnodes", "1"))
+    except (KeyError, ValueError) as exc:
+        raise ResourcePlanError("CI torchrun launches need explicit integer nproc and nnodes") from exc
+    validate_launch(nproc, nnodes=nnodes, command=args, env=env)
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("launch plans")
+    group.addoption("--ci-inventory", type=Path)
+    group.addoption("--ci-batch", type=Path)
+
+
+def pytest_configure(config):
+    global _active_config
+    _active_config = config
+    config._ci_results = {}
+    config.addinivalue_line("markers", "launch_plan(provider): shared launch configuration for this case")
+    config._ci_original_popen = subprocess.Popen
+
+    def popen(command, *args, **kwargs):
+        _validate_command(command, kwargs.get("env", os.environ))
+        return config._ci_original_popen(command, *args, **kwargs)
+
+    subprocess.Popen = popen
+    import torch.multiprocessing as mp
+
+    config._ci_original_spawn = mp.spawn
+
+    def spawn(fn, args=(), nprocs=1, **kwargs):
+        validate_launch(nprocs)
+        return config._ci_original_spawn(fn, args=args, nprocs=nprocs, **kwargs)
+
+    mp.spawn = spawn
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    batch_path = config.getoption("ci_batch")
+    if batch_path:
+        batch = json.loads(batch_path.read_text())
+        config._ci_batch_cases = {row["nodeid"]: row for row in batch["cases"]}
+        selected = [item for item in items if item.nodeid in config._ci_batch_cases]
+        if {item.nodeid for item in selected} != set(config._ci_batch_cases):
+            raise ResourcePlanError("Worker collection differs from the full-visibility inventory")
+        deselected = [item for item in items if item not in selected]
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+
+
+def pytest_collection_finish(session):
+    output = session.config.getoption("ci_inventory")
+    if not output:
+        return
+    from _pytest.skipping import evaluate_skip_marks
+
+    rows = []
+    for item in session.items:
+        skip = evaluate_skip_marks(item)
+        plan = resolve_plan(item)
+        cards = plan.cards(runner_capabilities())
+        if cards > len(runner_capabilities().devices) and skip is None:
+            raise ResourcePlanError(f"{item.nodeid} requires {cards} devices")
+        rows.append(
+            dict(
+                nodeid=item.nodeid,
+                file=str(item.path),
+                plan=plan.to_dict(),
+                cards=cards,
+                skip=skip.reason if skip else None,
+            )
+        )
+    output.write_text(json.dumps(rows, indent=2) + "\n")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    rows = getattr(item.config, "_ci_batch_cases", None)
+    if rows is None:
+        return
+    row = rows[item.nodeid]
+    os.environ["VEOMNI_CI_ACTIVE_PLAN"] = json.dumps(row["plan"])
+    os.environ["VEOMNI_CI_ACTIVE_NODEID"] = item.nodeid
+    plan = resolve_plan(item)
+    if plan.to_dict() != row["plan"]:
+        raise ResourcePlanError(f"Launch plan changed after device assignment: {item.nodeid}")
+    # Eligibility is evaluated with the runner's full owned visibility.
+    item.own_markers[:] = [mark for mark in item.own_markers if mark.name not in ("skipif", "skip")]
+    original_iter = item.iter_markers
+    item.iter_markers = lambda name=None: (mark for mark in original_iter(name) if mark.name not in ("skipif", "skip"))
+    if row["skip"] is not None:
+        pytest.skip(row["skip"])
+    if runner_capabilities().backend == "cpu" and any(spec.device != "cpu" for spec in plan.launches):
+        pytest.skip("Requires an accelerator")
+
+
+def pytest_unconfigure(config):
+    subprocess.Popen = config._ci_original_popen
+    import torch.multiprocessing as mp
+
+    mp.spawn = config._ci_original_spawn
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    started = time.time()
+    _progress(dict(kind="start", nodeid=item.nodeid, timestamp=started))
+    rows = getattr(item.config, "_ci_batch_cases", {})
+    case = rows.get(item.nodeid)
+    previous_device_type = None
+    previous_foreach_query = None
+    previous_dataloader_init = None
+    previous_npu_registration_disabled = None
+    try:
+        if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
+            import torch.optim.optimizer as optimizer_module
+            from torch._inductor.codegen.common import device_op_overrides_dict, register_device_op_overrides
+            from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
+            from torch.utils.checkpoint import DefaultDeviceType
+            from torch.utils.data import dataloader
+
+            # CPU-only checkpoint inputs fall back to this global default. A
+            # registered NPU backend can otherwise initialize hidden devices while
+            # querying AMP support, even though every tensor stays on CPU.
+            previous_device_type = DefaultDeviceType.get_device_type()
+            DefaultDeviceType.set_device_type("cpu")
+            # torch_npu replaces the optimizer's alias with a device-name query.
+            # CPU optimizers use Torch's original, query-free capability helper;
+            # explicit foreach/fused settings retain their ordinary semantics.
+            previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
+            optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+            # torch_npu eagerly registers its device override. Torch 2.10 then skips
+            # all built-in overrides because the registry is already nonempty.
+            # Register only the missing CPU entry, preserving existing vendor rows.
+            if "cpu" not in device_op_overrides_dict:
+                from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+                register_device_op_overrides("cpu", CpuDeviceOpOverrides())
+            # torch_npu's DataLoader constructor queries NPU affinity even for CPU
+            # inputs. Use its saved Torch constructor while devices are hidden,
+            # without importing the vendor package or overriding unrelated patches.
+            npu_module = sys.modules.get("torch_npu.utils._module")
+            if npu_module is not None and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(
+                npu_module, "_mpdl_iter_init", None
+            ):
+                if not hasattr(npu_module, "origin_mpdl_iter_init"):
+                    raise ResourcePlanError("Cannot isolate CPU DataLoader: torch_npu has no saved Torch constructor")
+                previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
+                dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
+            # The vendor Inductor wrapper otherwise registers its NPU backend even
+            # when compiling CPU graphs. Keep real CPU compilation enabled while
+            # suppressing that registration, without importing the vendor package.
+            npu_dynamo = sys.modules.get("torch_npu.utils._dynamo")
+            npu_registry = getattr(npu_dynamo, "_InductorNpuRegistry", None)
+            if npu_registry is not None:
+                if not hasattr(npu_registry, "_disabled_register") or not callable(
+                    getattr(npu_registry, "disable_register", None)
+                ):
+                    raise ResourcePlanError("Cannot isolate CPU Inductor: unsupported torch_npu registry policy")
+                previous_npu_registration_disabled = npu_registry._disabled_register
+                npu_registry.disable_register()
+        yield
+    finally:
+        if previous_npu_registration_disabled is not None:
+            npu_registry._disabled_register = previous_npu_registration_disabled
+        if previous_dataloader_init is not None:
+            dataloader._MultiProcessingDataLoaderIter.__init__ = previous_dataloader_init
+        if previous_foreach_query is not None:
+            optimizer_module._get_foreach_kernels_supported_devices = previous_foreach_query
+        if previous_device_type is not None:
+            DefaultDeviceType.set_device_type(previous_device_type)
+    row = item.config._ci_results.get(item.nodeid)
+    if row:
+        row["wall_seconds"] = time.time() - started
+        _progress(dict(row, kind="result"))
+
+
+def _progress(row):
+    output = os.environ.get("CI_CASE_PROGRESS")
+    if output:
+        with open(output, "a") as handle:
+            handle.write(json.dumps(row) + "\n")
+
+
+def pytest_runtest_logreport(report):
+    row = _active_config._ci_results.setdefault(
+        report.nodeid, dict(nodeid=report.nodeid, outcome="incomplete", phases=[])
+    )
+    row["phases"].append(dict(when=report.when, outcome=report.outcome, duration=report.duration))
+    if report.failed:
+        row.update(outcome="failed", detail=str(report.longrepr))
+        _progress(dict(row, kind="failure"))
+    elif row["outcome"] != "failed":
+        if report.skipped:
+            row.update(outcome="xfail" if hasattr(report, "wasxfail") else "skipped", detail=str(report.longrepr))
+        elif report.when == "call":
+            row["outcome"] = "xpass" if hasattr(report, "wasxfail") else "passed"
+
+
+def pytest_sessionfinish(session, exitstatus):
+    output = os.environ.get("CI_CASE_RESULTS")
+    if output:
+        Path(output).write_text(
+            json.dumps(dict(exitstatus=int(exitstatus), cases=list(session.config._ci_results.values())), indent=2)
+            + "\n"
+        )

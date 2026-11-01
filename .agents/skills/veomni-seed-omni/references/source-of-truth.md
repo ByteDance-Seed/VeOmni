@@ -12,7 +12,7 @@ Use this reference to decide which files to trust before editing SeedOmni.
 - `veomni/models/seed_omni/modules/**/modeling.py`
   - native HF class + in-file `InferenceMixin` (`generate()` + FSM state).
 - `veomni/models/seed_omni/modules/**/accelerated.py`
-  - composable `TrainingMixin` / `VeOmniMixin` + IDE type stubs; see `references/modulemixin-ide-stubs.md`.
+  - composable `TrainingMixin` / `VeOmniMixin` + IDE type stubs; see `references/module-contract.md`.
 - `veomni/models/seed_omni/graphs/base.py`
   - endpoint parsing and common graph schema.
 - `veomni/models/seed_omni/graphs/training_graph.py`
@@ -21,19 +21,17 @@ Use this reference to decide which files to trust before editing SeedOmni.
   - inference FSM execution, permissive routing, transition behavior.
 - `veomni/models/seed_omni/modeling_omni.py`
   - module construction, graph build, training/generation entrypoints.
-- `veomni/data/data_collator.py`
-  - `SeedOmniCollator` and ordered CPU preprocessor execution.
 - `veomni/data/seed_omni/seedomni_transform.py`
-  - current data transform that emits `conversation_list`.
+  - data transform that builds `conversation_list` and runs ordered CPU preprocessors (`OmniProcessor`).
+- `veomni/data/seed_omni/collator.py`
+  - `SeedOmniCollator` (pure list-grouping collator).
 
 ## Live Examples
 
-- `veomni/models/seed_omni/modules/janus/`
-  - Best complete multi-module example.
-- `configs/seed_omni/Janus/janus_1.3b/`
-  - Best complete training and inference config example.
-- `veomni/models/seed_omni/modules/qwen3*/`
-  - Useful for text-only, MoE, and vision-language variants.
+- `veomni/models/seed_omni/modules/fake_model/` and `configs/seed_omni/fake_model/`
+  - In-tree minimal multi-module stand-in.
+- `veomni/models/seed_omni/modules/<family>/` and `configs/seed_omni/<Family>/<variant>/`
+  - Complete multi-module family implementations (e.g. Janus, Qwen3, Qwen3-VL, BAGEL).
 
 ## Docs
 
@@ -51,9 +49,7 @@ Use this reference to decide which files to trust before editing SeedOmni.
   - Video / audio reading and saving, plus the decided-but-unimplemented
     audio-bearing video design. Read when touching media or adding audio.
 - `docs/seed_omni/usage/`
-  - `data_format.md`, `training_and_inference.md`, `adding_a_model.md`.
-- `docs/seed_omni/models/*.md`
-  - Per-model recipes (Janus, Qwen3, Qwen3 MoE, Qwen3-VL, BAGEL).
+  - `data_format.md`, `training_and_inference.md`, `adding_a_model.md`, `hf_layout.md`.
 
 ## Skill Resources
 

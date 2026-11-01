@@ -1,132 +1,103 @@
-# Module Contract
+# Module Contract, Stubs, and Workflow
 
-Read this before editing `veomni/models/seed_omni/modules/**`.
+Read this before adding or modifying `veomni/models/seed_omni/modules/**`. See
+also `docs/seed_omni/usage/adding_a_model.md` and
+`docs/seed_omni/design/architecture.md`.
 
-## Shape
-
-A SeedOmni module is usually:
-
-- A `configuration.py` with a unique `model_type` (family `PretrainedConfig`;
-  the omni composite stores each slot as an `OmniModuleConfig` descriptor in
-  `OmniConfig.modules`).
-- A `modeling.py` — pure HuggingFace-native, loadable with plain
-  `from_pretrained` / `AutoModel`, no VeOmni import required:
-  - the concrete model class: weights + `forward` / `encode` / …
-  - if inference-capable, an in-file `InferenceMixin` — the omni analog of
-    HF's `GenerationMixin` — holding `generate()` and FSM inference state
-    (`reset_local_inference_state`, `reset_global_inference_state`,
-    `finalize`, sampling helpers). The model class lists it **first**:
-    `class Xxx(InferenceMixin, PretrainedOmniModule)` (`PretrainedOmniModule`
-    ships no-op defaults for those three methods; MRO resolves left-to-right,
-    so `InferenceMixin` must come first or those no-ops shadow it).
-- An `accelerated/accelerated.py` with composable training-graph mixins:
-  - `TrainingMixin(TrainingModuleMixin)` — `@pre_forward` / `@post_forward` hooks.
-  - optional `MeterMixin(MetricMeterMixin)`.
-  - `VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin)` — family assembly +
-    assets / preprocessor class. **No `InferenceMixin` here** — `generate()` /
-    `reset_*` / `finalize` already reach the accelerated class unshadowed via
-    normal inheritance from the native `modeling.py` class.
-  - `XxxAccelerated(VeOmniMixin, Xxx)` — `VeOmniMixin` first, then the native
-    `modeling.py` class.
-- Optional `processing.py` for module-owned processors.
-- Optional `chat_template.py` for text encoders.
-
-Use short filenames inside the module folder:
+## 1. Module Folder Shape
 
 ```text
 modules/<family>/<submodule>/
-├── configuration.py
-├── modeling.py
+├── configuration.py     # PretrainedConfig with unique model_type
+├── modeling.py          # pure HF-native class + optional in-file InferenceMixin
 ├── accelerated/
 │   ├── __init__.py      # re-exports the accelerated class for the registry
-│   ├── accelerated.py
-│   └── packed.py        # only if the family has a packed graph
-└── processing.py
+│   ├── accelerated.py   # TrainingMixin / MeterMixin / VeOmniMixin + XxxAccelerated
+│   └── packed.py        # optional packed-graph hooks
+└── processing.py        # optional ModulePreprocessorBase / processor wrapper
 ```
 
-## Required Runtime Rules
+- **`modeling.py`**: pure HuggingFace-native, loadable with `from_pretrained` /
+  `AutoModel`. If inference-capable, list `InferenceMixin` **before**
+  `PretrainedOmniModule`: `class Xxx(InferenceMixin, PretrainedOmniModule)` so
+  its `generate()` / `reset_*` / `finalize` methods take precedence over
+  `PretrainedOmniModule`'s no-op defaults.
+- **`accelerated/accelerated.py`**: defines `TrainingMixin(TrainingModuleMixin)`,
+  optional `MeterMixin(MetricMeterMixin)`, `VeOmniMixin(BaseMixin,
+  TrainingMixin, MeterMixin)`, and `class XxxAccelerated(VeOmniMixin, Xxx)`.
+- **Registration** (`veomni/models/seed_omni/modules/__init__.py` at import
+  time, keyed by `config.model_type`): `OMNI_CONFIG_REGISTRY`,
+  `OMNI_MODEL_REGISTRY`, `OMNI_ACCELERATED_MODEL_REGISTRY`, and optional
+  `OMNI_PROCESSOR_REGISTRY`.
 
-- Methods return `dict[str, Any]`.
-- Training graph call-sites must implement `forward` or the referenced method.
-- Use `@pre_forward("<method>")` and `@post_forward("<method>")` when one module
+## 2. Runtime Rules
+
+- Graph endpoints and hooks return `dict[str, Any]`.
+- Use `@pre_forward("<method>")` and `@post_forward("<method>")` when a module
   has multiple graph call-sites.
-- Loss keys end in `_loss` and are scalar tensors after the correct reduction.
-- Module outputs should flow by mutating/returning `conversation_list` unless
-  the current source file explicitly uses another supported carrier (Janus
-  packed training writes `packed_*` tensors on the batch dict).
-- Tokenizers and processors are module-owned assets.
-- Do not add a top-level tokenizer path.
+- Return loss under the exact key `"_loss"` (`OmniModel.forward()` pops
+  `LOSS_KEY = "_loss"`), reduced to a scalar tensor over the module's
+  micro-batch (decode losses reduce over `ps.fsdp_group`; see constraint 2 in
+  `.agents/knowledge/veomni-seed-omni.md`).
+- Mutate `ConversationItem` fields in place and return
+  `{"conversation_list": conversation}`.
+- Keep tokenizers and processors inside the owning module's subfolder via
+  `get_assets()` / `attach_module_assets`.
+- In training, every active node runs on every micro-batch: use per-sample
+  CPU-preprocessor dummies (with `_OMNI_TOKEN_LEN` set in `item.meta` so
+  `dyn_bsz` counts physical and effective tokens accurately) or `dummy_inputs()`
+  + a `0.0` anchor when a modality is absent.
+- For shared stateless carrier helpers called by both `modeling.py` and
+  `accelerated/accelerated.py`, define plain module-level functions in
+  `modeling.py`.
 
-## IDE type stubs (`accelerated/accelerated.py`)
+## 3. IDE Type Stubs on `TrainingMixin`
 
-`TrainingMixin` hooks call modeling APIs through `self`, but implementation
-stays in `modeling.py`. `TrainingMixin` declares **only the names its hooks
-use**:
+Because `VeOmniMixin` precedes `Xxx` in `XxxAccelerated(VeOmniMixin, Xxx)`'s
+MRO, an unguarded `def foo(...): ...` on `TrainingMixin` shadows `Xxx.foo` at
+runtime. Declare class-level attribute annotations (`config`, `device`, `dtype`,
+modeling attributes) directly on `TrainingMixin`, and guard any typing-only
+method or property stubs with `if TYPE_CHECKING:`:
 
-- class attributes: `config`, `device`, `dtype`, modeling-owned fields;
-- method bodies: `...` plus docstring:
+```python
+from typing import TYPE_CHECKING
 
-  ```text
-  IDE stub — implemented on :class:`Xxx` in ``modeling.py``.
-  ```
 
-`generate()` and its FSM helpers live entirely on the native class's
-`InferenceMixin` — `accelerated/accelerated.py` needs no IDE stub for `generate` itself
-unless a training hook calls a `generate`-only helper.
+class TrainingMixin(TrainingModuleMixin):
+    config: XxxConfig
+    device: torch.device
+    dtype: torch.dtype
 
-Full style guide: `references/modulemixin-ide-stubs.md`. Reference implementation:
-`modules/bagel/flow_connector/accelerated/accelerated.py` (IDE stubs + module-level helpers).
+    if TYPE_CHECKING:
 
-## Optional Per-Module Metric Meter
+        def encode_helper(self, x: torch.Tensor) -> torch.Tensor:
+            """IDE stub — implemented on :class:`Xxx` in ``modeling.py``."""
+            ...
+```
 
-A module opts into token / theoretical-FLOPs metering by mixing in
-`MetricMeterMixin` on `VeOmniMixin` (or a dedicated `MeterMixin` class). Then:
+## 4. Optional Per-Module Metric Meter
 
-- **Report tokens** by calling `self.metric_meter_set_seqlens("<method>", seqlens)`
-  **inside `pre_forward`, BEFORE any SP gather/slice**. This is the single uniform
-  entry point — even AR backbones use it (built from their `cu_seqlens`), not a
-  custom reader. The executor's `metric_meter_add(method)` drains this stash
-  right after `pre_forward`; do **not** read the (SP-sliced) forward `data`.
-- **Implement `estimate_flops(seqlens)`** with the module's own FLOPs formula
-  (count only what this module computes — e.g. an AR backbone excludes `wte`/`lm_head`).
+Mix in `MetricMeterMixin` on `VeOmniMixin` (or `MeterMixin`):
 
-Critical SP rule: stash the **full (pre-slice)** per-sample seqlens, not the
-`1/sp` chunk the `pre_forward` SP branch slices to (stash BEFORE that
-`if sp_size > 1:` slice). `OmniEnvironMeter` sums tokens
-+ FLOPs over the `dp_group` (which excludes the replicated SP ranks), so the
-full-sample value counted once per DP shard reconstructs the global total; reading
-the sliced forward `data` would under-count by ~`sp`. See constraint 7e. A
-call-site that shouldn't be counted (e.g. a VQ codec's `decode`) simply stashes
-nothing → `[]`.
+- Call `self.metric_meter_set_seqlens("<method>", seqlens)` inside `pre_forward`
+  **before** the `if sp_size > 1:` slice, passing the full pre-slice per-sample
+  lengths (`OmniEnvironMeter` sums over `dp_group`, excluding SP; see constraint
+  3 in `.agents/knowledge/veomni-seed-omni.md`).
+- Implement `estimate_flops(seqlens)` counting only this module's compute.
 
-## Common Module Shapes
+## 5. Live Reference Map and Workflow
 
-| Shape | Current example |
+| Need | Path |
 |---|---|
-| Vision encoder | `modules/janus/siglip/` |
-| VQ codec with encode/decode | `modules/janus/vqvae/` |
-| Text encoder and tokenizer owner | `modules/janus/text_encoder/`, `modules/base/text_encoder/` |
-| AR backbone without vocab ownership | `modules/janus/llama/` |
-| Text-only LLM module | `modules/qwen3/llm/` |
-| Vision-language LLM module | `modules/qwen3vl/llm/` |
+| In-tree minimal module A/B (native + accelerated) | `veomni/models/seed_omni/modules/fake_model/fake_module_a/`, `veomni/models/seed_omni/modules/fake_model/fake_module_b/` |
+| In-tree minimal configs (train / eager & FSDP infer / graphs) | `configs/seed_omni/fake_model/train/`, `configs/seed_omni/fake_model/infer/` |
+| Family modules (vision, text_encoder, AR backbone, VQ/VAE) | `veomni/models/seed_omni/modules/<family>/<submodule>/` |
+| Family configs (train, packed, infer) | `configs/seed_omni/<Family>/<variant>/` |
 
-## Dummy And Missing Input Semantics
-
-- Training: active nodes must run. Use CPU-preprocessor dummies or module
-  dummy paths so FSDP/DDP collective order remains aligned.
-- Inference: missing optional input may return the unchanged carrier or `{}` if
-  graph routing supports it for that call-site.
-- Backbones that consume dummy upstream outputs must preserve a gradient path
-  when training requires it.
-
-## Registration
-
-Check current registry names before editing. Depending on branch layout, module
-registration may be centralized in `veomni/models/seed_omni/modules/__init__.py`
-and re-exported from `veomni/models/seed_omni/__init__.py`.
-
-Rules:
-
-- `config.model_type` must match the registry key.
-- Registration must happen at import time.
-- New family folders should re-export public classes from their `__init__.py`.
+Workflow:
+1. Pick the closest live module and decide asset ownership, item tags (`type` /
+   `role` / `meta`), dummy injection, and graph endpoints.
+2. Implement `configuration.py`, `modeling.py`, `accelerated/accelerated.py`,
+   and optional `processing.py`, then register in `modules/__init__.py`.
+3. Wire `modules_train.yaml`, `graph_train.yaml`, and `infer/` YAML configs.
+4. Validate with `pytest tests/seed_omni/ -q` and `make quality`.

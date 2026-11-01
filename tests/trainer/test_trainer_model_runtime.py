@@ -16,10 +16,16 @@
 
 from types import SimpleNamespace
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.arguments import ModelArguments
 from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.trainer.base import BaseTrainer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _train_args(load_path=None):

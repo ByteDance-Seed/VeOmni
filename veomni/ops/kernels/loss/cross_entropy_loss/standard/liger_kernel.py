@@ -126,7 +126,7 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, Non
                 saved.tensors,
                 _eager._Meta(True, meta.hidden_needs_grad, meta.weight_needs_grad),
             ),
-        )
+        )[:3]
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_backward
 

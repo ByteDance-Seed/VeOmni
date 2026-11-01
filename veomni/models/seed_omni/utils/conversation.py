@@ -73,6 +73,11 @@ ItemValue = Union[str, torch.Tensor, Image.Image]
 # ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key.
 _IMG_TAG_KEY = "_img_tag"
 
+# Per-item sequence-token length written on ``meta`` by CPU preprocessors so
+# ``dyn_bsz`` (``get_length_fn`` / ``get_length_by_labels_fn``)
+# can measure each sample's backbone token length before collation.
+_OMNI_TOKEN_LEN = "_omni_token_len"
+
 
 @dataclass
 class ConversationItem:
@@ -292,4 +297,5 @@ __all__ = [
     "iter_desired_items",
     "collect_desired_values",
     "_IMG_TAG_KEY",
+    "_OMNI_TOKEN_LEN",
 ]

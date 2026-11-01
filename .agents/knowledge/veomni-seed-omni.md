@@ -92,7 +92,7 @@ tasks/omni/infer_omni.py             -> OmniInferencer
 | `build_model_assets` | binds the preprocessor onto the model (`bind_module_assets`) so graph nodes and HF export can access it |
 | `freeze_model` | prefixes the parameter table and VRAM log with the module's name |
 | `build_parallelized_model` | supports custom `customized_build_parallelize_model` hooks; deferred to `OmniModelRuntime` when `fsdp_scope='model'` |
-| `build_optimizer` / `build_lr_scheduler` | scoped to the module's mesh and skipped when the module is frozen; passes the optimizer to `module.configure_optimizer(optimizer)` if defined |
+| `build_optimizer` / `build_lr_scheduler` | scoped to the module's mesh and skipped when the module is frozen |
 | `build_checkpoint` | creates a per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/` when trainable |
 | `clip_grad_norm` | computes this module's norm (`veomni_omni_module_clip_grad_norm`) for `OmniModelRuntime` to combine |
 | `skip_hf_weight_load` | keeps HF weight loading enabled on resume when the module is frozen and has persistent state |
@@ -147,9 +147,9 @@ build_omni_model_runtime_args()         OmniTrainer._setup()
 
 ## 3. Hard Constraints (SeedOmni)
 
-1. **SeedOmni SP + CP shares one `dp_size` (and therefore one `sp_size = cp_size * ulysses_size`), replicated data, single-pass per module**
-   - Each module may independently configure Ulysses SP (`ulysses_size`), Context Parallelism (`cp_size`), or hybrid `cp * sp` (`cp_size * ulysses_size`), **provided every distributed module and `model.accelerator` resolve to the same `dp_size`** (`_validate_omni_dp_size` in `build_omni_model_runtime_args`).
-   - Because `ParallelState` always orders its device mesh `[pp, dp_replicate, dp_shard, cp, ulysses, tp]`, any two modules with the same `dp_size` (and thus the same `sp_size = cp_size * ulysses_size = world_size // dp_size`) have the exact same `dp_rank`, `dp_group`, `sp_group`, and `fsdp_group` (`dp_sp`).
+1. **SeedOmni SP + CP shares one `dp_size` (and therefore one `sp_size = cp_size * ulysses_size` with `pp_size = tp_size = 1`), replicated data, single-pass per module**
+   - Each module may independently configure Ulysses SP (`ulysses_size = S, cp_size = 1`) or Context Parallelism (`cp_size = S, ulysses_size = 1`), **provided `pp_size = tp_size = 1` and every distributed module and `model.accelerator` resolve to the same `dp_size = world_size // (cp_size * ulysses_size)`** (`_validate_omni_dp_size` in `build_omni_model_runtime_args`; combining `cp_size > 1` and `ulysses_size > 1` on a single module is rejected by `AcceleratorConfig` / `ParallelState`).
+   - Because `ParallelState` always orders its device mesh `[pp, dp_replicate, dp_shard, cp, ulysses, tp]`, any two modules with the same `dp_size` (and thus the same `sp_size = cp_size * ulysses_size = world_size // dp_size` when `pp_size = tp_size = 1`) have the same `dp_rank`, `dp_group`, `sp_group`, and `fsdp_group` (`dp_sp`).
    - The dataloader is the standard build-time sharded loader: it yields `dp_size = world / sp_size` **distinct** shards and **replicates** each shard across its `sp_group`, so every rank of an `sp_group` holds the same sample with identical tensor shapes and dtypes.
    - A module with `sp_size = S > 1` pads and slices the replicated sample to its `1/S` shard inside `pre_forward` (`sp_pad` + `slice_input_tensor` or `sp_pad_and_slice`, rebuilding varlen/`cu_seqlens` over the full padded sequence first), runs its endpoint once, and all-gathers the output back to the full sample in `post_forward` (`gather_outputs`, then `narrow` off the SP pad).
    - **Gradient correctness:** `_Gather.backward` all-reduces (SUM) the grad over the SP group and takes this rank's shard; FSDP2's `÷|dp_shard_sp|` grad averaging cancels the `×sp` factor, yielding gradients identical to the non-SP baseline.
@@ -175,3 +175,8 @@ build_omni_model_runtime_args()         OmniTrainer._setup()
 
 6. **Frozen-module DCP resume (`ModuleRuntime.skip_hf_weight_load`)**
    - SeedOmni decides `skip_hf_weight_load` per `ModuleRuntime` after `_freeze_model_module` and `_setup_lora`. A fully frozen module with a non-empty `state_dict()` has no checkpoint manager from `build_checkpoint`, so `ModuleRuntime.skip_hf_weight_load` vetoes the skip (`False`) and loads its released HF weights during resume. A parameterless module with an empty `state_dict()` may skip HF loading.
+
+7. **Dataset-stage `OmniProcessor`, `_OMNI_TOKEN_LEN`, and per-sample dummy injection for `dyn_bsz`**
+   - `OmniTrainer._build_data_transform` builds `OmniProcessor.from_config(...)`, calls `bind_dummy_inputs`, and passes `processor` into `seedomni_transform` (`process_seedomni_example` and `process_seedomni_cached_example`). Every sample is preprocessed at the Dataset stage before dynamic batching; `SeedOmniCollator` is a pure list-grouping collator (`{key: [f[key] for f in features]}`).
+   - Every module's CPU preprocessor (`ModulePreprocessorBase` / `TextEncoderChatTemplate`) must set `item.meta[_OMNI_TOKEN_LEN]` (from `veomni.models.seed_omni.utils.conversation`) on every item it processes—both real items and `is_dummy=True` placeholders—and inject missing-modality `is_dummy=True` placeholders **per sample** when `not inference`.
+   - `get_length_fn` (`count_mode="total"` and `physical_token_cap`) sums `_omni_token_len` across all items in `sample["conversation_list"]` **including** `is_dummy=True` items; `get_length_by_labels_fn` (`count_mode="effective"`) excludes `is_dummy=True` items and sums supervised tokens (`(labels != IGNORE_INDEX).sum()` for text, `_omni_token_len` for `role == "assistant"` media, `0` for `role == "user"` media).

@@ -16,7 +16,8 @@ import pytest
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from scripts.ci.accelerator.launch_plan import runner_device_count
+from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 
 if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
@@ -102,7 +103,7 @@ class LTX2UlyssesTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         apply_veomni_ltx_transformer_patch()
         group = self._get_process_group()

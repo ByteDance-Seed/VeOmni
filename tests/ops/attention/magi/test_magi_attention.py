@@ -59,24 +59,13 @@ def _magi_ffa_available() -> bool:
     if not IS_CUDA_AVAILABLE or importlib.util.find_spec("magi_attention") is None:
         return False
     device = torch.device(get_device_type())
-    kernel_mode = magi_kernel.get_kernel_mode(device)
-    if kernel_mode == magi_kernel.KERNEL_CUTE_JIT:
-        return importlib.util.find_spec("flash_attn_cute") is not None
-    if kernel_mode != magi_kernel.KERNEL_CUTLASS:
-        return False
-    try:
-        from flash_attn_cute.ffa_fa3 import flash_attn_interface
-    except (ImportError, OSError, RuntimeError):
-        return False
-    return all(
-        callable(getattr(flash_attn_interface, name, None)) for name in ("_flash_attn_forward", "_flash_attn_backward")
+    return magi_kernel.get_kernel_mode(device) == magi_kernel.KERNEL_CUTE_JIT and (
+        importlib.util.find_spec("flash_attn_cute") is not None
     )
 
 
 _MAGI_FFA_AVAILABLE = _magi_ffa_available()
-_MAGI_FFA_REASON = (
-    "MagiAttention numerical tests require a supported NVIDIA GPU with its CUTLASS overlay or CUTE DSL/JIT backend"
-)
+_MAGI_FFA_REASON = "MagiAttention numerical tests require an NVIDIA SM100+ GPU with the CUTE DSL/JIT backend"
 
 
 @pytest.fixture(autouse=True)
@@ -356,14 +345,7 @@ def test_magi_attention_matches_math_sdpa(
 ):
     device = torch.device(get_device_type())
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
-    kernel_mode, build_flags = magi_kernel.prepare_kernel(device)
-    if (
-        dtype == torch.float16
-        and kernel_mode == magi_kernel.KERNEL_CUTLASS
-        and build_flags is not None
-        and build_flags.get("FLASHATTENTION_DISABLE_FP16", False)
-    ):
-        pytest.skip("The installed CUTLASS overlay does not include FP16 kernels.")
+    magi_kernel.prepare_kernel(device)
 
     generator = torch.Generator(device=device).manual_seed(9300)
     query, key, value = (

@@ -14,7 +14,6 @@
 
 """Unit tests for OmniTrainer step contexts and OmniModelRuntime forwarding (no GPU / distributed)."""
 
-import os
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -23,8 +22,12 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from tests.tools.launch_utils import find_free_port, run_bounded_process_group
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import run_bounded_process_group
 from veomni.distributed.offloading import build_activation_offloading_context, custom_save_on_cpu
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_build_activation_offloading_disabled():
@@ -88,19 +91,26 @@ def test_run_bounded_process_group_kills_sigterm_ignoring_torchrun_workers(tmp_p
         "time.sleep(300)\n",
         encoding="utf-8",
     )
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--nnodes=1",
-        "--nproc_per_node=1",
-        f"--master_port={find_free_port()}",
-        str(worker_script),
-    ]
+    # Emulate torchrun's exact process-group topology (launcher in its own session
+    # spawning a worker with start_new_session=True) using stdlib-only Python so
+    # slow torch / torch_npu import on Ascend cannot exceed the test timeout.
+    launcher_script = tmp_path / "fake_torchrun_launcher.py"
+    launcher_script.write_text(
+        "import subprocess, sys\n"
+        f"proc = subprocess.Popen([sys.executable, {str(worker_script)!r}], start_new_session=True)\n"
+        "proc.wait()\n",
+        encoding="utf-8",
+    )
+    cmd = [sys.executable, str(launcher_script)]
     with pytest.raises(subprocess.TimeoutExpired):
-        run_bounded_process_group(cmd, timeout=2.0, grace_timeout=0.5)
+        run_bounded_process_group(cmd, timeout=1.0, grace_timeout=0.5)
 
     assert pid_file.is_file(), "worker did not start before timeout"
     worker_pid = int(pid_file.read_text(encoding="utf-8").strip())
-    assert not psutil.pid_exists(worker_pid) or psutil.Process(worker_pid).status() == psutil.STATUS_ZOMBIE
-    assert not os.path.exists(f"/proc/{worker_pid}") or not psutil.pid_exists(worker_pid)
+    try:
+        worker_status = psutil.Process(worker_pid).status()
+    except psutil.NoSuchProcess:
+        worker_status = None
+    assert worker_status in (None, psutil.STATUS_ZOMBIE), (
+        f"worker {worker_pid} still alive with status={worker_status}"
+    )

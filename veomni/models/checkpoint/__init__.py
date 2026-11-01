@@ -28,6 +28,7 @@ from .convert import (
     prepare_fqn_to_index_mapping_for_model,
     resolve_fqn_to_index_mapping_for_save,
     shard_index_from_filename,
+    split_moe_params,
 )
 from .manager import ModelCheckpointManager
 from .moe_map import (
@@ -67,4 +68,5 @@ __all__ = [
     "save_model_assets",
     "save_model_weights",
     "shard_index_from_filename",
+    "split_moe_params",
 ]

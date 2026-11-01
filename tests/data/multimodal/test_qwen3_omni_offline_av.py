@@ -41,8 +41,12 @@ import PIL.Image
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.utils.constants import IGNORE_INDEX  # noqa: F401  (sanity import)
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ----------------------------------------------------------------------------

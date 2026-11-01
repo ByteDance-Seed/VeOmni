@@ -34,6 +34,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -51,6 +52,10 @@ config = PatchConfig(
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
+)
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
@@ -178,6 +183,12 @@ def deepseek_v3_attention_forward_patched(
 
     query_states = torch.cat((q_pass, q_rot), dim=-1)
     key_states, value_states = self.expand_kv(kv_nope, k_rot)
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=self.veomni_attn.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -186,7 +197,7 @@ def deepseek_v3_attention_forward_patched(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        **kwargs,
+        **attn_kwargs,
     )
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)

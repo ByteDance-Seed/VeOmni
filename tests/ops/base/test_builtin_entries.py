@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
 from veomni.ops.platform import (
     GpuKernelRequirement,
@@ -26,6 +29,9 @@ from veomni.ops.platform import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 _ANY = None
 _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
@@ -33,6 +39,8 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
+_GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
@@ -52,14 +60,14 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "flash_attention_3", "cuda", _GPU_NVIDIA_SM90, ("flash_attn_interface",)),
     ("attention", "standard", "flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
@@ -75,14 +83,14 @@ _BUILTIN_ENTRIES = (
     ),
     ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "veomni_flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "veomni_flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "veomni_magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_sage_attention", "cuda", _GPU_NVIDIA_SM80, ("sageattention",)),
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
@@ -137,10 +145,12 @@ _BUILTIN_ENTRIES = (
     ("mhc", "head", "cann", "npu", _NPU, ()),
     ("qsa_attention", "standard", "eager", "any", _ANY, ()),
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
+    ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
     ("moe_experts", "standard", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "standard", "deepgemm_fp8", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("moe_experts", "standard", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
@@ -207,13 +217,22 @@ def _requirement_metadata(requirement):
 
 
 def test_builtin_entry_catalog_is_exact():
-    """Built-in rows expose the intended device, platform, and package metadata."""
+    """Verify every built-in row and its hardware/dependency metadata alongside structural invariants."""
+    assert OP_REGISTRY._entries, "OP_REGISTRY must not be empty"
     actual = {
         (*key, _requirement_metadata(entry.requirement), entry.requires) for key, entry in OP_REGISTRY._entries.items()
     }
-    expected = set(_BUILTIN_ENTRIES)
+    for op, variant, impl, device, req_meta, _requires in actual:
+        if device == "any":
+            assert req_meta is None, f"{op}/{variant}/{impl} on device='any' must not set hardware requirement"
+        else:
+            expected_kind = "gpu" if device == "cuda" else device
+            assert req_meta is not None and req_meta[0] == expected_kind, (
+                f"{op}/{variant}/{impl} on device={device!r} has mismatched requirement {req_meta}"
+            )
 
-    assert len(expected) == len(_BUILTIN_ENTRIES)
+    expected = set(_BUILTIN_ENTRIES)
+    assert len(expected) == len(_BUILTIN_ENTRIES), "Duplicate expected built-in rows"
     assert actual == expected
 
 

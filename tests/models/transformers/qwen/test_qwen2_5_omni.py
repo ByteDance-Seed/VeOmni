@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniConfig as HFQwen2_5OmniConfig,
@@ -36,6 +37,7 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
     Qwen2_5OmniProcessor as HFQwen2_5OmniProcessor,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -43,6 +45,9 @@ from tests.models.compare import (
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
@@ -127,6 +132,90 @@ def test_qwen2_5_omni_eager_matches_hf_image_and_text():
         ours_fwd_kwargs=ours_masks,
         logits_equal=True,
     )
+
+
+def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(available_nvidia_ops, monkeypatch):
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniAudioAttention as HFQwen2_5OmniAudioAttention,
+    )
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniVisionAttention as HFQwen2_5OmniVisionAttention,
+    )
+
+    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+        Qwen2_5OmniAudioAttention,
+        Qwen2_5OmniVisionAttention,
+    )
+
+    torch.manual_seed(0)
+    thinker_config = _tiny_thinker_config()
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+
+    vision_cfg_hf = thinker_config.vision_config
+    vision_cfg_hf._attn_implementation = "sdpa"
+    hf_vision_attn = HFQwen2_5OmniVisionAttention(vision_cfg_hf).eval()
+
+    vision_cfg_ours = _tiny_thinker_config().vision_config
+    vision_cfg_ours._attn_implementation = "veomni_sdpa"
+    with ops_config_scope(eager_ops_config()):
+        ours_vision_attn = Qwen2_5OmniVisionAttention(vision_cfg_ours).eval()
+    ours_vision_attn.load_state_dict(hf_vision_attn.state_dict())
+
+    vision_hidden = torch.randn(7, vision_cfg_hf.hidden_size)
+    head_dim = vision_cfg_hf.hidden_size // vision_cfg_hf.num_heads
+    pos_emb = torch.randn(7, head_dim // 2)
+    torch.testing.assert_close(
+        ours_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        hf_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        rtol=0,
+        atol=0,
+    )
+
+    audio_cfg_hf = thinker_config.audio_config
+    audio_cfg_hf._attn_implementation = "sdpa"
+    hf_audio_attn = HFQwen2_5OmniAudioAttention(audio_cfg_hf).eval()
+
+    audio_cfg_ours = _tiny_thinker_config().audio_config
+    audio_cfg_ours._attn_implementation = "veomni_sdpa"
+    with ops_config_scope(eager_ops_config()):
+        ours_audio_attn = Qwen2_5OmniAudioAttention(audio_cfg_ours).eval()
+    ours_audio_attn.load_state_dict(hf_audio_attn.state_dict())
+
+    audio_hidden = torch.randn(7, audio_cfg_hf.d_model)
+    torch.testing.assert_close(
+        ours_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        hf_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        rtol=0,
+        atol=0,
+    )
+
+    # Also verify ``veomni_sage_attention`` preserves segment isolation.
+    # Stub the underlying ``sageattn`` kernel so this model-level test exercises the
+    # wrapper's ``cu_seqlens`` splitting on CPU.
+    from veomni.ops.kernels.attention.standard import sage as sage_backend
+
+    def fake_sage(query, key, value, tensor_layout="HND", is_causal=False, sm_scale=None):
+        scale = (query.shape[-1] ** -0.5) if sm_scale is None else sm_scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        return torch.matmul(weights, value)
+
+    monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
+    cfg = _tiny_thinker_config().audio_config
+    cfg._attn_implementation = "veomni_sage_attention"
+    with ops_config_scope(eager_ops_config()):
+        attn = Qwen2_5OmniAudioAttention(cfg).eval()
+    attn.load_state_dict(hf_audio_attn.state_dict())
+    h1 = torch.randn(4, cfg.d_model)
+    h2 = h1.clone()
+    h2[2:] += 10.0
+    with torch.no_grad():
+        # Single-segment ([0, 4]) and multi-segment ([0, 2, 4]) both succeed and isolate segments.
+        single_out = attn(h1, cu_seqlens=torch.tensor([0, 4], dtype=torch.int32))
+        assert single_out.shape == (4, cfg.d_model)
+        out1 = attn(h1, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
+        out2 = attn(h2, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
+        torch.testing.assert_close(out1[:2], out2[:2], rtol=1e-5, atol=1e-5)
 
 
 class _StubTokenizer:

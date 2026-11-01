@@ -48,6 +48,12 @@ from veomni.ops import VeomniOp
 @pytest.mark.parametrize("impl", ["torch_npu", "npu"])
 @pytest.mark.parametrize("family", ["flux", "ltx2_3", "deepseek_v4"])
 def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
+    if family == "ltx2_3":
+        # Package imports construct standard-op defaults before the instance
+        # below exercises its unweighted compatibility alias.
+        with ops_config_scope(eager_ops_config()):
+            from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
+
     cfg = eager_ops_config()
     cfg.rms_norm_implementation = impl
     with ops_config_scope(cfg):
@@ -56,8 +62,6 @@ def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
 
             handle = RMSNorm(8, eps=1e-6, elementwise_affine=False).veomni_rms_norm
         elif family == "ltx2_3":
-            from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
-
             handle = PytorchAdaZeroFunction().veomni_rms_norm
         else:
             from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (

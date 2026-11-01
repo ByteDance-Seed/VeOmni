@@ -88,11 +88,16 @@ the *block*, so callers passing `rotary_pos_emb=` still work (with a
 `FutureWarning`) until v5.20; the *attention* override had to be ported or it
 received `position_embeddings=None`.
 
-Note for VeOmni's SP path: `get_max_seqlen` gates on HF's
-`is_flash_attention_requested`, which does not recognise the custom
-`veomni_flash_attention_*` names, so it returns `None` for them. The ported
-overrides use the caller-supplied value when present and otherwise reduce
-`cu_seqlens` locally.
+Note for VeOmni's SP and attention-op path: vision and audio attention overrides
+do not call `get_max_seqlen` or branch on `is_flash_attention_requested` to
+split segments manually (only `Qwen4ExpVisionAttention.forward` still checks
+`is_flash_attention_requested` to guard its FlashAttention-only vision SP path).
+They use the caller-supplied `max_seqlen` when present (otherwise reducing
+`cu_seqlens` locally) and pass `cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`,
+and `max_length_k` directly to `self.veomni_attn`. Non-FlashAttention backends
+(`sdpa`, `veomni_sdpa`, non-causal `eager`, `veomni_sage_attention`) split
+unmasked batch-size-1 multi-segment `cu_seqlens` inside the attention op
+wrapper, after any Ulysses all-to-all for the `veomni_*` rows.
 
 ### `get_{image,video}_features` split `pooler_output` per item
 

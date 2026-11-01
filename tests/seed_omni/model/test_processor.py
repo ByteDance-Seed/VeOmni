@@ -1,15 +1,20 @@
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 from PIL import Image
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules.module_processing_base import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _RecordingPreprocessor:
@@ -105,7 +110,7 @@ def test_omni_processor_preprocess_mutates_existing_conversation():
     processor = OmniProcessor({"a": _RecordingPreprocessor("only", calls)})
     conversation = [ConversationItem(type="text", value="hi", role="user")]
 
-    out = processor.preprocess(conversation, inference=True)
+    out = processor.preprocess(conversation)
 
     assert calls == ["only"]
     assert out["conversation_list"] is conversation

@@ -113,10 +113,8 @@ def _all_to_all_single(
             .contiguous()
         )
 
-    # ``empty_like`` preserves strides. Ulysses backward can hand this helper a
-    # transposed view, which would otherwise create a non-contiguous NCCL output
-    # buffer and make ``all_to_all_single`` fail. Normalize the layout before
-    # allocating both communication buffers.
+    # Materialize the input before allocating with empty_like: otherwise the output
+    # can inherit a non-contiguous stride that NCCL all_to_all_single rejects.
     x = x.contiguous()
     output = torch.empty_like(x)
     comm = dist.all_to_all_single(output, x, group=group, async_op=async_op)
