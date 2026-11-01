@@ -24,6 +24,98 @@ def _model_and_optimizer(*, split=True):
     return model, MultiOptimizer(model, {"merged": merged}, ["merged"])
 
 
+def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    import veomni.checkpoint.dcp_checkpointer as checkpoint_module
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        torch.manual_seed(27)
+        source, optimizer = _model_and_optimizer()
+        for param in source.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        optimizer.zero_grad()
+        parallel = SimpleNamespace(dp_mode="ddp")
+        DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        target, restored = _model_and_optimizer()
+        original_model = checkpoint_module._ProvenModelState
+        original_optimizer = checkpoint_module._ProvenMultiOptimizerState
+        original_reader = DistributedCheckpointer._create_storage_reader
+        original_needs_marker = checkpoint_module._needs_extra_parallel_layout_marker
+        injected = False
+
+        def model_state(*args, **kwargs):
+            nonlocal injected
+            if rank == 1 and failure == "model_state":
+                injected = True
+                raise OSError("injected model state failure")
+            return original_model(*args, **kwargs)
+
+        def optimizer_state(*args, **kwargs):
+            nonlocal injected
+            if rank == 1 and failure == "optimizer_state":
+                injected = True
+                raise OSError("injected optimizer state failure")
+            return original_optimizer(*args, **kwargs)
+
+        def reader(path):
+            import inspect
+
+            nonlocal injected
+            callers = {frame.function for frame in inspect.stack()}
+            direct = not callers.intersection(
+                {"_preflight_multi_optimizer_layout", "_prepare_multi_optimizer_saved_states"}
+            )
+            kind = "optimizer_reader" if str(path).endswith("optimizer") else "model_reader"
+            if rank == 1 and direct and failure == kind:
+                injected = True
+                raise OSError(f"injected {kind} failure")
+            return original_reader(path)
+
+        def needs_marker(specs):
+            nonlocal injected
+            if failure == "layout_policy":
+                import inspect
+
+                callers = {frame.function for frame in inspect.stack() if frame.filename == checkpoint_module.__file__}
+                if "_reject_unproven_extra_parallel_optimizer" in callers:
+                    return False
+                if rank == 1:
+                    injected = True
+                return rank == 1
+            return original_needs_marker(specs)
+
+        with (
+            patch.object(checkpoint_module, "_ProvenModelState", side_effect=model_state),
+            patch.object(checkpoint_module, "_ProvenMultiOptimizerState", side_effect=optimizer_state),
+            patch.object(checkpoint_module, "_needs_extra_parallel_layout_marker", side_effect=needs_marker),
+            patch.object(DistributedCheckpointer, "_create_storage_reader", side_effect=reader),
+            pytest.raises((OSError, RuntimeError), match="injected|failed on another rank|marker policy differs"),
+        ):
+            DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+        if rank == 1:
+            assert injected, f"the {failure} fault did not reach its intended load stage"
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "failure", ["model_reader", "optimizer_reader", "model_state", "optimizer_state", "layout_policy"]
+)
+def test_proven_load_preflight_failure_stops_all_ranks(tmp_path, failure):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_load_preflight_failure_worker, args=(str(tmp_path), failure), nprocs=2)
+
+
 def test_multi_optimizer_async_checkpoint_rejected_before_writes(tmp_path):
     model, optimizer = _model_and_optimizer()
     with pytest.raises(RuntimeError, match="require synchronous DCP save"):
