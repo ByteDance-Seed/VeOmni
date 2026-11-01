@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.checkpoint.rank_local_optimizer import (
     local_optimizer_state,
@@ -22,6 +23,9 @@ from veomni.checkpoint.rank_local_optimizer import (
 from veomni.distributed.parallel_plan import SpecInfo
 from veomni.optim.muon import DistributedMuon
 from veomni.optim.optimizer import MultiOptimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _roundtrip_worker(rank, root, inactive_owner):
@@ -66,6 +70,7 @@ def _roundtrip_worker(rank, root, inactive_owner):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 @pytest.mark.parametrize("inactive_owner", [False, True])
 def test_rank_local_state_keeps_owner_steps_and_absence(tmp_path, inactive_owner):
     mp.spawn(_roundtrip_worker, args=(str(tmp_path), inactive_owner), nprocs=4, join=True)
@@ -123,6 +128,7 @@ def _optimizer_resume_worker(rank, root, inactive_owner):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 @pytest.mark.parametrize("inactive_owner", [False, True])
 def test_high_level_rank_owned_optimizer_cold_resume(tmp_path, inactive_owner):
     mp.spawn(_optimizer_resume_worker, args=(str(tmp_path), inactive_owner), nprocs=4, join=True)
@@ -219,6 +225,7 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 @pytest.mark.parametrize("inactive_owner", [False, True])
 @pytest.mark.parametrize("kind", ["adam", "muon"])
 @pytest.mark.parametrize("canonical", [False, True])
@@ -237,6 +244,7 @@ def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kin
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 def test_canonical_same_axis_muon_fresh_process_resume(tmp_path):
     mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "save", "muon", True, True), nprocs=4, join=True)
     mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "load", "muon", True, True), nprocs=4, join=True)
@@ -257,6 +265,7 @@ def _replica_check_worker(rank, root):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_divergent_replicas_rejected_before_checkpoint_deduplication(tmp_path):
     mp.spawn(_replica_check_worker, args=(str(tmp_path),), nprocs=2, join=True)
 
@@ -286,6 +295,7 @@ def _global_tensor_metadata_mismatch_worker(rank, root, mismatch):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("mismatch", ["dtype", "shape"])
 def test_checkpoint_global_tensor_metadata_mismatch_fails_all_ranks(tmp_path, mismatch):
     mp.spawn(_global_tensor_metadata_mismatch_worker, args=(str(tmp_path), mismatch), nprocs=2, join=True)
@@ -317,6 +327,7 @@ def _overlapping_tensor_shards_worker(rank, root, same_offset):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("same_offset", [False, True])
 def test_checkpoint_overlapping_shard_geometries_fail_all_ranks(tmp_path, same_offset):
     mp.spawn(_overlapping_tensor_shards_worker, args=(str(tmp_path), same_offset), nprocs=2, join=True)
@@ -362,6 +373,7 @@ def _owner_trainability_worker(rank, root, within_owner_mismatch):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 @pytest.mark.parametrize("within_owner_mismatch", [False, True])
 def test_trainability_may_differ_between_owners_but_not_replicas(tmp_path, within_owner_mismatch):
     mp.spawn(_owner_trainability_worker, args=(str(tmp_path), within_owner_mismatch), nprocs=4, join=True)
@@ -423,6 +435,7 @@ def _frozen_resume_worker(rank, root, phase):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 def test_frozen_owned_parameter_rebuilt_on_fresh_process(tmp_path):
     mp.spawn(_frozen_resume_worker, args=(str(tmp_path), "save"), nprocs=4, join=True)
     mp.spawn(_frozen_resume_worker, args=(str(tmp_path), "load"), nprocs=4, join=True)
@@ -482,5 +495,6 @@ def _missing_rank_payload_worker(rank, root):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_one_rank_missing_optimizer_payload_fails_all_before_model_copy(tmp_path):
     mp.spawn(_missing_rank_payload_worker, args=(str(tmp_path),), nprocs=2, join=True)

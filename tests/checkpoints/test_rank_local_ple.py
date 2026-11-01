@@ -4,15 +4,20 @@
 from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.distributed.parallel_plan import SpecInfo
 from veomni.optim.optimizer import MultiOptimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _worker(rank, root, phase):
@@ -67,6 +72,7 @@ def _worker(rank, root, phase):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 def test_persistent_ple_owner_local_optimizer_fresh_process(tmp_path):
     mp.spawn(_worker, args=(str(tmp_path), "save"), nprocs=4, join=True)
     mp.spawn(_worker, args=(str(tmp_path), "load"), nprocs=4, join=True)
