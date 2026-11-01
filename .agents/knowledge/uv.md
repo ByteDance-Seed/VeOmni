@@ -31,15 +31,15 @@ grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
 ├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
-│   ├── gpu          NVIDIA x86_64 / aarch64 (glibc 2.34+) — full superset:
+│   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
-│   │                  + FA3 / FlashMLA wheels on both architectures
+│   │                  + FA3 / FlashMLA / DeepGEMM wheels on both architectures
 │   │                  + FA4 / FlashQLA (pure-Python PyPI wheels)
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
-│   ├── magi         Optional NVIDIA SM90+ MagiAttention FFA (combine with gpu):
+│   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
@@ -60,7 +60,7 @@ pyproject.toml
 │   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion;
 │   │                        magi also conflicts with npu / npu_aarch64
 │   └── sources              Custom indexes, direct wheel URLs (av, torch,
-│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA);
+│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA, DeepGEMM);
 │                            git sources (MagiAttention and its three companions)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
@@ -73,18 +73,19 @@ conflicts with the NPU extras.
 
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
-uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
 
 A fresh `--extra gpu` installs architecture-specific torch, torchcodec, AV,
-FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
+FA3, FlashMLA, and DeepGEMM wheels. FA2 is installed from prebuilt wheels on x86_64 and
 omitted on aarch64. FA4 and FlashQLA are pure-Python PyPI wheels.
-The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
+The aarch64 FA3 wheel requires glibc 2.34 or newer. DeepGEMM has stricter
+host requirements listed below. uv caches built wheels
 under `~/.cache/uv`. MagiAttention is not part of that default GPU set:
-`--extra magi` also pulls `gpu` and source-builds SM90/SM100 CUDA extensions.
-Omit it on Ampere/Ada (SM80/SM89) and CPU environments.
+`--extra magi` also pulls `gpu` and source-builds SM100 CUDA extensions.
+Omit it on older GPUs and CPU environments.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
@@ -103,6 +104,22 @@ forced into a specific 5.x patch.
   pytorch index) — avoids uv resolving cu128_full wheels that drop nvidia-* deps.
 - **NPU**: pytorch index (`https://download.pytorch.org/whl/`).
 
+## DeepGEMM FP8 MoE
+
+The `gpu` extra pins `deep-gemm==2.8.2+5081f85` to four verl-wheelhouse
+release URLs in `[tool.uv.sources]`: Python 3.11/3.12 × x86_64/aarch64, built
+for torch 2.11.0 and CUDA 13.0.2. Update all four URLs and regenerate `uv.lock`
+when changing the source revision or torch/CUDA ABI. CPU-only and NPU extras
+must not acquire this dependency.
+
+These native Ubuntu 24.04 wheels require glibc >=2.38 and libstdc++ symbols
+through GLIBCXX_3.4.31 (x86_64) or GLIBCXX_3.4.29 (aarch64). They package the
+host extension and DeepJIT/CUTLASS headers; runtime kernel JIT still needs
+NVCC and a C++20 compiler (validated with GCC 13). The backend is lazy-imported
+and selected explicitly with `moe_implementation: deepgemm_fp8`; installing
+the GPU extra does not enable FP8 or import DeepGEMM on unsupported GPUs.
+See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
+
 ## Attention Kernels
 
 | Package | Source | Notes |
@@ -114,7 +131,7 @@ forced into a specific 5.x patch.
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
-| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM90/SM100 source builds, omitted by the default GPU CI install |
+| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
@@ -154,7 +171,7 @@ pinned `demonatic/flash-attention` fork, and it takes its toolchain from
 
 ```bash
 uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
-uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM100+)
 uv lock                                             # after pyproject edits
 uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 ```

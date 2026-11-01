@@ -5,8 +5,8 @@ description: "SeedOmni development guidance for Open-VeOmni. Use when adding or 
 
 # SeedOmni Skill
 
-Use this file as a routing entrypoint. Load only the references needed for the
-task at hand; do not read every reference by default.
+Use this file as a routing entrypoint and load the references matching the task
+from the routing table below.
 
 ## First Checks
 
@@ -15,50 +15,47 @@ task at hand; do not read every reference by default.
    - Configs under `configs/seed_omni/`.
    - SeedOmni data collation or `conversation_list` preprocessing.
    - SeedOmni checkpoint splitting or module registration.
-2. Treat current code as the source of truth. Some older docs still contain
-   stale examples; prefer graph/module source and Janus configs when they
-   disagree.
+2. Treat current code as the source of truth (graph/module source and live
+   configs).
 3. Choose the smallest applicable reference set from the routing table below.
-4. Prefer live examples over synthetic examples. Use Janus and Qwen modules as
-   implementation maps; avoid inventing placeholder module code.
+4. Use live `fake_model`, Janus, and Qwen modules as implementation maps.
 
 ## Routing
 
 | Task | Read |
 |---|---|
-| Understand current authoritative files | `references/source-of-truth.md` |
+| Understand SeedOmni architecture, runtime hierarchy, and hard constraints | `.agents/knowledge/veomni-seed-omni.md`, `references/source-of-truth.md` |
 | Change data flow, `conversation_list`, CPU preprocessing, dummy items, or raw request preprocessing | `references/data-flow.md` |
-| Add or modify a module mixin/model/config/processor | `references/module-contract.md`, `references/modulemixin-ide-stubs.md`, `references/module-workflow.md`, `references/janus-example-map.md` |
+| Add or modify a module mixin/model/config/processor | `references/module-contract.md` |
 | Edit training graph or generation FSM YAML | `references/graph-runtime.md`, then the matching `templates/*.yaml` |
 | Add a new model config layout | `references/graph-runtime.md`, `templates/base.template.yaml`, `templates/modules_train.template.yaml` |
 | Add distributed/eager inference module config | `references/per-module-parallel.md`, `templates/modules_infer_eager.template.yaml`, `templates/modules_infer_fsdp.template.yaml` |
-| Update split-checkpoint conversion | `references/checkpoint-splitting.md`, `references/janus-example-map.md` |
+| Update split-checkpoint conversion | `references/checkpoint-splitting.md` |
 | Validate a SeedOmni change | `references/validation.md` |
 
 ## Current Baseline
 
-- Entry-time samples use `{"conversation_list": [...]}`. The SeedOmni collator
-  groups samples and runs ordered module CPU preprocessors before GPU forward.
+- Entry-time samples use `{"conversation_list": [...]}`. `seedomni_transform`
+  runs ordered module CPU preprocessors (`OmniProcessor`) per sample in the
+  Dataset stage, and `SeedOmniCollator` groups preprocessed samples into a
+  micro-batch before GPU forward.
 - `ModulePreprocessorBase` is a core data-flow contract, shared by training and
-  inference. Training runs it inside `SeedOmniCollator`; inference runs it once
-  before the FSM.
-- Modules communicate by mutating/returning the shared `conversation_list`
-  carrier, not by hidden edge payloads. Janus packed training is the
-  exception: the text-encoder preprocessor writes packed tensors onto the
-  collator `batch` dict, and `pack_*` graph nodes only `masked_scatter` — see
-  `modules/janus/packing.py` and `packed/graph_train.yaml`.
+  inference. Training runs it inside `data_transform` (`seedomni_transform`);
+  inference runs it once before the FSM.
+- Modules communicate by mutating and returning the shared `conversation_list`
+  carrier.
 - Training graphs are flat edge lists over `module[.method]` endpoints.
   `to: end` is the virtual sink. Execution order is derived by topo sort.
 - Generation graphs are FSMs. Each state body is an ordered inline edge list.
   `done` is framework-injected; use `module_signal` and `default` transitions.
-- Tokenizers, processors, and other assets belong to the owning module
-  subfolder. Do not add top-level tokenizer paths.
+- Store tokenizers, processors, and other assets in the owning module's
+  subfolder.
 
 ## Templates
 
 Templates under `templates/` are skeletons, not authoritative examples. Use them
-to start a new config file, then compare against the live Janus configs listed
-in `references/janus-example-map.md`.
+to start a new config file, then compare against the live configs listed in
+`references/module-contract.md`.
 
 ## Sibling Skills
 

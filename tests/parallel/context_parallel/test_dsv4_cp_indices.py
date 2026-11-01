@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates, build_sparse_attention_indices
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 SEQ_LEN = 64

@@ -23,11 +23,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
 
 
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 _FWD_L2REL_TOL = 0.02
 _GRAD_L2REL_TOL = 0.02
 _LORA_KEYS = ("lora_a_gate", "lora_b_gate", "lora_a_up", "lora_b_up", "lora_a_down", "lora_b_down")
@@ -66,7 +69,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
 
 _SHAPES = {
     "small": dict(B=32, H=64, I=96, E=4, top_k=2, r=8),
-    # qwen3_moe_toy expert dimensions: the kernel tiles see production-sized H and I.
+    # Explicit larger dimensions retain kernel-tile coverage independently of model fixtures.
     "qwen3_moe": dict(B=64, H=2048, I=768, E=16, top_k=2, r=16),
 }
 
@@ -464,3 +467,206 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
         assert l2 <= _GRAD_L2REL_TOL, (
             f"[{variant}] {name}: NPU EP-vs-non-EP grad L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%}"
         )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton moe_experts_lora needs a GPU + triton",
+)
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_zero_b_preserves_fused_base_output_and_vjp(variant):
+    """Zero-initialized LoRA B matrices must preserve the base fused MoE path."""
+    from veomni.ops.kernels.moe_experts.standard.triton import MergedFc1TritonFusedMoeExpertFunction
+    from veomni.ops.kernels.moe_experts_lora.independent.triton import (
+        MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
+    )
+    from veomni.ops.kernels.moe_experts_lora.shared.triton import (
+        MergedFc1TritonFusedLoRAMoeExpertFunction,
+    )
+
+    nonep_cls = (
+        MergedFc1TritonFusedLoRAMoeExpertFunction
+        if variant == "shared"
+        else MergedFc1IndependentTritonFusedLoRAMoeExpertFunction
+    )
+
+    dev = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
+    scale_gate, scale_up, scale_down = 0.5, 0.5, 0.5
+
+    torch.manual_seed(0)
+    hidden_states = torch.randn(B, H, dtype=dtype, device=dev)
+    top_k_index = torch.randint(0, E, (B, top_k), device=dev)
+    top_k_weights = torch.softmax(torch.randn(B, top_k, dtype=torch.float32, device=dev), dim=-1).to(dtype)
+    gate_up_proj = (torch.randn(E, 2 * I, H, dtype=dtype, device=dev) * 0.05).detach()
+    down_proj = (torch.randn(E, H, I, dtype=dtype, device=dev) * 0.05).detach()
+    grad_out = torch.randn(B, H, dtype=dtype, device=dev)
+
+    hs_base = hidden_states.clone().detach().requires_grad_(True)
+    rw_base = top_k_weights.clone().detach().requires_grad_(True)
+    fc1_base = gate_up_proj.clone().detach().requires_grad_(True)
+    fc2_base = down_proj.clone().detach().requires_grad_(True)
+    out_base = MergedFc1TritonFusedMoeExpertFunction.apply(E, rw_base, top_k_index, hs_base, fc1_base, fc2_base, None)
+    out_base.backward(grad_out)
+
+    torch.manual_seed(123)
+    lora = _build_lora_leaves(variant, E=E, H=H, I=I, r=r, dtype=dtype, device=dev)
+    for key in ("lora_b_gate", "lora_b_up", "lora_b_down"):
+        lora[key] = torch.zeros_like(lora[key], requires_grad=True)
+
+    hs_lora = hidden_states.clone().detach().requires_grad_(True)
+    rw_lora = top_k_weights.clone().detach().requires_grad_(True)
+    fc1_lora = gate_up_proj.clone().detach().requires_grad_(True)
+    fc2_lora = down_proj.clone().detach().requires_grad_(True)
+    out_lora = nonep_cls.apply(
+        E,
+        rw_lora,
+        top_k_index,
+        hs_lora,
+        fc1_lora,
+        fc2_lora,
+        *(lora[k] for k in _LORA_KEYS),
+        scale_gate,
+        scale_up,
+        scale_down,
+    )
+    out_lora.backward(grad_out)
+
+    torch.testing.assert_close(out_lora, out_base, rtol=0, atol=0)
+    torch.testing.assert_close(hs_lora.grad, hs_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(rw_lora.grad, rw_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc1_lora.grad, fc1_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc2_lora.grad, fc2_base.grad, rtol=0, atol=0)
+    for key in ("lora_a_gate", "lora_a_up", "lora_a_down"):
+        assert torch.count_nonzero(lora[key].grad) == 0
+    for key in ("lora_b_gate", "lora_b_up", "lora_b_down"):
+        assert torch.isfinite(lora[key].grad).all() and torch.count_nonzero(lora[key].grad) > 0
+
+
+def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
+    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients."""
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", store=endpoint.connect(), rank=rank, world_size=_CI_ACCELERATOR_2.nproc)
+    try:
+        device = torch.device("cuda", rank)
+        dtype = torch.bfloat16
+        experts, hidden_size, intermediate_size, lora_rank, batch = 4, 64, 96, 8, 16
+        generator = torch.Generator().manual_seed(7123)
+
+        def random_tensor(shape: tuple[int, ...], scale: float) -> torch.Tensor:
+            return (torch.randn(shape, generator=generator) * scale).to(device=device, dtype=dtype)
+
+        hidden = random_tensor((2, batch, hidden_size), 0.5)[rank]
+        upstream = random_tensor((2, batch, hidden_size), 0.1)[rank]
+        gate_up = random_tensor((experts, 2 * intermediate_size, hidden_size), 0.05)
+        down = random_tensor((experts, hidden_size, intermediate_size), 0.05)
+        ids = torch.arange(batch, device=device)
+        selected = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
+        routing = torch.tensor([0.75, 0.25], dtype=dtype, device=device).expand(batch, 2).contiguous()
+        if variant == "shared":
+            shapes = [
+                (lora_rank, hidden_size),
+                (intermediate_size, lora_rank),
+                (lora_rank, hidden_size),
+                (intermediate_size, lora_rank),
+                (lora_rank, intermediate_size),
+                (hidden_size, lora_rank),
+            ]
+        else:
+            shapes = [
+                (experts, lora_rank, hidden_size),
+                (experts, intermediate_size, lora_rank),
+                (experts, lora_rank, hidden_size),
+                (experts, intermediate_size, lora_rank),
+                (experts, lora_rank, intermediate_size),
+                (experts, hidden_size, lora_rank),
+            ]
+        full_lora = [random_tensor(shape, 0.02).detach().requires_grad_(True) for shape in shapes]
+        hidden_reference = hidden.detach().requires_grad_(True)
+        non_ep_state = _init_parallel_state(dp_size=2, device_type="cuda", name="non_ep")
+        ep_state = _init_parallel_state(dp_size=2, device_type="cuda", extra_parallel_sizes=(2,), name="ep")
+
+        with use_parallel_state(non_ep_state):
+            reference = _call(
+                "fused_triton",
+                variant,
+                hidden_reference,
+                routing,
+                selected,
+                gate_up,
+                down,
+                full_lora,
+                num_experts=experts,
+            )
+            reference_grads = torch.autograd.grad(reference, [*full_lora, hidden_reference], grad_outputs=upstream)
+
+        local_lora = []
+        for value in full_lora:
+            if variant == "independent":
+                value = value[rank * 2 : (rank + 1) * 2]
+            local_lora.append(value.detach().clone().requires_grad_(True))
+        hidden_ep = hidden.detach().requires_grad_(True)
+        with use_parallel_state(ep_state):
+            actual = _call(
+                "fused_triton",
+                variant,
+                hidden_ep,
+                routing,
+                selected,
+                gate_up[rank * 2 : (rank + 1) * 2].contiguous(),
+                down[rank * 2 : (rank + 1) * 2].contiguous(),
+                local_lora,
+                num_experts=experts,
+            )
+            actual_grads = torch.autograd.grad(actual, [*local_lora, hidden_ep], grad_outputs=upstream)
+
+        # Non-EP computes a full gradient from each rank's tokens. EP computes
+        # one local expert shard from both ranks' tokens, or a shared-LoRA
+        # partial from its local experts. Compare the logical full gradients.
+        gradient_checks = []
+        for index, (local, full) in enumerate(zip(actual_grads[:-1], reference_grads[:-1], strict=True)):
+            expected = full.float().clone()
+            dist.all_reduce(expected, op=dist.ReduceOp.SUM)
+            if variant == "independent":
+                parts = [torch.empty_like(local) for _ in range(2)]
+                dist.all_gather(parts, local.contiguous())
+                observed = torch.cat(parts, dim=0).float()
+            else:
+                observed = local.float().clone()
+                dist.all_reduce(observed, op=dist.ReduceOp.SUM)
+            gradient_checks.append((index, observed, expected))
+
+        assert _l2_rel(actual, reference) <= _FWD_L2REL_TOL, f"{variant}: distributed EP forward differs from non-EP"
+        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
+            f"{variant}: distributed EP input gradient differs from non-EP"
+        )
+        for index, observed, expected in gradient_checks:
+            assert expected.count_nonzero().item() > 0, f"{variant}: LoRA gradient {index} was zero"
+            relative_error = _l2_rel(observed, expected)
+            assert relative_error <= _GRAD_L2REL_TOL, (
+                f"{variant}: distributed EP LoRA gradient {index} differs from non-EP "
+                f"(relative L2 error {relative_error:.4%})"
+            )
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="distributed triton moe_experts_lora needs GPUs + triton",
+)
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant):
+    """Two GPUs exercise real all-to-all dispatch and both LoRA gradient layouts."""
+    if runner_device_count() < _CI_ACCELERATOR_2.nproc:
+        pytest.skip("Distributed EP parity requires two CUDA devices.")
+    spawn_with_rendezvous(
+        _distributed_ep_parity_worker,
+        args=(variant,),
+        nprocs=_CI_ACCELERATOR_2.nproc,
+    )

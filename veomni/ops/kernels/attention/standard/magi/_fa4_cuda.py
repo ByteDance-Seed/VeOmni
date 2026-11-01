@@ -18,7 +18,7 @@ from contextlib import nullcontext
 
 import torch
 
-from ._kernel import CUDA_DEVICE_TYPE, KERNEL_CUTLASS, prepare_kernel, validate_cutlass_inputs
+from ._kernel import CUDA_DEVICE_TYPE, prepare_kernel
 from ._metadata import get_or_prepare_attn_arg
 
 
@@ -102,15 +102,8 @@ def _fa4_cuda_attention_forward(
     softmax_scale: float | None,
     softcap: float,
 ):
-    """Run the SM-specific CUDA FA4 backend with prepared mask metadata."""
-    kernel_mode, build_flags = prepare_kernel(query.device)
-    metadata_head_dim = None
-    if kernel_mode == KERNEL_CUTLASS:
-        if build_flags is None:
-            raise RuntimeError("MagiAttention's SM90 CUTLASS backend did not provide build configuration.")
-        # CUTLASS arbitrary-mask tiles follow the compiled bucket rather than
-        # the smaller runtime head dimension served by that bucket.
-        metadata_head_dim = validate_cutlass_inputs(query, value, softcap, build_flags)
+    """Run the SM100+ CUDA FA4 backend with prepared mask metadata."""
+    prepare_kernel(query.device)
 
     try:
         from magi_attention.api import AttnForwardMeta
@@ -126,7 +119,6 @@ def _fa4_cuda_attention_forward(
         q_ranges,
         k_ranges,
         attn_type_map,
-        metadata_head_dim,
     )
     output, lse = _MagiFA4Function.apply(
         query,

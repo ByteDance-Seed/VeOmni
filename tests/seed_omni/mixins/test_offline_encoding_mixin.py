@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import OfflineEncodingMixin
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):

@@ -93,18 +93,41 @@ def packed_mask_function(
         - q_starts[q_segment_ids]
     )
 
+    # Omit zero offsets entirely; nonzero offsets use indexed broadcast views
+    # so dynamic FLASH never captures Python coordinates in its mask graph.
+    q_offsets = (
+        None
+        if q_offset == 0
+        else torch.tensor([q_offset], device=device, dtype=torch.int64).expand(q_length + max(q_offset, 0))
+    )
+    k_offsets = (
+        None
+        if kv_offset == 0
+        else torch.tensor([kv_offset], device=device, dtype=torch.int64).expand(kv_length + max(kv_offset, 0))
+    )
+    # Keep row arithmetic outside the callback. FLASH cannot lower symbolic
+    # row-width arithmetic, even when the width comes from a tensor shape.
+    q_positions_in_k = q_positions_in_k.view(rows, q_length)
+    if rows > 1:
+        row_starts = torch.arange(rows, device=device)[:, None] * kv_length
+        q_positions_in_k = q_positions_in_k - row_starts
+    # Native auxiliary cache keys omit broadcast strides. Shared and distinct
+    # batch layouts must use the same non-broadcast representation.
+    q_positions_in_k = q_positions_in_k.expand(batch_size, -1).contiguous()
+    q_segment_ids = q_segment_ids.view(rows, q_length).expand(batch_size, -1).contiguous()
+    k_segment_ids = k_segment_ids.view(rows, kv_length).expand(batch_size, -1).contiguous()
+
     def packed_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
         """Require paired segments and evaluate the base mask in key coordinates."""
-        q_local = q_idx - q_offset
-        k_local = kv_idx - kv_offset
-        if rows == 1:
-            q_flat, k_flat = q_local, k_local
-            mapped_q_idx = q_positions_in_k[q_flat] + kv_offset
-        else:
-            q_flat = batch_idx * q_length + q_local
-            k_flat = batch_idx * kv_length + k_local
-            mapped_q_idx = q_positions_in_k[q_flat] - batch_idx * kv_length + kv_offset
-        same_segment = q_segment_ids[q_flat] == k_segment_ids[k_flat]
+        q_local = q_idx if q_offsets is None else q_idx - q_offsets[q_idx].to(q_idx.dtype)
+        k_local = kv_idx if k_offsets is None else kv_idx - k_offsets[kv_idx].to(kv_idx.dtype)
+        mapped_q_idx = q_positions_in_k[batch_idx, q_local]
+        if k_offsets is not None:
+            mapped_q_idx = mapped_q_idx + k_offsets[kv_idx]
+        # Preserve the callback's index dtype. FLASH supplies Int32 indices;
+        # forwarding Int64 metadata into another indexed mask breaks CuteDSL.
+        mapped_q_idx = mapped_q_idx.to(q_idx.dtype)
+        same_segment = q_segment_ids[batch_idx, q_local] == k_segment_ids[batch_idx, k_local]
         return same_segment & mask_function(batch_idx, head_idx, mapped_q_idx, kv_idx)
 
     return packed_mask

@@ -9,6 +9,7 @@ and provides guidance on which tests to add when onboarding a new model.
 
 ```
 tests/
+├── ci/                             # CPU tests for accelerator CI tooling
 ├── tools/                          # Shared test infrastructure (comparison, data gen, launch)
 ├── toy_config/                     # Minimal model configs for fast CI testing
 ├── testdata/                       # Sample images, audio, etc.
@@ -117,25 +118,38 @@ tests/
 
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
-| **Models** | `tests/models/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
-| **Ops** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
-| **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
-| **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
-| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
+| **Models** | `tests/models/` | 0-4 GPUs | pytest | Registry/build contracts, model parity, and implementation selection |
+| **Ops** | `tests/ops/` | 0-4 GPUs (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Data pipeline** | `tests/data/` | 0-8 GPUs | pytest + torchrun | Data loading, collation, preprocessing, and distributed resume |
+| **Parallelism** | `tests/parallel/` | 0-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
+| **Distributed runtime** | `tests/distributed/` | 0-4 GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
 | **SeedOmni** | `tests/seed_omni/` | 0; 2 for `e2e/` | pytest (+ torchrun for `e2e/`) | Multi-module OmniModel, runtimes, trainer, launcher, module mixins |
-| **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
+| **E2E parallel** | `tests/e2e/` | Per-case launch plan (up to 8 GPUs) | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
 | **Sanity** | `tests/special_sanity/` | 0 | script + pytest | Device API lint and op-architecture path guards |
 
-Unit CI does not run `pytest tests/`. `gpu_unit_tests.yml` and
-`npu_unit_tests.yml` collect `tests/ops/` (`not benchmark`), `tests/models/`,
-`tests/data/`, `tests/checkpoints/`, and `tests/arguments/` as directories.
-They also run `tests/special_sanity/test_ops_architecture.py`. Other files are
-listed one pytest invocation at a time. E2E jobs own
-`tests/e2e/test_e2e_parallel.py` and `tests/distributed/test_fsdp_equivalence.py`.
-A new file outside those directory collections is invisible to CI until a
-workflow line is added.
+Unit CI does not run `pytest tests/`. Suite selection is defined in the
+[GPU manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU manifest](../scripts/ci/accelerator/suites/npu.json), consumed by the
+[accelerator runner](../scripts/ci/accelerator/runner.py). Directory selections
+collect their children automatically; a file outside them must be added to its
+suite.
+
+The [case scheduling contract](design/ci_case_scheduling.md) defines planning
+from the actual `nproc/world_size` configuration, device isolation and GPU/NPU
+scheduling. The default launch plan uses one card of the selected accelerator
+backend on GPU/NPU runners, and CPU on CPU-only runners. Multi-card tests must
+expose their launch configuration; `skipif` describes eligibility, not a
+resource reservation. See [runner usage](../scripts/ci/accelerator/README.md) for commands
+and result artifacts. GPU/NPU unit and e2e workflows all use parallel dispatch
+with the same launch plans and scheduler core.
+
+Batches are ordered by required card count, largest first, and greedily assigned
+to free devices with smaller jobs filling remaining space. Fixed case weights
+(60 seconds for multi-card work, 2 seconds for single-card/CPU work) control
+batch size only. Measured timings are reporting artifacts; scheduling does not
+require historical timings.
 
 ---
 
@@ -202,6 +216,102 @@ DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; op
 tests require TileLang on an SM90+ NVIDIA GPU, and the `cann` parity tests require an Ascend NPU
 with `cann_ops_transformer`. Its mHC kernel parity is covered by `tests/ops/mhc/test_mhc.py` and
 requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
+
+DeepSeek-V4 expert-parallel training is exercised separately by
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
+four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
+eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+kernel paths. The CPU duplicate-hash-route regression verifies that EP split
+counts match unique token/expert dispatch pairs; repeated routing weights are
+summed when combining outputs.
+The GPU CI also runs `test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference`
+in `tests/models/transformers/deepseek_v4/test_deepseek_v4.py`: four-rank EP=4, unequal token
+payloads, ordinary and duplicate expert slots, and three held-out seeds. Output,
+input/routing gradients and expert-weight gradients are compared with a global
+FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
+described below. This isolates expert transport/kernel numerics, not FSDP2
+gradient averaging or whole-model optimizer trajectories.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 4.61% for EP2 versus EP1 before aligning routing-weight placement. Non-EP
+Triton experts now weight the down-projection output, matching EP and the eager
+reference, instead of weighting the BF16 activation before that projection.
+Both split/merged weights and shared/independent LoRA use this order; for LoRA,
+the routing weight scales the complete base-plus-adapter output.
+
+On the same four-rank fixture, this reduced first-step whole-model gradient
+relative L2 to 0.0751%, with bit-identical non-expert gradients. Expert weight
+gradients still differ across EP reduction layouts. First-step update relative
+L2 was 2.62%; after that update, second-step gradient relative L2 was 4.24% and
+update relative L2 was 5.21%. These measurements do not establish whole-model
+update parity or convergence. First-step AdamW replay and clipping passed their
+separate oracles in the earlier diagnostic runs.
+
+`tests/ops/moe_experts/test_moe_experts_ep.py` checks output and all VJPs against
+the single-expert EP projection order without relaxing split/merged parity.
+`tests/ops/moe_experts_lora/test_moe_experts_lora.py` checks that zero-B adapters preserve base
+output, input/routing and base-weight gradients, while retaining trainable
+B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
+EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
+
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
+eager and fullgraph Inductor through four-rank packed FSDP2 training, with
+static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
+at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
+update alignment, convergence or bitwise equivalence.
+It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts on `fused_triton`. Enabled
+ExtraParallel with compilation remains rejected. Single-device decoder trace
+and gradient checks live in `tests/distributed/test_torch_compile.py`.
+Backend `eager` capture compares two identically loaded BF16 models: loss within
+`rtol=atol=1e-4` and every parameter gradient within `rtol=atol=1e-3`. The
+Inductor execution gate runs two batches through the compiled decoder blocks and
+requires a finite loss, finite gradients and an AdamW step for each; it does not
+compare against eager BF16, which is not an exact numerical oracle. A separate
+fixed-route expert test feeds random hidden states, fixed top-k routes and a
+random cotangent to the Inductor-compiled and the eager fused experts, and
+compares output, input/routing gradients and both expert-weight gradients against
+an FP32 copy of the same experts on the eager `moe_experts` path. Outputs must be
+within `rtol=1e-2, atol=2e-2` of the reference; each gradient must have cosine
+similarity above 0.999 and be within `rtol=2e-2, atol=3e-2`; compiled and eager
+outputs and gradients must agree within `rtol=1e-2, atol=2e-2`. These local gates do not qualify
+whole-model numerical training correctness or the SM90+ optimized kernels.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 5.81% for Inductor versus eager. First-step AdamW replay and clipping
+passed their scoped oracles; whole-model update parity and convergence remain
+unqualified. See the separate EP validation PR for expert transport validation.
+
+`test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle` checks that
+compiled BF16 gradients track the direction of an FP32 reference about as
+closely as eager BF16 gradients do. From one fixed set of BF16-rounded weights
+(with hash-routing tables filled) and the same input, it runs the eager and the
+fullgraph Inductor BF16 models, both in batch-invariant mode, and an eager FP32
+forward/backward over those same values. Losses must be within
+`rtol=5e-3, atol=1e-2` of the FP32 reference and within `rtol=1e-3, atol=2e-3`
+of each other, and all three must give gradients to the same parameters.
+Gradients are compared by direction only, excluding `indexer.weights_proj`: the
+cosine between all gradients and the reference must exceed 0.995 for each mode
+and the two modes' cosines must agree within 2e-3; per parameter whose
+reference gradient norm is at least 1e-4, the Inductor cosine must exceed 0.97
+and trail eager by at most 5e-3. Cosine similarity is scale-invariant, so this
+test does not bound gradient magnitude or relative L2 error; only its loss
+checks are magnitude-sensitive. The reference runs the eager MoE implementation
+rather than the Triton grouped GEMM both BF16 modes use, so its distance also
+contains that implementation difference.
+
+Measurements taken for this document, none of which a test asserts: an earlier
+revision of the decoder harness (one 64-token sequence, filled hash-routing
+tables, no batch-invariant mode) read whole-model gradient relative L2 to the
+FP32 reference of 1.70% (eager) and 1.48% (Inductor), with the two BF16 modes
+2.08% apart. These were not re-measured with the current harness. In the
+four-rank run at step 1, eager and Inductor pre-clipping gradient norms agree to
+1.5e-4 relative and the cosine between the two gradients is 0.9985.
+`TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` does not close the four-rank gap:
+5.84% and 6.02% at steps 1 and 2, against 5.48% and 5.79% by default.
 
 ---
 
@@ -276,7 +386,8 @@ requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 - FSDP2 always enabled, `nproc_per_node = sp_size * 4`
 - 2 epochs, 2 max_steps per run
 
-**Models**: All supported text, VLM, omni, and DiT models.
+**Models**: The text, VLM, omni, and DiT parameter tables in
+`tests/e2e/test_e2e_parallel.py` define coverage.
 
 **GPU**: 4+ GPUs (up to 8 for sp=2).
 
@@ -309,7 +420,7 @@ requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 | `moe_experts/test_moe_experts.py` | Eager/Triton/Quack MoE parity, split/merged weights, and hardware guards | CPU for guards; CUDA for optimized kernels |
 | `dsa/test_dsa*.py` | DSA registry, CPU guards, and TileLang/cuDNN numerical parity | CPU for guards; matching CUDA hardware for optimized kernels |
 | `attention/flash/test_flash_attention.py` | FlashAttention contracts | CUDA |
-| `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
+| `attention/magi/` | Magi mask, SM100+ guard, FA4 metadata, and numerical contracts | CPU for guards; SM100+ for optimized kernels |
 | `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
 
 Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
@@ -363,7 +474,139 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 
 ---
 
+## Registering Tests in CI
+
+Test selection is maintained in the
+[GPU suite manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU suite manifest](../scripts/ci/accelerator/suites/npu.json). Each manifest
+contains both `unit` and `e2e` selections. The runner collects those selections
+and schedules the resulting cases using their launch plans.
+
+Workflows configure runners, dependencies, triggers, job-wide environment and
+runner options. Keep test selections in the manifests so local runs and CI use
+the same collection source. Test-specific environment variables belong in a
+selection's optional `env` object. Device requirements belong in the test's
+launch plan.
+
+### When a manifest needs an update
+
+| Test change | Required registration |
+|---|---|
+| Add a function or parameter combination included by an existing selection | No manifest or workflow change |
+| Add a file inside a directory already collected by the relevant manifest | No manifest or workflow change |
+| Add a file outside existing collection scopes | Add a selection to each applicable backend manifest |
+| Add a new CI machine requirement, dependency setup or workflow trigger | Update the corresponding workflow as well |
+
+Check the complete selection arguments: a node ID or a `-k` filter can narrow
+collection within a file or directory. The existence of a manifest entry for
+that file does not guarantee that every new case is included. A launch-plan
+marker declares resources; it does not register a test with CI.
+
+For example, if a new `tests/e2e/test_my_model.py` file is outside the existing
+scopes, append an entry like this to `suites/gpu.json` (replace the illustrative
+file path with the actual new file):
+
+```json
+{
+  "name": "my-model-e2e",
+  "suite": "e2e",
+  "conditional": false,
+  "args": ["-s", "-x", "tests/e2e/test_my_model.py"]
+}
+```
+
+Use a unique `name` within each backend manifest. Set `suite` to `unit` or
+`e2e`; keep ordinary selections unconditional. Conditional selections require
+an explicit workflow gate and are enabled with `--include-conditional`.
+Preserve any required pytest flags or filters in `args`. Do not add a per-file
+pytest step to the workflow or a second selection for an already covered
+scope. Add the corresponding NPU selection when the test is intended to run
+on NPU, retaining its hardware/dependency guards.
+
+A function or parameter added to `tests/e2e/test_e2e_parallel.py` is collected
+by that file's existing GPU e2e selection; it does not need another JSON entry.
+For a new multi-card case, also expose the shared `nproc/world_size`
+configuration as a [launch plan](#launch-plans-for-new-tests).
+
+On a runner with the selected backend, check collection before execution:
+
+```sh
+uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e --only my-model-e2e --collect-only --output-dir outputs/accelerator-ci/my-model-collection
+```
+
+Use the selection name with `--only`. Inspect `inventory.json` for the expected
+parameterized node IDs, eligibility and resolved plans. Use a fresh output
+directory for each invocation. See the
+[accelerator README](../scripts/ci/accelerator/README.md) for the full runner
+interface and result files.
+
+---
+
+## Launch Plans for New Tests
+
+A test without an explicit launch plan uses one card of the runner's selected
+accelerator backend, or CPU on a CPU-only runner. Single-card tests may use this
+default. Declare a CPU plan for CPU-only work, including preprocessing, config
+validation, eager CPU references, and tests with mocked accelerator kernels.
+A backend name in a test function does not imply that it needs that hardware.
+The scheduler follows the launch plan; it does not infer device use from tensor
+factories or test names.
+
+```python
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cpu_reference():
+    ...
+```
+
+For an entirely CPU-only module, use
+`pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))`.
+In mixed modules, mark individual CPU cases so optimized GPU/NPU kernel tests
+retain accelerator reservations. CPU workers hide accelerator devices and share
+the scheduler's separate CPU concurrency limit.
+
+CPU numerical checks should state their input dtype and device. An independent
+FP64 math reference can check an FP32 candidate without relying on automatic
+SDPA backend selection. Keep output and gradient tolerances explicit; changing
+a reference does not justify loosening the candidate's error bounds.
+For intermittent CPU numerical failures, reproduce in fresh processes as well
+as repeated calls: a first-call math error can disappear after warmup. Include
+the failing output/gradient name, seed, shapes, dtype, CPU and thread settings
+in assertion diagnostics. The QSA CPU mock evaluates exponentials in FP64 and
+casts back to FP32 to avoid a reproduced first-call CPU FP32 `exp` accuracy
+issue; its matrix products, normalization and gradient accumulation stay FP32.
+
+Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
+or parallel configuration used to launch their workers. A module, class, or
+fixture family may provide a shared plan. Parameterized tests resolve their
+plan for each parameter combination; they do not need entries in a device-quota
+table. A `skipif` marker alone does not declare a launch plan.
+
+Keep launch configuration independent of the number of cards currently free.
+An undersized plan is an error; it must not cause a smaller topology, a backend
+fallback, or a resource-induced skip. Use isolated output/cache paths and
+allocated rendezvous ports for concurrent cases. See the
+[test-author contract](design/ci_case_scheduling.md#writing-new-tests) for details.
+
+---
+
+The accelerator runner fails fast by default: the first failure stops dispatch
+and cancels running peers in the same suite/job, then waits for scoped process
+cleanup. Foreground output shows case progress, a 30-second heartbeat, failure
+tracebacks/log tails and a final summary. Use `--keep-going` to collect all
+failures. See [failure reporting](../scripts/ci/accelerator/README.md#results-and-local-commands)
+for full logs and partial-result artifacts.
+
 ## New Model Onboarding: Test Checklist
+
+Local tests and CI use the same canonical configs under `tests/toy_config/`.
+Reuse the [shared toy fixtures](../tests/toy_config/README.md) and preserve their
+model/input contracts; do not create CI-specific copies or switch configs based
+on the execution environment.
 
 When adding a new model to VeOmni, the following tests should be created or updated.
 See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_model.md) for step-by-step instructions.
@@ -431,8 +674,9 @@ pytest → family-specific eager parity test
 pytest → test_text_parallel_align(model_name, config, ...)
   → materialize_weights(config) → random weights on disk
   → DummyDataset(dataset_type) → parquet files
-  → for each (sp_size, ep_size):
-      prepare_exec_cmd() → torchrun command
+  → prepare_exec_cmd() → kwargs for each (sp_size, ep_size)
+  → dispatch independent modes on disjoint devices when GPU parallel mode is enabled
+      build_torchrun_cmd(**kwargs) → fresh torchrun command and rendezvous port
       subprocess.run(torchrun ... train_text_test.py ...)
         → TestTextTrainer.train() → log_dict.json
   → compare_multi_items(all_log_dicts, rtol, atol)
@@ -444,11 +688,28 @@ pytest → test_text_fsdp_equivalence(config, ...)
   → materialize_weights(config)
   → DummyDataset(text)
   → run_training_config(nproc=1, init_device=device)      # baseline
-  → run_training_config(nproc=2+, init_device=meta, fsdp2) # FSDP
+  → run_training_config(nproc=2, init_device=meta, fsdp2)  # fixed two-rank FSDP
   → compare_metrics(baseline_grad_norm, fsdp_grad_norm)
 ```
 
 ---
+
+## Batch-invariant FP32 GEMM precision
+
+`test_matmul_persistent_preserves_ieee_fp32_precision_and_batch_invariance` in
+`tests/ops/batch_invariant/test_batch_invariant.py` checks one FP32
+`matmul_persistent` product, with and without bias, against FP64 arithmetic over
+the same operands (`rtol=1e-6, atol=1e-5`), and requires bitwise-equal results
+when the rows are computed as two separate batches. It is the only FP64
+reference case in the file: BF16/FP16, strided and padded-tile products are not
+compared against FP64. The GPU unit workflow runs the entire
+`tests/ops/` directory.
+
+The invariant Triton GEMM explicitly uses IEEE input precision. Triton's default
+TF32 dot precision truncates FP32 projection inputs even when PyTorch's matmul
+precision is `highest`; setting the PyTorch policy alone does not configure a
+Triton kernel. This fixes that operator's FP32 accuracy, but does not establish
+whole-model BF16 gradient, parameter-update or convergence parity.
 
 ## Architecture Notes
 

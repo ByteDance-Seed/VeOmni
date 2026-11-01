@@ -29,3 +29,17 @@ from veomni.models.transformers.qwen4_exp.qwen4_exp_gpu_patch_gen_config import 
 config = deepcopy(gpu_config)
 config.target_file = "patched_modeling_qwen4_exp_npu.py"
 config.description = "Qwen4-Exp NPU VLM-SFT correctness integration with PLE sharding"
+
+# Replace the GPU QSA indexer mask value in-place so NPU masks invisible block
+# scores with -1.0 instead of -inf. ReLU block scores are non-negative, and
+# CANN TopKV2 faults (AICore error 507015) on sparse rows dominated by -inf.
+for _patch in config.patches:
+    if _patch.target == "Qwen4ExpTextQSAIndexer.forward":
+        _patch.name_map = {
+            'scores = scores.masked_fill(~visible, float("-inf"))': (
+                "scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)"
+            ),
+        }
+        break
+else:
+    raise RuntimeError("Expected Qwen4ExpTextQSAIndexer.forward in qwen4_exp GPU patch config")

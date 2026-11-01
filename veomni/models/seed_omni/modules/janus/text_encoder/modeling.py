@@ -4,7 +4,7 @@ import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modeling import TextEncoder
+from ...text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
 from .processing import JanusTextEncoderPreprocessor
 
@@ -32,7 +32,7 @@ class JanusTextEncoder(TextEncoder):
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         tail = conversation_list[-1]

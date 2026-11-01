@@ -67,8 +67,10 @@ different data-parallel samples to those ranks.
 
 - General `tp_size > 1` support.
 - Tensor-parallel attention, MLP, PLE projections, or LM head.
-- PLE with context parallelism; Ulysses is supported through sequence-local
-  lookup requests and cross-rank token/convolution halos.
+- Hybrid `ulysses_size > 1` and `cp_size > 1`; either Ulysses or GPU context
+  parallelism is supported through sequence-local lookup requests and cross-rank
+  token/convolution halos, while PLE table routing continues to use the independent
+  `ple_fsdp × ple` mesh.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
 - Hugging Face export of the complete 95 GiB PLE table.
@@ -99,7 +101,7 @@ a persistent column-sharding dimension only for PLE embedding parameters.
 Code in the Qwen4-Exp path should use local aliases such as `ple_row_*` and
 `ple_col_*` to make this distinction explicit.
 
-For the initial implementation:
+For the initial two-dimensional PLE implementation:
 
 ```text
 P * F == world_size
@@ -107,10 +109,14 @@ P > 1
 tp_size == 1
 pp_size == 1
 dp_replicate_size == 1
-ulysses_size == 1
-cp_size == 1
 ep_size divides world_size
 ```
+
+Either `ulysses_size > 1` or GPU `cp_size > 1` may be enabled (not both
+simultaneously). Sequence/context parallelism changes only the sequence-local
+PLE token/convolution halo group (`ulysses_group` or `cp_group`); the persistent
+PLE table ownership and two-dimensional lookup routing still span the full
+`ple_fsdp × ple` mesh.
 
 Each rank has a coordinate `(col_rank, row_rank)` in the `[F, P]` mesh.
 Code must derive group-local ranks and destination ranks from `DeviceMesh`; it

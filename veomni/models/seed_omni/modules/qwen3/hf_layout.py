@@ -36,7 +36,7 @@ def _llm_config(hf_config: Any) -> Qwen3LlmConfig:
 def _tokenizer(model_path: str) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
-    return {"tokenizer": AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)}
+    return {"tokenizer": AutoTokenizer.from_pretrained(model_path)}
 
 
 QWEN3_HF_LAYOUT = OmniHFLayout(

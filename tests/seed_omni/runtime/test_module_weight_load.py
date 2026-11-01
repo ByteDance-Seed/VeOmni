@@ -13,9 +13,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed.torch_compile import CompileConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _RESUME_PATH = "/tmp/checkpoint/global_step_10"

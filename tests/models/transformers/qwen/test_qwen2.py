@@ -33,6 +33,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model as HFQwen2Model
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
@@ -40,6 +41,9 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_qwen2_config as _tiny_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _qwen2_classes():

@@ -1,6 +1,6 @@
 """Config for :class:`Qwen3TextEncoder`."""
 
-from ...base.text_encoder.configuration import TextEncoderConfig
+from ...text_encoder.configuration import TextEncoderConfig
 
 
 class Qwen3TextEncoderConfig(TextEncoderConfig):

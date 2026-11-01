@@ -15,6 +15,8 @@
 """SeedOmni utilities: conversation carrier + HF → split-checkpoint conversion."""
 
 from .conversation import (
+    _IMG_TAG_KEY,
+    _OMNI_TOKEN_LEN,
     ConversationItem,
     build_conversation,
     collect_desired_values,
@@ -32,6 +34,8 @@ __all__ = [
     "seal_outputs",
     "iter_desired_items",
     "collect_desired_values",
+    "_IMG_TAG_KEY",
+    "_OMNI_TOKEN_LEN",
     "OMNI_CONVERT_REGISTRY",
     "convert_checkpoint",
 ]

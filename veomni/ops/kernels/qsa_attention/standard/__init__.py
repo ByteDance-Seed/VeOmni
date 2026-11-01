@@ -13,4 +13,4 @@
 # limitations under the License.
 
 
-"""Qwen4-Exp QSA attention rows (``eager``, ``tilelang``)."""
+"""Qwen4-Exp QSA attention rows (``eager``, ``tilelang``, ``torch_npu``)."""

@@ -20,18 +20,6 @@ import torch
 from torch import Tensor
 
 
-VARLEN_ATTENTION_TYPES = (
-    "flash_attention_2",
-    "flash_attention_2_hub",
-    "flash_attention_3",
-    "flash_attention_3_hub",
-    "flash_attention_4",
-    "veomni_flash_attention_2",
-    "veomni_flash_attention_2_hub",
-    "veomni_flash_attention_3",
-    "veomni_flash_attention_3_hub",
-    "veomni_flash_attention_4",
-)
 PACKED_ATTENTION_METADATA_KEYS = frozenset(
     {
         "cu_seqlens",
@@ -94,6 +82,7 @@ def dense_packed_attention_mask(
         cu_seqlens=cu_seqlens,
         device=device,
         allow_is_causal_skip=False,
+        skip_ulysses=True,
     )
     if attention_mask is not None and attention_mask.ndim >= 3:
         mask = _merge_dense_attention_masks(attention_mask, mask)
@@ -108,6 +97,7 @@ def dense_packed_attention_mask(
             cu_seqlens=cu_seqlens,
             device=device,
             allow_is_causal_skip=False,
+            skip_ulysses=True,
         )
         mask = _merge_dense_attention_masks(mask, packed_only)
     return mask
@@ -167,13 +157,23 @@ def prepare_dense_attention_inputs(
     packed inputs need a dense mask first; dropping lengths alone lets a
     2-D all-ones mask cross-attend across samples. An existing 4-D mask is
     merged with packed isolation so padding and overlays stay in place.
+    Under Ulysses SP (``veomni_sdpa``), ``hidden_states`` is the rank-local
+    shard while ``cu_seqlens`` and the dense mask describe the post-Ulysses
+    full sequence.
     """
     if _canonical_attn_impl(impl) not in DENSE_ATTENTION_IMPLS:
         return kwargs, attention_mask
     cu_seqlens = _multi_segment_cu_seqlens(kwargs)
     if cu_seqlens is not None:
-        q_len = hidden_states.shape[1]
-        kv_len = q_len
+        from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
+
+        local_q_len = hidden_states.shape[1]
+        skip_ulysses = bool(kwargs.get("skip_ulysses", False)) or _canonical_attn_impl(impl) == "eager"
+        q_len, kv_len = effective_sequence_lengths(
+            local_q_len,
+            local_q_len,
+            skip_ulysses=skip_ulysses,
+        )
         if attention_mask is not None and attention_mask.ndim >= 3:
             kv_len = attention_mask.shape[-1]
             if attention_mask.shape[-2] != q_len:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from typing import Any
 
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
@@ -25,14 +26,14 @@ logger = logging.get_logger(__name__)
 
 
 class DeepseekV4Config(_DeepseekV4Config):
-    """DeepSeek-V4, plus the two fields of the Lightning Indexer KL objective.
+    """DeepSeek-V4 config with Lightning Indexer KL and DSpark MTP fields.
 
-    The objective is a training objective, not a kernel backend, so it is
-    configured the way this model's other auxiliary objective already is:
-    ``output_router_logits`` / ``router_aux_loss_coef`` are fields of the model
-    config, folded into the loss in ``DeepseekV4ForCausalLM.forward`` from
-    ``self.config``, and ``dsa_indexer_loss`` / ``dsa_indexer_loss_coef`` sit
-    beside them and are read the same way. The neighbouring
+    The objectives and DSpark draft-stage shape are configured on the model
+    config rather than on the ops config: ``output_router_logits`` /
+    ``router_aux_loss_coef`` are fields of the model config, folded into the
+    loss in ``DeepseekV4ForCausalLM.forward`` from ``self.config``, and
+    ``dsa_indexer_loss`` / ``dsa_indexer_loss_coef`` as well as the DSpark
+    ``mtp.*`` fields sit beside them and are read the same way. The neighbouring
     ``dsa_indexer_implementation`` / ``dsa_attention_implementation`` stay on
     the ops config, which is implementation selection and nothing else.
 
@@ -40,13 +41,11 @@ class DeepseekV4Config(_DeepseekV4Config):
     ``model.model_config`` reach the config as ``**kwargs`` to
     ``PreTrainedConfig.from_dict``, which applies only those keys the
     constructed config already answers ``hasattr`` for and drops the rest
-    silently -- no error, no warning. An undeclared ``dsa_indexer_loss: true``
-    would therefore parse, launch, train the language-model objective alone and
-    report no indexer metric, which is the exact silent no-op every other gate
-    in this feature exists to refuse. Declaring the two fields is what makes the
-    YAML reach the model at all.
+    silently -- no error, no warning. Declaring the fields here is what makes
+    both ``config.json`` entries and ``model.model_config`` YAML overrides reach
+    the model.
 
-    Validated in ``validate_build_prerequisites`` below rather than in a
+    Validated in ``validate_build_prerequisites`` below rather than in
     ``__post_init__``: ``from_dict`` runs ``__post_init__`` on the on-disk values
     and only then ``setattr``s the overrides, so a bound checked there would see
     ``config.json`` and never the YAML that contradicts it.
@@ -54,35 +53,131 @@ class DeepseekV4Config(_DeepseekV4Config):
 
     dsa_indexer_loss: bool = False
     dsa_indexer_loss_coef: float = 1.0
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 128799
+    dspark_target_layer_ids: list[int] | None = None
+    dspark_markov_rank: int = 256
+    dspark_n_routed_experts: int | None = None
+    dspark_num_experts_per_tok: int | None = None
+    mtp_loss_coef: float = 1.0
+    freeze_mtp: bool = False
+
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        if "num_nextn_predict_layers" in kwargs:
+            object.__setattr__(instance, "_explicit_num_nextn_predict_layers", True)
+        return instance
+
+    def __post_init__(self, **kwargs):
+        explicit_num_nextn = bool(self.__dict__.pop("_explicit_num_nextn_predict_layers", False))
+        legacy_compress_ratios = kwargs.get("compress_ratios")
+        legacy_n_mtp_layers = kwargs.pop("n_mtp_layers", None)
+        super().__post_init__(**kwargs)
+        if legacy_n_mtp_layers is not None:
+            self.num_nextn_predict_layers = legacy_n_mtp_layers
+        elif (
+            legacy_compress_ratios is not None
+            and len(legacy_compress_ratios) > self.num_hidden_layers
+            and not explicit_num_nextn
+        ):
+            # Released DeepSeek-V4-Flash checkpoints ship 43+3 entries in
+            # ``compress_ratios`` (3 trailing zeros for ``mtp.0..2``) while leaving
+            # ``num_nextn_predict_layers`` at the upstream default of 1.
+            self.num_nextn_predict_layers = len(legacy_compress_ratios) - self.num_hidden_layers
+
+        if self.dspark_target_layer_ids is None and self.num_hidden_layers > 0:
+            self.dspark_target_layer_ids = list(range(max(0, self.num_hidden_layers - 3), self.num_hidden_layers))
+        elif self.dspark_target_layer_ids is not None:
+            self.dspark_target_layer_ids = list(self.dspark_target_layer_ids)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, Any], **kwargs):
+        config_dict = dict(config_dict)
+        on_disk_n = config_dict.get("num_hidden_layers", cls.num_hidden_layers)
+        on_disk_default_targets = (
+            list(range(max(0, on_disk_n - 3), on_disk_n)) if isinstance(on_disk_n, int) and on_disk_n > 0 else None
+        )
+        raw_on_disk_targets = config_dict.get("dspark_target_layer_ids")
+        used_default_targets = raw_on_disk_targets is None or (
+            isinstance(raw_on_disk_targets, (list, tuple)) and list(raw_on_disk_targets) == on_disk_default_targets
+        )
+        compress_ratios = kwargs.get("compress_ratios", config_dict.get("compress_ratios"))
+        n_hidden = kwargs.get("num_hidden_layers", on_disk_n)
+        if (
+            compress_ratios is not None
+            and isinstance(n_hidden, int)
+            and len(compress_ratios) > n_hidden
+            and config_dict.get("num_nextn_predict_layers") == 1
+            and "num_nextn_predict_layers" not in kwargs
+            and "n_mtp_layers" not in config_dict
+            and "n_mtp_layers" not in kwargs
+        ):
+            # Released DeepSeek-V4-Flash config.json files store the upstream
+            # placeholder ``"num_nextn_predict_layers": 1`` alongside 43+3
+            # ``compress_ratios`` entries; strip the on-disk placeholder when the
+            # caller did not explicitly override ``num_nextn_predict_layers``.
+            config_dict.pop("num_nextn_predict_layers", None)
+
+        result = super().from_dict(config_dict, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        if "num_hidden_layers" in kwargs:
+            if "layer_types" not in kwargs and config.layer_types is not None:
+                if len(config.layer_types) < config.num_hidden_layers:
+                    raise ValueError(
+                        "Pass layer_types explicitly when the num_hidden_layers override increases the layer count."
+                    )
+                config.layer_types = list(config.layer_types[: config.num_hidden_layers])
+            if "mlp_layer_types" not in kwargs and config.mlp_layer_types is not None:
+                if len(config.mlp_layer_types) < config.num_hidden_layers:
+                    raise ValueError(
+                        "Pass mlp_layer_types explicitly when the num_hidden_layers override increases the layer count."
+                    )
+                config.mlp_layer_types = list(config.mlp_layer_types[: config.num_hidden_layers])
+            if "dspark_target_layer_ids" not in kwargs and used_default_targets:
+                config.dspark_target_layer_ids = (
+                    list(range(max(0, config.num_hidden_layers - 3), config.num_hidden_layers))
+                    if config.num_hidden_layers > 0
+                    else None
+                )
+        return result
+
+    def moe_config_for_layer(self, layer_idx: int) -> tuple[int, int]:
+        """Return ``(n_routed_experts, num_experts_per_tok)`` for backbone or DSpark layer ``layer_idx``."""
+        if layer_idx < self.num_hidden_layers:
+            return self.n_routed_experts, self.num_experts_per_tok
+        return (
+            self.dspark_n_routed_experts or self.n_routed_experts,
+            self.dspark_num_experts_per_tok or self.num_experts_per_tok,
+        )
+
+    def _validate_mtp_prerequisites(self) -> None:
+        if not isinstance(self.freeze_mtp, bool):
+            raise TypeError(f"freeze_mtp must be a bool, got {self.freeze_mtp!r} ({type(self.freeze_mtp).__name__}).")
+        mtp_coef = self.mtp_loss_coef
+        if isinstance(mtp_coef, bool) or not isinstance(mtp_coef, (int, float)):
+            raise TypeError(f"mtp_loss_coef must be a number, got {mtp_coef!r} ({type(mtp_coef).__name__}).")
+        if not math.isfinite(mtp_coef) or mtp_coef < 0:
+            raise ValueError(
+                f"mtp_loss_coef={mtp_coef!r} must be finite and non-negative. Use 0.0 to switch the term off."
+            )
+        if self.num_nextn_predict_layers > 0 and self.dspark_block_size > 0:
+            if not self.dspark_target_layer_ids:
+                raise ValueError("dspark_target_layer_ids must be non-empty when DSpark MTP stages are enabled.")
+            for layer_idx in self.dspark_target_layer_ids:
+                if (
+                    isinstance(layer_idx, bool)
+                    or not isinstance(layer_idx, int)
+                    or not (0 <= layer_idx < self.num_hidden_layers)
+                ):
+                    raise ValueError(
+                        f"dspark_target_layer_ids contains {layer_idx!r}, outside [0, {self.num_hidden_layers})."
+                    )
 
     def validate_build_prerequisites(self) -> None:
-        """Refuse a Lightning Indexer KL objective this run cannot actually train.
-
-        ``build_foundation_model`` calls this on any config that defines it, once the
-        config is finished and before any rank reads a weight -- 54.8 GB for
-        DeepSeek-V4-Flash, which is the cost of learning from the first forward
-        instead that three lines of YAML disagree with each other.
-
-        It lives on the config rather than in the generic builder because
-        everything it knows is DeepSeek-V4's: two of its own fields, and which kernels
-        those fields require. A generic model builder holding a list of model names is
-        a list that the next model has to be remembered into. Here there is nothing to
-        remember -- ``model.model_config`` is DeepSeek-V4's config precisely when the
-        model is DeepSeek-V4.
-
-        What it needs from outside is the installed ops config: the objective's
-        student distribution is the TileLang indexer's per-slot scores and its teacher
-        is the TileLang sparse attention's log-sum-exp, and those two are kernel
-        selections rather than model fields. Read off the installed singleton, not
-        passed in, so that the hook stays a plain no-argument call that any config can
-        implement.
-
-        ``DeepseekV4Attention.forward`` refuses the same two on its first forward and
-        that gate stays: it covers the paths that never come through
-        ``build_foundation_model``, such as a test building a model straight from
-        ``_from_config``.
-        """
+        """Refuse an invalid DSpark MTP or Lightning Indexer KL configuration before weight loading."""
         from veomni.ops.config import get_ops_config
+
+        self._validate_mtp_prerequisites()
 
         enabled = self.dsa_indexer_loss
         if not isinstance(enabled, bool):
