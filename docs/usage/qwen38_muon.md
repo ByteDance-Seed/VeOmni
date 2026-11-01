@@ -10,7 +10,8 @@ Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
 - FP32 master weights and FP32 optimizer states; BF16 model compute copies.
 - Muon: Nesterov momentum 0.95, eight explicitly pinned Polar Express iterations,
   Frobenius normalization epsilon `1e-14`, update scale `0.2*sqrt(max(rows, cols))`.
-  Hardware HF32/TF32 down-conversion and autocast are disabled during NS.
+  Autocast and Ascend HF32 are disabled during NS. CUDA TF32 must already be
+  disabled by the caller, using IEEE FP32 (see below).
 - QSA Q/K/V and GDN Q/K/V input maps are orthogonalized separately per head.
   The interleaved QSA output-gate rows use AdamW within the same Parameter.
 - Expert gate/up halves are separate matrices, independently per expert.
@@ -52,7 +53,9 @@ whole training world. Directly constructed distributed optimizers must pass
 `cuda_precision_group`, and custom `MultiOptimizer` users must pass the same
 complete communication domain and enable `qwen38_cuda_guard` on every
 participant. A custom subgroup is valid only for an independent training
-domain with no dependent collectives outside it. CUDA Muon steps do not support
+domain with no dependent collectives outside it. When calling optimizer
+factories directly, every rank in the domain must supply the same optimizer
+type and call the factory in the same order. CUDA Muon steps do not support
 closures or optimizer step hooks, which could change precision after the
 preflight. For a `MultiOptimizer`, the only supported exact child types are
 `Qwen38MuonAdamW`, `torch.optim.AdamW`, `CPUOffloadAdamW`, `FullFP32AdamW` and

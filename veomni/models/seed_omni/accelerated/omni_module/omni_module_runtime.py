@@ -175,7 +175,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 if not self.wrap_omni_model:
                     # Parallel-state scoping for recompute rides in the policy; the
                     # apply step inside ``_build_parallelized_model`` is the last writer.
-                    self._build_optimizer()
+                    self._build_optimizer_checked()
                     self.build_checkpoint()
 
     @property
@@ -454,7 +454,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         with self._scoped():
             self._apply_recompute_policy()
-            self._build_optimizer()
+            self._build_optimizer_checked()
             self.build_checkpoint()
 
     def _apply_recompute_policy(self) -> None:

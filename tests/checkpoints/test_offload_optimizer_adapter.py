@@ -8,8 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.optimizer import MultiOptimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _dtype(optimizer, param, field):
@@ -315,6 +319,7 @@ def _adapter_load_failure_worker(rank, checkpoint, endpoint):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_registered_adapter_one_rank_load_failure_stops_all_ranks(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 

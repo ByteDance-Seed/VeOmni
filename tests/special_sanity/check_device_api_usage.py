@@ -36,6 +36,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/device.py",
     # Muon validates CUDA matmul precision with backend-specific APIs.
     "veomni/optim/qwen38_muon.py",
+    # The optimizer factory identifies the CUDA/NCCL domain for Muon's
+    # collective IEEE-FP32 preflight, including CPU-offloaded parameters.
+    "veomni/optim/optimizer.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",
@@ -63,6 +66,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/ci/test_accelerator.py",
     # EP option tests use literal backend names to verify cross-device rejection.
     "tests/ci/test_ep_hccl_options.py",
+    # Gloo failure-propagation tests mock an available CUDA device to verify
+    # that the process-group backend still selects CPU tensors.
+    "tests/utils/test_dist_utils_group.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
@@ -74,6 +80,11 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/distributed/test_async_activation_offload.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
+    # These Muon tests exercise CUDA-specific precision settings and mocks.
+    "tests/optim/test_qwen38_cuda_native.py",
+    "tests/optim/test_qwen38_cuda_preflight.py",
+    "tests/optim/test_qwen38_muon.py",
+    "tests/optim/test_qwen38_muon_device.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
