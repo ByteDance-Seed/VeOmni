@@ -129,7 +129,9 @@ over the same group. The combined degree must divide both GDN key and value
 head counts. This is not recurrent-state context sharding for GDN.
 
 Vision uses FlashAttention/Ulysses over that complete sequence group, with
-local patch rows and global varlen metadata. Eager/SDPA vision remains
+local patch rows and global varlen metadata. Vision attention head count must
+also be divisible by the combined sequence-parallel degree, including for
+text-only batches that execute FSDP dummy vision forwards. Eager/SDPA vision remains
 unsupported under SP. Combined degree 32 is not supported by a real model
 with only 16 GDN key heads; enabling the flag does not bypass head constraints.
 Hardware numerical and cold-resume qualification are recorded per profile,

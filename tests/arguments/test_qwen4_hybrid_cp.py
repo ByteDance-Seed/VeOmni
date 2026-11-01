@@ -59,6 +59,7 @@ def test_false_hybrid_opt_in_preserves_single_axis_topology(monkeypatch):
 
 @pytest.mark.parametrize("npu", [False, True])
 def test_hybrid_model_guard_keeps_other_families_closed(monkeypatch, npu):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, ulysses_size=8))
     monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", npu)
