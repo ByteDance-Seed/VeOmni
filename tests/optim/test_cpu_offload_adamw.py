@@ -25,6 +25,48 @@ def test_offload_pattern_requires_trainable_match():
     assert not selected[1]["cpu_offload"] and selected[1]["params"] == [model.weight]
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offload", [False, True])
+def test_moment_dtype_strings_match_torch_dtype_updates(dtype, offload):
+    parameters = [torch.nn.Parameter(torch.tensor([1.0, -0.5], dtype=torch.bfloat16)) for _ in range(2)]
+    configured = [str(dtype).removeprefix("torch."), dtype]
+    optimizers = [
+        CPUOffloadAdamW(
+            [{"params": [param], "cpu_offload": offload}],
+            resident_moment_dtype=moment_dtype,
+            cpu_moment_dtype=moment_dtype,
+        )
+        for param, moment_dtype in zip(parameters, configured, strict=True)
+    ]
+    for _ in range(3):
+        for param, optimizer in zip(parameters, optimizers, strict=True):
+            param.grad = torch.tensor([0.25, -0.125], dtype=param.dtype)
+            optimizer.step()
+    torch.testing.assert_close(parameters[0], parameters[1], rtol=0, atol=0)
+    for key, expected_dtype in (("master_weight", torch.float32), ("exp_avg", dtype), ("exp_avg_sq", dtype)):
+        left, right = (optimizer.state[param][key] for param, optimizer in zip(parameters, optimizers, strict=True))
+        assert left.dtype == right.dtype == expected_dtype
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
+def test_builder_applies_configured_moment_dtypes_to_each_group():
+    model = torch.nn.Linear(2, 2)
+    optimizer = build_optimizer(
+        model,
+        optimizer_type="cpu_offload_adamw",
+        cpu_offload_param_patterns=["weight"],
+        cpu_offload_resident_moment_dtype="bfloat16",
+        cpu_offload_cpu_moment_dtype="float32",
+    )
+    for param in model.parameters():
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    leaf = optimizer.optimizers_dict["adamw"]
+    for param, dtype in ((model.weight, torch.float32), (model.bias, torch.bfloat16)):
+        assert leaf.state[param]["master_weight"].dtype == torch.float32
+        assert leaf.state[param]["exp_avg"].dtype == leaf.state[param]["exp_avg_sq"].dtype == dtype
+
+
 def test_yaml_beta_sequence_has_immutable_optimizer_groups(tmp_path):
     from veomni.arguments.arguments_types import OptimizerConfig
     from veomni.arguments.parser import _instantiate_recursive
