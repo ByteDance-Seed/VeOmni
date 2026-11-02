@@ -695,8 +695,9 @@ class TestGlobalStateCallbackJobState:
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
-        assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_count == 2
+        assert mock_dist.all_reduce.call_args_list[0].kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_args_list[1].kwargs["op"] is torch.distributed.ReduceOp.MAX
 
     def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False

@@ -153,6 +153,14 @@ earlier checkpoint, write the new run to a different output directory to avoid
 colliding with checkpoints from the previous run. A same-step export can
 reuse an existing checkpoint only when its model, optimizer and trainer state
 have been proven to belong to the same completed save.
+Trainer sidecars record the generation of each `MultiOptimizer` checkpoint.
+An absent sidecar, a missing generation, or a trainer step/generation that
+differs from the restored optimizer stops resume before training. An older
+unversioned sidecar requires a verified migration or a fresh weights-only run;
+it is not silently combined with a restored optimizer and scheduler. Matching
+step and generation alone do not prove exact dataloader or RNG recovery.
+If a restored run has not established a same-step save receipt, an immediate
+export to the already completed step fails rather than overwriting that DCP.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
