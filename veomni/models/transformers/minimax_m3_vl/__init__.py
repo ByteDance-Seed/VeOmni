@@ -53,7 +53,7 @@ def register_minimax_m3_vl_modeling(architecture: str):
     else:
         from .generated.patched_modeling_minimax_m3_vl_gpu import MiniMaxM3SparseForConditionalGeneration
 
-    if "ForConditionalGeneration" not in architecture:
+    if architecture != "MiniMaxM3SparseForConditionalGeneration":
         raise ValueError(
             f"MiniMax M3 VL supports only MiniMaxM3SparseForConditionalGeneration, got architecture {architecture!r}."
         )
