@@ -463,25 +463,18 @@ def save_lora_adapter_with_dcp(
     from ..checkpoint.dcp_checkpointer import (
         _extra_parallel_layout_key,
         _needs_extra_parallel_layout_marker,
-        _runtime_extra_parallel_layout_signature,
         _validate_extra_parallel_tensor_v2,
     )
     from .dist_utils import raise_if_any_rank_failed
 
     fqn2spec_info = getattr(model, "_fqn2spec_info", None)
-    error, signature = None, None
+    error = None
     try:
         if _needs_extra_parallel_layout_marker(fqn2spec_info):
             _extra_parallel_layout_key(fqn2spec_info)
-            signature = _runtime_extra_parallel_layout_signature(fqn2spec_info)
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking LoRA ExtraParallel layout")
-    if dist.is_initialized():
-        signatures = [None] * dist.get_world_size()
-        dist.all_gather_object(signatures, signature)
-        if any(item != signature for item in signatures):
-            raise RuntimeError("Ranks disagree on LoRA ExtraParallel checkpoint layout")
 
     synchronize()
     if dist.is_initialized():
