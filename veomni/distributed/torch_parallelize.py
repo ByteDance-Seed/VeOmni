@@ -16,6 +16,7 @@
 import os
 import types
 from collections.abc import Collection, Mapping
+from dataclasses import replace
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -894,7 +895,11 @@ def parallelize_model_fsdp2(
         # Child first: the parent group excludes MLP parameters automatically.
         if id(layer_mod) in dense_mlp_pairs:
             _, dense_mlp = dense_mlp_pairs[id(layer_mod)]
-            fully_shard(dense_mlp, **fsdp_kwargs)
+            dense_mlp_fsdp_kwargs = dict(fsdp_kwargs)
+            if mixed_precision.enable:
+                # Keep the output cast at the parent block, after the residual addition.
+                dense_mlp_fsdp_kwargs["mp_policy"] = replace(fsdp_kwargs["mp_policy"], output_dtype=None)
+            fully_shard(dense_mlp, **dense_mlp_fsdp_kwargs)
             if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[dense_mlp] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(dense_mlp)
