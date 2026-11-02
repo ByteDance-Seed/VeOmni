@@ -59,13 +59,13 @@ def select_blocks(
     scores = torch.einsum("bshd,bnd->bsnh", index_q.float(), compressed_keys.float())
     scores = torch.relu(scores).sum(dim=-1) / head_dim**0.5
 
-    rows = torch.arange(seq_len, device=index_q.device)
-    blocks = torch.arange(compressed_len, device=index_q.device)
-    visible = blocks[None, :, None] < ((rows[:, None] + 1) // compress_ratio)[None, :, None]
+    rows = torch.arange(seq_len, device=index_q.device)[:, None]
+    blocks = torch.arange(compressed_len, device=index_q.device)[None, :]
+    visible = blocks < (rows + 1) // compress_ratio  # [S, N]: row s may pick fully covered blocks only
     scores = scores.masked_fill(~visible, -1.0)
 
     top_scores, top_blocks = scores.topk(width, dim=-1)
-    top_valid = visible.gather(-1, top_blocks)
+    top_valid = visible[None].expand(batch, -1, -1).gather(-1, top_blocks)
     indices = top_blocks.to(torch.int32).masked_fill(~top_valid, -1)
     top_scores = top_scores.float().masked_fill(~top_valid, float("-inf"))
 
