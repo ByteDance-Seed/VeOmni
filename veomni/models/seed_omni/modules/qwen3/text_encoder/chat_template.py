@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....utils.conversation import ConversationItem
-from ...text_encoder.chat_template import TextEncoderChatTemplate
+from ...text_encoder.chat_template import (
+    _MEDIA_WRAP_GROUP_KEY,
+    TextEncoderChatTemplate,
+    resolve_media_token_len,
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,7 @@ class Qwen3VLChatTemplate(Qwen3ChatTemplate):
         out: list[ConversationItem] = []
         dummy_parts: list[ConversationItem] = []
         prev_role: str | None = None
+        next_wrap_group = 0
 
         def close_turn(role: str) -> None:
             out.append(
@@ -131,9 +136,29 @@ class Qwen3VLChatTemplate(Qwen3ChatTemplate):
             if item.type == "text":
                 out.append(self._build_conversation_item("text", str(item.value), role))
             elif item.type in ("image", "video"):
-                out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
+                resolve_media_token_len(item)
+                wrap_group = next_wrap_group
+                next_wrap_group += 1
+                item.meta[_MEDIA_WRAP_GROUP_KEY] = wrap_group
+                out.append(
+                    self._build_conversation_item(
+                        "text",
+                        markers.vision_start_token,
+                        role,
+                        loss_mask=0,
+                        meta={_MEDIA_WRAP_GROUP_KEY: wrap_group},
+                    )
+                )
                 out.append(item)
-                out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
+                out.append(
+                    self._build_conversation_item(
+                        "text",
+                        markers.vision_end_token,
+                        role,
+                        loss_mask=0,
+                        meta={_MEDIA_WRAP_GROUP_KEY: wrap_group},
+                    )
+                )
             else:
                 raise ValueError(f"Qwen3-VL text encoder only supports text/image/video items, got {item.type!r}")
 

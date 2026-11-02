@@ -250,7 +250,7 @@ class OmniProcessor:
         uses :meth:`__call__` with ``inference=True``.
 
         ``max_seq_len`` is forwarded to text-encoder preprocessors so training
-        left-truncates each sample to ``data.max_seq_len`` before dyn_bsz.
+        truncates each sample to ``data.max_seq_len`` before dyn_bsz.
         """
         for preprocessor in self._preprocessors.values():
             preprocessor(

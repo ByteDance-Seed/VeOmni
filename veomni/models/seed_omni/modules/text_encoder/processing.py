@@ -59,8 +59,8 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
     def _tokenize_conversation_kwargs(self, inference: bool, **kwargs: Any) -> dict[str, Any]:
         """Extra kwargs forwarded to :meth:`TextEncoderChatTemplate.tokenize_conversation`."""
         out: dict[str, Any] = {"add_generation_prompt": inference}
-        # Training passes ``max_seq_len`` so overlong samples are left-truncated
-        # before dyn_bsz / collation (classic text-transform contract). Inference
+        # Training passes ``max_seq_len`` so overlong samples are suffix-truncated
+        # before dyn_bsz / collation (classic ChatML contract). Inference
         # leaves it unset — generation owns its own length budget.
         max_seq_len = kwargs.get("max_seq_len")
         if max_seq_len is not None and not inference:

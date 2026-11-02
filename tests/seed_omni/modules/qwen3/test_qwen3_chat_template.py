@@ -115,18 +115,87 @@ def _short_dialog() -> list[ConversationItem]:
     ]
 
 
-def test_qwen3_tokenize_conversation_left_truncates_to_max_seq_len():
+def test_qwen3_tokenize_conversation_suffix_truncates_and_preserves_assistant_answer():
     tmpl = _template()
-    full = tmpl.tokenize_conversation(_short_dialog())
-    full_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in full)
-    assert full_len > 8
 
-    truncated = tmpl.tokenize_conversation(_short_dialog(), max_seq_len=8)
-    trunc_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in truncated)
-    assert trunc_len == 8
+    def _long_prompt_short_answer() -> list[ConversationItem]:
+        return [
+            ConversationItem(type="text", value="x" * 64, role="user"),
+            ConversationItem(type="text", value="42", role="assistant"),
+        ]
+
+    full = tmpl.tokenize_conversation(_long_prompt_short_answer())
     full_ids = torch.cat(tmpl.pack_input_ids(full))
+    full_labels = torch.cat([part.meta["labels"] for part in full])
+    full_mask = torch.cat([part.meta["attention_mask"] for part in full])
+
+    # Budget is smaller than the user prompt alone, so prefix truncation would
+    # discard the entire assistant response and leave only -100 labels.
+    budget = 40
+    assert int(full[0].meta[_OMNI_TOKEN_LEN]) > budget
+
+    truncated = tmpl.tokenize_conversation(_long_prompt_short_answer(), max_seq_len=budget)
+    trunc_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in truncated)
+    assert trunc_len == budget
+
     trunc_ids = torch.cat(tmpl.pack_input_ids(truncated))
-    assert torch.equal(trunc_ids, full_ids[:8])
+    trunc_labels = torch.cat([part.meta["labels"] for part in truncated])
+    trunc_mask = torch.cat([part.meta["attention_mask"] for part in truncated])
+    assert torch.equal(trunc_ids, full_ids[-budget:])
+    assert torch.equal(trunc_labels, full_labels[-budget:])
+    assert torch.equal(trunc_mask, full_mask[-budget:])
+    assert int((trunc_labels != -100).sum()) == int((full_labels != -100).sum()) > 0
+
+
+def test_qwen3vl_tokenize_conversation_budgets_media_rows_and_keeps_vision_wrappers_atomic():
+    tmpl = Qwen3VLChatTemplate(FakeTokenizer())
+
+    def _mm_dialog() -> list[ConversationItem]:
+        return [
+            ConversationItem(type="text", value="p" * 30, role="user"),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(16, 8),
+                role="user",
+                meta={"_omni_grid": [1, 4, 4]},  # 1 * 4 * 4 // 2**2 == 4 merged visual tokens
+            ),
+            ConversationItem(type="text", value="?", role="user"),
+            ConversationItem(type="text", value="ok", role="assistant"),
+        ]
+
+    full = tmpl.tokenize_conversation(_mm_dialog())
+    img_items = [part for part in full if part.type == "image"]
+    assert len(img_items) == 1
+    assert img_items[0].meta[_OMNI_TOKEN_LEN] == 4
+
+    vs_ids = torch.tensor([ord(c) for c in "<|vision_start|>"], dtype=torch.long)
+    ve_ids = torch.tensor([ord(c) for c in "<|vision_end|>"], dtype=torch.long)
+
+    # 1) Budget fits the assistant turn, the trailing user text, the atomic
+    #    (<|vision_start|>, image, <|vision_end|>) group, and 5 tokens of the
+    #    leading user preamble.
+    tail_after_image_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in full[-2:])
+    media_group_len = int(vs_ids.numel()) + 4 + int(ve_ids.numel())
+    keep_media_budget = tail_after_image_len + media_group_len + 5
+
+    kept_with_media = tmpl.tokenize_conversation(_mm_dialog(), max_seq_len=keep_media_budget)
+    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in kept_with_media) == keep_media_budget
+    img_indices = [i for i, part in enumerate(kept_with_media) if part.type == "image"]
+    assert len(img_indices) == 1
+    img_idx = img_indices[0]
+    assert torch.equal(kept_with_media[img_idx - 1].value, vs_ids)
+    assert torch.equal(kept_with_media[img_idx + 1].value, ve_ids)
+
+    # 2) Budget is 1 token short of fitting the (<|vision_start|>, image, <|vision_end|>)
+    #    group ahead of the tail text: the entire media group (image + both wrappers)
+    #    must be dropped together without leaving a partial or dangling wrapper.
+    drop_media_budget = tail_after_image_len + media_group_len - 1
+    kept_without_media = tmpl.tokenize_conversation(_mm_dialog(), max_seq_len=drop_media_budget)
+    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in kept_without_media) == tail_after_image_len
+    assert all(part.type == "text" for part in kept_without_media)
+    for part in kept_without_media:
+        assert not torch.equal(part.value, vs_ids)
+        assert not torch.equal(part.value, ve_ids)
 
 
 def test_qwen3_text_preprocessor_forwards_max_seq_len_when_training():

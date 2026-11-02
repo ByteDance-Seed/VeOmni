@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -5,6 +6,68 @@ from typing import Any
 import torch
 
 from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, ItemRole, ItemType, ItemValue
+
+
+# Metadata key associating a media row with its surrounding template wrapper
+# rows (e.g. ``<|vision_start|>`` / ``<|vision_end|>`` in ``Qwen3VLChatTemplate``)
+# so ``merge_text_embeds`` and ``truncate_to_max_seq_len`` keep them together as
+# an indivisible span.
+_MEDIA_WRAP_GROUP_KEY = "_omni_media_wrap_group"
+
+
+def resolve_media_token_len(
+    item: ConversationItem,
+    *,
+    spatial_merge_size: int = 2,
+    patch_size: int = 16,
+    temporal_patch_size: int = 2,
+) -> int:
+    """Ensure a non-text ``ConversationItem`` records a positive ``_omni_token_len``.
+
+    Precedence:
+    1. Existing positive ``item.meta[_OMNI_TOKEN_LEN]`` (set by a module preprocessor).
+    2. ``_omni_grid`` / ``grid_thw`` ``[t, h, w]`` → ``(t * h * w) // spatial_merge_size**2``.
+    3. Tensor / PIL / ``VideoInputs`` payload dimensions using the Qwen3-VL patch/merge stride.
+    4. Fallback of ``1`` for symbolic placeholders in unit tests.
+    """
+    existing = item.meta.get(_OMNI_TOKEN_LEN)
+    if existing is not None and int(existing) > 0:
+        return int(existing)
+
+    grid = item.meta.get("_omni_grid", item.meta.get("grid_thw"))
+    if grid is not None:
+        if isinstance(grid, torch.Tensor):
+            t, h, w = (int(x) for x in grid.reshape(-1).tolist())
+        else:
+            t, h, w = (int(x) for x in grid)
+        token_len = max(1, (t * h * w) // (spatial_merge_size * spatial_merge_size))
+        item.meta[_OMNI_TOKEN_LEN] = token_len
+        return token_len
+
+    val = getattr(item.value, "video", item.value)
+    stride = patch_size * spatial_merge_size
+    if isinstance(val, torch.Tensor):
+        if val.dim() == 2:
+            token_len = max(1, int(val.shape[0]))
+        elif val.dim() == 3:
+            h_tok = max(1, math.ceil(int(val.shape[-2]) / stride))
+            w_tok = max(1, math.ceil(int(val.shape[-1]) / stride))
+            token_len = h_tok * w_tok
+        elif val.dim() == 4:
+            t_tok = max(1, math.ceil(int(val.shape[0]) / temporal_patch_size))
+            h_tok = max(1, math.ceil(int(val.shape[-2]) / stride))
+            w_tok = max(1, math.ceil(int(val.shape[-1]) / stride))
+            token_len = t_tok * h_tok * w_tok
+        else:
+            token_len = max(1, int(val.numel()))
+    elif hasattr(val, "size") and isinstance(getattr(val, "size", None), tuple) and len(val.size) == 2:
+        w, h = int(val.size[0]), int(val.size[1])
+        token_len = max(1, math.ceil(h / stride)) * max(1, math.ceil(w / stride))
+    else:
+        token_len = 1
+
+    item.meta[_OMNI_TOKEN_LEN] = token_len
+    return token_len
 
 
 @dataclass(frozen=True)
@@ -74,9 +137,10 @@ class TextEncoderChatTemplate:
         so the request is left ready for the model to start decoding; training
         leaves it off (the assistant turn is already in the data).
 
-        ``max_seq_len`` (training) truncates the merged conversation to the first
-        ``max_seq_len`` tokens — same left-truncate contract as the classic text
-        transforms — so a single overlong sample cannot exceed ``data.max_seq_len``.
+        ``max_seq_len`` (training) truncates the merged conversation to the last
+        ``max_seq_len`` tokens — same suffix-truncation contract as classic
+        ``ChatmlTemplate`` — so an overlong prompt does not discard the assistant
+        response at the tail.
         """
         parts = self.apply_chat_template(sample)
         if add_generation_prompt:
@@ -89,35 +153,75 @@ class TextEncoderChatTemplate:
 
     @staticmethod
     def truncate_to_max_seq_len(parts: list[ConversationItem], max_seq_len: int) -> list[ConversationItem]:
-        """Keep the first ``max_seq_len`` tokens across ``parts`` (left truncate).
+        """Keep the last ``max_seq_len`` tokens across ``parts`` (suffix truncate).
 
-        Walks items in order. Text rows are sliced in place (``value`` / ``labels`` /
-        ``attention_mask`` / ``_omni_token_len``). Non-text rows that do not fit in
-        the remaining budget are dropped together with everything after them —
-        partial media truncation is module-specific and out of scope here.
+        Walks non-dummy units from the end so assistant responses at the tail of
+        long prompts are preserved (matching classic ``ChatmlTemplate``). Plain
+        text rows are suffix-sliced in place (``value`` / ``labels`` /
+        ``attention_mask`` / ``_omni_token_len``). Media rows and their associated
+        vision wrapper rows (linked via ``_MEDIA_WRAP_GROUP_KEY``) are budgeted as
+        a single indivisible group: kept together when the full group fits in the
+        remaining token budget, or dropped together (stopping truncation) when it
+        does not. ``is_dummy`` FSDP-anchor items stay at the tail without
+        consuming sequence budget.
         """
         if max_seq_len < 0:
             raise ValueError(f"max_seq_len must be >= 0, got {max_seq_len}.")
-        if max_seq_len == 0:
-            return []
+        dummy_parts = [part for part in parts if part.is_dummy]
+        non_dummy = [part for part in parts if not part.is_dummy]
+        if max_seq_len == 0 or not non_dummy:
+            return dummy_parts
 
-        kept: list[ConversationItem] = []
-        remaining = max_seq_len
-        for part in parts:
-            token_len = int(part.meta.get(_OMNI_TOKEN_LEN, 0))
-            if token_len <= remaining:
-                kept.append(part)
-                remaining -= token_len
+        def _item_token_len(item: ConversationItem) -> int:
+            if item.type != "text":
+                return resolve_media_token_len(item)
+            existing = item.meta.get(_OMNI_TOKEN_LEN)
+            if existing is not None:
+                return int(existing)
+            if isinstance(item.value, torch.Tensor):
+                return int(item.value.numel())
+            return len(str(item.value))
+
+        units: list[tuple[bool, list[ConversationItem], int]] = []
+        idx = 0
+        while idx < len(non_dummy):
+            part = non_dummy[idx]
+            wrap_group = part.meta.get(_MEDIA_WRAP_GROUP_KEY)
+            if wrap_group is not None:
+                end_idx = idx + 1
+                while end_idx < len(non_dummy) and non_dummy[end_idx].meta.get(_MEDIA_WRAP_GROUP_KEY) == wrap_group:
+                    end_idx += 1
+                group_items = non_dummy[idx:end_idx]
+                group_len = sum(_item_token_len(item) for item in group_items)
+                units.append((True, group_items, group_len))
+                idx = end_idx
                 continue
-            if part.type != "text" or token_len == 0:
-                # Cannot partially truncate media / empty metadata rows.
+            item_len = _item_token_len(part)
+            units.append((part.type != "text", [part], item_len))
+            idx += 1
+
+        kept_groups_reversed: list[list[ConversationItem]] = []
+        remaining = max_seq_len
+        for is_atomic, group_items, group_len in reversed(units):
+            if group_len <= remaining:
+                kept_groups_reversed.append(group_items)
+                remaining -= group_len
+                if remaining == 0:
+                    break
+                continue
+            if is_atomic or remaining == 0:
+                # Cannot partially slice a media row or its vision wrappers.
                 break
-            part.value = part.value[:remaining]
-            part.meta["labels"] = part.meta["labels"][:remaining]
-            part.meta["attention_mask"] = part.meta["attention_mask"][:remaining]
+            (part,) = group_items
+            part.value = part.value[-remaining:]
+            part.meta["labels"] = part.meta["labels"][-remaining:]
+            part.meta["attention_mask"] = part.meta["attention_mask"][-remaining:]
             part.meta[_OMNI_TOKEN_LEN] = remaining
-            kept.append(part)
+            kept_groups_reversed.append([part])
             break
+
+        kept = [item for group in reversed(kept_groups_reversed) for item in group]
+        kept.extend(dummy_parts)
         return kept
 
     def _build_conversation_item(
@@ -172,7 +276,13 @@ class TextEncoderChatTemplate:
         """
         merged: list[ConversationItem] = []
         for part in parts:
-            if merged and merged[-1].type == "text" and part.type == "text" and merged[-1].role == part.role:
+            if (
+                merged
+                and merged[-1].type == "text"
+                and part.type == "text"
+                and merged[-1].role == part.role
+                and merged[-1].meta.get(_MEDIA_WRAP_GROUP_KEY) == part.meta.get(_MEDIA_WRAP_GROUP_KEY)
+            ):
                 prev = merged[-1]
                 prev.value = torch.cat([prev.value, part.value])
                 prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
