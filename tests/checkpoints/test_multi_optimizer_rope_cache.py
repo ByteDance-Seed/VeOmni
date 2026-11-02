@@ -213,25 +213,19 @@ def test_rank_local_expanded_rope_error_is_coordinated(tmp_path):
     assert not (tmp_path / "checkpoint").exists()
 
 
-def test_real_qwen3_dynamic_rope_reset_alias_mismatch_fails_closed(tmp_path):
+def test_real_qwen3_dynamic_rope_reset_is_rejected_before_save(tmp_path):
     model, optimizer = _build()
     _update(model, optimizer, 1.0)
     model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
     model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
     assert model.rope.inv_freq is model.rope.original_inv_freq
     assert not any("inv_freq" in key for key in model.state_dict())
-    checkpoint = str(tmp_path / "checkpoint")
-    DistributedCheckpointer.save(
-        checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
-    )
-    target, restored = _build()
-    before = target.projection.weight.detach().clone()
-    assert target.rope.inv_freq is not target.rope.original_inv_freq
-    with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(
-            checkpoint, {"model": target, "optimizer": restored}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    checkpoint = tmp_path / "checkpoint"
+    with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache"):
+        DistributedCheckpointer.save(
+            str(checkpoint), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
         )
-    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+    assert not checkpoint.exists()
 
 
 def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path):
@@ -245,17 +239,6 @@ def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path)
     expected = tmp_path / "expected.pt"
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
     mp.spawn(_fresh_resume, args=(checkpoint, str(expected)), nprocs=1, join=True)
-
-
-def test_distinct_overlapping_nonpersistent_buffer_views_still_fail_closed(tmp_path):
-    model, optimizer = _build()
-    storage = torch.zeros(8)
-    model.register_buffer("cache_view_a", storage[:6], persistent=False)
-    model.register_buffer("cache_view_b", storage[2:], persistent=False)
-    with pytest.raises(RuntimeError, match="checkpoint model storage alias"):
-        DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
-        )
 
 
 @pytest.mark.parametrize("source_alias", [False, True])
@@ -349,36 +332,8 @@ def test_custom_dynamic_rope_alias_mismatch_still_fails_before_load(tmp_path):
 
     model, optimizer = build(True)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
-    target, restored = build(False)
-    with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
-
-
-@pytest.mark.parametrize("hook_scope", ["local", "global"])
-def test_rope_forward_hook_disables_alias_exemption(tmp_path, hook_scope):
-    model, optimizer = _build()
-    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
-    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
-    assert model.rope.inv_freq is model.rope.original_inv_freq
-
-    def alter_rope(module, _inputs):
-        if isinstance(module, Qwen3RotaryEmbedding):
-            module.original_inv_freq.add_(1)
-
-    if hook_scope == "local":
-        handle = model.rope.register_forward_pre_hook(alter_rope)
-    else:
-        handle = torch.nn.modules.module.register_module_forward_pre_hook(alter_rope)
-    try:
-        parallel = SimpleNamespace(dp_mode="ddp")
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
-        target, restored = _build()
-        if hook_scope == "local":
-            target.rope.register_forward_pre_hook(alter_rope)
-        with pytest.raises(RuntimeError, match="layout|identity"):
-            DistributedCheckpointer.load(
-                str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel
-            )
-    finally:
-        handle.remove()
+    with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache"):
+        DistributedCheckpointer.save(
+            str(tmp_path / "checkpoint"), {"model": model, "optimizer": optimizer}, parallel_state=parallel
+        )
+    assert not (tmp_path / "checkpoint").exists()

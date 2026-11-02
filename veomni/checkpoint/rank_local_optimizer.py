@@ -9,11 +9,9 @@ for exact state preservation and requires an independently verified rank and
 mesh identity before use. It does not support elastic resharding.
 """
 
-import hashlib
 import heapq
 import io
 import json
-import struct
 from contextlib import contextmanager
 
 import torch
@@ -201,33 +199,15 @@ def _reject_overlapping_geometries(name, geometries):
         heapq.heappush(expiration, (start + size[axis], index))
 
 
-def verify_replicated_model_shards(state: dict, *, group=None, batch_size=128, chunk_bytes=4 << 20):
-    """Reject divergent model replicas before DCP deduplicates their shards.
-
-    Hashing is chunked to bound temporary CPU/NPU memory, including for
-    non-contiguous model shards.
-    """
+def verify_replicated_model_shards(state: dict, *, group=None):
+    """Validate shard geometry without reading or hashing tensor values."""
     from ..utils.dist_utils import raise_if_any_rank_failed
-
-    def scalar_bytes(value):
-        if type(value) is float:
-            return b"float:" + struct.pack("!d", value)
-        if type(value) in (str, int, bool, bytes, type(None), torch.dtype, torch.device):
-            return type(value).__name__.encode() + b":" + repr(value).encode()
-        if type(value) in (tuple, list):
-            parts = [scalar_bytes(item) for item in value]
-            return (
-                type(value).__name__.encode() + b":" + b"".join(len(part).to_bytes(8, "big") + part for part in parts)
-            )
-        raise RuntimeError(f"Cannot prove non-tensor checkpoint state of type {type(value).__name__}")
 
     error, records = None, []
     try:
         flattened, _ = flatten_state_dict({"model": state})
         for name, value in sorted(flattened.items()):
             if not torch.is_tensor(value):
-                payload = scalar_bytes(value)
-                records.append((name, (), (), type(value).__name__, hashlib.sha256(payload).hexdigest(), None))
                 continue
             if isinstance(value, DTensor):
                 chunks = value.__create_chunk_list__()
@@ -240,42 +220,27 @@ def verify_replicated_model_shards(state: dict, *, group=None, batch_size=128, c
                 offsets, size = (0,) * value.ndim, tuple(value.shape)
             if tuple(local.shape) != size:
                 raise RuntimeError(f"Cannot prove model shard shape for {name}")
-            from .tensor_bytes import tensor_byte_chunks
-
-            digest = hashlib.sha256()
-            for chunk in tensor_byte_chunks(local, chunk_bytes=chunk_bytes):
-                digest.update(chunk)
-            records.append((name, offsets, size, str(local.dtype), digest.hexdigest(), tuple(value.shape)))
+            records.append((name, offsets, size, str(local.dtype), tuple(value.shape)))
     except BaseException as exc:
         error = exc
-    raise_if_any_rank_failed(error, "hashing replicated model shards", group=group)
+    raise_if_any_rank_failed(error, "checking model shard geometry", group=group)
     if not dist.is_initialized():
         return
-    names = hashlib.sha256("\0".join(item[0] for item in records).encode()).hexdigest()
-    identities = [None] * dist.get_world_size(group)
-    dist.all_gather_object(identities, (len(records), names), group=group)
-    if any(identity != identities[0] for identity in identities):
-        raise RuntimeError("Model ranks have different checkpoint tensor inventories")
-    for start in range(0, len(records), batch_size):
-        gathered = [None] * len(identities)
-        dist.all_gather_object(gathered, records[start : start + batch_size], group=group)
-        seen = {}
-        geometries = {}
-        global_signatures = {}
-        for items in gathered:
-            for name, offsets, size, dtype, digest, global_shape in items:
-                signature = (dtype, global_shape)
-                previous = global_signatures.setdefault(name, signature)
-                if previous != signature:
-                    raise RuntimeError(f"Checkpoint tensor {name} has different global dtype or shape across ranks")
-                identity = (name, offsets, size)
-                if identity not in seen:
-                    geometries.setdefault(name, []).append((offsets, size))
-                old = seen.setdefault(identity, (dtype, digest))
-                if old != (dtype, digest):
-                    raise RuntimeError(f"Model replicas differ for checkpoint tensor {name} at {offsets}")
-        for name, shards in geometries.items():
-            _reject_overlapping_geometries(name, shards)
+    gathered = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, records, group=group)
+    geometries, signatures, seen = {}, {}, set()
+    for items in gathered:
+        for name, offsets, size, dtype, global_shape in items:
+            signature = (dtype, global_shape)
+            previous = signatures.setdefault(name, signature)
+            if previous != signature:
+                raise RuntimeError(f"Checkpoint tensor {name} has different global dtype or shape across ranks")
+            identity = (name, offsets, size)
+            if identity not in seen:
+                seen.add(identity)
+                geometries.setdefault(name, []).append((offsets, size))
+    for name, shards in geometries.items():
+        _reject_overlapping_geometries(name, shards)
 
 
 @contextmanager

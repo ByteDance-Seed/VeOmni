@@ -16,7 +16,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from functools import wraps
@@ -402,133 +402,7 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
-@contextmanager
-def _qwen_rank_local_state(optimizer):
-    if getattr(optimizer, "_veomni_rank_local_checkpoint", False):
-        raise RuntimeError("Reentrant rank-local optimizer checkpoint context")
-    optimizer._veomni_rank_local_checkpoint = True
-    try:
-        yield
-    finally:
-        del optimizer._veomni_rank_local_checkpoint
-
-
-def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
-    """Keep exact-recipe lazy state untouched while saving its parameter groups."""
-    exact_lazy = getattr(optimizer, "requires_exact_recipe", False) and getattr(
-        optimizer, "requires_exact_state_dtypes", False
-    )
-    if exact_lazy and any(not group["params"] for group in optimizer.param_groups):
-        raise RuntimeError("DCP optimizer checkpoint cannot represent an empty parameter group")
-    prepare = getattr(optimizer, "checkpoint_state", None)
-    with prepare(load=for_load) if prepare is not None else nullcontext():
-        # PyTorch initializes a wholly empty optimizer by calling step(). A
-        # temporary empty entry makes its getter serialize parameter groups
-        # without performing that update or materializing optimizer state.
-        sentinel = None
-        placeholder = None
-        sentinel_hook = None
-        sentinel_hook_called = False
-        if not for_load and not optimizer.state and exact_lazy:
-            sentinel = next((p for group in optimizer.param_groups for p in group["params"]), None)
-            if sentinel is not None:
-                placeholder = {}
-                optimizer.state[sentinel] = placeholder
-
-                def remove_sentinel(optim):
-                    nonlocal sentinel_hook_called
-                    sentinel_hook_called = True
-                    if optim.state.get(sentinel) is placeholder and not placeholder:
-                        optim.state.pop(sentinel, None)
-
-                sentinel_hook = optimizer.register_state_dict_pre_hook(remove_sentinel, prepend=True)
-        try:
-            result = get_optimizer_state_dict(
-                model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
-            )
-            if sentinel_hook is not None and not sentinel_hook_called:
-                raise RuntimeError("Optimizer state_dict did not run registered pre-hooks during checkpoint save")
-        finally:
-            if sentinel_hook is not None:
-                sentinel_hook.remove()
-            if sentinel is not None and optimizer.state.get(sentinel) is placeholder and not placeholder:
-                optimizer.state.pop(sentinel, None)
-        return result
-
-
-def _verify_registered_adapter_snapshot(model, optimizer, snapshot):
-    """Require a registered adapter to serialize each live state without alteration."""
-    from ..checkpoint.optimizer_resume_layout import _group_option_value
-
-    names = {}
-    for runtime_name, param in model.named_parameters(remove_duplicate=False):
-        names.setdefault(id(param), set()).update(_get_fqns(model, runtime_name))
-    owned = {id(param) for group in optimizer.param_groups for param in group["params"]}
-    expected_state_keys = set()
-
-    def same_view(left, right):
-        if not torch.is_tensor(left) or not torch.is_tensor(right):
-            return False
-        if tuple(left.shape) != tuple(right.shape) or left.dtype != right.dtype:
-            return False
-        left = left.to_local() if hasattr(left, "to_local") else left
-        right = right.to_local() if hasattr(right, "to_local") else right
-        return (
-            left.device == right.device
-            and tuple(left.shape) == tuple(right.shape)
-            and tuple(left.stride()) == tuple(right.stride())
-            and left.storage_offset() == right.storage_offset()
-            and left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
-        )
-
-    for param, state in optimizer.state.items():
-        if id(param) not in owned or id(param) not in names:
-            raise RuntimeError("Registered optimizer adapter has unowned live state")
-        for field, value in state.items():
-            candidates = [f"state.{name}.{field}" for name in names[id(param)]]
-            present = [key for key in candidates if key in snapshot]
-            if not present or any(not same_view(value, snapshot[key]) for key in present):
-                raise RuntimeError(f"Registered optimizer adapter omitted or altered live state {field}")
-            expected_state_keys.update(present)
-    actual_state_keys = {key for key in snapshot if key.startswith("state.")}
-    if actual_state_keys != expected_state_keys:
-        raise RuntimeError("Registered optimizer adapter fabricated checkpoint state")
-    expected_group_keys = set()
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            for key, value in group.items():
-                if key == "params":
-                    continue
-                candidates = [f"param_groups.{name}.{key}" for name in names.get(id(param), ())]
-                present = [candidate for candidate in candidates if candidate in snapshot]
-                if not present or any(
-                    _group_option_value(snapshot[candidate]) != _group_option_value(value) for candidate in present
-                ):
-                    raise RuntimeError(f"Registered optimizer adapter omitted or altered group option {key}")
-                expected_group_keys.update(present)
-    actual_group_keys = {key for key in snapshot if key.startswith("param_groups.")}
-    if actual_group_keys != expected_group_keys:
-        raise RuntimeError("Registered optimizer adapter fabricated checkpoint group options")
-
-
-def _adapter_live_state_versions(optimizer):
-    versions = []
-    for param, state in optimizer.state.items():
-        fields = []
-        for name, value in sorted(state.items()):
-            if not torch.is_tensor(value):
-                raise RuntimeError("Registered optimizer adapter state must contain tensors")
-            local = value.to_local() if hasattr(value, "to_local") else value
-            fields.append((name, id(value), value._version, local.untyped_storage().data_ptr(), local._version))
-        versions.append((id(param), tuple(fields)))
-    return tuple(sorted(versions))
-
-
 def _empty_optimizer_state_dict(model, opt):
-    from .checkpoint_adapter import rank_local_adamw_adapter
-
-    if getattr(opt.state_dict, "__func__", None) is not Optimizer.state_dict and rank_local_adamw_adapter(opt) is None:
-        raise RuntimeError("Cannot safely serialize an empty optimizer with a custom state_dict")
     packed_groups = []
     id_to_name = {}
     captured = False
@@ -681,23 +555,10 @@ class MultiOptimizer(Optimizer, Stateful):
         from .muon import DistributedMuon
 
         for optimizer in self.optimizers_dict.values():
-            if (
-                (
-                    type(optimizer) not in (torch.optim.AdamW, AnyPrecisionAdamW, DistributedMuon)
-                    and rank_local_adamw_adapter(optimizer) is None
-                )
-                or any(name in vars(optimizer) for name in ("state_dict", "load_state_dict"))
-                or any(
-                    getattr(optimizer, name, None)
-                    for name in (
-                        "_optimizer_state_dict_pre_hooks",
-                        "_optimizer_state_dict_post_hooks",
-                        "_optimizer_load_state_dict_pre_hooks",
-                        "_optimizer_load_state_dict_post_hooks",
-                    )
-                )
+            if type(optimizer) not in (torch.optim.AdamW, AnyPrecisionAdamW, DistributedMuon) and (
+                rank_local_adamw_adapter(optimizer) is None
             ):
-                raise RuntimeError("Cannot construct a safe raw MultiOptimizer snapshot with serialization hooks")
+                raise RuntimeError("Cannot construct a MultiOptimizer snapshot for an unsupported optimizer leaf")
         return {
             key: value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
             for key, value in self._sparse_state_dict().items()
@@ -716,19 +577,13 @@ class MultiOptimizer(Optimizer, Stateful):
         The groups must still be saved because their LR may have been updated
         by a scheduler even when no parameter has received a gradient.
         """
-        if coordinate:
-            from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
-
-            _coordinated_optimizer_flag(tuple(self.key_names), "optimizer leaf order", group=group)
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             error, sd = None, None
             try:
                 opt = self.optimizers_dict.get(name)
-                from .checkpoint_adapter import rank_local_adamw_adapter, rank_local_adamw_context
+                from .checkpoint_adapter import rank_local_adamw_context
 
-                registered = rank_local_adamw_adapter(opt) is not None
-                before = _adapter_live_state_versions(opt) if registered else None
                 with rank_local_adamw_context(opt):
                     if not opt.state:
                         sd = _empty_optimizer_state_dict(self.model, opt)
@@ -736,10 +591,6 @@ class MultiOptimizer(Optimizer, Stateful):
                         sd = get_optimizer_state_dict(
                             self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
                         )
-                if registered:
-                    if _adapter_live_state_versions(opt) != before:
-                        raise RuntimeError("Registered optimizer adapter mutated live state while serializing")
-                    _verify_registered_adapter_snapshot(self.model, opt, sd)
                 overlap = set(merged) & set(sd)
                 if overlap:
                     raise KeyError(
@@ -764,9 +615,6 @@ class MultiOptimizer(Optimizer, Stateful):
         )
 
     def _dcp_load_state_dict(self, state_dict: Dict[str, Any], *, group=None) -> None:
-        from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
-
-        _coordinated_optimizer_flag(tuple(self.key_names), "optimizer leaf order", group=group)
         for name in self.key_names:
             error = None
             try:

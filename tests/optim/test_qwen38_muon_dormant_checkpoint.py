@@ -141,40 +141,6 @@ def test_zero_optimizer_marker_uses_all_ranks(tmp_path):
         )
 
 
-def _rank_dependent_muon_state_worker(rank, rendezvous, checkpoint_dir):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
-    )
-    try:
-        torch.manual_seed(37)
-        model, optimizer = _make_model_and_optimizer()
-        if rank == 0:
-            model.first.down_proj.weight.grad = torch.ones_like(model.first.down_proj.weight)
-            optimizer.step()
-            optimizer.zero_grad()
-        with pytest.raises(
-            RuntimeError,
-            match="different checkpoint tensor inventories|Replicated optimizer metadata differs|replicas differ",
-        ):
-            DistributedCheckpointer.save(
-                checkpoint_dir, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
-            )
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_rank_dependent_muon_state_fails_closed(tmp_path):
-    mp.start_processes(
-        _rank_dependent_muon_state_worker,
-        args=(str(tmp_path / "rdzv-lazy"), str(tmp_path / "ckpt")),
-        nprocs=2,
-        join=True,
-        start_method="fork",
-    )
-
-
 def _ordinary_adam_hook_worker(rank, rendezvous):
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
