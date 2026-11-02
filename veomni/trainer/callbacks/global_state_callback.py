@@ -183,7 +183,7 @@ def _agree_restored_position(global_step, saved_epoch, group):
     dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
     dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
     if not torch.equal(low, high):
-        raise RuntimeError("Ranks restored different training positions")
+        raise RuntimeError("Restored training position differs across ranks")
 
 
 class GlobalStateCallback(Callback):
