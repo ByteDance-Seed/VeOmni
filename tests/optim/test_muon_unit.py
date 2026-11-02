@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import Partial, Replicate, Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
 from veomni.optim import muon as muon_impl
@@ -59,6 +60,45 @@ def _toy_model() -> nn.Module:
         nn.Linear(4, 8, bias=True),  # 2D weight (Muon), 1D bias (AdamW)
         nn.Linear(8, 4, bias=False),  # 2D weight (Muon), no bias
     )
+
+
+def _assert_nested_state_equal(before, after):
+    if isinstance(before, torch.Tensor):
+        torch.testing.assert_close(before, after, atol=0.0, rtol=0.0)
+    elif isinstance(before, dict):
+        assert before.keys() == after.keys()
+        for key in before:
+            _assert_nested_state_equal(before[key], after[key])
+    elif isinstance(before, (list, tuple)):
+        assert type(before) is type(after) and len(before) == len(after)
+        for left, right in zip(before, after, strict=True):
+            _assert_nested_state_equal(left, right)
+    else:
+        assert before == after
+
+
+def _dcp_restore_optimizer_and_model(tmp_path, source, source_optimizer, target, target_optimizer):
+    """Exercise the supported identity-checked MultiOptimizer checkpoint path."""
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel)
+    for before, after in zip(source.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(before, after, atol=0.0, rtol=0.0)
+
+
+def _assert_next_optimizer_update_matches(source, source_optimizer, target, target_optimizer):
+    for before, after in zip(source.parameters(), target.parameters(), strict=True):
+        if before.requires_grad:
+            before.grad = torch.full_like(before, 0.125)
+            after.grad = torch.full_like(after, 0.125)
+    source_optimizer.step()
+    target_optimizer.step()
+    for before, after in zip(source.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(before, after, atol=0.0, rtol=0.0)
+    _assert_nested_state_equal(source_optimizer.state_dict(), target_optimizer.state_dict())
 
 
 def _sample_2d(M: int, K: int, dtype: torch.dtype = torch.float32, seed: int = 0) -> torch.Tensor:
@@ -338,7 +378,8 @@ class TestNumerics:
 
         torch.testing.assert_close(a.detach(), b.detach(), atol=0.0, rtol=0.0)
 
-    def test_state_dict_roundtrip(self):
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=1))
+    def test_state_dict_roundtrip(self, tmp_path):
         """Step + serialize + restore preserves both Muon and AdamW state."""
         from veomni.optim import build_optimizer
 
@@ -354,6 +395,7 @@ class TestNumerics:
             if p.requires_grad:
                 p.grad = torch.randn_like(p)
         opt_a.step()
+        opt_a.zero_grad(set_to_none=True)
         sd_before = opt_a.state_dict()
 
         flat_keys = set(sd_before.keys())
@@ -365,7 +407,6 @@ class TestNumerics:
         )
 
         model_b = _toy_model()
-        model_b.load_state_dict(model_a.state_dict())
         opt_b = build_optimizer(
             model_b,
             lr=1e-4,
@@ -373,14 +414,11 @@ class TestNumerics:
             optimizer_type="muon",
             muon_kwargs={"lr": 1e-2, "adjust_lr_fn": "match_rms_adamw"},
         )
-        opt_b.load_state_dict(sd_before)
+        _dcp_restore_optimizer_and_model(tmp_path, model_a, opt_a, model_b, opt_b)
 
         sd_after = opt_b.state_dict()
-        assert set(sd_before.keys()) == set(sd_after.keys())
-        for k, v_before in sd_before.items():
-            v_after = sd_after[k]
-            if isinstance(v_before, torch.Tensor):
-                torch.testing.assert_close(v_before, v_after, atol=0.0, rtol=0.0, msg=f"state_dict mismatch at {k}")
+        _assert_nested_state_equal(sd_before, sd_after)
+        _assert_next_optimizer_update_matches(model_a, opt_a, model_b, opt_b)
 
 
 class TestBuildOptimizer:
@@ -1090,7 +1128,8 @@ class TestHeadSplitBuild:
         tagged = sorted(k[len("param_groups.") : -len(".head_blocks")] for k in opt.state_dict() if "head_blocks" in k)
         assert tagged == expected
 
-    def test_split_run_survives_a_state_dict_roundtrip(self):
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=1))
+    def test_split_run_survives_a_state_dict_roundtrip(self, tmp_path):
         """Multi-group Muon must save and reload through the MultiOptimizer path."""
         from veomni.optim import build_optimizer
 
@@ -1113,19 +1152,17 @@ class TestHeadSplitBuild:
             if p.requires_grad:
                 p.grad = torch.randn_like(p)
         opt_a.step()
+        opt_a.zero_grad(set_to_none=True)
         saved = opt_a.state_dict()
 
         model_b = _attention_model()
-        model_b.load_state_dict(model_a.state_dict())
         opt_b = _build(model_b)
-        opt_b.load_state_dict(saved)
+        _dcp_restore_optimizer_and_model(tmp_path, model_a, opt_a, model_b, opt_b)
 
         assert [g.get("head_blocks", 1) for g in opt_b.optimizers_dict["muon"].param_groups] == [1, 4]
         reloaded = opt_b.state_dict()
-        assert set(saved) == set(reloaded)
-        for key, before in saved.items():
-            if isinstance(before, torch.Tensor):
-                torch.testing.assert_close(before, reloaded[key], atol=0.0, rtol=0.0, msg=f"mismatch at {key}")
+        _assert_nested_state_equal(saved, reloaded)
+        _assert_next_optimizer_update_matches(model_a, opt_a, model_b, opt_b)
 
 
 class TestGramQuackFallback:

@@ -248,16 +248,22 @@ class _MetaModel(nn.Module):
 
 
 def _builder_worker(rank, world, shard_dim, directory, rendezvous):
+    from types import SimpleNamespace
+
     import torch.distributed.checkpoint as dcp
 
     from veomni.checkpoint.dcp_checkpointer import (
         _EXPERT_LAYOUTS_KEY,
+        DistributedCheckpointer,
         ModelState,
-        OptimizerState,
         _ExtraParallelSavePlanner,
         _ModelStrictLoadPlanner,
     )
+    from veomni.checkpoint.layout import optimizer_dir
+    from veomni.checkpoint.optimizer_resume_layout import MULTI_LAYOUT_MARKER
+    from veomni.checkpoint.rank_local_optimizer import rank_inventory_key
     from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.models.model_runtime import _configure_extra_parallel_checkpoint_layout
     from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
     from veomni.optim import build_optimizer
 
@@ -278,6 +284,7 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
             expert_fsdp_shard_dim=shard_dim,
             enable_gradient_checkpointing=False,
         )
+        _configure_extra_parallel_checkpoint_layout(model, SimpleNamespace(extra_parallel_canonical_layout=True))
         assert all(p.placements[0].dim == shard_dim for p in model.parameters())
         assert all(spec.fsdp_shard_dim == shard_dim for spec in model._fqn2spec_info.values())
         opt = build_optimizer(model, lr=1e-3)
@@ -306,34 +313,43 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
                     for param, state in sub.state.items()
                     for key, value in state.items()
                 }
-                save_kwargs = {
-                    "state_dict": {"model": ModelState(model), "optimizer": OptimizerState(model, opt)},
-                    "storage_writer": dcp.FileSystemWriter(directory),
+                opt.zero_grad(set_to_none=True)
+                # The proven MultiOptimizer format has a fixed owner layout;
+                # exercise it separately from model-only resharding.
+                DistributedCheckpointer.save(directory, {"model": model, "optimizer": opt})
+                optim_metadata = dcp.FileSystemReader(optimizer_dir(directory)).read_metadata().state_dict_metadata
+                assert f"optimizer.{MULTI_LAYOUT_MARKER}" in optim_metadata
+                for optimizer_rank in range(world):
+                    assert f"optimizer.{rank_inventory_key(optimizer_rank)}" in optim_metadata
+
+                # Model-only export can also be loaded with another FSDP axis.
+                # Keep async model staging coverage without claiming that the
+                # exact MultiOptimizer layout itself supports async recovery.
+                model_save = {
+                    "state_dict": {"model": ModelState(model)},
+                    "storage_writer": dcp.FileSystemWriter(directory + "-model"),
                     "planner": _ExtraParallelSavePlanner(),
                 }
                 if shard_dim == 0:
-                    # Metadata must also survive the production GPU -> CPU
-                    # async staging path, including optimizer tensors.
-                    dcp.async_save(**save_kwargs, process_group=save_group).result()
+                    dcp.async_save(**model_save, process_group=save_group).result()
                 else:
-                    dcp.save(**save_kwargs)
-                layouts = dcp.FileSystemReader(directory).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
-                assert any(key.startswith("optimizer.") for key in layouts)
-                assert all(layout["fsdp_shard_dim"] == shard_dim for layout in layouts.values())
+                    dcp.save(**model_save)
+                model_layouts = (
+                    dcp.FileSystemReader(directory + "-model")
+                    .read_metadata()
+                    .planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+                )
+                assert any(key.startswith("model.") for key in model_layouts)
+                assert all(layout["fsdp_shard_dim"] == shard_dim for layout in model_layouts.values())
             elif step == 1:
                 expected = y.detach().clone()
                 with torch.no_grad():
                     for p in model.parameters():
                         p.zero_()
-                for sub in opt.optimizers_dict.values():
-                    for values in sub.state.values():
-                        for value in values.values():
-                            value.add_(1)
-                dcp.load(
-                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt, load=True)},
-                    checkpoint_id=directory,
-                    planner=_ModelStrictLoadPlanner(strict_model=True),
-                )
+                opt.zero_grad(set_to_none=True)
+                # The target must be fresh; proven recovery rejects warm state.
+                opt = build_optimizer(model, lr=1e-3)
+                DistributedCheckpointer.load(directory, {"model": model, "optimizer": opt})
                 for (group, param, key), expected_value in saved_optim.items():
                     actual_value = opt.optimizers_dict[group].state[param][key]
                     torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
@@ -347,18 +363,12 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
             expert_fsdp_shard_dim=1 - shard_dim,
             enable_gradient_checkpointing=False,
         )
-        restored_opt = build_optimizer(restored, lr=1e-3)
+        _configure_extra_parallel_checkpoint_layout(restored, SimpleNamespace(extra_parallel_canonical_layout=True))
         dcp.load(
-            {"model": ModelState(restored), "optimizer": OptimizerState(restored, restored_opt, load=True)},
-            checkpoint_id=directory,
+            {"model": ModelState(restored)},
+            checkpoint_id=directory + "-model",
             planner=_ModelStrictLoadPlanner(strict_model=True),
         )
-        parameter_map = dict(zip(model.parameters(), restored.parameters()))
-        for (group, param, key), expected_value in saved_optim.items():
-            actual_value = restored_opt.optimizers_dict[group].state[parameter_map[param]][key]
-            if isinstance(actual_value, DTensor):
-                actual_value, expected_value = actual_value.full_tensor(), expected_value.full_tensor()
-            torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
         for original, loaded in zip(model.parameters(), restored.parameters()):
             torch.testing.assert_close(original.full_tensor(), loaded.full_tensor(), rtol=0, atol=0)
         restored_y = restored(x, routing, indices)
@@ -369,6 +379,43 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
             torch.testing.assert_close(
                 original.grad.full_tensor() / 2, loaded.grad.full_tensor(), rtol=1e-5, atol=1e-7
             )
+        # A second fresh target at the original layout validates the next
+        # real optimizer update and its state independently of model resharding.
+        with torch.device("meta"):
+            same_layout = _MetaModel()
+        same_layout = build_parallelize_model(
+            same_layout,
+            init_device="meta",
+            expert_weight_fp8_all_gather=True,
+            expert_fsdp_shard_dim=shard_dim,
+            enable_gradient_checkpointing=False,
+        )
+        _configure_extra_parallel_checkpoint_layout(same_layout, SimpleNamespace(extra_parallel_canonical_layout=True))
+        same_opt = build_optimizer(same_layout, lr=1e-3)
+        DistributedCheckpointer.load(directory, {"model": same_layout, "optimizer": same_opt})
+        same_layout.set_requires_gradient_sync(False)
+        same_layout(x, routing, indices).float().square().mean().backward()
+        same_layout.set_requires_gradient_sync(True)
+        same_layout(x, routing, indices).float().square().mean().backward()
+        for original, loaded in zip(model.parameters(), same_layout.parameters(), strict=True):
+            torch.testing.assert_close(original.grad.full_tensor(), loaded.grad.full_tensor(), rtol=1e-5, atol=1e-7)
+            # Attribute the exact optimizer comparison to checkpoint state,
+            # not nondeterminism across independent FP8 backward passes.
+            loaded.grad.copy_(original.grad)
+        opt.step()
+        same_opt.step()
+        parameter_map = dict(zip(model.parameters(), same_layout.parameters(), strict=True))
+        for original, loaded in parameter_map.items():
+            torch.testing.assert_close(original.full_tensor(), loaded.full_tensor(), rtol=0, atol=0)
+        for group, sub in opt.optimizers_dict.items():
+            for param, state in sub.state.items():
+                restored_state = same_opt.optimizers_dict[group].state[parameter_map[param]]
+                assert state.keys() == restored_state.keys()
+                for key, value in state.items():
+                    actual = restored_state[key]
+                    if isinstance(actual, DTensor):
+                        value, actual = value.full_tensor(), actual.full_tensor()
+                    torch.testing.assert_close(value, actual, rtol=0, atol=0)
         dist.barrier()
     finally:
         dist.destroy_process_group()

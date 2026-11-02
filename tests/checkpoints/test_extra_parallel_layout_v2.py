@@ -32,7 +32,7 @@ from veomni.checkpoint.dcp_checkpointer import (
 from veomni.distributed.parallel_plan import SpecInfo
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=1))
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim):
