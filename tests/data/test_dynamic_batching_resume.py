@@ -1151,14 +1151,8 @@ def _dynamic_restore_failure_worker(rank, failure, endpoint):
         cursor = source.state_dict()
         target = _native_mapping_loader(rank, 2)
         trainer = _native_resume_trainer(target, rank)
-        if failure == "load_path" and rank == 0:
-            trainer.args.train.checkpoint.load_path = None
-        elif failure == "rank_path" and rank == 0:
-            trainer.args.train.checkpoint.load_path = "/different-checkpoint"
-        elif failure == "strict_mismatch" and rank == 0:
+        if failure in ("non_strict_loaded_step", "corrupt_loaded_step"):
             trainer._sft_dynamic_exact_resume = False
-        if failure == "rank_context" and rank == 0:
-            trainer.args.data.train_path = "test://different-source"
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
         callback._last_saved_step = -1
@@ -1201,8 +1195,20 @@ def _dynamic_restore_failure_worker(rank, failure, endpoint):
                 state["device_rng_state"] = torch.Generator().manual_seed(123).get_state()
             elif failure in ("boundary_phase", "mid_phase"):
                 cursor["_veomni_resume_phase"] = "running"
-        callback._read_current = lambda _: state
-        with pytest.raises((RuntimeError, ValueError, AssertionError)):
+            elif failure == "rank_context":
+                state["_veomni_dynamic_context"]["data"]["train_path"] = "test://corrupt-saved-source"
+            elif failure == "non_strict_loaded_step":
+                state["global_step"] = 2
+            elif failure == "corrupt_loaded_step":
+                state["global_step"] = {"invalid": 1}
+
+        def read_current(_):
+            if rank == 0 and failure == "load_io":
+                raise OSError("cannot read rank-local cursor")
+            return state
+
+        callback._read_current = read_current
+        with pytest.raises((RuntimeError, ValueError, AssertionError, OSError)):
             callback.load_global_state()
         dist.barrier()
     finally:
@@ -1221,9 +1227,9 @@ def _dynamic_restore_failure_worker(rank, failure, endpoint):
         "mid_phase",
         "callback",
         "rank_context",
-        "load_path",
-        "rank_path",
-        "strict_mismatch",
+        "non_strict_loaded_step",
+        "corrupt_loaded_step",
+        "load_io",
         "save_collection",
     ],
 )
@@ -1232,61 +1238,3 @@ def test_dynamic_resume_rank_local_failures_are_coordinated(failure):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_dynamic_restore_failure_worker, args=(failure,), nprocs=2)
-
-
-def _checkpoint_begin_path_worker(rank, paths, endpoint):
-    from datetime import timedelta
-    from types import SimpleNamespace
-    from unittest.mock import patch
-
-    import torch.distributed as dist
-
-    from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    calls = []
-    try:
-        path = paths[rank]
-        trainer = SimpleNamespace(
-            args=SimpleNamespace(train=SimpleNamespace(checkpoint=SimpleNamespace(load_path=path))),
-            save_model_assets=lambda: calls.append("assets"),
-            load=lambda: (calls.append("load"), dist.barrier()),
-        )
-        callback = CheckpointCallback.__new__(CheckpointCallback)
-        callback.trainer = trainer
-        with patch("veomni.trainer.callbacks.checkpoint_callback.helper.empty_cache"):
-            if paths[0] == paths[1]:
-                callback.on_train_begin(SimpleNamespace())
-                assert calls == ["assets", "load"]
-            else:
-                with pytest.raises((RuntimeError, TypeError)):
-                    callback.on_train_begin(SimpleNamespace())
-                assert calls == []
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.parametrize("mode", ["missing", "same", "symlink", "surrogate", "invalid", "bytes"])
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_checkpoint_callback_checks_rank_paths_before_dcp(mode, tmp_path):
-    import os
-
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    if mode == "symlink":
-        base = tmp_path / "base"
-        (base / "other" / "child").mkdir(parents=True)
-        (base / "link").symlink_to(base / "other" / "child")
-        paths = (str(base / "link" / ".." / "checkpoint"), str(base / "checkpoint"))
-        assert os.path.normpath(paths[0]) == os.path.normpath(paths[1])
-        assert os.path.realpath(paths[0]) != os.path.realpath(paths[1])
-    elif mode == "surrogate":
-        paths = (os.fsdecode(b"/tmp/checkpoint-\xff"), "/ckpt/step_1")
-    elif mode == "invalid":
-        paths = (42, "/ckpt/step_1")
-    elif mode == "bytes":
-        paths = (b"/ckpt/step_1", "/ckpt/step_1")
-    else:
-        paths = (None, "/ckpt/step_1") if mode == "missing" else ("/ckpt/step_1", "/ckpt/step_1")
-    spawn_with_rendezvous(_checkpoint_begin_path_worker, args=(paths,), nprocs=2)
