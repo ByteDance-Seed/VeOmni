@@ -28,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     _flatten_optim_state_dict,
     _get_fqns,
+    _state_dict_fn,
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
@@ -429,7 +430,10 @@ def _empty_optimizer_state_dict(model, opt):
     try:
         post_hook = opt.register_state_dict_post_hook(capture_ids, prepend=True)
         try:
-            raw = opt.state_dict()
+            # PyTorch's DCP instance wrapper can perform a synthetic step
+            # when state is empty. Its resolver unwraps that known wrapper
+            # while preserving optimizer class methods and registered hooks.
+            raw = _state_dict_fn(opt, "state_dict")()
         finally:
             post_hook.remove()
     finally:
