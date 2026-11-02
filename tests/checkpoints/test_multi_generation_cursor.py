@@ -189,7 +189,7 @@ def test_hf_step_dcp_epoch_do_not_rewrite_a_completed_checkpoint(tmp_path):
     global_callback.on_step_end(state)
     model_callback.on_epoch_end(state)
     global_callback.on_epoch_end(state)
-    trainer.save_dcp.assert_not_called()
+    trainer.save_dcp.assert_called_once_with(state)
     payload = torch.load(
         layout.extra_state_path(layout.step_dir(str(tmp_path), 3), trainer.args.train.global_rank),
         map_location="cpu",
@@ -232,14 +232,66 @@ def test_legacy_export_confirms_dcp_and_suppresses_epoch_rewrite(tmp_path):
         trainer.args.train.checkpoint.hf_save_steps = 3
         trainer.args.train.checkpoint.hf_save_epochs = 0
         trainer.model.checkpoint = manager
+        trainer.save_dcp.side_effect = manager.save_dcp
         trainer.save_hf_or_lora.side_effect = lambda state, **kwargs: manager.prepare_export(state, "step_end")
         callback = CheckpointCallback(trainer)
         state = TrainerState(global_step=3, epoch=0)
         callback.on_step_end(state)
         callback.on_epoch_end(state)
         manager.save_dcp.assert_called_once_with(state)
-        trainer.save_dcp.assert_not_called()
+        trainer.save_dcp.assert_called_once_with(state)
         assert manager._last_legacy_export_dcp_step == 3
+
+
+@pytest.mark.parametrize("cadence", ["dcp", "hf_epoch"])
+def test_same_step_export_refuses_changed_optimizer_receipt(tmp_path, cadence):
+    class ChangedCheckpoint:
+        def checkpoint_receipt_is_current(self, step):
+            return False
+
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.model = SimpleNamespace(checkpoint=ChangedCheckpoint())
+    callback = CheckpointCallback(trainer)
+    callback.dcp_every_n_steps = 3 if cadence == "dcp" else 0
+    callback.dcp_every_n_epochs = 1 if cadence == "hf_epoch" else 0
+    callback.save_hf_weights = cadence == "hf_epoch"
+    callback.hf_every_n_steps = 3
+    callback._last_dcp_step = 3
+    with pytest.raises(RuntimeError, match="Optimizer or checkpoint changed"):
+        callback.on_step_end(TrainerState(global_step=3, epoch=0))
+    trainer.save_dcp.assert_not_called()
+    trainer.save_hf_or_lora.assert_not_called()
+
+
+def _step_receipt_mismatch_worker(rank, tmp_path):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path}/rendezvous", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        callback = CheckpointCallback(trainer)
+        callback.dcp_every_n_steps = 3
+        callback.save_hf_weights = False
+        callback._last_dcp_step = 3 if rank == 0 else -1
+        with pytest.raises(RuntimeError, match="same-step|receipt|differ"):
+            callback.on_step_end(TrainerState(global_step=3, epoch=0))
+        trainer.save_dcp.assert_not_called()
+        dist.barrier()
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_step_dcp_receipt_disagreement_fails_on_all_ranks(tmp_path):
+    torch.multiprocessing.spawn(_step_receipt_mismatch_worker, args=(str(tmp_path),), nprocs=2, join=True)
 
 
 def test_unconfirmed_or_multi_optimizer_export_does_not_create_legacy_receipt(tmp_path):

@@ -242,6 +242,13 @@ LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
 
+When epoch DCP saving is enabled, a step-scheduled HF/LoRA export first
+schedules its DCP through the trainer checkpoint callback. The built-in
+exporter already needs this DCP, so a later epoch save at the same step can
+reuse it. A custom HF-only exporter will also receive a DCP save at that HF
+step. Callers that save DCP outside the trainer callback must coordinate that
+save with the trainer's cadence to avoid writing the same step twice.
+
 When resuming a legacy Adam checkpoint into its original output directory, the
 trainer reuses an unchanged same-step checkpoint only after verifying the
 completed manifest, optimizer identity, RNG state and available data cursor.
