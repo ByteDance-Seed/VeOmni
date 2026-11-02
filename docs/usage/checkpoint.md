@@ -269,6 +269,9 @@ supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
 ## MultiOptimizer recovery identity
 
+Optimizer authors can find the registration callbacks and precision/placement
+contract in the [rank-local AdamW adapter guide](../design/rank_local_adamw_checkpoint_adapter.md).
+
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
 step with no pending gradients. Setting `save_async: true` for a runtime whose
