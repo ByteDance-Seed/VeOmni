@@ -125,3 +125,18 @@ def test_disabled_ple_does_not_break_converter_or_export():
     assert pad_ple_state_dict_from_dcp(model, state) is state
     # A PLE-free model must not even try to open DCP metadata.
     assert not ple_checkpoint_is_cropped("/does/not/exist", model)
+
+
+def test_hf_projection_cpu_offload_preserves_values_and_runtime_weights():
+    from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
+
+    model = _Model()
+    weight = _padded_weight()
+    original = weight.clone()
+    state = {_PLE: weight, "other.weight": torch.ones(2, 4)}
+    projected = project_state_dict_to_checkpoint(model, state, cpu_offload=True)
+    assert projected[_PLE].device.type == "cpu"
+    assert projected[_PLE].dtype == weight.dtype
+    torch.testing.assert_close(projected[_PLE], original[:10])
+    torch.testing.assert_close(weight, original)
+    assert projected["other.weight"] is state["other.weight"]

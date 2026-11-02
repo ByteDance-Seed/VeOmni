@@ -138,7 +138,11 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
+
+    # Stage each cropped PLE table before projecting the next to bound device copies.
+    save_state = ModelState(model, parallel_state=parallel_state, crop_ple=False).state_dict()
+    save_state = project_state_dict_to_checkpoint(model, save_state, cpu_offload=True)
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.

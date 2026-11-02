@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import _PLE_SHARD_PATTERN
@@ -62,6 +63,14 @@ def _from_local(tensor: torch.Tensor, reference: DTensor, rows: int) -> DTensor:
     """Rebuild a contiguous global matrix with explicit shape and stride."""
     shape = torch.Size([rows, *reference.shape[1:]])
     stride = torch.empty(shape, device="meta").stride()
+    if tensor.device.type == "cpu" and reference.device_mesh.device_type != "cpu":
+        # from_local moves CPU tensors to the mesh device; retain offloaded storage.
+        spec = DTensorSpec(
+            mesh=reference.device_mesh,
+            placements=reference.placements,
+            tensor_meta=TensorMeta(shape=shape, stride=stride, dtype=tensor.dtype),
+        )
+        return DTensor(tensor.contiguous(), spec, requires_grad=False)
     return DTensor.from_local(
         tensor.contiguous(), reference.device_mesh, reference.placements, shape=shape, stride=stride
     )
@@ -120,13 +129,22 @@ def _resize_dtensor(tensor: DTensor, rows: int, *, empty: bool = False) -> DTens
         recv_sizes.append(max(0, min(end, target_end) - max(start, target_start)))
     # Peer intersections are ordered contiguous intervals. Receive straight
     # into the valid output prefix; the remaining expansion tail stays zero.
-    dist.all_to_all_single(
-        output[: sum(recv_sizes)],
-        local[: sum(send_sizes)].contiguous(),
-        output_split_sizes=recv_sizes,
-        input_split_sizes=send_sizes,
-        group=mesh.get_group(axis),
-    )
+    group = mesh.get_group(axis)
+    send = local[: sum(send_sizes)].contiguous()
+    receive = output[: sum(recv_sizes)]
+    if local.device.type == "cpu" and dist.get_backend(group) in ("nccl", "hccl"):
+        # Accelerator collectives require device buffers even with CPU offload.
+        device = torch.device(mesh.device_type, getattr(torch, mesh.device_type).current_device())
+        send = send.to(device=device, non_blocking=False)
+        receive = torch.empty(receive.shape, dtype=local.dtype, device=device)
+        dist.all_to_all_single(
+            receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group
+        )
+        output[: sum(recv_sizes)].copy_(receive, non_blocking=False)
+    else:
+        dist.all_to_all_single(
+            receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group
+        )
     return _from_local(output, tensor, rows)
 
 
@@ -156,14 +174,19 @@ def _pad_one(tensor: torch.Tensor, padded_rows: int, name: str) -> torch.Tensor:
 
 
 def project_state_dict_to_checkpoint(
-    model: nn.Module, state_dict: Dict[str, torch.Tensor], *, empty: bool = False
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    empty: bool = False,
+    cpu_offload: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Store PLE weights at ``rows_per_checkpoint_shard``.
 
     HF export uses per-table converter metadata. DCP save uses a separate
     storage planner. Dense tensors use ``crop_hf_export_tensor``; DTensors
     exchange row intersections without full-table materialization. ``empty``
-    allocates load targets without copying runtime weights. Models without
+    allocates load targets without copying runtime weights. ``cpu_offload``
+    synchronously moves each projected PLE shard to CPU before the next table. Models without
     that converter are returned unchanged.
     """
     counts = ple_row_counts(model)
@@ -182,6 +205,8 @@ def project_state_dict_to_checkpoint(
         checkpoint_name = _checkpoint_name(name, counts)
         logical, _padded = counts[checkpoint_name]
         updated = _project_one(tensor, crop, logical, checkpoint_name, empty=empty)
+        if cpu_offload:
+            updated = updated.detach().to(device="cpu", non_blocking=False)
         if updated is not tensor:
             changed += 1
         projected[name] = updated
