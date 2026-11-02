@@ -61,24 +61,33 @@ same policies for them. Parameter ownership, optimizer group
 membership, scheduler identity, state dtypes and offload selection must match
 the saved checkpoint. Change these only with an explicitly verified migration.
 
+### Save and load call sites
+
+`optimizer_resume_layout._local_layout` records `algorithm_identity`, each
+parameter's `state_dtype`, and `state_is_offloaded` in the checkpoint identity;
+a mismatch rejects resume before applying state. During save,
+`multi_optimizer_checkpoint._validate_source_optimizer_states` uses
+`state_dtype` to check initialized fields against their declared precision.
+During load, `_prepare_multi_optimizer_saved_states` checks stored field dtypes
+and uses `state_is_offloaded` to allocate missing destination state on CPU when
+the adapter specifies offload. `context_factory` wraps the optimizer's actual
+state read and load; adapter implementations own correct placement and values.
+
 ## Framework call sites and restore behavior
 
 1. `MultiOptimizer._sparse_state_dict()` enters the context around PyTorch's
-   optimizer-state serialization. For registered optimizers it checks that
-   live tensor versions/storage were not changed, that each initialized state
-   field and group option is represented faithfully, and that no state was
-   fabricated. Each serialized live state tensor must be the same view/storage
-   as its live tensor, including device, dtype, shape, stride and offset; an
-   equal-valued clone is not enough. State-empty leaves retain their parameter
-   groups without creating optimizer moments.
+   optimizer-state serialization. Registered adapter implementations must
+   preserve live state and serialize all initialized fields and group options
+   faithfully. State-empty leaves retain their parameter groups without
+   creating optimizer moments.
 2. Checkpoint layout construction records the algorithm identity, parameter
    ownership, dtype policy and offload policy. Save validates the source state;
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
 3. `MultiOptimizer._dcp_load_state_dict()` enters the context again while
-   PyTorch applies the optimizer state. The framework checks the resulting
-   registered-optimizer payload for omissions or changes. An optimizer may
+   PyTorch applies the optimizer state. The trusted adapter must restore every
+   validated field without changing its value or dtype. An optimizer may
    implement its own precision-preserving loader; the adapter callbacks alone
    do not repair a lossy one.
 
@@ -87,7 +96,7 @@ The currently supported exact-precision training-checkpoint path requires
 `MultiOptimizer.load_state_dict()` and raw DCP `OptimizerState` reject
 unproven recovery; an individual leaf's direct `load_state_dict()` cannot prove
 the MultiOptimizer group, scheduler and generation identity. Unverified older
-group layouts, unsupported optimizer hooks, and changing the rank-local layout
+group layouts and changing the rank-local layout
 require an explicit verified migration or fail closed. See
 [MultiOptimizer recovery identity](../usage/checkpoint.md#multioptimizer-recovery-identity)
 for the complete recovery constraints. Test an extension with initialized and

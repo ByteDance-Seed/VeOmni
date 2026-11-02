@@ -302,12 +302,14 @@ inventory and replicated values already agree. For the ExtraParallel candidate,
 optimizer state is stored under rank-specific keys and recovery requires the
 identical rank-to-mesh mapping. This avoids merging distinct expert-owner steps
 and uninitialized states, but increases checkpoint storage for replicated
-optimizer shards and does not support elastic resharding. Model replica shards
-are checked for bitwise equality before DCP deduplication. The check streams
-bounded chunks to CPU and adds work during checkpoint save. Unknown model
-or optimizer hooks, asynchronous saves and unsupported layouts fail closed;
-callers should validate these constraints before starting a long run. Synchronous
-staged saves are supported.
+optimizer shards and does not support elastic resharding. All ranks must use
+the same trusted model and configuration. Optimizer leaf ordering is checked
+as part of the existing checkpoint-layout exchange; owner-specific freezing
+that removes a whole leaf from only some ranks is rejected before per-leaf
+checkpoint collectives, rather than supported. Replicated values are assumed synchronized,
+while checkpoint shard dtype, shape and geometry are validated without hashing
+tensor bytes. Hooks and adapters are trusted. MultiOptimizer asynchronous saves
+and unsupported layouts fail closed; synchronous staged saves are supported.
 Partially overlapping shards with different geometries are rejected, even when
 their shared values agree; exact replicas and disjoint shards remain supported.
 Group/state inventory and generation mismatches are rejected before model
@@ -317,14 +319,14 @@ discard and rebuild that runtime before retrying.
 `MultiOptimizer.state_dict()` returns a detached inspection snapshot for
 supported leaves, but `load_state_dict()` alone cannot prove group/scheduler
 identity and rejects restoration; use the proven DCP path instead.
-The codec also rejects tensor learning rates shared between groups and
-overlapping storage between distinct model or optimizer tensors. Its byte-range
-check is conservative for non-contiguous interleaved views.
-The saved alias identity covers parameters and buffers, including
-nonpersistent buffer aliases; the separate conservative storage-overlap check
-still applies to distinct buffer views. A reset dynamic RoPE cache can have a
+The codec rejects tensor learning rates shared between groups. The saved alias
+identity covers parameters and buffers, including nonpersistent buffer aliases.
+Optimizer adapters and model serialization hooks are trusted to preserve their
+state and semantics. Identity tracks repeated tensor objects, but does not detect
+distinct views sharing storage; models that rely on mutable shared views are
+outside this checkpoint contract. A reset dynamic RoPE cache can have a
 different alias graph from a newly constructed model and is conservatively
-rejected on resume until that cache state can be restored safely.
+rejected before writing until that cache state can be restored safely.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
 the cache grew beyond its original context and has not reset, a fresh process
 can compute different later outputs. MultiOptimizer checkpoints therefore
@@ -356,7 +358,7 @@ resume: they cannot establish scheduler and group provenance. The standalone
 their current devices, which can temporarily require as much extra device
 memory as the optimizer tensors themselves. That raw snapshot supports the
 built-in AdamW, AnyPrecisionAdamW and DistributedMuon leaves, as well as
-registered adapters, provided they have no unsupported serialization hooks.
+registered adapters. Custom serialization hooks and adapters must preserve state faithfully.
 It does not prove the identity needed for raw restoration. Use the high-level
 `DistributedCheckpointer` for save and restore; its save path avoids this copy.
 
