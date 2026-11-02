@@ -68,6 +68,12 @@ def test_bad_splits():
         ModuleDataBalancer(None).balance({"x": torch.ones(3, 2)}, {"x": [2]}, [1])
 
 
+@pytest.mark.parametrize("lengths,outputs", [([1.5, 2], [1, 1]), ([1, 2], [0.5, 1])])
+def test_fractional_splits_are_rejected(lengths, outputs):
+    with pytest.raises(ValueError, match="metadata"):
+        ModuleDataBalancer(None).balance({"x": torch.ones(3, 2)}, {"x": lengths}, outputs)
+
+
 @pytest.mark.parametrize("invalid", ["fields", "input", "output", "scalar", "overflow", "callback"])
 def test_invalid_metadata_is_shared_before_raising(monkeypatch, invalid):
     group = object()
