@@ -92,6 +92,37 @@ def _model_with_experts(*, model_type="qwen4_exp", impl="fused_npu", swiglu=True
     return model
 
 
+def test_fp8_policy_is_ignored_for_npu_experts_without_skipping_fp32_validation(monkeypatch):
+    from veomni.distributed import torch_parallelize
+
+    state = SimpleNamespace(dp_mode="fsdp2", tp_size=1, pp_size=1, tp_enabled=False, fsdp_enabled=True)
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: state)
+    calls = []
+    monkeypatch.setattr(
+        torch_parallelize, "parallelize_model_fsdp2", lambda **kwargs: calls.append(kwargs) or kwargs["model"]
+    )
+    model = _model_with_experts()
+    mixed = MixedPrecisionConfig(npu_expert_fp32_wgrad=True)
+    assert (
+        torch_parallelize.build_parallelize_model(
+            model, mixed_precision=mixed, enable_gradient_checkpointing=False, expert_weight_fp8_all_gather=True
+        )
+        is model
+    )
+    assert calls[0]["expert_weight_fp8_all_gather"] is False
+    assert calls[0]["mixed_precision"].npu_expert_fp32_wgrad is True
+
+    calls.clear()
+    with pytest.raises(ValueError, match="FP32 wgrad requires"):
+        torch_parallelize.build_parallelize_model(
+            model,
+            mixed_precision=MixedPrecisionConfig(npu_expert_fp32_wgrad=True, reduce_dtype="bfloat16"),
+            enable_gradient_checkpointing=False,
+            expert_weight_fp8_all_gather=True,
+        )
+    assert not calls
+
+
 def test_local_qwen4_experts_are_accepted():
     model = _model_with_experts()
     assert validate_qwen4_experts(model) == {id(model.experts)}
