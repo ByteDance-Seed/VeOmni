@@ -74,22 +74,29 @@ def _source_id(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> tuple[bo
     return True, digest.hexdigest() if found else None
 
 
-def _input_digest(features: list[dict[str, Any]], source_keys: tuple[str, ...]) -> str | None:
-    """Hash transformed CPU tensors before packing or SP slicing; do not infer raw dataset identity."""
-    digest = hashlib.sha256()
+def _supported_provenance_features(features: list[dict[str, Any]], source_keys: tuple[str, ...]) -> bool:
+    """Reject unsupported feature values before producing local segment evidence."""
+
+    def supported(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.device.type == "cpu"
+        if isinstance(value, dict):
+            return all(type(key) is str and supported(item) for key, item in value.items())
+        if isinstance(value, (list, tuple)):
+            return all(supported(item) for item in value)
+        return value is None or type(value) in (bool, int, float, str)
+
     allowed = {"input_ids", "labels", "position_ids", "attention_mask", "cur_token_num", *source_keys}
     for feature in features:
         if any(key not in allowed for key in feature):
-            return None
+            return False
         for key in ("input_ids", "labels", "position_ids", "attention_mask"):
             tensor = feature.get(key)
             if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.ndim != 1:
-                return None
-        try:
-            digest.update(bytes.fromhex(packed_batch_digest(feature, source_keys, feature=True)))
-        except (TypeError, ValueError):
-            return None
-    return digest.hexdigest()
+                return False
+        if any(not supported(value) for value in feature.values()):
+            return False
+    return True
 
 
 @dataclass
@@ -191,8 +198,7 @@ class DPOProvenanceCollator:
                     can_prove = False
                     break
                 ds_indices.append(value)
-        input_digest = _input_digest(clean, source_keys) if can_prove else None
-        can_prove = can_prove and input_digest is not None
+        can_prove = can_prove and _supported_provenance_features(clean, source_keys)
         segment_lengths: list[int] = []
         counts: list[int] = []
         sources: list[str | None] = []
@@ -293,9 +299,7 @@ class DPOProvenanceCollator:
             tuple(counts),
             tail,
             tuple(sources),
-            input_digest,
             packed_batch_digest(batch, source_keys),
-            packed_batch_digest(batch, global_only=True),
             tuple(ds_indices),
             source_keys,
             sp_size,

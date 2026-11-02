@@ -28,6 +28,7 @@ from veomni.utils.dpo_provenance import (
     DPO_FEATURE_KEY,
     DPO_PROOF_KEY,
     DPOInvalidProof,
+    DPOPackedProof,
     dpo_declared_producer_identity,
     dpo_tokenizer_fingerprint,
     packed_batch_digest,
@@ -1517,13 +1518,14 @@ def test_source_metadata_is_not_passed_to_model_after_callback(monkeypatch, remo
     assert chosen.numel() == rejected.numel() == 1
 
 
-def test_sp_input_evidence_covers_additional_feature_metadata(monkeypatch):
+def test_provenance_rejects_unsupported_feature_metadata(monkeypatch):
     state = _state()
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     collator = DPOProvenanceCollator(MainCollator())
     first, second = _feature("abc", "d", 0), _feature("abc", "d", 0)
     first["cur_token_num"], second["cur_token_num"] = 1, 2
-    assert collator([first])[DPO_PROOF_KEY].input_digest != collator([second])[DPO_PROOF_KEY].input_digest
+    assert isinstance(collator([first])[DPO_PROOF_KEY], DPOPackedProof)
+    assert isinstance(collator([second])[DPO_PROOF_KEY], DPOPackedProof)
     first["unknown_model_argument"] = 1
     assert isinstance(collator([first])[DPO_PROOF_KEY], DPOInvalidProof)
 
@@ -1570,7 +1572,7 @@ def test_shared_meter_ignores_proof_when_opt_in_is_disabled():
     from veomni.utils import helper
     from veomni.utils.dpo_provenance import DPOPackedProof
 
-    proof = DPOPackedProof((3, 1), (4,), 0, (None,), "a" * 64, "b" * 64, "c" * 64, producer_contract_version=1)
+    proof = DPOPackedProof((3, 1), (4,), 0, (None,), "b" * 64, producer_contract_version=1)
     ordinary = {"cu_seq_lens_q": torch.tensor([0, 3, 4])}
     with_proof = {**ordinary, DPO_APPROVED_KEY: proof}
     assert helper._compute_seqlens(with_proof) == helper._compute_seqlens(ordinary)

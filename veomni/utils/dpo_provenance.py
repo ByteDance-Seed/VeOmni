@@ -196,9 +196,7 @@ class DPOPackedProof:
     feature_token_counts: tuple[int, ...]
     collator_tail: int
     source_ids: tuple[str | int | None, ...]
-    input_digest: str
     packed_digest: str
-    global_digest: str
     source_indices: tuple[int, ...] = ()
     source_keys: tuple[str, ...] = ()
     layout_sp_size: int = 1
@@ -217,7 +215,6 @@ def packed_batch_digest(
     batch: dict[str, Any],
     source_keys: tuple[str, ...] = (),
     *,
-    global_only: bool = False,
     feature: bool = False,
     include_keys: tuple[str, ...] | None = None,
 ) -> str:
@@ -245,21 +242,6 @@ def packed_batch_digest(
             digest.update(f"{type(value).__name__}:{value!r};".encode())
         else:
             raise ValueError("DPO packed provenance has an unsupported value")
-
-    if global_only:
-        for key in (
-            "cu_seq_lens_q",
-            "cu_seq_lens_k",
-            "linear_attn_cu_seq_lens_q",
-            "packed_sequence_slices",
-            "max_length_q",
-            "max_length_k",
-            "attention_mask_is_all_ones",
-            "tail_padding_length",
-        ):
-            update(key)
-            update(batch.get(key))
-        return digest.hexdigest()
 
     required = ("input_ids", "labels", "position_ids", "attention_mask")
     if not feature:

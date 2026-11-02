@@ -74,9 +74,7 @@ def _worker(rank, world_size, scenario, endpoint):
             (4,),
             0,
             ("a" * 64,),
-            ("b" if group_id == 0 else "c") * 64,
             packed_batch_digest(batch),
-            packed_batch_digest(batch, global_only=True),
             layout_sp_size=2 if state.sp_enabled else 1,
             layout_sp_rank=rank % 2 if state.sp_enabled else 0,
             producer_contract_version=1,
@@ -89,13 +87,9 @@ def _worker(rank, world_size, scenario, endpoint):
                 source_indices=(index,),
                 packed_digest=packed_batch_digest(batch),
             )
-        if scenario in ("dp_only", "dp_only_count_mismatch"):
-            proof = replace(proof, input_digest=str(rank) * 64)
         batch[DPO_PROOF_KEY] = proof
         batches = [batch]
-        if scenario == "same_shape_different_input" and rank == 1:
-            batch[DPO_PROOF_KEY] = replace(proof, input_digest="d" * 64)
-        elif scenario == "missing" and rank == 1:
+        if scenario == "missing" and rank == 1:
             batch.pop(DPO_PROOF_KEY)
         elif scenario == "mixed_dp" and group_id == 1:
             batch.pop(DPO_PROOF_KEY)
@@ -115,6 +109,12 @@ def _worker(rank, world_size, scenario, endpoint):
             batch["labels"] = torch.cat((batch["labels"], batch["labels"][:, -1:]), dim=-1)
         elif scenario == "mutated_attention" and rank == 1:
             batch["cu_seq_lens_k"] = torch.tensor([0, 4])
+        elif scenario == "invalid_local_cu" and rank == 1:
+            batch["cu_seq_lens_q"] = torch.tensor([0, 2, 2, 4])
+            batch[DPO_PROOF_KEY] = replace(proof, packed_digest=packed_batch_digest(batch))
+        elif scenario == "invalid_local_tail" and rank == 1:
+            batch["tail_padding_length"] = torch.tensor(1)
+            batch[DPO_PROOF_KEY] = replace(proof, collator_tail=1, packed_digest=packed_batch_digest(batch))
         if (scenario == "one_eof" and rank == 1) or scenario == "all_eof":
             iterator = iter([])
         elif scenario == "loader_error" and rank == 1:
@@ -144,7 +144,7 @@ def _worker(rank, world_size, scenario, endpoint):
         if scenario == "consistent":
 
             def checked_gather(output, tensor, **kwargs):
-                assert tensor.shape == (69,) and tensor.dtype == torch.int64
+                assert tensor.shape == (3,) and tensor.dtype == torch.int64
                 return original_gather(output, tensor, **kwargs)
 
             def unexpected_object_gather(*args, **kwargs):
@@ -157,7 +157,10 @@ def _worker(rank, world_size, scenario, endpoint):
             result = "approved" if DPO_APPROVED_KEY in out[0] else "legacy"
         except StopIteration:
             result = "eof"
-        except RuntimeError:
+        except RuntimeError as exc:
+            if scenario in ("invalid_local_cu", "invalid_local_tail"):
+                assert "DPO pair-count preflight failed" in str(exc)
+                assert "DPO packed sequence boundaries changed after collation" in str(exc)
             result = "error"
         finally:
             dist.all_gather, dist.all_gather_object = original_gather, original_object_gather
@@ -174,7 +177,6 @@ def _worker(rank, world_size, scenario, endpoint):
     "scenario",
     [
         "consistent",
-        "same_shape_different_input",
         "missing",
         "mixed_dp",
         "invalid",
@@ -191,6 +193,8 @@ def _worker(rank, world_size, scenario, endpoint):
         "dp_only_count_mismatch",
         "mutated_labels",
         "mutated_attention",
+        "invalid_local_cu",
+        "invalid_local_tail",
         "different_global_metadata",
         "source_range",
     ],

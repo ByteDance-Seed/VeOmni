@@ -245,11 +245,11 @@ their cross-group failure coordination has not been validated.
 The checkpoint protocol does not fingerprint dataset or reference-model
 contents; pin and record those separately.
 Use the option with the same value on every rank, using the built-in DPO transform and standard
-`MainCollator`. Each step validates policy/reference SP membership and a small
-fingerprint of each SP group's transformed tensors and source IDs before model
-execution. Identical transformed inputs may originate from different raw
-records; this check does not certify raw dataset identity or cursor alignment. Unproven or
-inconsistent samples are rejected on all ranks before model forward; with
+`MainCollator`. Each step validates policy/reference SP membership and the local
+sample evidence before model execution. The caller must provide the same
+transformed inputs and source order to every rank in an SP group; this is not
+verified by comparing rank fingerprints. Locally unproven or malformed samples
+are rejected on all ranks before model forward; with
 multisource loading, every example must have one ordered integer `ds_idx`.
 Source names are checked against their IDs only when the loader supplies them.
 Token and position tensors must use 32- or 64-bit integers, the packed attention
@@ -281,10 +281,12 @@ Input validation and ordinary rank-local callback exceptions after callbacks
 return are coordinated before model execution. Failures inside a callback's own
 collective still rely on the launcher's failure handler or timeout.
 Use the standard trainer loop: direct `concatenated_forward` calls require a
-microbatch whose local provenance and SP input agreement have both been checked.
-The pair-count collective exchanges fixed-size tensors and also checks the
-producer's input and segment evidence within each SP group. A failure may use
-an additional object collective to report the error. CPU/Gloo tests do not
+microbatch whose local provenance and SP group have been checked. The data
+loader must supply the same sample, labels and packing layout to every rank in
+an SP group before sequence slicing; independent random transforms on those
+ranks violate this contract. The pair-count collective does not compare input
+fingerprints. A failure may use an additional object collective to report the
+error. CPU/Gloo tests do not
 establish Ascend HCCL behavior, full-model numerical equivalence, or checkpoint
 recovery.
 

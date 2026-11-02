@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import copy
-import hashlib
 import inspect
 import math
 import re
@@ -146,7 +145,6 @@ def _dpo_pair_weighting(
     group_size = dist.get_world_size(group) if distributed else 1
     packet: dict[str, Any] = {"rank": rank, "status": "ok", "error": None}
     local_counts: list[int] = []
-    layouts: list[Any] = []
     try:
         if loader_error is not None:
             raise loader_error
@@ -264,29 +262,6 @@ def _dpo_pair_weighting(
             if not lengths or len(lengths) % 2 or any(type(length) is not int or length <= 0 for length in lengths):
                 raise ValueError("DPO microbatch must contain nonempty chosen/rejected segment pairs")
             local_counts.append(len(lengths) // 2)
-            layouts.append(
-                (
-                    tuple(lengths),
-                    tuple(boundaries),
-                    tail,
-                    tuple(input_ids.shape),
-                    cu_k is not None,
-                    linear_cu is not None,
-                    attention_mask is not None,
-                    batch.get("max_length_q") is not None,
-                    batch.get("max_length_k") is not None,
-                    (
-                        proof.input_digest,
-                        proof.global_digest,
-                        proof.feature_token_counts,
-                        proof.source_ids,
-                        proof.source_indices,
-                    )
-                    if provenance_enabled
-                    else None,
-                )
-            )
-        layout_digest = hashlib.sha256(repr(tuple(layouts)).encode()).hexdigest()
         if getattr(state, "sp_enabled", False):
             if not distributed or getattr(state, "sp_group", None) is None:
                 raise ValueError("DPO sequence parallelism requires an initialized process group")
@@ -304,7 +279,6 @@ def _dpo_pair_weighting(
                 "microsteps": len(local_counts),
                 "pair_count": sum(local_counts),
                 "sp_members": members,
-                "layout_digest": layout_digest,
             }
         )
     except StopIteration:
@@ -313,44 +287,31 @@ def _dpo_pair_weighting(
         packet["status"] = "error"
         packet["error"] = f"{type(exc).__name__}: {exc}"[:512]
     if distributed:
-        # Send fixed-size tensors in the pair-count collective. Inputs were
-        # hashed once by the producer; no batch contents are rehashed here.
+        # SP peers are required to receive the same input by the data-loader
+        # contract; only step counts and actual loading errors are coordinated.
         status_code = {"ok": 0, "eof": 1, "error": 2}[packet["status"]]
-        members = packet.get("sp_members", ())
-        group_digest = hashlib.sha256(repr(members).encode()).digest()
-        layout_digest = bytes.fromhex(packet.get("layout_digest", "00" * 32))
         device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
         values = torch.tensor(
-            [rank, status_code, packet.get("microsteps", 0), packet.get("pair_count", 0), len(members)]
-            + list(group_digest)
-            + list(layout_digest),
+            [status_code, packet.get("microsteps", 0), packet.get("pair_count", 0)],
             dtype=torch.int64,
             device=device,
         )
         gathered = [torch.empty_like(values) for _ in range(group_size)]
         dist.all_gather(gathered, values, group=group)
         rows = [row.tolist() for row in gathered]
-        if any(row[1] == 2 for row in rows):
+        if any(row[0] == 2 for row in rows):
             errors: list[str | None] = [None] * group_size
             local_error = packet["error"] if status_code == 2 else None
             dist.all_gather_object(errors, local_error, group=group)
             first = next(message for message in errors if message is not None)
             raise RuntimeError(f"DPO pair-count preflight failed: {first}")
-        if all(row[1] == 1 for row in rows):
+        if all(row[0] == 1 for row in rows):
             raise StopIteration
-        if any(row[1] == 1 for row in rows):
+        if any(row[0] == 1 for row in rows):
             raise RuntimeError("DPO ranks reached the end of the data at different times")
-        if len({row[2] for row in rows}) != 1:
+        if len({row[1] for row in rows}) != 1:
             raise RuntimeError("DPO ranks must execute the same number of microbatches per optimizer step")
-        groups: dict[tuple[int, ...], list[list[int]]] = {}
-        for row in rows:
-            groups.setdefault(tuple(row[5:37]), []).append(row)
-        for peers in groups.values():
-            if len(peers) != peers[0][4] or len({tuple(row[37:69]) for row in peers}) != 1:
-                raise RuntimeError(
-                    "DPO sequence-parallel ranks disagree on inputs or per-microbatch segment boundaries"
-                )
-        global_count = sum(row[3] for row in rows)
+        global_count = sum(row[2] for row in rows)
     else:
         if packet["status"] == "eof":
             raise StopIteration

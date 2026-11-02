@@ -1014,7 +1014,7 @@ def _invalid_worker(rank, world_size, scenario, endpoint):
         "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
     )
     try:
-        if scenario in ("sp_boundaries", "sp_tail_divergence"):
+        if scenario in ("invalid_sp_boundaries", "invalid_sp_tail"):
             dp_groups = [dist.new_group([0]), dist.new_group([1])]
             state = SimpleNamespace(
                 sp_enabled=True,
@@ -1027,6 +1027,12 @@ def _invalid_worker(rank, world_size, scenario, endpoint):
         else:
             state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
         trainer, _ = _build_trainer(state, distributed=True)
+        if scenario in ("invalid_sp_boundaries", "invalid_sp_tail"):
+
+            def unexpected_forward(micro_batch, *, pair_normalization):
+                raise AssertionError("invalid local packing reached model forward")
+
+            trainer.forward_backward_step = unexpected_forward
         if scenario == "mismatched_microsteps":
             batches = [_microbatch([1])] * (1 if rank == 0 else 2)
         elif scenario in ("one_eof", "all_eof", "loader_error", "eof_and_loader_error", "callback_error"):
@@ -1038,18 +1044,11 @@ def _invalid_worker(rank, world_size, scenario, endpoint):
 
                 trainer.base.on_step_begin = fail_callback
         else:
-            if scenario == "sp_tail_divergence":
-                local_tokens = 3 if rank == 0 else 4
-                batch = {
-                    "input_ids": torch.zeros((1, local_tokens), dtype=torch.long),
-                    "labels": torch.full((1, local_tokens), -100, dtype=torch.long),
-                    "cu_seq_lens_q": torch.tensor([0, 2, 4, 2 * local_tokens], dtype=torch.int32),
-                    "tail_padding_length": torch.tensor(2 * local_tokens - 4, dtype=torch.int32),
-                }
-            else:
-                batch = _microbatch([1], state.sp_size, state.sp_rank)
-            if rank == 1 and scenario == "sp_boundaries":
-                batch["cu_seq_lens_q"] = torch.tensor([0, 1, 4], dtype=torch.int32)
+            batch = _microbatch([1], state.sp_size, state.sp_rank)
+            if rank == 1 and scenario == "invalid_sp_boundaries":
+                batch["cu_seq_lens_q"] = torch.tensor([0, 2, 2, 4], dtype=torch.int32)
+            if rank == 1 and scenario == "invalid_sp_tail":
+                batch["tail_padding_length"] = torch.tensor(1, dtype=torch.int32)
             if rank == 1 and scenario == "bad_labels":
                 batch["labels"] = batch["labels"][:, :-1]
             if rank == 1 and scenario == "bad_token":
@@ -1071,7 +1070,12 @@ def _invalid_worker(rank, world_size, scenario, endpoint):
         else:
             iterator = iter([batches])
         exception = StopIteration if scenario == "all_eof" else RuntimeError
-        with pytest.raises(exception, match="injected loader error" if scenario == "eof_and_loader_error" else None):
+        expected = {
+            "eof_and_loader_error": "injected loader error",
+            "invalid_sp_boundaries": "DPO pair-count preflight failed:.*boundaries",
+            "invalid_sp_tail": "DPO pair-count preflight failed:.*tail padding length",
+        }.get(scenario)
+        with pytest.raises(exception, match=expected):
             trainer.train_step(iterator)
         assert trainer.policy_model.optimizer.steps == 0
     finally:
@@ -1083,8 +1087,8 @@ def _invalid_worker(rank, world_size, scenario, endpoint):
     "scenario",
     [
         "mismatched_microsteps",
-        "sp_boundaries",
-        "sp_tail_divergence",
+        "invalid_sp_boundaries",
+        "invalid_sp_tail",
         "one_eof",
         "all_eof",
         "loader_error",
