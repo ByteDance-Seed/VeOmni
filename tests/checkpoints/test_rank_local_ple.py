@@ -53,7 +53,9 @@ def _worker(rank, root, phase):
                 optimizer.step()
                 optimizer.zero_grad()
             DistributedCheckpointer.save(
-                f"{root}/checkpoint", {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
             before = snapshot()
             model.weight.grad = torch.full_like(model.weight, 0.2)
@@ -61,7 +63,9 @@ def _worker(rank, root, phase):
             torch.save({"before": before, "after": snapshot()}, f"{root}/ple-ref-{rank}.pt")
         else:
             DistributedCheckpointer.load(
-                f"{root}/checkpoint", {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
             reference = torch.load(f"{root}/ple-ref-{rank}.pt", weights_only=True)
             torch.testing.assert_close(snapshot(), reference["before"], rtol=0, atol=0)

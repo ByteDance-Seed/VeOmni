@@ -75,9 +75,13 @@ def test_nested_omni_hook_allows_peft_dcp_roundtrip(tmp_path, model_class):
     expected = {name: value.detach().clone() for name, value in model.state_dict().items()}
     parallel = SimpleNamespace(dp_mode="ddp")
     checkpoint = str(tmp_path / "checkpoint")
-    DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     target, restored = build()
-    DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        checkpoint, {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     actual = target.state_dict()
     assert expected.keys() == actual.keys()
     for name in expected:

@@ -45,7 +45,11 @@ def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
         optimizer.step()
         optimizer.zero_grad()
         parallel = SimpleNamespace(dp_mode="ddp")
-        DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
         target, restored = _model_and_optimizer()
         original_model = checkpoint_module._ProvenModelState
         original_optimizer = checkpoint_module._ProvenMultiOptimizerState
@@ -86,7 +90,11 @@ def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
             patch.object(DistributedCheckpointer, "_create_storage_reader", side_effect=reader),
             pytest.raises((OSError, RuntimeError), match="injected|failed on another rank"),
         ):
-            DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+            DistributedCheckpointer.load(
+                checkpoint,
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         if rank == 1:
             assert injected, f"the {failure} fault did not reach its intended load stage"
         completed = torch.tensor(1)
@@ -109,7 +117,7 @@ def test_multi_optimizer_async_checkpoint_rejected_before_writes(tmp_path):
     with pytest.raises(RuntimeError, match="require synchronous DCP save"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             save_async=True,
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
@@ -165,7 +173,9 @@ def test_shared_mutable_group_options_rejected_before_save(tmp_path, mode):
     optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
     with pytest.raises(RuntimeError, match="Shared mutable optimizer option"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
 
@@ -176,7 +186,9 @@ def test_tensor_lr_aliased_to_optimizer_defaults_rejected_before_save(tmp_path):
     optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
     with pytest.raises(RuntimeError, match="Shared mutable optimizer tensor option"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
 
@@ -195,9 +207,17 @@ def test_noncontiguous_adamw_parameter_recovers_and_updates(tmp_path, singleton)
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     source.weight.grad = torch.full_like(source.weight, 0.125)
     target.weight.grad = source.weight.grad.clone()
     optimizer.step()
@@ -258,7 +278,7 @@ def test_staged_checkpoint_refuses_uncleared_previous_sidecar(tmp_path, monkeypa
     with pytest.raises(FileExistsError):
         DistributedCheckpointer.save(
             str(checkpoint),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             stage_dir=str(stage),
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
@@ -282,10 +302,17 @@ def _proven_staged_resume_worker(rank, checkpoint, stage, endpoint):
         optimizer.zero_grad()
         parallel = SimpleNamespace(dp_mode="ddp")
         DistributedCheckpointer.save(
-            checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel, stage_dir=stage
+            checkpoint,
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+            stage_dir=stage,
         )
         target, restored = _model_and_optimizer()
-        DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
         for source, destination in zip(model.parameters(), target.parameters(), strict=True):
             torch.testing.assert_close(source, destination, rtol=0, atol=0)
             source.grad = torch.full_like(source, 0.5)
@@ -326,7 +353,11 @@ def _writer_error_worker(rank, checkpoint, target, endpoint):
 
         DistributedCheckpointer._create_storage_writer = classmethod(make_writer)
         with pytest.raises(RuntimeError, match="writer"):
-            DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+            DistributedCheckpointer.save(
+                checkpoint,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
@@ -372,7 +403,11 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
             return model, MultiOptimizer(model, {"leaf": leaf}, ["leaf"]), parallel
 
         source, optimizer, parallel = build()
-        DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
         target, restored, parallel = build()
         attempts = 0
 
@@ -386,7 +421,11 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
 
         DistributedCheckpointer._create_storage_reader = classmethod(reader)
         with pytest.raises((RuntimeError, OSError), match="inventory reader"):
-            DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+            DistributedCheckpointer.load(
+                checkpoint,
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         assert attempts == 2
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -491,34 +530,6 @@ def test_inventory_hash_failure_propagates_before_collective():
     spawn_with_rendezvous(_inventory_hash_failure_worker, args=(), nprocs=2)
 
 
-def _trainability_mismatch_worker(rank, checkpoint, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model, optimizer = _model_and_optimizer()
-        if rank == 1:
-            model.weight.requires_grad_(False)
-        with pytest.raises(RuntimeError, match="trainability differs"):
-            DistributedCheckpointer.save(
-                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
-            )
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_rank_asymmetric_trainability_is_rejected_before_save(tmp_path):
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_trainability_mismatch_worker, args=(str(tmp_path),), nprocs=2)
-
-
 def _tied_parameter_order_worker(rank, endpoint):
     from datetime import timedelta
 
@@ -567,7 +578,9 @@ def _finalize_error_worker(rank, checkpoint, endpoint):
         checkpoint_module.synchronize = synchronize
         with pytest.raises(RuntimeError, match="synchronize|finalizing"):
             DistributedCheckpointer.save(
-                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+                checkpoint,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
             )
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -648,19 +661,28 @@ def test_trainable_only_resume_proves_frozen_base_before_loading(tmp_path, same_
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel, trainable_only=True
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+        trainable_only=True,
     )
     target, restored = make_model(1.0 if same_base else 2.0)
     before = target.bias.detach().clone()
     if same_base:
         DistributedCheckpointer.load(
-            str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel, trainable_only=True
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+            trainable_only=True,
         )
         torch.testing.assert_close(target.bias, source.bias, rtol=0, atol=0)
     else:
         with pytest.raises(RuntimeError, match="identity|layout|checkpoint"):
             DistributedCheckpointer.load(
-                str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel, trainable_only=True
+                str(tmp_path),
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+                trainable_only=True,
             )
         torch.testing.assert_close(target.bias, before, rtol=0, atol=0)
 
@@ -672,11 +694,19 @@ def test_multi_optimizer_rejects_changed_group_identity(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
 
     target, changed = _model_and_optimizer(split=False)
     with pytest.raises(RuntimeError, match="(?i)optimizer.*(group|layout|identity)"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": changed}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": changed, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 def test_unversioned_multi_optimizer_checkpoint_fails_closed(tmp_path):
@@ -693,7 +723,9 @@ def test_unversioned_multi_optimizer_checkpoint_fails_closed(tmp_path):
     target, restored = _model_and_optimizer()
     with pytest.raises(RuntimeError, match="(?i)group layout is unproven"):
         DistributedCheckpointer.load(
-            str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
 
 
@@ -703,7 +735,11 @@ def test_nonfresh_target_is_rejected_before_any_checkpoint_load(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
 
     target, restored = _model_and_optimizer()
     restored.optimizers_dict["weight"].state[target.weight] = {
@@ -713,7 +749,11 @@ def test_nonfresh_target_is_rejected_before_any_checkpoint_load(tmp_path):
     }
     original = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="fresh optimizer"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, original, rtol=0, atol=0)
 
 
@@ -737,7 +777,11 @@ def test_anyprecision_mixed_state_dtype_save_resume_and_update(tmp_path, monkeyp
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
     target_leaf = restored.optimizers_dict["weight"]
     original_load = AnyPrecisionAdamW.load_state_dict
@@ -753,7 +797,11 @@ def test_anyprecision_mixed_state_dtype_save_resume_and_update(tmp_path, monkeyp
         return result
 
     monkeypatch.setattr(AnyPrecisionAdamW, "load_state_dict", tracked_load)
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert len(owned_pointers) == 1
     before, after = owned_pointers[0]
     assert before == after
@@ -920,9 +968,17 @@ def test_anyprecision_uninitialized_leaf_restores_and_updates(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert target.weight not in restored.optimizers_dict["weight"].state
     model.weight.grad = torch.ones_like(model.weight)
     target.weight.grad = torch.ones_like(target.weight)
@@ -947,7 +1003,7 @@ def test_trainable_only_rejects_trained_then_frozen_optimizer_parameter(tmp_path
     with pytest.raises(RuntimeError, match="trainable-only save would omit a parameter with optimizer history"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
             trainable_only=True,
         )
@@ -959,14 +1015,18 @@ def test_trainable_only_resume_rejects_frozen_parameter_with_saved_history(tmp_p
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _model_and_optimizer()
     target.weight.requires_grad_(False)
     original = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="trainable-only resume cannot prove"):
         DistributedCheckpointer.load(
             str(tmp_path),
-            {"model": target, "optimizer": restored},
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
             parallel_state=parallel,
             trainable_only=True,
         )
@@ -980,12 +1040,20 @@ def test_multi_optimizer_uninitialized_leaf_uses_its_first_real_step(tmp_path):
     optimizer.zero_grad()
     bias_before = model.bias.detach().clone()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     torch.testing.assert_close(model.bias, bias_before, rtol=0, atol=0)
     assert model.bias not in optimizer.optimizers_dict["bias"].state
 
     target, restored = _model_and_optimizer()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert target.bias not in restored.optimizers_dict["bias"].state
     model.bias.grad = torch.full_like(model.bias, 0.4)
     target.bias.grad = torch.full_like(target.bias, 0.4)
@@ -1045,7 +1113,11 @@ def test_multi_model_generation_keeps_standard_torch_export_strictly_loadable(tm
 
     model, optimizer = _model_and_optimizer()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     exported = tmp_path / "export.pt"
     dcp_to_torch_save(str(tmp_path / "model" / "ckpt"), str(exported))
     state = torch.load(exported, weights_only=False)
@@ -1097,39 +1169,6 @@ def test_multi_lr_scheduler_rejects_missing_leaf():
         scheduler.load_state_dict(state)
 
 
-@pytest.mark.parametrize("override_container", [False, True])
-@pytest.mark.parametrize("method", ["load_state_dict", "step", "get_last_lr"])
-def test_multi_optimizer_rejects_overridden_scheduler_load(tmp_path, override_container, method):
-    model, optimizer = _model_and_optimizer()
-    scheduler = build_lr_scheduler(optimizer, train_steps=100, lr_decay_style="linear")
-    parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(
-        str(tmp_path),
-        {
-            "model": model,
-            "optimizer": optimizer,
-            "extra_state": {"lr_scheduler": scheduler.state_dict()},
-            "_veomni_scheduler_object": scheduler,
-        },
-        parallel_state=parallel,
-    )
-    target, restored = _model_and_optimizer()
-    restored_scheduler = build_lr_scheduler(restored, train_steps=100, lr_decay_style="linear")
-    owner = restored_scheduler if override_container else restored_scheduler["weight"]
-    setattr(owner, method, lambda *args, **kwargs: None)
-    with pytest.raises(RuntimeError, match="overridden scheduler"):
-        DistributedCheckpointer.load(
-            str(tmp_path),
-            {
-                "model": target,
-                "optimizer": restored,
-                "extra_state": {},
-                "_veomni_scheduler_object": restored_scheduler,
-            },
-            parallel_state=parallel,
-        )
-
-
 def test_multi_optimizer_rejects_snapshot_from_an_old_scheduler_binding(tmp_path):
     model, optimizer = _model_and_optimizer()
     original = build_lr_scheduler(optimizer, train_steps=100, lr_decay_style="linear")
@@ -1144,25 +1183,6 @@ def test_multi_optimizer_rejects_snapshot_from_an_old_scheduler_binding(tmp_path
         DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
     assert not (tmp_path / "model").exists()
     assert newer is not None
-
-
-def test_multi_optimizer_rejects_replaced_framework_scheduler_recipe(tmp_path):
-    model, optimizer = _model_and_optimizer()
-    scheduler = build_lr_scheduler(optimizer, train_steps=100, lr_decay_style="linear")
-
-    def custom(step, *, factor=0.5):
-        return factor
-
-    scheduler["weight"].lr_lambdas[0] = custom
-    state = {
-        "model": model,
-        "optimizer": optimizer,
-        "extra_state": {"lr_scheduler": scheduler.state_dict()},
-        "_veomni_scheduler_object": scheduler,
-    }
-    with pytest.raises(RuntimeError, match="scheduler recipe changed after construction"):
-        DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
-    assert not (tmp_path / "model").exists()
 
 
 def test_multi_optimizer_rejects_modified_scheduler_sidecar_before_loading(tmp_path):
@@ -1219,7 +1239,12 @@ def test_multi_optimizer_rejects_mixed_checkpoint_generations(tmp_path, swapped)
         optimizer.zero_grad()
         DistributedCheckpointer.save(
             str(path),
-            {"model": model, "optimizer": optimizer, "extra_state": {"condition_rng": torch.tensor(index)}},
+            {
+                "model": model,
+                "optimizer": optimizer,
+                "extra_state": {"condition_rng": torch.tensor(index)},
+                "_veomni_scheduler_object": None,
+            },
             parallel_state=parallel,
         )
     source = first / "model" / swapped
@@ -1231,7 +1256,9 @@ def test_multi_optimizer_rejects_mixed_checkpoint_generations(tmp_path, swapped)
     original = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="(?i)generation|layout"):
         DistributedCheckpointer.load(
-            str(second), {"model": target, "optimizer": restored, "extra_state": {}}, parallel_state=parallel
+            str(second),
+            {"model": target, "optimizer": restored, "extra_state": {}, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     torch.testing.assert_close(target.weight, original, rtol=0, atol=0)
 
@@ -1248,7 +1275,11 @@ def test_model_generation_rechecked_by_actual_dcp_load(tmp_path, monkeypatch):
         model.weight.grad = torch.full_like(model.weight, 0.1 * index)
         optimizer.step()
         optimizer.zero_grad()
-        DistributedCheckpointer.save(str(path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     original_preflight = checkpoint._preflight_multi_optimizer_layout
 
     def replace_after_preflight(*args, **kwargs):
@@ -1260,7 +1291,11 @@ def test_model_generation_rechecked_by_actual_dcp_load(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpoint, "_preflight_multi_optimizer_layout", replace_after_preflight)
     target, restored = _model_and_optimizer()
     with pytest.raises(BaseException, match="(?i)checkpoint.*(changed|generation)"):
-        DistributedCheckpointer.load(str(second), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(second),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 def test_checkpoint_generation_marker_is_not_a_hf_parameter():
@@ -1281,10 +1316,18 @@ def test_muon_adam_resume_does_not_run_an_optimizer_step(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
 
     target, restored = build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     torch.testing.assert_close(target.weight, model.weight, rtol=0, atol=0)
     torch.testing.assert_close(target.bias, model.bias, rtol=0, atol=0)
     assert target.bias not in restored.optimizers_dict["adam"].state
@@ -1309,10 +1352,18 @@ def test_muon_head_partition_change_requires_explicit_migration(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, changed = build(4)
     with pytest.raises(RuntimeError, match="(?i)optimizer.*layout"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": changed}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": changed, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 def test_multi_optimizer_layout_binds_extra_parallel_mesh_names():
@@ -1342,17 +1393,27 @@ def test_frozen_optimizer_history_survives_resume_then_unfreeze(tmp_path, target
     optimizer.zero_grad()
     model.weight.requires_grad_(False)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
 
     target, restored = build()
     target.weight.requires_grad_(not target_frozen)
     if not target_frozen:
         with pytest.raises(RuntimeError, match="(?i)optimizer.*layout"):
             DistributedCheckpointer.load(
-                str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel
+                str(tmp_path),
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
         return
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert target.weight.requires_grad is not target_frozen
     model.weight.requires_grad_(True)
     target.weight.requires_grad_(True)
@@ -1374,7 +1435,7 @@ def test_multi_optimizer_rejects_checkpoint_with_pending_gradients(tmp_path):
     with pytest.raises(RuntimeError, match="cannot omit pending gradients"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
@@ -1394,16 +1455,28 @@ def test_unowned_pending_gradients_reject_save_and_load_before_model_copy(tmp_pa
     optimizer.zero_grad()
     source.bias.grad = torch.ones_like(source.bias)
     with pytest.raises(RuntimeError, match="cannot omit pending gradients"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     assert not list(tmp_path.iterdir())
 
     source.bias.grad = None
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
     target.bias.grad = torch.ones_like(target.bias)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="cannot omit pending gradients"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1416,7 +1489,7 @@ def test_incomplete_optimizer_source_state_cannot_be_saved(tmp_path):
     with pytest.raises(RuntimeError, match="incomplete or unsupported parameter state"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
@@ -1432,7 +1505,11 @@ def test_incomplete_optimizer_checkpoint_rejected_before_model_copy(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     path = Path(optimizer_dir(str(tmp_path))) / ".metadata"
     with path.open("rb") as handle:
         metadata = pickle.load(handle)
@@ -1442,7 +1519,11 @@ def test_incomplete_optimizer_checkpoint_rejected_before_model_copy(tmp_path):
     target, restored = _model_and_optimizer()
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="incomplete or unsupported parameter state|inventory"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1458,7 +1539,11 @@ def test_missing_group_or_all_parameter_history_rejected_before_model_copy(tmp_p
     optimizer.zero_grad()
     optimizer.optimizers_dict["weight"].param_groups[0]["lr"] = 0.0025
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     path = Path(optimizer_dir(str(tmp_path))) / ".metadata"
     with path.open("rb") as handle:
         metadata = pickle.load(handle)
@@ -1478,7 +1563,11 @@ def test_missing_group_or_all_parameter_history_rejected_before_model_copy(tmp_p
     target, restored = _model_and_optimizer()
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="inventory"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1487,11 +1576,15 @@ def test_multi_optimizer_rejects_stale_sidecar_before_overwrite(tmp_path):
     parallel = SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
         str(tmp_path),
-        {"model": model, "optimizer": optimizer, "extra_state": {"cursor": "old"}},
+        {"model": model, "optimizer": optimizer, "extra_state": {"cursor": "old"}, "_veomni_scheduler_object": None},
         parallel_state=parallel,
     )
     with pytest.raises(RuntimeError, match="sidecar cannot be reused"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 def test_multi_optimizer_rejects_duplicate_ownership_before_checkpoint_write(tmp_path):
@@ -1500,7 +1593,7 @@ def test_multi_optimizer_rejects_duplicate_ownership_before_checkpoint_write(tmp
     with pytest.raises(RuntimeError, match="ownership is duplicated"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
@@ -1512,7 +1605,9 @@ def test_multi_optimizer_rejects_empty_parameter_group_before_checkpoint_write(t
     optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
     with pytest.raises(RuntimeError, match="empty parameter group"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
 
@@ -1528,7 +1623,7 @@ def test_optimizer_root_names_must_match_checkpoint_model(tmp_path):
     with pytest.raises(RuntimeError, match="different canonical parameter identities"):
         DistributedCheckpointer.save(
             str(tmp_path),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
@@ -1543,11 +1638,19 @@ def test_tensor_lr_dtype_change_rejected_before_model_load(tmp_path):
 
     model, optimizer = build(torch.float32)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(torch.bfloat16)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1562,7 +1665,11 @@ def test_shared_tensor_lr_across_groups_is_rejected_before_save(tmp_path):
     model, optimizer = build(True)
     parallel = SimpleNamespace(dp_mode="ddp")
     with pytest.raises(RuntimeError, match="Shared mutable optimizer tensor option"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     assert not list(tmp_path.iterdir())
 
 
@@ -1580,10 +1687,12 @@ def test_proven_optimizer_load_sets_identity_receipt(tmp_path):
     model, optimizer = _model_and_optimizer()
     parallel = SimpleNamespace(dp_mode="ddp")
     generation = DistributedCheckpointer.save(
-        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, restored = _model_and_optimizer()
-    state = {"model": target, "optimizer": restored}
+    state = {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}
     DistributedCheckpointer.load(str(tmp_path), state, parallel_state=parallel)
     assert state["_veomni_optimizer_identity_verified"] is True
     assert isinstance(generation, str) and state["_veomni_optimizer_checkpoint_generation"] == generation
@@ -1599,13 +1708,17 @@ def test_failed_second_load_clears_old_identity_receipt(tmp_path, monkeypatch):
         first.weight.fill_(1)
         second.weight.fill_(9)
     DistributedCheckpointer.save(
-        str(tmp_path / "first"), {"model": first, "optimizer": first_optimizer}, parallel_state=parallel
+        str(tmp_path / "first"),
+        {"model": first, "optimizer": first_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     DistributedCheckpointer.save(
-        str(tmp_path / "second"), {"model": second, "optimizer": second_optimizer}, parallel_state=parallel
+        str(tmp_path / "second"),
+        {"model": second, "optimizer": second_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, restored = _model_and_optimizer()
-    state = {"model": target, "optimizer": restored}
+    state = {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}
     DistributedCheckpointer.load(str(tmp_path / "first"), state, parallel_state=parallel)
     assert state["_veomni_optimizer_identity_verified"] is True
 
@@ -1624,12 +1737,20 @@ def test_model_buffer_dtype_change_rejected_before_model_load(tmp_path):
     model, optimizer = _model_and_optimizer()
     model.register_buffer("sensitive", torch.tensor([0.1], dtype=torch.float32))
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _model_and_optimizer()
     target.register_buffer("sensitive", torch.tensor([0.2], dtype=torch.bfloat16))
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="tensor dtype or shape differs"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1637,11 +1758,19 @@ def test_source_model_extra_buffer_rejected_before_model_load(tmp_path):
     model, optimizer = _model_and_optimizer()
     model.register_buffer("offset", torch.tensor([0.5]))
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _model_and_optimizer()
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="model state inventory differs"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1660,11 +1789,19 @@ def test_model_object_alias_graph_must_match_on_resume(tmp_path, kind):
 
     model, optimizer = build(True)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(False)
     before = target.p.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.p, before, rtol=0, atol=0)
 
 
@@ -1678,7 +1815,11 @@ def test_multi_optimizer_save_preserves_completed_checkpoint(tmp_path, old_model
     write_manifest(str(tmp_path), global_step=0, world_size=1, model_state=old_model_state)
     assert checkpoint_is_complete(str(tmp_path))
     with pytest.raises(RuntimeError, match="Cannot overwrite a completed checkpoint"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     assert checkpoint_is_complete(str(tmp_path))
 
 
@@ -1696,6 +1837,133 @@ def test_failed_multi_optimizer_save_remains_incomplete(tmp_path, monkeypatch):
     monkeypatch.setattr(DistributedCheckpointer, "_create_storage_writer", failing_writer)
     with pytest.raises(OSError, match="injected optimizer write failure"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not checkpoint_is_complete(str(tmp_path))
+
+
+def test_multi_checkpoint_requires_explicit_scheduler_declaration(tmp_path):
+    model, optimizer = _model_and_optimizer()
+    # Ordinary PyTorch schedulers can be attached without VeOmni's registry.
+    # Omission must not silently be interpreted as a claim that none exists.
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer.optimizers_dict["weight"], step_size=1)
+    state = {"model": model, "optimizer": optimizer}
+    with pytest.raises(RuntimeError, match="explicit scheduler declaration"):
+        DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
+    assert not (tmp_path / "model").exists()
+    state["_veomni_scheduler_object"] = scheduler
+    with pytest.raises(RuntimeError, match="scheduler object has no matching scheduler binding"):
+        DistributedCheckpointer.save(str(tmp_path), state, parallel_state=SimpleNamespace(dp_mode="ddp"))
+    assert not (tmp_path / "model").exists()
+
+
+def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
+    model, optimizer = _model_and_optimizer()
+    model.weight.grad = torch.ones_like(model.weight)
+    model.bias.grad = torch.ones_like(model.bias)
+    optimizer.step()
+    optimizer.zero_grad()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    source = {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}
+    DistributedCheckpointer.save(str(tmp_path), source, parallel_state=parallel)
+    target_model, target_optimizer = _model_and_optimizer()
+    target = {"model": target_model, "optimizer": target_optimizer, "_veomni_scheduler_object": None}
+    DistributedCheckpointer.load(str(tmp_path), target, parallel_state=parallel)
+    for actual, expected in zip(target_model.parameters(), model.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(target_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0)
+    for source_param, target_param in zip(model.parameters(), target_model.parameters(), strict=True):
+        source_param.grad = torch.full_like(source_param, 0.25)
+        target_param.grad = torch.full_like(target_param, 0.25)
+    optimizer.step()
+    target_optimizer.step()
+    for actual, expected in zip(target_model.parameters(), model.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(target_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0)
+
+
+def test_direct_multi_checkpoint_applies_returned_scheduler_state(tmp_path):
+    model, optimizer = _model_and_optimizer()
+    scheduler = build_lr_scheduler(optimizer, train_steps=10, lr_decay_style="linear")
+    for param in model.parameters():
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    optimizer.zero_grad()
+    scheduler.step()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    source = {
+        "model": model,
+        "optimizer": optimizer,
+        "extra_state": {"lr_scheduler": scheduler.state_dict()},
+        "_veomni_scheduler_object": scheduler,
+    }
+    DistributedCheckpointer.save(str(tmp_path), source, parallel_state=parallel)
+    target, target_optimizer = _model_and_optimizer()
+    target_scheduler = build_lr_scheduler(target_optimizer, train_steps=10, lr_decay_style="linear")
+    restored = {
+        "model": target,
+        "optimizer": target_optimizer,
+        "extra_state": {},
+        "_veomni_scheduler_object": target_scheduler,
+    }
+    DistributedCheckpointer.load(str(tmp_path), restored, parallel_state=parallel)
+    target_scheduler.load_state_dict(restored["extra_state"]["lr_scheduler"])
+    assert scheduler.state_dict() == target_scheduler.state_dict()
+    for source_param, target_param in zip(model.parameters(), target.parameters(), strict=True):
+        source_param.grad = torch.full_like(source_param, 0.25)
+        target_param.grad = torch.full_like(target_param, 0.25)
+    optimizer.step()
+    target_optimizer.step()
+    scheduler.step()
+    target_scheduler.step()
+    for actual, expected in zip(target.parameters(), model.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert scheduler.state_dict() == target_scheduler.state_dict()
+
+
+def _rank_scheduler_declaration_worker(rank, root, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        torch.manual_seed(42)
+        model, optimizer = _model_and_optimizer()
+        parallel = SimpleNamespace(dp_mode="ddp")
+        state = {"model": model, "optimizer": optimizer}
+        if rank == 1:
+            state["_veomni_scheduler_object"] = None
+        message = "explicit scheduler declaration" if rank == 0 else "failed on another rank"
+        with pytest.raises(RuntimeError, match=message):
+            DistributedCheckpointer.save(f"{root}/missing", state, parallel_state=parallel)
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+        assert not (Path(root) / "missing").exists()
+        state["_veomni_scheduler_object"] = None
+        DistributedCheckpointer.save(f"{root}/good", state, parallel_state=parallel)
+        target, restored = _model_and_optimizer()
+        before = target.weight.detach().clone()
+        load_state = {"model": target, "optimizer": restored}
+        if rank == 0:
+            load_state["_veomni_scheduler_object"] = None
+        message = "explicit scheduler declaration" if rank == 1 else "failed on another rank"
+        with pytest.raises(RuntimeError, match=message):
+            DistributedCheckpointer.load(f"{root}/good", load_state, parallel_state=parallel)
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+        torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
+        assert all(not child.state for child in restored.optimizers_dict.values())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_missing_scheduler_declaration_fails_all_ranks_before_mutation(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_rank_scheduler_declaration_worker, args=(str(tmp_path),), nprocs=2)

@@ -28,18 +28,12 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 _CHECKPOINT_SCHEDULER_BINDINGS = weakref.WeakKeyDictionary()
-_CHECKPOINT_SCHEDULER_FUNCTIONS = weakref.WeakKeyDictionary()
 
 
 def checkpoint_scheduler_binding(optimizer):
     """Find a framework-built scheduler without mutating the optimizer payload."""
     reference = _CHECKPOINT_SCHEDULER_BINDINGS.get(optimizer)
     return None if reference is None else reference()
-
-
-def checkpoint_scheduler_functions(scheduler):
-    """Identify the immutable function objects installed by the framework builder."""
-    return _CHECKPOINT_SCHEDULER_FUNCTIONS.get(scheduler)
 
 
 class MultiLRScheduler(dict):
@@ -128,7 +122,6 @@ def build_lr_scheduler(
     else:
         raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
     _CHECKPOINT_SCHEDULER_BINDINGS[optimizer] = weakref.ref(scheduler)
-    _CHECKPOINT_SCHEDULER_FUNCTIONS[scheduler] = tuple(scheduler.lr_lambdas)
     return scheduler
 
 

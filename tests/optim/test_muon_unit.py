@@ -83,8 +83,16 @@ def _dcp_restore_optimizer_and_model(tmp_path, source, source_optimizer, target,
 
     checkpoint = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
-    DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint,
+        {"model": source, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    DistributedCheckpointer.load(
+        checkpoint,
+        {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     for before, after in zip(source.parameters(), target.parameters(), strict=True):
         torch.testing.assert_close(before, after, atol=0.0, rtol=0.0)
 
