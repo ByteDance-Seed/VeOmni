@@ -2808,6 +2808,7 @@ class TestShardingPlanDropHfKeys:
         assert size == expected_size
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_split_dcp_prepares_lazy_adam_only_after_loading_model(tmp_path):
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
