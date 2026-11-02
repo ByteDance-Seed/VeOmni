@@ -32,34 +32,20 @@ def contains_padding(batch) -> bool:
     return is_padding_microbatch(batch)
 
 
-def _distributed_batch_status(batch, invalid: bool, has_error: bool = False, has_auxiliary_targets: bool = False):
+def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool = False):
     count = len(batch) if isinstance(batch, (list, tuple)) else 1
     device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
-    flags = torch.tensor(
-        [int(invalid), int(has_error), int(has_auxiliary_targets), count, -count], dtype=torch.int32, device=device
-    )
+    flags = torch.tensor([int(invalid), int(has_auxiliary_targets), count, -count], dtype=torch.int32, device=device)
     torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
     values = flags.tolist()
-    return bool(values[0]) or values[3] != -values[4], bool(values[1]), bool(values[2])
+    return bool(values[0]) or values[2] != -values[3], bool(values[1])
 
 
 def reject_objective_padding(batch, objective: str) -> None:
-    error = None
-    try:
-        found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
-    except Exception as exc:  # noqa: BLE001 - peers must reach the validation collective
-        error = exc
-        found = True
-    distributed = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-    if distributed:
-        found, has_error, _ = _distributed_batch_status(batch, found, error is not None)
-    else:
-        has_error = error is not None
+    found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        found, _ = _distributed_batch_status(batch, found)
     if found:
-        if has_error:
-            if not distributed:
-                raise error
-            raise RuntimeError(f"Invalid {objective} padding metadata on a rank") from error
         raise ValueError(
             f"{objective} does not support padded micro-batches, an empty step, or unequal microbatch counts across ranks"
         )
@@ -92,7 +78,7 @@ def reject_distributed_padding(batch) -> bool:
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
         has_auxiliary_targets = _has_auxiliary_labels(batch)
-        found, _, has_auxiliary_targets = _distributed_batch_status(
+        found, has_auxiliary_targets = _distributed_batch_status(
             batch, invalid, has_auxiliary_targets=has_auxiliary_targets
         )
         if found:

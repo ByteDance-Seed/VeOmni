@@ -135,6 +135,14 @@ def _asymmetric_distributed_padding_worker(rank, endpoint):
         counts = loss_utils.synchronize_auxiliary_loss_tokens(loss_utils.count_loss_token([batch]))
         totals = loss_utils.reduce_global_loss_token(counts)
         assert totals["image_tokens"] == 2 and totals["audio_tokens"] == 2
+
+        batch = {"labels": torch.tensor([1])}
+        if rank == 0:
+            batch["image_labels"] = torch.tensor([1, 2])
+        assert loss_utils.reject_distributed_padding([batch])
+        counts = loss_utils.synchronize_auxiliary_loss_tokens(loss_utils.count_loss_token([batch]))
+        totals = loss_utils.reduce_global_loss_token(counts)
+        assert totals["foundation_tokens"] == 2 and totals["image_tokens"] == 2
     finally:
         dist.destroy_process_group()
 
@@ -199,7 +207,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [5, 2] for _, _, sizes, *_ in results)
+        assert all(sizes == [4, 2] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
         assert results[1][3] and results[1][4] is None
 
@@ -270,6 +278,15 @@ def _asymmetric_objective_padding_worker(rank, endpoint):
                 failure = str(exc)
             dist.all_gather_object(failures, failure)
             assert all(message and objective in message and "empty step" in message for message in failures)
+            failure = None
+            try:
+                loss_utils.reject_objective_padding([{"labels": torch.tensor([1])}] * (rank + 1), objective)
+            except ValueError as exc:
+                failure = str(exc)
+            dist.all_gather_object(failures, failure)
+            assert all(
+                message and objective in message and "unequal microbatch counts" in message for message in failures
+            )
     finally:
         dist.destroy_process_group()
 
