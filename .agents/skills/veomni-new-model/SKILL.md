@@ -78,7 +78,22 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
 
-5. **Patch patterns** — follow existing models:
+5. **Configuration ownership** — custom configs inherit `VeOmniPretrainedConfig`
+   (inherit `(VeOmniPretrainedConfig, HFConfig)` when extending an HF schema;
+   declared `sub_configs` are adapted recursively at class creation). Generated
+   specs drop the HF `PreTrainedModel` import and import
+   `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
+   Handwritten models use the same base. It adapts direct model inputs and the
+   model's `config_class` recursively, validating final ops before HF initialization.
+   Standalone attention/MLP tests must use `get_veomni_config_class(HFConfig)` or
+   `as_veomni_config(config)` explicitly; native HF classes have no `ops_config`.
+   Read `docs/design/module_config.md`. Never patch HF config base methods or
+   maintain a separate attention field beside `ops_implementation`.
+   Handwritten Diffusers constructors that accept `attn_implementation` must
+   apply it to the config before HF initialization and kernel binding; preserve
+   existing choices when it is omitted or `None`.
+
+6. **Patch patterns** — follow existing models:
    - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.
    - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module.
    - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`.
@@ -126,6 +141,10 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 2. **Model tests**: follow
    [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).
+   Set eager attention on composite roots before constructing HF references;
+   text-only eager settings leave root and vision/audio defaults unresolved.
+   CPU model tests reject optional attention preloading even when installed.
+   Use config-owned SDPA for FP32 accelerator comparisons.
    Add the canonical tiny-config factory, registry/build case, eager family
    forward/backward parity, and reference coverage for one supported
    accelerator training configuration. Shape checks and a successful import
