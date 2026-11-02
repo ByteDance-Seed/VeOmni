@@ -170,6 +170,10 @@ class ProfileTraceCallback(Callback):
         self._profile_cleanup_barrier_required = False
         self._step_started_at = None
         self._profile_timing_start_step = None
+        # Trainer global_step can advance on an exhausted fetch. The profiler
+        # only advances on successful step-end callbacks, so keep its schedule
+        # on the same event count, anchored to the restored step at startup.
+        self._profile_next_step = state.global_step + 1
         if not args.train.profile.enable:
             return
 
@@ -229,16 +233,18 @@ class ProfileTraceCallback(Callback):
     def on_step_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
         timing_start_step = getattr(self, "_profile_timing_start_step", None)
+        profile_step = getattr(self, "_profile_next_step", state.global_step)
         if (
             self._profile_active
             and helper.IS_NPU_AVAILABLE
             and timing_start_step is not None
-            and timing_start_step <= state.global_step <= args.train.profile.end_step
+            and timing_start_step <= profile_step <= args.train.profile.end_step
         ):
             self._step_started_at = time.perf_counter()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
+        profile_step = getattr(self, "_profile_next_step", state.global_step)
         # on_trace_ready runs synchronously when the schedule exits its active
         # window, in profiler.step() at global step end_step - 1. Keep
         # non-profiled ranks out of the next collective until NPU finalization
@@ -247,7 +253,7 @@ class ProfileTraceCallback(Callback):
         synchronize_finalize = (
             self._profile_active
             and helper.IS_NPU_AVAILABLE
-            and state.global_step == args.train.profile.end_step - 1
+            and profile_step == args.train.profile.end_step - 1
             and dist.is_available()
             and dist.is_initialized()
         )
@@ -269,12 +275,12 @@ class ProfileTraceCallback(Callback):
                 and not getattr(self, "_profiler_stopped", False)
             ):
                 try:
-                    if state.global_step <= args.train.profile.end_step:
+                    if profile_step <= args.train.profile.end_step:
                         started = time.perf_counter()
                         self.profiler.step()
                         profiler_step_seconds = time.perf_counter() - started
 
-                    if state.global_step == args.train.profile.end_step:
+                    if profile_step == args.train.profile.end_step:
                         self.profiler.stop()
                         self._profiler_stopped = True
                 except Exception as exc:
@@ -294,7 +300,7 @@ class ProfileTraceCallback(Callback):
                 f"after all ranks leave the finalization barrier. Error: {profile_error}"
             )
 
-        if state.global_step == args.train.profile.end_step:
+        if profile_step == args.train.profile.end_step:
             self._profile_active = False
 
         step_started_at = getattr(self, "_step_started_at", None)
@@ -307,7 +313,7 @@ class ProfileTraceCallback(Callback):
             timing_message = (
                 "NPU_PROFILE_STEP "
                 f"mode={effective_mode} rank={getattr(args.train, 'global_rank', 0)} "
-                f"step={state.global_step} finalize={str(synchronize_finalize).lower()} "
+                f"step={state.global_step} profile_step={profile_step} finalize={str(synchronize_finalize).lower()} "
                 f"total_seconds={time.perf_counter() - step_started_at:.6f} "
                 f"pre_barrier_seconds={pre_barrier_seconds:.6f} "
                 f"profiler_step_seconds={profiler_step_seconds:.6f} "
@@ -318,6 +324,8 @@ class ProfileTraceCallback(Callback):
             else:
                 logger.info_rank0(timing_message)
             self._step_started_at = None
+
+        self._profile_next_step = profile_step + 1
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args

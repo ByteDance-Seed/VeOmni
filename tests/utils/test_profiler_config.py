@@ -825,6 +825,67 @@ def test_npu_profile_synchronizes_finalization(monkeypatch, npu_analysis_mode, t
     assert events == expected_events
 
 
+@pytest.mark.parametrize("this_rank", [True, False])
+def test_profile_finalization_tracks_successful_steps_after_iterator_exhaustion(monkeypatch, this_rank):
+    events = []
+    profile = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=6, this_rank=this_rank)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile)))
+    callback._profile_active = True
+    callback._profile_next_step = 1
+    callback.profiler = (
+        SimpleNamespace(step=lambda: events.append("step"), stop=lambda: events.append("stop")) if this_rank else None
+    )
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+
+    # Global step 4 was consumed by a failed fetch; no step-end callback ran.
+    for global_step in (1, 2, 3, 5):
+        callback.on_step_end(TrainerState(global_step=global_step))
+    events.clear()
+    callback.on_step_end(TrainerState(global_step=6))
+
+    assert events == (["barrier", "step", "barrier"] if this_rank else ["barrier", "barrier"])
+    assert callback._profile_next_step == 6
+
+
+def test_real_profiler_trace_is_inside_barriers_after_iterator_exhaustion(monkeypatch):
+    events = []
+    actual_step = [0]
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=torch.profiler.schedule(wait=3, warmup=1, active=1, repeat=1),
+        on_trace_ready=lambda _: events.append(("trace", actual_step[0])),
+    )
+    profile = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=6, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile)))
+    callback._profile_active = True
+    callback._profile_next_step = 1
+    callback.profiler = profiler
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(
+        trace_callback,
+        "dist",
+        SimpleNamespace(
+            is_available=lambda: True,
+            is_initialized=lambda: True,
+            barrier=lambda: events.append(("barrier", actual_step[0])),
+        ),
+    )
+
+    profiler.start()
+    try:
+        for actual_step[0] in (1, 2, 3, 5, 6):
+            callback.on_step_end(TrainerState(global_step=actual_step[0]))
+    finally:
+        profiler.stop()
+
+    assert events == [("barrier", 6), ("trace", 6), ("barrier", 6)]
+
+
 def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
     events = []
     warnings = []

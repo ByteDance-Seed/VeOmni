@@ -537,11 +537,16 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 `train.profile.*` — Torch profiler settings.
 
+After resume, the profiler anchors its completed-step count to the saved
+`global_step`. Checkpoints do not record prior exhausted-fetch events, so
+the absolute profiling window may differ from an uninterrupted run after such
+an event; this does not change training or checkpoint steps.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable profiling. |
-| start_step | `int` | `1` | Start step for profiling. |
-| end_step | `int` | `2` | End step for profiling. |
+| start_step | `int` | `1` | Start profiler step, counted from the restored training step using completed step callbacks. |
+| end_step | `int` | `2` | End profiler step; an exhausted data fetch does not advance the profiler. |
 | trace_dir | `str` | `"./trace"` | Directory to save profiling traces. |
 | record_shapes | `bool` | `True` | Record input tensor shapes. |
 | profile_memory | `bool` | `True` | Record memory events; on NPU they are kept in the torch_npu trace rather than a CUDA `.pkl` allocator snapshot. |
