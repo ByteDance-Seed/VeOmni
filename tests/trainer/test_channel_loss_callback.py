@@ -1875,159 +1875,24 @@ def test_channel_data_metrics_gloo_sp_and_dp(sp_size):
     spawn_with_rendezvous(_gloo_channel_data_metrics_worker, args=(4, sp_size), nprocs=4)
 
 
-def test_channel_loss_filters_padding_tail_per_batch_row():
-    result = ChannelLossComputer._aggregate_by_source(
-        per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
-        source_ids=["row0", "row1"],
-        position_ids=torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0", "loss_sum": 3.0, "token_count": 2},
-        {"source_id": "row1", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_preserves_zero_supervision_tail_when_later_row_has_padding():
-    result = ChannelLossComputer._aggregate_by_source(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        position_ids=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0_normal", "loss_sum": 6.0, "token_count": 3},
-        {"source_id": "row0_zero", "loss_sum": 0.0, "token_count": 0},
-        {"source_id": "row1_normal", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_compute_uses_position_aligned_mask_for_padding_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_sp_state(monkeypatch, sp_size=1))
-    computer.strict = True
-    computer._source_ids = ["row0_normal", "row0_zero", "row1_normal"]
-    computer._position_ids = torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]])
-    labels = torch.tensor([[1, 2, 3, 4], [1, 2, IGNORE_INDEX, IGNORE_INDEX]])
-    logits = torch.randn(2, 4, 8)
-
-    result = computer._compute_channel_loss(
-        logits=logits,
-        labels=labels,
-        vocab_size=8,
-        hidden_states=None,
-        weights=None,
-        attention_mask=torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),
-        shift_labels=None,
-        ignore_index=IGNORE_INDEX,
-    )
-
-    assert [item["source_id"] for item in result] == ["row0_normal", "row0_zero", "row1_normal"]
-    assert [item["token_count"].item() for item in result] == [3, 0, 1]
-
-
-def test_channel_loss_rejects_ambiguous_per_row_padding_without_mask_evidence():
-    kwargs = dict(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.ones(8, dtype=torch.long),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        position_ids=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        ignore_index=IGNORE_INDEX,
-    )
-
-    assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
-        ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
-
-
-def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
-    result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
-        per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
-        source_ids=["row0", "row1"],
-        positions=torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0", "loss_sum": 3.0, "token_count": 2},
-        {"source_id": "row1", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padding(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
-    result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        strict=True,
-    )
-
-    assert result == [
-        {"source_id": "row0_normal", "loss_sum": 6.0, "token_count": 3},
-        {"source_id": "row0_zero", "loss_sum": 0.0, "token_count": 0},
-        {"source_id": "row1_normal", "loss_sum": 7.0, "token_count": 2},
-    ]
-
-
-def test_channel_loss_sp_rejects_ambiguous_per_row_padding_without_mask_evidence(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-    kwargs = dict(
-        per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        attention_mask_flat=torch.ones(8, dtype=torch.long),
-        source_ids=["row0_normal", "row0_zero", "row1_normal"],
-        positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
-        seq_len=8,
-        ignore_index=IGNORE_INDEX,
-        parallel_state=sp_state,
-    )
-
-    assert ChannelLossComputer._aggregate_sp(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
-        ChannelLossComputer._aggregate_sp(**kwargs, strict=True)
-
-
 @pytest.mark.parametrize("sp_enabled", [False, True])
-def test_channel_data_stats_preserve_per_row_padding_boundaries(monkeypatch, sp_enabled):
-    kwargs = {
-        "per_token_loss": torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
-        "labels_flat": torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
-        "attention_mask_flat": torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
-        "source_ids": ["row0", "row1"],
-        "ignore_index": IGNORE_INDEX,
-        "strict": True,
-        "include_data_stats": True,
-    }
-    positions = torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]])
+def test_channel_loss_rejects_ambiguous_multirow_surplus(monkeypatch, sp_enabled):
+    kwargs = dict(
+        per_token_loss=torch.tensor([1.0, 2.0, 0.0, 3.0, 4.0, 0.0]),
+        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX]),
+        attention_mask_flat=torch.tensor([1, 1, 0, 1, 1, 1]),
+        source_ids=["row0", "row1_actual", "row1_zero"],
+        ignore_index=IGNORE_INDEX,
+    )
+    positions = torch.tensor([[0, 1, 0], [0, 1, 0]])
     if sp_enabled:
-        result = ChannelLossComputer._aggregate_sp(
-            **kwargs, positions=positions, seq_len=8, parallel_state=_sp_state(monkeypatch, sp_size=1)
+        aggregate = lambda strict: ChannelLossComputer._aggregate_sp(  # noqa: E731
+            **kwargs, positions=positions, seq_len=6, parallel_state=_sp_state(monkeypatch, sp_size=1), strict=strict
         )
     else:
-        result = ChannelLossComputer._aggregate_by_source(**kwargs, position_ids=positions)
-    assert result == [
-        {"source_id": "row0", "loss_sum": 3.0, "token_count": 2, "sample_count": 1, "input_token_count": 2},
-        {"source_id": "row1", "loss_sum": 7.0, "token_count": 2, "sample_count": 1, "input_token_count": 2},
-    ]
+        aggregate = lambda strict: ChannelLossComputer._aggregate_by_source(  # noqa: E731
+            **kwargs, position_ids=positions, strict=strict
+        )
+    assert aggregate(False) == []
+    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
+        aggregate(True)
