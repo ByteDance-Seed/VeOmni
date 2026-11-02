@@ -1102,49 +1102,6 @@ def test_incompatible_distributed_batches_fail_before_optimizer(scenario):
     spawn_with_rendezvous(_invalid_worker, args=(2, scenario), nprocs=2)
 
 
-def _different_producers_worker(rank, world_size, native_npu, endpoint):
-    class Tokenizer:
-        dpo_unpadded_output_contract = True
-
-        def dpo_unpadded_output_contract_id(self):
-            return f"tokenizer-{rank}"
-
-    if native_npu:
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(rank)
-    dist.init_process_group(
-        "hccl" if native_npu else "gloo", store=endpoint.connect(), rank=rank, world_size=world_size
-    )
-    try:
-        trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
-        trainer._dpo_provenance_required = True
-        trainer.base = SimpleNamespace(
-            args=SimpleNamespace(dpo_config=dpo.DPOConfig(), data=SimpleNamespace(max_seq_len=32))
-        )
-        trainer.policy_model = SimpleNamespace(tokenizer=Tokenizer(), chat_template=None)
-        with pytest.raises(RuntimeError, match="producer identity does not match across ranks"):
-            trainer._build_data_transform()
-    finally:
-        dist.destroy_process_group()
-
-
-def _different_objectives_worker(rank, world_size, native_npu, endpoint):
-    if native_npu:
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(rank)
-    dist.init_process_group(
-        "hccl" if native_npu else "gloo", store=endpoint.connect(), rank=rank, world_size=world_size
-    )
-    try:
-        params = dpo._dpo_objective_parameters(dpo.DPOConfig(beta=0.1 if rank == 0 else 0.2))
-        with pytest.raises(RuntimeError, match="objective parameters does not match across ranks"):
-            dpo._dpo_check_consistent_across_ranks(params, context="objective parameters")
-    finally:
-        dist.destroy_process_group()
-
-
 def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint):
     from unittest.mock import patch
 
@@ -1284,16 +1241,6 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_rank_local_producer_identity_mismatch_is_coordinated():
-    spawn_with_rendezvous(_different_producers_worker, args=(2, False), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_rank_local_objective_mismatch_is_coordinated():
-    spawn_with_rendezvous(_different_objectives_worker, args=(2, False), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -1314,18 +1261,6 @@ def test_rank_local_objective_mismatch_is_coordinated():
 )
 def test_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(scenario):
     spawn_with_rendezvous(_invalid_dpo_cursor_worker, args=(2, scenario, False), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=2))
-@pytest.mark.skipif(not IS_NPU_AVAILABLE or runner_device_count() < 2, reason="requires two Ascend NPUs and HCCL")
-def test_native_hccl_rank_local_producer_identity_mismatch_is_coordinated():
-    spawn_with_rendezvous(_different_producers_worker, args=(2, True), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=2))
-@pytest.mark.skipif(not IS_NPU_AVAILABLE or runner_device_count() < 2, reason="requires two Ascend NPUs and HCCL")
-def test_native_hccl_rank_local_objective_mismatch_is_coordinated():
-    spawn_with_rendezvous(_different_objectives_worker, args=(2, True), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=2))

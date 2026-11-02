@@ -95,9 +95,10 @@ File-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
 Each optimizer step uses the global mean over preference pairs, including when
 microbatches or data-parallel ranks contain different numbers of pairs. The
 reported loss and reward metrics use the same pair weights. Sequence-parallel
-ranks must have the same segment boundaries, and all data-parallel ranks must
-execute the same number of microbatches for an optimizer step. The required
-experimental provenance mode also checks sequence-parallel input identity.
+ranks must receive identical inputs, labels and segment boundaries from the
+dataloader, and all data-parallel ranks must execute the same number of
+microbatches for an optimizer step. Provenance mode checks local segment
+structure; it does not compare sequence-parallel inputs across ranks.
 Validate expert and dense gradients separately
 on the target EP/HSDP runtime; their distributed reduction implementations
 can differ. Callback-internal collective failures still rely on the launcher's

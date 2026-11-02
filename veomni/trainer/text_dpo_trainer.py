@@ -340,15 +340,6 @@ def _dpo_sync_step_begin_error(error: Exception | None, *, context: str = "step-
         raise RuntimeError(f"DPO {context} failed: " + "; ".join(failures)) from error
 
 
-def _dpo_check_consistent_across_ranks(value: Any, *, context: str) -> None:
-    if not dist.is_available() or not dist.is_initialized():
-        return
-    values = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
-    if any(item != values[0] for item in values):
-        raise RuntimeError(f"DPO {context} does not match across ranks")
-
-
 def _dpo_fixed_batch_steps(samples: int, dp_size: int, batch_size: int) -> int:
     if samples <= 0 or dp_size <= 0 or batch_size <= 0:
         raise ValueError("DPO fixed-batch training requires nonempty data and positive DP/batch sizes")
@@ -653,8 +644,6 @@ class TextDPOTrainer:
         except Exception as exc:  # noqa: BLE001 - synchronize malformed rank-local configuration
             config_error = exc
         _dpo_sync_step_begin_error(config_error, context="configuration")
-        _dpo_check_consistent_across_ranks(self._dpo_objective_parameters, context="objective parameters")
-        _dpo_check_consistent_across_ranks(self._dpo_recovery_geometry, context="recovery geometry")
         source = self._dpo_recovery_geometry["data"]
         contract = source["resume_input_contract"]
         if (
@@ -693,7 +682,6 @@ class TextDPOTrainer:
             except Exception as exc:  # noqa: BLE001 - synchronize dataset geometry errors
                 batch_error = exc
             _dpo_sync_step_begin_error(batch_error, context="fixed-batch geometry")
-            _dpo_check_consistent_across_ranks(args.train_steps, context="training steps per epoch")
             self.base._build_collate_fn()
             if args.dpo_config.explicit_segment_provenance:
                 self.base.collate_fn = DPOProvenanceCollator(
@@ -778,7 +766,6 @@ class TextDPOTrainer:
             except Exception as exc:  # noqa: BLE001 - report producer failures consistently across ranks
                 identity_error = exc
             _dpo_sync_step_begin_error(identity_error, context="producer attestation")
-            _dpo_check_consistent_across_ranks(self._dpo_producer_identity, context="producer identity")
             provenance_options["expected_dpo_producer_identity"] = self._dpo_producer_identity
         if tokenizer_fingerprint is not None:
             provenance_options["audited_unpadded_tokenizer_sha256"] = tokenizer_fingerprint
