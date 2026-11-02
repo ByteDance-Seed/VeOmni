@@ -10,6 +10,9 @@ from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.optimizer import MultiOptimizer
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _build():
     model = torch.nn.Linear(2, 2)
     weight = torch.optim.AdamW([model.weight], lr=0.01)
