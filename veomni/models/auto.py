@@ -111,14 +111,16 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
             )
         if is_torch_npu_available() and implementation != "veomni_flash_attention_2_with_sp":
             raise NotImplementedError("Ascend USP uses the VeOmni FlashAttention 2 adapter with torch_npu.")
-        # The deterministic mode of torch_npu.npu_fusion_attention_grad returns wrong gradients
-        # in the Ring backward. ``train.enable_full_determinism`` turns it on (via
-        # ``torch.use_deterministic_algorithms``) before the model is built, so refuse here
-        # rather than train on a silently corrupted backward.
+        # The NPU FlashAttention backward operator (torch_npu.npu_fusion_attention_grad)
+        # computes wrong gradients on its deterministic path, which the Ring backward runs
+        # under ``torch.use_deterministic_algorithms(True)``. ``train.enable_full_determinism``
+        # turns that on before the model is built, so stop here rather than train on a
+        # corrupted backward. Operator fix: https://gitcode.com/cann/ops-transformer/pull/11732
         if is_torch_npu_available() and torch.are_deterministic_algorithms_enabled():
-            raise NotImplementedError(
-                "Ascend USP Ring Attention does not support deterministic mode: the deterministic "
-                "npu_fusion_attention_grad gives wrong gradients in the Ring backward. "
+            raise RuntimeError(
+                "Ascend USP Ring Attention cannot run in deterministic mode: the NPU FlashAttention "
+                "backward operator (npu_fusion_attention_grad) computes wrong gradients on its "
+                "deterministic path (fix: https://gitcode.com/cann/ops-transformer/pull/11732). "
                 "Set train.enable_full_determinism=false, or cp_size=1."
             )
         if getattr(config, "attention_dropout", 0.0):

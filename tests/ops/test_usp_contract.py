@@ -147,7 +147,7 @@ def test_npu_usp_rejects_deterministic_mode(monkeypatch, on_npu):
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     config = SimpleNamespace(model_type="qwen3_vl")
     if on_npu:
-        with pytest.raises(NotImplementedError, match="deterministic mode"):
+        with pytest.raises(RuntimeError, match="deterministic path"):
             auto.check_context_parallel_supported(config, "veomni_flash_attention_2_with_sp")
     else:
         # CUDA Ring honors FLASH_ATTENTION_DETERMINISTIC instead.
