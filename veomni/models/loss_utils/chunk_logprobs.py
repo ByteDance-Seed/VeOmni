@@ -24,7 +24,6 @@ device-dispatched per-token log-probability kernels to
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 
@@ -56,7 +55,7 @@ _per_token_entropy_from_logits = token_entropy_from_logits
 def _prepare_causal_chunk_inputs(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
-    shift_labels: Optional[torch.Tensor],
+    shift_labels: torch.Tensor | None,
     *,
     sp_enabled: bool,
     label_aligned_tensors: tuple[torch.Tensor, ...] = (),
@@ -102,7 +101,7 @@ def chunk_logprobs_function(
     labels: torch.Tensor,
     chunk_size: int = 1024,
     ignore_index: int = -100,
-    shift_labels: Optional[torch.Tensor] = None,
+    shift_labels: torch.Tensor | None = None,
     temperature: float = 1.0,
     *,
     op: Callable[..., torch.Tensor] | None = None,

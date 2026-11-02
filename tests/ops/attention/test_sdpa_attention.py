@@ -95,6 +95,8 @@ _MAX_LENGTH_KEYS = ("max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_
 def _sdpa_forward(entrypoint):
     if entrypoint == "adapter":
         return sdpa_backend.sdpa_attention_forward
+    if entrypoint == "eager_sdpa":
+        return VeomniOp("attention", "standard", "eager")
     return VeomniOp("attention", "standard", entrypoint)
 
 
@@ -169,7 +171,7 @@ def test_sdpa_accepts_packing_isolated_by_dense_mask(entrypoint):
     torch.testing.assert_close(output[0, 2], query[0, :, 2], rtol=ATTN_RTOL, atol=ATTN_ATOL)
 
 
-@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter", "eager"))
+@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter", "eager", "eager_sdpa"))
 @pytest.mark.parametrize("is_causal", (False, True))
 @pytest.mark.parametrize(
     "metadata_keys",
@@ -190,7 +192,7 @@ def test_sdpa_splits_unmasked_packed_cu_seqlens(entrypoint, is_causal, metadata_
     grad_out = torch.randn(1, 9, 4, 8, generator=generator)
     scaling = 8**-0.5
 
-    module = _FakeAttentionModule()
+    module = SimpleNamespace(training=False) if entrypoint == "eager_sdpa" else _FakeAttentionModule()
     module.is_causal = is_causal
     module.num_key_value_groups = 2
     forward = _sdpa_forward(entrypoint)
@@ -401,7 +403,8 @@ def test_sdpa_attention_rejects_softcap():
         )
 
 
-def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
+@pytest.mark.parametrize("entrypoint", ("adapter", "eager"))
+def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch, entrypoint):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
     recorder = UlyssesHelperRecorder()
@@ -417,8 +420,8 @@ def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     monkeypatch.setattr(sdpa_backend, "restore_ulysses_output", recorder.restore)
     query = torch.randn(1, 4, 8, 8)
 
-    output, _ = sdpa_backend.sdpa_attention_forward(
-        _FakeAttentionModule(),
+    output, _ = _sdpa_forward(entrypoint)(
+        SimpleNamespace(is_causal=True, num_key_value_groups=2, training=False),
         query,
         query[:, :2],
         query[:, :2],
@@ -636,8 +639,9 @@ def test_sdpa_builder_preserves_visibility_and_gradients(mask_case, padding, req
         torch.testing.assert_close(actual_gradient, reference_gradient, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("entrypoint", ("adapter", "eager"))
 @pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
-def test_sdpa_attention_matches_math_reference(mask_case):
+def test_sdpa_attention_matches_math_reference(mask_case, entrypoint):
     sequence_length = 32
     query_heads, kv_heads, head_dim = 4, 2, 16
     generator = torch.Generator().manual_seed(11)
@@ -652,10 +656,9 @@ def test_sdpa_attention_matches_math_reference(mask_case):
     reference_output, _ = math_sdpa_reference(*reference_qkv, dense, scaling=scaling)
     reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient)
 
-    module = _FakeAttentionModule()
-    module.num_key_value_groups = query_heads // kv_heads
+    module = SimpleNamespace(is_causal=True, num_key_value_groups=query_heads // kv_heads, training=False)
     sdpa_qkv = clone_qkv(query, key, value)
-    sdpa_output, lse = sdpa_backend.sdpa_attention_forward(
+    sdpa_output, lse = _sdpa_forward(entrypoint)(
         module,
         *sdpa_qkv,
         attention_mask=dense,

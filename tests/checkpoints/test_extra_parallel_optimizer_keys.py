@@ -61,3 +61,36 @@ def test_optimizer_spec_matching_still_rejects_ambiguous_specs(monkeypatch, acti
             action,
             key_match="substring",
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_same_axis_offloaded_shards_keep_cpu_storage_and_strided_layout(dtype):
+    from torch.distributed.tensor import Shard
+    from torch.distributed.tensor.placement_types import _StridedShard
+
+    class FakeMesh:
+        def __init__(self, shape):
+            self.device_type = "xpu"
+            self.mesh = torch.zeros(shape, dtype=torch.int64)
+            self.ndim = len(shape)
+            self.mesh_dim_names = tuple(f"d{i}" for i in range(self.ndim))
+
+        def size(self, dim=None):
+            return self.mesh.numel() if dim is None else self.mesh.size(dim)
+
+        def get_coordinate(self):
+            return [0] * self.ndim
+
+    full, sub = FakeMesh((2, 2)), FakeMesh((2,))
+    local = torch.arange(12, dtype=dtype).reshape(3, 4)
+    original = dcp_checkpointer._from_local_preserve_device(local, sub, [Shard(0)])
+    restored = dcp_checkpointer.restore_extra_parallel_dim(original, full, sub, ep_shard_dim=-2, fsdp_shard_dim=0)
+    dropped = dcp_checkpointer.drop_extra_parallel_dim(restored, sub, fsdp_shard_dim=-2)
+    assert restored.shape == (12, 4)
+    assert restored.placements == (_StridedShard(0, split_factor=2), Shard(0))
+    assert dropped.shape == (6, 4)
+    assert dropped.placements == (Shard(0),)
+    for value in (original, restored, dropped):
+        assert value.dtype == dtype
+        assert value.to_local().device.type == "cpu"
+        assert value.to_local().data_ptr() == local.data_ptr()

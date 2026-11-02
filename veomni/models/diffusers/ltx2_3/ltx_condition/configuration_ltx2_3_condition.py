@@ -1,9 +1,9 @@
 from typing import Optional
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class LTXVideoConditionModelConfig(PretrainedConfig):
+class LTXVideoConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "LTXVideoConditionModel"
 
     def __init__(

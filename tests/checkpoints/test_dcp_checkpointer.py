@@ -50,10 +50,10 @@ def _offloaded_extra_parallel_checkpoint_worker(rank, world_size, directory, pha
         singleton_groups = [dist.new_group([i]) for i in range(world_size)]
         # An accelerator mesh can describe CPU-resident offloaded shards. Gloo
         # supplies the real checkpoint collectives without requiring a GPU.
-        local_mesh = DeviceMesh.from_group(singleton_groups[rank], "cuda", mesh_dim_names=("ep_fsdp",))
+        local_mesh = DeviceMesh.from_group(singleton_groups[rank], "xpu", mesh_dim_names=("ep_fsdp",))
         full_mesh = DeviceMesh.from_group(
             [singleton_groups[rank], dist.group.WORLD],
-            "cuda",
+            "xpu",
             mesh=torch.arange(world_size).reshape(1, world_size),
             mesh_dim_names=("ep_fsdp", "ep"),
         )

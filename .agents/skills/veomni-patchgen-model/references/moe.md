@@ -8,14 +8,13 @@ This is *in addition to* the SKILL.md spine, not a replacement for it.
 
 - **MoE expert replacement** — `@config.replace_class("<M>Experts")` with
   `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]` and an instance-local
-  `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`. Always call that
+  `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`. Always call that
   handle; `eager` is a registered row, not a separate `ModuleList` fork or
   `_moe_implementation in {"eager", "fused"}` branch. See qwen3_moe and
   qwen3_5_moe (the latter also removes the upstream `@use_experts_implementation`
   decorator which would otherwise re-route around the VeOmni path).
 - **MoE top-level init** — v5 often wraps a text_config under a top model.
-  Selection comes from `OpsImplementationConfig.moe_implementation` via
-  `resolve_op_impl("moe_implementation")`.
+  Selection comes from `config.ops_config.moe_implementation` (propagated automatically into `sub_configs`).
 - **MoE expert parallel plan** — `@config.override_method("<M>ForCausalLM.get_parallel_plan")`
   (or `ForConditionalGeneration.get_parallel_plan`) returning
   `parallel_plan.get_parallel_plan()`. `parallel_plan.py` shards the fused
@@ -189,7 +188,7 @@ tensors through and confirm they come out identical (no transpose applied).
 - **Branching experts on `_moe_implementation`** — do not keep
   `_moe_implementation in {"eager", "fused"}` or call a public
   `fused_moe_forward`. Construct `VeomniOp("moe_experts", ...)` from
-  `resolve_op_impl("moe_implementation")`.
+  `config.ops_config.moe_implementation`.
 - **Registering converter on the wrong class tuple** — make sure `_create_checkpoint_tensor_converter`
   is attached to every concrete model class you import from `generated/`, not
   just `ForCausalLM`. Must use `staticmethod(...)`.
