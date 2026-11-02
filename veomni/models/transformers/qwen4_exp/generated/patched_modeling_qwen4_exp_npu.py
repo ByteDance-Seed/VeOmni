@@ -1159,29 +1159,58 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         if block_starts.numel():
             top_count = min(self.block_topk, block_starts.numel())
             block_offsets = torch.arange(self.compress_ratio, dtype=torch.int32, device=hidden_states.device)
-            # The CANN Lightning Indexer covers the single-segment causal case: no
-            # sequence/CP parallelism (world_size == 1) and no packed batch. Packed
-            # layouts set cu_seq_lens_q, so its absence also rules out packing. The
-            # flat block list is batch-major with equal-length segments there, so the
-            # kernel's per-element block ids map back through batch-strided flat ids.
-            use_cann = self.veomni_qsa_indexer.impl == "cann" and world_size == 1 and cu_seq_lens_q is None
+            # The CANN Lightning Indexer's TND (packed-flat) layout carries the
+            # segment boundaries natively, so both single-segment rows and the
+            # padding-free packed training batches take the kernel: it
+            # reproduces the eager loop's per-segment floor-causal selection,
+            # and the wrapper offsets its per-segment block ids into this flat
+            # segment-major block list. Only sequence/CP parallelism
+            # (world_size > 1) and callers without host-side segment lengths
+            # (a cu_seq_lens_q tensor but no packed_seq_lens) stay on eager.
+            if cu_seq_lens_q is None:
+                host_segment_lens = [global_seq_len] * batch_size
+            elif packed_seq_lens is not None:
+                host_segment_lens = [int(value) for value in packed_seq_lens]
+            else:
+                host_segment_lens = None
+            use_cann = (
+                self.veomni_qsa_indexer.impl == "cann"
+                and world_size == 1
+                and host_segment_lens is not None
+                and sum(host_segment_lens) == batch_size * local_seq_len
+            )
             if use_cann:
-                n_blocks = local_seq_len // self.compress_ratio
-                if block_starts.numel() != batch_size * n_blocks:
+                seg_block_counts = [length // self.compress_ratio for length in host_segment_lens]
+                if sum(seg_block_counts) != block_starts.numel():
                     raise ValueError(
-                        "Qwen4-Exp compact QSA CANN indexer needs batch-major equal-length blocks; "
-                        f"got {block_starts.numel()} blocks for batch_size={batch_size}, "
-                        f"local_seq_len={local_seq_len}, compress_ratio={self.compress_ratio}."
+                        "Qwen4-Exp compact QSA CANN indexer needs the flat block list to hold exactly "
+                        f"the per-segment blocks; got {block_starts.numel()} blocks for segment lengths "
+                        f"{host_segment_lens} with compress_ratio={self.compress_ratio}."
                     )
+                cu_q_host = [0]
+                cu_k_host = [0]
+                for length, count in zip(host_segment_lens, seg_block_counts):
+                    cu_q_host.append(cu_q_host[-1] + length)
+                    cu_k_host.append(cu_k_host[-1] + count)
+                device = hidden_states.device
                 block_ids = self.veomni_qsa_indexer(
                     q,
-                    pooled_keys[0].reshape(batch_size, n_blocks, self.index_head_dim),
+                    pooled_keys[0],
                     self.compress_ratio,
                     self.block_topk,
+                    cu_seq_lens_q=torch.tensor(cu_q_host, dtype=torch.int32, device=device),
+                    cu_seq_lens_k=torch.tensor(cu_k_host, dtype=torch.int32, device=device),
+                    cmp_residual_k=torch.tensor(
+                        [length % self.compress_ratio for length in host_segment_lens],
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    batch_size=len(host_segment_lens),
+                    max_seqlen_q=max(host_segment_lens),
+                    max_seqlen_k=max(seg_block_counts),
                 )
                 valid_ids = block_ids >= 0
-                element_offsets = torch.arange(batch_size, device=hidden_states.device) * n_blocks
-                safe_ids = (block_ids + element_offsets.view(-1, 1, 1)).clamp(min=0)
+                safe_ids = block_ids.clamp(min=0).to(torch.long)
                 selected_starts = block_starts[safe_ids].to(torch.int32)
                 selected_local = (
                     (selected_starts[..., None] + block_offsets).masked_fill(~valid_ids[..., None], -1).flatten(-2)
@@ -1192,8 +1221,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     if not _QSA_CANN_LAYOUT_WARNED:
                         _QSA_CANN_LAYOUT_WARNED = True
                         logger.warning(
-                            "Qwen4-Exp QSA CANN indexer covers only single-segment causal selection "
-                            "(no sequence/CP parallelism, no packed batch); falling back to the eager loop."
+                            "Qwen4-Exp QSA CANN indexer covers the flat packed layout with host-side "
+                            "segment lengths and no sequence/CP parallelism; falling back to the eager loop."
                         )
                 elements_per_query = max(1, batch_size * block_starts.numel() * self.index_n_heads)
                 query_chunk_size = max(1, min(local_seq_len, 16 * 1024 * 1024 // elements_per_query))
