@@ -251,6 +251,13 @@ rejected until an owner-aware codec can preserve rank-specific optimizer
 states; this opt-in therefore does not yet support resuming training. The
 standard VeOmni HF export strips the namespace.
 
+All ranks in a checkpoint operation must use the same logical model and
+checkpoint configuration, including the layout version and corresponding
+sharding specifications. Normal rank-local shard contents and mesh coordinates
+may differ. Cross-rank agreement is an input contract, not a runtime preflight;
+divergent configurations are unsupported and can hang or produce an invalid
+checkpoint. Rank-local layout validation errors are still propagated to peers.
+
 Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
 supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
