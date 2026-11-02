@@ -139,6 +139,21 @@ def test_npu_usp_model_gate(monkeypatch):
         auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_4_with_sp")
 
 
+@pytest.mark.parametrize("on_npu", [True, False])
+def test_npu_usp_rejects_deterministic_mode(monkeypatch, on_npu):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: on_npu)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag"))
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    config = SimpleNamespace(model_type="qwen3_vl")
+    if on_npu:
+        with pytest.raises(NotImplementedError, match="deterministic mode"):
+            auto.check_context_parallel_supported(config, "veomni_flash_attention_2_with_sp")
+    else:
+        # CUDA Ring honors FLASH_ATTENTION_DETERMINISTIC instead.
+        auto.check_context_parallel_supported(config, "veomni_flash_attention_2_with_sp")
+
+
 @pytest.mark.parametrize("pre_gathered", [False, True])
 def test_skip_ulysses_keeps_ring_only_when_pre_gathered(monkeypatch, pre_gathered):
     import veomni.distributed.sequence_parallel.ring_attention as ring_module

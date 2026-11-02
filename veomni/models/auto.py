@@ -111,6 +111,16 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
             )
         if is_torch_npu_available() and implementation != "veomni_flash_attention_2_with_sp":
             raise NotImplementedError("Ascend USP uses the VeOmni FlashAttention 2 adapter with torch_npu.")
+        # The deterministic mode of torch_npu.npu_fusion_attention_grad returns wrong gradients
+        # in the Ring backward. ``train.enable_full_determinism`` turns it on (via
+        # ``torch.use_deterministic_algorithms``) before the model is built, so refuse here
+        # rather than train on a silently corrupted backward.
+        if is_torch_npu_available() and torch.are_deterministic_algorithms_enabled():
+            raise NotImplementedError(
+                "Ascend USP Ring Attention does not support deterministic mode: the deterministic "
+                "npu_fusion_attention_grad gives wrong gradients in the Ring backward. "
+                "Set train.enable_full_determinism=false, or cp_size=1."
+            )
         if getattr(config, "attention_dropout", 0.0):
             raise NotImplementedError("USP requires attention_dropout=0.")
         return

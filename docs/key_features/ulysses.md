@@ -527,7 +527,12 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.
   `FLASH_ATTENTION_DETERMINISTIC=1`, set by `train.enable_full_determinism=true`.
   Unset or `0` keeps the non-deterministic backward. This can use more memory
   and be slower; it does not imply bitwise equality across USP topologies.
-  NPU backend behavior is unchanged.
+- **NPU determinism**: Ascend USP does not support deterministic mode. The
+  deterministic `npu_fusion_attention_grad` gives wrong gradients in the Ring
+  backward, so model build raises when `cp_size > 1` runs under
+  `torch.use_deterministic_algorithms(True)` (which
+  `train.enable_full_determinism=true` turns on). Set
+  `train.enable_full_determinism=false` for Ascend USP runs.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
