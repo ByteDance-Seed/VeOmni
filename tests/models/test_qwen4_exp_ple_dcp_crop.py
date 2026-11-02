@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-from veomni.checkpoint.layout import step_dir, weights_dir
+from veomni.checkpoint.layout import optimizer_dir, step_dir, weights_dir
 from veomni.checkpoint.ple_rows import _resize_dtensor, pad_ple_state_dict_from_dcp, ple_checkpoint_is_cropped
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
     create_qwen4_exp_checkpoint_tensor_converter,
@@ -79,27 +79,57 @@ def _full(weight):
     return tensor.detach().cpu()
 
 
-def _train_ple(model):
-    """Move only the logical rows, leaving the runtime pad untouched."""
+def _optimizer(model):
+    # Disable weight decay on PLE so the sentinel padding cannot affect the
+    # uninterrupted reference. Real gradients touch logical vocabulary only.
+    return torch.optim.AdamW(
+        [
+            {"params": list(model.block.parameters()), "weight_decay": 0.0},
+            {"params": list(model.other.parameters())},
+        ],
+        lr=0.01,
+        foreach=False,
+    )
+
+
+def _train_step(model, optimizer, step):
+    optimizer.zero_grad(set_to_none=True)
     weight = model.block.ngram_embedding["shard_0"].weight
-    full = weight.full_tensor().detach().clone()
-    full[:LOGICAL] += 1
-    updated = distribute_tensor(full, weight.device_mesh, weight.placements)
-    with torch.no_grad():
-        weight.to_local().copy_(updated.to_local())
-    return full
+    local = weight.to_local()
+    row_start = weight.device_mesh.get_local_rank("ple") * (PADDED // weight.device_mesh.size("ple"))
+    valid_rows = max(0, min(local.shape[0], LOGICAL - row_start))
+    # to_local() remains differentiable: backward populates the real DTensor
+    # parameter gradient, and AdamW creates padded DTensor moments naturally.
+    loss = local[:valid_rows].square().sum() * (0.001 * (step + 1))
+    loss = loss + model.other.weight.square().sum() * (0.01 * (step + 1))
+    loss.backward()
+    optimizer.step()
 
 
-def _freeze_ple(model):
-    for parameter in model.block.parameters():
-        parameter.requires_grad_(False)
+def _check_optimizer(source, restored, source_opt, restored_opt):
+    restored_parameters = dict(restored.named_parameters())
+    for name, parameter in source.named_parameters():
+        loaded_parameter = restored_parameters[name]
+        expected_state = source_opt.state[parameter]
+        loaded_state = restored_opt.state[loaded_parameter]
+        for key in ("exp_avg", "exp_avg_sq"):
+            expected, actual = expected_state[key], loaded_state[key]
+            assert actual.shape == expected.shape == parameter.shape, (name, key)
+            if "ngram_embedding" in name:
+                assert isinstance(actual, DTensor)
+                assert actual.placements == expected.placements == parameter.placements
+                assert actual.device_mesh == parameter.device_mesh
+                assert actual.to_local().shape == parameter.to_local().shape
+                assert torch.count_nonzero(_full(expected)[:LOGICAL]) > 0, (name, key)
+            torch.testing.assert_close(_full(actual), _full(expected), rtol=0, atol=0, msg=f"{name}: {key}")
+        torch.testing.assert_close(loaded_state["step"], expected_state["step"], rtol=0, atol=0)
 
 
 def _max_abs(left, right):
     return (left.detach().cpu() - right.detach().cpu()).abs().max().item()
 
 
-def _check_resume(model, trained_rows, trained_other, source_opt, opt):
+def _check_resume(model, trained_rows, trained_other, source, source_opt, opt):
     loaded = _full(model.block.ngram_embedding["shard_0"].weight)
     logical_diff = _max_abs(loaded[:LOGICAL], trained_rows[:LOGICAL])
     tail_diff = _max_abs(loaded[LOGICAL:], torch.zeros_like(loaded[LOGICAL:]))
@@ -109,12 +139,7 @@ def _check_resume(model, trained_rows, trained_other, source_opt, opt):
     assert tail_diff == 0.0, tail_diff
     assert SENTINEL not in set(loaded.reshape(-1).tolist())
     assert other_diff == 0.0, other_diff
-    source_param = source_opt.param_groups[0]["params"][0]
-    restored_param = opt.param_groups[0]["params"][0]
-    for key in ("exp_avg", "exp_avg_sq"):
-        moment_diff = _max_abs(opt.state[restored_param][key], source_opt.state[source_param][key])
-        assert moment_diff == 0.0, (key, moment_diff)
-    assert opt.state[restored_param]["step"].item() == source_opt.state[source_param]["step"].item()
+    _check_optimizer(source, model, source_opt, opt)
     return logical_diff, tail_diff, other_diff
 
 
@@ -155,11 +180,10 @@ def main():
 
     source = _Model()
     _install(source, mesh, rows.clone(), other.clone())
-    trained_rows = _train_ple(source)
-    _freeze_ple(source)
-    source_opt = torch.optim.AdamW(source.other.parameters(), lr=0.01)
-    source.other.weight.sum().backward()
-    source_opt.step()
+    source_opt = _optimizer(source)
+    for step in range(2):
+        _train_step(source, source_opt, step)
+    trained_rows = _full(source.block.ngram_embedding["shard_0"].weight).clone()
     trained_other = source.other.weight.detach().cpu().clone()
 
     directory = None
@@ -187,6 +211,16 @@ def main():
         saved_rows = int(metadata.state_dict_metadata[ple_key].size[0])
         assert saved_rows == LOGICAL, saved_rows
 
+        optimizer_metadata = FileSystemReader(optimizer_dir(checkpoint)).read_metadata()
+        for moment in ("exp_avg", "exp_avg_sq"):
+            entries = [
+                value
+                for key, value in optimizer_metadata.state_dict_metadata.items()
+                if "ngram_embedding.shard_0.weight" in key and key.endswith(moment)
+            ]
+            assert len(entries) == 1, (moment, optimizer_metadata.state_dict_metadata.keys())
+            assert tuple(entries[0].size) == (PADDED, COLS), moment
+
         dense = {
             "block.ngram_embedding.shard_0.weight": trained_rows,
             "other.weight": trained_other,
@@ -206,15 +240,14 @@ def main():
 
         restored = _Model()
         _install(restored, mesh, torch.zeros(PADDED, COLS), torch.zeros(4, 4))
-        _freeze_ple(restored)
-        restored_opt = torch.optim.AdamW(restored.other.parameters(), lr=0.01)
+        restored_opt = _optimizer(restored)
         DistributedCheckpointer.load(
             checkpoint,
             {"model": restored, "optimizer": restored_opt, "extra_state": {}},
             parallel_state=parallel_state,
         )
         logical_diff, tail_diff, other_diff = _check_resume(
-            restored, trained_rows, trained_other, source_opt, restored_opt
+            restored, trained_rows, trained_other, source, source_opt, restored_opt
         )
 
         DistributedCheckpointer.save(
@@ -225,21 +258,30 @@ def main():
         )
         second = _Model()
         _install(second, mesh, torch.full((PADDED, COLS), 9.0), torch.full((4, 4), 9.0))
-        _freeze_ple(second)
-        second_opt = torch.optim.AdamW(second.other.parameters(), lr=0.01)
+        second_opt = _optimizer(second)
         DistributedCheckpointer.load(
             step_dir(directory, 2),
             {"model": second, "optimizer": second_opt, "extra_state": {}},
             parallel_state=parallel_state,
         )
-        _check_resume(second, trained_rows, trained_other, source_opt, second_opt)
+        _check_resume(second, trained_rows, trained_other, source, source_opt, second_opt)
         assert ple_checkpoint_is_cropped(weights_dir(step_dir(directory, 2)), second)
+
+        # Compare the next real optimizer update with uninterrupted training.
+        _train_step(source, source_opt, 2)
+        _train_step(second, second_opt, 2)
+        next_reference = _full(source.block.ngram_embedding["shard_0"].weight)
+        next_restored = _full(second.block.ngram_embedding["shard_0"].weight)
+        torch.testing.assert_close(next_restored[:LOGICAL], next_reference[:LOGICAL], rtol=0, atol=0)
+        torch.testing.assert_close(next_restored[LOGICAL:], torch.zeros_like(next_restored[LOGICAL:]), rtol=0, atol=0)
+        torch.testing.assert_close(second.other.weight, source.other.weight, rtol=0, atol=0)
+        _check_optimizer(source, second, source_opt, second_opt)
 
         if rank == 0:
             print(
                 f"PASS saved_rows={saved_rows} logical_max_abs={logical_diff} "
                 f"tail_max_abs={tail_diff} other_max_abs={other_diff} "
-                f"hf_bf16_max_abs=0.0 resume_cycles=2",
+                f"hf_bf16_max_abs=0.0 resume_cycles=2 ple_optimizer_padded=True next_update_match=True",
                 flush=True,
             )
     finally:
