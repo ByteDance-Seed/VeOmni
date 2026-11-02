@@ -137,14 +137,10 @@ def _resize_dtensor(tensor: DTensor, rows: int, *, empty: bool = False) -> DTens
         device = torch.device(mesh.device_type, getattr(torch, mesh.device_type).current_device())
         send = send.to(device=device, non_blocking=False)
         receive = torch.empty(receive.shape, dtype=local.dtype, device=device)
-        dist.all_to_all_single(
-            receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group
-        )
+        dist.all_to_all_single(receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group)
         output[: sum(recv_sizes)].copy_(receive, non_blocking=False)
     else:
-        dist.all_to_all_single(
-            receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group
-        )
+        dist.all_to_all_single(receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group)
     return _from_local(output, tensor, rows)
 
 
