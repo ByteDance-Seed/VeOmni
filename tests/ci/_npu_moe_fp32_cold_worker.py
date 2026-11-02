@@ -21,16 +21,16 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 from torch import nn
 from torch.distributed._tensor import DTensor, Shard
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig
+from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import Qwen4ExpTextExperts
+from veomni.optim.optimizer import build_optimizer
 
 
 class ToyDecoder(nn.Module):
@@ -77,10 +77,17 @@ def _local(tensor):
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _optimizer_state(optimizer, param):
+    leaves = getattr(optimizer, "optimizers_dict", None)
+    owners = [leaf for leaf in leaves.values() if param in leaf.state] if leaves is not None else [optimizer]
+    assert len(owners) == 1 and param in owners[0].state
+    return owners[0].state[param]
+
+
 def _snapshot(model, optimizer):
     result = {}
     for name, param in model.named_parameters():
-        state = optimizer.state[param]
+        state = _optimizer_state(optimizer, param)
         result[name] = {
             "param": _local(param.detach()).cpu().clone(),
             "m": _local(state["exp_avg"]).detach().cpu().clone(),
@@ -97,7 +104,7 @@ def _step(model, optimizer, rank, ep, step):
     # Each EP rank owns a zero-token expert while experts 0 and 2 receive tokens.
     indices = torch.tensor([[0, 2]] * 8, device="npu", dtype=torch.int64)
     weights = torch.full((8, 2), 0.5, device="npu", dtype=torch.float32)
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad()
     loss = model(x, indices, weights).float().square().mean()
     loss.backward()
     grads = {}
@@ -149,16 +156,34 @@ def run(rank, phase, output_dir, ep, endpoint=None):
             enable_forward_prefetch=False,
         )
         assert model.layer.experts._veomni_fp32_expert_wgrad
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+        optimizer = build_optimizer(model, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.0, fused=False)
         ckpt = str(Path(output_dir) / f"ep{ep}-dcp")
         if phase == "fresh":
+            # The locally unused expert is different on each EP owner, so a
+            # duplicated or swapped shard cannot pass the resume comparison.
+            with torch.no_grad():
+                for param in model.parameters():
+                    _local(param)[0].add_(rank / 2048)
+                    _local(param)[1].add_(rank / 1024)
             _step(model, optimizer, rank, ep, 1)
-            model_state, optim_state = get_state_dict(model, optimizer)
-            dcp.save({"model": model_state, "optimizer": optim_state}, checkpoint_id=ckpt)
+            # An expert can have historical moments even when this batch gave
+            # it no tokens. Make those moments distinct across EP owners too.
+            with torch.no_grad():
+                for param in model.parameters():
+                    state = _optimizer_state(optimizer, param)
+                    _local(state["exp_avg"])[1].fill_((rank + 1) / 1024)
+                    _local(state["exp_avg_sq"])[1].fill_((rank + 1) / 2048)
+            optimizer.zero_grad()
+            DistributedCheckpointer.save(
+                ckpt, {"model": model, "optimizer": optimizer}, parallel_state=get_parallel_state()
+            )
         else:
-            model_state, optim_state = get_state_dict(model, optimizer)
-            dcp.load({"model": model_state, "optimizer": optim_state}, checkpoint_id=ckpt)
-            set_state_dict(model, optimizer, model_state_dict=model_state, optim_state_dict=optim_state)
+            with torch.no_grad():
+                for param in model.parameters():
+                    _local(param).fill_(-0.05 - rank * 0.01)
+            DistributedCheckpointer.load(
+                ckpt, {"model": model, "optimizer": optimizer}, parallel_state=get_parallel_state()
+            )
         before = _snapshot(model, optimizer)
         after = _step(model, optimizer, rank, ep, 2)
         for name in before:
