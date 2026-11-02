@@ -126,7 +126,7 @@ full, or it is built on meta.
   device has to be chosen before the module exists. Then
   [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L321)
   passes `init_device="meta"`, and the
-  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L160)
+  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L163)
   right after `requires_grad_(False)`: no parallel wrap, no weight load, no
   optimizer, no checkpoint manager. The offline-training method therefore must
   read only the config, never a parameter or buffer: parameters are meta
@@ -323,7 +323,7 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L624),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L627),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot
@@ -353,8 +353,8 @@ A missing module or method still fails before the first request runs.
   [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L209),
   and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L241).
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
-  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L417), and
-  [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L304).
+  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L418), and
+  [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L305).
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),
@@ -371,7 +371,7 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2551).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2552).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
