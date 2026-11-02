@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 
 import pytest
+import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import CheckpointConfig
@@ -32,3 +33,20 @@ def test_checkpoint_config_parser_preserves_explicit_layout():
     )
     assert config.output_dir == "checkpoint-dir"
     assert config.extra_parallel_canonical_layout is True
+
+
+@pytest.mark.parametrize("value", ["'false'", "'true'", "0", "1", "null"])
+def test_checkpoint_config_parser_rejects_non_boolean_layout(value):
+    from veomni.arguments.parser import _instantiate_recursive
+
+    config = yaml.safe_load(f"extra_parallel_canonical_layout: {value}")
+    with pytest.raises(ValueError, match="extra_parallel_canonical_layout must be a boolean"):
+        _instantiate_recursive(CheckpointConfig, config)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_checkpoint_config_cli_converts_layout_boolean(monkeypatch, value):
+    from veomni.arguments.parser import parse_args
+
+    monkeypatch.setattr("sys.argv", ["test", "--extra_parallel_canonical_layout", str(value).lower()])
+    assert parse_args(CheckpointConfig).extra_parallel_canonical_layout is value

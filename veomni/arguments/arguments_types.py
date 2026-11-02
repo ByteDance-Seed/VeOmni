@@ -1059,6 +1059,12 @@ class CheckpointConfig:
         ``save_async`` too, but not until the first checkpoint is due -- a
         ``save_steps``-long wait to be told the configuration was never valid.
         """
+        if not isinstance(self.extra_parallel_canonical_layout, bool):
+            raise ValueError(
+                "extra_parallel_canonical_layout must be a boolean; use unquoted true or false in YAML, "
+                f"got {self.extra_parallel_canonical_layout!r}."
+            )
+
         if self.stage_dir and self.save_async:
             raise ValueError(
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
