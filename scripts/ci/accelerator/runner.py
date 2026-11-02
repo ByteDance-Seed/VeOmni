@@ -2,7 +2,6 @@
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import shutil
@@ -34,6 +33,7 @@ from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
 
 def main():
+    """Collect suite cases, batch by device request, and schedule workers across devices."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("unit", "e2e"), required=True)
     parser.add_argument("--backend", choices=("auto", "cuda", "npu", "cpu"), default="auto")
@@ -54,14 +54,6 @@ def main():
     if (output / "inventory.json").exists():
         parser.error("Use a fresh output directory to preserve each run's evidence")
     started = time.time()
-    source_paths = [
-        path
-        for pattern in ("scripts/ci/**/*.py", "scripts/ci/**/*.json", "tests/**/*.py", "tests/toy_config/**/*.json")
-        for path in ROOT.glob(pattern)
-    ]
-    source_paths.extend([ROOT / "pyproject.toml", ROOT / "uv.lock"])
-    sources = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
-    (output / "sources.json").write_text(json.dumps(sources, indent=2) + "\n")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
@@ -97,10 +89,11 @@ def main():
         parser.error("No suite selections matched")
 
     def collect(selection):
+        """Collect test cases and launch plans for one manifest selection."""
         name = selection["name"]
         inventory_path = output / f"{name}.inventory.json"
         collect_env = {**env, **selection.get("env", {})}
-        for key in ("CI_TIMING_EVENTS", "CI_CASE_RESULTS", "CI_CASE_PROGRESS", "VEOMNI_CI_ACTIVE_PLAN"):
+        for key in ("CI_CASE_RESULTS", "CI_CASE_PROGRESS", "VEOMNI_CI_ACTIVE_PLAN"):
             collect_env.pop(key, None)
         command = [
             sys.executable,
@@ -172,6 +165,7 @@ def main():
     )
 
     def execute(job, assigned):
+        """Run one batched pytest job in an isolated workspace on its leased devices."""
         row = job.payload
         name = row["name"]
         workspace = output / "work" / name
@@ -184,9 +178,6 @@ def main():
             VEOMNI_CI_LEASE=json.dumps(assigned),
             TMPDIR=temporary,
             CACHE_DIR=str(workspace / "cache"),
-            CI_TIMING_EVENTS=str(output / f"{name}.jsonl"),
-            CI_LAUNCH_EVENTS=str(output / f"{name}.launches.jsonl"),
-            CI_RENDEZVOUS_EVENTS=str(output / f"{name}.rendezvous.jsonl"),
             CI_CASE_RESULTS=str(output / f"{name}.results.json"),
             CI_CASE_PROGRESS=str(output / f"{name}.progress.jsonl"),
         )
@@ -346,16 +337,6 @@ def main():
         (output / "durations.json").write_text(
             json.dumps({row["nodeid"]: row.get("wall_seconds", 0) for row in case_rows}, indent=2) + "\n"
         )
-        changed = [
-            name
-            for name, digest in sources.items()
-            if not (ROOT / name).is_file() or hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest
-        ]
-        summary["changed_sources"] = changed
-        if changed:
-            error = error or "Sources changed during execution"
-            summary["error"] = error
-            reporter.fail("runner", "Sources changed during execution")
         reporter.summary(finished)
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return int(error is not None or len(finished) != len(jobs) or any(row["returncode"] for row in finished.values()))

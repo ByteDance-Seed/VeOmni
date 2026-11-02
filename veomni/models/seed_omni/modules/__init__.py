@@ -100,13 +100,7 @@ def read_model_type(model_path: str) -> str:
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
     # decide registration explicitly.
-    config_keys = set(OMNI_CONFIG_REGISTRY.valid_keys())
     model_keys = set(OMNI_MODEL_REGISTRY.valid_keys())
-    if model_type in config_keys:
-        # Validate the config can be re-read by the registered subclass so
-        # downstream `from_pretrained` doesn't hit a surprise schema gap.
-        cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
             f"Module model_type {model_type!r} (from {model_path}) is not registered in "

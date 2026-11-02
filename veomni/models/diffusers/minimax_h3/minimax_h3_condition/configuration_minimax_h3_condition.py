@@ -1,10 +1,10 @@
 import math
 from typing import Optional
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class MiniMaxH3ConditionModelConfig(PretrainedConfig):
+class MiniMaxH3ConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "MiniMaxH3ConditionModel"
 
     def __init__(

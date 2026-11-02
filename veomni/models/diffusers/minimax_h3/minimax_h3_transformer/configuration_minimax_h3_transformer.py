@@ -1,7 +1,7 @@
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class MiniMaxH3DiTModelConfig(PretrainedConfig):
+class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
     model_type = "MiniMaxH3DiTModel"
     condition_model_type = "MiniMaxH3ConditionModel"
 

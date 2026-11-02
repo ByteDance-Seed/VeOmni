@@ -86,33 +86,34 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
-        if impl in _RAW_NON_SP_IMPLS:
+        eager_default = _module_eager_forward(module)
+        interface = "veomni_sdpa" if impl == "eager" and eager_default is None else impl
+        if interface in _RAW_NON_SP_IMPLS:
             skip_ulysses = bool(kwargs.pop("skip_ulysses", False))
             if kwargs.get("dsa_position_ids") is None and should_apply_ulysses(skip_ulysses=skip_ulysses):
                 raise ValueError(
-                    f"Attention implementation {impl!r} does not perform Ulysses sequence-parallel exchanges; "
+                    f"Attention implementation {interface!r} does not perform Ulysses sequence-parallel exchanges; "
                     "use a 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass skip_ulysses=True "
                     "when Q/K/V are already gathered."
                 )
 
         packed_cu_seqlens = None
-        if impl in ("sdpa", "eager"):
+        if interface in ("sdpa", "eager"):
             kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
                 kwargs,
                 batch_size=query.shape[0],
                 attention_mask=attention_mask,
             )
 
-        eager_default = _module_eager_forward(module)
-        forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
+        forward = ALL_ATTENTION_FUNCTIONS.get_interface(interface, eager_default)
         if forward is None:
             raise KeyError(
-                f"attention impl {impl!r} is not registered and "
+                f"attention impl {interface!r} is not registered and "
                 f"{type(module).__module__} has no eager_attention_forward"
             )
 
         if packed_cu_seqlens is not None:
-            if impl == "eager":
+            if interface == "eager":
                 is_causal = kwargs.get("is_causal")
                 if is_causal is None:
                     is_causal = bool(getattr(module, "is_causal", False))
@@ -216,7 +217,7 @@ def _register_attention(
         )
 
 
-_register_attention("eager", "Transformers model-local eager attention")
+_register_attention("eager", "Model-local eager attention, or VeOmni SDPA for modules without a local eager forward")
 _register_attention("sdpa", "PyTorch scaled dot-product attention through Transformers")
 _register_attention("flash_attention_2", "FlashAttention 2 through Transformers", rows=_FA2_ROWS)
 _register_attention(

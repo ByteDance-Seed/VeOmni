@@ -91,17 +91,20 @@ def _create_feature_extractor(transformer_config: dict) -> torch.nn.Module:
     )
 
 
-def build_embeddings_processor(config: dict, with_feature_extractor: bool = False) -> EmbeddingsProcessor:
+def build_embeddings_processor(
+    config: dict, with_feature_extractor: bool = False, model_config=None
+) -> EmbeddingsProcessor:
     """Build EmbeddingsProcessor from model config.
 
     Args:
         config: Model config dict (must contain 'transformer' key with connector params).
         with_feature_extractor: If True, also creates the feature extractor (for precompute).
+        model_config: Optional PretrainedConfig carrying ops_config.
     """
     transformer_config = config.get("transformer", {})
 
-    video_connector = Embeddings1DConnectorConfigurator.from_config(config)
-    audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
+    video_connector = Embeddings1DConnectorConfigurator.from_config(config, model_config=model_config)
+    audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config, model_config=model_config)
     feature_extractor = _create_feature_extractor(transformer_config) if with_feature_extractor else None
 
     return EmbeddingsProcessor(

@@ -33,7 +33,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 
@@ -53,15 +52,18 @@ def _dsv4_cls():
 
 
 def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _dsv4_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _dsv4_cls()(config)
 
 
 @pytest.mark.parametrize("impl", ["liger_kernel", "npu"])
-def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(impl):
+def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(monkeypatch, impl):
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", impl == "npu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = impl
-    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{impl}'"):
+    resolved = "torch_npu" if impl == "npu" else impl
+    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{resolved}'"):
         _build_ours(_tiny_config(), ops)
 
 
@@ -217,17 +219,17 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     from tests.ops.moe_experts.reference import standard_ep_reference
     from veomni.arguments import OpsImplementationConfig
 
+    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
     config = SimpleNamespace(
         num_local_experts=4,
         hidden_size=256,
         intermediate_size=128,
         hidden_act="silu",
         swiglu_limit=10.0,
+        ops_config=ops,
     )
     device = get_device_type()
-    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
-    with ops_config_scope(ops):
-        experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
+    experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
     assert experts.veomni_moe.impl == "deepgemm_fp8"
     torch.manual_seed(91)
     with torch.no_grad():
