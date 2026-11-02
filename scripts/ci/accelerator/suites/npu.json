@@ -211,6 +211,16 @@
     ]
   },
   {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
+    ]
+  },
+  {
     "name": "npu-unit-20",
     "suite": "unit",
     "args": [
