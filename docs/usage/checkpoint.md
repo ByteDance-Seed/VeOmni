@@ -311,16 +311,20 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec also rejects tensor learning rates shared between groups and
 overlapping storage between distinct model or optimizer tensors. Its byte-range
 check is conservative for non-contiguous interleaved views.
-The saved alias identity covers parameters and persistent buffers, including
-their aliases to nonpersistent buffers. Aliases solely among transient buffers,
-such as dynamic RoPE caches, are not part of that identity. The separate
-conservative storage-overlap check still applies to distinct buffer views.
-Older checkpoints whose identity included such aliases can require an
-independently verified migration.
+The saved alias identity covers parameters and buffers, including
+nonpersistent buffer aliases; the separate conservative storage-overlap check
+still applies to distinct buffer views. A reset dynamic RoPE cache can have a
+different alias graph from a newly constructed model and is conservatively
+rejected on resume until that cache state can be restored safely.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
 the cache grew beyond its original context and has not reset, a fresh process
-can compute different later outputs; exact resume for that case is not yet
-supported.
+can compute different later outputs. MultiOptimizer checkpoints therefore
+reject a non-reconstructible dynamic or longrope cache at save. With a dynamic
+or longrope target, resume requires a matching cache contract; older checkpoints
+without that proof need a verified migration. Older checkpoints do not identify
+the source's RoPE configuration, so the operator must also independently verify
+that the source and target configurations match. Saving an expanded cache is not
+yet supported.
 Mutable optimizer options must not be shared between groups or optimizer
 defaults: ordinary YAML `betas` are normalized to a tuple; custom shared lists,
 dictionaries and tensor-valued learning rates require explicitly independent

@@ -1,17 +1,20 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-"""Transient RoPE buffers are not part of checkpoint ownership identity."""
+"""Dynamic RoPE cache and alias state must not silently change on resume."""
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.optimizer import MultiOptimizer
 
@@ -20,7 +23,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _TinyQwenRope(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, theta=10000):
         super().__init__()
         self.projection = torch.nn.Linear(8, 8)
         config = Qwen3Config(
@@ -29,13 +32,13 @@ class _TinyQwenRope(torch.nn.Module):
             num_attention_heads=4,
             num_key_value_heads=2,
             max_position_embeddings=16,
-            rope_parameters={"rope_type": "dynamic", "factor": 2.0, "rope_theta": 10000},
+            rope_parameters={"rope_type": "dynamic", "factor": 2.0, "rope_theta": theta},
         )
         self.rope = Qwen3RotaryEmbedding(config)
 
 
-def _build():
-    model = _TinyQwenRope()
+def _build(theta=10000):
+    model = _TinyQwenRope(theta)
     leaf = torch.optim.AdamW(model.parameters(), lr=0.01)
     return model, MultiOptimizer(model, {"model": leaf}, ["model"])
 
@@ -62,11 +65,9 @@ def _rope_update(model, optimizer):
 
 def _fresh_resume(_rank, checkpoint, expected_path):
     model, optimizer = _build()
-    assert model.rope.inv_freq is not model.rope.original_inv_freq
     DistributedCheckpointer.load(
         checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
     )
-    assert model.rope.inv_freq is not model.rope.original_inv_freq
     trace = _rope_update(model, optimizer)
     expected = torch.load(expected_path, map_location="cpu", weights_only=True)
     actual = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}
@@ -79,29 +80,118 @@ def _fresh_resume(_rank, checkpoint, expected_path):
                 assert value == expected[group][key]
 
 
-def test_old_all_buffer_identity_rejects_real_rope_cache_reset(tmp_path, monkeypatch):
-    import veomni.checkpoint.optimizer_resume_layout as layout
+def test_standard_qwen4_rope_128k_does_not_require_dynamic_cache_contract():
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRotaryEmbedding
 
-    monkeypatch.setattr(layout, "persistent_named_buffers", lambda model: model.named_buffers(remove_duplicate=False))
+    from veomni.checkpoint.dynamic_rope import dynamic_rope_checkpoint_contract
+
+    config = Qwen4ExpTextConfig(
+        hidden_size=32,
+        head_dim=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=262144,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 2],
+        },
+    )
+    rope = Qwen4ExpTextRotaryEmbedding(config)
+    positions = torch.arange(131072).reshape(1, 1, -1).expand(3, 1, -1)
+    rope(torch.zeros((1, 131072, 8)), positions)
+    assert rope.max_seq_len_cached == 262144
+    assert dynamic_rope_checkpoint_contract(rope) == []
+
+
+def test_expanded_dynamic_rope_cache_is_rejected_before_checkpoint_write(tmp_path):
     model, optimizer = _build()
     model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
-    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
-    assert model.rope.inv_freq is model.rope.original_inv_freq
+    assert int(model.rope.max_seq_len_cached) == 32
+    checkpoint = tmp_path / "checkpoint"
+    with pytest.raises(RuntimeError, match="Dynamic RoPE cache.*depends on prior sequence lengths"):
+        DistributedCheckpointer.save(
+            str(checkpoint), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    assert not checkpoint.exists()
+
+
+def test_old_unproven_expanded_rope_checkpoint_is_rejected_before_model_load(tmp_path, monkeypatch):
+    import veomni.checkpoint.dynamic_rope as dynamic_rope
+
+    model, optimizer = _build()
+    with torch.no_grad():
+        model.projection.weight.fill_(7)
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    with monkeypatch.context() as old:
+        old.setattr(dynamic_rope, "dynamic_rope_checkpoint_contract", lambda _model: [])
+        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
     target, restored = _build()
-    assert target.rope.inv_freq is not target.rope.original_inv_freq
+    before = target.projection.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
         DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
 
 
-def test_real_qwen3_dynamic_rope_reset_saves_and_fresh_process_resumes(tmp_path):
+def test_changed_dynamic_rope_config_is_rejected_before_model_load(tmp_path):
+    model, optimizer = _build()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target, restored = _build(theta=5000)
+    before = target.projection.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+
+
+def _rank_local_rope_error(rank, checkpoint, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model, optimizer = _build()
+        if rank == 1:
+            model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+        error = "Dynamic RoPE cache.*prior sequence lengths" if rank == 1 else "layout failed on another rank"
+        with pytest.raises(RuntimeError, match=error):
+            DistributedCheckpointer.save(
+                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_rank_local_expanded_rope_error_is_coordinated(tmp_path):
+    spawn_with_rendezvous(_rank_local_rope_error, args=(str(tmp_path / "checkpoint"),), nprocs=2)
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def test_real_qwen3_dynamic_rope_reset_alias_mismatch_fails_closed(tmp_path):
     model, optimizer = _build()
     _update(model, optimizer, 1.0)
     model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
     model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
     assert model.rope.inv_freq is model.rope.original_inv_freq
     assert not any("inv_freq" in key for key in model.state_dict())
+    checkpoint = str(tmp_path / "checkpoint")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+    )
+    target, restored = _build()
+    before = target.projection.weight.detach().clone()
+    assert target.rope.inv_freq is not target.rope.original_inv_freq
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            checkpoint, {"model": target, "optimizer": restored}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+
+
+def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path):
+    model, optimizer = _build()
+    _update(model, optimizer, 1.0)
     checkpoint = str(tmp_path / "checkpoint")
     DistributedCheckpointer.save(
         checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
@@ -152,3 +242,98 @@ def test_nonpersistent_buffer_persistent_alias_mismatch_still_fails_before_load(
         DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
     torch.testing.assert_close(target.persistent, persistent_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("source_alias", [False, True])
+def test_non_rope_transient_buffer_alias_mismatch_still_fails_before_load(tmp_path, source_alias):
+    class Model(torch.nn.Module):
+        def __init__(self, alias):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2))
+            first = torch.ones(2)
+            self.register_buffer("cache_a", first, persistent=False)
+            self.register_buffer("cache_b", first if alias else first.clone(), persistent=False)
+
+    def build(alias):
+        model = Model(alias)
+        leaf = torch.optim.AdamW(model.parameters(), lr=0.01)
+        return model, MultiOptimizer(model, {"model": leaf}, ["model"])
+
+    model, optimizer = build(source_alias)
+    with torch.no_grad():
+        model.weight.fill_(5)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target, restored = build(not source_alias)
+    before = target.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
+
+
+def test_custom_dynamic_rope_alias_mismatch_still_fails_before_load(tmp_path):
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    class CustomRope(torch.nn.Module):
+        def __init__(self, alias):
+            super().__init__()
+            self.config = Qwen3Config(
+                hidden_size=32,
+                head_dim=8,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=16,
+                rope_parameters={"rope_type": "dynamic", "factor": 2.0, "rope_theta": 10000},
+            )
+            self.rope_type = "dynamic"
+            self.original_max_seq_len = self.max_seq_len_cached = 16
+            inv, self.attention_scaling = ROPE_INIT_FUNCTIONS["dynamic"](self.config, device="cpu")
+            self.register_buffer("inv_freq", inv, persistent=False)
+            self.register_buffer("original_inv_freq", inv if alias else inv.clone(), persistent=False)
+
+        def forward(self):
+            self.inv_freq.add_(1)
+            return self.original_inv_freq.clone()
+
+    def build(alias):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.ones(2))
+        model.rope = CustomRope(alias)
+        leaf = torch.optim.AdamW(model.parameters(), lr=0.01)
+        return model, MultiOptimizer(model, {"model": leaf}, ["model"])
+
+    model, optimizer = build(True)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target, restored = build(False)
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+
+
+@pytest.mark.parametrize("hook_scope", ["local", "global"])
+def test_rope_forward_hook_disables_alias_exemption(tmp_path, hook_scope):
+    model, optimizer = _build()
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
+    assert model.rope.inv_freq is model.rope.original_inv_freq
+
+    def alter_rope(module, _inputs):
+        if isinstance(module, Qwen3RotaryEmbedding):
+            module.original_inv_freq.add_(1)
+
+    if hook_scope == "local":
+        handle = model.rope.register_forward_pre_hook(alter_rope)
+    else:
+        handle = torch.nn.modules.module.register_module_forward_pre_hook(alter_rope)
+    try:
+        parallel = SimpleNamespace(dp_mode="ddp")
+        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        target, restored = _build()
+        if hook_scope == "local":
+            target.rope.register_forward_pre_hook(alter_rope)
+        with pytest.raises(RuntimeError, match="layout|identity"):
+            DistributedCheckpointer.load(
+                str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel
+            )
+    finally:
+        handle.remove()
