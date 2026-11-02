@@ -12,7 +12,15 @@ from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
-_CI_LAUNCH = LaunchSpec(nproc=4)
+def _balance_world_size():
+    # One value feeds both the launch plan and torchrun, so the runner reserves what the test starts.
+    world_size = int(os.getenv("VEOMNI_BALANCE_WORLD_SIZE", "4"))
+    if world_size < 2:
+        raise ValueError("VEOMNI_BALANCE_WORLD_SIZE must be at least 2; one rank has nothing to redistribute.")
+    return world_size
+
+
+_CI_LAUNCH = LaunchSpec(nproc=_balance_world_size())
 
 # Deterministic imbalanced per-rank image grids (t, h, w):
 # - Rank 0 & 2 hold many large/mixed images and scatter to multiple target ranks;
@@ -102,15 +110,12 @@ def main():
 
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_encoder_balance():
-    world_size = int(os.getenv("VEOMNI_BALANCE_WORLD_SIZE", str(_CI_LAUNCH.nproc)))
-    if world_size < 1:
-        raise ValueError("VEOMNI_BALANCE_WORLD_SIZE must be positive.")
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        f"--nproc-per-node={world_size}",
+        f"--nproc-per-node={_CI_LAUNCH.nproc}",
         "--node-rank=0",
         "--master_addr=localhost",
         "--standalone",

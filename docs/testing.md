@@ -764,5 +764,6 @@ The following redundancies have been addressed:
 
 `tests/parallel/encoder_data_balance/test_balance_reverse.py` defaults to the
 four ranks declared by its CI launch plan. Set `VEOMNI_BALANCE_WORLD_SIZE` to
-run with a different number of ranks; the worker derives its DP topology from
-the torchrun world size.
+run with a different number of ranks (at least two); the launch plan and the
+torchrun command both use it, and the worker derives its DP topology from the
+torchrun world size.
