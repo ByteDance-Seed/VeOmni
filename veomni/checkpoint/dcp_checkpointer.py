@@ -2621,6 +2621,7 @@ def _process_shard(
     shard_keys: Dict[str, str],
     checkpoint_path: str,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
+    *,
     legacy_expert_source_layout: Optional[str] = None,
 ) -> str:
     _validate_legacy_expert_source_layout(legacy_expert_source_layout)
