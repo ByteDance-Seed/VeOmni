@@ -18,6 +18,53 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 All processing parameters are configured through the `mm_configs` section in your YAML config.
 
+## Checkpoint identity for metadata collator hooks
+
+`SerializablePureCollatorHook` in `veomni.data.data_collator` wraps a model's
+metadata hook with two declarations intended for checkpoint compatibility:
+
+- `supports_rng_free_collation = True` declares that the wrapped hook derives
+  its metadata without consuming random state or depending on mutable state.
+- `checkpoint_collator_identity` is a stable, versioned string identifying
+  the hook's collation semantics, such as `veomni:qwen4-exp-metadata-v1`.
+
+Only the hook's author or maintainer should make the RNG-free declaration,
+after auditing the function and its dependencies for deterministic output and
+the absence of Python, NumPy, Torch, or other RNG consumption and mutable
+external state. The hook may update the supplied batch with its derived
+metadata; this does not imply that other transforms, the complete collator, or
+the data source are RNG-free. Wrapping a callable does not check the claim.
+
+Keep an identity stable for behavior-preserving refactors. Change its version
+when the same batch and collation inputs can produce incompatible metadata,
+for example after changing metadata layout, boundary semantics, or a
+behavior-affecting configuration not otherwise captured in the identity. A
+new identity identifies the changed behavior; it does not itself migrate or
+validate an older checkpoint.
+
+The wrapper and its `func` must be pickleable where DataLoader workers are
+started or restored. Prefer an importable module-level function, keep its module
+available to new processes, and test a pickle round trip; wrapping a closure,
+lambda, or unpickleable captured object does not make it pickleable. Qwen3.5,
+Qwen3.5-MoE, and Qwen4-Exp use these wrappers for their model-provided hooks on
+both GPU and NPU paths.
+
+`VLMTrainer._build_collate_fn` obtains the optional hook from
+`model.get_metadata_collate_func()` and passes it to `MainCollator`. Without
+sequence parallelism, `PackingCollator` invokes it after packing and passes
+zero image/video SP-padding counts. With sequence parallelism,
+`SequenceParallelCollator` invokes it after SP padding and slicing, passing
+the actual padding counts for `pixel_values` and `pixel_values_videos`.
+`sp_pad` maps those keys to the number of appended patch rows. The hook receives
+`(batch, sp_pad)` and updates the batch in place.
+
+This change only supplies declarations: it has no runtime consumer that checks
+these markers or enforces checkpoint compatibility. A resume implementation
+must explicitly consume and validate them; the markers alone do not establish
+exact data-loader or training recovery.
+See the [checkpoint guide](checkpoint.md) for the available save and restore
+workflows.
+
 ## Image Resolution Control
 
 Images are resized by `smart_resize` to satisfy three constraints simultaneously:
