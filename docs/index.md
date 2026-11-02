@@ -120,6 +120,7 @@ seed_omni/mixins/offline_encoding.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
+design/rank_local_adamw_checkpoint_adapter.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md

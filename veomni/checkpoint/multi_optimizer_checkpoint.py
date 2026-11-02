@@ -269,6 +269,7 @@ def _check_qwen_omni_checkpoint_keys(model, keys):
 
 def _check_model_serialization_hooks(model):
     """Allow the FSDP2 reshard hook, reject unproven model transforms."""
+    import dis
     import types
 
     from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
@@ -279,6 +280,22 @@ def _check_model_serialization_hooks(model):
         return {
             item for item in parent.__code__.co_consts if isinstance(item, types.CodeType) and item.co_name == name
         }
+
+    def returns_before_nested_load(hook):
+        # A sample call cannot prove this: the hook could modify other real
+        # keys, the module or error lists without changing the probe.
+        ops = [item for item in dis.get_instructions(hook) if item.opname not in ("RESUME", "NOP", "CACHE")]
+        if len(ops) < 3 or (ops[0].opname, ops[0].argval) != ("LOAD_FAST", "prefix"):
+            return False
+        if ops[1].opname not in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE"):
+            return False
+        if (ops[2].opname, ops[2].argval) == ("RETURN_CONST", None):
+            return True
+        return (
+            len(ops) >= 4
+            and (ops[2].opname, ops[2].argval) == ("LOAD_CONST", None)
+            and ops[3].opname == "RETURN_VALUE"
+        )
 
     post_codes = nested_code(FSDPParam.__init__, "<lambda>")
     pre_codes = nested_code(FSDPParamGroup._register_state_dict_hooks, "to_sharded_hook")
@@ -303,14 +320,18 @@ def _check_model_serialization_hooks(model):
                     and code in pre_codes
                     and any(isinstance(item, FSDPParamGroup) for item in captured)
                 )
-                builtin_qwen = (
-                    attr == "_load_state_dict_pre_hooks" and not name and _qwen_omni_filtered_prefixes(model, func)
-                )
+                builtin_qwen = attr == "_load_state_dict_pre_hooks" and _qwen_omni_filtered_prefixes(module, func)
                 if not builtin_fsdp and not builtin_qwen:
                     raise RuntimeError(f"Cannot prove model serialization hook {attr} on {name or '<root>'}")
-                if builtin_qwen and any(
-                    key.startswith(builtin_qwen)
-                    for key, _ in list(model.named_parameters()) + list(model.named_buffers())
+                if builtin_qwen and name and not returns_before_nested_load(func):
+                    raise RuntimeError("Cannot prove nested Qwen Omni load hook preserves checkpoint keys")
+                if (
+                    builtin_qwen
+                    and not name
+                    and any(
+                        key.startswith(builtin_qwen)
+                        for key, _ in list(model.named_parameters()) + list(model.named_buffers())
+                    )
                 ):
                     raise RuntimeError("Cannot prove Qwen Omni load hook is a no-op for checkpoint model tensors")
 
