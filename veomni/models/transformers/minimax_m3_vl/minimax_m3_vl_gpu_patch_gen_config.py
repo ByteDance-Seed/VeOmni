@@ -572,11 +572,8 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, grid_thw, **k
         )
     else:
         cu_seqlens_list = [0]
-        fallback_max_seqlen = 0
         for t, h, w in grid_thw_list:
-            seq_len = t * h * w
-            cu_seqlens_list.append(cu_seqlens_list[-1] + seq_len)
-            fallback_max_seqlen = max(fallback_max_seqlen, seq_len)
+            cu_seqlens_list.append(cu_seqlens_list[-1] + t * h * w)
         if sp_pad_seq_len > 0:
             cu_seqlens_list.append(cu_seqlens_list[-1] + sp_pad_seq_len)
         cu_seqlens = torch.tensor(
@@ -588,7 +585,7 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, grid_thw, **k
     if precomputed_max_seqlen is not None:
         max_seqlen = precomputed_max_seqlen
     else:
-        max_seqlen = max(fallback_max_seqlen, sp_pad_seq_len)
+        max_seqlen = max(max((t * h * w for t, h, w in grid_thw_list), default=0), sp_pad_seq_len)
 
     if IS_NPU_AVAILABLE:
         cu_seqlens = cu_seqlens.cpu()
