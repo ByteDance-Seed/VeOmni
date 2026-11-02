@@ -77,10 +77,28 @@ class CheckpointCallback(Callback):
             self.trainer.wait_for_pending_save()
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        if self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0:
+        if (
+            self.dcp_every_n_steps
+            and state.global_step % self.dcp_every_n_steps == 0
+            and state.global_step != self._last_dcp_step
+        ):
             self._save_dcp(state)
         if self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0:
-            self._save_hf(state)
+            # HF/LoRA export requires a same-step DCP. When epoch DCP saves
+            # are enabled, schedule that DCP through this callback so the
+            # epoch-end cadence reuses it instead of overwriting its manifest.
+            if self.dcp_every_n_epochs and state.global_step != self._last_dcp_step:
+                if getattr(self.trainer.args.train.checkpoint, "save_async", False):
+                    self.trainer.wait_for_pending_save()
+                self._save_dcp(state)
+            try:
+                self._save_hf(state)
+            except BaseException:
+                # An asynchronous DCP may have failed while export waited for
+                # it; do not treat that submission as a completed save.
+                if getattr(self.trainer.args.train.checkpoint, "save_async", False):
+                    self._last_dcp_step = -1
+                raise
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:

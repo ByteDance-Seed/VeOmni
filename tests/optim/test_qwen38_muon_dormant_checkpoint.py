@@ -44,12 +44,16 @@ def test_dcp_preserves_dormant_muon_recipe_without_creating_state(tmp_path):
     optimizer.zero_grad()
     dormant = optimizer.optimizers_dict["second"]
     ps = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=ps)
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=ps
+    )
     metadata = dcp.FileSystemReader(optimizer_dir(str(tmp_path))).read_metadata().state_dict_metadata
     assert "optimizer.param_groups.second.down_proj.weight.qwen38_plan" in metadata
     assert not dormant.state
     target, restored = _make_model_and_optimizer()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=ps)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=ps
+    )
     assert not restored.optimizers_dict["second"].state
     for source_param, target_param in zip(model.parameters(), target.parameters(), strict=True):
         source_param.grad = torch.ones_like(source_param)
@@ -75,11 +79,15 @@ def test_frozen_muon_parameter_history_is_saved_and_recovered(tmp_path):
     optimizer.zero_grad()
     weight.requires_grad_(False)
     ps = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=ps)
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=ps
+    )
     target, restored = _make_model_and_optimizer()
     target_weight = target.first.down_proj.weight
     target_weight.requires_grad_(False)
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=ps)
+    DistributedCheckpointer.load(
+        str(tmp_path), {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=ps
+    )
     assert not target_weight.requires_grad
     for key, value in optimizer.optimizers_dict["first"].state[weight].items():
         torch.testing.assert_close(restored.optimizers_dict["first"].state[target_weight][key], value, rtol=0, atol=0)
@@ -97,12 +105,18 @@ def test_frozen_muon_restore_target_mismatch_is_rejected(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     ps = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=ps)
+    DistributedCheckpointer.save(
+        str(tmp_path), {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=ps
+    )
     target, restored = _make_model_and_optimizer()
     target.first.down_proj.weight.requires_grad_(False)
     before = target.first.down_proj.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|generation|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=ps)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=ps,
+        )
     torch.testing.assert_close(target.first.down_proj.weight, before, rtol=0, atol=0)
     assert not restored.optimizers_dict["first"].state
 
@@ -119,9 +133,17 @@ def _global_marker_worker(rank, rendezvous, checkpoint_dir, all_dormant):
             optimizer.step()
             optimizer.zero_grad()
         ps = SimpleNamespace(dp_mode="ddp")
-        DistributedCheckpointer.save(checkpoint_dir, {"model": model, "optimizer": optimizer}, parallel_state=ps)
+        DistributedCheckpointer.save(
+            checkpoint_dir,
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=ps,
+        )
         target, restored = _make_model_and_optimizer()
-        DistributedCheckpointer.load(checkpoint_dir, {"model": target, "optimizer": restored}, parallel_state=ps)
+        DistributedCheckpointer.load(
+            checkpoint_dir,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=ps,
+        )
         assert not restored.optimizers_dict["second"].state
         assert bool(restored.optimizers_dict["first"].state) is (not all_dormant)
         dist.barrier()
@@ -197,10 +219,18 @@ def _empty_ple_owner_worker(rank, rendezvous, checkpoint_dir):
         ps = SimpleNamespace(
             dp_mode="fsdp2", extra_parallel_names=["ple"], extra_parallel_fsdp_device_mesh={"ple": mesh}
         )
-        DistributedCheckpointer.save(checkpoint_dir, {"model": source, "optimizer": optimizer}, parallel_state=ps)
+        DistributedCheckpointer.save(
+            checkpoint_dir,
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=ps,
+        )
         assert not leaf.state
         target, restored_leaf, restored = make()
-        DistributedCheckpointer.load(checkpoint_dir, {"model": target, "optimizer": restored}, parallel_state=ps)
+        DistributedCheckpointer.load(
+            checkpoint_dir,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=ps,
+        )
         assert not restored_leaf.state
         p = source.ngram_embedding.weight
         q = target.ngram_embedding.weight

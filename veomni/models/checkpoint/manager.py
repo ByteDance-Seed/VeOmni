@@ -59,8 +59,6 @@ def _scheduler_recipe(scheduler, optimizer):
         raise RuntimeError("MultiOptimizer requires a scheduler for each optimizer leaf")
     if type(scheduler) not in (LambdaLR, StepLR) or scheduler.optimizer is not optimizer:
         raise RuntimeError("MultiOptimizer scheduler implementation or binding is unsupported")
-    if any(name in vars(scheduler) for name in ("state_dict", "load_state_dict", "step", "get_lr", "get_last_lr")):
-        raise RuntimeError("MultiOptimizer scheduler methods are overridden")
     if type(scheduler) is StepLR:
         return {"type": "StepLR", "step_size": scheduler.step_size, "gamma": scheduler.gamma}
 

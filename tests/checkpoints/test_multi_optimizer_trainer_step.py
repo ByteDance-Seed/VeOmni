@@ -99,7 +99,8 @@ def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path,
 
 
 @pytest.mark.parametrize("mode", ["missing", "stale_generation", "matching"])
-def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, mode):
+@pytest.mark.parametrize("instrumented", ["none", "source", "target", "both"])
+def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, mode, instrumented):
     import torch
 
     from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
@@ -110,12 +111,22 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.trainer.callbacks.base import TrainerState
 
-    def build():
+    def build(with_instrumentation):
         runtime = _make_mock_runtime(save_path=str(tmp_path))
         runtime.model = torch.nn.Linear(2, 2)
         leaf = torch.optim.AdamW(runtime.model.parameters(), lr=0.01)
         runtime.optimizer = MultiOptimizer(runtime.model, {"model": leaf}, ["model"])
         runtime.lr_scheduler = build_lr_scheduler(runtime.optimizer, train_steps=100, lr=0.01)
+        if with_instrumentation:
+            scheduler = runtime.lr_scheduler["model"]
+            original_state_dict = scheduler.state_dict
+
+            def observed_state_dict():
+                # A profiling wrapper delegates to the scheduler and keeps the
+                # callable itself out of the serializable scheduler snapshot.
+                return {key: value for key, value in original_state_dict().items() if key != "state_dict"}
+
+            scheduler.state_dict = observed_state_dict
         runtime.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
         return runtime
 
@@ -123,7 +134,7 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
         patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
         patch("torch.distributed.barrier"),
     ):
-        source = build()
+        source = build(instrumented in ("source", "both"))
         manager = ModelCheckpointManager(source)
         for _ in range(3):
             source.model(torch.ones(1, 2)).sum().backward()
@@ -147,7 +158,7 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
 
             os.makedirs(os.path.dirname(sidecar), exist_ok=True)
             torch.save({"global_step": 3, "_veomni_optimizer_generations": {"model": "stale"}}, sidecar)
-        target = build()
+        target = build(instrumented in ("target", "both"))
         target.train_args.checkpoint.load_path = str(tmp_path / "global_step_3")
         target.checkpoint = ModelCheckpointManager(target)
         target.checkpoint.load()
@@ -161,11 +172,114 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
     if mode == "matching":
         GlobalStateCallback(trainer).load_global_state()
         assert trainer.state.global_step == 3
+        for runtime in (source, target):
+            runtime.optimizer.zero_grad()
+            runtime.model(torch.ones(1, 2)).sum().backward()
+            runtime.optimizer.step()
+            runtime.lr_scheduler.step()
+        for actual, expected in zip(target.model.parameters(), source.model.parameters(), strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert target.lr_scheduler["model"].get_last_lr() == source.lr_scheduler["model"].get_last_lr()
     else:
         with pytest.raises(RuntimeError, match="Trainer state is missing|generations differ"):
             GlobalStateCallback(trainer).load_global_state()
         assert trainer.state.global_step == 0
-    assert target.lr_scheduler["model"].last_epoch == 3
+    assert target.lr_scheduler["model"].last_epoch == (4 if mode == "matching" else 3)
+
+
+@pytest.mark.parametrize("fail_once", [False, True])
+def test_hf_step_and_epoch_dcp_share_multi_optimizer_checkpoint(tmp_path, fail_once):
+    import torch
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime, _make_mock_trainer
+    from veomni.checkpoint import layout
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.optim.lr_scheduler import build_lr_scheduler
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.trainer.callbacks.base import TrainerState
+    from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
+
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    ckpt = trainer.args.train.checkpoint
+    ckpt.save_steps, ckpt.save_epochs = 0, 1
+    ckpt.save_hf_weights, ckpt.hf_save_steps, ckpt.hf_save_epochs = True, 5, 0
+    trainer.train_dataloader = None
+    trainer.data_iterator = SimpleNamespace(state_dict=lambda: {})
+    trainer.environ_meter.state_dict.return_value = {}
+    trainer.channel_loss_callback = None
+    trainer.offline_cache_writer = None
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.model = torch.nn.Linear(2, 2)
+    leaf = torch.optim.AdamW(runtime.model.parameters(), lr=0.01)
+    runtime.optimizer = MultiOptimizer(runtime.model, {"model": leaf}, ["model"])
+    runtime.lr_scheduler = build_lr_scheduler(runtime.optimizer, train_steps=100, lr=0.01)
+    runtime.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
+        patch("torch.distributed.barrier"),
+    ):
+        manager = ModelCheckpointManager(runtime)
+        runtime.checkpoint = manager
+        trainer.model = runtime
+        trainer.save_dcp.side_effect = manager.save_dcp
+        attempts = []
+
+        def export(state, stage):
+            manager.prepare_export(state, stage)
+            attempts.append(True)
+            if fail_once and len(attempts) == 1:
+                raise RuntimeError("HF conversion failed after DCP")
+
+        trainer.save_hf_or_lora.side_effect = export
+        for _ in range(5):
+            runtime.model(torch.ones(1, 2)).sum().backward()
+            runtime.optimizer.step()
+            runtime.optimizer.zero_grad(set_to_none=True)
+            runtime.lr_scheduler.step()
+        checkpoint_cb = CheckpointCallback(trainer)
+        global_cb = GlobalStateCallback(trainer)
+        state = TrainerState(global_step=5, epoch=0)
+
+        if fail_once:
+            with pytest.raises(RuntimeError, match="HF conversion failed"):
+                checkpoint_cb.on_step_end(state)
+        checkpoint_cb.on_step_end(state)
+        global_cb.on_step_end(state)
+        assert layout.checkpoint_is_complete(layout.step_dir(str(tmp_path), 5))
+        checkpoint_cb.on_epoch_end(state)
+        global_cb.on_epoch_end(state)
+        trainer.save_dcp.assert_called_once_with(state)
+        assert manager.last_saved_step == checkpoint_cb._last_dcp_step == global_cb._last_saved_step == 5
+
+        restored = _make_mock_runtime(save_path=str(tmp_path))
+        restored.model = torch.nn.Linear(2, 2)
+        restored_leaf = torch.optim.AdamW(restored.model.parameters(), lr=0.01)
+        restored.optimizer = MultiOptimizer(restored.model, {"model": restored_leaf}, ["model"])
+        restored.lr_scheduler = build_lr_scheduler(restored.optimizer, train_steps=100, lr=0.01)
+        restored.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
+        restored.train_args.checkpoint.load_path = layout.step_dir(str(tmp_path), 5)
+        restored.checkpoint = ModelCheckpointManager(restored)
+        restored.checkpoint.load()
+        restored_trainer = _make_mock_trainer(save_path=str(tmp_path))
+        restored_trainer.args.train.checkpoint.load_path = restored.train_args.checkpoint.load_path
+        restored_trainer.model = restored
+        restored_trainer.train_dataloader = None
+        restored_trainer.data_iterator = SimpleNamespace(load_state_dict=lambda state: None)
+        restored_trainer.channel_loss_callback = None
+        restored_trainer.offline_cache_writer = None
+        GlobalStateCallback(restored_trainer).load_global_state()
+        assert restored_trainer.state.global_step == 5
+        assert restored.lr_scheduler["model"].last_epoch == 5
+        torch.testing.assert_close(restored.optimizer.state_dict(), runtime.optimizer.state_dict(), rtol=0, atol=0)
+        for model_runtime in (runtime, restored):
+            model_runtime.optimizer.zero_grad()
+            model_runtime.model(torch.full((1, 2), 2.0)).sum().backward()
+            model_runtime.optimizer.step()
+            model_runtime.lr_scheduler.step()
+        for actual, expected in zip(restored.model.parameters(), runtime.model.parameters(), strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_train_end_sidecar_keeps_generation_after_optimizer_release(tmp_path):
