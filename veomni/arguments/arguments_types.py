@@ -1547,6 +1547,15 @@ class OpsImplementationConfig:
             "cann_ops_transformer)."
         },
     )
+    qsa_indexer_implementation: Literal["eager", "cann"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA top-k indexer implementation: 'eager' or 'cann'. 'eager' is the "
+            "einsum+ReLU+topk reference loop. 'cann' is the Ascend CANN Lightning Indexer "
+            "(requires cann_ops_transformer, NPU) and covers the single-segment causal case "
+            "(equal-length, non-packed batch, no Ulysses/CP); other layouts fall back to 'eager'."
+        },
+    )
     dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={

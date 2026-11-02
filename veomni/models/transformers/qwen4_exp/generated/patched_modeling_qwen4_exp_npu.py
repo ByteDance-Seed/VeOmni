@@ -159,6 +159,9 @@ _VEOMNI_VISION_ATTENTION_PATCHED = True
 
 logger = logging.get_logger(__name__)
 
+# Warn once per process when the QSA CANN indexer cannot take a layout.
+_QSA_CANN_LAYOUT_WARNED = False
+
 
 # ======================================================================
 # [HELPERS] Module-level helpers injected via config.add_helper
@@ -1040,6 +1043,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_qsa_indexer = VeomniOp("qsa_indexer", "standard", config.ops_config.qsa_indexer_implementation)
 
     def forward(
         self,
@@ -1155,32 +1159,68 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         if block_starts.numel():
             top_count = min(self.block_topk, block_starts.numel())
             block_offsets = torch.arange(self.compress_ratio, dtype=torch.int32, device=hidden_states.device)
-            elements_per_query = max(1, batch_size * block_starts.numel() * self.index_n_heads)
-            query_chunk_size = max(1, min(local_seq_len, 16 * 1024 * 1024 // elements_per_query))
-            selected_chunks = []
-            for query_start in range(0, local_seq_len, query_chunk_size):
-                query_end = min(query_start + query_chunk_size, local_seq_len)
-                scores = torch.einsum(
-                    "blhd,nd->blnh",
-                    q[:, query_start:query_end].float(),
-                    pooled_keys[0].float(),
+            # The CANN Lightning Indexer covers the single-segment causal case: no
+            # sequence/CP parallelism (world_size == 1) and no packed batch. Packed
+            # layouts set cu_seq_lens_q, so its absence also rules out packing. The
+            # flat block list is batch-major with equal-length segments there, so the
+            # kernel's per-element block ids map back through batch-strided flat ids.
+            use_cann = self.veomni_qsa_indexer.impl == "cann" and world_size == 1 and cu_seq_lens_q is None
+            if use_cann:
+                n_blocks = local_seq_len // self.compress_ratio
+                if block_starts.numel() != batch_size * n_blocks:
+                    raise ValueError(
+                        "Qwen4-Exp compact QSA CANN indexer needs batch-major equal-length blocks; "
+                        f"got {block_starts.numel()} blocks for batch_size={batch_size}, "
+                        f"local_seq_len={local_seq_len}, compress_ratio={self.compress_ratio}."
+                    )
+                block_ids = self.veomni_qsa_indexer(
+                    q,
+                    pooled_keys[0].reshape(batch_size, n_blocks, self.index_head_dim),
+                    self.compress_ratio,
+                    self.block_topk,
                 )
-                scores = torch.relu(scores).sum(dim=-1) / self.index_head_dim**0.5
-                visible = (block_segment_ids[None, None] == local_segment_ids[:, query_start:query_end, None]) & (
-                    block_starts[None, None] + self.compress_ratio - 1
-                    <= query_positions[None, query_start:query_end, None]
+                valid_ids = block_ids >= 0
+                element_offsets = torch.arange(batch_size, device=hidden_states.device) * n_blocks
+                safe_ids = (block_ids + element_offsets.view(-1, 1, 1)).clamp(min=0)
+                selected_starts = block_starts[safe_ids].to(torch.int32)
+                selected_local = (
+                    (selected_starts[..., None] + block_offsets).masked_fill(~valid_ids[..., None], -1).flatten(-2)
                 )
-                scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)
-                top_blocks = scores.topk(top_count, dim=-1).indices
-                top_valid = (
-                    visible.to(torch.int8).gather(-1, top_blocks).bool()
-                    if hidden_states.device.type == "npu"
-                    else visible.gather(-1, top_blocks)
-                )
-                selected_starts = block_starts[top_blocks].to(torch.int32)
-                selected_chunk = selected_starts[..., None] + block_offsets
-                selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))
-            selected_local = torch.cat(selected_chunks, dim=1)
+            else:
+                if self.veomni_qsa_indexer.impl == "cann":
+                    global _QSA_CANN_LAYOUT_WARNED
+                    if not _QSA_CANN_LAYOUT_WARNED:
+                        _QSA_CANN_LAYOUT_WARNED = True
+                        logger.warning(
+                            "Qwen4-Exp QSA CANN indexer covers only single-segment causal selection "
+                            "(no sequence/CP parallelism, no packed batch); falling back to the eager loop."
+                        )
+                elements_per_query = max(1, batch_size * block_starts.numel() * self.index_n_heads)
+                query_chunk_size = max(1, min(local_seq_len, 16 * 1024 * 1024 // elements_per_query))
+                selected_chunks = []
+                for query_start in range(0, local_seq_len, query_chunk_size):
+                    query_end = min(query_start + query_chunk_size, local_seq_len)
+                    scores = torch.einsum(
+                        "blhd,nd->blnh",
+                        q[:, query_start:query_end].float(),
+                        pooled_keys[0].float(),
+                    )
+                    scores = torch.relu(scores).sum(dim=-1) / self.index_head_dim**0.5
+                    visible = (block_segment_ids[None, None] == local_segment_ids[:, query_start:query_end, None]) & (
+                        block_starts[None, None] + self.compress_ratio - 1
+                        <= query_positions[None, query_start:query_end, None]
+                    )
+                    scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)
+                    top_blocks = scores.topk(top_count, dim=-1).indices
+                    top_valid = (
+                        visible.to(torch.int8).gather(-1, top_blocks).bool()
+                        if hidden_states.device.type == "npu"
+                        else visible.gather(-1, top_blocks)
+                    )
+                    selected_starts = block_starts[top_blocks].to(torch.int32)
+                    selected_chunk = selected_starts[..., None] + block_offsets
+                    selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))
+                selected_local = torch.cat(selected_chunks, dim=1)
         else:
             selected_local = torch.empty(
                 batch_size,
