@@ -9,9 +9,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW, select_cpu_offload_groups
 from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 from veomni.optim.optimizer import MultiOptimizer, build_optimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_offload_pattern_requires_trainable_match():

@@ -201,6 +201,8 @@ def _local_layout(
         optimizer_names.setdefault(id(param), set()).update(_get_fqns(optimizer.model, runtime_name))
     if names != optimizer_names:
         raise RuntimeError("MultiOptimizer and checkpoint model have different canonical parameter identities")
+    from .dynamic_rope import dynamic_rope_checkpoint_contract
+
     model_aliases = {}
     for kind, items in (
         ("parameter", model.named_parameters(remove_duplicate=False)),
@@ -372,6 +374,11 @@ def _local_layout(
         "extra_digest": extra_digest,
         "frozen_digest": frozen_digest,
     }
+    rope_contract = dynamic_rope_checkpoint_contract(model)
+    if rope_contract:
+        # Earlier checkpoints did not prove that transient cache history was
+        # reconstructible by a fresh process.
+        layout["dynamic_rope_cache_v1"] = rope_contract
     return hashlib.sha256(
         json.dumps(layout, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     ).hexdigest()

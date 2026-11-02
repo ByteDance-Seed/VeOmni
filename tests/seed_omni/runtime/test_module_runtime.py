@@ -62,6 +62,94 @@ def test_module_runtime_is_a_model_runtime():
     assert issubclass(ModuleRuntime, VeOmniModelRuntime)
 
 
+@pytest.mark.parametrize(
+    "enabled,persistent_dim,expected", [(False, None, False), (True, None, True), (True, 1, False)]
+)
+def test_module_scope_applies_canonical_checkpoint_plan_after_wrap(monkeypatch, enabled, persistent_dim, expected):
+    from torch.distributed.tensor import Shard
+
+    spec = SimpleNamespace(placement=Shard(0), persistent_fsdp_shard_dim=persistent_dim, checkpoint_layout_v2=False)
+    model = nn.Linear(2, 2)
+    model._fqn2spec_info = {"weight": spec}
+    for step in (
+        "setup",
+        "_build_model_assets",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", model))
+    monkeypatch.setattr(ModuleRuntime, "_build_optimizer_checked", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    monkeypatch.setattr(
+        "veomni.models.model_runtime.get_parallel_state_by_name",
+        lambda name: SimpleNamespace(any_extra_parallel_enabled=True),
+    )
+    train = SimpleNamespace(
+        training_task="online_training",
+        checkpoint=SimpleNamespace(load_path=None, extra_parallel_canonical_layout=enabled),
+    )
+    ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "vision_encoder",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+    assert spec.checkpoint_layout_v2 is expected
+
+
+def test_canonical_checkpoint_layout_rejects_missing_required_plan():
+    from veomni.models.model_runtime import _configure_extra_parallel_checkpoint_layout
+
+    checkpoint = SimpleNamespace(extra_parallel_canonical_layout=True)
+    with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
+        _configure_extra_parallel_checkpoint_layout(nn.Linear(2, 2), checkpoint, require_plan=True)
+    _configure_extra_parallel_checkpoint_layout(nn.Linear(2, 2), checkpoint, require_plan=False)
+
+
+def test_module_scope_active_plan_without_wrapped_specs_fails_before_optimizer(monkeypatch):
+    from torch.distributed.tensor import Shard
+
+    from veomni.distributed.parallel_plan import ParallelPlan
+
+    model = nn.Linear(2, 2)
+    model.get_parallel_plan = lambda: ParallelPlan(extra_parallel_plan={"ep": {"weight": Shard(0)}})
+    for step in (
+        "setup",
+        "_build_model_assets",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", model))
+    called = []
+    monkeypatch.setattr(ModuleRuntime, "_build_optimizer_checked", lambda self: called.append(True))
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    state = SimpleNamespace(
+        any_extra_parallel_enabled=True,
+        extra_parallel_sizes=("ep",),
+        extra_parallel_enabled=lambda name: name == "ep",
+    )
+    monkeypatch.setattr("veomni.models.model_runtime.get_parallel_state_by_name", lambda _name: state)
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.get_parallel_state", lambda: state)
+    train = SimpleNamespace(
+        training_task="online_training",
+        checkpoint=SimpleNamespace(load_path=None, extra_parallel_canonical_layout=True),
+    )
+    with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
+        ModuleRuntime(
+            SimpleNamespace(accelerator=_fsdp("module")),
+            "vision_encoder",
+            module_config=SimpleNamespace(),
+            global_accelerator=_fsdp("module"),
+            train_args=train,
+        )
+    assert not called
+
+
 def test_omni_runtime_arguments_are_model_arguments():
     from veomni.arguments import ModelArguments
     from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments

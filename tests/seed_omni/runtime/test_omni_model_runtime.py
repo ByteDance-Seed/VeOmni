@@ -414,6 +414,77 @@ def test_metric_meter_collect_drains_only_the_metered_modules():
     assert runtime.metric_meter_collect() == {"metered": (0.0, [])}
 
 
+def test_composed_canonical_extra_parallel_rejected_before_wrap(monkeypatch):
+    model = _model()
+    children = tuple(model._modules)
+    train = SimpleNamespace(checkpoint=SimpleNamespace(extra_parallel_canonical_layout=True))
+    runtime = OmniModelRuntime(model, train_args=train)
+    runtime.omni_model_runtime_args = SimpleNamespace(accelerator=SimpleNamespace())
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.composed_model_owns_wrap",
+        lambda _acc: True,
+    )
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.use_parallel_state",
+        lambda _name: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "veomni.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(any_extra_parallel_enabled=True),
+    )
+    with pytest.raises(RuntimeError, match="fsdp_scope='model'.*fsdp_scope='module'"):
+        runtime._parallelize_composed_model()
+    assert tuple(model._modules) == children
+
+
+def _composed_canonical_error_worker(rank, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = _model()
+        children = tuple(model._modules)
+        train = SimpleNamespace(checkpoint=SimpleNamespace(extra_parallel_canonical_layout=True))
+        runtime = OmniModelRuntime(model, train_args=train)
+        runtime.omni_model_runtime_args = SimpleNamespace(accelerator=SimpleNamespace())
+
+        def read_state():
+            if rank == 1:
+                raise RuntimeError("injected state failure")
+            return SimpleNamespace(any_extra_parallel_enabled=False)
+
+        with (
+            patch(
+                "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.composed_model_owns_wrap",
+                return_value=True,
+            ),
+            patch(
+                "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.use_parallel_state",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "veomni.distributed.parallel_state.get_parallel_state",
+                side_effect=read_state,
+            ),
+        ):
+            message = "injected state failure" if rank == 1 else "failed on another rank"
+            with pytest.raises(RuntimeError, match=message):
+                runtime._parallelize_composed_model()
+        assert tuple(model._modules) == children
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_composed_canonical_extra_parallel_error_is_rank_coordinated():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_composed_canonical_error_worker, nprocs=2)
+
+
 def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     """Under ``fsdp_scope='model'``, cache readers must not go through weight materialisation."""
     model = _model()
@@ -447,6 +518,8 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
                 offload=False,
                 offload_pin_memory=False,
                 max_load_broadcast_size=20.0,
+                expert_weight_fp8_all_gather=True,
+                expert_fsdp_shard_dim=0,
             ),
             torch_compile=SimpleNamespace(
                 enable=False,
@@ -467,6 +540,8 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     captured = {}
 
     def fake_parallelize(model, **kwargs):
+        captured["expert_weight_fp8_all_gather"] = kwargs["expert_weight_fp8_all_gather"]
+        captured["expert_fsdp_shard_dim"] = kwargs["expert_fsdp_shard_dim"]
         captured["weights_path"] = kwargs["weights_path"]
         captured["children"] = list(dict(model.named_children()))
         return model
@@ -490,6 +565,8 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
 
     runtime._parallelize_composed_model()
 
+    assert captured["expert_weight_fp8_all_gather"] is True
+    assert captured["expert_fsdp_shard_dim"] == 0
     assert list(captured["weights_path"]) == ["module_b"]
     assert "module_a" not in captured["children"]
     assert runtime.model.get_module("module_a") is meta_module

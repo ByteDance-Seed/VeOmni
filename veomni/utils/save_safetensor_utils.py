@@ -383,6 +383,7 @@ def save_lora_adapter_with_dcp(
 
     from ..checkpoint.dcp_checkpointer import (
         _extra_parallel_layout_key,
+        _ExtraParallelSavePlanner,
         _needs_extra_parallel_layout_marker,
         _validate_extra_parallel_tensor_v2,
     )
@@ -478,6 +479,8 @@ def save_lora_adapter_with_dcp(
                         lora_state[name],
                         spec.para_fsdp_mesh,
                         spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                        ep_shard_dim=spec.placement.dim,
+                        fsdp_shard_dim=spec.fsdp_shard_dim,
                     )
 
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
@@ -493,6 +496,7 @@ def save_lora_adapter_with_dcp(
     dcp.save(
         state_dict=dcp_lora_state,
         storage_writer=storage_writer,
+        planner=_ExtraParallelSavePlanner(),
     )
 
     if dist.is_initialized():
