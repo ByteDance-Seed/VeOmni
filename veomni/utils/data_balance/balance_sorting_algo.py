@@ -94,9 +94,12 @@ def post_mbs_balancing_greedy_without_pad(
     sorted_lengths = [row[dim] for row in sorted_rows]
     if any(not math.isfinite(length) or length < 0 for length in sorted_lengths):
         raise ValueError("Item lengths must be finite and nonnegative.")
-    sorted_costs = (
-        [length**exponent for length in sorted_lengths] if order is None else [cost_values[i] for i in order]
-    )
+    try:
+        sorted_costs = (
+            [length**exponent for length in sorted_lengths] if order is None else [cost_values[i] for i in order]
+        )
+    except OverflowError as exc:
+        raise ValueError("Scheduling costs must be finite.") from exc
     if any(isinstance(cost, float) and not math.isfinite(cost) for cost in sorted_costs):
         raise ValueError("Scheduling costs must be finite.")
 

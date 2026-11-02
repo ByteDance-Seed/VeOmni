@@ -197,6 +197,13 @@ def test_invalid_exponent(exponent):
         )
 
 
+def test_float_cost_overflow_is_a_value_error():
+    with pytest.raises(ValueError, match="finite"):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            torch.tensor([[1000], [999]]), 2, 0, cost_exponent=200.0
+        )
+
+
 def test_exact_integer_cost_does_not_overflow():
     table = torch.tensor([[1000], [999], [998]])
     result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](table, 2, 0, cost_exponent=200)
