@@ -53,7 +53,7 @@ CRITICAL_METADATA_FIELDS = frozenset(
     }
 )
 
-_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_NUMBER = r"[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|nan|inf(?:inity)?)"
 _LOSS_PATTERN = re.compile(rf"(?<![\w/])(?:total_)?loss\s*[:=]\s*({_NUMBER})(?![\w.])", re.IGNORECASE)
 _GRAD_PATTERN = re.compile(
     rf"(?<![\w/])(?:grad_norm|gradient_norm)\s*[:=]\s*({_NUMBER})(?![\w.])",

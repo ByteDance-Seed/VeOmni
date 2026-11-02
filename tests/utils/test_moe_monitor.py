@@ -244,6 +244,41 @@ def test_compute_metrics_empty_returns_empty():
     assert monitor.compute_metrics(current_step=0) == {}
 
 
+@pytest.mark.parametrize("physical", [False, True])
+def test_scalar_only_metrics_skip_image_builders_and_preserve_interval_state(monkeypatch, physical):
+    monitor = MoERouterMonitor(num_experts=4)
+    routers = [nn.Identity(), nn.Identity()]
+    for router in routers:
+        monitor._register_layer(router)
+    monkeypatch.setattr(monitor, "build_heatmap_image", lambda *args: "logical-image")
+    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", lambda *args: "physical-image")
+
+    def record_interval():
+        for index, router in enumerate(routers):
+            monitor.record(router, torch.tensor([[index]], dtype=torch.long))
+        if physical:
+            monitor.record_ep_balance(0, (8, 0), (4, 4), 1, 4)
+            monitor.record_ep_balance(1, (3, 1), (2, 2), 1, 1)
+
+    record_interval()
+    expected = monitor.compute_metrics(current_step=1)
+    expected_scalars = {key: value for key, value in expected.items() if not key.endswith("_heatmap")}
+
+    def unexpected_image(*args, **kwargs):
+        pytest.fail("Scalar-only metrics must not call an image builder.")
+
+    monkeypatch.setattr(monitor, "build_heatmap_image", unexpected_image)
+    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", unexpected_image)
+    record_interval()
+    actual = monitor.compute_metrics(current_step=2, render_heatmaps=False)
+    assert actual == expected_scalars
+    assert monitor._last_step_range == (2, 2)
+    assert monitor._ep_rank_loads_before == {}
+    assert monitor._ep_rank_loads_after == {}
+    assert monitor._ep_stats == {}
+    assert all(torch.count_nonzero(value) == 0 for value in monitor._counts.values())
+
+
 def test_active_monitor_singleton_roundtrip():
     assert get_active_monitor() is None
     m = MoERouterMonitor(num_experts=4)
@@ -253,6 +288,40 @@ def test_active_monitor_singleton_roundtrip():
     finally:
         set_active_monitor(None)
     assert get_active_monitor() is None
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_physical_plan_totals_include_checkpoint_recomputation(checkpointing):
+    from functools import partial
+
+    from torch.utils.checkpoint import checkpoint
+    from transformers.modeling_layers import GradientCheckpointingLayer
+
+    monitor = MoERouterMonitor(num_experts=2)
+    router = nn.Identity()
+    monitor._register_layer(router)
+
+    class MonitoredLayer(GradientCheckpointingLayer):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(4, 4))
+
+        def forward(self, hidden_states):
+            monitor.record(router, torch.tensor([[0, 1]] * 4))
+            monitor.record_ep_balance(0, (8, 0), (4, 4), 1, 4)
+            return (hidden_states @ self.weight).sin()
+
+    layer = MonitoredLayer().train()
+    layer.gradient_checkpointing = checkpointing
+    layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+    layer(torch.ones(2, 4, requires_grad=True)).square().sum().backward()
+
+    calls = 2 if checkpointing else 1
+    metrics = monitor.compute_metrics(current_step=1, render_heatmaps=False)
+    assert metrics["moe/ep_active_replicas/sum"] == calls
+    assert metrics["moe/ep_moved_tokens/sum"] == 4 * calls
+    assert metrics["moe/ep_total_routed_tokens/sum"] == 8 * calls
+    assert metrics["moe/ep_moved_token_fraction/avg"] == 0.5
 
 
 def test_hook_noop_when_inactive():
@@ -802,10 +871,9 @@ def _monitor_callback_trainer(*, config, wandb_enabled=False, global_rank=0):
                 wandb=SimpleNamespace(enable=wandb_enabled),
             )
         ),
-        model_config=config,
         parallel_state=SimpleNamespace(ep_enabled=True, ep_size=2, fsdp_group=None),
         step_env_metrics={"environment/tokens": 10},
-        model=nn.Identity(),
+        model=SimpleNamespace(model_config=config, model=nn.Identity()),
     )
 
 
@@ -833,8 +901,8 @@ def test_monitor_callback_collects_without_wandb_and_propagates_only_scalars(mon
     class FakeMonitor:
         _last_step_range = (0, 2)
 
-        def compute_metrics(self, current_step, format_only_on):
-            calls.append((current_step, format_only_on))
+        def compute_metrics(self, current_step, format_only_on, render_heatmaps):
+            calls.append((current_step, format_only_on, render_heatmaps))
             return {
                 "moe/ep_rank_imbalance_before/avg": 0.5,
                 "moe/ep_rank_load_before_heatmap": object(),
@@ -842,7 +910,7 @@ def test_monitor_callback_collects_without_wandb_and_propagates_only_scalars(mon
 
     callback.monitor = FakeMonitor()
     callback.on_step_end(SimpleNamespace(global_step=2))
-    assert calls == [(2, True)]
+    assert calls == [(2, True, False)]
     assert trainer.step_env_metrics == {
         "environment/tokens": 10,
         "moe/ep_rank_imbalance_before/avg": 0.5,
@@ -862,13 +930,13 @@ def test_monitor_callback_nonzero_rank_collects_and_resets_without_formatting():
     calls = []
 
     class FakeMonitor:
-        def compute_metrics(self, current_step, format_only_on):
-            calls.append((current_step, format_only_on))
+        def compute_metrics(self, current_step, format_only_on, render_heatmaps):
+            calls.append((current_step, format_only_on, render_heatmaps))
             return {}
 
     callback.monitor = FakeMonitor()
     callback.on_step_end(SimpleNamespace(global_step=2))
-    assert calls == [(2, False)]
+    assert calls == [(2, False, False)]
 
 
 def test_monitor_callback_wandb_directly_logs_only_heatmaps_and_handles_missing_logical_keys(monkeypatch):
@@ -882,7 +950,8 @@ def test_monitor_callback_wandb_directly_logs_only_heatmaps_and_handles_missing_
     class FakeMonitor:
         _last_step_range = (1, 2)
 
-        def compute_metrics(self, current_step, format_only_on):
+        def compute_metrics(self, current_step, format_only_on, render_heatmaps):
+            assert render_heatmaps is True
             return {
                 "moe/ep_rank_imbalance_before/avg": 0.5,
                 "moe/ep_rank_load_before_heatmap": image,
@@ -933,9 +1002,8 @@ def test_base_trainer_orders_monitor_after_metric_producers_before_wandb(monkeyp
         "TqdmCallback": "tqdm",
         "WandbTraceCallback": "wandb",
         "ProfileTraceCallback": "profile",
-        "CheckpointerCallback": "checkpointer",
-        "HuggingfaceCkptCallback": "hf_checkpoint",
-        "HFLoraCkptCallback": "hf_lora_checkpoint",
+        "CheckpointCallback": "checkpoint",
+        "GlobalStateCallback": "global_state",
         "EvaluateCallback": "evaluate",
         "MoERouterMonitorCallback": "moe_monitor",
         "ChannelLossCallback": "channel_loss",
@@ -947,6 +1015,17 @@ def test_base_trainer_orders_monitor_after_metric_producers_before_wandb(monkeyp
     trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config={}))
     trainer._init_callbacks()
     order = [callback.name for callback in trainer._callbacks]
+    assert order == [
+        "environment",
+        "tqdm",
+        "channel_loss",
+        "moe_monitor",
+        "wandb",
+        "profile",
+        "checkpoint",
+        "global_state",
+        "evaluate",
+    ]
     assert order.index("environment") < order.index("moe_monitor")
     assert order.index("channel_loss") < order.index("moe_monitor")
     assert order.index("moe_monitor") < order.index("wandb")

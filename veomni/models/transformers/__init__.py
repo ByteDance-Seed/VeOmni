@@ -19,7 +19,6 @@ from . import (
     gemma3,
     glm_moe_dsa,
     gpt_oss,
-    janus,
     llama,
     movqgan,
     qwen2,
@@ -33,6 +32,7 @@ from . import (
     qwen3_omni_moe,
     qwen3_vl,
     qwen3_vl_moe,
+    qwen4_exp,
     seed_oss,
     wan,
 )
@@ -44,7 +44,6 @@ __all__ = [
     "flux",
     "gemma3",
     "gpt_oss",
-    "janus",
     "llama",
     "movqgan",
     "qwen2",
@@ -60,5 +59,6 @@ __all__ = [
     "wan",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen4_exp",
     "glm_moe_dsa",
 ]

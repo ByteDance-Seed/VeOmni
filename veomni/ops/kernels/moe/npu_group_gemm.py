@@ -21,30 +21,38 @@ import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
-from ....distributed.moe.ep_load_balance import ExpertReplicaTransfer, cat_local_and_replica_weights
-from ....distributed.moe.moe_layer import EPMergedFc1GroupGemm, _record_ep_balance, _validate_ep_balance_dispatch
+from ....distributed.moe.ep_dispatch import _record_ep_balance, _validate_ep_balance_dispatch
+from ....distributed.moe.ep_load_balance import ExpertReplicaTransfer
 from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
+from . import npu_ep_memory
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
 
 
-def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
-    """gpt-oss-style clamped SwiGLU (DeepSeek-V4).
-
-    ``torch_npu.npu_swiglu`` is a fused kernel with no clamp support, so this
-    manual (unfused) path is only taken when ``swiglu_limit`` is set -- today
-    that is exclusively DeepSeek-V4's ``PatchedDeepseekV4Experts`` (see
-    ``deepseek_v4_gpu_patch_gen_config.py``). Chunk convention and clamp
-    bounds mirror that class's eager ``_apply_gate`` exactly: first half of
-    the last dim is ``gate`` (clamped to ``max=limit``), second half is ``up``
-    (clamped to ``[-limit, limit]``), activation is SiLU (DeepSeek-V4's
-    ``config.hidden_act``).
-    """
+def _eager_clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
     return F.silu(gate) * up
+
+
+def _is_triton_ascend_available() -> bool:
+    try:
+        from triton._C import libtriton
+    except ImportError:
+        return False
+    return hasattr(libtriton, "ascend")
+
+
+def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Use Ascend Triton when available and preserve the eager training fallback."""
+    if _is_triton_ascend_available():
+        from ._kernels.kernel.npu_clamped_swiglu import npu_triton_clamped_swiglu
+
+        return npu_triton_clamped_swiglu(x, limit)
+
+    return _eager_clamped_swiglu(x, limit)
 
 
 def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
@@ -178,20 +186,23 @@ def _npu_ep_balanced_moe_forward(
             "NPU EP load balancing requires the entry point and load balancer to use the same process group."
         )
 
-    plan, fc1_weight, fc2_weight, swiglu_limit = _validate_ep_balance_dispatch(
-        EPMergedFc1GroupGemm,
+    fc1_weight = fc1_1_2_weight
+    plan = _validate_ep_balance_dispatch(
         num_experts,
         selected_experts,
-        (fc1_1_2_weight, fc2_weight, swiglu_limit),
+        fc1_weight,
+        fc2_weight,
         load_balancer,
     )
     _record_ep_balance(load_balancer, plan)
 
     gate_up_transfer = None
     down_transfer = None
+    optimize_memory = getattr(load_balancer, "optimize_memory", False) and bool(plan.replicas)
     if plan.replicas:
-        gate_up_transfer = ExpertReplicaTransfer.start(fc1_weight, plan, ep_group)
-        down_transfer = ExpertReplicaTransfer.start(fc2_weight, plan, ep_group)
+        transfer_options = {"pool": load_balancer.buffer_pool} if optimize_memory else {}
+        gate_up_transfer = ExpertReplicaTransfer.start(fc1_weight, plan, ep_group, **transfer_options)
+        down_transfer = ExpertReplicaTransfer.start(fc2_weight, plan, ep_group, **transfer_options)
 
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     physical_slots_per_rank = plan.tokens_per_local_physical_expert.shape[1]
@@ -206,28 +217,57 @@ def _npu_ep_balanced_moe_forward(
         ep_group,
     )
 
-    if gate_up_transfer is not None and down_transfer is not None:
-        replica_fc1_weight = gate_up_transfer.wait()
-        replica_fc2_weight = down_transfer.wait()
-        fc1_weight = cat_local_and_replica_weights(fc1_weight, replica_fc1_weight, plan, ep_group)
-        fc2_weight = cat_local_and_replica_weights(fc2_weight, replica_fc2_weight, plan, ep_group)
-
-    tokens_per_local_physical_expert = plan.tokens_per_local_physical_expert.sum(dim=0).to(
+    host_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
+    tokens_per_local_physical_expert = host_counts.to(
         hidden_states.device,
         dtype=torch.int64,
         non_blocking=True,
     )
-    intermediate_hidden_states = npu_group_gemm(
-        hidden_states,
-        fc1_weight.transpose(1, 2),
-        tokens_per_local_physical_expert,
-    )
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
-    hidden_states = npu_group_gemm(
-        intermediate_activations,
-        fc2_weight.transpose(1, 2),
-        tokens_per_local_physical_expert,
-    )
+    if gate_up_transfer is not None and down_transfer is not None:
+        replica_fc1_weight = gate_up_transfer.wait()
+        replica_fc2_weight = down_transfer.wait()
+        try:
+            intermediate_hidden_states = npu_ep_memory.balanced_group_gemm(
+                hidden_states,
+                fc1_weight,
+                replica_fc1_weight,
+                tokens_per_local_physical_expert,
+                host_counts,
+                plan,
+                ep_group,
+                gate_up_transfer,
+                optimize_memory,
+                npu_group_gemm,
+            )
+            hidden_states = npu_ep_memory.balanced_group_gemm(
+                _swiglu(intermediate_hidden_states, swiglu_limit),
+                fc2_weight,
+                replica_fc2_weight,
+                tokens_per_local_physical_expert,
+                host_counts,
+                plan,
+                ep_group,
+                down_transfer,
+                optimize_memory,
+                npu_group_gemm,
+            )
+        finally:
+            try:
+                gate_up_transfer.record_stream_use()
+            finally:
+                down_transfer.record_stream_use()
+    else:
+        intermediate_hidden_states = npu_group_gemm(
+            hidden_states,
+            fc1_weight.transpose(1, 2),
+            tokens_per_local_physical_expert,
+        )
+        intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+        hidden_states = npu_group_gemm(
+            intermediate_activations,
+            fc2_weight.transpose(1, 2),
+            tokens_per_local_physical_expert,
+        )
 
     return alltoall_combine(
         hidden_states,
@@ -345,8 +385,15 @@ def npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,  # intentionally unused; see the del below
     load_balancer=None,
 ):
+    # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
+    # launch bound in the Triton backend. The NPU group GEMM has no such launch
+    # bound to tighten, so the flag is a no-op here. It stays in the signature
+    # only so the unified ``fused_moe_forward`` dispatch and the OpSlot adapter
+    # can forward it to any backend uniformly.
+    del assume_distinct_experts
     if load_balancer is not None:
         parallel_state = get_parallel_state()
         if not parallel_state.ep_enabled:

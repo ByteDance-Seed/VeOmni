@@ -37,7 +37,13 @@ class Callback:
         pass
 
     def on_step_end(
-        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: Dict[str, float],
+        grad_norm: float,
+        aux_metrics: Dict[str, float] = None,
+        **kwargs,
     ) -> None:
         pass
 

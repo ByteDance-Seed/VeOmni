@@ -40,7 +40,7 @@ def _current_state():
     # UNINITIALIZED process resolves to ``None`` — i.e. "no groups" — instead of
     # constructing a default ``ParallelState`` that validates against the
     # distributed world size and raises. Production always initializes via
-    # ``init_parallel_state`` before any SP op runs; this ``None`` path only
+    # ``_init_parallel_state`` before any SP op runs; this ``None`` path only
     # covers pre-init / unit-test code (which drives SP via the override seam).
     from .. import parallel_state
 

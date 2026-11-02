@@ -277,6 +277,54 @@ def test_randomized_plans_are_deterministic_and_conservative():
         _assert_global_invariants(counts, plans)
 
 
+@pytest.mark.parametrize("ep_size,local_experts", [(2, 2), (4, 4), (8, 32)])
+def test_bulk_replica_allocations_match_scalar_reference_without_mutating_counts(ep_size, local_experts):
+    generator = torch.Generator().manual_seed(616)
+    for _ in range(20):
+        counts = torch.randint(0, 40, (ep_size, ep_size * local_experts), generator=generator)
+        original = counts.clone()
+        states, _, _, _ = ep_load_balance._plan_replicas(counts, ep_size, ep_size * local_experts, local_experts, 1)
+        expected = counts.clone()
+        expected_allocations = []
+        for state in states:
+            left = state.moved_tokens
+            row = []
+            for sender in range(ep_size):
+                moved = min(left, int(expected[sender, state.source_expert]))
+                expected[sender, state.source_expert] -= moved
+                row.append(moved)
+                left -= moved
+            assert left == 0
+            expected_allocations.append(tuple(row))
+        actual, allocations = ep_load_balance._allocate_replica_rows(counts, states)
+        assert torch.equal(counts, original)
+        assert torch.equal(actual, expected)
+        assert actual.dtype == counts.dtype
+        assert allocations == expected_allocations
+
+
+@pytest.mark.parametrize("loads", [(0, 0), (1, 0), (8, 8, 8, 8), (101, 100, 101, 100), (32,) * 8])
+def test_integer_optimal_rank_loads_do_not_search_equivalent_replica_moves(monkeypatch, loads):
+    ep_size, local_experts = len(loads), 4
+    num_experts = ep_size * local_experts
+    counts = torch.zeros(ep_size, num_experts, dtype=torch.long)
+    # Experts can be highly skewed within a rank while physical rank loads
+    # already attain the global integer lower bound.
+    for owner, load in enumerate(loads):
+        counts[0, owner * local_experts] = load
+
+    def unexpected_waterfill(*args, **kwargs):
+        pytest.fail("An integer-optimal rank profile must not search replica moves.")
+
+    monkeypatch.setattr(ep_load_balance, "_waterfill_allocations", unexpected_waterfill)
+    replicas, before, after, allocations = ep_load_balance._plan_replicas(
+        counts, ep_size, num_experts, local_experts, 1
+    )
+    assert replicas == []
+    assert before == after == list(loads)
+    assert sum(sum(row.values()) for row in allocations) == sum(loads)
+
+
 def _gloo_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
     try:
@@ -348,6 +396,27 @@ def test_attachment_accepts_fsdp2_dynamic_runtime_class(monkeypatch):
 
     assert attached == 1
     assert experts._veomni_ep_load_balancer.ep_group is group
+
+
+@pytest.mark.parametrize("optimize_memory", [False, True])
+def test_attachment_memory_pools_are_private_per_layer(monkeypatch, optimize_memory):
+    monkeypatch.setattr(ep_load_balance, "get_parallel_state", lambda: SimpleNamespace(ep_group=object()))
+    monkeypatch.setattr(ep_load_balance.dist, "get_world_size", lambda group=None: 2)
+    model = nn.ModuleList([_qwen_experts(expert_rows=2), _qwen_experts(expert_rows=2)])
+    parameters = tuple(model.parameters())
+    state_keys = tuple(model.state_dict())
+
+    attach_qwen3_5_moe_ep_load_balancers(model, 1, optimize_memory=optimize_memory)
+
+    controllers = [layer._veomni_ep_load_balancer for layer in model]
+    assert all(controller.optimize_memory is optimize_memory for controller in controllers)
+    if optimize_memory:
+        assert all(isinstance(controller.buffer_pool, ep_load_balance.ReplicaBufferPool) for controller in controllers)
+        assert controllers[0].buffer_pool is not controllers[1].buffer_pool
+    else:
+        assert all(controller.buffer_pool is None for controller in controllers)
+    assert tuple(model.parameters()) == parameters
+    assert tuple(model.state_dict()) == state_keys
 
 
 def test_attachment_targets_only_runtime_merged_qwen_experts(monkeypatch):

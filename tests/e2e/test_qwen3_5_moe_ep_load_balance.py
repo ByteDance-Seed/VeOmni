@@ -124,17 +124,18 @@ class EnvelopeLogSink(Callback):
                 "checkpoint": str(args.model.model_path),
                 "dataset": str(args.data.train_path),
                 "seed": args.train.seed,
-                "dtype": args.train.accelerator.fsdp_config.mixed_precision.param_dtype,
+                "dtype": args.model.accelerator.fsdp_config.mixed_precision.param_dtype,
                 "world_size": args.train.world_size,
-                "fsdp_mode": args.train.accelerator.fsdp_config.fsdp_mode,
-                "sp_size": args.train.accelerator.ulysses_size,
-                "ep_size": args.train.accelerator.ep_size,
+                "fsdp_mode": args.model.accelerator.fsdp_config.fsdp_mode,
+                "sp_size": args.model.accelerator.ulysses_size,
+                "ep_size": args.model.accelerator.ep_size,
                 "global_batch_size": args.train.global_batch_size,
                 "micro_batch_size": args.train.micro_batch_size,
                 "max_seq_len": args.data.max_seq_len,
-                "gradient_checkpointing": args.train.gradient_checkpointing.enable,
+                "gradient_checkpointing": args.model.accelerator.gradient_checkpointing.enable,
                 "run_label": self.run_label,
                 "feature_enabled": args.train.moe_ep_load_balance.enabled,
+                "optimize_memory": args.train.moe_ep_load_balance.optimize_memory,
             },
             "metrics": dict(self.metrics),
         }
@@ -152,7 +153,7 @@ def main():
     )
     previous_replay = get_active_replay()
     try:
-        set_active_replay(HotspotReplay(args.train.accelerator.ep_size))
+        set_active_replay(HotspotReplay(args.model.accelerator.ep_size))
         trainer.train()
     finally:
         set_active_replay(previous_replay)
@@ -552,7 +553,10 @@ def test_npu_generated_model_only_precomputes_gdn_metadata_when_needed():
 
 
 @pytest.mark.parametrize("ep_size", [2, 4])
-def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, ep_size):
+@pytest.mark.parametrize("optimize_memory,checkpointing", [(False, False), (True, False), (True, True)])
+def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
+    tmp_path, ep_size, optimize_memory, checkpointing
+):
     _require_accelerators()
 
     from tests.tools import DummyDataset, ParallelConfig, build_torchrun_cmd
@@ -581,15 +585,16 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, e
         "--data.max_seq_len=2048",
         "--train.profile.enable=False",
         "--train.wandb.enable=False",
-        "--train.gradient_checkpointing.enable=False",
+        f"--model.accelerator.gradient_checkpointing.enable={checkpointing}",
         "--train.moe_load_balance_monitor_interval=1",
         "--train.moe_ep_load_balance.max_replicas_per_rank=1",
-        "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-        "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-        "--train.accelerator.fsdp_config.mixed_precision.reduce_dtype=float32",
-        "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+        "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+        "--model.accelerator.fsdp_config.mixed_precision.reduce_dtype=float32",
+        "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         *_backend_args(),
         "--train.moe_ep_load_balance.enabled=False",
+        "--train.moe_ep_load_balance.optimize_memory=False",
     ]
     parallel = ParallelConfig(sp_size=1, ep_size=ep_size, fsdp_mode="fsdp2")
     baseline_command = build_torchrun_cmd(
@@ -613,6 +618,11 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, e
         candidate_command,
         "--train.moe_ep_load_balance.enabled=False",
         "--train.moe_ep_load_balance.enabled=True",
+    )
+    candidate_command = _replace_exact_arg(
+        candidate_command,
+        "--train.moe_ep_load_balance.optimize_memory=False",
+        f"--train.moe_ep_load_balance.optimize_memory={optimize_memory}",
     )
 
     base_env = os.environ.copy()
@@ -638,6 +648,10 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, e
     assert baseline["metadata"]["feature_enabled"] is False
     assert candidate["metadata"]["run_label"] == "candidate"
     assert candidate["metadata"]["feature_enabled"] is True
+    assert baseline["metadata"]["optimize_memory"] is False
+    assert candidate["metadata"]["optimize_memory"] is optimize_memory
+    assert baseline["metadata"]["gradient_checkpointing"] is checkpointing
+    assert candidate["metadata"]["gradient_checkpointing"] is checkpointing
 
     before = _finite_curve(candidate, _TELEMETRY_KEYS["before"])
     after = _finite_curve(candidate, _TELEMETRY_KEYS["after"])
@@ -651,11 +665,12 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, e
     assert all(value > 0 for value in moved_fraction)
     assert all(after_value <= before_value for before_value, after_value in zip(before, after, strict=True))
     assert any(after_value < before_value for before_value, after_value in zip(before, after, strict=True))
-    # Four MoE layers, GBS8, 2048 tokens, top-k2; count physical plans once,
-    # not once per EP sibling. Both fixtures move exactly half the assignments.
-    expected_total = toy_config["text_config"]["num_hidden_layers"] * 8 * 2048 * 2
+    # Count physical execution, including checkpoint recomputation, once per
+    # EP group. Both fixtures move exactly half the assignments.
+    forward_calls = 2 if checkpointing else 1
+    expected_total = toy_config["text_config"]["num_hidden_layers"] * 8 * 2048 * 2 * forward_calls
     assert total_tokens == [expected_total] * 2
     assert moved_tokens == [expected_total // 2] * 2
     # Two accumulated microbatches, four layers: EP2 has two groups with
     # one replica each; EP4 has one group with two replicas.
-    assert replicas == [16] * 2
+    assert replicas == [16 * forward_calls] * 2

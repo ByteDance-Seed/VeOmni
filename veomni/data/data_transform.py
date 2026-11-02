@@ -315,8 +315,13 @@ def _process_sample_qwen_vl_base(
 
     if "videos" in sample and sample["videos"]:
         videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        # Fetch already sampled the frames. Preserve its source indices/FPS for timestamps.
         video_inputs = processor.video_processor(
-            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+            videos=videos,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+            return_metadata=True,
         )
         video_grid_thw = video_inputs["video_grid_thw"]
         video_metadata = video_inputs.pop("video_metadata", None)
@@ -386,6 +391,7 @@ def _process_sample_qwen_vl_base(
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5_moe")
+@DATA_TRANSFORM_REGISTRY.register("qwen4_exp")
 def process_sample_qwen_vl(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
@@ -417,7 +423,7 @@ def process_sample_qwen_omni(
     from .multimodal import conv_preprocess
     from .multimodal.audio_utils import fetch_audios
     from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos
+    from .multimodal.video_utils import fetch_videos_metadata
 
     QWEN_OMNI_SYSTEM_MESSAGE = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -468,9 +474,9 @@ def process_sample_qwen_omni(
 
     videos = sample.get("videos", [])
     if videos:
-        videos, video_audios = fetch_videos(videos, **kwargs)
+        videos, video_metadata, video_audios, _ = fetch_videos_metadata(videos, **kwargs)
     else:
-        videos, video_audios = [], []
+        videos, video_metadata, video_audios = [], [], []
 
     audios = sample.get("audios", [])
     if audios:
@@ -493,6 +499,8 @@ def process_sample_qwen_omni(
         audios=audios,
         images=images,
         videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
         return_tensors="pt",
         padding=True,
     )

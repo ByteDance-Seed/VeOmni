@@ -1,3 +1,9 @@
+"""Four-GPU dense async Ulysses parity against the sync attention path.
+
+Single-process projection-grad contracts live in ``test_async_ulysses_grad.py``.
+Shared backward-unit math lives in ``test_backward.py``.
+"""
+
 import sys
 
 import torch

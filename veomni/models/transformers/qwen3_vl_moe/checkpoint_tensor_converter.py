@@ -30,9 +30,9 @@ per-expert stacking is needed (unlike `qwen3_moe`).
 
 Because VeOmni's training save path can also emit the v5 layout directly (e.g.
 `save_pretrained(save_original_format=False)`), the converter uses the dim-1
-shape to distinguish HF layout from v5 layout and only transposes when needed;
-v5-layout tensors pass through untouched. Shapes matching neither layout raise
-loudly rather than silently corrupting weights.
+and dim-2 shapes to distinguish HF layout from v5 layout and only transposes
+when needed; v5-layout tensors pass through untouched. Shapes matching both
+layouts or neither layout raise rather than silently corrupting weights.
 """
 
 import re
@@ -52,14 +52,13 @@ class Qwen3VLMoeCheckpointTensorConverter:
 
     The incoming tensor is always 3-D with dim-0 == ``num_experts``. For each
     projection we know both the HF layout and the v5 layout shapes exactly, so
-    we dispatch on dim-1:
+    we check both trailing dimensions:
 
     - ``gate_up_proj``: HF has dim-1 == ``hidden_size``, v5 has dim-1 == ``2 * intermediate_size``.
     - ``down_proj``:    HF has dim-1 == ``intermediate_size``, v5 has dim-1 == ``hidden_size``.
 
-    Hidden size, intermediate size and (for Qwen3-VL-MoE) their doubled variants
-    are all distinct integers for any realistic model, so the dispatch is
-    unambiguous.
+    If the two layouts coincide, shape alone cannot identify the source layout.
+    Reject these tensors instead of guessing whether to transpose them.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
@@ -88,14 +87,21 @@ class Qwen3VLMoeCheckpointTensorConverter:
         else:  # down_proj
             hf_mid, v5_mid = self.intermediate_size, self.hidden_size
 
-        if tensor.shape[1] == hf_mid:
+        hf_shape = (self.num_experts, hf_mid, v5_mid)
+        v5_shape = (self.num_experts, v5_mid, hf_mid)
+        if tensor.shape == hf_shape == v5_shape:
+            raise RuntimeError(
+                f"Qwen3VLMoe checkpoint converter: ambiguous layout for {name} "
+                f"(shape={tuple(tensor.shape)} matches both HF and v5); explicit source layout is required"
+            )
+        if tensor.shape == hf_shape:
             converted = tensor.transpose(1, 2).contiguous()
-        elif tensor.shape[1] == v5_mid:
+        elif tensor.shape == v5_shape:
             converted = tensor
         else:
             raise RuntimeError(
                 f"Qwen3VLMoe checkpoint converter: unrecognized layout for {name} "
-                f"(shape={tuple(tensor.shape)}; expected dim-1 == {hf_mid} (HF) or {v5_mid} (v5))"
+                f"(shape={tuple(tensor.shape)}; expected {hf_shape} (HF) or {v5_shape} (v5))"
             )
         return ConvertedCheckpointTensor(name, converted)
 

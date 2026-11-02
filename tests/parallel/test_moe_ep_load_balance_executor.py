@@ -1,7 +1,12 @@
+import gc
 import importlib
 import os
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -278,3 +283,330 @@ def _noncontiguous_group_worker(rank: int, world_size: int, rendezvous: str) -> 
 def test_real_noncontiguous_process_groups_map_ep_ranks_to_global_peers(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-noncontiguous'}"
     mp.spawn(_noncontiguous_group_worker, args=(4, rendezvous), nprocs=4, join=True)
+
+
+def _buffer_pool(max_cached=2):
+    return ep_load_balance.ReplicaBufferPool(max_cached=max_cached)
+
+
+def test_pool_refreshes_reused_storage_without_reusing_live_leases():
+    pool = _buffer_pool()
+    reference = torch.empty(2)
+    first = pool.acquire(reference, (2, 3))
+    first_tensor = first.tensor
+    first_tensor.fill_(7)
+    live = pool.acquire(reference, (2, 3))
+    assert live.tensor.data_ptr() != first_tensor.data_ptr()
+    first.record_use()
+    first.release()
+    first.release()
+    with pytest.raises(RuntimeError, match="released"):
+        first.record_use()
+    with pytest.raises(RuntimeError, match="released"):
+        _ = first.tensor
+    recycled = pool.acquire(reference, (2, 3))
+    assert recycled.tensor.data_ptr() == first_tensor.data_ptr()
+    assert torch.equal(recycled.tensor, torch.zeros(2, 3))
+    recycled.tensor.fill_(11)
+    assert torch.equal(live.tensor, torch.zeros(2, 3))
+
+
+def test_pool_separates_shape_dtype_and_bounds_total_idle_storage():
+    pool = _buffer_pool()
+    leases = [
+        pool.acquire(torch.empty(1, dtype=dtype), shape)
+        for dtype, shape in ((torch.float32, (2,)), (torch.float64, (2,)), (torch.float32, (3,)))
+    ]
+    tensors = [lease.tensor for lease in leases]
+    for lease in leases:
+        lease.record_use()
+        lease.release()
+    borrowed = [pool.acquire(torch.empty_like(tensor), tensor.shape) for tensor in tensors]
+    reused = sum(lease.tensor.data_ptr() == tensor.data_ptr() for lease, tensor in zip(borrowed, tensors))
+    assert reused == 2
+    for lease, tensor in zip(borrowed, tensors):
+        assert lease.tensor.shape == tensor.shape
+        assert lease.tensor.dtype == tensor.dtype
+
+
+def test_concurrent_returns_preserve_total_idle_cap():
+    pool = _buffer_pool()
+    leases = [pool.acquire(torch.empty(1), (4,)) for _ in range(8)]
+    tensors = [lease.tensor for lease in leases]
+    for lease in leases:
+        lease.record_use()
+
+    class YieldingList(list):
+        def __len__(self):
+            size = super().__len__()
+            # Force a scheduling point between the size check and append.
+            # The stored tensors and actual cache operations remain real.
+            time.sleep(0.01)
+            return size
+
+    pool._idle = YieldingList(pool._idle)
+    barrier = threading.Barrier(len(leases))
+
+    def release(lease):
+        barrier.wait()
+        lease.release()
+
+    with ThreadPoolExecutor(max_workers=len(leases)) as executor:
+        list(executor.map(release, leases))
+    borrowed = [pool.acquire(tensors[0], (4,)) for _ in leases]
+    old_pointers = {tensor.data_ptr() for tensor in tensors}
+    assert sum(lease.tensor.data_ptr() in old_pointers for lease in borrowed) == 2
+    assert len({lease.tensor.data_ptr() for lease in borrowed}) == len(borrowed)
+
+
+def test_unrecorded_lease_is_not_cached():
+    pool = _buffer_pool()
+    lease = pool.acquire(torch.empty(1), (4,))
+    old_tensor = lease.tensor
+    lease.release()
+    assert pool.acquire(old_tensor, old_tensor.shape).tensor.data_ptr() != old_tensor.data_ptr()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_unfinished_or_failed_transfer_cannot_reenter_pool(failure):
+    pool = _buffer_pool()
+    lease = pool.acquire(torch.empty(1), (4,))
+    old_tensor = lease.tensor
+
+    class FailingWork:
+        def wait(self):
+            raise RuntimeError("transfer failed")
+
+    transfer = ep_load_balance.ExpertReplicaTransfer(old_tensor, (FailingWork(),), (), lease=lease)
+    with pytest.raises(RuntimeError, match="wait"):
+        transfer.record_stream_use()
+    if failure:
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            transfer.wait()
+    del transfer, lease
+    gc.collect()
+    assert pool.acquire(old_tensor, old_tensor.shape).tensor.data_ptr() != old_tensor.data_ptr()
+
+
+class _GraphHeldReplica(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, transfer):
+        ctx.transfer = transfer
+        result = value * transfer.wait()
+        transfer.record_stream_use()
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        result = gradient * ctx.transfer.wait()
+        ctx.transfer.record_stream_use()
+        return result, None
+
+
+def test_graph_owned_transfer_survives_retained_backward_and_refreshes_after_gc():
+    pool = _buffer_pool()
+    value = torch.ones(4, requires_grad=True)
+    lease = pool.acquire(value, value.shape)
+    old_tensor = lease.tensor
+    old_tensor.fill_(3)
+    transfer = ep_load_balance.ExpertReplicaTransfer(old_tensor, (), (), lease=lease)
+    output = _GraphHeldReplica.apply(value, transfer)
+    del transfer, lease
+    output.sum().backward(retain_graph=True)
+    assert torch.equal(value.grad, torch.full((4,), 3.0))
+    other = pool.acquire(value, value.shape)
+    other.tensor.fill_(19)
+    assert other.tensor.data_ptr() != old_tensor.data_ptr()
+    value.grad = None
+    output.sum().backward(retain_graph=True)
+    assert torch.equal(value.grad, torch.full((4,), 3.0))
+    del output
+    gc.collect()
+    recycled = pool.acquire(value, value.shape)
+    assert recycled.tensor.data_ptr() == old_tensor.data_ptr()
+    assert torch.equal(recycled.tensor, torch.zeros(4))
+
+
+def test_no_grad_transfer_recycles_on_gc_without_graph():
+    pool = _buffer_pool()
+    value = torch.ones(4)
+    lease = pool.acquire(value, value.shape)
+    old_tensor = lease.tensor
+    old_tensor.fill_(5)
+    transfer = ep_load_balance.ExpertReplicaTransfer(old_tensor, (), (), lease=lease)
+    with torch.no_grad():
+        result = _GraphHeldReplica.apply(value, transfer)
+    del transfer, lease
+    gc.collect()
+    recycled = pool.acquire(value, value.shape)
+    assert recycled.tensor.data_ptr() == old_tensor.data_ptr()
+    assert torch.equal(result, torch.full((4,), 5.0))
+
+
+def _pooled_gradient_parts_worker(rank, world_size, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    try:
+        pool = _buffer_pool()
+        plan = _plan(ep_size=2, replicas=(_replica(source_rank=0, target_rank=1),))
+        previous = None
+        for step in range(2):
+            weight = torch.full((1, 2, 3), float(10 + rank + step))
+            transfer = ep_load_balance.ExpertReplicaTransfer.start(weight, plan, dist.group.WORLD, pool=pool)
+            replica = transfer.wait()
+            if previous is not None:
+                assert replica.data_ptr() == previous.data_ptr()
+            assert torch.equal(replica, torch.full_like(replica, float(10 + step) if rank else 0.0))
+            local_grad = torch.arange(6.0).reshape(1, 3, 2).transpose(1, 2) + rank * 10
+            replica_grad = torch.full((1, 3, 2), float(20 + rank)).transpose(1, 2)
+            original = local_grad.clone()
+            result = ep_load_balance._merge_replica_weight_gradient_parts(
+                local_grad, replica_grad, plan, dist.group.WORLD
+            )
+            assert torch.equal(result, original + 21 if rank == 0 else original)
+            assert torch.equal(local_grad, original)
+            assert result.dtype == local_grad.dtype
+            transfer.record_stream_use()
+            previous = replica
+            del transfer
+            gc.collect()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_pooled_two_rank_refresh_and_noncontiguous_gradient_parts(tmp_path):
+    mp.spawn(_pooled_gradient_parts_worker, args=(2, f"file://{tmp_path / 'pooled'}"), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("failure_stage", ["record_stream", "event"])
+def test_stream_record_failure_permanently_excludes_storage(monkeypatch, failure_stage):
+    # The host has no accelerator. Substitute only the stream API boundary;
+    # the lease, pool, tensor storage and pointer-reuse checks are real.
+    buffer_module = sys.modules[ep_load_balance.ReplicaBufferPool.__module__]
+    failing = True
+
+    class StreamTensor(torch.Tensor):
+        @property
+        def device(self):
+            return torch.device("meta")
+
+        def record_stream(self, stream):
+            if failing and failure_stage == "record_stream":
+                raise RuntimeError("stream tracking failed")
+
+    class Event:
+        def record(self, stream):
+            if failing and failure_stage == "event":
+                raise RuntimeError("stream tracking failed")
+
+    api = types.SimpleNamespace(device=lambda device: nullcontext(), current_stream=lambda: object())
+    monkeypatch.setattr(buffer_module, "_device_api", lambda tensor: api)
+    monkeypatch.setattr(buffer_module, "create_event", Event)
+    pool = _buffer_pool()
+    tensor = torch.ones(4).as_subclass(StreamTensor)
+    lease = buffer_module.ReplicaBufferLease(pool, tensor)
+    with pytest.raises(RuntimeError, match="tracking failed"):
+        lease.record_use()
+    failing = False
+    lease.record_use()
+    lease.release()
+    replacement = pool.acquire(tensor, tensor.shape)
+    assert replacement.tensor.data_ptr() != tensor.data_ptr()
+    assert torch.equal(tensor, torch.ones(4))
+
+
+def test_inference_forward_storage_can_be_reused_by_training():
+    pool = _buffer_pool()
+    with torch.inference_mode():
+        lease = pool.acquire(torch.ones(4), (4,))
+        pointer = lease.tensor.data_ptr()
+        lease.record_use()
+        lease.release()
+    lease = pool.acquire(torch.ones(4), (4,))
+    assert lease.tensor.data_ptr() == pointer
+    lease.tensor.fill_(3)
+    value = torch.ones(4, requires_grad=True)
+    (value * lease.tensor).sum().backward()
+    assert torch.equal(value.grad, torch.full((4,), 3.0))
+
+
+def test_accelerator_pool_waits_for_every_stream_before_reuse():
+    from veomni.utils.device import (
+        IS_CUDA_AVAILABLE,
+        IS_NPU_AVAILABLE,
+        create_stream,
+        get_device_type,
+        get_torch_device,
+    )
+
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        pytest.skip("Requires CUDA or NPU stream execution.")
+    api = get_torch_device()
+    reference = torch.empty(512 * 512, device=get_device_type())
+    pool = _buffer_pool()
+    streams = [create_stream() for _ in range(3)]
+    previous = api.current_stream()
+    for stream in streams:
+        stream.wait_stream(previous)
+    lease = pool.acquire(reference, reference.shape)
+    pointer = lease.tensor.data_ptr()
+    # Independent consumers on two streams: waiting for just the last event
+    # cannot protect the first stream's read from the third stream's zero_.
+    lease.tensor.fill_(7)
+    for stream in streams[:2]:
+        stream.wait_stream(api.current_stream())
+    results = []
+    for index, stream in enumerate(streams[:2]):
+        with api.stream(stream):
+            delay = torch.ones((512, 512), device=reference.device)
+            for _ in range(16 if index == 0 else 2):
+                delay = delay @ delay
+            results.append(lease.tensor.clone())
+            lease.record_use()
+    lease.release()
+    with api.stream(streams[2]):
+        replacement = pool.acquire(reference, reference.shape)
+        assert replacement.tensor.data_ptr() == pointer
+        zeroed = replacement.tensor.clone()
+        replacement.tensor.fill_(19)
+        replacement.record_use()
+        replacement.release()
+    for stream in streams:
+        stream.synchronize()
+    assert torch.equal(zeroed, torch.zeros_like(reference))
+    for result in results:
+        assert torch.equal(result, torch.full_like(reference, 7))
+
+
+def test_accelerator_eviction_preserves_allocator_stream_ownership():
+    from veomni.utils.device import (
+        IS_CUDA_AVAILABLE,
+        IS_NPU_AVAILABLE,
+        create_stream,
+        get_device_type,
+        get_torch_device,
+    )
+
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        pytest.skip("Requires CUDA or NPU allocator stream execution.")
+    api = get_torch_device()
+    reference = torch.empty(512 * 512, device=get_device_type())
+    pool = _buffer_pool(max_cached=0)
+    allocation_stream, consumer_stream = create_stream(), create_stream()
+    with api.stream(allocation_stream):
+        lease = pool.acquire(reference, reference.shape)
+        lease.tensor.fill_(7)
+    consumer_stream.wait_stream(allocation_stream)
+    with api.stream(consumer_stream):
+        delay = torch.ones((512, 512), device=reference.device)
+        for _ in range(16):
+            delay = delay @ delay
+        result = lease.tensor.clone()
+        lease.record_use()
+    lease.release()
+    with api.stream(allocation_stream):
+        # Repeated same-sized allocations pressure the freed storage's bin.
+        for _ in range(16):
+            torch.empty_like(reference).fill_(19)
+    allocation_stream.synchronize()
+    consumer_stream.synchronize()
+    assert torch.equal(result, torch.full_like(reference, 7))

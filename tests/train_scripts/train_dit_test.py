@@ -6,8 +6,9 @@ from typing import Any, Dict
 import torch
 
 from veomni.arguments import parse_args
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.callbacks import Callback, TrainerState
-from veomni.trainer.dit_trainer import DiTTrainer, VeOmniDiTArguments
+from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer, VeOmniDiTArguments
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -43,6 +44,16 @@ class LogDictSaveCallback(Callback):
                 json.dump(self.log_dict, f, indent=4)
 
 
+class TestDiTModelRuntime(DiTModelRuntime):
+    """No condition model needed – data arrives in model-ready format."""
+
+    def _build_condition_model(self, condition_model_type: str) -> None:
+        self.condition_model = None
+
+    def _freeze_model_module(self) -> None:
+        pass
+
+
 class TestDiTTrainer(DiTTrainer):
     """DiTTrainer subclass for SP-alignment testing.
 
@@ -56,17 +67,8 @@ class TestDiTTrainer(DiTTrainer):
         super().__init__(args)
         self.base._log_callback = LogDictSaveCallback(self.base)
 
-    # ------------------------------------------------------------------
-    # No condition model needed – data arrives in model-ready format.
-    # ------------------------------------------------------------------
-    def _build_condition_model(self, condition_model_type: str) -> None:
-        self.condition_model = None
-
-    def _freeze_model_module(self) -> None:
-        self.base.lora = False
-
-    def _build_model_assets(self) -> None:
-        self.base.model_assets = [self.base.model.config]
+    def _build_model_runtime(self) -> TestDiTModelRuntime:
+        return TestDiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _build_data_transform(self) -> None:
         self.base.data_transform = process_dummy_example
@@ -76,12 +78,12 @@ class TestDiTTrainer(DiTTrainer):
     # ------------------------------------------------------------------
     def forward_backward_step(self, micro_batch: Dict[str, Any]) -> tuple:
         micro_batch = self.preforward(micro_batch)
-        with self.base.model_fwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with self.base.model_bwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
             loss.backward()
 
         return loss, loss_dict
@@ -90,10 +92,14 @@ class TestDiTTrainer(DiTTrainer):
         super().on_train_end()
         self.base._log_callback.on_train_end(self.base.state)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        super().on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        super().on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
         self.base._log_callback.on_step_end(
-            self.base.state, loss=loss, loss_dict=loss_dict or {}, grad_norm=grad_norm or 0.0
+            self.base.state,
+            loss=loss,
+            loss_dict=loss_dict or {},
+            grad_norm=grad_norm or 0.0,
+            aux_metrics=aux_metrics,
         )
 
 

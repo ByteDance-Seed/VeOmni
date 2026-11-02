@@ -9,10 +9,10 @@ import torch
 import yaml
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
@@ -56,6 +56,27 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.mhc_implementation=tilelang",
 ]
 
+_QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
+_ACCELERATOR = get_torch_device()
+_QWEN4_EXP_TRAINING_ARGS = [
+    "--model.ops_implementation.attn_implementation=eager",
+    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+    "--model.ops_implementation.rms_norm_implementation=eager",
+    "--model.ops_implementation.swiglu_mlp_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
+    "--model.ops_implementation.load_balancing_loss_implementation=eager",
+    "--model.ops_implementation.rms_norm_gated_implementation=eager",
+    "--model.ops_implementation.causal_conv1d_implementation=eager",
+    "--model.ops_implementation.chunk_gated_delta_rule_implementation=eager",
+    "--model.accelerator.extra_parallel_names=ple",
+    "--model.accelerator.extra_parallel_sizes=2",
+    "--model.accelerator.extra_parallel_placement_innermost=false",
+    "--model.broadcast_model_weights_from_rank0=false",
+    "--model.ep_sharded_stream_load=true",
+    "--train.enable_batch_invariant_mode=False",
+]
+
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
@@ -92,17 +113,7 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
-    #
-    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
-    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
-    #   Disable save_original_format to save in native stacked format.
-    #
-    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
-    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
-    save_original_format = model_name != "qwen3_5_moe"
-    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
+    _materialize_weights_dir(config_path, test_path)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
@@ -237,7 +248,7 @@ deepseek_v4_tilelang_dyn_bsz_test_cases = [
     ),
     pytest.param(
         "dummy_deepseek_v4_dense_packed_text_dataset",
-        ["--train.gradient_checkpointing.enable=False"],
+        ["--model.accelerator.gradient_checkpointing.enable=False"],
         id="packed-4x512-no-gc",
     ),
 ]
@@ -590,6 +601,55 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not _ACCELERATOR.is_available() or _ACCELERATOR.device_count() < 2,
+    reason="Qwen4-Exp VLM SFT pipeline smoke requires two CUDA or NPU devices",
+)
+def test_qwen4_exp_training_smoke(tmp_path):
+    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=1."""
+    model_path = tmp_path / "model"
+    output_dir = tmp_path / "output"
+    _materialize_weights_dir(_QWEN4_EXP_CONFIG, str(model_path), save_original_format=False)
+
+    dummy_dataset = DummyDataset(
+        num_samples=8,
+        seq_len=64,
+        dataset_type="qwen4exp",
+        cache_name=f"qwen4_exp_pipeline_{tmp_path.name}",
+    )
+    try:
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_vlm_test.py",
+            config_path=_QWEN4_EXP_CONFIG,
+            model_path=str(model_path),
+            train_path=dummy_dataset.save_path,
+            output_dir=str(output_dir),
+            parallel_config=ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2"),
+            nproc=2,
+            extra_args=[
+                *_QWEN4_EXP_TRAINING_ARGS,
+                "--data.max_seq_len=64",
+                "--data.dataloader.num_workers=0",
+                "--train.global_batch_size=4",
+                "--model.accelerator.gradient_checkpointing.enable=false",
+                "--model.optimizer.lr=0.01",
+            ],
+            model_name="qwen4_exp",
+        )
+        env = dict(os.environ)
+        if IS_NPU_AVAILABLE:
+            env.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
+            env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        subprocess.run(cmd, check=True, env=env)
+
+        with open(output_dir / "log_dict.json") as f:
+            result = json.load(f)
+        assert result
+        assert all(values and torch.isfinite(torch.tensor(values)).all() for values in result.values())
+    finally:
+        dummy_dataset.clean_cache()
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
 def test_qwen2omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
@@ -636,9 +696,9 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 

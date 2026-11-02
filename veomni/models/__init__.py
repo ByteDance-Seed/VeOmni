@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from ..utils.import_utils import is_diffusers_available
-from . import seed_omni, transformers
+from . import transformers
 from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import (
     init_empty_weights,
@@ -37,7 +37,6 @@ __all__ = [
     "save_model_weights",
     "transformers",
     "diffusers",
-    "seed_omni",
 ]
 
 if is_diffusers_available():

@@ -118,3 +118,5 @@ Key checkpoint configuration parameters:
 - `save_steps`: Number of steps between checkpoint saves
 - `save_epochs`: Number of epochs between checkpoint saves
 - `save_hf_weights`: Whether to save Hugging Face model weights in addition to the VeOmni checkpoint format (only in the last checkpoint directory)
+
+On-disk files under `output_dir`: [Checkpoint layout](../usage/checkpoint.md).

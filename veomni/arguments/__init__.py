@@ -15,8 +15,8 @@
 
 from .arguments_types import (
     AcceleratorConfig,
+    BaseModelArguments,
     CheckpointConfig,
-    ChunkMBSConfig,
     DataArguments,
     DataloaderConfig,
     FSDPConfig,

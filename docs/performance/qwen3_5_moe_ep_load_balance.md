@@ -1,133 +1,135 @@
-# Qwen3.5-MoE EP load-balance evidence report
+# Qwen3.5-MoE EP validation
 
-Status: local structural validation plus four-device Ascend A3 functional, precision, steady-state, memory, and profiler evidence
+Updated: 2026-11-02.
 
-Date: 2026-08-22 (Asia/Shanghai)
+GPU paired measurements show no degradation in observed mean throughput, with
+real load balancing and exactly matching loss/gradient-norm curves. Native NPU
+execution also preserves precision and redistributes work, but its measured
+whole-step throughput regresses. The NPU performance requirement remains open.
+The memory path keeps allocated memory close to OFF and below Legacy.
 
-Base revision: `a8a6e5418e435e006e873afce0c8cff31fe350ce`
+## Scope and provenance
 
-## What this report establishes
+The benchmark uses native routing, BF16, standard AdamW, seed 0, sequence length
+2048, global batch 8, hidden size 2048, intermediate size 512, 256 experts and
+top-k 8. Activation checkpointing and profiling are disabled for the timing
+comparisons. These are reduced-depth prefixes, not full 40-layer results.
 
-Local validation establishes deterministic planning/executor/monitor behavior on CPU and real two-rank gloo collectives, plus the standalone artifact reporter's parsing and arithmetic. A separate four-device Ascend A3 run establishes the fused-NPU path for the synthetic Qwen3.5-MoE workload described below. CUDA/NCCL and production-scale behavior remain untested.
+| Cohort | Hardware / topology | Training | Evidence revision |
+| --- | --- | --- | --- |
+| GP04 | Four H20-3e, L8/EP4, accumulation 2 | Five paired groups, three modes, 100 steps each; discard 20 warm-up | Patch `b861bc31…` |
+| GP06 | Same GPU configuration | Same 15-run protocol | CUDA optimization patch `59c4040b…` |
+| Current NPU | Eight Ascend 910B3, L24/EP8, accumulation 1 | OFF/Memory, 20 steps each; discard 5 warm-up | Native-precision patch `8bcc3ee5…` |
 
-The four-device synthetic E2E is present in both accelerator workflows, but this Mac skips it before dataset/checkpoint materialization. Dedicated GPU/NPU workflow steps select only the exact real-hardware test node and enable strict proof mode, in which any device, backend, or package prerequisite failure fails the test instead of skipping it. Static/backend and local-policy tests run without that workflow-scoped environment. The A3 evidence is a forced-hotspot toy workload, not a production-scale claim.
+The patch identifiers and software versions are in [the numerical evidence](data/ep_validation.json).
+The publication preserves the tested production-file contents; the accompanying
+test and offline-reporter corrections account for activation-checkpoint
+recomputation in CI and reject nonfinite values in plain logs.
+The combined production snapshot has also passed 34 real CUDA kernel/stream
+tests. No new 100-step GPU experiment is claimed for the combined snapshot.
+Historical GPU timing rows retain their own source identities.
 
-## Local environment
+The tested upstream base is `86c5ec1dbba8270206b1ab7f439285215ae4ec92`.
+Integration with newer upstream `main` has unresolved merge conflicts, so the
+PR remains a draft. This publication retains the tested production tree;
+the hardware evidence does not validate future conflict resolutions.
 
-- Host: macOS 26.5 arm64.
-- Interpreter: Python 3.12.2 from `.venv/bin/python`.
-- Packages recorded by the Task 6 baseline: PyTorch 2.13.0, Transformers 5.9.0; `torch_npu` unavailable.
-- Accelerators: CUDA unavailable; no Ascend NPU. MPS is outside the distributed evidence scope.
-- Distributed local evidence: CPU plus spawned two-rank gloo only.
+Each window includes the complete training step and uses the maximum elapsed
+window across ranks. Global tokens are counted once. Profiling and isolated
+kernel timings are excluded. Different platforms have different layer counts
+and accumulation; their absolute times must not be compared as a hardware ranking.
 
-## Exact local test ledger
+## Whole-step throughput and memory
 
-| Validation set | Result | What it proves |
-| --- | ---: | --- |
-| Comparison reporter (`tests/scripts/test_compare_moe_ep_load_balance.py`) | 75 passed | Canonical/flat/JSONL/plain parsing; strict schema/curve/metadata validation; precision/correlation; optional timing/throughput/P2P/memory semantics; deterministic JSON/Markdown including warmup timing and P2P aggregates; CLI exit codes |
-| Accelerator workflow/backend/gate contracts | 16 passed | Both dedicated workflows require strict hardware proof; local skip and strict-failure policies; NPU exact Ascend-index install, project-venv child PATH/order/no-resync contracts, `npu` GDN command and `triton-ascend` import gate; CUDA ROCm, per-device SM70, and Liger gates; mocked hardware boundary only |
-| Accelerator E2E execution on this host | 1 skipped | Honest pre-materialization gate only; no model, precision, performance, or memory evidence |
-| Tasks 1-6 combined CPU/gloo regression rerun after the final support-boundary fix | 113 passed, 3 skipped | Config and enabled-only topology/offload/resume rejection, planner, temporary transfer/autograd, CUDA/NPU dispatch seams, monitor formulas, and real gloo collective structure; accelerator-gated cases remain skips |
-| Real two-device Ascend NPU alias/gradient test | 2 ranks passed | Fused-NPU alias forward/backward, routing-weight preservation, finite gate/down gradients, owner-gradient equality, and zero non-owner gradients |
-| Real four-device Ascend NPU matched E2E | 1 passed in 103.87 s | Baseline and enabled two-step loss/gradient equality, real replica participation, positive moved-token telemetry, and strict EP-rank load improvement |
+| Cohort / mode | Mean seconds/step | Tokens/s | Throughput vs OFF | Peak allocated GiB |
+| --- | ---: | ---: | ---: | ---: |
+| GP04 OFF | 5.322727 | 3078.12 | baseline | 39.415 |
+| GP04 Legacy | 5.302935 | 3089.61 | +0.373% | 42.310 |
+| GP04 Memory | 5.309289 | 3085.91 | **+0.253%** | 39.368 |
+| GP06 OFF | 5.693585 | 2877.62 | baseline | 39.415 |
+| GP06 Legacy | 5.330590 | 3073.58 | +6.810% | 42.310 |
+| GP06 Memory | 5.347487 | 3063.87 | **+6.472%** | 39.368 |
+| Current NPU OFF | 5.961189 | 2748.44 | baseline | 50.623 |
+| Current NPU Memory | 7.260221 | 2256.68 | **−17.892%** | 50.283 |
 
-The final Task 7 combined rerun is recorded in the task implementation report. Counts above are never converted into accelerator claims.
+The GPU claim is about observed means, not a statistical non-inferiority proof.
+GP04's paired 95% step-reduction interval is [−0.641%, +1.137%]. GP06's pooled
++6.472% throughput is strongly influenced by one slow OFF run; its paired
+throughput-gain median is only +0.116%, and the paired step-reduction interval
+is [−9.978%, +18.679%]. All five groups are retained. A repeatable 5% gain has
+not been established. Non-degradation is the required criterion; 5% is an
+optimization goal, not a new acceptance threshold.
 
-## Evidence matrix
+![Whole-step comparisons](assets/ep_throughput.png)
 
-| Hardware/backend | Functional structure | Precision | Performance | Accelerator memory | Host memory | Status / note |
-| --- | --- | --- | --- | --- | --- | --- |
-| Apple CPU / gloo | pass | reporter arithmetic pass; no real Qwen3.5 training curve | untested | not applicable | untested | Structural/unit evidence only |
-| CUDA / NCCL, fused Triton | untested | untested | untested | untested | untested | Requires the self-hosted four-device E2E and a separate matched steady run |
-| Ascend A3 / HCCL, fused NPU | pass on toy EP=2/FSDP2 | 10/10 loss and gradient points exactly equal | 10-step matched run: +0.997% steady tokens/s after 2 warmup steps | +113,223,680 bytes peak allocated | untested | Synthetic forced-hotspot evidence on torch/torch_npu 2.9.0; not production scale |
+The NPU figures are one short matched pair, not repeated formal performance
+acceptance. A preceding four-mode qualification on the same production patch
+also failed the performance gate: OFF 6.634920 / 6.211011, Memory 8.145908 and
+Legacy 6.646638 seconds/step. Its allocated peaks were 50.624–50.626, 50.283 and
+54.772 GiB respectively. Separate cohorts are not used as a source-code A/B
+speedup calculation. Memory reduces the Legacy allocation overhead without
+establishing a speed benefit.
 
-Enabled-mode fail-fast exclusions: HSDP, `ep_outside`, FSDP CPU offload, activation offload, checkpoint resume, LoRA/PEFT, eager MoE, and Quack MoE. Untested topology/features beyond that fail-fast surface: multi-node and SP values other than the synthetic E2E's SP=1. The existing production Ascend recipe topology is not evidence for these cells.
+## Precision and actual balancing
 
-## Precision acceptance
+All 100-step GPU loss/gradient-norm curves match OFF exactly across all ranks.
+The current NPU 20-step curves also match exactly. The acceptance envelope
+remains `abs(error) <= 1e-4 + 1e-3 * abs(reference)`; it was not relaxed.
+Current native EP2 validation covers a small case and the full H/I/E/top-k
+dimensions with three seeds, including partial migration and owner operand
+checks. It compares outputs, input/router gradients and both expert-weight
+gradients against native OFF.
 
-For every loss and gradient-norm point, the reporter applies the repository envelope
+Both GPU ON modes perform real moves on every measured step. The NPU plan
+capture contains 480 improved plans across 24 layers and 20 steps, 3,549
+replicas and 13,181,991 moved expert-token items. The mean per-plan imbalance
+falls from **0.393764 to 0.038123**, using
+`mean(abs(rank_load / mean(rank_load) - 1))`. The plan capture is diagnostic;
+its timing is excluded from throughput evidence. Every EP-global plan is
+counted once, not once per sibling rank.
 
-```text
-abs(candidate - baseline) <= atol + rtol * abs(baseline)
-```
+![Native NPU rank-load redistribution](assets/ep_rank_balance.png)
 
-and requires a 100% hit rate for both curves. It also reports maximum absolute error, epsilon-safe relative error, threshold-relative hit rate, and standard Pearson correlation. Fewer than two points or zero variance produce `null` correlation with a reason instead of a fabricated `1.0`.
+On NPU, the plan balances forward and input-gradient execution. Native weight
+gradients are reconstructed on original owners to preserve the OFF reduction
+order; the load plot is not proof that every backward operation is balanced.
+NPU returns replica X/dY operands, rather than adding independently rounded
+partial weight gradients. This preserves precision but adds communication,
+reconstruction and ordering costs. Their critical-path contributions remain
+under investigation.
 
-The accelerator E2E uses `rtol=atol=0.1`, exactly two steps, one seed-0 checkpoint, one dataset/order, and one forced `[0, 1]` hotspot for both baseline and enabled runs. It additionally requires positive active-replica and moved-token telemetry, `after <= before` imbalance at every recorded point, and at least one strict improvement. Because this is a forced two-step run with `CUDA_LAUNCH_BLOCKING=1`, it is not a performance experiment.
+## Reproduction and evidence
 
-## Performance and memory reporting contract
+The [training guide](../examples/qwen3_5.md#qwen35-moe-ep-load-balance-experiments)
+contains opt-in and matched OFF/ON command templates. For reproduction, freeze
+the same model/data tensors, seed, optimizer, dimensions, topology, checkpointing,
+operator choices and software versions. Predeclare run order and warm-up; retain
+all windows, full scalar curves, resolved configuration and clean exit receipts.
+Require positive moves/replicas and strict load-profile improvement on ON runs.
 
-Performance is available only from explicit matched fields:
+- [Per-run timings and memory](data/ep_timing.csv), including all GP04/GP06 groups.
+- [Per-rank loss and gradient-norm curves](data/ep_curves.csv).
+- [NPU per-step/layer/rank loads](data/ep_rank_load.csv).
+- [Version, scope and aggregate evidence](data/ep_validation.json).
+- [Figure generator](plot_ep_validation.py); requires Matplotlib and reads only
+  the adjacent numerical CSV files.
 
-- `step_time_s` for warmup and steady mean time;
-- `step_tokens` with `step_time_s` for aggregate `sum(tokens) / sum(time)`;
-- `tokens_per_second` for explicit steady throughput;
-- `p2p_bytes` for warmup/steady per-step communication volume, steady total/mean, candidate-minus-baseline deltas, and candidate/baseline ratios;
-- `p2p_wait_time_s` for warmup/steady mean wait time, candidate-minus-baseline steady delta, and baseline/candidate speedup;
-- `peak_accelerator_memory_bytes`; and
-- `peak_host_memory_bytes`.
+The checked-in evidence deliberately contains numeric results and version
+identifiers, without machine addresses, credentials, user-specific paths or raw
+debug logs. Kernel/stream tests and CPU tests are distinct from hardware training
+evidence. The CI E2E's forced hotspot/two-step fixture is functional evidence,
+not a performance benchmark. Physical telemetry includes recomputation forwards
+when activation checkpointing is enabled.
 
-Every present per-step performance/P2P curve must align with its run's loss and gradient-norm step count. P2P curves come from profiler trace post-processing or explicit runtime export; the reporter itself neither instruments training nor infers communication. The reporter emits candidate-minus-baseline deltas and directionally defined ratios/speedups. Missing data on either or both sides yields `status: unavailable`, `null` numbers, and a side-specific reason. It never substitutes zero or samples system-wide used CPU memory.
+## Remaining work and rollback
 
-## Ascend A3 matched result
+NPU non-degradation and repeatable GPU gains still require work. Additional
+topologies, full-depth training, multi-node execution and production datasets
+remain outside this evidence. No cross-platform bitwise claim follows from
+different-depth GPU/NPU runs. A process allocator experiment that slowed both
+OFF and ON was rejected; it is not part of the implementation or recommended
+configuration.
 
-The remote host exposed 16 `Ascend910_9382` devices; four idle devices were isolated for this run. The exact software stack was CANN 9.0.0, PyTorch 2.9.0, `torch_npu` 2.9.0, Transformers 5.9.0, and `triton-ascend` 3.2.1. This differs from the repository's torch/torch_npu 2.10 CI target and is therefore recorded as a separate compatibility point.
-
-Both runs used the same seed-0 checkpoint and 80-sample order, bf16 FSDP2, world size 4, EP=2, SP=1, global batch 8, micro batch 1, sequence length 2048, four MoE layers, 16 experts, top-k 2, and the same forced `[0, 1]` hotspot. Profiling and checkpoint saves were disabled. Two warmup steps were excluded from the eight-step steady window.
-
-| Metric | Disabled | Enabled | Delta / result |
-| --- | ---: | ---: | ---: |
-| Max absolute loss error (10 points) | — | — | 0 |
-| Max absolute grad-norm error (10 points) | — | — | 0 |
-| Steady tokens/s | 22,835.054 | 23,062.686 | +0.997% |
-| Steady derived step time | 0.717560 s | 0.710590 s | -0.006970 s |
-| Peak allocated accelerator memory | 18,950,668,288 bytes | 19,063,891,968 bytes | +113,223,680 bytes |
-| EP-rank imbalance, before | unavailable | 1.0 at every step | — |
-| EP-rank imbalance, after | unavailable | 0.0 at every step | strict improvement |
-| Moved expert-token fraction | 0 | 0.5 at every step | replicas active |
-
-A separate all-rank one-step Ascend profiler capture showed no `HcclSend`/`HcclRecv` events in the disabled run. The enabled trace contained the expected bf16 expert-row transfers with shapes `1024x2048` and `2048x512`, totaling 201,326,592 bytes (192 MiB) of unique send volume across four ranks for the captured optimizer step, including forward parameter transfer and backward gradient return. Mean per-rank `AscendCL` SEND+RECV device-event duration was 2.621 ms. This is communication-path evidence, not a step-aligned `p2p_wait_time_s` measurement: the reporter correctly leaves both P2P curves unavailable because only one separately profiled step was captured and HCCL work-handle wait time was not exported explicitly. Process-scoped host peak memory was also not captured.
-
-## Reproduction
-
-Reporter unit tests:
-
-```shell
-.venv/bin/python -m pytest -q \
-  tests/scripts/test_compare_moe_ep_load_balance.py --tb=short
-```
-
-Honest local E2E gate:
-
-```shell
-.venv/bin/python -m pytest -q \
-  tests/e2e/test_qwen3_5_moe_ep_load_balance.py --tb=short
-```
-
-Artifact comparison:
-
-```shell
-python scripts/profile/compare_moe_ep_load_balance.py \
-  --baseline baseline.json \
-  --candidate candidate.json \
-  --warmup-steps 20 \
-  --rtol 0.1 \
-  --atol 0.1 \
-  --relative-error-threshold 0.1 \
-  --epsilon 1e-12 \
-  --json-out comparison.json \
-  --markdown-out comparison.md
-```
-
-Matched functional, steady-state performance, and all-rank profiler command templates are in the [Qwen3.5 training guide](../examples/qwen3_5.md#qwen35-moe-ep-load-balance-experiments). The functional and performance templates explicitly disable the recipe's profiler; the diagnosis template explicitly enables it on all ranks and excludes those traces from throughput evidence.
-
-## Next required experiments
-
-1. Run the isolated E2E on the declared CUDA self-hosted image and record the exact GPU model, driver/CUDA, PyTorch, Triton/FLA, NCCL, resolved arguments, exit status, and JSON envelope.
-2. Repeat the Ascend run on the repository's declared torch/torch_npu 2.10 image and on a production-sized Qwen3.5-MoE checkpoint.
-3. Extend the matched accelerator run to 100 or more steps and multiple seeds, retaining the predeclared warmup and explicit tokens/timing fields.
-4. Add explicit runtime export for step-aligned `p2p_bytes` and `p2p_wait_time_s`; keep profiler wall-clock timings out of the steady throughput comparison.
-
-## Rollback
-
-Set `train.moe_ep_load_balance.enabled=false`, `max_replicas_per_rank=1`, and `moe_load_balance_monitor_interval=0`. This returns runtime behavior to the original fused EP dispatch without changing checkpoint or optimizer state. Code rollback must remove only scoped EP-balance changes and preserve unrelated worktree changes; any NPU modeling rollback is made in the patch spec and propagated with the repository's joint patchgen command rather than by hand-editing generated files.
+Disable only `train.moe_ep_load_balance.optimize_memory` to return to Legacy.
+Disable `train.moe_ep_load_balance.enabled` and set monitoring interval to zero
+to return to OFF. Parameters, optimizer state and checkpoint keys are unchanged.

@@ -27,9 +27,6 @@ class TestTextTrainer(TextTrainer):
         super().__init__(args)
         self.base.logdictsave_callback = LogDictSaveCallback(self.base)
 
-    def _build_model_assets(self):
-        self.base.model_assets = []
-
     def _build_data_transform(self):
         self.base.data_transform = process_dummy_example
 

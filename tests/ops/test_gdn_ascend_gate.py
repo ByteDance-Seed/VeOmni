@@ -57,17 +57,18 @@ def test_opslot_npu_backend_on_gpu_raises(op_name):
 
 
 # ---------------------------------------------------------------------------
-# fla (GPU) backend requested on an NPU host → device_type='gpu' gate fails
+# fla backend requested on an NPU host binds successfully
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("op_name", _GDN_OPS)
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", True)
-def test_opslot_fla_backend_on_npu_raises(op_name):
+@patch(f"{_REGISTRY_MODULE}.IS_MLU_AVAILABLE", False)
+def test_opslot_fla_backend_on_npu_binds(op_name):
     slot = OpSlot(op_name, "standard")
-    with pytest.raises(RuntimeError, match="device_type='gpu'"):
-        slot.bind("fla")
+    slot.bind("fla")
+    assert slot.use_non_eager_impl
 
 
 # ---------------------------------------------------------------------------

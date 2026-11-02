@@ -103,6 +103,7 @@ def test_gpt_oss_moe_unbound_slot_does_not_fallback_to_eager(monkeypatch):
 
 def test_gpt_oss_rejects_triton_moe_backend(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
 
     with pytest.raises(KeyError, match="Unknown kernel 'triton'.*variant='gpt_oss'"):
         build_foundation_model(
@@ -120,6 +121,7 @@ def test_gpt_oss_fused_quack_without_sm90_raises(monkeypatch):
     monkeypatch.setattr(kernel_registry, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(kernel_registry, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(kernel_registry, "get_gpu_compute_capability", lambda: 80)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="compute_capability>=90"):
         build_foundation_model(

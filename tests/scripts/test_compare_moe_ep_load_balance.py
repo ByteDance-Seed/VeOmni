@@ -519,6 +519,22 @@ def test_plain_log_accepts_repository_total_loss_name(tmp_path):
     assert run["metrics"]["grad_norm"] == [2.5, 2.0]
 
 
+@pytest.mark.parametrize("value", ["nan", "-NaN", "+inf", "-INF", "Infinity", "-infinity"])
+@pytest.mark.parametrize("metric", ["loss", "grad_norm", "both"])
+def test_plain_log_rejects_nonfinite_steps_after_finite_steps(tmp_path, value, metric):
+    reporter = _load_reporter()
+    path = tmp_path / "nonfinite.log"
+    loss = value if metric in {"loss", "both"} else "0.5"
+    grad_norm = value if metric in {"grad_norm", "both"} else "2.0"
+    path.write_text(
+        f"step=1 loss=1.0 grad_norm=3.0\nstep=2 loss=0.8 grad_norm=2.5\nstep=3 loss={loss} grad_norm={grad_norm}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        reporter.load_run(path)
+
+
 def _run_cli(tmp_path: Path, baseline_payload, candidate_payload, stem: str):
     baseline = _write_json(tmp_path / f"{stem}-baseline.json", baseline_payload)
     candidate = _write_json(tmp_path / f"{stem}-candidate.json", candidate_payload)

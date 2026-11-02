@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import heapq
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 from ..parallel_state import get_parallel_state
+from .ep_buffer import ReplicaBufferLease, ReplicaBufferPool
 
 
 __all__ = [
@@ -124,11 +126,15 @@ class ExpertReplicaTransfer:
         replica_weight: torch.Tensor,
         work_handles: tuple[dist.Work, ...],
         communication_tensors: tuple[torch.Tensor, ...],
+        *,
+        lease: ReplicaBufferLease | None = None,
     ) -> None:
         self._replica_weight = replica_weight
         self._work_handles = work_handles
         self._communication_tensors = communication_tensors
         self._completed = False
+        self._lease = lease
+        self._failed = False
 
     @classmethod
     def start(
@@ -136,10 +142,14 @@ class ExpertReplicaTransfer:
         local_weight: torch.Tensor,
         plan: EPBalancePlan,
         ep_group: dist.ProcessGroup,
+        *,
+        pool: ReplicaBufferPool | None = None,
     ) -> "ExpertReplicaTransfer":
         """Launch all plan-required weight sends and receives without waiting."""
         ep_rank = _validate_executor_plan(local_weight, plan, ep_group)
-        replica_weight = local_weight.new_zeros((plan.max_replicas_per_rank, *local_weight.shape[1:]))
+        shape = (plan.max_replicas_per_rank, *local_weight.shape[1:])
+        lease = pool.acquire(local_weight, shape) if pool is not None else None
+        replica_weight = lease.tensor if lease is not None else local_weight.new_zeros(shape)
         work_handles: list[dist.Work] = []
         communication_tensors: list[torch.Tensor] = []
 
@@ -157,15 +167,30 @@ class ExpertReplicaTransfer:
                 communication_tensors.append(recv_tensor)
                 work_handles.append(work)
 
-        return cls(replica_weight, tuple(work_handles), tuple(communication_tensors))
+        return cls(replica_weight, tuple(work_handles), tuple(communication_tensors), lease=lease)
 
     def wait(self) -> torch.Tensor:
         """Wait for every P2P operation and return all fixed replica slots."""
+        if self._failed:
+            raise RuntimeError("Cannot wait on a failed replica transfer.")
         if not self._completed:
-            for work in self._work_handles:
-                work.wait()
+            try:
+                for work in self._work_handles:
+                    work.wait()
+                if self._lease is not None:
+                    self._lease.record_use()
+            except Exception:
+                self._failed = True
+                raise
             self._completed = True
         return self._replica_weight
+
+    def record_stream_use(self) -> None:
+        """Record a compute consumer after submission; retain this transfer with its graph."""
+        if not self._completed:
+            raise RuntimeError("Call wait before recording replica compute use.")
+        if self._lease is not None:
+            self._lease.record_use()
 
 
 def _validate_replica_weight(
@@ -205,39 +230,49 @@ class _CatLocalAndReplicaWeights(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
-        plan = ctx.plan
-        ep_group = ctx.ep_group
-        ep_rank = dist.get_rank(group=ep_group)
-        local_grad = grad_output[: plan.num_local_experts].clone()
-        work_handles: list[dist.Work] = []
-        communication_tensors: list[torch.Tensor] = []
-        received_gradients: list[tuple[int, torch.Tensor]] = []
+        return _merge_replica_weight_gradients(grad_output, ctx.plan, ctx.ep_group), None, None, None
 
-        for replica in plan.replicas:
-            if ep_rank == replica.target_rank:
-                send_tensor = grad_output[plan.num_local_experts + replica.target_slot].contiguous()
-                owner_global_rank = dist.get_global_rank(ep_group, replica.source_rank)
-                work = dist.isend(send_tensor, dst=owner_global_rank, group=ep_group)
-                communication_tensors.append(send_tensor)
-                work_handles.append(work)
-            elif ep_rank == replica.source_rank:
-                # Transposed expert GEMMs can return non-contiguous gradients.
-                # P2P payloads must use the same dense layout as the sender.
-                recv_tensor = torch.empty_like(
-                    local_grad[replica.source_local_expert], memory_format=torch.contiguous_format
-                )
-                target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
-                work = dist.irecv(recv_tensor, src=target_global_rank, group=ep_group)
-                communication_tensors.append(recv_tensor)
-                received_gradients.append((replica.source_local_expert, recv_tensor))
-                work_handles.append(work)
 
-        for work in work_handles:
-            work.wait()
-        for source_local_expert, received_gradient in received_gradients:
-            local_grad[source_local_expert].add_(received_gradient)
+def _merge_replica_weight_gradients(
+    grad_output: torch.Tensor, plan: EPBalancePlan, ep_group: dist.ProcessGroup
+) -> torch.Tensor:
+    return _merge_replica_weight_gradient_parts(
+        grad_output[: plan.num_local_experts], grad_output[plan.num_local_experts :], plan, ep_group
+    )
 
-        return local_grad, None, None, None
+
+def _merge_replica_weight_gradient_parts(
+    local_grad: torch.Tensor,
+    replica_grad: torch.Tensor,
+    plan: EPBalancePlan,
+    ep_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Return replica contributions in the existing order, without mutating borrowed gradients."""
+    ep_rank = dist.get_rank(group=ep_group)
+    local_grad = local_grad.clone()
+    work_handles: list[dist.Work] = []
+    communication_tensors: list[torch.Tensor] = []
+    received_gradients: list[tuple[int, torch.Tensor]] = []
+    for replica in plan.replicas:
+        if ep_rank == replica.target_rank:
+            send_tensor = replica_grad[replica.target_slot].contiguous()
+            owner_global_rank = dist.get_global_rank(ep_group, replica.source_rank)
+            work_handles.append(dist.isend(send_tensor, dst=owner_global_rank, group=ep_group))
+            communication_tensors.append(send_tensor)
+        elif ep_rank == replica.source_rank:
+            # Sender and receiver must agree on contiguous logical row layout.
+            recv_tensor = torch.empty_like(
+                local_grad[replica.source_local_expert], memory_format=torch.contiguous_format
+            )
+            target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
+            work_handles.append(dist.irecv(recv_tensor, src=target_global_rank, group=ep_group))
+            communication_tensors.append(recv_tensor)
+            received_gradients.append((replica.source_local_expert, recv_tensor))
+    for work in work_handles:
+        work.wait()
+    for source_local_expert, received_gradient in received_gradients:
+        local_grad[source_local_expert].add_(received_gradient)
+    return local_grad
 
 
 def cat_local_and_replica_weights(
@@ -372,43 +407,64 @@ def _plan_replicas(
     replica_states: list[_ReplicaState] = []
     replica_indices_by_expert: list[list[int]] = [[] for _ in range(num_experts)]
     used_slots: list[set[int]] = [set() for _ in range(ep_size)]
+    owners = [expert // num_local_experts for expert in range(num_experts)]
+    owner_tokens = expert_totals.copy()
+    excluded_targets = [1 << owner for owner in owners]
+    available_targets = (1 << ep_size) - 1
+    expert_order = [
+        sorted(
+            range(owner * num_local_experts, (owner + 1) * num_local_experts),
+            key=lambda expert: (-owner_tokens[expert], expert),
+        )
+        for owner in range(ep_size)
+    ]
+
+    def candidate_keys(owner, minimum_target_load):
+        if not available_targets & ~(1 << owner):
+            return
+        for expert in expert_order[owner]:
+            if owner_tokens[expert] <= 0:
+                break
+            if not available_targets & ~excluded_targets[expert]:
+                continue
+            # Before an expert has replicas, a first move needs a load gap of
+            # at least two. Using the lightest available rank is sufficient
+            # for rejecting impossible candidates before building heap entries.
+            if not replica_indices_by_expert[expert] and rank_loads[owner] <= minimum_target_load + 1:
+                continue
+            yield (-rank_loads[owner], -owner_tokens[expert], owner, expert)
 
     while True:
-        candidate_experts = []
-        for expert in range(num_experts):
-            owner = expert // num_local_experts
-            owner_tokens = expert_allocations[expert].get(owner, 0)
-            existing_targets = {replica_states[index].target_rank for index in replica_indices_by_expert[expert]}
-            has_target = any(
-                rank != owner and rank not in existing_targets and len(used_slots[rank]) < max_replicas_per_rank
-                for rank in range(ep_size)
-            )
-            if owner_tokens > 0 and has_target:
-                candidate_experts.append(expert)
-
-        candidate_experts.sort(
-            key=lambda expert: (
-                -rank_loads[expert // num_local_experts],
-                -expert_allocations[expert].get(expert // num_local_experts, 0),
-                expert // num_local_experts,
-                expert,
-            )
+        # Integer loads that differ by at most one already attain the minimum
+        # descending-sorted profile for this fixed token total. No replica can
+        # strictly improve the objective, so avoid searching equivalent moves.
+        if not available_targets or max(rank_loads) - min(rank_loads) <= 1:
+            break
+        target_order = sorted(
+            (rank for rank in range(ep_size) if available_targets & (1 << rank)),
+            key=lambda rank: (rank_loads[rank], rank),
         )
+        minimum_target_load = rank_loads[target_order[0]]
+        # Each owner list is sorted by the remaining complete priority key;
+        # rank load is constant within that list for this decision. A lazy
+        # merge preserves the original global order without materializing
+        # every expert's tuple after every accepted move.
+        candidate_experts = heapq.merge(*(candidate_keys(owner, minimum_target_load) for owner in range(ep_size)))
 
         accepted = None
         current_profile = _rank_load_profile(rank_loads)
-        for expert in candidate_experts:
-            owner = expert // num_local_experts
+        for _, _, owner, expert in candidate_experts:
             existing_indices = replica_indices_by_expert[expert]
-            existing_targets = {replica_states[index].target_rank for index in existing_indices}
-            target_candidates = [
-                rank
-                for rank in range(ep_size)
-                if rank != owner and rank not in existing_targets and len(used_slots[rank]) < max_replicas_per_rank
-            ]
-            target_candidates.sort(key=lambda rank: (rank_loads[rank], rank))
+            target_candidates = [rank for rank in target_order if not excluded_targets[expert] & (1 << rank)]
 
             for target in target_candidates:
+                # A first replica only transfers integer tokens between two
+                # ranks. If their load gap is at most one, a positive transfer
+                # can only tie (swap the loads) or worsen the sorted profile.
+                # Later targets are no lighter. Existing replicas may instead
+                # redistribute among several ranks and must not be pruned.
+                if not existing_indices and rank_loads[owner] - rank_loads[target] <= 1:
+                    break
                 locations = [owner, *(replica_states[index].target_rank for index in existing_indices), target]
                 base_loads = {rank: rank_loads[rank] - expert_allocations[expert].get(rank, 0) for rank in locations}
                 allocations = _waterfill_allocations(expert_totals[expert], base_loads)
@@ -437,6 +493,13 @@ def _plan_replicas(
         expert, owner, target, existing_indices, allocations, rank_loads = accepted
         target_slot = next(slot for slot in range(max_replicas_per_rank) if slot not in used_slots[target])
         used_slots[target].add(target_slot)
+        if len(used_slots[target]) == max_replicas_per_rank:
+            available_targets &= ~(1 << target)
+        excluded_targets[expert] |= 1 << target
+        owner_tokens[expert] = allocations.get(owner, 0)
+        # Only the chosen expert's owner allocation changed. Re-sort that
+        # owner's small list; all other local priority orders remain valid.
+        expert_order[owner].sort(key=lambda item: (-owner_tokens[item], item))
         replica_states.append(
             _ReplicaState(
                 source_expert=expert,
@@ -459,19 +522,23 @@ def _allocate_replica_rows(
     counts: torch.Tensor,
     replica_states: list[_ReplicaState],
 ) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
-    remaining_counts = counts.clone()
+    # Counts have already been validated and transferred to the host. Keep
+    # scalar bookkeeping in Python rather than dispatching one Tensor op per
+    # replica/sender cell, then materialize the result once.
+    remaining_values = counts.tolist()
     allocations_by_replica = []
     for state in replica_states:
         remaining = state.moved_tokens
         row_allocations = []
         for sender in range(counts.shape[0]):
-            moved = min(remaining, int(remaining_counts[sender, state.source_expert].item()))
-            remaining_counts[sender, state.source_expert] -= moved
+            moved = min(remaining, remaining_values[sender][state.source_expert])
+            remaining_values[sender][state.source_expert] -= moved
             row_allocations.append(moved)
             remaining -= moved
         if remaining != 0:
             raise RuntimeError("A replica requests more concrete occurrences than its source expert owns.")
         allocations_by_replica.append(tuple(row_allocations))
+    remaining_counts = torch.tensor(remaining_values, dtype=counts.dtype, device=counts.device).reshape_as(counts)
     return remaining_counts, allocations_by_replica
 
 
@@ -481,6 +548,8 @@ def _build_ep_balance_plan_from_counts(
     num_experts: int,
     ep_rank: int,
     max_replicas_per_rank: int,
+    *,
+    token_granularity: int = 1,
 ) -> EPBalancePlan:
     """Pure count-driven planning helper used by the public collective entry point."""
     ep_size, num_local_experts, counts = _validate_planner_inputs(
@@ -497,6 +566,24 @@ def _build_ep_balance_plan_from_counts(
         num_local_experts,
         max_replicas_per_rank,
     )
+
+    if type(token_granularity) is not int or token_granularity <= 0:
+        raise ValueError("token_granularity must be a positive integer.")
+    if token_granularity > 1:
+        replica_states = [
+            replace(state, moved_tokens=state.moved_tokens // token_granularity * token_granularity)
+            for state in replica_states
+            if state.moved_tokens >= token_granularity
+        ]
+        rank_loads_after = rank_loads_before.copy()
+        for state in replica_states:
+            rank_loads_after[state.source_rank] -= state.moved_tokens
+            rank_loads_after[state.target_rank] += state.moved_tokens
+        # Quantization can remove useful outgoing moves from a rank that is
+        # also a target. Never retain a rounded plan that worsens the objective.
+        if _rank_load_profile(rank_loads_after) >= _rank_load_profile(rank_loads_before):
+            replica_states = []
+            rank_loads_after = rank_loads_before.copy()
 
     if not replica_states:
         start = ep_rank * num_local_experts
@@ -557,19 +644,15 @@ def _build_ep_balance_plan_from_counts(
 
     physical_slots_per_rank = stride
     local_physical_counts = torch.zeros((ep_size, physical_slots_per_rank), dtype=torch.long)
-    for expert in range(num_experts):
-        owner = expert // num_local_experts
-        if owner == ep_rank:
-            local_physical_counts[:, expert % num_local_experts] = remaining_counts[:, expert]
+    start = ep_rank * num_local_experts
+    local_physical_counts[:, :num_local_experts] = remaining_counts[:, start : start + num_local_experts]
     for replica, row_allocations in zip(replicas, allocations_by_replica, strict=True):
         if replica.target_rank == ep_rank:
             local_physical_counts[:, num_local_experts + replica.target_slot] = torch.tensor(
                 row_allocations, dtype=torch.long
             )
 
-    input_splits = [0] * ep_size
-    for expert in range(num_experts):
-        input_splits[expert // num_local_experts] += int(remaining_counts[ep_rank, expert].item())
+    input_splits = remaining_counts[ep_rank].reshape(ep_size, num_local_experts).sum(dim=1).tolist()
     for replica, row_allocations in zip(replicas, allocations_by_replica, strict=True):
         input_splits[replica.target_rank] += row_allocations[ep_rank]
     output_splits = tuple(int(value) for value in local_physical_counts.sum(dim=1).tolist())
@@ -598,6 +681,18 @@ def _build_ep_balance_plan_from_counts(
         rank_loads_before=tuple(rank_loads_before),
         rank_loads_after=tuple(rank_loads_after),
     )
+
+
+def _gather_counts_with_kernel_metadata(local_counts, ep_group, metadata):
+    """Check configuration agreement in the existing histogram collective."""
+    local = torch.cat((local_counts, local_counts.new_tensor(metadata)))
+    gathered = local.new_empty(dist.get_world_size(ep_group) * local.numel())
+    dist.all_gather_into_tensor(gathered, local, group=ep_group)
+    gathered = gathered.reshape(-1, local.numel()).cpu()
+    configurations = gathered[:, -2:].tolist()
+    if any(config != configurations[0] for config in configurations[1:]):
+        raise ValueError("Ordered EP weight gradients require identical kernel configurations on every EP rank.")
+    return gathered[:, :-2]
 
 
 def build_ep_balance_plan(
@@ -633,25 +728,41 @@ def build_ep_balance_plan(
             "max_replicas_per_rank must be no greater than num_local_experts "
             f"({num_local_experts}), got {max_replicas_per_rank}."
         )
-    flat_selected = selected_experts.reshape(-1)
+    # The planner already needs host-side integer metadata. Transfer IDs once
+    # on accelerators so validation and each concrete replica rewrite do not introduce
+    # separate device synchronizations. Preserve the public result device.
+    host_planning = selected_experts.device.type in ("cuda", "npu")
+    planning_selected = selected_experts.cpu() if host_planning else selected_experts
+    flat_selected = planning_selected.reshape(-1)
     if flat_selected.numel() and (
         int(flat_selected.min().item()) < 0 or int(flat_selected.max().item()) >= num_experts
     ):
         raise ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
     local_counts = torch.bincount(flat_selected.to(dtype=torch.long), minlength=num_experts)
-    gathered_counts_flat = torch.empty(
-        ep_size * num_experts,
-        dtype=torch.long,
-        device=selected_experts.device,
-    )
-    dist.all_gather_into_tensor(gathered_counts_flat, local_counts, group=ep_group)
-    return _build_ep_balance_plan_from_counts(
-        selected_experts=selected_experts,
-        tokens_per_expert_by_rank=gathered_counts_flat.reshape(ep_size, num_experts),
+    if host_planning:
+        local_counts = local_counts.to(selected_experts.device)
+    granularity = 1
+    if selected_experts.is_cuda:
+        from .ep_grad import weight_grad_config_metadata
+
+        metadata = weight_grad_config_metadata()
+        granularity = metadata[0]
+        gathered_counts = _gather_counts_with_kernel_metadata(local_counts, ep_group, metadata)
+    else:
+        gathered_counts_flat = local_counts.new_empty(ep_size * num_experts)
+        dist.all_gather_into_tensor(gathered_counts_flat, local_counts, group=ep_group)
+        gathered_counts = gathered_counts_flat.reshape(ep_size, num_experts)
+    plan = _build_ep_balance_plan_from_counts(
+        selected_experts=planning_selected,
+        tokens_per_expert_by_rank=gathered_counts,
         num_experts=num_experts,
         ep_rank=ep_rank,
         max_replicas_per_rank=max_replicas_per_rank,
+        token_granularity=granularity,
     )
+    if host_planning:
+        plan = replace(plan, selected_physical_experts=plan.selected_physical_experts.to(selected_experts.device))
+    return plan
 
 
 @dataclass(frozen=True)
@@ -660,6 +771,11 @@ class _Qwen3_5MoEEPLoadBalancer:
     num_experts: int
     max_replicas_per_rank: int
     layer_index: int
+    buffer_pool: ReplicaBufferPool | None = None
+
+    @property
+    def optimize_memory(self) -> bool:
+        return self.buffer_pool is not None
 
     def build_plan(self, selected_experts: torch.Tensor) -> EPBalancePlan:
         return build_ep_balance_plan(
@@ -681,7 +797,9 @@ def _is_runtime_qwen3_5_merged_experts(module: nn.Module) -> bool:
     return getattr(gate_up_proj, "ndim", None) == 3 and getattr(down_proj, "ndim", None) == 3
 
 
-def attach_qwen3_5_moe_ep_load_balancers(model: nn.Module, max_replicas_per_rank: int) -> int:
+def attach_qwen3_5_moe_ep_load_balancers(
+    model: nn.Module, max_replicas_per_rank: int, *, optimize_memory: bool = False
+) -> int:
     """Attach a private planner controller to each compatible Qwen3.5 MoE layer."""
     parallel_state = get_parallel_state()
     ep_group = parallel_state.ep_group
@@ -729,5 +847,6 @@ def attach_qwen3_5_moe_ep_load_balancers(model: nn.Module, max_replicas_per_rank
             num_experts=num_experts,
             max_replicas_per_rank=max_replicas_per_rank,
             layer_index=layer_index,
+            buffer_pool=ReplicaBufferPool() if optimize_memory else None,
         )
     return len(expert_modules)

@@ -91,8 +91,8 @@ Qwen3.5 Dense 9B:
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --train.init_device meta \
+    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
+    --model.accelerator.init_device meta \
     --train.max_steps 20 \
     --train.checkpoint.output_dir ./exp/qwen3_5_9b_sft
 ```
@@ -104,8 +104,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-35B-A3B \
     --model.ops_implementation.moe_implementation fused_triton \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --train.init_device meta \
+    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
+    --model.accelerator.init_device meta \
     --train.global_batch_size 16 \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
@@ -230,20 +230,31 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_a
 ```
 
 The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To run without
-sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
+sequence parallelism, override `--model.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
 ## Qwen3.5-MoE EP load-balance experiments
 
-Temporary expert replicas are opt-in. The AscendC recipe declares the safe defaults explicitly (`moe_load_balance_monitor_interval: 0`, `moe_ep_load_balance.enabled: false`, and `max_replicas_per_rank: 1`) and retains its original topology. Enabled mode currently fail-fast requires FSDP2, resolved `dp_replicate_size == 1` (no HSDP), `ep_outside=false`, no FSDP CPU offload, no activation offload, no checkpoint resume, full SFT, and fused MoE. Multi-node and other topologies remain untested. Ordinary checkpoint saving and ordinary gradient checkpointing are still allowed.
+Balancing is disabled by default. Review the [design's support boundaries](../design/qwen3_5_moe_ep_load_balance.md#scope-and-configuration) before opting in.
+The [validation report](../performance/qwen3_5_moe_ep_load_balance.md) records
+GPU paired mean non-degradation and current native NPU precision/load gains.
+NPU throughput still regresses; the evidence index preserves scope and source
+boundaries rather than promising a speedup for every platform.
 
-The recipe enables profiling by default, so every functional or throughput comparison below overrides `train.profile.enable=false`. Keep the two commands in a pair identical except for feature enablement and output/run labels. Replace the model and dataset paths with immutable local revisions before collecting evidence.
+Use Bash for the arrays below. Pin immutable local model/data revisions and
+save the resolved config, environment, source hashes and raw output for each
+arm. This AscendC recipe requires its documented NPU dependencies; CUDA runs
+must use the CUDA recipe/backends. Keep paired commands identical except
+enablement and output/run labels. This template sets SP1/EP2 on eight devices,
+does not claim other topology support, and is not a published hardware result.
 
-### Functional and precision evidence
+### Shared setup and functional comparison
 
-Use the monitor for per-step physical-load evidence, keep the profiler off, and run enough steps to inspect a real loss/gradient trajectory. These commands are a reproducible experiment template, not a published accelerator result:
+The recipe enables profiling by default; override it for functional and
+throughput comparisons. Freeze the ordinary gradient-checkpointing choice in
+the shared settings.
 
-```shell
+```bash
 CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
 MODEL=${HOME}/Qwen3.5-35B-A3B
 DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
@@ -251,147 +262,164 @@ DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
 COMMON=(
   --model.model_path "$MODEL"
   --data.train_path "$DATA"
-  --train.accelerator.ulysses_size 1
-  --train.accelerator.ep_size 2
-  --train.profile.enable false
-  --train.moe_load_balance_monitor_interval 1
+  --model.accelerator.ulysses_size 1
+  --model.accelerator.ep_size 2
+  --model.accelerator.gradient_checkpointing.enable true
   --train.moe_ep_load_balance.max_replicas_per_rank 1
   --train.checkpoint.save_steps 0
   --train.checkpoint.save_epochs 0
   --train.checkpoint.save_hf_weights false
-  --train.max_steps 20
   --train.seed 0
 )
 
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled false \
-  --train.wandb.name qwen3_5_moe_ep_balance_functional_baseline \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_functional_baseline
-
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled true \
-  --train.wandb.name qwen3_5_moe_ep_balance_functional_enabled \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_functional_enabled
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_functional_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable false \
+    --train.moe_load_balance_monitor_interval 1 \
+    --train.max_steps 20 \
+    --train.wandb.name "qwen3_5_ep_functional_$MODE" \
+    --train.checkpoint.output_dir "$OUT"
+done
 ```
 
-The CI E2E uses a smaller, deterministic two-step hotspot and a versioned scalar sink. It requires four compatible CUDA or NPU devices, forces both runs to route to experts `[0, 1]`, compares finite loss and gradient-norm curves with `rtol=atol=0.1`, and checks positive replicas/moved tokens plus non-worsening physical imbalance. Its NPU path selects the three `npu` GatedDeltaNet kernels and requires the `triton` import from `triton-ascend`, without requiring `fla_npu`; its CUDA path rejects ROCm, requires SM70 or newer on all four selected devices, and checks the default Liger dependency. Dedicated GPU and NPU workflow steps select only that exact real-hardware test node and set `VEOMNI_REQUIRE_EP_BALANCE_E2E=1`, so any missing prerequisite fails those jobs without applying strict mode to the module's local-policy gate tests. Ordinary local invocation leaves that variable unset and honestly skips before dataset/checkpoint creation. Forced routing and `CUDA_LAUNCH_BLOCKING=1` make it functional/precision evidence only.
+Inspect complete finite loss/gradient trajectories and positive replica/move
+telemetry, not only the first loss or a balanced heatmap. The strict four-device
+CI E2E uses a deterministic two-step hotspot with exact count/imbalance checks;
+its forced routing and blocking launch are not throughput evidence.
 
-### Steady-state performance evidence
+### Steady-state performance comparison
 
-Disable both monitoring and profiling because their synchronization and formatting costs invalidate throughput attribution. Use sufficient warmup and steady steps; this 100-step template reserves the first 20 reporter steps as warmup:
+Reuse `CONFIG` and `COMMON` from above. Disable monitoring and profiling to
+exclude their synchronization/formatting costs, and predeclare warmup (20 of
+these 100 steps) before collecting results.
 
-```shell
-CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
-MODEL=${HOME}/Qwen3.5-35B-A3B
-DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
-
-PERF_COMMON=(
-  --model.model_path "$MODEL"
-  --data.train_path "$DATA"
-  --train.accelerator.ulysses_size 1
-  --train.accelerator.ep_size 2
-  --train.profile.enable false
-  --train.moe_load_balance_monitor_interval 0
-  --train.moe_ep_load_balance.max_replicas_per_rank 1
-  --train.checkpoint.save_steps 0
-  --train.checkpoint.save_epochs 0
-  --train.checkpoint.save_hf_weights false
-  --train.max_steps 100
-  --train.seed 0
-)
-
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PERF_COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled false \
-  --train.wandb.name qwen3_5_moe_ep_balance_perf_baseline \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_perf_baseline
-
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PERF_COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled true \
-  --train.wandb.name qwen3_5_moe_ep_balance_perf_enabled \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_perf_enabled
+```bash
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_perf_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable false \
+    --train.moe_load_balance_monitor_interval 0 \
+    --train.max_steps 100 \
+    --train.wandb.name "qwen3_5_ep_perf_$MODE" \
+    --train.checkpoint.output_dir "$OUT"
+done
 ```
 
-Performance artifacts must explicitly record `step_time_s` and either `step_tokens` or `tokens_per_second`; peak memory must come from explicit `peak_accelerator_memory_bytes` and `peak_host_memory_bytes` fields. Optional per-step `p2p_bytes` and `p2p_wait_time_s` curves may be added by profiler post-processing or runtime instrumentation, with exactly one value per loss/gradient step. The training commands and comparison reporter do not collect those P2P curves automatically. If either matched run lacks a field, the reporter marks that section unavailable. Do not substitute process/system-wide used memory, inferred communication values, or zero for a missing measurement.
+### Experimental memory candidate
+
+`--train.moe_ep_load_balance.optimize_memory true` selects the local/replica
+two-storage path and a bounded replica-buffer pool. It is default-off and
+requires balancing enabled. Matched GPU and native NPU results are in the
+validation report. Memory stays close to OFF allocation, while NPU throughput
+remains slower. NPU segmentation trades weight copies for additional
+launches/activation copies; lower memory overhead does not establish speedup.
+
+When hardware is available, first run the existing kernel/lifetime and matched
+training gates with the installed GPU or NPU environment:
+
+```bash
+pytest tests/parallel/test_moe_ep_load_balance_executor.py -q
+# CUDA: real two-storage GEMM parity (BF16/FP16, tails and empty groups).
+pytest tests/ops/test_group_gemm_two_storage.py -q
+# NPU: real two-rank alias dispatch and owner gradients, both memory settings.
+torchrun --standalone --nproc-per-node=2 -m pytest -q \
+  tests/ops/test_npu_moe_ep_load_balance.py::test_real_npu_two_rank_alias_forward_backward_and_owner_gradient
+# CUDA or NPU: EP2/EP4, legacy/optimized, optimized with checkpointing.
+VEOMNI_REQUIRE_EP_BALANCE_E2E=1 pytest -q \
+  tests/e2e/test_qwen3_5_moe_ep_load_balance.py::test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry
+```
+
+Then use the same `CONFIG`/`COMMON` and source revision for three arms:
+
+| Arm | `enabled` | `optimize_memory` |
+| --- | --- | --- |
+| OFF | false | false |
+| Legacy ON | true | false |
+| Memory ON | true | true |
+
+Keep weights/data order/seed, dtype, optimizer, batch/sequence length, topology,
+replica count and checkpointing identical. For each predeclared seed, repeat
+the arms in alternating order; collect 100 steps excluding the first 20 from
+steady-state statistics. Compare complete finite loss/gradient-norm curves,
+step-time distributions and tokens/s, allocated/reserved accelerator peaks,
+host peak, and initialization separately. Run native routing for performance;
+use forced/dynamic hotspots separately for functional stress. Capture a trace
+in a separate profiling run to confirm fewer weight copies and identify GMM,
+P2P, allocation and event costs. Report Memory ON vs Legacy ON **and** vs OFF;
+CPU pointer reuse or a balanced heatmap cannot meet the throughput criterion.
+
+The two-step E2E is a functional gate, not an acceptance-quality precision or
+performance run. CPU offload, resume, HSDP and the other existing exclusions
+remain unsupported. Roll back only this candidate with `optimize_memory=false`.
+
+Artifacts need explicit `step_time_s` and `step_tokens` or
+`tokens_per_second`; allocator/host peaks use
+`peak_accelerator_memory_bytes`/`peak_host_memory_bytes`.
+Optional `p2p_bytes` and `p2p_wait_time_s` require one value per loss/gradient
+step from trace post-processing or runtime export. Neither these commands nor
+the reporter automatically collects them. Do not infer missing P2P or memory.
 
 ### All-rank profiler diagnosis
 
-Profiler traces diagnose operator/communication behavior but are not used for throughput. Profile every rank so EP sends, receives, and all-to-all work are visible. Run the matched baseline and enabled commands separately to keep trace directories distinct:
+Reuse the same shared setup. Capture both arms separately on every rank; these
+traces diagnose execution and are excluded from the throughput comparison.
 
-```shell
-CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
-MODEL=${HOME}/Qwen3.5-35B-A3B
-DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
-
-PROFILE_COMMON=(
-  --model.model_path "$MODEL"
-  --data.train_path "$DATA"
-  --train.accelerator.ulysses_size 1
-  --train.accelerator.ep_size 2
-  --train.profile.enable true
-  --train.profile.rank0_only false
-  --train.profile.start_step 20
-  --train.profile.end_step 25
-  --train.moe_load_balance_monitor_interval 0
-  --train.moe_ep_load_balance.max_replicas_per_rank 1
-  --train.checkpoint.save_steps 0
-  --train.checkpoint.save_epochs 0
-  --train.checkpoint.save_hf_weights false
-  --train.max_steps 26
-  --train.seed 0
-)
-
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PROFILE_COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled false \
-  --train.profile.trace_dir ./exp/qwen3_5_moe_ep_balance_profile_baseline/traces \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_profile_baseline
-
-NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PROFILE_COMMON[@]}" \
-  --train.moe_ep_load_balance.enabled true \
-  --train.profile.trace_dir ./exp/qwen3_5_moe_ep_balance_profile_enabled/traces \
-  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_profile_enabled
+```bash
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_profile_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable true \
+    --train.profile.rank0_only false \
+    --train.profile.start_step 20 \
+    --train.profile.end_step 25 \
+    --train.profile.trace_dir "$OUT/traces" \
+    --train.moe_load_balance_monitor_interval 0 \
+    --train.max_steps 26 \
+    --train.checkpoint.output_dir "$OUT"
+done
 ```
 
 ### Compare saved artifacts
 
-The standard-library reporter accepts the E2E schema-version-1 envelope, existing flat `log_dict.json`, per-step JSONL, or plain training logs for loss/gradient only:
+The standard-library reporter accepts schema-version-1 envelopes, flat
+`log_dict.json`, per-step JSONL or plain loss/gradient logs:
 
-```shell
+```bash
 python scripts/profile/compare_moe_ep_load_balance.py \
   --baseline ./artifacts/baseline.json \
   --candidate ./artifacts/enabled.json \
-  --warmup-steps 20 \
-  --rtol 0.1 \
-  --atol 0.1 \
-  --relative-error-threshold 0.1 \
-  --epsilon 1e-12 \
+  --warmup-steps 20 --rtol 0.1 --atol 0.1 \
+  --relative-error-threshold 0.1 --epsilon 1e-12 \
   --json-out ./artifacts/comparison.json \
   --markdown-out ./artifacts/comparison.md
 ```
 
-Precision failure returns a nonzero status after both requested reports are written. Missing performance, P2P, or memory fields produce an explicit `unavailable` section with `null` values; they are not a comparison failure by themselves. See the [design](../design/qwen3_5_moe_ep_load_balance.md) and [evidence report](../performance/qwen3_5_moe_ep_load_balance.md) for formulas, support boundaries, and rollback.
+Precision failure returns nonzero after writing both reports. Missing optional
+performance/P2P/memory fields produce `unavailable` with `null` values, not a
+fabricated zero or a comparison failure. A precision pass is separate from a
+performance-benefit gate; choose tolerances, warmup and benefit criteria before
+the run. See the design for formulas, telemetry and rollback.
 
-## ChunkMBS
+### Qwen3.5 MoE 35B VL Muon training
 
-Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
-then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
-same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
-both cumulative-length tensors; their internal boundaries may differ.
+The Ascend VL recipe uses UP1 and EP4, `fused_npu` MoE, the AscendC GatedDeltaNet
+backend, and the pure-PyTorch `gram` Muon backend:
 
-The example config exposes the feature but keeps it disabled by default:
-
-```yaml
-train:
-  chunk_mbs_config:
-    enable: true
-    chunk_mbs: 2
+```shell
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_muon_ascendc.yaml \
+    --model.model_path ${HOME}/Qwen3.5-35B-A3B \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --train.max_steps 20
 ```
 
-`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
-ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
-Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
-[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
-The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
-FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
+`muon_expert_zero_comm: true` selects whole-expert `Shard(0)` when the
+EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
+a warning and falls back to the communication path.
 
 ## Ulysses Sequence Parallelism
 
@@ -399,9 +427,9 @@ Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention lay
 linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
 distributing the sequence across multiple GPUs.
 
-To enable Ulysses SP, set `train.accelerator.ulysses_size`. VeOmni derives the effective
+To enable Ulysses SP, set `model.accelerator.ulysses_size`. VeOmni derives the effective
 data-parallel size from the world size and the other parallel dimensions; set
-`train.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
+`model.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
 For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
 
 ```shell
@@ -409,8 +437,8 @@ For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.dp_shard_size 4 \
-    --train.accelerator.ulysses_size 2 \
+    --model.accelerator.dp_shard_size 4 \
+    --model.accelerator.ulysses_size 2 \
     --model.ops_implementation.attn_implementation flash_attention_3
 ```
 

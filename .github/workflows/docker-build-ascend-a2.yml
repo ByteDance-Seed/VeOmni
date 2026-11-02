@@ -127,20 +127,29 @@ jobs:
           QUAY_REPO="quay.io/ascend/veomni"
           if [ "${{ github.event_name }}" = "release" ]; then
             RELEASE_TAG="${{ github.event.release.tag_name }}"
-            VERSION_CORE=$(echo "$RELEASE_TAG" | sed 's/^v//g')
-            TAG_PREFIX="${BASE_IMAGE_NAME}-${VERSION_CORE}"
+            # Prefix must match what this workflow actually pushes, tag `v` and
+            # all, or the ".postN" bump below can never see its own tags.
+            TAG_PREFIX="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
             EXISTING_TAGS=$(skopeo list-tags "docker://${QUAY_REPO}" | jq -r '.Tags[]' 2>/dev/null || echo "")
-            if [ -n "$EXISTING_TAGS" ]; then
-              HAS_BASE_TAG=$(echo "$EXISTING_TAGS" | grep -c "^${TAG_PREFIX}$")
-              POST_COUNT=$(echo "$EXISTING_TAGS" | grep -c "${TAG_PREFIX}.post")
-              if [ $HAS_BASE_TAG -gt 0 ] || [ $POST_COUNT -gt 0 ]; then
-                POST_NUM=$((POST_COUNT + 1))
-                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}.post${POST_NUM}"
-              else
-                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
-              fi
+            # -F -x: the prefix is full of dots (8.3.rc2, py3.11, v0.1.12) that a
+            # basic regex would treat as wildcards. `|| true`: grep -c exits 1 on
+            # zero matches and steps run under `bash -e`, so an unmatched prefix
+            # used to kill the whole step.
+            HAS_BASE_TAG=$(printf '%s\n' "$EXISTING_TAGS" | grep -c -F -x -- "$TAG_PREFIX" || true)
+            # Highest existing .postN, not how many there are: a gap in the
+            # sequence would otherwise resolve to a tag that already exists.
+            POST_MAX=$(printf '%s\n' "$EXISTING_TAGS" | awk -v prefix="${TAG_PREFIX}.post" '
+              index($0, prefix) == 1 {
+                suffix = substr($0, length(prefix) + 1)
+                if (suffix ~ /^[0-9]+$/ && suffix + 0 > max) max = suffix + 0
+              }
+              END { print max + 0 }')
+            if [ "$POST_MAX" -gt 0 ]; then
+              FINAL_TAG="${TAG_PREFIX}.post$((POST_MAX + 1))"
+            elif [ "${HAS_BASE_TAG:-0}" -gt 0 ]; then
+              FINAL_TAG="${TAG_PREFIX}.post1"
             else
-              FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
+              FINAL_TAG="${TAG_PREFIX}"
             fi
             echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then

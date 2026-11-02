@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import importlib
 import os
 import sys
@@ -29,10 +30,6 @@ import torch.nn.functional as F
 import veomni.distributed  # noqa: F401 -- ensure parent attribute restoration is covered
 from veomni.ops.kernels import moe as moe_kernels
 from veomni.utils.device import IS_NPU_AVAILABLE
-
-
-def _unexpected_accelerator_kernel(*args, **kwargs):
-    raise AssertionError("CPU plumbing tests must not execute an accelerator kernel.")
 
 
 def _cpu_token_permute(hidden_states, selected_experts):
@@ -72,27 +69,38 @@ def _cpu_group_gemm(hidden_states, weight, group_list):
     return hidden_states.new_empty((0, weight.shape[-1]))
 
 
+def _cpu_native_weight_grad(x, weight, *, group_list, split_item, group_type, group_list_type, **kwargs):
+    assert (split_item, group_type, group_list_type) == (3, 2, 1)
+    tokens, grad = x[0].T, weight[0]
+    values = []
+    start = 0
+    for count in group_list.tolist():
+        values.append(tokens[start : start + count].T @ grad[start : start + count])
+        start += count
+    return [torch.stack(values)]
+
+
 # Import the real VeOmni NPU wrapper with only its unavailable hardware boundary
 # replaced. Planner, plan validation, replica transfer, token all-to-all, and
 # combine code remain the production implementations.
 _DISTRIBUTED_MOE_NAME = "veomni.distributed.moe"
-_MOE_LAYER_NAME = f"{_DISTRIBUTED_MOE_NAME}.moe_layer"
+_EP_DISPATCH_NAME = f"{_DISTRIBUTED_MOE_NAME}.ep_dispatch"
 _EP_LOAD_BALANCE_NAME = f"{_DISTRIBUTED_MOE_NAME}.ep_load_balance"
 _MOE_COMM_NAME = f"{_DISTRIBUTED_MOE_NAME}.comm"
 _MOE_UTILS_NAME = f"{_DISTRIBUTED_MOE_NAME}.moe_utils"
-_TRITON_GROUP_GEMM_NAME = "veomni.ops.kernels.moe._kernels.kernel.group_gemm"
 _NPU_GROUP_GEMM_KERNEL_NAME = "veomni.ops.kernels.moe._kernels.kernel.npu_group_gemm"
 _NPU_MOE_NAME = "veomni.ops.kernels.moe.npu_group_gemm"
+_NPU_MEMORY_NAME = "veomni.ops.kernels.moe.npu_ep_memory"
 _MISSING_ATTRIBUTE = object()
 _SEAM_NAMES = (
     "torch_npu",
     _DISTRIBUTED_MOE_NAME,
-    _MOE_LAYER_NAME,
+    _EP_DISPATCH_NAME,
     _EP_LOAD_BALANCE_NAME,
     _MOE_COMM_NAME,
     _MOE_UTILS_NAME,
-    _TRITON_GROUP_GEMM_NAME,
     _NPU_GROUP_GEMM_KERNEL_NAME,
+    _NPU_MEMORY_NAME,
     _NPU_MOE_NAME,
 )
 _saved_modules = {name: sys.modules.get(name) for name in _SEAM_NAMES}
@@ -113,23 +121,19 @@ _fake_torch_npu = types.ModuleType("torch_npu")
 _fake_torch_npu.npu_moe_token_permute = _cpu_token_permute
 _fake_torch_npu.npu_moe_token_unpermute = _cpu_token_unpermute
 _fake_torch_npu.npu_swiglu = _cpu_swiglu
+_fake_torch_npu.npu_grouped_matmul = _cpu_native_weight_grad
 sys.modules["torch_npu"] = _fake_torch_npu
 
 _isolated_moe_package = types.ModuleType(_DISTRIBUTED_MOE_NAME)
 _isolated_moe_package.__path__ = [str(Path(__file__).parents[2] / "veomni" / "distributed" / "moe")]
 sys.modules[_DISTRIBUTED_MOE_NAME] = _isolated_moe_package
 
-_triton_group_gemm_stub = types.ModuleType(_TRITON_GROUP_GEMM_NAME)
-_triton_group_gemm_stub.group_gemm_same_mn = _unexpected_accelerator_kernel
-_triton_group_gemm_stub.group_gemm_same_nk = _unexpected_accelerator_kernel
-sys.modules[_TRITON_GROUP_GEMM_NAME] = _triton_group_gemm_stub
-
 _npu_group_gemm_stub = types.ModuleType(_NPU_GROUP_GEMM_KERNEL_NAME)
 _npu_group_gemm_stub.npu_group_gemm = _cpu_group_gemm
 sys.modules[_NPU_GROUP_GEMM_KERNEL_NAME] = _npu_group_gemm_stub
 
 try:
-    moe_layer = importlib.import_module(_MOE_LAYER_NAME)
+    ep_dispatch = importlib.import_module(_EP_DISPATCH_NAME)
     ep_load_balance = importlib.import_module(_EP_LOAD_BALANCE_NAME)
     npu_moe = importlib.import_module(_NPU_MOE_NAME)
 finally:
@@ -253,7 +257,7 @@ def test_npu_ep_rejects_split_fc1_before_planning():
 def test_npu_ep_validates_merged_shapes_before_planning(monkeypatch, gate_up, down):
     ep_group = object()
     balancer = _UnexpectedBalancer(ep_group)
-    monkeypatch.setattr(moe_layer, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
+    monkeypatch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
 
     with pytest.raises(ValueError, match="compatible merged expert weights"):
         npu_moe.npu_ep_fused_moe_forward(
@@ -327,8 +331,8 @@ def test_npu_ep_rejects_invalid_plan_before_parameter_or_token_communication(mon
         raise AssertionError("Invalid plans must fail before token all-to-all.")
 
     balancer = InvalidPlanBalancer()
-    monkeypatch.setattr(moe_layer, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
-    monkeypatch.setattr(npu_moe, "ExpertReplicaTransfer", UnexpectedTransfer, raising=False)
+    monkeypatch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
+    monkeypatch.setattr(npu_moe, "ExpertReplicaTransfer", UnexpectedTransfer)
     monkeypatch.setattr(npu_moe, "alltoall_dispatch", unexpected_dispatch)
     with pytest.raises(ValueError, match="physical expert IDs"):
         npu_moe.npu_ep_fused_moe_forward(
@@ -347,12 +351,14 @@ def test_npu_ep_rejects_invalid_plan_before_parameter_or_token_communication(mon
 
 
 class _RecordingBalancer:
-    def __init__(self, ep_group, balance_module=ep_load_balance):
+    def __init__(self, ep_group, balance_module=ep_load_balance, *, optimize_memory=False):
         self.ep_group = ep_group
         self.layer_index = 7
         self.balance_module = balance_module
         self.plan = None
         self.build_calls = 0
+        self.optimize_memory = optimize_memory
+        self.buffer_pool = balance_module.ReplicaBufferPool() if optimize_memory else None
 
     def build_plan(self, selected_experts):
         self.build_calls += 1
@@ -394,7 +400,7 @@ def _reference_owner_gradients(hidden_states, routing_weights, group):
     return gate_grad, down_grad
 
 
-def _exercise_cpu_two_rank_npu_plumbing(rank, group):
+def _exercise_cpu_two_rank_npu_plumbing(rank, group, optimize_memory):
     from veomni.utils import moe_monitor
 
     selected_experts = torch.zeros((6 if rank == 0 else 4, 1), dtype=torch.long)
@@ -403,30 +409,39 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
     hidden_states = torch.arange(1 if rank == 0 else 7, 7 if rank == 0 else 11, dtype=torch.float32).reshape(-1, 1)
     weights = _ExpertWeights(rank)
     parameter_names_before = tuple(dict(weights.named_parameters()))
-    balancer = _RecordingBalancer(group)
+    balancer = _RecordingBalancer(group, optimize_memory=optimize_memory)
     monitor = _BalanceMonitor()
     events = []
     observed_group_lists = []
 
     original_start = npu_moe.ExpertReplicaTransfer.start
     original_all_to_all = npu_moe.all_to_all
-    original_cat = npu_moe.cat_local_and_replica_weights
     original_group_gemm = npu_moe.npu_group_gemm
     original_stream_synchronize = npu_moe.stream_synchronize
     original_get_parallel_state = npu_moe.get_parallel_state
-    original_moe_layer_get_parallel_state = moe_layer.get_parallel_state
+    original_ep_dispatch_get_parallel_state = ep_dispatch.get_parallel_state
+    original_torch_cat = torch.cat
+
+    def checked_cat(tensors, *args, **kwargs):
+        assert not optimize_memory or all(tensor.ndim != 3 for tensor in tensors), "Expert weights were copied."
+        if tensors and tensors[0].ndim == 3:
+            events.append("cat_gate" if tensors[0] is weights.gate_up else "cat_down")
+        return original_torch_cat(tensors, *args, **kwargs)
 
     class TrackingTransfer:
         @staticmethod
-        def start(local_weight, plan, ep_group):
+        def start(local_weight, plan, ep_group, **kwargs):
             name = "gate" if local_weight is weights.gate_up else "down"
             events.append(f"start_{name}")
-            transfer = original_start(local_weight, plan, ep_group)
+            transfer = original_start(local_weight, plan, ep_group, **kwargs)
 
             class TrackingWait:
                 def wait(self):
                     events.append(f"wait_{name}")
                     return transfer.wait()
+
+                def record_stream_use(self):
+                    transfer.record_stream_use()
 
             return TrackingWait()
 
@@ -434,22 +449,17 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
         events.append("all_to_all")
         return original_all_to_all(*args, **kwargs)
 
-    def tracking_cat(local_weight, replica_weight, plan, ep_group):
-        name = "gate" if local_weight is weights.gate_up else "down"
-        events.append(f"cat_{name}")
-        return original_cat(local_weight, replica_weight, plan, ep_group)
-
     def tracking_group_gemm(hidden, weight, group_list):
         observed_group_lists.append(group_list.detach().cpu().clone())
         return original_group_gemm(hidden, weight, group_list)
 
     npu_moe.ExpertReplicaTransfer = TrackingTransfer
+    torch.cat = checked_cat
     npu_moe.all_to_all = tracking_all_to_all
-    npu_moe.cat_local_and_replica_weights = tracking_cat
     npu_moe.npu_group_gemm = tracking_group_gemm
     npu_moe.stream_synchronize = lambda: None
     npu_moe.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True, ep_group=group)
-    moe_layer.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
+    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     moe_monitor.set_active_monitor(monitor)
     try:
         output = npu_moe.npu_fused_moe_forward(
@@ -468,16 +478,17 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
         assert torch.equal(routing_weights.contiguous().view(torch.uint8), routing_bytes)
         assert balancer.build_calls == 1
         assert balancer.plan.replicas == (ep_load_balance.ExpertReplica(0, 0, 0, 1, 0, 3, 5),)
-        assert events[:7] == [
+        expected_events = [
             "start_gate",
             "start_down",
             "all_to_all",
             "wait_gate",
             "wait_down",
-            "cat_gate",
-            "cat_down",
         ]
-        expected_counts = [5, 0] if rank == 0 else [0, 5]
+        if not optimize_memory:
+            expected_events += ["cat_gate", "cat_down"]
+        assert events[: len(expected_events)] == expected_events
+        expected_counts = [5] if optimize_memory else ([5, 0] if rank == 0 else [0, 5])
         assert observed_group_lists[0].tolist() == expected_counts
         assert observed_group_lists[1].tolist() == expected_counts
         assert monitor.records == ([(7, (10, 0), (5, 5), 1, 5)] if rank == 0 else [])
@@ -492,35 +503,31 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
             assert torch.count_nonzero(weights.down.grad).item() == 0
         assert tuple(dict(weights.named_parameters())) == parameter_names_before
     finally:
+        torch.cat = original_torch_cat
         moe_monitor.set_active_monitor(None)
         npu_moe.ExpertReplicaTransfer = ep_load_balance.ExpertReplicaTransfer
         npu_moe.all_to_all = original_all_to_all
-        npu_moe.cat_local_and_replica_weights = original_cat
         npu_moe.npu_group_gemm = original_group_gemm
         npu_moe.stream_synchronize = original_stream_synchronize
         npu_moe.get_parallel_state = original_get_parallel_state
-        moe_layer.get_parallel_state = original_moe_layer_get_parallel_state
+        ep_dispatch.get_parallel_state = original_ep_dispatch_get_parallel_state
 
     dist.barrier(group=group)
     balanced_selected = torch.full((2, 1), rank, dtype=torch.long)
     balanced_hidden = torch.tensor([[0.5], [1.0]])
     balanced_routing = torch.tensor([[0.5], [0.75]])
     balanced_weights = _ExpertWeights(rank)
-    balanced_balancer = _RecordingBalancer(group)
+    balanced_balancer = _RecordingBalancer(group, optimize_memory=optimize_memory)
 
     class UnexpectedTransfer:
         @staticmethod
         def start(*args, **kwargs):
             raise AssertionError("A no-replica plan must not start parameter P2P.")
 
-    def unexpected_cat(*args, **kwargs):
-        raise AssertionError("A no-replica plan must not concatenate temporary weights.")
-
     npu_moe.ExpertReplicaTransfer = UnexpectedTransfer
-    npu_moe.cat_local_and_replica_weights = unexpected_cat
     npu_moe.stream_synchronize = lambda: None
     npu_moe.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True, ep_group=group)
-    moe_layer.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
+    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     try:
         balanced_output = npu_moe.npu_fused_moe_forward(
             2,
@@ -540,27 +547,323 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
         assert balanced_balancer.plan.replicas == ()
     finally:
         npu_moe.ExpertReplicaTransfer = ep_load_balance.ExpertReplicaTransfer
-        npu_moe.cat_local_and_replica_weights = original_cat
         npu_moe.stream_synchronize = original_stream_synchronize
         npu_moe.get_parallel_state = original_get_parallel_state
-        moe_layer.get_parallel_state = original_moe_layer_get_parallel_state
+        ep_dispatch.get_parallel_state = original_ep_dispatch_get_parallel_state
 
 
-def _cpu_two_rank_worker(rank, world_size, rendezvous):
+def _cpu_two_rank_worker(rank, world_size, rendezvous, optimize_memory):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
     try:
-        _exercise_cpu_two_rank_npu_plumbing(rank, dist.group.WORLD)
+        _exercise_cpu_two_rank_npu_plumbing(rank, dist.group.WORLD, optimize_memory)
     finally:
         dist.destroy_process_group()
 
 
-def test_two_rank_cpu_plumbing_alias_routing_order_and_owner_gradients(tmp_path):
+@pytest.mark.parametrize("optimize_memory", [False, True])
+def test_two_rank_cpu_plumbing_alias_routing_order_and_owner_gradients(tmp_path, optimize_memory):
     rendezvous = f"file://{tmp_path / 'npu-moe-balance-world2'}"
-    mp.spawn(_cpu_two_rank_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_cpu_two_rank_worker, args=(2, rendezvous, optimize_memory), nprocs=2, join=True)
+
+
+def _cpu_partial_bf16_worker(rank, rendezvous, optimize_memory):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        native_gather = dist.all_gather_into_tensor
+        # Gloo requires flat output; the native HCCL boundary accepts stacked rows.
+        dist.all_gather_into_tensor = lambda output, value, *args, **kwargs: native_gather(
+            output.view(-1), value.view(-1), *args, **kwargs
+        )
+        state = SimpleNamespace(ep_enabled=True, ep_group=dist.group.WORLD)
+        npu_moe.get_parallel_state = lambda: state
+        ep_dispatch.get_parallel_state = lambda: state
+        npu_moe.stream_synchronize = lambda: None
+        generator = torch.Generator().manual_seed(1009 * rank)
+        operands = {
+            "x": torch.randn(16, 8, generator=generator).bfloat16(),
+            "gate": torch.randn(1, 8, 8, generator=generator).bfloat16() / 8**0.5,
+            "down": torch.randn(1, 8, 4, generator=generator).bfloat16() / 4**0.5,
+            "route": torch.ones(16, 1, dtype=torch.bfloat16),
+        }
+        dy = torch.randn(16, 8, generator=generator).bfloat16()
+        selected = torch.zeros(16, 1, dtype=torch.long)
+        selected[-1] = 1
+        results = []
+        for enabled in (False, True):
+            values = {key: value.clone().requires_grad_() for key, value in operands.items()}
+            balancer = _RecordingBalancer(dist.group.WORLD, optimize_memory=optimize_memory) if enabled else None
+            output = npu_moe.npu_ep_fused_moe_forward(
+                2,
+                values["route"],
+                selected,
+                values["x"],
+                None,
+                None,
+                values["down"],
+                values["gate"],
+                ep_group=dist.group.WORLD,
+                load_balancer=balancer,
+            )
+            output.backward(dy)
+            results.append({"output": output.detach(), **{key: value.grad for key, value in values.items()}})
+            if enabled:
+                assert 0 < sum(replica.moved_tokens for replica in balancer.plan.replicas) < 30
+        for name in results[0]:
+            torch.testing.assert_close(results[1][name], results[0][name], atol=1e-4, rtol=1e-3, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("optimize_memory", [False, True])
+def test_partial_expert_bf16_owner_gradients_match_off(tmp_path, optimize_memory):
+    rendezvous = f"file://{tmp_path / 'npu-partial-bf16'}"
+    mp.spawn(_cpu_partial_bf16_worker, args=(rendezvous, optimize_memory), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize(
+    "retained,outgoing,expected", [([5, 11], True, [14, 11]), ([0, 0], True, [9, 0]), ([0, 0], False, [0, 0])]
+)
+def test_owner_token_counts_exclude_incoming_replicas_and_preserve_physical_counts(retained, outgoing, expected):
+    replicas = [SimpleNamespace(source_rank=1, source_local_expert=1, moved_tokens=9)]
+    if outgoing:
+        replicas.extend(SimpleNamespace(source_rank=0, source_local_expert=0, moved_tokens=value) for value in (7, 2))
+    plan = SimpleNamespace(
+        num_local_experts=2,
+        replicas=tuple(replicas),
+    )
+    physical = torch.tensor([*retained, 9], dtype=torch.int32)
+    before = physical.clone()
+    owner = npu_moe.npu_ep_memory._owner_token_counts(physical, plan, rank=0)
+    assert owner.dtype == torch.int64
+    assert owner.tolist() == expected
+    assert torch.equal(physical, before)
+
+
+def _cpu_restore_owner_rows_worker(rank, rendezvous, top_k):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4)
+    try:
+        npu_moe.stream_synchronize = lambda: None
+        experts = 4 * top_k
+        selected = torch.arange(top_k).repeat(20, 1)
+        selected[-1] = torch.arange(top_k) + rank * top_k
+        tokens = torch.arange(60, dtype=torch.float32).reshape(20, 3) + rank * 1000
+        plan = ep_load_balance.build_ep_balance_plan(selected, experts, dist.group.WORLD, 1)
+        assert len(plan.replicas) >= 2
+        physical_experts = 4 * plan.tokens_per_local_physical_expert.shape[1]
+        physical, _ = npu_moe.alltoall_dispatch(
+            tokens,
+            plan.selected_physical_experts,
+            plan.input_splits,
+            plan.output_splits,
+            physical_experts,
+            plan.tokens_per_local_physical_expert,
+            dist.group.WORLD,
+        )
+        gradient = physical[:, :2] * 0.25 + 1
+        physical_before, gradient_before = physical.clone(), gradient.clone()
+        references, counts = [], []
+        for expert in range(rank * top_k, (rank + 1) * top_k):
+            parts = []
+            for sender in range(4):
+                sender_selected = torch.arange(top_k).repeat(20, 1)
+                sender_selected[-1] = torch.arange(top_k) + sender * top_k
+                sender_tokens = torch.arange(60, dtype=torch.float32).reshape(20, 3) + sender * 1000
+                parts.append(sender_tokens.repeat_interleave(top_k, 0)[sender_selected.reshape(-1) == expert])
+            rows = torch.cat(parts)
+            references.append(rows)
+            counts.append(len(rows))
+        reference = torch.cat(references)
+        host_counts = plan.tokens_per_local_physical_expert.sum(0)
+        host_before = host_counts.clone()
+        prepared_counts = npu_moe.npu_ep_memory._owner_token_counts(host_counts, plan, rank)
+        assert prepared_counts.tolist() == counts
+        assert torch.equal(host_counts, host_before)
+        for device_counts in (None, prepared_counts):
+            for _ in range(2):
+                owner, owner_grad, owner_counts = npu_moe.npu_ep_memory.restore_owner_wgrad_inputs(
+                    physical,
+                    gradient,
+                    plan,
+                    dist.group.WORLD,
+                    device_counts=device_counts,
+                )
+                assert torch.equal(owner, reference)
+                assert torch.equal(owner_grad, reference[:, :2] * 0.25 + 1)
+                assert owner_counts.tolist() == counts
+                assert torch.equal(physical, physical_before)
+                assert torch.equal(gradient, gradient_before)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_replica_prefixes_restore_exact_owner_rows_with_multiple_targets(tmp_path, top_k):
+    rendezvous = f"file://{tmp_path / 'npu-owner-order'}"
+    mp.spawn(_cpu_restore_owner_rows_worker, args=(rendezvous, top_k), nprocs=4, join=True)
+
+
+def _cpu_memory_lifetime_worker(rank, world_size, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    group = dist.group.WORLD
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(npu_moe, "stream_synchronize", lambda: None)
+            patch.setattr(npu_moe, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True, ep_group=group))
+            patch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=group))
+            for frozen in ((), ("gate_up",), ("down",), ("gate_up", "down")):
+                for limit in (None, 0.7):
+                    references = []
+                    for optimize in (False, True):
+                        weights = _ExpertWeights(rank)
+                        for name in frozen:
+                            getattr(weights, name).requires_grad_(False)
+                        balancer = _RecordingBalancer(group, optimize_memory=optimize)
+                        outputs, inputs = [], []
+                        for hotspot in (0, 1):
+                            hidden = torch.linspace(0.1, 0.8, 6 if rank == 0 else 4).reshape(-1, 1)
+                            hidden.requires_grad_(True)
+                            outputs.append(
+                                npu_moe.npu_fused_moe_forward(
+                                    2,
+                                    torch.ones_like(hidden),
+                                    torch.full_like(hidden, hotspot, dtype=torch.long),
+                                    hidden,
+                                    None,
+                                    None,
+                                    weights.down,
+                                    weights.gate_up,
+                                    swiglu_limit=limit,
+                                    load_balancer=balancer,
+                                )
+                            )
+                            inputs.append(hidden)
+                        # Neither live graph may be overwritten by later pool borrowers.
+                        borrowers = []
+                        if optimize:
+                            for parameter in (weights.gate_up, weights.down):
+                                lease = balancer.buffer_pool.acquire(parameter, parameter.shape)
+                                lease.tensor.fill_(123)
+                                borrowers.append(lease)
+                        loss = sum(output.sum() for output in outputs)
+                        loss.backward(retain_graph=True)
+                        if optimize:
+                            for parameter in (weights.gate_up, weights.down):
+                                shape = (balancer.plan.max_replicas_per_rank, *parameter.shape[1:])
+                                lease = balancer.buffer_pool.acquire(parameter, shape)
+                                lease.tensor.fill_(456)
+                                borrowers.append(lease)
+                        loss.backward()
+                        observed = [output.detach().clone() for output in outputs]
+                        observed += [hidden.grad.clone() for hidden in inputs]
+                        observed += [
+                            parameter.grad.clone() for parameter in weights.parameters() if parameter.requires_grad
+                        ]
+                        if optimize:
+                            for result, expected in zip(observed, references, strict=True):
+                                torch.testing.assert_close(result, expected)
+                        else:
+                            references = observed
+                        del loss, outputs, inputs, borrowers
+                        gc.collect()
+                        # Inference -> training must refresh values and keep valid autograd storage.
+                        if optimize:
+                            hidden = torch.ones((4, 1), requires_grad=True)
+                            selected = torch.zeros((4, 1), dtype=torch.long)
+                            with torch.inference_mode():
+                                npu_moe.npu_fused_moe_forward(
+                                    2,
+                                    torch.ones_like(hidden),
+                                    selected,
+                                    hidden,
+                                    None,
+                                    None,
+                                    weights.down,
+                                    weights.gate_up,
+                                    load_balancer=balancer,
+                                )
+                            with torch.no_grad():
+                                weights.down.mul_(2)
+                            refreshed = npu_moe.npu_fused_moe_forward(
+                                2,
+                                torch.ones_like(hidden),
+                                selected,
+                                hidden,
+                                None,
+                                None,
+                                weights.down,
+                                weights.gate_up,
+                                load_balancer=balancer,
+                            )
+                            torch.testing.assert_close(refreshed, F.silu(hidden * 2) * hidden * 6)
+                            refreshed.sum().backward()
+                            reference_input = hidden.detach().clone().requires_grad_(True)
+                            (F.silu(reference_input * 2) * reference_input * 6).sum().backward()
+                            torch.testing.assert_close(hidden.grad, reference_input.grad)
+            from torch.utils.checkpoint import checkpoint
+
+            for reentrant in (False, True):
+                weights = _ExpertWeights(rank)
+                balancer = _RecordingBalancer(group, optimize_memory=True)
+                hidden = torch.linspace(0.1, 0.8, 4).reshape(-1, 1).requires_grad_(True)
+
+                def forward(tokens, weights=weights, balancer=balancer):
+                    return npu_moe.npu_fused_moe_forward(
+                        2,
+                        torch.ones_like(tokens),
+                        torch.zeros_like(tokens, dtype=torch.long),
+                        tokens,
+                        None,
+                        None,
+                        weights.down,
+                        weights.gate_up,
+                        load_balancer=balancer,
+                    )
+
+                output = checkpoint(forward, hidden, use_reentrant=reentrant)
+                output.sum().backward()
+                reference_input = hidden.detach().clone().requires_grad_(True)
+                expected = F.silu(reference_input * 2) * reference_input * 3
+                expected.sum().backward()
+                torch.testing.assert_close(output, expected)
+                torch.testing.assert_close(hidden.grad, reference_input.grad)
+                gate_grad, down_grad = _reference_owner_gradients(hidden.detach(), torch.ones_like(hidden), group)
+                if rank == 0:
+                    torch.testing.assert_close(weights.gate_up.grad[0, :, 0], gate_grad)
+                    torch.testing.assert_close(weights.down.grad[0, 0, 0], down_grad)
+                else:
+                    assert not weights.gate_up.grad.count_nonzero()
+                    assert not weights.down.grad.count_nonzero()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_cpu_memory_frozen_clamped_retained_graph_and_dynamic_hotspots(tmp_path):
+    rendezvous = f"file://{tmp_path / 'npu-memory-lifetime'}"
+    mp.spawn(_cpu_memory_lifetime_worker, args=(2, rendezvous), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("counts", [[2, 0, 1, 3], [0, 0, 3, 2], [3, 2, 0, 0], [0, 0, 0, 0]])
+def test_segmented_gmm_empty_segments_preserve_input_and_weight_gradients(counts):
+    generator = torch.Generator().manual_seed(4)
+    tokens = torch.randn(sum(counts), 3, generator=generator, requires_grad=True)
+    local = torch.randn(2, 5, 3, generator=generator, requires_grad=True)
+    replica = torch.randn(2, 5, 3, generator=generator, requires_grad=True)
+    actual = npu_moe.npu_ep_memory.segmented_group_gemm(
+        tokens, local, replica, torch.tensor(counts), sum(counts[:2]), _cpu_group_gemm
+    )
+    weights = torch.cat((local, replica))
+    segments = tokens.split(counts)
+    expected = torch.cat([segment @ weight.T for segment, weight in zip(segments, weights, strict=True)])
+    torch.testing.assert_close(actual, expected)
+    actual_grads = torch.autograd.grad(actual.sum(), (tokens, local, replica))
+    expected_grads = torch.autograd.grad(expected.sum(), (tokens, local, replica))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
-def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient():
+@pytest.mark.parametrize("optimize_memory", [False, True])
+def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_memory):
     world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
     if world_size != 2:
         pytest.skip("Run with torchrun --standalone --nproc-per-node=2 on an Ascend host.")
@@ -572,7 +875,7 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient():
         dist.init_process_group("hccl")
 
     real_npu_moe = importlib.import_module(_NPU_MOE_NAME)
-    real_moe_layer = importlib.import_module(_MOE_LAYER_NAME)
+    real_ep_dispatch = importlib.import_module(_EP_DISPATCH_NAME)
     real_ep_load_balance = importlib.import_module(_EP_LOAD_BALANCE_NAME)
     group = dist.group.WORLD
     rank = dist.get_rank(group)
@@ -591,11 +894,11 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient():
     ).reshape(-1, 1)
     weights = _ExpertWeights(rank, dtype=torch.bfloat16, device=device)
     parameter_names_before = tuple(dict(weights.named_parameters()))
-    balancer = _RecordingBalancer(group, real_ep_load_balance)
+    balancer = _RecordingBalancer(group, real_ep_load_balance, optimize_memory=optimize_memory)
     original_get_parallel_state = real_npu_moe.get_parallel_state
-    original_moe_layer_get_parallel_state = real_moe_layer.get_parallel_state
+    original_ep_dispatch_get_parallel_state = real_ep_dispatch.get_parallel_state
     real_npu_moe.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True, ep_group=group)
-    real_moe_layer.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
+    real_ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     try:
         output = real_npu_moe.npu_fused_moe_forward(
             2,
@@ -613,6 +916,16 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient():
         assert balancer.build_calls == 1
         assert len(balancer.plan.replicas) == 1
         assert int(balancer.plan.tokens_per_local_physical_expert[:, -1].sum().item()) == (0 if rank == 0 else 5)
+        expected_plan = real_ep_load_balance._build_ep_balance_plan_from_counts(
+            selected_experts.cpu(), torch.tensor([[6, 0], [4, 0]]), 2, rank, 1
+        )
+        for name in ("replicas", "input_splits", "output_splits", "rank_loads_before", "rank_loads_after"):
+            assert getattr(balancer.plan, name) == getattr(expected_plan, name)
+        assert balancer.plan.selected_physical_experts.device == device
+        assert torch.equal(balancer.plan.selected_physical_experts.cpu(), expected_plan.selected_physical_experts)
+        assert torch.equal(
+            balancer.plan.tokens_per_local_physical_expert.cpu(), expected_plan.tokens_per_local_physical_expert
+        )
 
         output.float().sum().backward()
         assert torch.isfinite(weights.gate_up.grad.float()).all().item()
@@ -629,6 +942,6 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient():
         assert tuple(dict(weights.named_parameters())) == parameter_names_before
     finally:
         real_npu_moe.get_parallel_state = original_get_parallel_state
-        real_moe_layer.get_parallel_state = original_moe_layer_get_parallel_state
+        real_ep_dispatch.get_parallel_state = original_ep_dispatch_get_parallel_state
         if owns_group:
             dist.destroy_process_group()

@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Fenced code blocks used for copy-paste training commands
 SHELL_FENCE = re.compile(r"```(?:shell|bash|sh)\s*\n(.*?)```", re.DOTALL | re.MULTILINE)
-# Paths like tasks/train_vlm.py or tasks/deprecated_task/train_wan.py
+# Paths like tasks/train_vlm.py or tasks/infer/infer_text.py
 TASK_SCRIPT = re.compile(r"tasks/[A-Za-z0-9_./]+\.py")
 
 # Placeholder examples in docs (not real files)

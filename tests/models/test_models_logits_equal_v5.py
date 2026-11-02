@@ -9,7 +9,7 @@ Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
 class (``transformers-stable`` default group in ``pyproject.toml`` pins
-``transformers==5.9.0``):
+``transformers==5.16.1``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3,
                                    gpt_oss
@@ -144,10 +144,13 @@ CASES = [
     ),
     # ── DeepSeek-V3 (MLA + MoE) ──────────────────────────────────────────
     # HF v5 builds the fused ``gate_up_proj [E, 2*I, H]`` directly via
-    # ``DeepseekV3NaiveMoe`` (no ``_experts_implementation`` knob — the
-    # ``naive`` path is hard-wired). VeOmni's ``PatchedDeepseekV3NaiveMoe``
-    # dispatches on the ``moe_experts`` OpSlot — eager loop here because
-    # the test runs without fused-kernel bindings.
+    # ``DeepseekV3Experts`` (named ``DeepseekV3NaiveMoe`` before transformers
+    # 5.16). VeOmni's ``PatchedDeepseekV3Experts`` drops upstream's
+    # ``@use_experts_implementation`` decorator and dispatches on the
+    # ``moe_experts`` OpSlot instead — eager loop here because the test runs
+    # without fused-kernel bindings. ``_experts_implementation`` is pinned to
+    # ``"eager"`` like the other MoE cases so the HF reference cannot drift to
+    # ``grouped_mm`` if upstream changes its default.
     #
     # eager+fp32 only: deepseek_v3 ships MLA (multi-head latent attention)
     # with split q_a / q_b / kv_a / kv_b projections, and the patchgen-
@@ -157,7 +160,13 @@ CASES = [
     # to validate the patchgen modeling: it covers the MoE expert dispatch,
     # the OpSlot-guarded cross-entropy, and the v5 ``gate_up_proj`` layout
     # end-to-end.
-    Case("deepseek_v3-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    Case(
+        "deepseek_v3-eager",
+        _toy("deepseek_v3_toy"),
+        "DeepseekV3ForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     # ── GPT-OSS (SWA + learnable sinks + interleaved gate/up MoE) ────────
     # eager+fp32 only for this HF bitwise baseline: fused_quack is covered by
     # ``test_gpt_oss_integration.py`` against VeOmni eager, while this test

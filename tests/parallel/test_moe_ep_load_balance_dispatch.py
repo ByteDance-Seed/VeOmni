@@ -11,9 +11,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from veomni.distributed.torch_compile import CompileConfig
+from veomni.models import model_runtime
 from veomni.ops.kernels import moe as moe_kernels
-from veomni.trainer import base as trainer_base
+from veomni.ops.kernels.moe._scatter import compute_expert_scatter_index, compute_max_expert_tokens
 
 
 def _unexpected_triton_kernel(*args, **kwargs):
@@ -25,6 +25,7 @@ def _unexpected_triton_kernel(*args, **kwargs):
 # executor, token permutation, and collectives remain unchanged.
 _MOE_PACKAGE_NAME = "veomni.distributed.moe"
 _MOE_LAYER_NAME = f"{_MOE_PACKAGE_NAME}.moe_layer"
+_EP_DISPATCH_NAME = f"{_MOE_PACKAGE_NAME}.ep_dispatch"
 _EP_LOAD_BALANCE_NAME = f"{_MOE_PACKAGE_NAME}.ep_load_balance"
 _GROUP_GEMM_KERNEL_NAME = "veomni.ops.kernels.moe._kernels.kernel.group_gemm"
 _MOE_KERNEL_NAME = "veomni.ops.kernels.moe._kernels.kernel.moe"
@@ -37,6 +38,7 @@ _saved_modules = {
     for name in (
         _MOE_PACKAGE_NAME,
         _MOE_LAYER_NAME,
+        _EP_DISPATCH_NAME,
         _EP_LOAD_BALANCE_NAME,
         _GROUP_GEMM_KERNEL_NAME,
         _MOE_KERNEL_NAME,
@@ -58,10 +60,12 @@ _moe_kernel.moe_gather = _unexpected_triton_kernel
 _moe_kernel.moe_scatter = _unexpected_triton_kernel
 sys.modules[_MOE_KERNEL_NAME] = _moe_kernel
 _scatter = types.ModuleType(_SCATTER_NAME)
-_scatter.compute_expert_scatter_index = _unexpected_triton_kernel
+_scatter.compute_expert_scatter_index = compute_expert_scatter_index
+_scatter.compute_max_expert_tokens = compute_max_expert_tokens
 sys.modules[_SCATTER_NAME] = _scatter
 
-moe_layer = importlib.import_module(f"{_MOE_PACKAGE_NAME}.moe_layer")
+moe_layer = importlib.import_module(_MOE_LAYER_NAME)
+ep_dispatch = importlib.import_module(_EP_DISPATCH_NAME)
 ep_load_balance = importlib.import_module(f"{_MOE_PACKAGE_NAME}.ep_load_balance")
 for _name in (
     "EPGroupGemm",
@@ -215,12 +219,18 @@ def test_opslot_adapter_adds_balancer_only_when_private_attribute_exists():
         "fc2_weight",
         "fc1_1_2_weight",
         "swiglu_limit",
+        "assume_distinct_experts",
     }
+    assert received[-1]["assume_distinct_experts"] is False
+    experts.assume_distinct_experts = True
+    adapter(experts, hidden_states, selected_experts, routing_weights)
+    assert received[-1]["assume_distinct_experts"] is True
 
     load_balancer = object()
     experts._veomni_ep_load_balancer = load_balancer
     adapter(experts, hidden_states, selected_experts, routing_weights)
     assert received[-1]["load_balancer"] is load_balancer
+    assert received[-1]["assume_distinct_experts"] is True
 
 
 @pytest.mark.parametrize("ep_enabled", [False, True])
@@ -360,7 +370,7 @@ def test_common_dispatch_validates_merged_weights_before_controller_plan(monkeyp
         def build_plan(self, selected_experts):
             raise AssertionError("Invalid merged weights must fail before controller planning.")
 
-    monkeypatch.setattr(moe_layer, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
+    monkeypatch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
 
     with pytest.raises(ValueError, match="merged expert weights"):
         moe_layer.dispatch_to_ep_class(
@@ -417,7 +427,7 @@ def _plan_telemetry_worker(rank: int, world_size: int, rendezvous: str, ep_size:
         monitor = moe_monitor.MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
         monitor.record(nn.Identity(), selected)
         moe_monitor.set_active_monitor(monitor)
-        moe_layer._record_ep_balance(SimpleNamespace(ep_group=ep_group, layer_index=0), plan)
+        ep_dispatch._record_ep_balance(SimpleNamespace(ep_group=ep_group, layer_index=0), plan)
         metrics = monitor.compute_metrics(current_step=1, format_only_on=rank == 0)
         if rank == 0:
             groups = world_size // ep_size
@@ -469,7 +479,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
     original_start = ep_load_balance.ExpertReplicaTransfer.start
     original_all_to_all = moe_layer.all_to_all
     original_apply = moe_layer.EPMergedFc1GroupGemm.apply
-    original_get_parallel_state = moe_layer.get_parallel_state
+    original_get_parallel_state = ep_dispatch.get_parallel_state
     original_group_gemm_get_parallel_state = group_gemm.get_parallel_state
     original_cat_weights = moe_layer.cat_local_and_replica_weights
 
@@ -504,7 +514,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
     moe_layer.all_to_all = tracking_all_to_all
     moe_layer.cat_local_and_replica_weights = tracking_cat
     moe_layer.EPMergedFc1GroupGemm.apply = staticmethod(cpu_apply)
-    moe_layer.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
+    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     group_gemm.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True)
     moe_monitor.set_active_monitor(monitor)
     try:
@@ -559,7 +569,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
         moe_layer.all_to_all = original_all_to_all
         moe_layer.cat_local_and_replica_weights = original_cat_weights
         moe_layer.EPMergedFc1GroupGemm.apply = original_apply
-        moe_layer.get_parallel_state = original_get_parallel_state
+        ep_dispatch.get_parallel_state = original_get_parallel_state
         group_gemm.get_parallel_state = original_group_gemm_get_parallel_state
 
     dist.barrier(group=group)
@@ -581,7 +591,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
     moe_layer.ExpertReplicaTransfer = UnexpectedTransfer
     moe_layer.cat_local_and_replica_weights = unexpected_cat
     moe_layer.EPMergedFc1GroupGemm.apply = staticmethod(_cpu_merged_expert)
-    moe_layer.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
+    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     group_gemm.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True)
     try:
         balanced_output = group_gemm.group_gemm_fused_moe_forward(
@@ -602,7 +612,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
         moe_layer.ExpertReplicaTransfer = ep_load_balance.ExpertReplicaTransfer
         moe_layer.cat_local_and_replica_weights = original_cat_weights
         moe_layer.EPMergedFc1GroupGemm.apply = original_apply
-        moe_layer.get_parallel_state = original_get_parallel_state
+        ep_dispatch.get_parallel_state = original_get_parallel_state
         group_gemm.get_parallel_state = original_group_gemm_get_parallel_state
 
 
@@ -619,33 +629,18 @@ def test_two_rank_balanced_dispatch_output_routing_and_owner_gradient(tmp_path: 
     mp.spawn(_two_rank_dispatch_worker, args=(2, rendezvous), nprocs=2, join=True)
 
 
-def _trainer_args(*, enabled: bool) -> SimpleNamespace:
-    fsdp_config = SimpleNamespace(
-        reshard_after_forward=True,
-        mixed_precision=None,
-        forward_prefetch=False,
-        offload=False,
-        max_load_broadcast_size=0,
+def _runtime_args(*, enabled: bool) -> SimpleNamespace:
+    from veomni.arguments import ModelArguments
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    return SimpleNamespace(
+        model=ModelArguments(model_path="unused", ops_implementation=make_eager_ops_config()),
+        train=SimpleNamespace(
+            checkpoint=SimpleNamespace(load_path=None),
+            moe_ep_load_balance=SimpleNamespace(enabled=enabled, max_replicas_per_rank=1),
+        ),
     )
-    train = SimpleNamespace(
-        optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
-        chunk_mbs_config=SimpleNamespace(enable=False),
-        checkpoint=SimpleNamespace(load_path=None),
-        init_device="meta",
-        accelerator=SimpleNamespace(fsdp_config=fsdp_config),
-        gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
-        broadcast_model_weights_from_rank0=True,
-        ep_sharded_stream_load=False,
-        torch_compile=CompileConfig(),
-        moe_ep_load_balance=SimpleNamespace(enabled=enabled, max_replicas_per_rank=1),
-    )
-    model = SimpleNamespace(
-        lora_config=None,
-        fqn_to_index_mapping=None,
-        model_path="unused",
-        basic_modules=[],
-    )
-    return SimpleNamespace(model=model, train=train)
 
 
 class _OrderModel(nn.Module):
@@ -664,10 +659,16 @@ def _install_ep_load_balance_test_module(monkeypatch):
     monkeypatch.setitem(sys.modules, _EP_LOAD_BALANCE_NAME, ep_load_balance)
 
 
-def test_trainer_attaches_after_parallelization_and_training(monkeypatch):
+def test_runtime_attaches_after_parallelization_and_training(monkeypatch):
+    from veomni.distributed import torch_parallelize
+
     events = []
     model = _OrderModel(events)
-    trainer = SimpleNamespace(args=_trainer_args(enabled=True), model=model)
+    args = _runtime_args(enabled=True)
+    runtime = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
+    runtime.args = args.model
+    runtime.train_args = args.train
+    runtime.model = model
 
     def fake_build(model_arg, **kwargs):
         assert model_arg is model
@@ -681,33 +682,35 @@ def test_trainer_attaches_after_parallelization_and_training(monkeypatch):
         events.append("attach")
         return 1
 
-    monkeypatch.setattr(trainer_base, "build_parallelize_model", fake_build)
-    monkeypatch.setattr(trainer_base, "should_skip_hf_weight_load", lambda *args: False)
+    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", fake_build)
     monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", fake_attach)
     _install_ep_load_balance_test_module(monkeypatch)
 
-    trainer_base.BaseTrainer._build_parallelized_model(trainer)
+    runtime._build_parallelized_model()
+    runtime._attach_moe_ep_load_balancers()
 
-    assert trainer.model is model
+    assert runtime.model is model
     assert events == ["build", "train", "attach"]
 
 
-def test_trainer_disabled_is_noop_and_enabled_requires_a_real_expert(monkeypatch):
-    monkeypatch.setattr(trainer_base, "build_parallelize_model", lambda model, **kwargs: model)
-    monkeypatch.setattr(trainer_base, "should_skip_hf_weight_load", lambda *args: False)
+def test_runtime_disabled_is_noop_and_enabled_requires_a_real_expert(monkeypatch):
     _install_ep_load_balance_test_module(monkeypatch)
 
     def unexpected_attach(*args, **kwargs):
         raise AssertionError("Disabled configuration must not attach controllers.")
 
     monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", unexpected_attach)
-    disabled = SimpleNamespace(args=_trainer_args(enabled=False), model=_OrderModel([]))
-    trainer_base.BaseTrainer._build_parallelized_model(disabled)
+    disabled = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
+    disabled.train_args = _runtime_args(enabled=False).train
+    disabled.model = _OrderModel([])
+    disabled._attach_moe_ep_load_balancers()
 
     monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", lambda *args, **kwargs: 0)
-    enabled = SimpleNamespace(args=_trainer_args(enabled=True), model=_OrderModel([]))
+    enabled = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
+    enabled.train_args = _runtime_args(enabled=True).train
+    enabled.model = _OrderModel([])
     with pytest.raises(RuntimeError, match="no compatible Qwen3.5 MoE expert modules"):
-        trainer_base.BaseTrainer._build_parallelized_model(enabled)
+        enabled._attach_moe_ep_load_balancers()
 
 
 def test_torchrun_two_rank_balanced_dispatch_output_routing_and_owner_gradient():

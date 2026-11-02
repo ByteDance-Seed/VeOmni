@@ -595,7 +595,7 @@ def _chunk_loss_seq_cls_factory():
 # Register under both the canonical name ("chunk_loss") and the legacy alias
 # ("npu") so KERNEL_REGISTRY.resolve succeeds for either spelling. The kernel
 # itself is hardware-agnostic; the device_type="any" gate just confirms a real
-# accelerator is present.
+# accelerator(e.g. gpu, npu, mlu, etc.) is present.
 for _name, _hw in (
     ("chunk_loss", HardwareRequirement(device_type="any")),
     ("npu", HardwareRequirement(device_type="npu")),

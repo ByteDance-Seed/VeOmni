@@ -1,0 +1,4 @@
+# Convert-time training DAGs, keyed by train_type.
+default:
+- {from: fake_module_a, to: fake_module_b}
+- {from: fake_module_b, to: end}

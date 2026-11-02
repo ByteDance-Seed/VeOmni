@@ -40,7 +40,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/auto.py",
     "veomni/models/loader.py",
     "veomni/models/module_utils.py",
-    "veomni/models/seed_omni/auto.py",
     "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
     "veomni/ops/kernels/moe/_kernels/utils/device.py",

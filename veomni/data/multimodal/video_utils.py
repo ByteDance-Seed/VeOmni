@@ -17,14 +17,17 @@ import math
 import subprocess
 from typing import ByteString, Dict, List, Optional, Union
 
+import av
 import numpy as np
 import PIL
 import torch
+from PIL import Image
 from torchvision.transforms import InterpolationMode, functional
+from tqdm import tqdm
 
 from ...utils import logging
 from ...utils.import_utils import is_ffmpeg_available
-from .audio_utils import extract_audio_from_video
+from .audio_utils import _prepare_audio_stream, _write_audio, extract_audio_from_video
 
 
 logger = logging.get_logger(__name__)
@@ -150,7 +153,7 @@ def smart_video_nframes(
     min_frames: int = None,
     max_frames: int = None,
     **kwargs,
-) -> tuple[torch.Tensor, Dict[str, Union[float, int]]]:
+) -> tuple[torch.Tensor, Dict[str, Union[float, int, torch.Tensor]]]:
     """Sample video frames with fps and alignment constraints.
 
     Args:
@@ -163,7 +166,9 @@ def smart_video_nframes(
         **kwargs: Additional arguments (e.g., 'frames' for explicit count)
 
     Returns:
-        (video, metadata): Processed video and metadata dict with 'fps', 'total_num_frames'
+        (video, metadata): Sampled video and source metadata. 'fps' and
+        'total_num_frames' describe the input before sampling; 'frames_indices'
+        maps each output frame back to that input, including repeated padding.
     """
     total_frames = video.shape[0]
 
@@ -194,11 +199,13 @@ def smart_video_nframes(
     if pad_count > 0:
         last_frame = video[-1:].expand(pad_count, -1, -1, -1)
         video = torch.cat([video, last_frame], dim=0)
+        indices = indices + [indices[-1]] * pad_count
 
-    nframes = video.shape[0]
-    fps_out = video_fps * nframes / total_frames if total_frames > 0 else fps
-
-    return video, {"fps": fps_out, "total_num_frames": nframes}
+    return video, {
+        "fps": video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": torch.tensor(indices, dtype=torch.long),
+    }
 
 
 def smart_audio_nframes(
@@ -449,8 +456,8 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     Supports: str (path/URL), bytes, List[PIL.Image], List[bytes], Dict[str, np.ndarray].
 
     Returns:
-        (video, audio, audio_fps, frames_indices): Processed video, audio array, audio FPS,
-        and sampled frame indices from original video
+        (video, audio, audio_fps, video_metadata): Processed video, audio array,
+        audio FPS, and source video metadata with sampled original frame indices.
     """
     if isinstance(video_input, list):
         if len(video_input) > 0 and isinstance(video_input[0], bytes):
@@ -472,9 +479,8 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         # Pre-compute nframes for dynamic max_pixels before spatial resize
         indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
         resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
-        video, _ = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
-        frames_indices = torch.arange(video.shape[0])
-        return video, audio, audio_fps, frames_indices
+        video, video_metadata = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
+        return video, audio, audio_fps, video_metadata
 
     elif isinstance(video_input, dict):
         video, video_fps, audio, audio_fps = _dict_to_video_audio(
@@ -483,9 +489,8 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         # Pre-compute nframes for dynamic max_pixels before spatial resize
         indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
         resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
-        video, _ = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
-        frames_indices = torch.arange(video.shape[0])
-        return video, audio, audio_fps, frames_indices
+        video, video_metadata = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
+        return video, audio, audio_fps, video_metadata
 
     # video_input is str (path/URL) or bytes — the only branch that needs the
     # ffmpeg / torchcodec stack. dict / List[bytes] / List[PIL.Image] inputs above
@@ -555,9 +560,13 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         max_audio_duration = (metadata.duration_seconds or 60.0) + 1.0
         audio, audio_fps = extract_audio_from_video(video_input, max_duration_seconds=max_audio_duration)
 
-    frames_indices = torch.tensor(padded_indices, dtype=torch.long)
+    video_metadata = {
+        "fps": video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": torch.tensor(padded_indices, dtype=torch.long),
+    }
 
-    return final_frames, audio, audio_fps, frames_indices
+    return final_frames, audio, audio_fps, video_metadata
 
 
 def fetch_videos(videos: List[VideoInput], **kwargs):
@@ -595,7 +604,10 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
 def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     """Fetch and process videos with full metadata.
 
-    IMPORTANT: For Qwen3-VL, this returns frames_indices needed for timestamp calculation.
+    The video metadata uses the source FPS and frame count, not the requested
+    sampling FPS or output frame count. 'frames_indices' maps output frames to
+    the source timeline, including repeated indices for padding. Consumers of
+    these already-sampled videos must disable further frame sampling.
 
     ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
     inputs — see ``fetch_videos`` for the same note.
@@ -614,13 +626,7 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
 
     for i, video in enumerate(videos):
         try:
-            processed_video, audio, audio_fps, frames_indices = _load_and_process_video_with_codec(video, **kwargs)
-
-            video_meta = {
-                "fps": kwargs.get("fps", 2.0),
-                "total_num_frames": processed_video.shape[0],
-                "frames_indices": frames_indices,
-            }
+            processed_video, audio, audio_fps, video_meta = _load_and_process_video_with_codec(video, **kwargs)
 
             video_inputs.append(processed_video)
             video_metadata_list.append(video_meta)
@@ -873,3 +879,67 @@ def save_video_tensors_to_file(
         finally:
             if os.path.exists(tmp_audio_path):
                 os.remove(tmp_audio_path)
+
+
+def write_video_audio(
+    video: list[Image.Image],
+    audio: torch.Tensor | None,
+    output_path: str,
+    fps: int = 24,
+    audio_sample_rate: int | None = None,
+) -> None:
+    """
+    Writes a sequence of images and an audio tensor to a video file.
+
+    This function utilizes PyAV (or a similar multimedia library) to encode a list of PIL images into a video stream
+    and multiplex a PyTorch tensor as the audio stream into the output container.
+
+    Args:
+        video (list[Image.Image]): A list of PIL Image objects representing the video frames.
+            The length of this list determines the total duration of the video based on the FPS.
+        audio (torch.Tensor | None): The audio data as a PyTorch tensor.
+            The shape is typically (channels, samples). If no audio is required, pass None.
+            channels can be 1 or 2. 1 for mono, 2 for stereo.
+        output_path (str): The file path (including extension) where the output video will be saved.
+        fps (int, optional): The frame rate (frames per second) for the video. Defaults to 24.
+        audio_sample_rate (int | None, optional): The sample rate (e.g., 44100, 48000) for the audio.
+            If the audio tensor is provided and this is None, the function attempts to infer the rate
+            based on the audio tensor's length and the video duration.
+    Raises:
+        ValueError: If an audio tensor is provided but the sample rate cannot be determined.
+    """
+    duration = len(video) / fps
+    if audio is not None and audio_sample_rate is None:
+        audio_sample_rate = int(audio.shape[-1] / duration)
+
+    width, height = video[0].size
+    # yuv420p (4:2:0) requires even dimensions: crop odd-sized frames to the
+    # even bound, consistent with save_video_tensors_to_file.
+    width = width // 2 * 2
+    height = height // 2 * 2
+    if (width, height) != video[0].size:
+        video = [frame.crop((0, 0, width, height)) for frame in video]
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=int(fps))
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+
+    if audio is not None:
+        if audio_sample_rate is None:
+            raise ValueError("audio_sample_rate is required when audio is provided")
+        audio_stream = _prepare_audio_stream(container, audio_sample_rate)
+
+    for frame in tqdm(video, total=len(video)):
+        frame = av.VideoFrame.from_image(frame)
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    # Flush encoder
+    for packet in stream.encode():
+        container.mux(packet)
+
+    if audio is not None:
+        _write_audio(container, audio_stream, audio, audio_sample_rate)
+
+    container.close()

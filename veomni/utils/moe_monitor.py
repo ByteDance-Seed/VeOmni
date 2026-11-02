@@ -588,13 +588,15 @@ class MoERouterMonitor:
         load_matrix: torch.Tensor,
         ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         prefix: str,
+        render_heatmaps: bool = True,
     ) -> Dict[str, Any]:
         num_layers = load_matrix.shape[0]
         vio = self.compute_vio(load_matrix)
         max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
 
         metrics: Dict[str, Any] = {}
-        metrics[f"{prefix}/expert_load_heatmap"] = self.build_heatmap_image(load_matrix)
+        if render_heatmaps:
+            metrics[f"{prefix}/expert_load_heatmap"] = self.build_heatmap_image(load_matrix)
         for i in range(num_layers):
             metrics[f"{prefix}/max_vio/layer_{i}"] = max_vio[i].item()
             metrics[f"{prefix}/min_vio/layer_{i}"] = min_vio[i].item()
@@ -619,8 +621,9 @@ class MoERouterMonitor:
                 torch.zeros_like(total_routed_tokens, dtype=torch.float),
             )
 
-            metrics[f"{prefix}/ep_rank_load_before_heatmap"] = self.build_ep_rank_heatmap_image(before, "before")
-            metrics[f"{prefix}/ep_rank_load_after_heatmap"] = self.build_ep_rank_heatmap_image(after, "after")
+            if render_heatmaps:
+                metrics[f"{prefix}/ep_rank_load_before_heatmap"] = self.build_ep_rank_heatmap_image(before, "before")
+                metrics[f"{prefix}/ep_rank_load_after_heatmap"] = self.build_ep_rank_heatmap_image(after, "after")
             for i in range(num_layers):
                 metrics[f"{prefix}/ep_rank_imbalance_before/layer_{i}"] = before_imbalance[i].item()
                 metrics[f"{prefix}/ep_rank_imbalance_after/layer_{i}"] = after_imbalance[i].item()
@@ -651,6 +654,8 @@ class MoERouterMonitor:
         current_step: int,
         prefix: str = "moe",
         format_only_on: Optional[bool] = None,
+        *,
+        render_heatmaps: bool = True,
     ) -> Dict[str, Any]:
         """Produce a backend-agnostic metrics dict for the current interval.
 
@@ -659,6 +664,11 @@ class MoERouterMonitor:
         global rank logs the result. Pass ``format_only_on=False`` on
         non-logging ranks to skip the scalar + heatmap build (the rank still
         participates in collectives and resets).
+
+        Pass ``render_heatmaps=False`` when the caller only consumes scalars.
+        This omits image construction and image keys, but preserves all scalar
+        metrics, collectives, validation, interval reset and failure handling.
+        The default retains images for existing direct API consumers.
 
         Returns a dict with:
 
@@ -681,7 +691,7 @@ class MoERouterMonitor:
             self._last_step_range = (self._accumulate_start_step, current_step)
             try:
                 load_matrix, ep_balance = self._prepare_snapshot_for_format(load_matrix, ep_balance)
-                metrics = self._format_metrics(load_matrix, ep_balance, prefix)
+                metrics = self._format_metrics(load_matrix, ep_balance, prefix, render_heatmaps=render_heatmaps)
             except Exception as exc:
                 format_error = exc
                 self._last_step_range = previous_step_range

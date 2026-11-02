@@ -1,87 +1,160 @@
 # Qwen3.5-MoE expert-parallel load balancing
 
-## Scope
+## Scope and configuration
 
-VeOmni can optionally reduce a per-forward Qwen3.5-MoE expert-parallel hotspot by placing temporary copies of selected expert weights on less-loaded EP ranks. The default remains disabled:
+Temporary expert replicas can redistribute a Qwen3.5-MoE per-forward EP hotspot.
+This changes fused execution, not the router auxiliary loss or persistent model
+structure. The public switch `train.moe_ep_load_balance.enabled` defaults to
+`false`; `max_replicas_per_rank` defaults to `1`.
 
-```yaml
-train:
-  moe_load_balance_monitor_interval: 0
-  moe_ep_load_balance:
-    enabled: false
-    max_replicas_per_rank: 1
-```
+Enabled mode requires full, non-LoRA Qwen3.5-MoE SFT, compatible merged experts,
+and the following settings:
 
-This is a fused-EP execution feature, not the router auxiliary loss and not a persistent model transformation. Enabling it currently fail-fast requires full Qwen3.5-MoE SFT with FSDP2, resolved `dp_replicate_size == 1` (no HSDP), `ep_outside=false`, no FSDP CPU offload, no activation offload, no checkpoint resume (`train.checkpoint.load_path=null`), `ep_size > 1`, and either CUDA `fused_triton` or Ascend `fused_npu`. Multi-node, other SP/EP topologies, eager MoE, Quack MoE, and other model families remain outside the validated support surface.
+| Owner | Requirement |
+| --- | --- |
+| `model.accelerator` | `ep_size > 1`, resolved `dp_replicate_size == 1`, `ep_outside=false` |
+| `model.accelerator.fsdp_config` | `fsdp_mode=fsdp2`, `offload=false` |
+| `model.accelerator.offload_config` | `enable_activation=false`, `enable_async_activation=false` |
+| `model.ops_implementation` | `moe_implementation=fused_triton` on CUDA or `fused_npu` on Ascend |
+| `train.checkpoint` | `load_path=null` (resume unsupported) |
 
-## Runtime path and ownership
+The expert count must be divisible by EP size, and the positive replica-slot
+count cannot exceed the original local expert count. Invalid configuration,
+module layouts or plans fail before replica communication; there is no eager or
+alternate-backend fallback. HSDP, EP-outside, CPU/activation offload, resume,
+LoRA, eager/Quack MoE and other model families are unsupported. Multi-node and
+other SP/EP topology combinations remain untested. Ordinary checkpoint saving
+and `model.accelerator.gradient_checkpointing` remain allowed.
 
-After model loading, Qwen3.5's normal `ParallelPlan` shards the original expert dimension across EP ranks and FSDP2 wraps the model. Only then does `BaseTrainer` attach one private load-balancer controller to each compatible merged `Qwen3_5MoeExperts` module. Attachment validates the real EP process group, the global/local expert-row relationship, and the fixed replica-slot count.
+[The validation report](../performance/qwen3_5_moe_ep_load_balance.md) records
+GPU observed-mean non-degradation, native NPU precision/load redistribution,
+and the remaining NPU throughput regression. Measurements retain their own
+source, hardware and software identities; they are not universal guarantees. Executable opt-in, comparison and
+profiling recipes belong in the [training guide](../examples/qwen3_5.md#qwen35-moe-ep-load-balance-experiments).
 
-For every fused MoE forward:
+## Ownership and forward lifecycle
 
-1. The native Qwen3.5 router produces weights and logical top-k expert IDs.
-2. The planner computes a histogram from those actual selected IDs, then gathers the histogram across the existing EP group. It does not predict load from a prior step or add a second routing policy.
-3. A deterministic greedy/water-filling plan selects only replicas that strictly improve the descending-sorted physical rank-load vector, compared lexicographically. This prioritizes the busiest ranks without requiring the global max-minus-min spread to drop on every individual move. It conserves selected occurrences and assigns concrete occurrences of a hot logical expert to each replica.
-4. Dispatch rewrites only those selected IDs into a private physical-alias namespace, transfers temporary weights, and runs the existing fused EP dispatcher.
-5. The custom autograd boundary returns every replica gradient to the original expert owner before the optimizer sees the original parameter gradient.
+[`VeOmniModelRuntime`](../../veomni/models/model_runtime.py) owns attachment in
+its training constructor, after EP/FSDP2 wrapping and weight loading but before
+optimizer construction, inside `use_parallel_state(self.model_name)`. It
+attaches one private controller per compatible merged expert module. The
+trainer owns job callbacks, not model construction or attachment.
 
-The generic trainer owns lifecycle and validation; the planner owns the immutable per-forward plan; CUDA and NPU dispatchers own backend-specific fused execution. The monitor observes routing and physical-plan telemetry. No expert forward hook replaces routing. The synthetic E2E uses the existing router-replay seam, after native top-k, and leaves Qwen3.5's own gather and renormalization of routing weights in place.
+1. Native top-k yields logical expert IDs and routing weights.
+2. The controller gathers actual selected-ID histograms across its EP group.
+3. The integer planner chooses replicas that strictly improve the
+   descending-sorted physical rank-load vector, lexicographically.
+4. Dispatch assigns concrete occurrences to physical aliases, transfers
+   temporary weights and invokes the backend's fused EP execution.
+5. Backward returns replica weight gradients to the original owner before its
+   optimizer update.
 
-For example, `[100, 100, 0, 0]` first becomes `[50, 100, 50, 0]`, then `[50, 50, 50, 50]`. The first move leaves the spread unchanged because another hot rank and another empty rank remain. Rejecting that move would incorrectly leave both hotspots unbalanced. The sorted-load objective accepts it without increasing the busiest rank's load; moving a lone token between ranks with the same sorted load profile is still rejected. This is a token-load planning objective, not a communication-cost or end-to-end performance guarantee.
+The [planner/controller](../../veomni/distributed/moe/ep_load_balance.py) owns
+the immutable per-forward plan. Shared dispatch validation owns group identity,
+merged-weight layout and plan invariants; CUDA/NPU dispatchers own backend
+execution. No expert forward hook replaces routing, and no cross-forward plan
+or weight-value cache is kept. Router replay is a test seam after native top-k, not a
+production routing policy.
 
-## Physical alias namespace
+The objective admits `[100,100,0,0] -> [50,100,50,0] -> [50,50,50,50]`:
+the first move is useful even though max-minus-min spread has not yet changed.
+Equal sorted profiles are rejected. Search stops exactly when the rank-load
+range is at most one, the integer-optimal profile for a conserved token total.
+This is a token-load objective, not a communication-cost or speedup guarantee.
 
-Let `E` be the number of logical experts, `R` the EP size, `L = E / R` the original experts per rank, `K` the fixed `max_replicas_per_rank`, and `S = L + K` the physical stride.
+## Dispatch invariants
 
-- Original logical expert `e` maps to physical ID `floor(e / L) * S + (e mod L)`.
-- Replica slot `s` on target EP rank `r` maps to `r * S + L + s`, for `0 <= s < K`.
+Let `E` be logical experts, `R` EP size, `L=E/R` original rows per rank,
+`K` replica slots per rank and `S=L+K` physical stride.
 
-The namespace keeps every rank's original rows first and fixed replica slots second. It exists only for the current forward. When the plan creates no replica, dispatch retains the original logical IDs and expert count.
+- Logical expert `e` maps to `floor(e/L)*S + (e mod L)`.
+- Replica slot `s` on rank `r` maps to `r*S + L+s`, `0 <= s < K`.
+- With no replica, dispatch retains the original IDs and expert count.
 
-The plan contains rewritten IDs, EP input/output splits, per-sender counts for every local physical row, replica ownership, moved-token counts, and before/after physical rank loads. Validation checks integer IDs, local histogram agreement, token conservation, unique target slots, alias formulas, and consistent group/expert dimensions before communication starts.
+Validation checks integer IDs, local histogram agreement, selected-occurrence
+conservation, split totals, unique replica slots, alias formulas and matching
+group/expert dimensions. Native per-token top-k uniqueness is retained;
+across-token repetitions remain valid.
 
-## Temporary weights and gradients
+CUDA gathers in logical expert order, applies a one-to-one physical occurrence
+permutation for all-to-all, and restores logical order before combination.
+Stable physical sorting alone does not preserve top-k output or duplicated-input
+gradient summation order. Reused chunk-row maps only copy values; they perform
+no floating-point reduction. NPU and disabled dispatch keep their native paths.
 
-Qwen3.5's merged expert has two parameter tensors that must move together: the merged gate/up projection and the down projection. The dispatcher validates both tensors first, then starts two asynchronous point-to-point transfers over the same EP group. A target rank receives each copied row into a fixed temporary tensor and concatenates original rows followed by replica rows.
+## Temporary weights and backward invariants
 
-The concatenation is a custom `torch.autograd.Function`. During backward, a target rank sends the gradient of each temporary row back to its source rank. The source adds that contribution to the corresponding original local expert gradient. The temporary tensor is not an `nn.Parameter`; the custom function returns no gradient for it.
+Merged gate/up and down rows move together through asynchronous P2P on the EP
+group. Temporary rows are tensors, not parameters: parameter/state-dict names,
+optimizer groups/state and checkpoint format are unchanged. P2P send and receive buffers are contiguous even for transposed GEMM
+operands. CUDA returns ordered FP32 gradient prefixes; NPU returns replica
+inputs/upstream gradients to reconstruct native owner GEMM operands.
 
-Replica-gradient P2P payloads are contiguous on both ends, even when the merged GEMM returns a transposed weight gradient. The owner's accumulated gradient may retain its original dense strided layout; received rows are added by logical index. Copying that layout into the receive buffer would violate Gloo's contiguous-tensor requirement and does not match the sender's packed payload. A non-square, multi-element weight-gradient check is required when validating new backends; scalar expert fixtures cannot expose transpose/layout mistakes.
+CUDA replica weight gradients stay FP32 inside the fused backward boundary
+until the final owner cast. Independent FP32 partial sums would still change
+the original reduction tree. Replicas instead continue consecutive token-prefix
+accumulators in original order; owners continue with the suffix. Quotas align
+to the least common multiple of weight-gradient `BLOCK_K` values, and every
+segment uses the original owner's token count for kernel selection. Histogram
+collection also checks tile-configuration agreement across EP ranks.
 
-Consequently, model parameters, optimizer parameter groups/state, state-dict keys, and checkpoint format do not change. Checkpoint saving remains structurally unchanged. DCP resume with `train.moe_ep_load_balance.enabled=true` is intentionally rejected at configuration time via `train.checkpoint.load_path`. This statement describes the design and CPU/gloo structural tests only; it is not an accelerator checkpoint-resume support claim.
+Affected owner suffixes are computed only once. The ordered down-projection
+chain submits its first stage before independent gate derivatives/input-gradient
+work, then waits; down communication completes before gate/up communication.
+Pending handles retain operands and buffers, support idempotent waits and drain
+in `finally` when independent work raises.
 
-## Configuration and failure behavior
+These rules preserve the tested arithmetic order, not unrestricted bitwise
+identity across every dtype, shape or backend. FP32 P2P doubles low-precision
+gradient bytes, and ordered chains serialize segments. Better load balance
+does not establish net throughput or memory benefit.
 
-`train.moe_ep_load_balance.enabled` defaults to `false`; `max_replicas_per_rank` defaults to `1`. Enabling the feature requires:
+### Experimental memory path
 
-- `train.accelerator.ep_size > 1`;
-- `train.accelerator.fsdp_config.fsdp_mode=fsdp2`;
-- resolved `train.accelerator.dp_replicate_size == 1` (HSDP unsupported);
-- `train.accelerator.ep_outside=false`;
-- `train.accelerator.fsdp_config.offload=false`;
-- `train.accelerator.offload_config.enable_activation=false`;
-- `train.checkpoint.load_path=null`;
-- full, non-LoRA training;
-- `model.ops_implementation.moe_implementation=fused_triton` on CUDA or `fused_npu` on NPU;
-- compatible merged Qwen3.5 expert modules after EP sharding/FSDP2 wrapping;
-- a positive replica count no greater than `num_experts / ep_size`; and
-- a global expert count divisible by the EP size.
+`train.moe_ep_load_balance.optimize_memory=true` requires balancing enabled
+and defaults to `false`. It changes storage/compute boundaries, not planning,
+token order, replica quotas or the CUDA ordered FP32 weight-gradient chain.
 
-Invalid settings raise during argument validation or attachment. The implementation does not silently select eager MoE or another backend. HSDP, `ep_outside`, FSDP CPU offload, activation offload, and DCP resume are explicit enabled-only fail-fast boundaries rather than fallback paths. Checkpoint saving and ordinary gradient checkpointing remain allowed because they do not change the runtime load-balance contract. Qwen3.5's GatedDeltaNet backend is independent of MoE balancing: CUDA packed/varlen training uses the fused FLA path. The NPU toy E2E pins gated RMSNorm, causal conv1d, and chunk GDN to the executable `npu` kernels, which import `triton` from the `triton-ascend` distribution. It deliberately avoids the `npu_ascendc` chunk-GDN backend and its additional `fla_npu` dependency. `dyn_bsz=false` selects the non-dynamic batching path for both matched NPU runs; it is not an eager-kernel fallback.
+- CUDA grouped GEMMs read original and replica weight tensors in one launch,
+  avoiding their full weight concatenation while retaining the existing tile
+  selection and accumulation instructions. Strided original weights retain
+  the legacy concatenation path; that layout does not receive the memory optimization.
+- NPU reuses its native grouped matmul over original and replica token
+  segments. Segment boundaries come from the plan's existing CPU counts.
+  Only activations are concatenated; empty segments keep zero gradients
+  without launching an empty native GMM. A shared autograd boundary returns
+  replica X/dY prefixes in original sender/token order and computes each owner
+  weight gradient with the original native grouped matmul. Independent FP32
+  partial sums are not numerically interchangeable with that reduction.
+  Original owner counts are retained in pinned CPU storage for asynchronous
+  device upload; batched P2P posting preserves peer and operand order.
+- Each layer owns a bounded idle-storage pool (two tensors total). Transfers
+  refresh weights every forward. Live/retained autograd graphs retain their
+  leases; CUDA/NPU events and allocator stream tracking protect later reuse.
+  Concurrent graphs can allocate more than two live tensors. No-grad buffers
+  can return after submission; later reuse waits on their recorded events.
 
-## Telemetry
+The pool is not a parameter, optimizer state, checkpoint entry or weight-value
+cache. It introduces no DeepEP/MoonEP dependency, VMM mapping or global
+allocator change. CPU/Gloo tests exercise storage lifetime, empty/frozen
+paths and gradient return. Actual CUDA/NPU validation is reported separately
+in the evidence report; untested combinations remain untested. NPU segmentation adds launches and activation
+copies, so lower weight-copy volume does **not** establish faster training or
+lower peak memory. See the [hardware comparison protocol](../examples/qwen3_5.md#experimental-memory-candidate).
 
-Set `train.moe_load_balance_monitor_interval=N` to emit an interval every `N` optimizer steps. Logical expert counts are rank-local and reduced across the cached DP+SP/FSDP group containing all distinct token slices. In the supported `ep_outside=false` topology this group includes EP siblings: replicated router weights do not imply replicated input tokens. Physical plan data, in contrast, has already been gathered across EP and is identical on its siblings. Only EP-local rank 0 records that plan before the DP+SP/FSDP reduction. Every rank still enters the monitor collectives, including ranks with no physical contribution. This avoids multiplying moved-token totals, replica-event counts, and physical heatmap loads by `ep_size`; normalized imbalance and moved fractions alone would not reveal that error.
+## Telemetry and artifacts
 
-For a physical rank-load row `x` with `R` ranks, normalized imbalance is
+Logical router histograms sum every distinct rank-local token slice over the
+cached DP+SP/FSDP group. Physical plans are already EP-global: only EP-local
+rank 0 contributes them, while every rank joins monitoring collectives. This
+prevents EP-size inflation of absolute moved-token/replica/heatmap counts.
+Physical telemetry counts executions, including activation-checkpoint
+recomputation forwards; its absolute totals are not unique training-token counts.
 
-```text
-imbalance(x) = 0                                      if sum(x) = 0
-             = mean_r(abs(R * x[r] / sum(x) - 1))   otherwise
-```
-
-For each layer, moved-token fraction is `moved_tokens / total_routed_tokens`, or zero when the denominator is zero. The monitor publishes per-layer values, cross-layer `max`/`avg` values for imbalance and fraction, and `sum`/`max`/`avg` values for replicas, moved tokens, and total routed tokens. The frozen aggregate acceptance keys are:
+For physical loads `x` over `R` ranks, imbalance is zero if their sum is zero;
+otherwise it is `mean(abs(R*x/sum(x)-1))`. Moved fraction is
+`moved_tokens/total_routed_tokens`, or zero for an empty denominator.
+Acceptance telemetry keys are:
 
 - `moe/ep_rank_imbalance_before/avg`
 - `moe/ep_rank_imbalance_after/avg`
@@ -89,34 +162,35 @@ For each layer, moved-token fraction is `moved_tokens / total_routed_tokens`, or
 - `moe/ep_moved_tokens/sum`
 - `moe/ep_moved_token_fraction/avg`
 
-Before/after physical-rank heatmaps are media values; scalar sinks must not serialize them as numbers. Every rank participates in the interval collectives, while only the formatting/logging rank publishes scalar/media output.
+The callback requests heatmaps only for an enabled WandB image sink.
+`MoERouterMonitor.compute_metrics(..., render_heatmaps=False)` retains scalar
+values, collectives, cadence and reset; direct callers render images by default.
 
-## Synthetic accelerator E2E
+The [comparison reporter](../../scripts/profile/compare_moe_ep_load_balance.py)
+accepts strict schema-version-1 envelopes, flat JSON, per-step JSONL or plain
+loss/gradient logs. It rejects nonfinite/misaligned curves and inconsistent
+critical metadata. Precision uses `abs(delta) <= atol + rtol*abs(baseline)`;
+undefined Pearson correlation is unavailable with a reason. Timing, throughput,
+P2P and memory sections require explicit fields on both sides. Missing
+measurements remain unavailable, never zero or inferred values.
 
-`tests/e2e/test_qwen3_5_moe_ep_load_balance.py` skips before dataset or checkpoint creation unless at least four compatible devices and required packages are available. CUDA must be NVIDIA rather than ROCm, each of the four selected devices must be SM70 or newer, and the `triton`, `fla`, `flash_attn`, and `liger_kernel` imports must resolve. NPU requires both `torch_npu` and the `triton` import provided by `triton-ascend`. It creates one seed-0 CPU-fp32, native-stacked toy checkpoint and reuses one dummy dataset for exactly two matched four-process FSDP2/SP=1/EP=2 jobs.
+## CI proof and rollback
 
-A stateless router-replay manager forces unique top-k IDs `[0, 1]` for every Qwen3.5 router. Both experts belong to EP rank 0 in the 16-expert, EP=2 toy. Baseline and enabled jobs use the same replay manager, checkpoint, data ordering, seed, dtype, batch sizes, gradient-checkpointing setting, backend, and two-step schedule. Only feature enablement, output directory, and run label differ. The temporary wrapper reuses `TestVLMTrainer`, replaces only its log sink, and restores the replay singleton in `finally`.
+Unit workflows run planner/executor/dispatch/config/monitor/reporter and E2E
+gate contracts without accelerator training. The separate GPU/NPU E2E
+workflows select the exact matched-training node in strict prerequisite mode
+(`VEOMNI_REQUIRE_EP_BALANCE_E2E=1`). CUDA requires four NVIDIA SM70+ devices
+and its declared imports; NPU requires four devices, `torch_npu` and the
+`triton` import supplied by `triton-ascend`. Missing prerequisites fail those
+jobs. Ordinary local invocation skips before fixture creation.
+Forced hotspots, two steps and blocking launches prove function/limited
+precision, not throughput. NPU's separate two-rank alias/gradient node is
+launched explicitly with torchrun in unit CI.
 
-The test requires finite, equal-length loss and gradient-norm curves within `rtol=atol=0.1`; positive candidate replica/move telemetry; no step whose after-imbalance exceeds before-imbalance; and at least one strict improvement. `CUDA_LAUNCH_BLOCKING=1`, two steps, and a forced hotspot make this functional/precision coverage only. It provides no throughput, overlap, or memory conclusion.
-
-Both accelerator E2E workflows invoke only the exact real-hardware test node `test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry` in a step separate from the existing SP/EP grid and set `VEOMNI_REQUIRE_EP_BALANCE_E2E=1`. In that strict CI mode, every unsupported device type, insufficient device count, ROCm, insufficient CUDA capability, or missing-package prerequisite is a test failure rather than a skip, so a dedicated accelerator job cannot pass without executing the hardware proof. Static workflow/backend and local-policy gate tests remain in ordinary pytest without the strict variable; this prevents their intentional skip assertions from inheriting the hardware job's policy. A CPU or Mac still skips the real E2E before fixture materialization during ordinary local invocation, and that skip is not accelerator evidence.
-
-## Comparison artifacts
-
-`scripts/profile/compare_moe_ep_load_balance.py` compares canonical schema-version-1 JSON envelopes. It also normalizes flat `log_dict.json`, per-step JSONL, and plain loss/gradient training logs. Schema version is strictly integer `1` (not `true` or `1.0`). JSONL tracks whether metadata has been seen so an empty metadata object cannot hide a later change. Shared critical metadata uses type-sensitive equality. The reporter rejects missing, boolean, non-numeric, non-finite, or misaligned curves; each present `step_time_s`, `step_tokens`, `tokens_per_second`, `p2p_bytes`, and `p2p_wait_time_s` series must align with the same run's loss/gradient step count.
-
-Precision reports maximum absolute/epsilon-safe relative error, repository-close and relative-threshold hit rates, and standard Pearson correlation. Correlation is unavailable, with a reason, for fewer than two points or zero variance. Optional timing, throughput, P2P, and peak-memory sections are available only when both artifacts explicitly contain the required values; absent values remain `null` with a side-specific reason. `p2p_bytes` reports warmup totals/means, steady totals/means, candidate-minus-baseline deltas, and candidate/baseline ratios. `p2p_wait_time_s` reports warmup/steady means, candidate-minus-baseline steady delta, and baseline/candidate speedup. Both are canonical per-step inputs exported by profiler post-processing or runtime instrumentation; the reporter does not collect or infer them. Deterministic JSON and Markdown expose the same available aggregates.
-
-## Rollback
-
-For an immediate runtime rollback, set:
-
-```yaml
-train:
-  moe_load_balance_monitor_interval: 0
-  moe_ep_load_balance:
-    enabled: false
-    max_replicas_per_rank: 1
-```
-
-This restores the pre-feature fused EP dispatch without changing the model checkpoint. For a code rollback, remove only the Qwen3.5 EP-balance planner/dispatcher/monitor integrations and their scoped tests/docs; do not edit generated modeling files or destructively reset an unrelated dirty worktree.
+Rollback is `train.moe_ep_load_balance.enabled=false` and
+`train.moe_load_balance_monitor_interval=0`; checkpoints need no conversion.
+Set `train.moe_ep_load_balance.optimize_memory=false` first if it was enabled.
+To roll back only the memory candidate, leave balancing enabled and set this
+memory flag to `false`.
+Code rollback must remove only scoped feature changes, not reset unrelated
+work or hand-edit generated modeling files.

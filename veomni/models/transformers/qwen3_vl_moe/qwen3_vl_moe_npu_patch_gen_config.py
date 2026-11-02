@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE NPU build (transformers>=5.9.0).
+Patch configuration for Qwen3-VL-MoE NPU build (transformers>=5.16.1).
 
 Inherits every GPU patch from `qwen3_vl_moe_gpu_patch_gen_config` (which in
 turn reuses the qwen3_vl VLM patches) and layers NPU kernel replacements on
@@ -44,6 +44,7 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     qwen3_vl_moe_for_conditional_generation_forward_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
+    qwen3_vl_moe_model_init_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -67,6 +68,12 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLMoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+
+config.override_method(
+    "Qwen3VLMoeModel.__init__",
+    replacement=qwen3_vl_moe_model_init_patched,
+    description="Construct generated towers and propagate the MoE implementation to text_config",
+)
 
 
 # ================================================================
