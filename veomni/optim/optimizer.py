@@ -456,6 +456,41 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _build_state_offload_optimizer(
+    optimizer_type: str,
+    param_groups: Sequence[Dict[str, Any]],
+    *,
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    optimizer_config: Optional["OptimizerConfig"],
+) -> "Optimizer":
+    """Build the optimizer whose moment states live in host buffers.
+
+    ``optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
+    algorithm dispatch lives here, so a new offloadable algorithm is one branch
+    rather than one helper per algorithm. Muon will add its own ``elif`` (its
+    AdamW leaf is what carries host state today).
+    """
+    if optimizer_type == "adamw":
+        from .swap_adamw import SwapAdamW
+
+        return SwapAdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            mem_fraction_static=0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static,
+            pin_memory=True if optimizer_config is None else optimizer_config.swap_pin_memory,
+        )
+    else:
+        raise ValueError(
+            f"optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+        )
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -474,12 +509,12 @@ def build_optimizer(
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
     that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
-    ``adamw_swap``'s ``swap_mem_fraction_static``/``swap_pin_memory``) are read
-    here rather than unpacked by every trainer. It does *not* supply ``lr``,
-    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
-    because callers such as the VLM trainer drive the AdamW side from their own
-    param groups. ``muon_kwargs`` overrides the config key by key, for callers
-    that build Muon without an ``OptimizerConfig`` at all.
+    ``state_offload='cpu'``'s ``swap_mem_fraction_static``/``swap_pin_memory``)
+    are read here rather than unpacked by every trainer. It does *not* supply
+    ``lr``, ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit
+    arguments, because callers such as the VLM trainer drive the AdamW side from
+    their own param groups. ``muon_kwargs`` overrides the config key by key, for
+    callers that build Muon without an ``OptimizerConfig`` at all.
     """
     if optimizer_type == "muon":
         if optimizer_config is not None:
@@ -547,29 +582,28 @@ def build_optimizer(
     if not param_groups:
         raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
-    if optimizer_type == "adamw":
-        foreach = not fused
-        fused = fused
-        optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
-    elif optimizer_type == "adamw_swap":
-        from .swap_adamw import SwapAdamW
-
-        mem_fraction_static = 0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static
-        pin_memory = True if optimizer_config is None else optimizer_config.swap_pin_memory
-        optim = SwapAdamW(
+    if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+        # State offload is a placement choice, not a new algorithm: dispatch on it
+        # first; the algorithm branch lives in the helper.
+        return _build_state_offload_optimizer(
+            optimizer_type,
             param_groups,
             lr=lr,
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            mem_fraction_static=mem_fraction_static,
-            pin_memory=pin_memory,
+            optimizer_config=optimizer_config,
         )
+
+    if optimizer_type == "adamw":
+        foreach = not fused
+        fused = fused
+        optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
         raise ValueError(
-            "Only adamw, adamw_swap, anyprecision_adamw and muon are supported as optimizers; "
+            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
             f"got optimizer_type={optimizer_type!r}."
         )
 
@@ -939,27 +973,27 @@ def build_extra_parallel_fsdp2_optimizer(
     # ``step``, so there is no cross-leaf copy to serialize.
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
-        if optimizer_type == "adamw":
-            nonlocal fused
-            foreach = not fused
-            _fused = fused
-            return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
-        elif optimizer_type == "adamw_swap":
-            from .swap_adamw import SwapAdamW
-
-            return SwapAdamW(
+        if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+            # Same outer dispatch as the dense path: offload decides placement,
+            # the helper decides the algorithm.
+            return _build_state_offload_optimizer(
+                optimizer_type,
                 groups,
                 lr=lr,
                 betas=betas,
                 eps=eps,
                 weight_decay=weight_decay,
-                mem_fraction_static=0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static,
-                pin_memory=True if optimizer_config is None else optimizer_config.swap_pin_memory,
+                optimizer_config=optimizer_config,
             )
+        if optimizer_type == "adamw":
+            nonlocal fused
+            foreach = not fused
+            _fused = fused
+            return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw, adamw_swap and anyprecision_adamw are supported as optimizers.")
+            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     for para in parallel_state.extra_parallel_names:

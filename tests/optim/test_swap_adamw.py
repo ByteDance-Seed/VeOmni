@@ -841,3 +841,18 @@ def test_async_save_snapshots_state_before_later_steps(cpu_mesh, tmp_path):
             )
             # The live buffers moved past the snapshot, so the match above is meaningful.
             assert not torch.equal(snapshot[src_param][key], opt._host_states[src_param][key])
+
+
+def test_build_optimizer_routes_state_offload_to_swap_adamw():
+    """``state_offload='cpu'`` is a placement flag, not a separate optimizer type."""
+    from veomni.arguments.arguments_types import OptimizerConfig
+    from veomni.optim.optimizer import build_optimizer
+
+    model = nn.Linear(4, 3)
+
+    cfg = OptimizerConfig(state_offload="cpu")
+    offloaded = build_optimizer(model, lr=1e-3, optimizer_type=cfg.type, optimizer_config=cfg)
+    assert isinstance(offloaded, SwapAdamW)
+
+    stock = build_optimizer(model, lr=1e-3, optimizer_type="adamw")
+    assert not isinstance(stock, SwapAdamW)
