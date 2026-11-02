@@ -41,7 +41,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 
 ## Known Limitations
 
-- **No fused kernels yet.** Liger, fused MoE and the other CUDA kernels are not available; ops run on `eager`. Attention runs on `sdpa` by default. The only FlashAttention path is the Hub adapter, `veomni_flash_attention_2_hub`, which needs the `kernels` package; the local `flash_attn` package is not available, and Ulysses sequence parallelism needs the Hub adapter because `sdpa` does not support it.
+- **No fused kernels yet.** Liger, fused MoE and the other CUDA kernels are not available; ops run on `eager`. The default attention backend `flash_attention_2` has no Intel GPU build, so select one explicitly: `sdpa` (see the configuration above; with Ulysses sequence parallelism it needs a full-sequence 2D attention mask or `cu_seqlens` when the model uses a custom mask function), or `veomni_flash_attention_2_hub`, which needs the `kernels` package. The Hub adapter is the only FlashAttention path on Intel GPU; the local `flash_attn` package is not available.
 - **No linear-attention models yet.** Models with gated delta net layers, such as Qwen3.5, need the `fla` kernels for packed sequences, and those are not registered for Intel GPU.
 - **No expert parallelism.** Set `model.accelerator.ep_size=1` until an XPU-compatible implementation is available.
 - **Low-precision ReduceScatter transport is CUDA-only.**
