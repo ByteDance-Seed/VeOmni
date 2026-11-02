@@ -271,11 +271,6 @@ def _reject_unproven_extra_parallel_optimizer(
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel optimizer state", group=group)
-    if dist.is_initialized():
-        signatures = [None] * dist.get_world_size(group)
-        dist.all_gather_object(signatures, signature, group=group)
-        if any(item != signature for item in signatures):
-            raise RuntimeError("Ranks disagree on canonical ExtraParallel checkpoint layout")
     error = None
     try:
         if signature is not None:
