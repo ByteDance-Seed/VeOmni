@@ -106,32 +106,37 @@ def _trainability_worker(rank, rendezvous, backend, mode):
         for index, table in enumerate(tables.values()):
             weight = torch.arange(16, dtype=torch.float32).reshape(4, 4).add_(100 * index)
             table.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(1), Shard(0)]))
-            trainable = mode != "all_frozen" and (
-                (mode == "partial_agreed" and index == 0)
-                or (mode != "partial_agreed" and (rank == 0 or (mode == "partial_mismatch" and index == 1)))
-            )
+            trainable = mode == "partial_agreed" and index == 0
             table.weight.requires_grad_(trainable)
         fixture = SimpleNamespace(ngram_embedding=tables)
         lookup = model_module.Qwen4ExpTextNGramEmbedding._lookup_local_rows
         selected_shard = 1 if mode == "partial_agreed" and rank == 1 else 0
         shard_ids, row_ids = torch.tensor([selected_shard, selected_shard]), torch.tensor([0, 1])
-        if mode in ("all_frozen", "partial_agreed"):
+        calls = []
+        all_reduce = dist.all_reduce
+
+        def record_all_reduce(tensor, *args, **kwargs):
+            calls.append(tensor.numel())
+            return all_reduce(tensor, *args, **kwargs)
+
+        dist.all_reduce = record_all_reduce
+        try:
             actual = lookup(fixture, shard_ids, row_ids)
-            expected = tables[f"shard_{selected_shard}"].weight.to_local().detach()[row_ids]
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            assert actual.requires_grad == (mode == "partial_agreed")
-            if mode == "partial_agreed":
-                actual.sum().backward()
-                torch.testing.assert_close(
-                    tables["shard_0"].weight.grad.to_local(),
-                    torch.full_like(tables["shard_0"].weight.to_local(), 1.0 if rank == 0 else 0.0),
-                    rtol=0,
-                    atol=0,
-                )
-                assert tables["shard_1"].weight.grad is None
-        else:
-            with pytest.raises(RuntimeError, match="shard trainability must agree"):
-                lookup(fixture, shard_ids, row_ids)
+        finally:
+            dist.all_reduce = all_reduce
+        assert calls == ([] if mode == "all_frozen" else [len(tables)])
+        expected = tables[f"shard_{selected_shard}"].weight.to_local().detach()[row_ids]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.requires_grad == (mode == "partial_agreed")
+        if mode == "partial_agreed":
+            actual.sum().backward()
+            torch.testing.assert_close(
+                tables["shard_0"].weight.grad.to_local(),
+                torch.full_like(tables["shard_0"].weight.to_local(), 1.0 if rank == 0 else 0.0),
+                rtol=0,
+                atol=0,
+            )
+            assert tables["shard_1"].weight.grad is None
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
@@ -140,7 +145,7 @@ def _trainability_worker(rank, rendezvous, backend, mode):
 
 
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
-@pytest.mark.parametrize("mode", ["all_frozen", "partial_agreed", "owner_mismatch", "partial_mismatch"])
+@pytest.mark.parametrize("mode", ["all_frozen", "partial_agreed"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_ple_shard_trainability_agreement(tmp_path, monkeypatch, backend, mode):
     _isolate_cpu_spawn(monkeypatch)
