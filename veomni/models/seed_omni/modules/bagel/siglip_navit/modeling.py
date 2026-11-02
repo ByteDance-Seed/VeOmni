@@ -320,11 +320,6 @@ class BagelSiglipVisionEmbeddings(nn.Module):
         return patch_embeds + position_embeds.to(device=patch_embeds.device, dtype=patch_embeds.dtype)
 
 
-def _is_flash_attention_impl(impl: str | None) -> bool:
-    """Return whether ``impl`` names a FlashAttention backend."""
-    return impl is not None and "flash_attention" in impl
-
-
 class BagelSiglipAttention(nn.Module):
     def __init__(self, config: BagelSiglipNavitConfig) -> None:
         """Initialize NaViT self-attention projections and instance-local ``VeomniOp`` handles."""
@@ -332,6 +327,7 @@ class BagelSiglipAttention(nn.Module):
         self.config = config
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_groups = 1
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
@@ -349,9 +345,13 @@ class BagelSiglipAttention(nn.Module):
         self.veomni_rope = VeomniOp("rope", "full", rope_impl)
 
         attn_impl = config.ops_config.attn_implementation
-        if not attn_impl or attn_impl == "eager":
-            attn_impl = "veomni_sdpa"
-        self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+        if "attn_implementation" not in config.ops_implementation:
+            try:
+                self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+            except RuntimeError:
+                self.veomni_attn = VeomniOp("attention", "standard", "veomni_sdpa")
+        else:
+            self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 
     def forward(
         self,
@@ -388,41 +388,21 @@ class BagelSiglipAttention(nn.Module):
         value_states = value_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
         dropout = 0.0 if not self.training else self.attention_dropout
 
-        if _is_flash_attention_impl(self.veomni_attn.impl):
-            attn_output, _ = self.veomni_attn(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                skip_ulysses=True,
-            )
-        else:
-            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-            splits = [torch.split(tensor, lengths, dim=2) for tensor in (query_states, key_states, value_states)]
-            attn_outputs = [
-                self.veomni_attn(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=dropout,
-                    is_causal=False,
-                    skip_ulysses=True,
-                )[0]
-                for q, k, v in zip(*splits, strict=True)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
-
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            skip_ulysses=True,
+        )
         return self.out_proj(attn_output.reshape(total_q_len, -1).to(hidden_states.dtype))
 
 

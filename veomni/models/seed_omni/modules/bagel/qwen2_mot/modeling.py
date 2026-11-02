@@ -789,12 +789,16 @@ class BagelQwen2MoTAttention(nn.Module):
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
         self.k_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
-        attn_impl = config.ops_config.attn_implementation
-        self.veomni_attn: VeomniOp | None = (
-            VeomniOp("attention", "standard", "veomni_flex_attention")
-            if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS
-            else None
+        attn_impl = (
+            config.ops_config.attn_implementation if "attn_implementation" in config.ops_implementation else "sdpa"
         )
+        self.veomni_attn_impl = attn_impl
+        self.veomni_attn: VeomniOp | None = None
+        if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
+            try:
+                self.veomni_attn = VeomniOp("attention", "standard", "veomni_flex_attention")
+            except RuntimeError:
+                self.veomni_attn = None
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
@@ -1398,6 +1402,14 @@ class BagelQwen2MoTBackbone(nn.Module):
         self.use_moe = "Mo" in config.layer_module
         self.attention_cls = attention_cls
 
+    def _bound_attn_implementation(self) -> str | None:
+        """Return the attention implementation bound onto the decoder layers at initialization."""
+        if len(self.layers) > 0:
+            bound = getattr(self.layers[0].self_attn, "veomni_attn_impl", None)
+            if bound is not None:
+                return bound
+        return self.config._attn_implementation
+
     def _build_inference_attention_mask(
         self,
         packed_query_sequence: torch.Tensor,
@@ -1419,7 +1431,7 @@ class BagelQwen2MoTBackbone(nn.Module):
             )
         return self.attention_cls.build_attention_mask(
             packed_attention_metadata.to(device=packed_query_sequence.device),
-            attn_implementation=self.config._attn_implementation,
+            attn_implementation=self._bound_attn_implementation(),
         )
 
     def _apply_inference_final_norm(
@@ -1450,7 +1462,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         """Run packed training forward across all MoT decoder layers and final expert norms."""
         attention_mask = self.attention_cls.build_attention_mask(
             packed_attention_metadata,
-            attn_implementation=self.config._attn_implementation,
+            attn_implementation=self._bound_attn_implementation(),
         )
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
         packed_position_cos = cos.squeeze(0)

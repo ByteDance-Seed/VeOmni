@@ -8,6 +8,7 @@ from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.models.conftest import available_nvidia_ops  # noqa: F401
 from tests.seed_omni.modules.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
@@ -176,7 +177,7 @@ def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) ->
         torch.testing.assert_close(getattr(veomni_loaded.model.layers[0].self_attn, name).bias, expected.bias)
 
 
-def test_bagel_qwen2_mot_selects_module_level_ops_without_global_ops_config() -> None:
+def test_bagel_qwen2_mot_selects_module_level_ops_without_global_ops_config(available_nvidia_ops) -> None:  # noqa: F811
     """Verify ``BagelQwen2MoTAccelerated`` binds ``VeomniOp`` handles from ``config.ops_config``."""
     cfg = BagelQwen2MoTConfig(
         vocab_size=128,
@@ -206,6 +207,7 @@ def test_bagel_qwen2_mot_selects_module_level_ops_without_global_ops_config() ->
     assert layer.self_attn.veomni_async_ulysses_o.variant == "bagel"
     assert layer.self_attn.veomni_attn is not None
     assert layer.self_attn.veomni_attn.impl == "veomni_flex_attention"
+    assert layer.self_attn.veomni_denoise_attn is not None
     assert layer.self_attn.veomni_denoise_attn.impl == "veomni_flash_attention_2"
 
 
@@ -233,12 +235,167 @@ def test_bagel_siglip_navit_selects_module_level_ops_and_forwards() -> None:
 
     packed_patches = torch.randn(4, 3 * 14 * 14)
     position_ids = torch.arange(4, dtype=torch.long)
-    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
-    out = model.vision_model(
-        patchified_pixel_values=packed_patches,
-        patchified_position_ids=position_ids,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=4,
+    for cu_seqlens, max_seqlen in (
+        (torch.tensor([0, 4], dtype=torch.int32), 4),
+        (torch.tensor([0, 2, 4], dtype=torch.int32), 2),
+    ):
+        out = model.vision_model(
+            patchified_pixel_values=packed_patches,
+            patchified_position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        assert out.shape == (4, 32)
+        assert torch.isfinite(out).all()
+
+
+class _CallCounter:
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    @property
+    def impl(self):
+        return self.inner.impl
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.inner(*args, **kwargs)
+
+
+@pytest.mark.parametrize("hidden_act", ["silu", "swish", "gelu"])
+def test_bagel_qwen2_mot_mlp_and_rms_norm_dispatch_through_veomni_ops(hidden_act: str) -> None:
+    """Verify ``Qwen2RMSNormAccelerated`` and ``Qwen2MLPAccelerated`` route through their ``VeomniOp`` handles."""
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as HFQwen2RMSNorm
+
+    from tests.models.compare import assert_module_forward_and_grads_match
+
+    cfg = BagelQwen2MoTConfig(
+        **{
+            **tiny_bagel_qwen2_cfg(),
+            "hidden_act": hidden_act,
+            "ops_implementation": {
+                "attn_implementation": "sdpa",
+                "rms_norm_implementation": "eager",
+                "swiglu_mlp_implementation": "eager",
+                "rotary_pos_emb_implementation": "eager",
+            },
+        }
     )
-    assert out.shape == (4, 32)
-    assert torch.isfinite(out).all()
+
+    torch.manual_seed(0)
+    hf_norm = HFQwen2RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+    ours_norm = accelerated.Qwen2RMSNormAccelerated(cfg.hidden_size, eps=cfg.rms_norm_eps, config=cfg)
+    ours_norm.load_state_dict(hf_norm.state_dict())
+    norm_counter = _CallCounter(ours_norm.veomni_rms_norm)
+    ours_norm.veomni_rms_norm = norm_counter
+    assert_module_forward_and_grads_match(hf_norm, ours_norm, torch.randn(3, cfg.hidden_size))
+    assert norm_counter.calls == 1
+    empty_norm_out = ours_norm(torch.empty(0, cfg.hidden_size, requires_grad=True))
+    assert empty_norm_out.shape == (0, cfg.hidden_size)
+    assert norm_counter.calls == 2
+
+    hf_mlp = HFQwen2MLP(cfg)
+    ours_mlp = accelerated.Qwen2MLPAccelerated(cfg)
+    ours_mlp.load_state_dict(hf_mlp.state_dict())
+    mlp_counter = _CallCounter(ours_mlp.veomni_swiglu_mlp)
+    ours_mlp.veomni_swiglu_mlp = mlp_counter
+    assert_module_forward_and_grads_match(hf_mlp, ours_mlp, torch.randn(3, cfg.hidden_size))
+    if hidden_act in {"silu", "swish"}:
+        assert mlp_counter.calls == 1
+        empty_mlp_out = ours_mlp(torch.empty(0, cfg.hidden_size, requires_grad=True))
+        assert empty_mlp_out.shape == (0, cfg.hidden_size)
+        assert mlp_counter.calls == 2
+    else:
+        assert mlp_counter.calls == 0
+
+
+def test_bagel_modules_keep_construction_ops_when_config_mutated() -> None:
+    """Verify ``BagelQwen2MoTAccelerated``, ``BagelSiglipNavit``, and ``BagelTextEncoderAccelerated`` keep construction-time ops after ``config.ops_implementation`` is mutated."""
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.configuration import BagelSiglipNavitConfig
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.modeling import BagelSiglipNavit
+    from veomni.models.seed_omni.modules.bagel.text_encoder.accelerated.accelerated import BagelTextEncoderAccelerated
+    from veomni.models.seed_omni.modules.bagel.text_encoder.configuration import BagelTextEncoderConfig
+
+    poison_ops = {
+        "attn_implementation": "sdpa",
+        "rms_norm_implementation": "liger_kernel",
+        "swiglu_mlp_implementation": "liger_kernel",
+        "rotary_pos_emb_implementation": "liger_kernel",
+        "rotary_pos_emb_vision_implementation": "liger_kernel",
+        "cross_entropy_loss_implementation": "liger_kernel",
+    }
+
+    # 1. BagelSiglipNavit forward isolation
+    siglip_cfg = BagelSiglipNavitConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        image_size=28,
+        patch_size=14,
+        rope=True,
+        ops_implementation={
+            "attn_implementation": "eager",
+            "rotary_pos_emb_vision_implementation": "eager",
+        },
+    )
+    siglip = BagelSiglipNavit(siglip_cfg).eval()
+    siglip_attn = siglip.vision_model.encoder.layers[0].self_attn
+    assert siglip_attn.veomni_attn.impl == "eager"
+    assert siglip_attn.veomni_rope.impl == "eager"
+
+    patches = torch.randn(4, 3 * 14 * 14)
+    pos_ids = torch.arange(4, dtype=torch.long)
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    with torch.no_grad():
+        siglip_ref = siglip.vision_model(patches, pos_ids, cu_seqlens=cu_seqlens, max_seqlen=2)
+        siglip_cfg.ops_implementation = dict(poison_ops)
+        assert siglip_attn.veomni_attn.impl == "eager"
+        assert siglip_attn.veomni_rope.impl == "eager"
+        siglip_out = siglip.vision_model(patches, pos_ids, cu_seqlens=cu_seqlens, max_seqlen=2)
+    torch.testing.assert_close(siglip_out, siglip_ref)
+
+    # 2. BagelTextEncoderAccelerated decode loss isolation
+    text_cfg = BagelTextEncoderConfig(
+        vocab_size=32,
+        hidden_size=16,
+        ops_implementation={"cross_entropy_loss_implementation": "eager"},
+    )
+    text_enc = BagelTextEncoderAccelerated(text_cfg).eval()
+    assert text_enc.veomni_ce.impl == "eager"
+    hidden = torch.randn(4, 16)
+    shift_labels = torch.tensor([1, 2, 3, -100], dtype=torch.long)
+    with torch.no_grad():
+        loss_ref = text_enc.decode(hidden_states=hidden, shift_labels=shift_labels)["loss"]
+        text_cfg.ops_implementation = dict(poison_ops)
+        assert text_enc.veomni_ce.impl == "eager"
+        loss_out = text_enc.decode(hidden_states=hidden, shift_labels=shift_labels)["loss"]
+    torch.testing.assert_close(loss_out, loss_ref)
+
+    # 3. BagelQwen2MoTAccelerated RoPE / RMSNorm / SwiGLU / Attention isolation
+    mot_cfg = _flex_config()
+    mot = accelerated.BagelQwen2MoTAccelerated(mot_cfg).eval()
+    layer = mot.model.layers[0]
+    rope_counter = _CallCounter(layer.self_attn.veomni_rope)
+    layer.self_attn.veomni_rope = rope_counter
+    q = torch.randn(3, layer.self_attn.num_heads, layer.self_attn.head_dim)
+    k = torch.randn(3, layer.self_attn.num_key_value_heads, layer.self_attn.head_dim)
+    cos = torch.ones(3, layer.self_attn.head_dim)
+    sin = torch.zeros(3, layer.self_attn.head_dim)
+    with torch.no_grad():
+        q_ref, k_ref = layer.self_attn.apply_rotary_pos_emb(q, k, cos, sin)
+        mlp_ref = layer.mlp(torch.randn(3, mot_cfg.hidden_size))
+        mot_cfg.ops_implementation = dict(poison_ops)
+        assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
+        assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
+        assert layer.self_attn.veomni_rms_norm.impl == "eager"
+        assert layer.self_attn.veomni_rope.impl == "eager"
+        assert layer.self_attn.veomni_attn_impl == "veomni_flex_attention"
+        assert mot.model._bound_attn_implementation() == "veomni_flex_attention"
+        q_out, k_out = layer.self_attn.apply_rotary_pos_emb(q, k, cos, sin)
+    torch.testing.assert_close(q_out, q_ref)
+    torch.testing.assert_close(k_out, k_ref)
+    assert rope_counter.calls == 2
+    assert torch.isfinite(mlp_ref).all()

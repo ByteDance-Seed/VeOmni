@@ -48,9 +48,6 @@ from ..modeling import (
     BagelQwen2MoTCore,
     InferenceMixin,
 )
-from ..modeling import (
-    _apply_rotary_pos_emb as _apply_rotary_pos_emb_eager,
-)
 from ..processing import PackedConversation, preprocess_mot_inputs
 
 
@@ -342,7 +339,7 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
 
 
 class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
-    """Qwen2 RMSNorm with instance-local VeomniOp fused dispatch."""
+    """Qwen2 RMSNorm with instance-local VeomniOp dispatch."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6, *, config: BagelQwen2MoTConfig | None = None) -> None:
         super().__init__(hidden_size, eps=eps)
@@ -351,49 +348,36 @@ class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
         self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply RMSNorm, falling back to eager on empty modality branches."""
-        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
-        # Triton kernel cannot launch the resulting zero-row grid.
-        if hidden_states.numel() == 0:
-            return super().forward(hidden_states)
-
-        if self.veomni_rms_norm.impl != "eager":
-            return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
-
-        return super().forward(hidden_states)
+        """Apply the instance-local ``rms_norm`` ``VeomniOp``."""
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 class Qwen2MLPAccelerated(Qwen2MLP):
-    """Qwen2 SwiGLU MLP with instance-local VeomniOp fused dispatch."""
+    """Qwen2 SwiGLU MLP with instance-local VeomniOp dispatch."""
 
     def __init__(self, config: BagelQwen2MoTConfig) -> None:
         super().__init__(config)
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SwiGLU MLP, falling back to eager on empty modality branches."""
-        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
-        # Triton kernel cannot launch the resulting zero-row grid.
-        if x.numel() == 0:
-            return super().forward(x)
+        """Apply the instance-local ``swiglu_mlp`` ``VeomniOp`` for ``silu``/``swish`` on plain linear projections."""
+        if self.config.hidden_act not in {"silu", "swish"} and self.veomni_swiglu_mlp.impl != "eager":
+            raise ValueError(
+                f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
+                "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
+                "to use the Transformers reference implementation."
+            )
 
-        if self.veomni_swiglu_mlp.impl != "eager":
-            if self.config.hidden_act not in {"silu", "swish"}:
-                raise ValueError(
-                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
-                    "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
-                    "to use the Transformers reference implementation."
-                )
-            if has_plain_linear_projections(self):
-                return self.veomni_swiglu_mlp(
-                    x,
-                    self.gate_proj.weight,
-                    self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                    self.up_proj.weight,
-                    self.up_proj.bias if self.up_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                    self.down_proj.weight,
-                    self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-                )
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
 
         return super().forward(x)
 
@@ -407,38 +391,36 @@ def _apply_rotary_pos_emb(
     *,
     rope_op: VeomniOp | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Packed RoPE with optional instance-local VeomniOp dispatch."""
+    """Packed RoPE dispatched through the instance-local ``VeomniOp``."""
     if rope_op is None:
         rope_op = VeomniOp("rope", "full", "eager")
-    if q.numel() != 0 and k.numel() != 0 and rope_op.impl != "eager":
-        if unsqueeze_dim != 1:
-            raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
-        if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
-            raise NotImplementedError(
-                "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
-                "and cos/sin tensors shaped [tokens, head_dim]."
-            )
-        if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
-            raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
-        if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
-            raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
-
-        # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim].
-        # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
-        # a synthetic batch dimension and restore the packed layout afterwards.
-        q_embed, k_embed = rope_op(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            cos.unsqueeze(0),
-            sin.unsqueeze(0),
-            unsqueeze_dim=1,
+    if unsqueeze_dim != 1:
+        raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
+    if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
+        raise NotImplementedError(
+            "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
+            "and cos/sin tensors shaped [tokens, head_dim]."
         )
-        return (
-            q_embed.squeeze(0).transpose(0, 1).contiguous(),
-            k_embed.squeeze(0).transpose(0, 1).contiguous(),
-        )
+    if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
+        raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
+    if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
+        raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
 
-    return _apply_rotary_pos_emb_eager(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim]
+    # for LLM-dtype arithmetic (whereas 3-D [S, H, D] triggers vision FP32 promotion).
+    # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
+    # a synthetic batch dimension and restore the packed layout afterwards.
+    q_embed, k_embed = rope_op(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        cos.unsqueeze(0),
+        sin.unsqueeze(0),
+        unsqueeze_dim=1,
+    )
+    return (
+        q_embed.squeeze(0).transpose(0, 1).contiguous(),
+        k_embed.squeeze(0).transpose(0, 1).contiguous(),
+    )
 
 
 _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
@@ -473,17 +455,23 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_async_ulysses_qkv = VeomniOp("async_ulysses_qkv", "bagel")
         self.veomni_async_ulysses_o = VeomniOp("async_ulysses_o", "bagel")
-        attn_impl = _normalize_packed_attn_impl(config.ops_config.attn_implementation)
-        if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
-            self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
-        elif attn_impl in _MAGI_ATTN_IMPLEMENTATIONS:
+        attn_impl = _normalize_packed_attn_impl(
+            config.ops_config.attn_implementation
+            if "attn_implementation" in config.ops_implementation
+            else "veomni_flex_attention"
+        )
+        self.veomni_attn_impl = attn_impl
+        if attn_impl in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
             try:
-                self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+                self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
             except RuntimeError:
                 self.veomni_attn = None
         else:
             self.veomni_attn = None
-        self.veomni_denoise_attn = VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        try:
+            self.veomni_denoise_attn: VeomniOp | None = VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        except RuntimeError:
+            self.veomni_denoise_attn = None
         self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
         self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
@@ -532,17 +520,16 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim, rope_op=self.veomni_rope)
 
     def _resolve_packed_attn_op(self, *, context: str) -> VeomniOp:
-        """Resolve the packed fused attention ``VeomniOp`` for ``context``."""
-        attn_impl = _normalize_packed_attn_impl(self.config._attn_implementation)
-        if attn_impl not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
+        """Resolve the packed fused attention ``VeomniOp`` bound at initialization for ``context``."""
+        if self.veomni_attn is not None:
+            return self.veomni_attn
+        if self.veomni_attn_impl not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
             raise ValueError(
                 f"BAGEL Qwen2-MoT {context} requires packed fused attention "
                 f"({', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}), got "
-                f"{self.config._attn_implementation!r}."
+                f"{self.veomni_attn_impl!r}."
             )
-        if self.veomni_attn is not None and self.veomni_attn.impl == attn_impl:
-            return self.veomni_attn
-        return VeomniOp("attention", "standard", attn_impl)
+        return VeomniOp("attention", "standard", self.veomni_attn_impl)
 
     def attend(
         self,
@@ -594,7 +581,8 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
             )
             return packed_attn_output.squeeze(0)
 
-        packed_attn_output, _ = self.veomni_denoise_attn(
+        denoise_op = self.veomni_denoise_attn or VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        packed_attn_output, _ = denoise_op(
             self,
             packed_query_states.transpose(0, 1).unsqueeze(0),
             merged_key_states.transpose(0, 1).unsqueeze(0),
