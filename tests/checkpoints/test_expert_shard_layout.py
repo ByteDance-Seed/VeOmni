@@ -210,3 +210,46 @@ def test_lora_adapter_export_preserves_expert_shard_layout(world, shard_dim, neg
     spawn_with_rendezvous(
         _lora_export_worker, args=(world, shard_dim, negative_ep, use_v2, str(tmp_path / "adapter")), nprocs=world
     )
+
+
+def _ordinary_fsdp_expert_export_worker(rank, root, ndim, endpoint):
+    from torch.distributed.tensor import distribute_tensor
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("fsdp",))
+        shape = (8,) + (4,) * (ndim - 1)
+        expected = torch.arange(8 * 4 ** (ndim - 1), dtype=torch.float32).reshape(shape)
+        weight = distribute_tensor(expected, mesh, [Shard(0)])
+        dcp.save({"model": {"experts": {"weight": weight}}}, checkpoint_id=root, planner=_ExtraParallelSavePlanner())
+        dist.barrier()
+        result = [None]
+        if rank == 0:
+            try:
+                metadata = dcp.FileSystemReader(root).read_metadata()
+                assert metadata.planner_data[_EXPERT_LAYOUTS_KEY] == {"version": 1, "tensors": {}}
+                exported = dcp_to_torch_state_dict(root)
+                torch.testing.assert_close(exported["experts.weight"], expected, rtol=0, atol=0)
+            except Exception as exc:
+                result[0] = repr(exc)
+        dist.broadcast_object_list(result, src=0)
+        assert result[0] is None, result[0]
+
+        # An old expert-only chunk has no provenance, even when the target is
+        # ordinary FSDP. It must not be loaded and re-saved as canonical.
+        legacy = root + "-legacy"
+        dcp.save({"model": {"experts": {"weight": weight}}}, checkpoint_id=legacy)
+        target = {"model": {"experts": {"weight": torch.zeros_like(weight)}}}
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            dcp.load(target, checkpoint_id=legacy, planner=_ModelStrictLoadPlanner(strict_model=True))
+        assert target["model"]["experts"]["weight"].to_local().count_nonzero() == 0
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [2])
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_recorded_non_ep_fsdp_expert_export(world, ndim, tmp_path):
+    assert world == 2
+    spawn_with_rendezvous(_ordinary_fsdp_expert_export_worker, args=(str(tmp_path / "dcp"), ndim), nprocs=world)

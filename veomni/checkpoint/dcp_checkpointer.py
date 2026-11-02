@@ -209,13 +209,22 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         for key, value in self.state_dict.items():
             layout = _expert_layout(value)
             saved = self.metadata.state_dict_metadata.get(key)
-            if layout is None or saved is None:
+            if saved is None:
                 continue
             # For legacy VeOmni EP weights, the faulty same-axis layout only
             # split the expert dimension. A source chunk that splits matrix
             # rows (old dim-1 FSDP), or spans all experts, cannot have that
             # permutation. This uses saved chunks, never the target FSDP dim.
-            ep_dim = layout["ep_shard_dim"]
+            if layout is None:
+                # A non-EP target can also load an ambiguous old EP source;
+                # letting it re-save would incorrectly mark that data as
+                # canonical. The stacked VeOmni expert axis is dimension 0.
+                shape = getattr(saved, "size", ())
+                if "experts" not in key.split(".") or len(shape) < 2:
+                    continue
+                ep_dim = 0
+            else:
+                ep_dim = layout["ep_shard_dim"]
             if all(
                 chunk.sizes[ep_dim] == saved.size[ep_dim]
                 or any(size < saved.size[dim] for dim, size in enumerate(chunk.sizes) if dim != ep_dim)
@@ -2014,6 +2023,9 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys) -> None:
                 raise RuntimeError(
                     f"Checkpoint tensor {key!r} has noncanonical expert order; migrate it before export"
                 )
+        # The writer records every EP tensor; omissions are ordinary tensors,
+        # including FSDP-only expert shards, whose coordinates are canonical.
+        return
 
     marker_key = "model." + _extra_parallel_layout_key({})
     if marker_key in metadata.state_dict_metadata or planner_data.get("__veomni_ep_first_layout__") == 1:
@@ -2024,7 +2036,7 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys) -> None:
     for key in model_keys:
         tensor_metadata = metadata.state_dict_metadata[key]
         shape = getattr(tensor_metadata, "size", ())
-        if "experts" not in key.split(".") or len(shape) < 3 or key in layouts:
+        if "experts" not in key.split(".") or len(shape) < 2 or key in layouts:
             continue
         if any(
             chunk.sizes[0] < shape[0] and all(chunk.sizes[dim] == shape[dim] for dim in range(1, len(shape)))

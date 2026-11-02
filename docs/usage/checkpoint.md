@@ -257,7 +257,10 @@ Older readers may ignore that metadata and interpret these shards using the old
 FSDP-first order; do not use them for these checkpoints without a verified
 migration. Conversely, an old unversioned checkpoint with expert-only chunks
 may not prove its source order even when resumed with the same topology. The
-distributed reader rejects ambiguous sources when loading into EP/FSDP DTensors.
+distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
+FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
+metadata also needs verified source-layout migration, since it cannot be
+distinguished safely from an old EP checkpoint.
 Offline export also rejects unversioned expert-only chunks for stacked tensors
 under an `experts` module when their source order cannot be established. Other
 legacy tensor naming schemes may still need explicit source-layout verification
