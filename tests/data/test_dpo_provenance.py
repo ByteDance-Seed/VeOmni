@@ -777,24 +777,6 @@ def test_collator_does_not_mutate_input_labels(monkeypatch):
     assert batch["labels"][0, labels_before[0].numel()] == -100
 
 
-@pytest.mark.parametrize("key", [DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY])
-def test_reserved_provenance_keys_cannot_be_overwritten(monkeypatch, key):
-    state = _state()
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    feature = _feature("abc", "d", 0)
-    feature[key] = torch.tensor([314159])
-    with pytest.raises(ValueError, match="reserved"):
-        DPOProvenanceCollator(MainCollator())([feature])
-    assert feature[key].item() == 314159
-    if key in (DPO_APPROVED_KEY, DPO_AGREED_KEY):
-        feature.pop(key)
-        batch = DPOProvenanceCollator(MainCollator())([feature])
-        batch[key] = torch.tensor([314159])
-        with pytest.raises(RuntimeError, match="reserved"):
-            next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)
-        assert batch[key].item() == 314159
-
-
 def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "d", 5)

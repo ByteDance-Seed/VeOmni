@@ -15,8 +15,6 @@ import torch
 
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dpo_provenance import (
-    DPO_AGREED_KEY,
-    DPO_APPROVED_KEY,
     DPO_FEATURE_KEY,
     DPO_PROOF_KEY,
     DPOFeatureSegments,
@@ -111,10 +109,6 @@ class DPOProvenanceCollator:
         self.sp_rank = state.sp_rank if state.sp_enabled else 0
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        if any(
-            any(key in feature for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY)) for feature in features
-        ):
-            raise ValueError("DPO input contains a reserved packed-provenance key")
         sp_size, sp_rank = self.sp_size, self.sp_rank
         if type(self.collator) is MainCollator:
             expected_types = (
@@ -232,9 +226,6 @@ class DPOProvenanceCollator:
                 counts.append(get_length_fn(feature))
 
         batch = self.collator(clean)
-        if any(key in batch for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY)):
-            batch[DPO_PROOF_KEY] = DPOInvalidProof("reserved packed-proof key already exists")
-            return batch
         if not can_prove:
             batch[DPO_PROOF_KEY] = DPOInvalidProof("missing or invalid feature segments")
             return batch

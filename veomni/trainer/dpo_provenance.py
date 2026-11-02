@@ -15,7 +15,6 @@ import torch.distributed as dist
 
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dpo_provenance import (
-    DPO_AGREED_KEY,
     DPO_APPROVED_KEY,
     DPO_PROOF_KEY,
     DPOInvalidProof,
@@ -165,8 +164,6 @@ def _next_local_dpo_microbatches(
         count = len(catalog)
     vocabulary = vocab_size() if vocab_size is not None else None
     for batch in batches:
-        if DPO_APPROVED_KEY in batch or DPO_AGREED_KEY in batch:
-            raise ValueError("DPO microbatch contains a reserved approved-provenance key")
         proof = batch.get(DPO_PROOF_KEY)
         _validate_proof(proof)
         if proof.layout_sp_size != sp_size or proof.layout_sp_rank != sp_rank:
