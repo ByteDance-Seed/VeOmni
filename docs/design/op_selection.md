@@ -513,9 +513,12 @@ unavailable on the device.
 
 MiniMax M3 experts use the `swiglu_oai` variant, which registers `eager`,
 `fused_triton` and `fused_npu` only. It shares the standard merged-fc1 Triton
-and NPU paths (including EP) with a `swiglu_alpha` argument that replaces SiLU
-with the clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation; selecting
-an implementation without a row, such as `fused_quack`, fails at model build.
+and NPU paths (including EP) with `swiglu_alpha` and `swiglu_limit` arguments
+that replace SiLU with MiniMax's clamped activation: `gate` is clamped to
+`max=swiglu_limit` and `up` to `[-swiglu_limit, swiglu_limit]`, then the output
+is `(up + 1) * gate * sigmoid(swiglu_alpha * gate)` on the clamped values.
+Selecting an implementation without a row, such as `fused_quack`, fails at
+model build.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
