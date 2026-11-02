@@ -121,6 +121,11 @@ class InferenceMixin:
         return {"conversation_list": batched[0]}
 
 
+def _module_weight(module: nn.Module) -> torch.Tensor:
+    """Return the underlying weight parameter for plain or LoRA-wrapped modules."""
+    return getattr(module, "base_layer", module).weight
+
+
 class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
@@ -148,11 +153,11 @@ class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
 
     @property
     def _vit_device(self) -> torch.device:
-        return self.vision_model.embeddings.patch_embedding.weight.device
+        return _module_weight(self.vision_model.embeddings.patch_embedding).device
 
     @property
     def _connector_device(self) -> torch.device:
-        return self.connector.fc1.weight.device
+        return _module_weight(self.connector.fc1).device
 
     @property
     def _pos_embed_device(self) -> torch.device:
@@ -204,7 +209,8 @@ class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
         vit_hidden: torch.Tensor,
         patchified_position_ids: torch.LongTensor,
     ) -> torch.Tensor:
-        vit_hidden = vit_hidden.to(device=self._connector_device, dtype=self.connector.fc1.weight.dtype)
+        fc1_weight = _module_weight(self.connector.fc1)
+        vit_hidden = vit_hidden.to(device=fc1_weight.device, dtype=fc1_weight.dtype)
         patchified_position_ids = patchified_position_ids.to(device=self._pos_embed_device)
         image_embeds = self.connector(vit_hidden)
         return image_embeds + self.vit_pos_embed(patchified_position_ids).to(
@@ -308,14 +314,16 @@ class BagelSiglipVisionEmbeddings(nn.Module):
         patchified_pixel_values: torch.Tensor,
         patchified_position_ids: torch.LongTensor,
     ) -> torch.Tensor:
+        patch_weight = _module_weight(self.patch_embedding)
         patchified_pixel_values = patchified_pixel_values.to(
-            device=self.patch_embedding.weight.device,
-            dtype=self.patch_embedding.weight.dtype,
+            device=patch_weight.device,
+            dtype=patch_weight.dtype,
         )
         patch_embeds = self.patch_embedding(patchified_pixel_values)
         if self.position_embedding is None:
             return patch_embeds
-        position_ids = patchified_position_ids.to(device=self.position_embedding.weight.device, dtype=torch.long)
+        position_weight = _module_weight(self.position_embedding)
+        position_ids = patchified_position_ids.to(device=position_weight.device, dtype=torch.long)
         position_embeds = self.position_embedding(position_ids)
         return patch_embeds + position_embeds.to(device=patch_embeds.device, dtype=patch_embeds.dtype)
 

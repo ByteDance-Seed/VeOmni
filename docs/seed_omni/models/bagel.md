@@ -193,12 +193,12 @@ training does not use FlashAttention-2.
 
 | Backend | Class | Config | Use |
 |---------|-------|--------|-----|
-| FlexAttention | accelerated / eager | `train/modules_train.yaml`, `infer/modules_infer_eager.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training and inference |
-| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
+| FlexAttention | accelerated / eager | `train/modules_train.yaml`, `infer/modules_infer_eager.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training and inference (only supported packed backend on SM90) |
+| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM100+ CUTE DSL/JIT fused training |
 | SDPA | eager | CLI override onto `bagel_qwen2_mot` | Dense-mask oracle |
 
-Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
-from the CLI (the launcher rewrites it to `veomni_magi_attention`):
+Leave the YAML on `flex_attention` unless you are opting into Magi on SM100+.
+Enable Magi from the CLI (the launcher rewrites it to `veomni_magi_attention`):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
@@ -207,31 +207,13 @@ bash train.sh tasks/omni/train_omni.py \
   --train.micro_batch_size 1
 ```
 
-Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM90 or newer.
-Ulysses still works. On 8 ranks, `--model.accelerator.ulysses_size 4` gives
-`dp_shard=2` and SP4. Packed Magi/Flex is the training (and FSDP prefill) path;
-the denoise loop still uses FlashAttention-2. The Magi adapter contract is in
+Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM100 or newer
+(with CUTE DSL/JIT installed via `uv sync --extra gpu --extra magi --dev`).
+SM90 and older GPUs only support FlexAttention. Ulysses still works. On 8 ranks,
+`--model.accelerator.ulysses_size 4` gives `dp_shard=2` and SP4. Packed
+Magi/Flex is the training (and FSDP prefill) path; the denoise loop still uses
+FlashAttention-2. The Magi adapter contract is in
 [`docs/transformers_v5/veomni_attention_interface.md`](../../transformers_v5/veomni_attention_interface.md).
-
-#### SM90 nfunc vs dataset
-
-On SM90, Magi uses a precompiled CUTLASS overlay. `nfunc` is baked at install
-time: it is the HSTU interval count for the worst query in a sample, not the
-Magi range-list length. The installer default is `1,3,5`. A later exact
-`uv sync` removes the overlay, so rerun the installer before SM90 Magi runs.
-
-Text-only and single-image gen samples are typically `nfunc=1`. Multi-turn
-`seed_edit_p23_multi_turn` punches noise-key holes, so nfunc grows with the
-number of assistant images (about `2G-1`). That mixture needs **nfunc ≥ 11**:
-
-```bash
-bash scripts/kernel/install_magi_sm90.sh --nfunc 1,3,5,7,9,11
-```
-
-If a sample's runtime nfunc is missing from the compiled matrix, the kernel
-fails with `Compile-time kNFunc (...) must match runtime arbitrary_func_num (...)`.
-SM100+ uses CUTE DSL/JIT and compiles unseen nfunc at runtime, so it does not
-need this overlay matrix.
 
 ### 3.2 Offline VAE posterior cache (two stages)
 
@@ -370,8 +352,8 @@ YAML.
 The Bagel module and graph contracts cover carrier context-tag routing, generation
 state transitions, packing/cache behavior, and graph config structure. Packed
 MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
-in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
-SM90 CUTLASS overlay or SM100+ CUTE JIT backend is present.
+in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless an
+NVIDIA SM100+ GPU with the CUTE DSL/JIT backend is present.
 
 ```bash
 .venv/bin/python -m pytest -q tests/seed_omni/modules/bagel

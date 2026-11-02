@@ -8,6 +8,7 @@ import importlib.util
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.bagel.helpers import (
     ALIGN_ATOL,
     ALIGN_GRAD_ATOL,
@@ -25,7 +26,7 @@ from tests.seed_omni.modules.bagel.helpers import (
     tiny_align_qwen2_cfg,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import BagelQwen2MoTAccelerated
-from veomni.ops.kernels.attention.standard.magi import _fa4_cuda as magi_fa4_backend
+from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -36,30 +37,18 @@ _FLEX_IMPLEMENTATION = "veomni_flex_attention"
 
 
 def _is_magi_ffa_available() -> bool:
-    """Return whether a runnable MagiAttention CUTLASS or CUTE backend is installed on this GPU."""
+    """Return whether a runnable MagiAttention CUTE DSL/JIT backend is installed on this GPU."""
     if not IS_CUDA_AVAILABLE or importlib.util.find_spec("magi_attention") is None:
         return False
 
-    kernel_mode = magi_fa4_backend._get_magi_kernel_mode(torch.device(get_device_type()))
-    if kernel_mode == magi_fa4_backend._MAGI_KERNEL_CUTE_JIT:
-        return importlib.util.find_spec("flash_attn_cute") is not None
-    if kernel_mode != magi_fa4_backend._MAGI_KERNEL_CUTLASS:
-        return False
-
-    try:
-        from flash_attn_cute.ffa_fa3 import flash_attn_interface
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-    return all(
-        callable(getattr(flash_attn_interface, name, None)) for name in ("_flash_attn_forward", "_flash_attn_backward")
+    device = torch.device(get_device_type())
+    return magi_kernel.get_kernel_mode(device) == magi_kernel.KERNEL_CUTE_JIT and (
+        importlib.util.find_spec("flash_attn_cute") is not None
     )
 
 
 _MAGI_FFA_AVAILABLE = _is_magi_ffa_available()
-_MAGI_FFA_REASON = (
-    "MagiAttention alignment requires a supported NVIDIA GPU with its CUTLASS overlay or CUTE DSL/JIT backend"
-)
+_MAGI_FFA_REASON = "MagiAttention alignment requires an NVIDIA SM100+ GPU with the CUTE DSL/JIT backend"
 
 
 def _eager_config():
@@ -177,3 +166,20 @@ def test_accelerated_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
 @pytest.mark.parametrize("case", _CASES)
 def test_magi_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
     _assert_accelerated_matches_eager(case, _MAGI_IMPLEMENTATION)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_is_magi_ffa_available_checks_current_kernel_interface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify ``_is_magi_ffa_available`` queries ``magi_kernel.get_kernel_mode`` cleanly when Magi is installed."""
+    monkeypatch.setattr("tests.seed_omni.modules.bagel.test_bagel_accel_align.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(
+        "tests.seed_omni.modules.bagel.test_bagel_accel_align.get_device_type",
+        lambda: magi_kernel.CUDA_DEVICE_TYPE,
+    )
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+
+    monkeypatch.setattr(magi_kernel, "get_kernel_mode", lambda device: magi_kernel.KERNEL_UNSUPPORTED)
+    assert _is_magi_ffa_available() is False
+
+    monkeypatch.setattr(magi_kernel, "get_kernel_mode", lambda device: magi_kernel.KERNEL_CUTE_JIT)
+    assert _is_magi_ffa_available() is True

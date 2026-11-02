@@ -522,3 +522,70 @@ def test_bagel_siglip_navit_multi_image_sample_flops_and_seqlens() -> None:
     assert flops == pytest.approx(5.834821, rel=1e-4)
     assert overcounted_sample_flops == pytest.approx(6.588592, rel=1e-4)
     assert flops < overcounted_sample_flops
+
+
+def test_bagel_flow_connector_and_siglip_navit_support_lora_wrapped_projections() -> None:
+    """Verify ``BagelFlowConnector`` and ``BagelSiglipNavit`` run with ``LoraLinear``-wrapped projections."""
+    from veomni.lora.layers import LoraLinear
+    from veomni.models.seed_omni.modules.bagel.flow_connector.configuration import BagelFlowConnectorConfig
+    from veomni.models.seed_omni.modules.bagel.flow_connector.modeling import BagelFlowConnector
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.configuration import BagelSiglipNavitConfig
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.modeling import BagelSiglipNavit
+
+    flow_cfg = BagelFlowConnectorConfig(
+        hidden_size=16,
+        z_channels=4,
+        latent_patch_size=2,
+        max_latent_size=8,
+        timestep_frequency_embedding_size=8,
+    )
+    flow = BagelFlowConnector(flow_cfg).eval()
+    flow.vae2llm = LoraLinear(flow.vae2llm, adapter_name="default", r=2, lora_alpha=4)
+    flow.llm2vae = LoraLinear(flow.llm2vae, adapter_name="default", r=2, lora_alpha=4)
+    flow.time_embedder.mlp[0] = LoraLinear(flow.time_embedder.mlp[0], adapter_name="default", r=2, lora_alpha=4)
+    flow.time_embedder.mlp[2] = LoraLinear(flow.time_embedder.mlp[2], adapter_name="default", r=2, lora_alpha=4)
+    with torch.no_grad():
+        flow.vae2llm.lora_B["default"].weight.fill_(0.1)
+        flow.llm2vae.lora_B["default"].weight.fill_(0.1)
+        latent_out = flow.embed_latent(
+            latents=torch.randn(3, flow_cfg.patch_latent_dim),
+            position_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+            timesteps=torch.tensor([0.2, 0.5, 0.8], dtype=torch.float32),
+        )["latent_embeds"]
+        vel_out = flow.decode_velocity(torch.randn(3, flow_cfg.hidden_size))["velocity"]
+    assert latent_out.shape == (3, flow_cfg.hidden_size)
+    assert vel_out.shape == (3, flow_cfg.patch_latent_dim)
+    assert torch.isfinite(latent_out).all()
+    assert torch.isfinite(vel_out).all()
+
+    siglip_cfg = BagelSiglipNavitConfig(
+        hidden_size=16,
+        output_size=24,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        image_size=28,
+        patch_size=14,
+        rope=False,
+        ops_implementation={
+            "attn_implementation": "eager",
+            "rotary_pos_emb_vision_implementation": "eager",
+        },
+    )
+    siglip = BagelSiglipNavit(siglip_cfg).eval()
+    siglip.vision_model.embeddings.patch_embedding = LoraLinear(
+        siglip.vision_model.embeddings.patch_embedding, adapter_name="default", r=2, lora_alpha=4
+    )
+    siglip.connector.fc1 = LoraLinear(siglip.connector.fc1, adapter_name="default", r=2, lora_alpha=4)
+    siglip.connector.fc2 = LoraLinear(siglip.connector.fc2, adapter_name="default", r=2, lora_alpha=4)
+    patch_dim = siglip_cfg.num_channels * siglip_cfg.patch_size * siglip_cfg.patch_size
+    with torch.no_grad():
+        siglip_out = siglip(
+            patchified_pixel_values=torch.randn(4, patch_dim),
+            patchified_position_ids=torch.arange(4, dtype=torch.long),
+            cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
+            max_seqlen=2,
+            token_lens=torch.tensor([2, 2], dtype=torch.int32),
+        )
+    assert siglip_out["image_embeds"].shape == (4, siglip_cfg.output_size)
+    assert torch.isfinite(siglip_out["image_embeds"]).all()

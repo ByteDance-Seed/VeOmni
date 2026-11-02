@@ -286,6 +286,11 @@ class InferenceMixin:
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
 
+def _module_weight(module: nn.Module) -> torch.Tensor:
+    """Return the underlying weight parameter for plain or LoRA-wrapped linear modules."""
+    return getattr(module, "base_layer", module).weight
+
+
 class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
     config_class = BagelFlowConnectorConfig
     base_model_prefix = "bagel_flow_connector"
@@ -315,11 +320,11 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
 
     @property
     def _vae2llm_device(self) -> torch.device:
-        return self.vae2llm.weight.device
+        return _module_weight(self.vae2llm).device
 
     @property
     def _llm2vae_device(self) -> torch.device:
-        return self.llm2vae.weight.device
+        return _module_weight(self.llm2vae).device
 
     @property
     def _pos_embed_device(self) -> torch.device:
@@ -327,7 +332,7 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
 
     @property
     def _time_embedder_device(self) -> torch.device:
-        return self.time_embedder.mlp[0].weight.device
+        return _module_weight(self.time_embedder.mlp[0]).device
 
     def embed_latent(
         self,
@@ -336,7 +341,8 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         timesteps: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Project patchified latents and add timestep and 2D sinusoidal position embeddings."""
-        latents = latents.to(device=self._vae2llm_device, dtype=self.vae2llm.weight.dtype)
+        vae2llm_weight = _module_weight(self.vae2llm)
+        latents = latents.to(device=vae2llm_weight.device, dtype=vae2llm_weight.dtype)
         position_ids = position_ids.to(device=self._pos_embed_device, dtype=torch.long).reshape(-1)
         timesteps = timesteps.to(device=self._time_embedder_device, dtype=torch.float32).reshape(-1)
         if position_ids.numel() != latents.shape[0]:
@@ -352,7 +358,8 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         }
 
     def decode_velocity(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-        hidden_states = hidden_states.to(device=self._llm2vae_device)
+        llm2vae_weight = _module_weight(self.llm2vae)
+        hidden_states = hidden_states.to(device=llm2vae_weight.device, dtype=llm2vae_weight.dtype)
         return {"velocity": self.llm2vae(hidden_states)}
 
 
@@ -379,7 +386,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        first_weight = self.mlp[0].weight
+        first_weight = _module_weight(self.mlp[0])
         return self.mlp(t_freq.to(device=first_weight.device, dtype=first_weight.dtype))
 
 
