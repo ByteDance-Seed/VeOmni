@@ -265,11 +265,44 @@ non-persistent ExtraParallel shard in a checkpoint must use the canonical
 layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
 identifies canonical global values independently of source geometry, so DCP can
 reshard a model checkpoint across supported FSDP shard axes. Use
-`DistributedCheckpointer` for save and resume: it rejects old/unversioned
-layouts before copying model tensors. Migrating a legacy checkpoint requires
-verified source layout information. Canonical v2 optimizer save and resume use
+`DistributedCheckpointer` for save and resume: it rejects ambiguous unversioned
+expert layouts before copying model tensors unless the model-only source is
+explicitly declared as described below. Migrating a legacy optimizer checkpoint
+requires verified source layout information. Canonical v2 optimizer save and resume use
 the rank-local codec described below. The standard VeOmni HF export strips the
 namespace.
+
+### Known legacy VeOmni model-only sources
+
+An unversioned checkpoint does not record its producing EP/FSDP geometry. If
+the caller has independently verified that **every expert tensor** came from
+the legacy standard VeOmni TP1 implementation with expert axis 0 and FSDP
+axis 1, they may explicitly declare `legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"`
+on `DistributedCheckpointer.load` or `dcp_to_torch_state_dict`. All ranks must
+provide the same declaration. A legacy VeOmni TP1 source that used no expert
+parallelism at all can instead be declared as `"veomni_tp1_no_ep"`. A missing
+declaration keeps ambiguous sources
+fail-closed. This is a trusted assertion about the source, not a conclusion drawn
+from target geometry or the DCP chunks. In particular, do not declare this for
+same-axis Muon/EP checkpoints or external TP-produced shards. An incorrect
+assertion can silently permute experts. The declaration supports model-only
+restore/export and is rejected when restoring an optimizer; it does not migrate
+optimizer groups, moments, master weights or scheduler state. It does not load
+directly into the canonical v2 namespace: export the verified legacy weights
+and load them as model weights into the v2 target instead.
+This also applies to old non-EP optimizer checkpoints: an unversioned,
+FSDP-sharded expert bias or moment without source provenance can be rejected.
+Neither source declaration authorizes optimizer-state migration.
+When per-tensor source layout metadata is present, a recorded noncanonical
+expert is always rejected. Missing metadata for one expert is not inferred
+from the presence of metadata for another expert.
+
+For CLI export, pass `--legacy-expert-source-layout veomni_tp1_ep0_fsdp1` to
+`scripts/merge_dcp_to_hf.py` only after verifying the source. Use
+`--save-dtype preserve` when the checkpoint contains FP32 tensors that must not
+be rounded to BF16; the CLI retains its historical BF16 export default. This
+preserves tensor dtypes on disk; consumers must configure their loader to avoid
+subsequently casting the FP32 tensors.
 
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
