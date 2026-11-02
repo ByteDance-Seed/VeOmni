@@ -74,9 +74,17 @@ def test_registered_optimizer_preserves_lazy_state_and_next_update(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert target.bias not in restored.optimizers_dict["toy"].state
     for left, right in zip(source.parameters(), target.parameters(), strict=True):
         left.grad = torch.full_like(left, 0.125)
@@ -106,10 +114,18 @@ def test_registered_optimizer_raw_snapshot_is_detached_but_restore_requires_proo
 def test_registered_optimizer_rejects_changed_algorithm_before_loading(tmp_path):
     source, optimizer = _build()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _build(scale=2.0)
     with pytest.raises(RuntimeError, match="layout|identity|checkpoint"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 @pytest.mark.parametrize("changed_field", ["master_weight", "step"])
@@ -135,11 +151,19 @@ def test_lazy_adapter_state_dtype_policy_is_part_of_checkpoint_identity(tmp_path
     parallel = SimpleNamespace(dp_mode="ddp")
     source, optimizer = build(torch.float32)
     assert not optimizer.optimizers_dict["leaf"].state
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(torch.bfloat16)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity|checkpoint"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -157,7 +181,9 @@ def test_registered_single_optimizer_is_rejected_before_any_save_or_model_load(t
     invalid_dir = tmp_path / "single-optimizer"
     with pytest.raises(RuntimeError, match="require MultiOptimizer"):
         DistributedCheckpointer.save(
-            str(invalid_dir), {"model": source, "optimizer": optimizer}, parallel_state=parallel
+            str(invalid_dir),
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     assert not invalid_dir.exists()
 
@@ -175,6 +201,8 @@ def test_registered_single_optimizer_is_rejected_before_any_save_or_model_load(t
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="require MultiOptimizer"):
         DistributedCheckpointer.load(
-            str(model_dir), {"model": target, "optimizer": ToyAdamW(target.parameters())}, parallel_state=parallel
+            str(model_dir),
+            {"model": target, "optimizer": ToyAdamW(target.parameters()), "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)

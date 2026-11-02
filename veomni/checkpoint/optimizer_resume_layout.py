@@ -68,48 +68,15 @@ def _lr_layout(group, key, aliases):
 def _scheduler_layout(leaf):
     import math
 
-    from ..optim.lr_scheduler import checkpoint_scheduler_binding, checkpoint_scheduler_functions
+    from ..optim.lr_scheduler import checkpoint_scheduler_binding
 
     scheduler = checkpoint_scheduler_binding(leaf)
-    wrapped = getattr(leaf.step, "_wrapped_by_lr_sched", False)
     if scheduler is None:
-        if wrapped or "step" in vars(leaf):
-            raise RuntimeError("MultiOptimizer scheduler identity is unknown; explicit migration is required")
         return None
-    import weakref
-
-    def nested_codes(code):
-        result = {code}
-        for value in code.co_consts:
-            if isinstance(value, types.CodeType):
-                result.update(nested_codes(value))
-        return result
-
-    step = vars(leaf).get("step")
-    permitted = nested_codes(torch.optim.lr_scheduler.LRScheduler.__init__.__code__)
-    closure = getattr(step, "__closure__", None) or ()
-    captured = tuple(cell.cell_contents for cell in closure)
-    if (
-        getattr(step, "__code__", None) not in permitted
-        or not any(item is type(leaf).step for item in captured)
-        or not any(isinstance(item, weakref.ReferenceType) and item() is leaf for item in captured)
-    ):
-        raise RuntimeError("MultiOptimizer cannot prove optimizer step implementation")
-    if type(scheduler) is not torch.optim.lr_scheduler.LambdaLR or any(
-        name in vars(scheduler) for name in ("state_dict", "load_state_dict", "step", "get_lr", "get_last_lr")
-    ):
-        raise RuntimeError("MultiOptimizer cannot prove an overridden scheduler method")
-    if scheduler.optimizer is not leaf or not wrapped:
+    if type(scheduler) is not torch.optim.lr_scheduler.LambdaLR:
+        raise RuntimeError("MultiOptimizer requires a supported scheduler")
+    if scheduler.optimizer is not leaf:
         raise RuntimeError("MultiOptimizer scheduler binding changed")
-    original_functions = checkpoint_scheduler_functions(scheduler)
-    if (
-        original_functions is None
-        or len(original_functions) != len(scheduler.lr_lambdas)
-        or any(
-            current is not original for current, original in zip(scheduler.lr_lambdas, original_functions, strict=True)
-        )
-    ):
-        raise RuntimeError("MultiOptimizer scheduler recipe changed after construction")
     functions = []
     for function in scheduler.lr_lambdas:
         if not isinstance(function, types.FunctionType):
@@ -327,9 +294,6 @@ def _local_layout(
 
         if type(scheduler_object) is not MultiLRScheduler or set(scheduler_object) != set(keys):
             raise RuntimeError("MultiOptimizer scheduler checkpoint requires its live scheduler object")
-        if any(name in vars(scheduler_object) for name in ("state_dict", "load_state_dict", "step", "get_last_lr")):
-            raise RuntimeError("MultiOptimizer cannot prove an overridden scheduler container method")
-
         for name in keys:
             current_scheduler = scheduler_object[name]
             if current_scheduler is not checkpoint_scheduler_binding(optimizer.optimizers_dict[name]):
@@ -395,7 +359,7 @@ def coordinated_multi_layout(
     frozen_digest=None,
 ):
     """Return the same rank-indexed layout on every participant or fail together."""
-    local, trainability = None, None
+    local = None
     error = None
     try:
         local = _local_layout(
@@ -407,31 +371,6 @@ def coordinated_multi_layout(
             writing=writing,
             frozen_digest=frozen_digest,
         )
-        from torch.distributed.tensor import Shard
-
-        specs = getattr(model, "_fqn2spec_info", {}) or {}
-        trainability_by_owner = {}
-        for runtime_name, param in model.named_parameters(remove_duplicate=False):
-            for name in _get_fqns(model, runtime_name):
-                spec = specs.get(runtime_name) or specs.get(name)
-                owner = None
-                if spec is not None and isinstance(spec.placement, Shard):
-                    mesh = spec.para_fsdp_mesh
-                    if mesh is None:
-                        raise RuntimeError(f"Cannot prove ExtraParallel owner for trainability of {name}")
-                    owner = (spec.para_name, mesh[spec.para_name].get_local_rank())
-                    if owner[1] < 0:
-                        raise RuntimeError(f"Current rank is not an ExtraParallel owner of {name}")
-                values = trainability_by_owner.setdefault(owner, {})
-                enabled = bool(param.requires_grad)
-                previous = values.setdefault(name, enabled)
-                if previous != enabled:
-                    raise RuntimeError(f"Tied parameter trainability differs for {name}")
-        trainability = []
-        for owner, values in trainability_by_owner.items():
-            payload = json.dumps(sorted(values.items()), separators=(",", ":")).encode()
-            trainability.append((owner, len(values), hashlib.sha256(payload).hexdigest()))
-        trainability = tuple(sorted(trainability, key=lambda entry: repr(entry[0])))
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "inspecting MultiOptimizer layout", group=group)
@@ -442,16 +381,10 @@ def coordinated_multi_layout(
         # This existing layout exchange also guards the order of subsequent
         # per-leaf collectives. Owner-specific freezing can otherwise leave
         # one rank without a leaf and strand peers during checkpoint I/O.
-        dist.all_gather_object(gathered, (local, trainability, tuple(optimizer.key_names)), group=group)
+        dist.all_gather_object(gathered, (local, tuple(optimizer.key_names)), group=group)
         digests = [item[0] for item in gathered]
-        if any(item[2] != gathered[0][2] for item in gathered):
+        if any(item[1] != gathered[0][1] for item in gathered):
             raise RuntimeError("MultiOptimizer checkpoint leaf order differs across ranks")
-        owners = {}
-        for _, entries, _ in gathered:
-            for owner, count, digest in entries:
-                previous = owners.setdefault(owner, (count, digest))
-                if previous != (count, digest):
-                    raise RuntimeError("Model parameter trainability differs across checkpoint replica ranks")
         ranks = list(range(world)) if group is None else dist.get_process_group_ranks(group)
     else:
         ranks, digests = [0], [local]

@@ -291,7 +291,9 @@ def test_extra_parallel_rejects_unproven_legacy_dcp_groups(tmp_path):
     before = [p.detach().clone() for p in target_model.parameters()]
     with pytest.raises(RuntimeError, match="group layout is unproven|inventory is missing"):
         DistributedCheckpointer.load(
-            str(old_dir), {"model": target_model, "optimizer": target}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(old_dir),
+            {"model": target_model, "optimizer": target, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     for actual, expected in zip(target_model.parameters(), before, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -30,9 +30,9 @@ def _make():
     return model, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
 
 
-def _update(model, optimizer):
+def _update(model, optimizer, gradient=0.25):
     for param in model.parameters():
-        param.grad = torch.full_like(param, 0.25)
+        param.grad = torch.full_like(param, gradient)
     optimizer.step()
     optimizer.zero_grad()
 
@@ -42,17 +42,29 @@ def test_fp32_gdn_and_proven_optimizer_save_restore_next_update(tmp_path):
     _update(source, source_optim)
     path = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(path, {"model": source, "optimizer": source_optim}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        path, {"model": source, "optimizer": source_optim, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     manifest = read_qwen4_gdn_manifest(weights_dir(path))
     assert {"linear_attn.A_log", "linear_attn.dt_bias"}.issubset(manifest)
     restored, restored_optim = _make()
-    DistributedCheckpointer.load(path, {"model": restored, "optimizer": restored_optim}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        path,
+        {"model": restored, "optimizer": restored_optim, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     for (name, original), (name2, loaded) in zip(source.named_parameters(), restored.named_parameters(), strict=True):
         assert name == name2
         if name.endswith(("A_log", "dt_bias")):
             assert original.dtype == loaded.dtype == torch.float32
         torch.testing.assert_close(original, loaded, rtol=0, atol=0)
-    _update(source, source_optim)
-    _update(restored, restored_optim)
+        source_state = source_optim.optimizers_dict["leaf"].state[original]
+        target_state = restored_optim.optimizers_dict["leaf"].state[loaded]
+        assert set(source_state) == set(target_state) == {"step", "master_weight", "exp_avg", "exp_avg_sq"}
+        for key in source_state:
+            torch.testing.assert_close(source_state[key], target_state[key], rtol=0, atol=0)
+            assert source_state[key].dtype == target_state[key].dtype == torch.float32
+    _update(source, source_optim, gradient=-0.125)
+    _update(restored, restored_optim, gradient=-0.125)
     for original, loaded in zip(source.parameters(), restored.parameters(), strict=True):
         torch.testing.assert_close(original, loaded, rtol=0, atol=0)

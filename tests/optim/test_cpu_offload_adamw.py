@@ -81,7 +81,9 @@ def test_yaml_beta_sequence_has_immutable_optimizer_groups(tmp_path):
     model = torch.nn.Linear(2, 2)
     optimizer = build_optimizer(model, optimizer_type=config.type, betas=config.betas)
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
 
 
@@ -126,7 +128,9 @@ def test_unwrapped_exact_optimizer_dcp_is_rejected_before_write(tmp_path):
     optimizer = CPUOffloadAdamW([{"params": list(model.parameters()), "cpu_offload": True}])
     with pytest.raises(RuntimeError, match="require MultiOptimizer"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not list(tmp_path.iterdir())
 
@@ -144,13 +148,21 @@ def test_frozen_optimizer_ownership_is_rebuilt_for_non_ep_checkpoint(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     source.weight.requires_grad_(False)
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target = torch.nn.Linear(2, 2)
     target.weight.requires_grad_(False)
     with recover_frozen_optimizer_ownership(target, str(tmp_path)):
         resumed = build_optimizer(target, optimizer_type="full_fp32_adamw")
     assert not target.weight.requires_grad
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": resumed, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     source.weight.requires_grad_(True)
     target.weight.requires_grad_(True)
     source.weight.grad = torch.ones_like(source.weight)

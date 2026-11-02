@@ -316,7 +316,9 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
                 opt.zero_grad(set_to_none=True)
                 # The proven MultiOptimizer format has a fixed owner layout;
                 # exercise it separately from model-only resharding.
-                DistributedCheckpointer.save(directory, {"model": model, "optimizer": opt})
+                DistributedCheckpointer.save(
+                    directory, {"model": model, "optimizer": opt, "_veomni_scheduler_object": None}
+                )
                 optim_metadata = dcp.FileSystemReader(optimizer_dir(directory)).read_metadata().state_dict_metadata
                 assert f"optimizer.{MULTI_LAYOUT_MARKER}" in optim_metadata
                 for optimizer_rank in range(world):
@@ -349,7 +351,9 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
                 opt.zero_grad(set_to_none=True)
                 # The target must be fresh; proven recovery rejects warm state.
                 opt = build_optimizer(model, lr=1e-3)
-                DistributedCheckpointer.load(directory, {"model": model, "optimizer": opt})
+                DistributedCheckpointer.load(
+                    directory, {"model": model, "optimizer": opt, "_veomni_scheduler_object": None}
+                )
                 for (group, param, key), expected_value in saved_optim.items():
                     actual_value = opt.optimizers_dict[group].state[param][key]
                     torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
@@ -392,7 +396,9 @@ def _builder_worker(rank, world, shard_dim, directory, rendezvous):
         )
         _configure_extra_parallel_checkpoint_layout(same_layout, SimpleNamespace(extra_parallel_canonical_layout=True))
         same_opt = build_optimizer(same_layout, lr=1e-3)
-        DistributedCheckpointer.load(directory, {"model": same_layout, "optimizer": same_opt})
+        DistributedCheckpointer.load(
+            directory, {"model": same_layout, "optimizer": same_opt, "_veomni_scheduler_object": None}
+        )
         same_layout.set_requires_gradient_sync(False)
         same_layout(x, routing, indices).float().square().mean().backward()
         same_layout.set_requires_gradient_sync(True)

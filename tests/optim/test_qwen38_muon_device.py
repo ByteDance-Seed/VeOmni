@@ -67,9 +67,17 @@ def test_native_qwen_muon_adam_offload_update_and_recovery(tmp_path, dtype):
             assert actual.device.type == "cpu" and actual.dtype == torch.float32
             torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-6)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, target_leaf, restored = _build(device, dtype)
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     for src, dst in zip(model.parameters(), target.parameters(), strict=True):
         torch.testing.assert_close(src, dst, rtol=0, atol=0)
         for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):

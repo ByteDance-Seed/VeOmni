@@ -415,9 +415,13 @@ def _file_dcp_fsdp_worker(rank, rendezvous, root):
         source, source_opt = build()
         step(source, source_opt)
         path = os.path.join(root, "checkpoint-fsdp")
-        DistributedCheckpointer.save(path, {"model": source, "optimizer": source_opt}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            path, {"model": source, "optimizer": source_opt, "_veomni_scheduler_object": None}, parallel_state=parallel
+        )
         target, target_opt = build()
-        DistributedCheckpointer.load(path, {"model": target, "optimizer": target_opt}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            path, {"model": target, "optimizer": target_opt, "_veomni_scheduler_object": None}, parallel_state=parallel
+        )
         step(source, source_opt)
         step(target, target_opt)
         original = source.ngram_embedding.weight

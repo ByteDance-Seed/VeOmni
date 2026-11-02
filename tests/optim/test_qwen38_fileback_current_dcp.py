@@ -65,9 +65,13 @@ def test_file_backed_ple_matches_fp32_and_strict_dcp_next_update(tmp_path):
         assert leaf._ple_moment_storage.owns(leaf.state[param][key])
     parallel = SimpleNamespace(dp_mode="ddp")
     path = tmp_path / "checkpoint"
-    DistributedCheckpointer.save(str(path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(path), {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     target, target_leaf, restored = _build(scratch, True)
-    DistributedCheckpointer.load(str(path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(path), {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     target_param = target.ngram_embedding.weight
     for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
         torch.testing.assert_close(leaf.state[param][key], target_leaf.state[target_param][key], rtol=0, atol=0)
@@ -88,13 +92,19 @@ def test_file_backed_provider_mismatch_fails_before_model_mutation(tmp_path, sav
     _update(source, optimizer)
     path = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(path, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        path, {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     target, _, target_optimizer = _build(scratch, load_file)
     with torch.no_grad():
         target.ngram_embedding.weight.fill_(-3)
     previous = target.ngram_embedding.weight.detach().clone()
     with pytest.raises((ValueError, RuntimeError), match="(?i)optimizer|identity|metadata|layout|recipe"):
-        DistributedCheckpointer.load(path, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            path,
+            {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(previous, target.ngram_embedding.weight, rtol=0, atol=0)
 
 
@@ -106,7 +116,7 @@ def test_file_backed_state_rejects_async_checkpoint(tmp_path):
     with pytest.raises((ValueError, RuntimeError), match="(?i)synchronous|asynchronous|async"):
         DistributedCheckpointer.save(
             str(tmp_path / "checkpoint"),
-            {"model": model, "optimizer": optimizer},
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
             save_async=True,
         )
@@ -120,13 +130,19 @@ def _cold_worker(scratch_path, checkpoint_path, reference_path, save):
         _update(model, optimizer)
         _update(model, optimizer)
         DistributedCheckpointer.save(
-            checkpoint_path, {"model": model, "optimizer": optimizer}, parallel_state=parallel
+            checkpoint_path,
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
         _update(model, optimizer)
         param = model.ngram_embedding.weight
         torch.save({"weight": param.detach(), **leaf.state[param]}, reference_path)
         return
-    DistributedCheckpointer.load(checkpoint_path, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        checkpoint_path,
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     _update(model, optimizer)
     expected = torch.load(reference_path, map_location="cpu", weights_only=True)
     param = model.ngram_embedding.weight
@@ -162,13 +178,19 @@ def test_file_backed_dcp_load_releases_pages_before_and_after_apply(tmp_path):
     _update(source, source_optimizer)
     checkpoint = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint,
+        {"model": source, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, target_leaf, target_optimizer = _build(scratch, True, shape)
     with patch.object(
         target_leaf, "checkpoint_evict_file_backed_state", wraps=target_leaf.checkpoint_evict_file_backed_state
     ) as evict:
         DistributedCheckpointer.load(
-            checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+            checkpoint,
+            {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     assert evict.call_count == 2
     source_param, target_param = source.ngram_embedding.weight, target.ngram_embedding.weight
@@ -189,7 +211,11 @@ def test_file_backed_dcp_load_page_release_failure_poisons_state(tmp_path, failu
     _update(source, source_optimizer)
     checkpoint = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint,
+        {"model": source, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, target_leaf, target_optimizer = _build(scratch, True)
     original = target_leaf.checkpoint_evict_file_backed_state
     count = 0
@@ -204,7 +230,9 @@ def test_file_backed_dcp_load_page_release_failure_poisons_state(tmp_path, failu
     with patch.object(target_leaf, "checkpoint_evict_file_backed_state", side_effect=fail_release):
         with pytest.raises((OSError, RuntimeError), match="page release|MultiOptimizer"):
             DistributedCheckpointer.load(
-                checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+                checkpoint,
+                {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
     assert target_leaf._ple_state_poisoned
     with pytest.raises(RuntimeError, match="checkpoint|state failed"):
@@ -218,7 +246,9 @@ def test_file_backed_failed_load_poisons_optimizer(tmp_path):
     _update(source, optimizer)
     path = str(tmp_path / "checkpoint")
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(path, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        path, {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     target, target_leaf, target_optimizer = _build(scratch, True)
     from veomni.checkpoint import dcp_checkpointer
 
@@ -232,7 +262,9 @@ def test_file_backed_failed_load_poisons_optimizer(tmp_path):
     with patch.object(dcp_checkpointer.dcp, "load", side_effect=fail_optimizer_load):
         with pytest.raises(OSError, match="injected optimizer DCP load failure"):
             DistributedCheckpointer.load(
-                path, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+                path,
+                {"model": target, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
     assert target_leaf._ple_state_poisoned
     with pytest.raises(RuntimeError, match="checkpoint|state failed"):
