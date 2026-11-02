@@ -96,7 +96,9 @@ def _train_step(model, optimizer, step):
     optimizer.zero_grad(set_to_none=True)
     weight = model.block.ngram_embedding["shard_0"].weight
     local = weight.to_local()
-    row_start = weight.device_mesh.get_local_rank("ple") * (PADDED // weight.device_mesh.size("ple"))
+    mesh = weight.device_mesh
+    row_axis = mesh.mesh_dim_names.index("ple")
+    row_start = mesh.get_local_rank(row_axis) * (PADDED // mesh.size(row_axis))
     valid_rows = max(0, min(local.shape[0], LOGICAL - row_start))
     # to_local() remains differentiable: backward populates the real DTensor
     # parameter gradient, and AdamW creates padded DTensor moments naturally.
@@ -141,6 +143,18 @@ def _check_resume(model, trained_rows, trained_other, source, source_opt, opt):
     assert other_diff == 0.0, other_diff
     _check_optimizer(source, model, source_opt, opt)
     return logical_diff, tail_diff, other_diff
+
+
+def _dcp_save(*args, **kwargs):
+    """Require DCP to save without constructing resized PLE DTensors."""
+    with patch("veomni.checkpoint.ple_rows._resize_dtensor", side_effect=AssertionError("DCP resharded PLE")):
+        return DistributedCheckpointer.save(*args, **kwargs)
+
+
+def _dcp_load(*args, **kwargs):
+    """Require DCP to read directly into the runtime PLE layout."""
+    with patch("veomni.checkpoint.ple_rows._resize_dtensor", side_effect=AssertionError("DCP resharded PLE")):
+        return DistributedCheckpointer.load(*args, **kwargs)
 
 
 def main():
@@ -195,7 +209,7 @@ def main():
     parallel_state = _parallel_state()
 
     try:
-        DistributedCheckpointer.save(
+        _dcp_save(
             directory,
             {"model": source, "optimizer": source_opt, "extra_state": {"lr_scheduler": None}},
             global_steps=1,
@@ -210,6 +224,11 @@ def main():
         ple_key = next(key for key in metadata.state_dict_metadata if "ngram_embedding.shard_0.weight" in key)
         saved_rows = int(metadata.state_dict_metadata[ple_key].size[0])
         assert saved_rows == LOGICAL, saved_rows
+        ple_metadata = metadata.state_dict_metadata[ple_key]
+        row_intervals = {(int(chunk.offsets[0]), int(chunk.sizes[0])) for chunk in ple_metadata.chunks}
+        assert row_intervals == {(0, 8), (8, 3)}, row_intervals
+        # The ordinary weight must keep its original complete shape.
+        assert tuple(metadata.state_dict_metadata["model.other.weight"].size) == (4, 4)
 
         optimizer_metadata = FileSystemReader(optimizer_dir(checkpoint)).read_metadata()
         for moment in ("exp_avg", "exp_avg_sq"):
@@ -241,7 +260,7 @@ def main():
         restored = _Model()
         _install(restored, mesh, torch.zeros(PADDED, COLS), torch.zeros(4, 4))
         restored_opt = _optimizer(restored)
-        DistributedCheckpointer.load(
+        _dcp_load(
             checkpoint,
             {"model": restored, "optimizer": restored_opt, "extra_state": {}},
             parallel_state=parallel_state,
@@ -250,7 +269,7 @@ def main():
             restored, trained_rows, trained_other, source, source_opt, restored_opt
         )
 
-        DistributedCheckpointer.save(
+        _dcp_save(
             directory,
             {"model": restored, "optimizer": restored_opt, "extra_state": {"lr_scheduler": None}},
             global_steps=2,
@@ -259,13 +278,38 @@ def main():
         second = _Model()
         _install(second, mesh, torch.full((PADDED, COLS), 9.0), torch.full((4, 4), 9.0))
         second_opt = _optimizer(second)
-        DistributedCheckpointer.load(
+        _dcp_load(
             step_dir(directory, 2),
             {"model": second, "optimizer": second_opt, "extra_state": {}},
             parallel_state=parallel_state,
         )
         _check_resume(second, trained_rows, trained_other, source, source_opt, second_opt)
         assert ple_checkpoint_is_cropped(weights_dir(step_dir(directory, 2)), second)
+
+        # Older padded checkpoints must retain their stored tail, not zero it.
+        from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+
+        with patch(
+            "veomni.checkpoint.dcp_checkpointer.PleSavePlanner",
+            side_effect=lambda rows, **kwargs: DefaultSavePlanner(**kwargs),
+        ):
+            _dcp_save(
+                directory,
+                {"model": source, "optimizer": source_opt, "extra_state": {"lr_scheduler": None}},
+                global_steps=3,
+                parallel_state=parallel_state,
+            )
+        legacy = _Model()
+        _install(legacy, mesh, torch.zeros(PADDED, COLS), torch.zeros(4, 4))
+        legacy_opt = _optimizer(legacy)
+        _dcp_load(
+            step_dir(directory, 3),
+            {"model": legacy, "optimizer": legacy_opt, "extra_state": {}},
+            parallel_state=parallel_state,
+        )
+        torch.testing.assert_close(_full(legacy.block.ngram_embedding["shard_0"].weight), trained_rows, rtol=0, atol=0)
+        torch.testing.assert_close(legacy.other.weight, trained_other, rtol=0, atol=0)
+        _check_optimizer(source, legacy, source_opt, legacy_opt)
 
         # Compare the next real optimizer update with uninterrupted training.
         _train_step(source, source_opt, 2)

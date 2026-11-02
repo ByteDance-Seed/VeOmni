@@ -8,13 +8,10 @@
 
 """HF export crops only the Qwen4-Exp PLE runtime pad."""
 
-import json
-import os
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -22,10 +19,7 @@ from veomni.checkpoint.ple_rows import pad_ple_state_dict_from_dcp, ple_checkpoi
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
     create_qwen4_exp_checkpoint_tensor_converter,
 )
-from veomni.utils.save_safetensor_utils import (
-    crop_exported_hf_ple_files,
-    crop_state_dict_for_hf_export,
-)
+from veomni.utils.save_safetensor_utils import crop_state_dict_for_hf_export
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -131,32 +125,3 @@ def test_disabled_ple_does_not_break_converter_or_export():
     assert pad_ple_state_dict_from_dcp(model, state) is state
     # A PLE-free model must not even try to open DCP metadata.
     assert not ple_checkpoint_is_cropped("/does/not/exist", model)
-
-
-def test_exported_file_crop_updates_shape_and_total_size(tmp_path):
-    model = _Model()
-    weight = _padded_weight()
-    other = torch.ones(2, 2)
-    save_file({_PLE: weight, "model.embed_tokens.weight": other}, str(tmp_path / "model-00001-of-00001.safetensors"))
-    total_size = weight.numel() * weight.element_size() + other.numel() * other.element_size()
-    index = {
-        "metadata": {"total_size": total_size},
-        "weight_map": {
-            _PLE: "model-00001-of-00001.safetensors",
-            "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
-        },
-    }
-    with open(tmp_path / "model.safetensors.index.json", "w", encoding="utf-8") as handle:
-        json.dump(index, handle)
-
-    crop_exported_hf_ple_files(model, str(tmp_path))
-
-    loaded = load_file(str(tmp_path / "model-00001-of-00001.safetensors"))
-    assert loaded[_PLE].shape == (10, 4)
-    assert torch.equal(loaded[_PLE], weight[:10])
-    assert torch.equal(loaded["model.embed_tokens.weight"], other)
-    with open(tmp_path / "model.safetensors.index.json", encoding="utf-8") as handle:
-        updated = json.load(handle)
-    dropped = 6 * 4 * weight.element_size()
-    assert updated["metadata"]["total_size"] == total_size - dropped
-    assert not os.path.exists(str(tmp_path / "model-00001-of-00001.safetensors.crop.tmp"))

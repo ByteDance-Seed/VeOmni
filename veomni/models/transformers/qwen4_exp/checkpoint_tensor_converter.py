@@ -99,8 +99,8 @@ class Qwen4ExpCheckpointTensorConverter:
     def crop_hf_export_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         """Drop the runtime dim-0 pad from a full PLE matrix.
 
-        Both DCP save and Hugging Face export use this. ``tensor`` must already
-        be the full matrix, not one ``ple`` rank's local shard. Rows
+        Used by Hugging Face export. ``tensor`` must already be the full
+        matrix, not one ``ple`` rank's local shard. Rows
         ``[logical_rows:)`` are the zeros added so the table can be split
         evenly. Lookup indexes only ``[0, logical_rows)``.
         """

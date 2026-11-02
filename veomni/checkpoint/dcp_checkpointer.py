@@ -31,7 +31,7 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
+from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -57,6 +57,7 @@ from .layout import (
     step_dir,
     weights_dir,
 )
+from .ple_planner import PleLoadPlanner, PleSavePlanner
 
 
 logger = logging.get_logger(__name__)
@@ -66,11 +67,11 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
-class _ModelStrictLoadPlanner(DefaultLoadPlanner):
+class _ModelStrictLoadPlanner(PleLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
-    def __init__(self, strict_model: bool):
-        super().__init__(allow_partial_load=True)
+    def __init__(self, strict_model: bool, ple_rows_by_name=None):
+        super().__init__(allow_partial_load=True, ple_rows_by_name=ple_rows_by_name)
         self.strict_model = strict_model
 
     def create_local_plan(self):
@@ -912,7 +913,9 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             cls.execute_save(
                 save_state={
-                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+                    "model": ModelState(
+                        state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
+                    )
                 },
                 storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
                 save_async=save_async,
@@ -1024,13 +1027,13 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        def _model_state(crop_ple: bool) -> "ModelState":
+        from .ple_rows import ple_row_counts
+
+        ple_counts = {f"model.{name}": counts for name, counts in ple_row_counts(state["model"]).items()}
+
+        def _model_state() -> "ModelState":
             return ModelState(
-                state["model"],
-                trainable_only=trainable_only,
-                parallel_state=parallel_state,
-                crop_ple=crop_ple,
-                load_target=True,
+                state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
             )
 
         def _optimizer_state() -> "OptimizerState":
@@ -1043,18 +1046,16 @@ class DistributedCheckpointer(CheckpointerBase):
 
         wants_optimizer = state.get("optimizer") is not None
 
-        from .ple_rows import ple_checkpoint_is_cropped
-
         fused_dir = cls._legacy_fused_dir(path, module)
         if fused_dir is not None:
-            load_state: Dict[str, Any] = {"model": _model_state(ple_checkpoint_is_cropped(fused_dir, state["model"]))}
+            load_state: Dict[str, Any] = {"model": _model_state()}
             if wants_optimizer:
                 load_state["optimizer"] = _optimizer_state()
             dcp.load(
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
@@ -1063,10 +1064,10 @@ class DistributedCheckpointer(CheckpointerBase):
         model_root = model_dir(path, module)
         weights_path = weights_dir(path, module)
         dcp.load(
-            state_dict={"model": _model_state(ple_checkpoint_is_cropped(weights_path, state["model"]))},
+            state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_path),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
         )
         if wants_optimizer:
             dcp.load(
@@ -1212,7 +1213,18 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        from .ple_rows import ple_row_counts
+
+        model_state = save_state.get("model")
+        counts = ple_row_counts(model_state.model) if isinstance(model_state, ModelState) else {}
+        planner = (
+            PleSavePlanner(
+                {f"model.{name}": rows for name, rows in counts.items()},
+                dedup_save_to_lowest_rank=save_to_lowest_rank,
+            )
+            if counts
+            else DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        )
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save

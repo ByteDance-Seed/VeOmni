@@ -36,74 +36,13 @@ logger = helper.create_logger(__name__)
 def crop_state_dict_for_hf_export(model, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Project PLE weights to checkpoint rows before a Hugging Face write.
 
-    This is the same projection DCP save applies. A dense matrix is cropped by
-    ``crop_hf_export_tensor``. Row-sharded DTensors exchange overlapping row intervals while retaining
-    column sharding; no full PLE table is gathered.
+    Dense tensors use ``crop_hf_export_tensor``. Row-sharded DTensors retain
+    standard logical-shape partitioning and column sharding without gathering
+    a full PLE table. DCP uses a separate storage planner.
     """
     from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
 
     return project_state_dict_to_checkpoint(model, state_dict)
-
-
-def crop_exported_hf_ple_files(model, save_path: str) -> None:
-    """Crop PLE rows in an already written Hugging Face directory.
-
-    Rank 0 rewrites only the safetensors files that contain a PLE shard.
-    This optional repair helper is not part of the normal distributed writer,
-    which projects the live state dict before writing. One file is loaded at a
-    time.
-    """
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return
-
-    from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
-
-    converter = get_checkpoint_tensor_converter(model) if model is not None else None
-    crop = getattr(converter, "crop_hf_export_tensor", None)
-    if crop is None or not save_path:
-        return
-
-    import json
-
-    from safetensors.torch import load_file, save_file
-
-    index_path = os.path.join(save_path, "model.safetensors.index.json")
-    index = None
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as handle:
-            index = json.load(handle)
-        filenames = sorted(set(index.get("weight_map", {}).values()))
-    elif os.path.isfile(os.path.join(save_path, "model.safetensors")):
-        filenames = ["model.safetensors"]
-    else:
-        return
-
-    byte_delta = 0
-    for filename in filenames:
-        path = os.path.join(save_path, filename)
-        tensors = load_file(path)
-        changed = False
-        for name, tensor in list(tensors.items()):
-            updated = crop(name, tensor)
-            if updated is tensor:
-                continue
-            byte_delta += updated.numel() * updated.element_size() - tensor.numel() * tensor.element_size()
-            tensors[name] = updated
-            changed = True
-        if not changed:
-            continue
-        temporary = path + ".crop.tmp"
-        save_file(tensors, temporary)
-        os.replace(temporary, path)
-        logger.info_rank0(f"Cropped PLE export padding in {path}")
-
-    if index is not None and byte_delta and isinstance(index.get("metadata"), dict):
-        total_size = index["metadata"].get("total_size")
-        if isinstance(total_size, int):
-            index["metadata"]["total_size"] = total_size + byte_delta
-            with open(index_path, "w", encoding="utf-8") as handle:
-                json.dump(index, handle, indent=2)
-                handle.write("\n")
 
 
 @torch.no_grad()

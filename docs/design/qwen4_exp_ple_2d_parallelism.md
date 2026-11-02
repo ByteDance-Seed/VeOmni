@@ -449,6 +449,10 @@ checkpoints and remains compatible with older padded checkpoints. Invalid row
 counts and mixed logical/padded formats are rejected. Models with
 `ple_layer_ids=[]` skip PLE row conversion.
 
+DCP clips PLE chunks at their original offsets and loads directly into padded
+runtime shards, avoiding extra device-side projection tensors. HF retains its
+standard DTensor partitioning; other weights and optimizer state are unchanged.
+
 The existing ExtraParallel DCP adapter drops the ExtraParallel dimension before
 handing an FSDP-local tensor to DCP and restores it afterward. Extend
 `SpecInfo` so the adapter can distinguish:

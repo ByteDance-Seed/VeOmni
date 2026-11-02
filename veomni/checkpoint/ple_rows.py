@@ -160,8 +160,8 @@ def project_state_dict_to_checkpoint(
 ) -> Dict[str, torch.Tensor]:
     """Store PLE weights at ``rows_per_checkpoint_shard``.
 
-    DCP save and Hugging Face export both call this. The row cut is
-    converter metadata. Dense tensors use ``crop_hf_export_tensor``; DTensors
+    HF export uses per-table converter metadata. DCP save uses a separate
+    storage planner. Dense tensors use ``crop_hf_export_tensor``; DTensors
     exchange row intersections without full-table materialization. ``empty``
     allocates load targets without copying runtime weights. Models without
     that converter are returned unchanged.
