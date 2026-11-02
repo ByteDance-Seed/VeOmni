@@ -103,31 +103,73 @@ def test_sparse_leaf_respects_live_group_reordering_in_post_hook():
     assert len(leaf._optimizer_state_dict_post_hooks) == 1
 
 
-def test_sparse_leaf_rejects_custom_state_dict():
+@pytest.mark.parametrize("patched", [False, True])
+def test_sparse_leaf_preserves_custom_optimizer_state_dict(patched):
+    calls = []
+
     class CustomAdamW(torch.optim.AdamW):
         def state_dict(self):
+            calls.append(True)
             return super().state_dict()
 
     model = torch.nn.Linear(2, 2)
-    leaf = CustomAdamW(model.parameters())
+    leaf = CustomAdamW(model.parameters(), lr=0.0025)
+    if patched:
+        from torch.distributed.checkpoint.state_dict import _patch_optimizer_state_dict
+
+        _patch_optimizer_state_dict(model, optimizers=(leaf,))
     optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-    with pytest.raises(RuntimeError, match="custom state_dict"):
-        optimizer._sparse_state_dict()
+    result = optimizer._sparse_state_dict()
+    assert calls == [True]
+    assert result["param_groups.weight.lr"] == 0.0025
+    assert not leaf.state
 
 
-def test_sparse_leaf_rejects_instance_patched_state_dict_before_mutation():
+@pytest.mark.parametrize("initialized", [False, True])
+@pytest.mark.parametrize("target_patched", [False, True])
+def test_pytorch_patched_adamw_dcp_resume_preserves_next_update(tmp_path, initialized, target_patched):
     from torch.distributed.checkpoint.state_dict import _patch_optimizer_state_dict
 
     model = torch.nn.Linear(2, 2)
-    leaf = torch.optim.AdamW(model.parameters())
+    leaf = torch.optim.AdamW(model.parameters(), lr=0.0025)
     optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
     _patch_optimizer_state_dict(model, optimizers=(leaf,))
+    if initialized:
+        for param in model.parameters():
+            param.grad = torch.full_like(param, 0.25)
+        optimizer.step()
+        optimizer.zero_grad()
     before = [param.detach().clone() for param in model.parameters()]
-    with pytest.raises(RuntimeError, match="custom state_dict"):
-        optimizer._sparse_state_dict()
-    assert not leaf.state
-    for actual, expected in zip(model.parameters(), before, strict=True):
+    before_states = [
+        {key: value.detach().clone() for key, value in leaf.state.get(param, {}).items()}
+        for param in model.parameters()
+    ]
+    parallel = SimpleNamespace(dp_mode="ddp")
+    checkpoint = str(tmp_path / "patched")
+    DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    for actual, expected, expected_state in zip(model.parameters(), before, before_states, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert leaf.state.get(actual, {}).keys() == expected_state.keys()
+        for key, value in expected_state.items():
+            torch.testing.assert_close(leaf.state[actual][key], value, rtol=0, atol=0)
+
+    restored_model = torch.nn.Linear(2, 2)
+    restored_leaf = torch.optim.AdamW(restored_model.parameters(), lr=0.9)
+    if target_patched:
+        _patch_optimizer_state_dict(restored_model, optimizers=(restored_leaf,))
+    restored = MultiOptimizer(restored_model, {"leaf": restored_leaf}, ["leaf"])
+    DistributedCheckpointer.load(checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel)
+    assert bool(restored_leaf.state) is initialized
+    assert restored_leaf.param_groups[0]["lr"] == 0.0025
+    for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
+        current.grad = torch.ones_like(current)
+        target.grad = torch.ones_like(target)
+    optimizer.step()
+    restored.step()
+    for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
+        torch.testing.assert_close(current, target, rtol=0, atol=0)
+        for key in leaf.state[current]:
+            torch.testing.assert_close(leaf.state[current][key], restored_leaf.state[target][key], rtol=0, atol=0)
 
 
 def test_sparse_leaf_reentrant_hook_fails_without_leaking_temporary_hooks():
@@ -167,22 +209,6 @@ def test_sparse_leaf_learning_rate_survives_dcp_roundtrip(tmp_path):
         str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
     )
     assert restored_bias.param_groups[0]["lr"] == 0.0025
-
-
-def test_sparse_leaf_post_hook_live_reorder_is_rejected_before_dcp_save(tmp_path):
-    def build():
-        model = torch.nn.Linear(2, 2)
-        leaf = torch.optim.AdamW([{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}])
-        return model, leaf, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-
-    model, leaf, optimizer = build()
-    leaf.register_state_dict_post_hook(lambda opt, state: (opt.param_groups.reverse(), state)[1])
-    parallel = SimpleNamespace(dp_mode="ddp")
-    with pytest.raises(RuntimeError, match="cannot prove custom optimizer serialization hooks"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
-    assert leaf.param_groups[0]["params"][0] is model.weight
-    assert leaf.param_groups[1]["params"][0] is model.bias
-    assert not list(tmp_path.iterdir())
 
 
 def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
