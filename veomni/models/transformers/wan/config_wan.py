@@ -16,7 +16,7 @@
 import json
 import os
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
 try:
@@ -28,7 +28,7 @@ except ModuleNotFoundError as e:
     raise ImportError("diffusers is not installed") from e
 
 
-class WanConfig(PretrainedConfig):
+class WanConfig(VeOmniPretrainedConfig):
     model_type = "wan"
 
     def __init__(
@@ -70,6 +70,7 @@ class WanConfig(PretrainedConfig):
         config = {
             "_class_name": "WanModel",
             "_diffusers_version": diffusers_version,
+            "ops_implementation": dict(self.ops_implementation),
             "dim": self.dim,
             "eps": self.eps,
             "ffn_dim": self.ffn_dim,

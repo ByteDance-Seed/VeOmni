@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,181 @@
+@@ -1,3 +1,185 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -18,6 +18,10 @@
 +#      Always call the local rms_norm VeomniOp
 +#    - method_override: Qwen2MLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
++#    - method_override: Qwen2VLDecoderLayer.__init__
++#      Pass config to Qwen2VLRMSNorm instances
++#    - method_override: Qwen2VLTextModel.__init__
++#      Pass config to final Qwen2VLRMSNorm
 +#    - method_override: Qwen2MLP.forward
 +#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 +#    - init_modification: VisionAttention
@@ -49,7 +53,6 @@
 +#
 +# ==============================================================================
 +
-+# Additional imports for patches
 +import copy
 +import itertools
 +import warnings
@@ -72,7 +75,6 @@
 +from transformers.modeling_layers import GradientCheckpointingLayer
 +from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-+from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
@@ -89,9 +91,11 @@
 +from veomni.distributed.parallel_state import get_parallel_state
 +from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
 +from veomni.models.loss_utils import ForCausalLMLoss
++
++# Additional imports for patches
++from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 +from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 +from veomni.ops import VeomniOp
-+from veomni.ops.config import resolve_op_impl
 +from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import (
@@ -182,7 +186,7 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -18,51 +196,6 @@
+@@ -18,51 +200,6 @@
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
 
@@ -234,7 +238,7 @@
 
  logger = logging.get_logger(__name__)
 
-@@ -91,23 +224,22 @@
+@@ -91,23 +228,23 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -247,15 +251,17 @@
 +
  # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2VL
  class Qwen2VLRMSNorm(nn.Module):
-     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
 -        """
 -        Qwen2VLRMSNorm is equivalent to T5LayerNorm
 -        """
 -        super().__init__()
++    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
 +        nn.Module.__init__(self)
          self.weight = nn.Parameter(torch.ones(hidden_size))
          self.variance_epsilon = eps
-+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
++        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
++        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 -        input_dtype = hidden_states.dtype
@@ -267,7 +273,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -169,73 +301,6 @@
+@@ -169,73 +306,6 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -341,7 +347,7 @@
  class VisionRotaryEmbedding(nn.Module):
      def __init__(self, dim: int, theta: float = 10000.0) -> None:
          super().__init__()
-@@ -339,7 +404,14 @@
+@@ -339,7 +409,14 @@
      return attn_output, attn_weights
 
 
@@ -356,13 +362,13 @@
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
          self.dim = config.embed_dim
-@@ -352,13 +424,17 @@
+@@ -352,13 +429,17 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
 +        # Bind instance-local rope and attention VeomniOps
-+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
++        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
++        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
      def forward(
          self,
@@ -375,7 +381,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -366,56 +442,28 @@
+@@ -366,56 +447,28 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -449,7 +455,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -449,10 +497,16 @@
+@@ -449,10 +502,16 @@
          return hidden_states
 
 
@@ -467,11 +473,11 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -460,10 +514,26 @@
+@@ -460,10 +519,26 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
-+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
++        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -496,7 +502,7 @@
 
 
  class Qwen2VLAttention(nn.Module):
-@@ -472,6 +542,7 @@
+@@ -472,6 +547,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
@@ -504,17 +510,17 @@
      def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -504,6 +575,9 @@
+@@ -504,6 +580,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 +        # Bind instance-local rope and attention VeomniOps
 +        self.veomni_rope = VeomniOp("rope", "mrope", "eager")
-+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
++        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
      def forward(
          self,
-@@ -516,6 +590,7 @@
+@@ -516,6 +595,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -522,7 +528,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -527,18 +602,25 @@
+@@ -527,18 +607,25 @@
          value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -555,7 +561,7 @@
              self,
              query_states,
              key_states,
-@@ -547,8 +629,8 @@
+@@ -547,8 +634,8 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -566,7 +572,44 @@
          )
 
          attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-@@ -645,6 +727,12 @@
+@@ -556,21 +643,27 @@
+         return attn_output, attn_weights
+
+
++# ======================================================================
++# [MODIFIED CLASS] Qwen2VLDecoderLayer
++# Methods patched: __init__
++# ======================================================================
++
++
+ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
+-    def __init__(self, config: Qwen2VLTextConfig, layer_idx: int):
++    def __init__(self, config, layer_idx: int):
+         super().__init__()
+         self.hidden_size = config.hidden_size
+
+-        if config.use_sliding_window and not is_flash_attention_requested(config):
+-            logger.warning_once(
+-                f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
++        if config.use_sliding_window and not is_flash_attention_requested(config):  # noqa: F821
++            logger.warning_once(  # noqa: F821
++                f"Sliding Window Attention is enabled but not implemented for `{config.ops_config.attn_implementation}`; "
+                 "unexpected results may be encountered."
+             )
+-        self.self_attn = Qwen2VLAttention(config, layer_idx)
+-
+-        self.mlp = Qwen2MLP(config)
+-        self.input_layernorm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+-        self.post_attention_layernorm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.self_attn = Qwen2VLAttention(config, layer_idx)  # noqa: F821
++
++        self.mlp = Qwen2MLP(config)  # noqa: F821
++        self.input_layernorm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
++        self.post_attention_layernorm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+
+     def forward(
+         self,
+@@ -645,6 +738,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -579,7 +622,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -698,19 +786,86 @@
+@@ -698,19 +797,86 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -671,11 +714,10 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -727,6 +882,47 @@
-             last_hidden_state=hidden_states,
+@@ -728,6 +894,53 @@
              pooler_output=merged_hidden_states,
          )
-+
+
 +    def dummy_forward(self):
 +        # Build the `vit_metadata` sub-dict host-side from the Python-int dummy
 +        # grid: dummy_forward runs inside Model.forward (FSDP path for ranks with
@@ -716,10 +758,46 @@
 +            outputs = self(**self._dummy_data)
 +
 +        return outputs
-
++
++
++# ======================================================================
++# [MODIFIED CLASS] Qwen2VLTextModel
++# Methods patched: __init__
++# ======================================================================
++
 
  @auto_docstring
-@@ -842,6 +1038,12 @@
+ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
+@@ -738,22 +951,21 @@
+         "attentions": Qwen2VLAttention,
+     }
+
+-    def __init__(self, config: Qwen2VLTextConfig):
++    def __init__(self, config):
+         super().__init__(config)
+         self.padding_idx = config.pad_token_id
+         self.vocab_size = config.vocab_size
+
+         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+         self.layers = nn.ModuleList(
+-            [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+-        )
+-        self._attn_implementation = config._attn_implementation
+-        self.norm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++            [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
++        )
++        self._attn_implementation = config.ops_config.attn_implementation
++        self.norm = Qwen2VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+-        self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
++        self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)  # noqa: F821
+
+         self.gradient_checkpointing = False
+-        # Initialize weights and apply final processing
+         self.post_init()
+
+     @merge_with_config_defaults
+@@ -842,6 +1054,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -732,7 +810,7 @@
 
 
  @auto_docstring
-@@ -1024,11 +1226,14 @@
+@@ -1024,11 +1242,14 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -751,7 +829,7 @@
 
          return vision_outputs
 
-@@ -1041,11 +1246,14 @@
+@@ -1041,11 +1262,14 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -770,7 +848,7 @@
 
          return vision_outputs
 
-@@ -1149,33 +1357,128 @@
+@@ -1149,33 +1373,128 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -910,7 +988,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1185,6 +1488,10 @@
+@@ -1185,6 +1504,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -921,7 +999,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1193,15 +1500,27 @@
+@@ -1193,15 +1516,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -950,18 +1028,18 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1211,7 +1530,9 @@
+@@ -1211,7 +1546,9 @@
          super().__init__(config)
          self.model = Qwen2VLModel(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 -
-+        impl = resolve_op_impl("cross_entropy_loss_implementation")
++        impl = config.ops_config.cross_entropy_loss_implementation
 +        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 +        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
          self.post_init()
 
      @auto_docstring
-@@ -1251,90 +1572,82 @@
+@@ -1251,90 +1588,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1095,7 +1173,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1514,5 +1827,51 @@
+@@ -1514,5 +1843,51 @@
 
          return input_ids, model_kwargs
 
