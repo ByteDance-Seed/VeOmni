@@ -302,6 +302,7 @@ class OmniTrainer:
         self.data_transform = build_data_transform(
             args.data.data_type,
             processor=processor,
+            max_seq_len=args.data.max_seq_len,
             **args.data.mm_configs,
         )
 

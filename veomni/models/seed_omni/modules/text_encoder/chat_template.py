@@ -65,6 +65,7 @@ class TextEncoderChatTemplate:
         sample: list[ConversationItem],
         *,
         add_generation_prompt: bool = False,
+        max_seq_len: int | None = None,
     ) -> list[ConversationItem]:
         """Full text pipeline: apply chat template → tokenize → merge tokenized text.
 
@@ -72,12 +73,52 @@ class TextEncoderChatTemplate:
         prefix (:meth:`apply_generation_prompt`) between templating and tokenizing,
         so the request is left ready for the model to start decoding; training
         leaves it off (the assistant turn is already in the data).
+
+        ``max_seq_len`` (training) truncates the merged conversation to the first
+        ``max_seq_len`` tokens — same left-truncate contract as the classic text
+        transforms — so a single overlong sample cannot exceed ``data.max_seq_len``.
         """
         parts = self.apply_chat_template(sample)
         if add_generation_prompt:
             parts = self.apply_generation_prompt(parts)
         self.tokenize(parts)
-        return self.merge_text_embeds(parts)
+        parts = self.merge_text_embeds(parts)
+        if max_seq_len is not None:
+            parts = self.truncate_to_max_seq_len(parts, max_seq_len)
+        return parts
+
+    @staticmethod
+    def truncate_to_max_seq_len(parts: list[ConversationItem], max_seq_len: int) -> list[ConversationItem]:
+        """Keep the first ``max_seq_len`` tokens across ``parts`` (left truncate).
+
+        Walks items in order. Text rows are sliced in place (``value`` / ``labels`` /
+        ``attention_mask`` / ``_omni_token_len``). Non-text rows that do not fit in
+        the remaining budget are dropped together with everything after them —
+        partial media truncation is module-specific and out of scope here.
+        """
+        if max_seq_len < 0:
+            raise ValueError(f"max_seq_len must be >= 0, got {max_seq_len}.")
+        if max_seq_len == 0:
+            return []
+
+        kept: list[ConversationItem] = []
+        remaining = max_seq_len
+        for part in parts:
+            token_len = int(part.meta.get(_OMNI_TOKEN_LEN, 0))
+            if token_len <= remaining:
+                kept.append(part)
+                remaining -= token_len
+                continue
+            if part.type != "text" or token_len == 0:
+                # Cannot partially truncate media / empty metadata rows.
+                break
+            part.value = part.value[:remaining]
+            part.meta["labels"] = part.meta["labels"][:remaining]
+            part.meta["attention_mask"] = part.meta["attention_mask"][:remaining]
+            part.meta[_OMNI_TOKEN_LEN] = remaining
+            kept.append(part)
+            break
+        return kept
 
     def _build_conversation_item(
         self,

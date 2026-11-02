@@ -108,6 +108,43 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline_and_sets_token_len():
     assert torch.equal(worker_shape, ref_shape)
 
 
+def _short_dialog() -> list[ConversationItem]:
+    return [
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="hi there", role="assistant"),
+    ]
+
+
+def test_qwen3_tokenize_conversation_left_truncates_to_max_seq_len():
+    tmpl = _template()
+    full = tmpl.tokenize_conversation(_short_dialog())
+    full_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in full)
+    assert full_len > 8
+
+    truncated = tmpl.tokenize_conversation(_short_dialog(), max_seq_len=8)
+    trunc_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in truncated)
+    assert trunc_len == 8
+    full_ids = torch.cat(tmpl.pack_input_ids(full))
+    trunc_ids = torch.cat(tmpl.pack_input_ids(truncated))
+    assert torch.equal(trunc_ids, full_ids[:8])
+
+
+def test_qwen3_text_preprocessor_forwards_max_seq_len_when_training():
+    tmpl = _template()
+    batch = [_short_dialog()]
+    Qwen3TextEncoderPreprocessor(tmpl)({"conversation_list": batch}, max_seq_len=8)
+    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in batch[0]) == 8
+
+    # Inference leaves the sequence uncapped even if max_seq_len is passed.
+    infer_batch = [_short_dialog()]
+    Qwen3TextEncoderPreprocessor(tmpl)(
+        {"conversation_list": infer_batch},
+        inference=True,
+        max_seq_len=8,
+    )
+    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in infer_batch[0]) > 8
+
+
 def test_qwen3_text_preprocessor_from_pretrained_applies_enable_image_override(tmp_path, monkeypatch):
     import veomni.models.seed_omni.modules.qwen3.text_encoder.processing as qwen3_text_processing
 

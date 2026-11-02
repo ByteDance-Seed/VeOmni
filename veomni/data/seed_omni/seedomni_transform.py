@@ -246,7 +246,10 @@ def process_seedomni_example(
 
     conversation_list = _build_conversation_list(constructed, media)
     if processor is not None:
-        return [processor.preprocess(conversation_list)]
+        # ``max_seq_len`` is threaded from ``OmniTrainer._build_data_transform``
+        # (not ``mm_configs``) so text-encoder preprocessors can left-truncate
+        # before dyn_bsz / collation — same contract as classic text transforms.
+        return [processor.preprocess(conversation_list, max_seq_len=kwargs.get("max_seq_len"))]
     return [{"conversation_list": conversation_list}]
 
 
@@ -262,10 +265,10 @@ def process_seedomni_cached_example(
     ``conversation_list`` as pickle bytes so cached tensors keep their exact
     dtype/shape and no source-specific raw dataset parsing runs on reload.
     """
-    del kwargs
+    max_seq_len = kwargs.get("max_seq_len")
     conversation_list = example["conversation_list"]
     if isinstance(conversation_list, (bytes, bytearray)):
         conversation_list = pickle.loads(conversation_list)
     if processor is not None:
-        return [processor.preprocess(conversation_list)]
+        return [processor.preprocess(conversation_list, max_seq_len=max_seq_len)]
     return [{"conversation_list": conversation_list}]

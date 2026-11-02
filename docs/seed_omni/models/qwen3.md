@@ -92,7 +92,7 @@ Key knobs (override on the CLI):
 
 - `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length.
+- `--data.max_seq_len` — per-sample truncate length and dyn_bsz pack unit (see `train.dyn_bsz`).
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -199,6 +199,18 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
   --train.max_steps 15 --train.wandb.enable false
 ```
 
-The classic `chatml` template labels the whole assistant block (role prefix +
-`<|im_end|>`); the omni `qwen3_text_encoder` template masks the
-`<|im_start|>assistant\n` prefix, which accounts for the small residual gap.
+Two intentional input differences keep a small residual gap even on matched
+data:
+
+1. **Assistant-prefix mask.** The classic `chatml` template labels the whole
+   assistant block (role prefix + `<|im_end|>`); the omni
+   `qwen3_text_encoder` template masks the `<|im_start|>assistant\n` prefix.
+2. **Tulu system turns.** For Tulu rows that open with a system message,
+   SeedOmni's `tulu_3_sft_mixture_preprocess` folds that system text into the
+   first user turn (`<system>…</system>\n…`), while the classic ChatML
+   template keeps a separate system turn. The two trainers therefore see
+   different token sequences on those rows.
+
+For a parity comparison, filter to Tulu rows **without** a system message (or
+otherwise feed both trainers the same already-normalized conversations) and
+compare losses on those matched inputs and labels.
