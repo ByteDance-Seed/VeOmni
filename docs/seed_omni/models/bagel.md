@@ -125,6 +125,32 @@ code skip it via `item.is_dummy`.
 Training uses the accelerated Qwen2-MoT class from `train/modules_train.yaml`. The
 default packed attention backend is FlexAttention.
 
+On H20 (SM90), eligible BF16/FP16 calls automatically use Flex's FlashAttention-4
+backend from the standard `gpu` extra. The MoT training module enables async
+Ulysses when sequence parallelism is active. A single-node H20 baseline is:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.accelerator.ulysses_size 4 \
+  --train.micro_batch_size 1
+```
+
+The online and cached-VAE training module configs both set
+`bagel_qwen2_mot.accelerator.enable_async: true`. For a matched synchronous
+control, override
+`--model.model_config.modules.bagel_qwen2_mot.accelerator.enable_async false`.
+With SP disabled, the fused synchronous QKV path is used regardless of this
+flag. Both paths retain the same split-QKV external checkpoint schema.
+
+The async path dispatches through the `("async_ulysses_qkv", "bagel")` and
+`("async_ulysses_o", "bagel")` compound ops, overlapping Q/K exchanges with
+later routed projections and inverse exchanges with backward projection work.
+It forwards the module's configured `rms_norm` and `rope` handles into the
+compound ops and passes `skip_ulysses=True` to attention because Q/K/V have
+already been redistributed. Inference continues to use its existing packed
+prefill and FlashAttention-2 denoise/decode paths.
+
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml

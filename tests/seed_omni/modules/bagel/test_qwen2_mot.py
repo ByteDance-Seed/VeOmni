@@ -200,7 +200,10 @@ def test_bagel_qwen2_mot_selects_module_level_ops_without_global_ops_config() ->
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
+    assert layer.self_attn.veomni_rms_norm.impl == "eager"
     assert layer.self_attn.veomni_rope.impl == "eager"
+    assert layer.self_attn.veomni_async_ulysses_qkv.variant == "bagel"
+    assert layer.self_attn.veomni_async_ulysses_o.variant == "bagel"
     assert layer.self_attn.veomni_attn is not None
     assert layer.self_attn.veomni_attn.impl == "veomni_flex_attention"
     assert layer.self_attn.veomni_denoise_attn.impl == "veomni_flash_attention_2"

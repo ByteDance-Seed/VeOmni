@@ -1,7 +1,7 @@
 """VeOmni-accelerated BAGEL Qwen2-MoT — instance-local VeomniOp ops plus training-graph hooks.
 
 Native weights and packed ``forward`` live on :class:`BagelQwen2MoTCore`.
-This module adds packed CFG denoise, fused RMSNorm / SwiGLU / RoPE,
+This module adds packed CFG denoise, async Ulysses, fused RMSNorm / SwiGLU / RoPE,
 attention ``VeomniOp`` dispatch, and the training pre/forward/post hooks.
 """
 
@@ -469,7 +469,10 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
     ):
         super().__init__(config, layer_idx, rms_norm_cls=rms_norm_cls)
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", config.ops_config.rms_norm_implementation)
         self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_async_ulysses_qkv = VeomniOp("async_ulysses_qkv", "bagel")
+        self.veomni_async_ulysses_o = VeomniOp("async_ulysses_o", "bagel")
         attn_impl = _normalize_packed_attn_impl(config.ops_config.attn_implementation)
         if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
             self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
@@ -608,6 +611,96 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
             skip_ulysses=True,
         )
         return packed_attn_output.squeeze(0)
+
+    def forward_packed_train(
+        self,
+        packed_sequence: torch.Tensor,
+        attention_mask: BlockMask | MagiAttentionMask,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
+        packed_und_token_indexes: torch.Tensor,
+        packed_gen_token_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run packed training attention, using async Ulysses when enabled on the active parallel state."""
+        parallel_state = get_parallel_state()
+        use_async_ulysses = parallel_state.ulysses_enabled and bool(parallel_state.async_enabled)
+        if not use_async_ulysses:
+            return super().forward_packed_train(
+                packed_sequence,
+                attention_mask,
+                packed_position_cos,
+                packed_position_sin,
+                packed_und_token_indexes,
+                packed_gen_token_indexes,
+            )
+        attn_op = self._resolve_packed_attn_op(context="training")
+
+        q_weight_und, k_weight_und, v_weight_und = self.qkv_proj_und.weight.split(self.qkv_split_sizes, dim=0)
+        q_bias_und, k_bias_und, v_bias_und = (
+            (None, None, None)
+            if self.qkv_proj_und.bias is None
+            else self.qkv_proj_und.bias.split(self.qkv_split_sizes, dim=0)
+        )
+        q_weight_gen, k_weight_gen, v_weight_gen = self.qkv_proj_gen.weight.split(self.qkv_split_sizes, dim=0)
+        q_bias_gen, k_bias_gen, v_bias_gen = (
+            (None, None, None)
+            if self.qkv_proj_gen.bias is None
+            else self.qkv_proj_gen.bias.split(self.qkv_split_sizes, dim=0)
+        )
+        rms_norm_op = getattr(self.q_norm, "veomni_rms_norm", self.veomni_rms_norm)
+        packed_query_states, packed_key_states, packed_value_states = self.veomni_async_ulysses_qkv(
+            hidden_states=packed_sequence,
+            route_0_indices=packed_und_token_indexes,
+            route_1_indices=packed_gen_token_indexes,
+            position_cos=packed_position_cos,
+            position_sin=packed_position_sin,
+            q_weight_0=q_weight_und,
+            q_bias_0=q_bias_und,
+            k_weight_0=k_weight_und,
+            k_bias_0=k_bias_und,
+            v_weight_0=v_weight_und,
+            v_bias_0=v_bias_und,
+            q_norm_weight_0=self.q_norm.weight,
+            k_norm_weight_0=self.k_norm.weight,
+            q_weight_1=q_weight_gen,
+            q_bias_1=q_bias_gen,
+            k_weight_1=k_weight_gen,
+            k_bias_1=k_bias_gen,
+            v_weight_1=v_weight_gen,
+            v_bias_1=v_bias_gen,
+            q_norm_weight_1=self.q_norm_moe_gen.weight,
+            k_norm_weight_1=self.k_norm_moe_gen.weight,
+            head_dim=self.head_dim,
+            rms_norm_eps=self.config.rms_norm_eps,
+            # The SP pre-hook already pads the packed sequence and builds a
+            # BlockMask for that full padded length. Keep those padding rows
+            # through attention; the module post-hook removes them after the
+            # local output shards have been gathered.
+            unpadded_dim_size=packed_sequence.shape[0] * parallel_state.ulysses_size,
+            group=parallel_state.ulysses_group,
+            rms_norm=rms_norm_op,
+            rope=self.veomni_rope,
+        )
+        packed_attn_output, _ = attn_op(
+            self,
+            packed_query_states.transpose(0, 1).unsqueeze(0),
+            packed_key_states.transpose(0, 1).unsqueeze(0),
+            packed_value_states.transpose(0, 1).unsqueeze(0),
+            attention_mask,
+            dropout=0.0,
+            scaling=self.head_dim**-0.5,
+            skip_ulysses=True,
+        )
+        return self.veomni_async_ulysses_o(
+            hidden_states=packed_attn_output.squeeze(0),
+            route_0_indices=packed_und_token_indexes,
+            route_1_indices=packed_gen_token_indexes,
+            proj_weight_0=self.o_proj.weight,
+            proj_bias_0=self.o_proj.bias,
+            proj_weight_1=self.o_proj_moe_gen.weight,
+            proj_bias_1=self.o_proj_moe_gen.bias,
+            group=parallel_state.ulysses_group,
+        )
 
 
 class InferenceMixinAccelerated(InferenceMixin):
