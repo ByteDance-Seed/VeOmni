@@ -61,14 +61,13 @@ preflight. For a `MultiOptimizer`, the only supported exact child types are
 `Qwen38MuonAdamW`, `torch.optim.AdamW`, `CPUOffloadAdamW`, `FullFP32AdamW` and
 `MasterFP32AdamW`; subclasses are not supported. Do not change process-wide
 matmul settings from another thread during an optimizer step.
-Direct CUDA `MultiOptimizer` checkpoint loading rejects user load hooks to
-avoid partial restoration across children; the framework's internal DCP
-filter remains supported. Generating CUDA DCP templates fails closed when a
-non-Muon child has uninitialized optimizer state; that case requires an
-explicit state migration before checkpoint save or resume.
-Use the framework's coordinated DCP wrapper for distributed CUDA checkpoint
-operations; calling the underlying `MultiOptimizer` directly does not coordinate
-errors across ranks.
+Use the framework's coordinated `DistributedCheckpointer` for distributed
+`MultiOptimizer` checkpoints. A non-Muon child with empty state retains its
+parameter groups and is restored lazily, without a synthetic optimizer step;
+its emptiness alone does not require migration. Adapters and load hooks must
+obey the trusted serialization contract; optimizer leaves containing frozen
+parameters reject custom load hooks. Calling the underlying `MultiOptimizer` directly does
+not coordinate errors across ranks.
 Ascend uses its separate `allow_hf32` path and does not perform this CUDA
 preflight.
 
