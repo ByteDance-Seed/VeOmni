@@ -7,10 +7,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from ....utils.conversation import ConversationItem
@@ -26,8 +28,11 @@ from ..sources import (
 )
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
-from .masking import build_mot_sdpa_mask
+from .masking import build_mot_block_mask, build_mot_sdpa_mask
 from .processing import PackedConversation, preprocess_mot_inputs
+
+
+_FLEX_ATTN_IMPLEMENTATIONS = frozenset({"flex_attention", "veomni_flex_attention"})
 
 
 class InferenceMixin:
@@ -107,7 +112,7 @@ class InferenceMixin:
             if tail.type != "output" or bagel_phase(tail) != BAGEL_START_TOKEN:
                 raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
             self._prefill_prompt(conversation_list[:-1], generation_kwargs)
-            hidden_states = self._decode_next_token(conversation_list)
+            return {"conversation_list": conversation_list}
         else:
             hidden_states = self._decode_next_token(conversation_list)
 
@@ -439,7 +444,7 @@ class BagelQwen2MoTCore(PretrainedOmniModule):
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _supports_flex_attn = False
+    _supports_flex_attn = True
     _export_hf_checkpoint_with_weight_conversions = False
 
     def __init__(self, config: BagelQwen2MoTConfig):
@@ -784,6 +789,12 @@ class BagelQwen2MoTAttention(nn.Module):
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
         self.k_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        attn_impl = config.ops_config.attn_implementation
+        self.veomni_attn: VeomniOp | None = (
+            VeomniOp("attention", "standard", "veomni_flex_attention")
+            if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS
+            else None
+        )
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
@@ -818,8 +829,9 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_attention_metadata: torch.Tensor,
         *,
         attn_implementation: str | None = None,
-    ) -> torch.Tensor:
-        del attn_implementation
+    ) -> torch.Tensor | BlockMask:
+        if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS:
+            return build_mot_block_mask(packed_attention_metadata)
         return build_mot_sdpa_mask(packed_attention_metadata)
 
     def apply_rotary_pos_emb(
@@ -882,8 +894,22 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
         packed_value_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | BlockMask,
     ) -> torch.Tensor:
+        if isinstance(attention_mask, BlockMask):
+            attn_op = self.veomni_attn or VeomniOp("attention", "standard", "veomni_flex_attention")
+            packed_attn_output, _ = attn_op(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                packed_key_states.transpose(0, 1).unsqueeze(0),
+                packed_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask,
+                dropout=0.0,
+                scaling=self.head_dim**-0.5,
+                skip_ulysses=True,
+            )
+            return packed_attn_output.squeeze(0).reshape(-1, self.num_heads * self.head_dim)
+
         packed_attn_output = _sdpa_packed_attention(
             packed_query_states,
             packed_key_states,
@@ -1017,7 +1043,7 @@ class BagelQwen2MoTAttention(nn.Module):
         merged_key_states: torch.Tensor,
         merged_value_states: torch.Tensor,
         *,
-        attention_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor | BlockMask],
         is_causal: bool,
         cu_seq_lens_q: torch.Tensor,
         cu_seq_lens_k: torch.Tensor,
@@ -1025,6 +1051,21 @@ class BagelQwen2MoTAttention(nn.Module):
         max_length_k: int,
     ) -> torch.Tensor:
         del max_length_q, max_length_k
+
+        if isinstance(attention_mask, BlockMask):
+            attn_op = self.veomni_attn or VeomniOp("attention", "standard", "veomni_flex_attention")
+            packed_attn_output, _ = attn_op(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                merged_key_states.transpose(0, 1).unsqueeze(0),
+                merged_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask,
+                dropout=0.0,
+                scaling=self.head_dim**-0.5,
+                skip_ulysses=True,
+            )
+            return packed_attn_output.squeeze(0)
+
         return _sdpa_packed_attention(
             packed_query_states,
             merged_key_states,

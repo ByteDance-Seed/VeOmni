@@ -60,7 +60,7 @@ def _eager_cuda_model():
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="eager sequential infer smoke uses CUDA bf16")
 def test_eager_und_generate_runs() -> None:
-    """Verify eager understanding generation populates the KV cache and emits a finite output embedding."""
+    """Verify eager understanding generation populates the KV cache on prefill and emits a finite output embedding on decode."""
     model = _eager_cuda_model()
     prompt = ConversationItem(
         type="text",
@@ -75,13 +75,17 @@ def test_eager_und_generate_runs() -> None:
     )
 
     outputs = model.generate([prompt, bos], generation_kwargs={"infer_type": "infer_und"})
+    assert model._generation_state.main.cache is not None
+    assert outputs["conversation_list"][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
+
+    outputs = model.generate(outputs["conversation_list"], generation_kwargs={"infer_type": "infer_und"})
     conversation = outputs["conversation_list"]
     tail = conversation[-1]
     assert tail.type == "output"
+    assert BAGEL_PHASE_KEY not in tail.meta
     assert torch.is_tensor(tail.value)
     assert tail.value.shape == (1, int(model.config.hidden_size))
     assert torch.isfinite(tail.value).all()
-    assert model._generation_state.main.cache is not None
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="eager sequential infer smoke uses CUDA bf16")

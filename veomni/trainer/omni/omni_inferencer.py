@@ -242,6 +242,7 @@ class OmniInferencer:
             videos=req.videos or None,
             mm_configs=req.mm_configs or None,
             inference=True,
+            **req.generation_kwargs,
         )
         if self._distributed:
             # Every module sits on this rank's device, as in training. An eager

@@ -27,7 +27,7 @@ inference block maps each scenario to a separate generation graph.
 |------|------|
 | `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and `infer` block. |
 | `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
-| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
+| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses FlexAttention. |
 | `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
 | `train/graph_train.yaml` | Training DAG. |
 | `infer/graph_infer_und.yaml` | Image/text understanding to text. |
@@ -193,9 +193,9 @@ training does not use FlashAttention-2.
 
 | Backend | Class | Config | Use |
 |---------|-------|--------|-----|
-| FlexAttention | accelerated | `train/modules_train.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
+| FlexAttention | accelerated / eager | `train/modules_train.yaml`, `infer/modules_infer_eager.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training and inference |
 | MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
-| SDPA | eager | `infer/modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
+| SDPA | eager | CLI override onto `bagel_qwen2_mot` | Dense-mask oracle |
 
 Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
 from the CLI (the launcher rewrites it to `veomni_magi_attention`):

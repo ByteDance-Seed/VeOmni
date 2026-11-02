@@ -74,7 +74,7 @@ def test_bagel_text_encoder_injects_raw_bos_for_understanding() -> None:
 
 
 def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(monkeypatch) -> None:
-    """Verify ``BagelQwen2MoT.generate`` prefills the prompt before decoding the tail BOS token."""
+    """Verify ``BagelQwen2MoT.generate`` prefills the prompt on ``prompt_encode`` and decodes the tail BOS token on ``text_ar``."""
     BagelQwen2MoT = native_model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).eval()
@@ -89,8 +89,14 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
     calls: list[tuple[str, list[ConversationItem]]] = []
 
     def _prefill(self, conversation_list, generation_kwargs):
-        del self, generation_kwargs
+        del generation_kwargs
         calls.append(("prefill", list(conversation_list)))
+        self._generation_state.main.install_cache(
+            cache=self._new_empty_cache(),
+            cache_len=2,
+            next_position_id=torch.tensor(2),
+            device=self.device,
+        )
         return torch.full((2, hidden_size), 3.0)
 
     def _decode(self, conversation_list):
@@ -105,7 +111,14 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
         [prompt, bos],
         generation_kwargs={"infer_type": "infer_und"},
     )["conversation_list"]
+    assert calls == [("prefill", [prompt])]
+    assert conversation[-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
+    torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 2.0))
 
+    conversation = model.generate(
+        conversation,
+        generation_kwargs={"infer_type": "infer_und"},
+    )["conversation_list"]
     assert calls == [("prefill", [prompt]), ("decode", [prompt, bos])]
     assert conversation == [prompt, bos]
     assert BAGEL_PHASE_KEY not in bos.meta

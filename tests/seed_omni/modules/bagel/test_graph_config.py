@@ -38,6 +38,9 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     runtime_modules = load_module_runtime_args(modules_path=bagel_cfg_dir() / "train/modules_train.yaml")
     assert runtime_modules["bagel_qwen2_mot"].ops_implementation.attn_implementation == ("veomni_flex_attention")
     assert runtime_modules["bagel_qwen2_mot"].accelerator.enable_async is True
+    for infer_modules in ("infer/modules_infer_eager.yaml", "infer/modules_infer_fsdp.yaml"):
+        infer_runtime = load_module_runtime_args(modules_path=bagel_cfg_dir() / infer_modules, for_inference=True)
+        assert infer_runtime["bagel_qwen2_mot"].ops_implementation.attn_implementation == ("veomni_flex_attention")
 
 
 def test_bagel_train_graph_fan_in_execution_order():
