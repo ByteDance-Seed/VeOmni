@@ -27,6 +27,28 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_file_backed_planner_reclaims_previous_resolved_tensor():
+    class Tracker:
+        def __init__(self):
+            self.consumed = []
+
+        def checkpoint_commit_tensor(self, value):
+            self.consumed.append(value)
+
+    tracker = Tracker()
+    planner = _FileBackedSavePlanner(optimizers=[tracker])
+    planner.set_up_planner({"first": torch.ones(4), "second": torch.full((4,), 2.0)}, is_coordinator=True)
+    plan = planner.create_local_plan()
+    assert len(plan.items) == 2
+    first = planner.resolve_data(plan.items[0])
+    assert not tracker.consumed
+    planner.resolve_data(plan.items[1])
+    assert len(tracker.consumed) == 1
+    assert tracker.consumed[0] is first
+    torch.testing.assert_close(tracker.consumed[0], first, rtol=0, atol=0)
+
+
 def _layout_worker(rank, world, directory, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=90))
     try:
@@ -112,7 +134,6 @@ def _layout_worker(rank, world, directory, rendezvous):
         layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
         assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
         assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
-        assert tracker.consumed > 0
         target = {"model": {"weight": wrap(1, empty=True)}}
         dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
         torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
