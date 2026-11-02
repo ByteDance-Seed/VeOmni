@@ -283,6 +283,25 @@ supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
 ## MultiOptimizer recovery identity
 
+**Breaking change relative to earlier VeOmni checkpoint behavior:**
+
+- MultiOptimizer DCP save now requires `save_async: false`. Existing async
+  MultiOptimizer jobs must switch to synchronous save before adopting this
+  codec; model-only and ordinary-optimizer async paths remain separate.
+- A MultiOptimizer checkpoint can only resume with the recorded owner, mesh,
+  world size and optimizer layout. It cannot be restored across an EP/FSDP
+  shard-axis or world-size change, even when model weights can be resharded.
+- Older MultiOptimizer checkpoints whose parameter-group and scheduler identity
+  cannot be proven are rejected. The repository does not yet provide a
+  validated general migration for these checkpoints. Continue with the
+  original compatible runtime or use an explicitly accepted weights-only
+  restart with new optimizer/scheduler state; that is not an exact continuation.
+
+Supported CPU optimizer offload adapters are independent of asynchronous DCP
+save and remain available with synchronous checkpointing. A future migration must preserve
+owner-specific master weights, moments and step counters as well as optimizer
+groups and scheduler state, and verify the next update against the source.
+
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
 step with no pending gradients. Setting `save_async: true` for a runtime whose
