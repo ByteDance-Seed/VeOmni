@@ -160,15 +160,9 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
-            from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
             from ..utils.dist_utils import raise_if_any_rank_failed
 
-            specs = getattr(self.model, "_fqn2spec_info", None)
-            _coordinated_optimizer_flag(specs is not None, "ExtraParallel model plan presence")
-            canonical = _coordinated_optimizer_flag(
-                getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False),
-                "canonical ExtraParallel checkpoint policy",
-            )
+            canonical = getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False)
             layout_error = None
             try:
                 if canonical:
@@ -182,9 +176,6 @@ class VeOmniModelRuntime:
                 and self.model_name in ("base", "policy")
                 and (getattr(self.model, "_fqn2spec_info", None) is not None or self.args.optimizer.type in ("muon",))
             )
-            recover_ownership = _coordinated_optimizer_flag(recover_ownership, "frozen optimizer ownership policy")
-            if recover_ownership:
-                _coordinated_optimizer_flag(checkpoint_path, "frozen optimizer checkpoint path")
             self._build_optimizer_checked(checkpoint_path if recover_ownership else None)
         self._build_model_assets()
         self.build_checkpoint()
@@ -209,18 +200,11 @@ class VeOmniModelRuntime:
 
     def _validate_optimizer_checkpoint_mode(self) -> None:
         """Reject unsupported checkpoint modes on all ranks before training."""
-        from ..checkpoint.multi_optimizer_checkpoint import _coordinated_optimizer_flag
         from ..utils.dist_utils import raise_if_any_rank_failed
 
         checkpoint = getattr(self.train_args, "checkpoint", None)
-        _, manager, asynchronous = _coordinated_optimizer_flag(
-            (
-                self.model_name,
-                getattr(checkpoint, "manager", "dcp"),
-                bool(getattr(checkpoint, "save_async", False)),
-            ),
-            "optimizer checkpoint mode",
-        )
+        manager = getattr(checkpoint, "manager", "dcp")
+        asynchronous = bool(getattr(checkpoint, "save_async", False))
         if manager == "dcp" and asynchronous:
             error = (
                 RuntimeError("MultiOptimizer checkpoints currently require synchronous DCP save")

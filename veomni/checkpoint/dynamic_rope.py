@@ -43,6 +43,11 @@ def dynamic_rope_checkpoint_contract(model):
                 cached = int(getattr(module, f"{prefix}max_seq_len_cached", module.max_seq_len_cached))
                 inv = getattr(module, f"{prefix}inv_freq")
                 initial_inv = getattr(module, f"{prefix}original_inv_freq")
+                # After a dynamic grow/reset, HF can assign the original
+                # buffer object directly. A fresh instance may not share
+                # this alias, and DCP does not persist it.
+                if inv is initial_inv:
+                    raise RuntimeError("dynamic RoPE reset shares nonpersistent cache buffers")
                 kwargs = {} if layer_type is None else {"layer_type": layer_type}
                 expected_inv, expected_scale = ROPE_INIT_FUNCTIONS[kind](
                     module.config, device=inv.device, seq_len=None if kind == "longrope" else original, **kwargs

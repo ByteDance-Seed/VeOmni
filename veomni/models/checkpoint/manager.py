@@ -43,20 +43,6 @@ from ...utils import helper
 from ...utils.dist_utils import raise_if_any_rank_failed
 
 
-def _agree_checkpoint_value(value, description):
-    if dist.is_initialized():
-        values = [None] * dist.get_world_size()
-        dist.all_gather_object(values, value)
-        if any(item != value for item in values):
-            raise RuntimeError(f"Ranks disagree on checkpoint {description}")
-    return value
-
-
-def _agree_multi_optimizer_mode(optimizer):
-    multi = getattr(optimizer, "_is_multi_optimizer", False) is True
-    return _agree_checkpoint_value(multi, "optimizer mode")
-
-
 def _scheduler_recipe(scheduler, optimizer):
     """Stable schedule identity; LambdaLR state_dict omits its callable."""
     from ...optim.lr_scheduler import MultiLRScheduler
@@ -345,7 +331,6 @@ class ModelCheckpointManager:
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         load_dir = self.load_dir()
-        _agree_checkpoint_value(load_dir, "load path")
         if load_dir is None:
             return
 
@@ -356,7 +341,7 @@ class ModelCheckpointManager:
             "extra_state": {},
             "_veomni_scheduler_object": self.runtime.lr_scheduler,
         }
-        multi = _agree_multi_optimizer_mode(self.runtime.optimizer)
+        multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
         error = None
         try:
             self.checkpointer.load(load_dir, state, **self._checkpointer_kwargs())
@@ -438,8 +423,7 @@ class ModelCheckpointManager:
             # A failed rewrite may already have invalidated the old DCP marker.
             # A later export must not reuse the previous same-step receipt.
             self._last_saved_step = -1
-        _agree_checkpoint_value((self.config.save_path, state.global_step), "save path and step")
-        multi = _agree_multi_optimizer_mode(self.runtime.optimizer)
+        multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
         error, extra_state = None, None
         try:
             extra_state = self._extra_state(state)
@@ -447,7 +431,6 @@ class ModelCheckpointManager:
             error = exc
         if multi:
             raise_if_any_rank_failed(error, "preparing MultiOptimizer model extra state")
-            _agree_checkpoint_value(extra_state["_veomni_scheduler_recipe"], "scheduler recipe")
         elif error is not None:
             raise error
 
