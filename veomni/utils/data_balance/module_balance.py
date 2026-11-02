@@ -12,6 +12,7 @@
 """Module-agnostic whole-item DP scheduling and differentiable reverse routing."""
 
 import math
+import operator
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -143,8 +144,9 @@ class ModuleDataBalancer:
                 raise ValueError("Tensor fields and input-length fields must match and be nonempty.")
             if any(not isinstance(tensors[name], torch.Tensor) or tensors[name].ndim == 0 for name in names):
                 raise ValueError("Packed tensor fields need a leading item dimension.")
-            lengths = {name: tuple(int(n) for n in input_lengths[name]) for name in names}
-            outputs = tuple(int(n) for n in output_lengths)
+            # operator.index rejects fractional splits that int() would silently truncate.
+            lengths = {name: tuple(operator.index(n) for n in input_lengths[name]) for name in names}
+            outputs = tuple(operator.index(n) for n in output_lengths)
             # Backward collectives must participate on every rank, including
             # empty owners. Reject rank-asymmetric autograd before routing.
             schema = tuple(
