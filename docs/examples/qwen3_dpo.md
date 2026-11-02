@@ -152,9 +152,10 @@ chosen/rejected lengths produced by the built-in DPO transform. This distinguish
 a real one-token response from padding appended by the standard collator and
 attributes packed source-token counts per original DPO example. It does not
 infer or remove padding already present in input examples.
-The DPO objective parameters are held fixed for a run and must match on every
-rank; rank-local changes and step-begin callbacks that change them fail before
-model forward. To change the objective, start a new run from weights.
+The DPO objective parameters must remain fixed for a run and match on every
+rank. Step-begin callbacks may consume source metadata, but must not change the
+objective, model inputs, or microbatch order. To change the objective, start a
+new run from weights.
 
 This proof assumes the input producer honors its unpadded-output contract. The
 built-in text templates declare that contract. A tokenizer's Python class alone
@@ -274,16 +275,18 @@ contract for the reference model and input data. Feature tensors are
 fingerprinted at production and checked again at collation;
 the digest detects mutation but cannot prove a producer's contract is truthful.
 Local packed tensors and channel-loss metadata are fingerprinted at preflight
-to detect mutation after collation. Model inputs are checked again after
-step-begin callbacks; callbacks should transform data before collation instead.
+to detect mutation after collation. Callbacks should transform data before
+collation; model inputs are not rehashed after step-begin callbacks.
 Input validation and ordinary rank-local callback exceptions after callbacks
 return are coordinated before model execution. Failures inside a callback's own
 collective still rely on the launcher's failure handler or timeout.
 Use the standard trainer loop: direct `concatenated_forward` calls require a
-microbatch already approved by both rank-agreement phases. The provenance path
-uses four WORLD-level and one FSDP-group object collective per step; measure
-their overhead and validate the target hardware before using the option for production. CPU/Gloo tests do not establish
-Ascend HCCL behavior, full-model numerical equivalence, or checkpoint recovery.
+microbatch whose local provenance and SP input agreement have both been checked.
+The pair-count collective exchanges fixed-size tensors and also checks the
+producer's input and segment evidence within each SP group. A failure may use
+an additional object collective to report the error. CPU/Gloo tests do not
+establish Ascend HCCL behavior, full-model numerical equivalence, or checkpoint
+recovery.
 
 Resume only with the same data-semantics version and provenance option recorded
 in trainer state. An old or missing trainer state is rejected: plaintext prompt-masking semantics changed, so a legacy loader buffer can
@@ -291,3 +294,6 @@ mix old labels with newly transformed labels. Start a fresh run from model weigh
 without restoring optimizer, scheduler, or loader state for a consistent objective.
 Unversioned legacy checkpoints cannot resume through this required provenance
 path; use model weights for a fresh run or an independently validated migration.
+The streamlined provenance collator has a different recorded callable identity
+from older versions, so their exact-resume loader state is also rejected unless
+it is migrated and validated separately.

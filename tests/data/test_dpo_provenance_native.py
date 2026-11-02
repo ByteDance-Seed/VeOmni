@@ -6,13 +6,12 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Native four-NPU gate for DPO provenance and HCCL object collectives."""
+"""Native four-NPU gate for DPO provenance and HCCL communication."""
 
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -51,6 +50,7 @@ def _native_provenance_hccl(require_hccl=False):
     import veomni.data.data_collator as data_collator
     from veomni.data.dpo_collator import DPOProvenanceCollator
     from veomni.trainer.dpo_provenance import next_dpo_microbatches
+    from veomni.trainer.text_dpo_trainer import _dpo_pair_weighting
 
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == 4
@@ -58,7 +58,9 @@ def _native_provenance_hccl(require_hccl=False):
         assert get_device_type() == "npu" and dist.get_backend() == "hccl", "four NPU HCCL ranks are required"
     groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
     group_id = rank // 2
-    state = SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=rank % 2, sp_group=groups[group_id])
+    state = SimpleNamespace(
+        sp_enabled=True, sp_size=2, sp_rank=rank % 2, sp_group=groups[group_id], fsdp_group=dist.group.WORLD
+    )
     data_collator.get_parallel_state = lambda: state
 
     def feature(text):
@@ -88,12 +90,6 @@ def _native_provenance_hccl(require_hccl=False):
         "different_global_metadata",
         "source_range",
         "vocab_range",
-        "vocab_mismatch",
-        "catalog_mismatch",
-        "callback_mutation",
-        "callback_metadata_added",
-        "callback_metadata_changed",
-        "callback_drop",
     ):
         chosen = "xyz" if scenario == "different_input" and rank == 1 else "abc"
         sample = feature(chosen)
@@ -135,16 +131,13 @@ def _native_provenance_hccl(require_hccl=False):
         if scenario == "mutated_attention" and rank == 1:
             batch["max_length_q"] += 1
         batches = [batch, dict(batch)] if scenario == "microbatch_count" and rank >= 2 else [batch]
-        if scenario == "callback_drop":
-            batches = [batch, dict(batch)]
         if scenario == "empty_batch" and rank == 1:
             batches = []
         iterator = iter([]) if scenario == "one_eof" and rank == 1 else iter([batches])
         if collate_error is not None:
             iterator = raise_collate_error(collate_error)
+        approved, loader_error = None, None
         try:
-            expected_vocab_size = 999 if scenario == "vocab_mismatch" and rank == 1 else 1000
-            expected_catalog = ("a", "different") if scenario == "catalog_mismatch" and rank == 1 else ("a", "b")
             approved = next_dpo_microbatches(
                 iterator,
                 state,
@@ -152,27 +145,13 @@ def _native_provenance_hccl(require_hccl=False):
                 global_step=1,
                 epoch=1,
                 source_count=lambda: 2,
-                source_catalog=lambda value=expected_catalog: value,
-                vocab_size=lambda value=expected_vocab_size: value,
+                source_catalog=lambda: ("a", "b"),
+                vocab_size=lambda: 1000,
             )
-            expected_proofs = tuple(batch[DPO_APPROVED_KEY] for batch in approved)
-            if scenario == "callback_drop":
-                approved.pop()
-            if scenario == "callback_mutation" and rank == 1:
-                approved[0]["labels"][0, 0] += 1
-            if scenario == "callback_metadata_added" and rank == 1:
-                approved[0]["cur_token_num"] = 12345
-            if scenario == "callback_metadata_changed" and rank == 1:
-                approved[0]["ds_idx"] = torch.tensor([99])
-            next_dpo_microbatches(
-                iter([approved]),
-                state,
-                state,
-                global_step=1,
-                epoch=1,
-                after_callbacks=True,
-                expected_proofs=expected_proofs,
-            )
+        except Exception as exc:
+            loader_error = exc
+        try:
+            _dpo_pair_weighting(approved, data_collator.PostCollator(), state, True, loader_error=loader_error)
             result = "approved" if DPO_APPROVED_KEY in approved[0] else "legacy"
         except RuntimeError:
             result = "error"

@@ -40,10 +40,11 @@ from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import get_device_type, synchronize
+from ..utils.dist_utils import any_rank_failed
 from ..utils.dpo_provenance import (
+    DPO_AGREED_KEY,
     DPO_APPROVED_KEY,
     DPO_CALLBACK_METADATA_KEYS,
-    DPO_POSTCHECK_KEY,
     DPO_PROOF_KEY,
     DPOInvalidProof,
     DPOPackedProof,
@@ -274,6 +275,15 @@ def _dpo_pair_weighting(
                     attention_mask is not None,
                     batch.get("max_length_q") is not None,
                     batch.get("max_length_k") is not None,
+                    (
+                        proof.input_digest,
+                        proof.global_digest,
+                        proof.feature_token_counts,
+                        proof.source_ids,
+                        proof.source_indices,
+                    )
+                    if provenance_enabled
+                    else None,
                 )
             )
         layout_digest = hashlib.sha256(repr(tuple(layouts)).encode()).hexdigest()
@@ -303,29 +313,55 @@ def _dpo_pair_weighting(
         packet["status"] = "error"
         packet["error"] = f"{type(exc).__name__}: {exc}"[:512]
     if distributed:
-        packets: list[dict[str, Any]] = [None] * group_size
-        dist.all_gather_object(packets, packet, group=group)
+        # Send fixed-size tensors in the pair-count collective. Inputs were
+        # hashed once by the producer; no batch contents are rehashed here.
+        status_code = {"ok": 0, "eof": 1, "error": 2}[packet["status"]]
+        members = packet.get("sp_members", ())
+        group_digest = hashlib.sha256(repr(members).encode()).digest()
+        layout_digest = bytes.fromhex(packet.get("layout_digest", "00" * 32))
+        device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+        values = torch.tensor(
+            [rank, status_code, packet.get("microsteps", 0), packet.get("pair_count", 0), len(members)]
+            + list(group_digest)
+            + list(layout_digest),
+            dtype=torch.int64,
+            device=device,
+        )
+        gathered = [torch.empty_like(values) for _ in range(group_size)]
+        dist.all_gather(gathered, values, group=group)
+        rows = [row.tolist() for row in gathered]
+        if any(row[1] == 2 for row in rows):
+            errors: list[str | None] = [None] * group_size
+            local_error = packet["error"] if status_code == 2 else None
+            dist.all_gather_object(errors, local_error, group=group)
+            first = next(message for message in errors if message is not None)
+            raise RuntimeError(f"DPO pair-count preflight failed: {first}")
+        if all(row[1] == 1 for row in rows):
+            raise StopIteration
+        if any(row[1] == 1 for row in rows):
+            raise RuntimeError("DPO ranks reached the end of the data at different times")
+        if len({row[2] for row in rows}) != 1:
+            raise RuntimeError("DPO ranks must execute the same number of microbatches per optimizer step")
+        groups: dict[tuple[int, ...], list[list[int]]] = {}
+        for row in rows:
+            groups.setdefault(tuple(row[5:37]), []).append(row)
+        for peers in groups.values():
+            if len(peers) != peers[0][4] or len({tuple(row[37:69]) for row in peers}) != 1:
+                raise RuntimeError(
+                    "DPO sequence-parallel ranks disagree on inputs or per-microbatch segment boundaries"
+                )
+        global_count = sum(row[3] for row in rows)
     else:
-        packets = [packet]
-    statuses = {item["status"] for item in packets}
-    if statuses == {"eof"}:
-        raise StopIteration
-    failures = [item for item in packets if item["status"] == "error"]
-    if failures:
-        raise RuntimeError(f"DPO pair-count preflight failed on rank {failures[0]['rank']}: {failures[0]['error']}")
-    if "eof" in statuses:
-        raise RuntimeError("DPO ranks reached the end of the data at different times")
-    if len({item["microsteps"] for item in packets}) != 1:
-        raise RuntimeError("DPO ranks must execute the same number of microbatches per optimizer step")
-    groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
-    for item in packets:
-        groups.setdefault(item["sp_members"], []).append(item)
-    for members, peers in groups.items():
-        if {item["rank"] for item in peers} != set(members) or len({item["layout_digest"] for item in peers}) != 1:
-            raise RuntimeError("DPO sequence-parallel ranks disagree on per-microbatch segment boundaries")
-    global_count = sum(item["pair_count"] for item in packets)
+        if packet["status"] == "eof":
+            raise StopIteration
+        if packet["status"] == "error":
+            raise RuntimeError(f"DPO pair-count preflight failed: {packet['error']}")
+        global_count = packet["pair_count"]
     if global_count <= 0:
         raise RuntimeError("DPO optimizer step contains no preference pairs")
+    if provenance_enabled:
+        for batch in micro_batches:
+            batch[DPO_AGREED_KEY] = (batch[DPO_APPROVED_KEY], packet["sp_members"])
     return _DPOPairWeighting(tuple(local_counts), global_count, group_size, group)
 
 
@@ -335,11 +371,11 @@ def _dpo_sync_step_begin_error(error: Exception | None, *, context: str = "step-
         if error is not None:
             raise error
         return
-    packet = None if error is None else f"rank {dist.get_rank()}: {type(error).__name__}: {error}"
-    packets = [None] * dist.get_world_size()
-    dist.all_gather_object(packets, packet)
-    failures = [failure for failure in packets if failure is not None]
-    if failures:
+    if any_rank_failed(error is not None, group=dist.group.WORLD):
+        packet = None if error is None else f"rank {dist.get_rank()}: {type(error).__name__}: {error}"
+        packets = [None] * dist.get_world_size()
+        dist.all_gather_object(packets, packet)
+        failures = [failure for failure in packets if failure is not None]
         raise RuntimeError(f"DPO {context} failed: " + "; ".join(failures)) from error
 
 
@@ -1041,18 +1077,34 @@ class TextDPOTrainer:
             self.base.args.dpo_config, "explicit_segment_provenance", False
         )
         approved = micro_batch.get(DPO_APPROVED_KEY) if provenance_enabled else None
-        if provenance_enabled and (
-            not isinstance(approved, DPOPackedProof) or micro_batch.get(DPO_POSTCHECK_KEY) != approved
-        ):
-            raise RuntimeError("DPO provenance must be approved before and after callbacks before model forward")
+        if provenance_enabled:
+            parallel_state = get_parallel_state()
+            if getattr(parallel_state, "sp_enabled", False):
+                members = tuple(dist.get_process_group_ranks(parallel_state.sp_group))
+                sp_size, sp_rank = parallel_state.sp_size, parallel_state.sp_rank
+            else:
+                members = (dist.get_rank() if dist.is_initialized() else 0,)
+                sp_size, sp_rank = 1, 0
+            agreed = micro_batch.get(DPO_AGREED_KEY)
+            if (
+                not isinstance(approved, DPOPackedProof)
+                or not isinstance(agreed, tuple)
+                or len(agreed) != 2
+                or agreed[0] is not approved
+                or agreed[1] != members
+                or approved.layout_sp_size != sp_size
+                or approved.layout_sp_rank != sp_rank
+            ):
+                raise RuntimeError("DPO segment provenance and SP agreement are required before model forward")
         model_inputs = {
             k: v
             for k, v in micro_batch.items()
             if k not in _NON_MODEL_KEYS
             and not (provenance_enabled and k in DPO_CALLBACK_METADATA_KEYS | set(approved.source_keys))
+            and not (provenance_enabled and k == DPO_AGREED_KEY)
             and not (
                 provenance_enabled
-                and k in (DPO_APPROVED_KEY, DPO_POSTCHECK_KEY, DPO_PROOF_KEY)
+                and k in (DPO_APPROVED_KEY, DPO_PROOF_KEY)
                 and isinstance(v, (DPOPackedProof, DPOInvalidProof))
             )
         }
@@ -1205,39 +1257,29 @@ class TextDPOTrainer:
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         required = getattr(self, "_dpo_provenance_required", False)
-        if required:
-            config_error = None
-            try:
-                if self.base.args.dpo_config.explicit_segment_provenance is not True:
-                    raise ValueError("DPO segment provenance cannot be disabled after trainer initialization")
-                if _dpo_objective_parameters(self.base.args.dpo_config) != self._dpo_objective_parameters:
-                    raise ValueError("DPO objective parameters cannot change after trainer initialization")
-            except Exception as exc:  # noqa: BLE001 - synchronize malformed rank-local configuration
-                config_error = exc
-            _dpo_sync_step_begin_error(config_error, context="configuration")
         provenance_enabled = required or self.base.args.dpo_config.explicit_segment_provenance
         next_step = self.state.global_step + 1
 
         loader_error = None
-        if provenance_enabled:
-            micro_batches = next_dpo_microbatches(
-                data_iterator,
-                self.policy_model.parallel_state,
-                self.reference_model.parallel_state,
-                next_step,
-                self.state.epoch,
-                source_catalog=lambda: (
-                    tuple(self.environ_meter.multisource_tracker.names)
-                    if self.base.args.data.enable_multisource
-                    else None
-                ),
-                vocab_size=self._dpo_vocabulary_size,
-            )
-        else:
-            try:
+        try:
+            if provenance_enabled:
+                micro_batches = next_dpo_microbatches(
+                    data_iterator,
+                    self.policy_model.parallel_state,
+                    self.reference_model.parallel_state,
+                    next_step,
+                    self.state.epoch,
+                    source_catalog=lambda: (
+                        tuple(self.environ_meter.multisource_tracker.names)
+                        if self.base.args.data.enable_multisource
+                        else None
+                    ),
+                    vocab_size=self._dpo_vocabulary_size,
+                )
+            else:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
-            except Exception as exc:  # noqa: BLE001 - synchronize before callbacks/model collectives
-                micro_batches, loader_error = None, exc
+        except Exception as exc:  # noqa: BLE001 - synchronize before callbacks/model collectives
+            micro_batches, loader_error = None, exc
 
         weighting = _dpo_pair_weighting(
             micro_batches,
@@ -1252,29 +1294,14 @@ class TextDPOTrainer:
         # only after all ranks have obtained and validated this step's data.
         self.state.global_step = next_step
 
-        expected_proofs = tuple(batch[DPO_APPROVED_KEY] for batch in micro_batches) if provenance_enabled else None
         step_begin_error = None
         try:
             self.base._reset_async_activation_offload_if_enabled(self.policy_model)
             self.on_step_begin(micro_batches=micro_batches)
-            if required and self.base.args.dpo_config.explicit_segment_provenance is not True:
-                raise ValueError("DPO segment provenance cannot be disabled during a callback")
-            if required and _dpo_objective_parameters(self.base.args.dpo_config) != self._dpo_objective_parameters:
-                raise ValueError("DPO objective parameters cannot change during a callback")
         except Exception as exc:  # noqa: BLE001 - report a local callback error to every rank before forwarding
             step_begin_error = exc
         _dpo_sync_step_begin_error(step_begin_error)
-        if provenance_enabled:
-            next_dpo_microbatches(
-                iter([micro_batches]),
-                self.policy_model.parallel_state,
-                self.reference_model.parallel_state,
-                self.state.global_step,
-                self.state.epoch,
-                after_callbacks=True,
-                expected_proofs=expected_proofs,
-            )
-        else:
+        if not provenance_enabled:
             weighting = _dpo_pair_weighting(
                 micro_batches,
                 self.post_forward,

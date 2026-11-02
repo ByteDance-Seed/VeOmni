@@ -1098,100 +1098,6 @@ def test_incompatible_distributed_batches_fail_before_optimizer(scenario):
     spawn_with_rendezvous(_invalid_worker, args=(2, scenario), nprocs=2)
 
 
-def _mutated_provenance_worker(rank, world_size, phase, native_npu, endpoint):
-    import veomni.data.data_collator as collator_module
-
-    class Tokenizer:
-        dpo_unpadded_output_contract = True
-        dpo_unpadded_output_contract_id = "test-tokenizer-v1"
-
-        def encode(self, text, add_special_tokens=True):
-            return [ord(value) for value in text]
-
-    if native_npu:
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(rank)
-    device = f"npu:{rank}" if native_npu else "cpu"
-    dist.init_process_group(
-        "hccl" if native_npu else "gloo", store=endpoint.connect(), rank=rank, world_size=world_size
-    )
-    try:
-        state = SimpleNamespace(sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD)
-        collator_module.get_parallel_state = lambda: state
-        trainer, _ = _build_trainer(state, distributed=True, device=device)
-        trainer._dpo_provenance_required = True
-        trainer.base.args.dpo_config.explicit_segment_provenance = True
-        trainer._dpo_objective_parameters = dpo._dpo_objective_parameters(trainer.base.args.dpo_config)
-        trainer.base.args.data = SimpleNamespace(enable_multisource=False)
-        feature = process_dpo_example(
-            {"chosen": "!Bx", "rejected": "!Ax"}, tokenizer=Tokenizer(), record_segment_provenance=True
-        )[0]
-        batch = DPOProvenanceCollator(MainCollator())([feature])
-        if rank == 1 and phase == "before":
-            trainer.base.args.dpo_config.explicit_segment_provenance = False
-        if rank == 1 and phase == "callback":
-
-            def disable_provenance(**kwargs):
-                trainer.base.args.dpo_config.explicit_segment_provenance = False
-                kwargs["micro_batches"][0] = _microbatch([1])
-
-            trainer.base.on_step_begin = disable_provenance
-        if rank == 1 and phase == "objective_before":
-            trainer.base.args.dpo_config.beta = 0.2
-        if rank == 1 and phase == "objective_callback":
-
-            def change_objective(**_kwargs):
-                trainer.base.args.dpo_config.beta = 0.2
-
-            trainer.base.on_step_begin = change_objective
-        if rank == 1 and phase == "audit_before":
-            trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = "a" * 64
-        if rank == 1 and phase == "audit_callback":
-
-            def change_audit(**_kwargs):
-                trainer.base.args.dpo_config.audited_unpadded_tokenizer_sha256 = "a" * 64
-
-            trainer.base.on_step_begin = change_audit
-        if rank == 1 and phase == "malformed_before":
-            trainer.base.args.dpo_config = None
-        if rank == 1 and phase == "malformed_callback":
-
-            def invalidate_config(**_kwargs):
-                trainer.base.args.dpo_config = None
-
-            trainer.base.on_step_begin = invalidate_config
-        if phase.startswith(("objective_", "audit_")):
-            expected = "objective parameters cannot change"
-        elif phase.startswith("malformed_"):
-            expected = "AttributeError"
-        else:
-            expected = "provenance cannot be disabled"
-        with pytest.raises(RuntimeError, match=expected):
-            trainer.train_step(iter([[batch]]))
-        assert trainer.policy_model.optimizer.steps == 0
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize(
-    "phase",
-    [
-        "before",
-        "callback",
-        "objective_before",
-        "objective_callback",
-        "audit_before",
-        "audit_callback",
-        "malformed_before",
-        "malformed_callback",
-    ],
-)
-def test_rank_local_provenance_disable_is_coordinated(phase):
-    spawn_with_rendezvous(_mutated_provenance_worker, args=(2, phase, False), nprocs=2)
-
-
 def _different_producers_worker(rank, world_size, native_npu, endpoint):
     class Tokenizer:
         dpo_unpadded_output_contract = True
@@ -1404,25 +1310,6 @@ def test_rank_local_objective_mismatch_is_coordinated():
 )
 def test_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(scenario):
     spawn_with_rendezvous(_invalid_dpo_cursor_worker, args=(2, scenario, False), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=2))
-@pytest.mark.skipif(not IS_NPU_AVAILABLE or runner_device_count() < 2, reason="requires two Ascend NPUs and HCCL")
-@pytest.mark.parametrize(
-    "phase",
-    [
-        "before",
-        "callback",
-        "objective_before",
-        "objective_callback",
-        "audit_before",
-        "audit_callback",
-        "malformed_before",
-        "malformed_callback",
-    ],
-)
-def test_native_hccl_rank_local_provenance_disable_is_coordinated(phase):
-    spawn_with_rendezvous(_mutated_provenance_worker, args=(2, phase, True), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=2))

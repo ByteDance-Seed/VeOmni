@@ -16,14 +16,13 @@ import torch
 
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dpo_provenance import (
+    DPO_AGREED_KEY,
     DPO_APPROVED_KEY,
     DPO_FEATURE_KEY,
-    DPO_POSTCHECK_KEY,
     DPO_PROOF_KEY,
     DPOFeatureSegments,
     DPOInvalidProof,
     DPOPackedProof,
-    callback_metadata_digests,
     packed_batch_digest,
 )
 from . import data_collator as collator_module
@@ -112,7 +111,7 @@ class DPOProvenanceCollator:
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         if any(
-            any(key in feature for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY)) for feature in features
+            any(key in feature for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY)) for feature in features
         ):
             raise ValueError("DPO input contains a reserved packed-provenance key")
         sp_size, sp_rank = self.sp_size, self.sp_rank
@@ -243,7 +242,7 @@ class DPOProvenanceCollator:
                 sources.append(source)
 
         batch = self.collator(clean)
-        if any(key in batch for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY)):
+        if any(key in batch for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY)):
             batch[DPO_PROOF_KEY] = DPOInvalidProof("reserved packed-proof key already exists")
             return batch
         if not can_prove:
@@ -296,11 +295,9 @@ class DPOProvenanceCollator:
             tuple(sources),
             input_digest,
             packed_batch_digest(batch, source_keys),
-            packed_batch_digest(batch, source_keys, after_callbacks=True),
             packed_batch_digest(batch, global_only=True),
             tuple(ds_indices),
             source_keys,
-            callback_metadata_digests(batch, source_keys),
             sp_size,
             sp_rank,
             producer_contract_version=1,

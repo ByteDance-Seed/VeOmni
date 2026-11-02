@@ -21,12 +21,11 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.trainer.dpo_provenance import next_dpo_microbatches
 from veomni.utils.dpo_provenance import (
+    DPO_AGREED_KEY,
     DPO_APPROVED_KEY,
-    DPO_POSTCHECK_KEY,
     DPO_PROOF_KEY,
     DPOInvalidProof,
     DPOPackedProof,
-    callback_metadata_digests,
     packed_batch_digest,
 )
 
@@ -41,13 +40,19 @@ def _worker(rank, world_size, scenario, endpoint):
     )
     try:
         groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+        alternate_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
         group_id = rank // 2
         state = SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=rank % 2, sp_group=groups[group_id])
         if scenario in ("dp_only", "dp_only_count_mismatch"):
             state = SimpleNamespace(sp_enabled=False)
+        state.fsdp_group = dist.group.WORLD
         reference = state
         if scenario == "reference_mismatch" and rank == 1:
             reference = SimpleNamespace(sp_enabled=False)
+        if scenario == "reference_members_mismatch":
+            reference = SimpleNamespace(
+                sp_enabled=True, sp_size=2, sp_rank=rank % 2, sp_group=alternate_groups[rank % 2]
+            )
         width = 2 if state.sp_enabled else 4
         batch = {
             "input_ids": torch.zeros((1, width), dtype=torch.long),
@@ -71,21 +76,18 @@ def _worker(rank, world_size, scenario, endpoint):
             ("a" * 64,),
             ("b" if group_id == 0 else "c") * 64,
             packed_batch_digest(batch),
-            packed_batch_digest(batch, after_callbacks=True),
             packed_batch_digest(batch, global_only=True),
             layout_sp_size=2 if state.sp_enabled else 1,
             layout_sp_rank=rank % 2 if state.sp_enabled else 0,
             producer_contract_version=1,
         )
-        if scenario in ("source_range", "catalog_mismatch"):
+        if scenario == "source_range":
             index = 42 if scenario == "source_range" and rank == 1 else 0
             batch["ds_idx"] = torch.tensor([index])
             proof = replace(
                 proof,
                 source_indices=(index,),
                 packed_digest=packed_batch_digest(batch),
-                forward_digest=packed_batch_digest(batch, after_callbacks=True),
-                callback_metadata_digests=callback_metadata_digests(batch, ()),
             )
         if scenario in ("dp_only", "dp_only_count_mismatch"):
             proof = replace(proof, input_digest=str(rank) * 64)
@@ -104,8 +106,6 @@ def _worker(rank, world_size, scenario, endpoint):
         elif (scenario == "microbatch_count" and group_id == 1) or (
             scenario == "dp_only_count_mismatch" and rank == 1
         ):
-            batches = [batch, batch.copy()]
-        elif scenario == "callback_drop":
             batches = [batch, batch.copy()]
         elif scenario == "all_missing":
             batch.pop(DPO_PROOF_KEY)
@@ -126,42 +126,41 @@ def _worker(rank, world_size, scenario, endpoint):
             iterator = failing_iterator()
         else:
             iterator = iter([batches])
+        from veomni.trainer.text_dpo_trainer import _dpo_pair_weighting
+
+        out, loader_error = None, None
         try:
-            step = 2 if scenario == "wrong_step" and rank == 1 else 1
-            epoch = 2 if scenario == "wrong_epoch" and rank == 1 else 1
             out = next_dpo_microbatches(
                 iterator,
                 state,
                 reference,
-                global_step=step,
-                epoch=epoch,
+                global_step=1,
+                epoch=1,
                 source_count=(lambda: 1) if scenario == "source_range" else None,
-                source_catalog=(lambda: ("a", "different") if rank == 1 else ("a", "b"))
-                if scenario == "catalog_mismatch"
-                else None,
-                vocab_size=(lambda: 17 if rank == 1 else 16) if scenario == "vocab_mismatch" else None,
             )
-            expected_proofs = tuple(batch[DPO_APPROVED_KEY] for batch in out)
-            if scenario == "callback_drop":
-                out.pop()
-            if scenario == "callback_mutation" and rank == 1:
-                out[0]["labels"][0, 0] += 1
-            if scenario == "callback_metadata_added" and rank == 1:
-                out[0]["cur_token_num"] = 12345
-            next_dpo_microbatches(
-                iter([out]),
-                state,
-                reference,
-                global_step=step,
-                epoch=epoch,
-                after_callbacks=True,
-                expected_proofs=expected_proofs,
-            )
+        except Exception as exc:
+            loader_error = exc
+        original_gather, original_object_gather = dist.all_gather, dist.all_gather_object
+        if scenario == "consistent":
+
+            def checked_gather(output, tensor, **kwargs):
+                assert tensor.shape == (69,) and tensor.dtype == torch.int64
+                return original_gather(output, tensor, **kwargs)
+
+            def unexpected_object_gather(*args, **kwargs):
+                raise AssertionError("normal pair-count reduction must not gather Python objects")
+
+            dist.all_gather = checked_gather
+            dist.all_gather_object = unexpected_object_gather
+        try:
+            _dpo_pair_weighting(out, SimpleNamespace(), state, True, loader_error=loader_error)
             result = "approved" if DPO_APPROVED_KEY in out[0] else "legacy"
         except StopIteration:
             result = "eof"
         except RuntimeError:
             result = "error"
+        finally:
+            dist.all_gather, dist.all_gather_object = original_gather, original_object_gather
         results = [None] * world_size
         dist.all_gather_object(results, result)
         expected = "approved" if scenario in ("consistent", "dp_only") else "eof" if scenario == "all_eof" else "error"
@@ -184,9 +183,8 @@ def _worker(rank, world_size, scenario, endpoint):
         "one_eof",
         "all_eof",
         "reference_mismatch",
+        "reference_members_mismatch",
         "loader_error",
-        "wrong_step",
-        "wrong_epoch",
         "empty_batch",
         "all_missing",
         "dp_only",
@@ -194,11 +192,6 @@ def _worker(rank, world_size, scenario, endpoint):
         "mutated_labels",
         "mutated_attention",
         "different_global_metadata",
-        "vocab_mismatch",
-        "catalog_mismatch",
-        "callback_mutation",
-        "callback_metadata_added",
-        "callback_drop",
         "source_range",
     ],
 )
@@ -239,14 +232,8 @@ def _training_worker(rank, world_size, endpoint):
         ]
         batch = DPOProvenanceCollator(data_collator.MainCollator(pad_to_length=12))(features)
         approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
-        next_dpo_microbatches(
-            iter([[approved]]),
-            state,
-            state,
-            global_step=1,
-            after_callbacks=True,
-            expected_proofs=(approved[DPO_APPROVED_KEY],),
-        )
+        state.fsdp_group = dist.group.WORLD
+        dpo._dpo_pair_weighting([approved], data_collator.PostCollator(), state, True)
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -254,7 +241,7 @@ def _training_worker(rank, world_size, endpoint):
                 self.values = torch.nn.Parameter(-torch.arange(1, 13, dtype=torch.float32)[rank * 6 : (rank + 1) * 6])
 
             def forward(self, input_ids, **kwargs):
-                assert all(key not in kwargs for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_POSTCHECK_KEY))
+                assert all(key not in kwargs for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY))
                 return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=self.values[None]))
 
         trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
