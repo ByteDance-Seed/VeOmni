@@ -400,6 +400,29 @@ raise during config validation or kernel binding.
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 
+Qwen3.5's CUDA BF16 EP-balancing alias path uses an internal weighted-combine
+library (`distributed/moe/weighted_combine.py`). It fuses alias gathering,
+weighting, and ordered token reduction, and fuses the input-gradient/product
+generation in backward. BF16 multiplication rounding and the original ATen
+hidden-dimension weight-gradient reduction are preserved. It supports first-order
+gradients and requires hidden widths divisible by 16 to keep ATen's per-row
+vector alignment unchanged. Other widths, dtypes, layouts, devices, and
+unsupported top-k sizes keep the original PyTorch path. This library is not an
+OpSlot and adds no config switch.
+The disabled load-balancing path does not use it.
+
+Ordered CUDA EP weight gradients launch the existing grouped GEMM on an internal
+subset of unaffected local experts first. Affected owners receive the original
+FP32 prefix before their suffix is computed once. The group-index indirection
+does not change matrix offsets, tile selection or reduction order; ordinary
+grouped GEMM calls retain the default all-groups path. This is an internal
+library optimization with no new model-level kernel selection.
+
+Qwen3.5's CUDA EP-balancing path also uses an internal chunk-permutation library
+kernel (`veomni/ops/kernels/moe/ep_permutation.py`). It constructs reusable
+forward/inverse row maps for exact copies around all-to-all; there is no new
+config field or OpSlot. Disabled balancing and NPU keep the existing path.
+
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to

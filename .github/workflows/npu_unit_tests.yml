@@ -155,6 +155,31 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -v -s -x tests/parallel/test_ddp_sp_grad_sync.py
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
+      - name: Run MoE EP load-balance unit tests
+        run: |
+          uv run --frozen pytest -v -s -x \
+            tests/parallel/test_moe_alias_order.py \
+            tests/parallel/test_moe_chunk_permutation.py \
+            tests/parallel/test_moe_compact_dispatch.py \
+            tests/parallel/test_moe_ep_cuda_host_plan.py \
+            tests/parallel/test_moe_ep_fp32_grad.py \
+            tests/parallel/test_moe_ep_load_balance_dispatch.py \
+            tests/parallel/test_moe_ep_load_balance_executor.py \
+            tests/parallel/test_moe_ep_load_balance_planner.py \
+            tests/parallel/test_moe_ep_planner_priority.py \
+            tests/parallel/test_moe_no_redundant_weight_grad.py \
+            tests/parallel/test_moe_ordered_weight_grad.py \
+            tests/parallel/test_moe_weight_grad_overlap.py \
+            tests/utils/test_moe_ep_load_balance_config.py \
+            tests/utils/test_moe_router_replay.py \
+            tests/utils/test_moe_monitor.py \
+            tests/utils/test_moe_monitor_wandb_smoke.py \
+            tests/scripts/test_compare_moe_ep_load_balance.py
+      - name: Run MoE EP E2E gate and workflow contracts
+        # Real training remains in the strict accelerator E2E workflow.
+        run: |
+          uv run --frozen pytest -v -s -x tests/e2e/test_qwen3_5_moe_ep_load_balance.py \
+            -k 'not test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry'
       - name: Run models tests
         run: |
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
@@ -198,6 +223,15 @@ jobs:
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+      - name: Run NPU MoE EP load-balance CPU seams
+        run: |
+          uv run --frozen pytest -v -s -x tests/ops/test_npu_moe_ep_load_balance.py \
+            -k 'not test_real_npu_two_rank_alias_forward_backward_and_owner_gradient'
+      - name: Run real two-rank NPU MoE EP alias and gradient test
+        # Launch only this node on two ranks, not the CPU seams or full ops suite.
+        run: |
+          uv run --frozen torchrun --standalone --nproc-per-node=2 -m pytest -v -s -x \
+            tests/ops/test_npu_moe_ep_load_balance.py::test_real_npu_two_rank_alias_forward_backward_and_owner_gradient
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

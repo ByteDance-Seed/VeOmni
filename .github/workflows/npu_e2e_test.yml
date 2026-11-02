@@ -152,6 +152,28 @@ jobs:
             sleep 3
             npu-smi info || true
           fi
+      - name: Install Qwen3.5 NPU GatedDeltaNet dependency
+        # triton-ascend is outside the `npu` extra and default PyPI. Install it
+        # from the documented Ascend index into the already-synced project
+        # environment, then invoke that exact environment without a re-sync.
+        run: |
+          uv pip install --python .venv/bin/python --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple triton-ascend==3.2.1
+      - name: Run Qwen3.5 MoE EP load-balance E2E
+        env:
+          VEOMNI_REQUIRE_EP_BALANCE_E2E: "1"
+        run: |
+          PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m pytest -v -s -x tests/e2e/test_qwen3_5_moe_ep_load_balance.py::test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry
+      - name: Free NPUs after MoE EP load-balance E2E
+        if: always()
+        run: |
+          npu-smi info || true
+          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale NPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            npu-smi info || true
+          fi
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_fsdp_equivalence.py

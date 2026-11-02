@@ -179,7 +179,7 @@ def _make_moe_experts_adapter(raw_forward):
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
-        return raw_forward(
+        kwargs = dict(
             num_experts=self.num_experts,
             routing_weights=top_k_weights.to(hidden_states.dtype),
             selected_experts=top_k_index,
@@ -191,6 +191,9 @@ def _make_moe_experts_adapter(raw_forward):
             swiglu_limit=getattr(self, "limit", None),
             assume_distinct_experts=getattr(self, "assume_distinct_experts", False),
         )
+        if hasattr(self, "_veomni_ep_load_balancer"):
+            kwargs["load_balancer"] = self._veomni_ep_load_balancer
+        return raw_forward(**kwargs)
 
     return adapter
 

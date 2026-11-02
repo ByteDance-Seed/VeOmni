@@ -16,6 +16,54 @@
 import torch
 
 
+def compact_permute(tokens: torch.Tensor, selected_experts: torch.Tensor):
+    """Stable expert-major dispatch without a dense expert/token mask.
+
+    Native top-k and its replica aliases have unique physical IDs per token.
+    Keep the flattened occurrence index so combine can recover its exact weight.
+    """
+    topk = selected_experts.shape[-1]
+    if topk == 0:
+        raise ValueError("Compact EP dispatch requires at least one selected expert.")
+    order = torch.argsort(selected_experts.reshape(-1), stable=True)
+    token_indices = torch.div(order, topk, rounding_mode="floor")
+    return tokens.index_select(0, token_indices), order
+
+
+def compact_unpermute(tokens, routing_weights, hidden_states_shape, occurrence_order):
+    """Preserve expert-major multiplication and the existing FP32 scatter sum."""
+    weights = routing_weights.reshape(-1).index_select(0, occurrence_order)
+    weighted_tokens = tokens * weights.unsqueeze(-1)
+    token_indices = torch.div(occurrence_order, routing_weights.shape[-1], rounding_mode="floor")
+    output = torch.zeros(hidden_states_shape, dtype=torch.float32, device=tokens.device)
+    output.scatter_add_(0, token_indices.unsqueeze(1).expand(-1, hidden_states_shape[-1]), weighted_tokens.float())
+    return output.to(weighted_tokens.dtype)
+
+
+def alias_permute(tokens: torch.Tensor, physical_experts: torch.Tensor, logical_experts: torch.Tensor):
+    """Dispatch physical rows while accumulating input gradients in logical order.
+
+    The second gather is a one-to-one occurrence permutation, so its backward
+    cannot add or round contributions. The first gather retains the unbalanced
+    dispatch's logical expert-major accumulation order, independent of aliases.
+    """
+    if physical_experts.shape != logical_experts.shape:
+        raise ValueError("Physical aliases must preserve the logical routing shape.")
+    topk = physical_experts.shape[-1]
+    if topk == 0:
+        raise ValueError("Alias EP dispatch requires at least one selected expert.")
+    logical_order = torch.argsort(logical_experts.reshape(-1), stable=True)
+    physical_order = torch.argsort(physical_experts.reshape(-1), stable=True)
+    inverse_logical = torch.empty_like(logical_order)
+    positions = torch.arange(logical_order.numel(), device=logical_order.device)
+    inverse_logical.scatter_(0, logical_order, positions)
+    physical_to_logical = inverse_logical.index_select(0, physical_order)
+    logical_to_physical = torch.empty_like(physical_to_logical)
+    logical_to_physical.scatter_(0, physical_to_logical, positions)
+    logical_tokens = tokens.index_select(0, torch.div(logical_order, topk, rounding_mode="floor"))
+    return logical_tokens.index_select(0, physical_to_logical), (logical_order, logical_to_physical)
+
+
 def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
     """
     Permutes the tokens according to the routing map.

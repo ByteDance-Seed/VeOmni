@@ -143,9 +143,26 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
+            self._attach_moe_ep_load_balancers()
             self._build_optimizer()
         self._build_model_assets()
         self.build_checkpoint()
+
+    def _attach_moe_ep_load_balancers(self) -> None:
+        """Attach temporary EP replicas to the training model before optimizer build."""
+        config = self.train_args.moe_ep_load_balance
+        if not config.enabled:
+            return
+        from ..distributed.moe.ep_load_balance import attach_qwen3_5_moe_ep_load_balancers
+
+        options = {"max_replicas_per_rank": config.max_replicas_per_rank}
+        if getattr(config, "optimize_memory", False):
+            options["optimize_memory"] = True
+        attached = attach_qwen3_5_moe_ep_load_balancers(self.model, **options)
+        if attached == 0:
+            raise RuntimeError(
+                "MoE EP load balancing is enabled, but no compatible Qwen3.5 MoE expert modules were found."
+            )
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""

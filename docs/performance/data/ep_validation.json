@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "gpu": {
+    "gp04": {
+      "source_patch_sha256": "b861bc31c734c53570977bf7984be758832c54969e6962ffb46d49810e0f81ea",
+      "hardware": "4 x H20-3e",
+      "layers": 8,
+      "ep_size": 4,
+      "gradient_accumulation": 2,
+      "steps_per_run": 100,
+      "warmup_steps": 20,
+      "groups": 5,
+      "versions": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "transformers": "5.16.1",
+        "datasets": "4.8.4",
+        "fla": "0.5.2",
+        "tilelang": "0.1.12"
+      },
+      "modes": {
+        "off": {
+          "mean_seconds_per_step": 5.322726827675942,
+          "pooled_tokens_per_second": 3078.1215212492375,
+          "step_seconds_range": [
+            5.301663200912299,
+            5.372507879522163
+          ],
+          "peak_allocated_gib": 39.41476058959961,
+          "peak_reserved_gib": 49.1484375
+        },
+        "legacy": {
+          "mean_seconds_per_step": 5.302934763745871,
+          "pooled_tokens_per_second": 3089.60994806331,
+          "step_seconds_range": [
+            5.270739871892147,
+            5.353205466404324
+          ],
+          "peak_allocated_gib": 42.31010437011719,
+          "peak_reserved_gib": 51.923828125
+        },
+        "memory": {
+          "mean_seconds_per_step": 5.309288540122798,
+          "pooled_tokens_per_second": 3085.9125240951885,
+          "step_seconds_range": [
+            5.2936620679392945,
+            5.34386528498726
+          ],
+          "peak_allocated_gib": 39.36829948425293,
+          "peak_reserved_gib": 48.900390625
+        }
+      },
+      "memory_vs_off": {
+        "paired_step_reductions_percent": [
+          -0.7694108298020863,
+          1.1461753533523522,
+          0.2797617542066755,
+          -0.024857001236711085,
+          0.6171689220162868
+        ],
+        "pooled_step_reduction_percent": 0.25246998367962625,
+        "pooled_throughput_gain_percent": 0.25310900795068036,
+        "geometric_mean_step_reduction_percent": 0.25182434875260507,
+        "paired_log_ratio_t95_step_reduction_percent": [
+          -0.641159401032243,
+          1.1368847003758509
+        ],
+        "all_five_pairs_faster": false,
+        "step_reduction_t95_lower_bound_above_zero": false,
+        "observed_10pct_step_target_met": false
+      },
+      "all_scalar_curves_exact": true,
+      "all_measured_on_steps_balanced": true
+    },
+    "gp06": {
+      "source_patch_sha256": "59c4040b64cf5ef6c76f1a603bcd1e67f7d7e4a88908eb1c5b86ee9be530ba50",
+      "hardware": "4 x H20-3e",
+      "layers": 8,
+      "ep_size": 4,
+      "gradient_accumulation": 2,
+      "steps_per_run": 100,
+      "warmup_steps": 20,
+      "groups": 5,
+      "versions": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "transformers": "5.16.1",
+        "datasets": "4.8.4",
+        "fla": "0.5.2",
+        "tilelang": "0.1.12"
+      },
+      "modes": {
+        "off": {
+          "mean_seconds_per_step": 5.693585483680945,
+          "pooled_tokens_per_second": 2877.6243101926034,
+          "step_seconds_range": [
+            5.29582173297531,
+            7.101747459103353
+          ],
+          "peak_allocated_gib": 39.41476058959961,
+          "peak_reserved_gib": 49.1484375
+        },
+        "legacy": {
+          "mean_seconds_per_step": 5.330589993417962,
+          "pooled_tokens_per_second": 3073.5809770082537,
+          "step_seconds_range": [
+            5.29646634462406,
+            5.368342038203264
+          ],
+          "peak_allocated_gib": 42.31010437011719,
+          "peak_reserved_gib": 51.923828125
+        },
+        "memory": {
+          "mean_seconds_per_step": 5.347486646327889,
+          "pooled_tokens_per_second": 3063.8692686125487,
+          "step_seconds_range": [
+            5.2977911848865915,
+            5.4143199789512435
+          ],
+          "peak_allocated_gib": 39.36829948425293,
+          "peak_reserved_gib": 50.3359375
+        }
+      },
+      "memory_vs_off": {
+        "paired_step_reductions_percent": [
+          -1.0463770160761499,
+          -1.1947725190880165,
+          0.11596821787343004,
+          23.76073621132622,
+          2.8550571643997102
+        ],
+        "pooled_step_reduction_percent": 6.078750171487723,
+        "pooled_throughput_gain_percent": 6.4721776835239275,
+        "geometric_mean_step_reduction_percent": 5.429702327758267,
+        "paired_log_ratio_t95_step_reduction_percent": [
+          -9.977912044190806,
+          18.678750709299173
+        ],
+        "all_five_pairs_faster": false,
+        "step_reduction_t95_lower_bound_above_zero": false,
+        "observed_mean_performance_non_regressing": true,
+        "aspirational_5pct_throughput_gain_met": true
+      },
+      "all_scalar_curves_exact": true,
+      "all_measured_on_steps_balanced": true
+    }
+  },
+  "npu": {
+    "source_patch_sha256": "8bcc3ee5bf5c2feffac4d93c17a0c73b77e679cfeea54a5d853d02cd8aacb2d5",
+    "hardware": "8 x Ascend 910B3",
+    "layers": 24,
+    "ep_size": 8,
+    "gradient_accumulation": 1,
+    "steps_per_run": 20,
+    "warmup_steps": 5,
+    "versions": {
+      "torch": "2.10.0+cpu",
+      "torch_npu": "2.10.0.post2",
+      "transformers": "5.16.1",
+      "fla": "0.5.2",
+      "cann": "9.1.0",
+      "driver": "25.5.1"
+    },
+    "all_scalar_curves_exact": true,
+    "all_on_steps_balanced": true,
+    "current_cuda_compatibility_tests_passed": 34,
+    "native_partial_migration_cases_passed": 4,
+    "performance_non_regression_met": false,
+    "load_distribution": {
+      "plans": 480,
+      "scope": "forward and input-gradient execution; owner weight gradients remain canonical",
+      "steps": 20,
+      "layers": 24,
+      "forced_hotspot": false,
+      "mean_imbalance_before": 0.39376386006673175,
+      "mean_imbalance_after": 0.03812274932861328,
+      "moved_expert_token_items": 13181991,
+      "replicas": 3549,
+      "improved_plans": 480
+    }
+  },
+  "common": {
+    "hidden": 2048,
+    "intermediate": 512,
+    "experts": 256,
+    "top_k": 8,
+    "dtype": "bfloat16",
+    "optimizer": "adamw",
+    "global_batch_size": 8,
+    "sequence_length": 2048,
+    "seed": 0,
+    "activation_checkpointing": false,
+    "precision_envelope": {
+      "atol": 0.0001,
+      "rtol": 0.001
+    },
+    "timing": "maximum rank elapsed window; global tokens counted once; profiler excluded"
+  },
+  "production_content": {
+    "sha256": "97e3cf8c16375fbb072b211107e6bc752c39ab15451082f0ff9801e083f6b7c1",
+    "files": 562,
+    "encoding": "sha256 of compact sorted JSON mapping tracked veomni paths to content SHA256",
+    "matches_hardware_validated_snapshot": true
+  }
+}

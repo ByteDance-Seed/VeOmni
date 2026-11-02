@@ -87,6 +87,9 @@ def group_gemm_same_nk_kernel(
     ACTIVATION: tl.constexpr,
     HAS_ACTIVATION: tl.constexpr,
     SAVE_ACTIVATION: tl.constexpr,
+    b_extra_ptr=None,
+    LOCAL_G: tl.constexpr = 0,
+    HAS_EXTRA: tl.constexpr = False,
 ):
     m, n = get_pid_mn(tl.program_id(axis=0), max_M, N, BLOCK_M, BLOCK_N, GROUP)
     gid = tl.program_id(1).to(tl.uint64)
@@ -98,7 +101,13 @@ def group_gemm_same_nk_kernel(
         return
 
     a_ptr += gtid_start * K
-    b_ptr += gid * K * N
+    if HAS_EXTRA:
+        if gid < LOCAL_G:
+            b_ptr += gid * K * N
+        else:
+            b_ptr = b_extra_ptr + (gid - LOCAL_G) * K * N
+    else:
+        b_ptr += gid * K * N
     c_ptr += gtid_start * N
 
     offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -164,6 +173,8 @@ def group_gemm_same_nk(
     activation: Optional[ActivationType] = None,
     save_activation: bool = False,
     c: Optional[torch.Tensor] = None,
+    *,
+    b_extra: Optional[torch.Tensor] = None,
 ):
     """Grouped gemm for same nk
 
@@ -177,11 +188,25 @@ def group_gemm_same_nk(
     activation -- activation type if needed
     save_activation -- return the activation's input or not
     c -- which tensor accumulate to, c = c + ggemm(a, b)
+    b_extra -- optional dense contiguous extra groups, following b's groups
     """
     if transpose_b:
         G, N, K = b.shape
     else:
         G, K, N = b.shape
+
+    local_groups = G
+    if b_extra is not None:
+        if (
+            b_extra.ndim != 3
+            or b_extra.shape[1:] != b.shape[1:]
+            or b_extra.dtype != b.dtype
+            or b_extra.device != b.device
+            or b_extra.layout != torch.strided
+            or not b_extra.is_contiguous()
+        ):
+            raise ValueError("b_extra must be dense contiguous with the same dtype, device and trailing shape as b.")
+        G += b_extra.shape[0]
 
     assert not transpose_a, "Transpose A not tested yet."
 
@@ -190,7 +215,7 @@ def group_gemm_same_nk(
 
     assert a.device == b.device, f"a.device = {a.device}, b.device = {b.device}"
 
-    assert len(cumsum_M) == b.shape[0]
+    assert len(cumsum_M) == G
 
     assert activation is None or activation in list(ActivationType), f"Not implemented: activation is {activation}."
     assert activation or not save_activation, "Can't save activation since activation type is None"
@@ -213,12 +238,15 @@ def group_gemm_same_nk(
         ](
             a_ptr=a,
             b_ptr=b,
+            b_extra_ptr=b_extra,
             c_ptr=c,
             act_ptr=act if save_activation else None,
             cumsum_M=cumsum_M,
             max_M=max_M,
             total_M=a.shape[0],
             G=G,
+            LOCAL_G=local_groups,
+            HAS_EXTRA=b_extra is not None,
             K=K,
             N=N,
             TRANSPOSE_A=transpose_a,
@@ -267,9 +295,13 @@ def group_gemm_same_mn_kernel(
     GROUP: tl.constexpr,
     M_ALIGNED: tl.constexpr,
     N_ALIGNED: tl.constexpr,
+    group_indices_ptr=None,
+    HAS_GROUP_INDICES: tl.constexpr = False,
 ):
     m, n = get_pid_mn(tl.program_id(axis=0), M, N, BLOCK_M, BLOCK_N, GROUP)
     gid = tl.program_id(1).to(tl.uint64)
+    if HAS_GROUP_INDICES:
+        gid = tl.load(group_indices_ptr + gid).to(tl.uint64)
     gtid_start = tl.load(cumsum_K + gid - 1, mask=gid > 0, other=0)
     gtid_end = tl.load(cumsum_K + gid)
     k = (gtid_end - gtid_start).to(tl.uint64)
@@ -337,7 +369,7 @@ def group_gemm_same_mn_kernel(
         return
 
     if ACCUMULATE_TO_C:
-        out = tl.load(c_block_ptr).to(tl.float32)
+        out = load_block_with_pred_2d(c_block_ptr, M_ALIGNED, N_ALIGNED).to(tl.float32)
     else:
         out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
