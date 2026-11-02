@@ -154,6 +154,7 @@ def test_mixin_metadata_errors_reach_shared_validation(monkeypatch, invalid):
     [
         (True, True, True, 2, 2, None, "sp_slice", True),
         (True, True, True, 2, 2, "off", "sp_slice", False),
+        (True, False, True, 2, 2, False, "replicate", False),
         (True, True, True, 1, 4, None, "sp_slice", False),
         (True, True, True, 4, 1, None, "dp_balance", True),
         (True, False, True, 2, 2, None, "dp_balance", True),
@@ -168,6 +169,22 @@ def test_structural_strategy(global_attn, patchify, items, dp, sp, override, exp
         ModuleStructure(global_attn, patchify, items), sp_size=sp, dp_size=dp, override=override
     )
     assert (plan.strategy, plan.balance_dp) == (expected, balance)
+
+
+@pytest.mark.parametrize("source", ["yaml", "cli"])
+def test_bare_off_from_yaml_or_cli_disables_balancing(source):
+    import yaml
+
+    from veomni.arguments.omni_parser import _coerce_cli_value
+    from veomni.models.seed_omni.mixins.data_balance_mixin import ModuleStructure, resolve_balance_strategy
+
+    if source == "yaml":
+        override = yaml.safe_load("data_balance_override: off")["data_balance_override"]
+    else:
+        override = _coerce_cli_value("off")
+    assert override is False
+    plan = resolve_balance_strategy(ModuleStructure(), sp_size=1, dp_size=2, override=override)
+    assert (plan.strategy, plan.balance_dp) == ("replicate", False)
 
 
 def test_invalid_strategy_override():
