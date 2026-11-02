@@ -35,7 +35,8 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     _no_split_modules = ["Qwen3DecoderLayer"]
     supports_gradient_checkpointing = True
 
-    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+    @staticmethod
+    def _reject_flex_attention(attn_implementation: Any) -> None:
         # Attention is validated and executed by ``self.language_model``, which
         # receives a plain 2-D mask on this module's packed path. Flex would
         # turn that into a causal ``BlockMask`` without the sample boundaries
@@ -45,11 +46,24 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
                 "Qwen3Llm packs several conversations into one sequence and isolates them with a dense "
                 "mask, so `flex_attention` is not supported here; use `eager`, `sdpa`, or a flash backend."
             )
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        self._reject_flex_attention(attn_implementation)
+        # Nested ``text_config`` can keep an explicit Flex selection when the
+        # outer wrapper is something else (e.g. eager). Reject that too: the
+        # backbone is what actually runs attention.
+        text_config = getattr(self.config, "text_config", None)
+        if text_config is not None:
+            self._reject_flex_attention(getattr(text_config, "_attn_implementation", None))
         return attn_implementation
 
     def __init__(self, config: Qwen3LlmConfig):
         super().__init__(config)
         self.config = config
+        # Re-check the nested backend immediately before construction: HF's
+        # wrapper check only sees the outer selection, and a later nested
+        # override must not reach ``Qwen3Model`` with Flex.
+        self._reject_flex_attention(getattr(self.config.text_config, "_attn_implementation", None))
         self.language_model = Qwen3Model._from_config(self.config.text_config)
         self.language_model.set_input_embeddings(nn.Identity())
         self._past_key_values: Any = None
