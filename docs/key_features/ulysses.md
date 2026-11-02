@@ -509,9 +509,14 @@ For packed input, the CPU `SequenceParallelCollator` prepares
 document length), and `usp_half0` / `usp_half1` (int64 gather indices for the
 two halves of each local document). These describe the sequence after the
 Ulysses gather. The trainer moves tensors with the batch; attention consumes
-them without reading device scalars. Custom packed callers must provide the
-same metadata, using `prepare_usp_metadata` before moving the batch to the
-accelerator. A missing packed metadata set raises before communication.
+them without reading device scalars. Custom packed callers must provide
+`cu_seq_lens_q` identifying the packed document boundaries and the same USP
+metadata, using `prepare_usp_metadata` before moving the batch to the
+accelerator. The missing-metadata guard rejects a packed call before
+communication when `cu_seq_lens_q` identifies multiple documents. If both
+`cu_seq_lens_q` and USP metadata are omitted, attention selects the dense Ring
+path instead of raising and can attend across document boundaries. Callers
+must supply the metadata rather than relying on this guard to detect packing.
 
 BF16 Ring changes attention reduction and rounding order. The tests check
 dense and packed Ring output/gradient parity, CP=2/4, Ulysses=2 × CP=2, and
