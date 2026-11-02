@@ -374,8 +374,15 @@ as part of the existing checkpoint-layout exchange; owner-specific freezing
 that removes a whole leaf from only some ranks is rejected before per-leaf
 checkpoint collectives, rather than supported. Replica values, trainability, dtype, shape and geometry
 are trusted to be consistent across ranks. Source and target checkpoint layout
-metadata are checked during restore; no tensor bytes are hashed. Hooks and
-adapters are trusted. MultiOptimizer asynchronous saves
+metadata are checked during restore; tensor bytes are not hashed for replica
+consistency. Trainable-only MultiOptimizer checkpoints do hash each rank's local
+frozen base parameters on save and load to verify the base identity. That may copy
+device tensors to CPU and can add substantial time for a large frozen model.
+Hooks, adapters and scheduler method wrappers are trusted: a wrapper must
+preserve serializable scheduler state and implement the same learning-rate
+behavior on both sides of a restore. The persisted recipe checks scheduler
+configuration and optimizer binding; it does not inspect arbitrary wrapper
+code. MultiOptimizer asynchronous saves
 and unsupported layouts fail closed; synchronous staged saves are supported.
 The runtime assumes ranks use a consistent model configuration and compatible
 replica geometries; saved source layout is validated on restore.
