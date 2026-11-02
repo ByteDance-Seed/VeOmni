@@ -20,7 +20,6 @@ from ..utils.dpo_provenance import (
     DPO_PROOF_KEY,
     DPOInvalidProof,
     DPOPackedProof,
-    packed_batch_digest,
 )
 from ..utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
 
@@ -46,12 +45,6 @@ def _validate_proof(value: Any) -> None:
         or any(type(count) is not int or count < 0 for count in value.feature_token_counts)
         or type(value.collator_tail) is not int
         or value.collator_tail < 0
-        or type(value.source_ids) is not tuple
-        or len(value.source_ids) != len(value.feature_token_counts)
-        or any(source is not None and (type(source) is not str or len(source) != 64) for source in value.source_ids)
-        or type(value.packed_digest) is not str
-        or len(value.packed_digest) != 64
-        or any(char not in "0123456789abcdef" for char in value.packed_digest)
         or type(value.source_indices) is not tuple
         or len(value.source_indices) not in (0, len(value.feature_token_counts))
         or any(type(index) is not int or index < 0 for index in value.source_indices)
@@ -72,8 +65,10 @@ def _validate_batch(
     vocab_size: int | None,
     source_catalog: tuple[str, ...] | None,
 ) -> None:
-    if packed_batch_digest(batch, proof.source_keys) != proof.packed_digest:
-        raise ValueError("DPO batch changed after its segment evidence was produced")
+    for key in ("input_ids", "labels", "position_ids", "attention_mask", "cu_seq_lens_q"):
+        value = batch.get(key)
+        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+            raise ValueError(f"DPO packed {key} must be a CPU tensor")
     ids, labels = batch["input_ids"], batch["labels"]
     if ids.ndim != 2 or ids.shape[0] != 1 or labels.shape != ids.shape:
         raise ValueError("DPO input and label shapes must agree")
@@ -140,7 +135,8 @@ def _next_local_dpo_microbatches(
 
     Sequence-parallel ranks must receive the same deterministic input, as for
     the other training objectives. Callback consumers may remove metadata but
-    must not mutate or reorder model inputs.
+    must not mutate or reorder model inputs. Features must likewise remain
+    unchanged between the producer and collator; token contents are not hashed.
     """
     del global_step, epoch
     batches = next(data_iterator)

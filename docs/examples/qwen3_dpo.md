@@ -271,12 +271,10 @@ any buffered loader data are restored. Each rank must have a loader cursor;
 local cursor restoration failures are synchronized. A custom loader's restore
 method must not contain its own unmatched collectives. This protocol does not hash reference
 weights or dataset contents: an exact resume still requires an immutable external
-contract for the reference model and input data. Feature tensors are
-fingerprinted at production and checked again at collation;
-the digest detects mutation but cannot prove a producer's contract is truthful.
-Local packed tensors and channel-loss metadata are fingerprinted at preflight
-to detect mutation after collation. Callbacks should transform data before
-collation; model inputs are not rehashed after step-begin callbacks.
+contract for the reference model and input data. The producer and collator
+must preserve the same feature contents and ordering. Tokens and packed
+batches are not fingerprinted for mutation; transforms and callbacks must not
+change model inputs after the corresponding segment lengths are produced.
 Input validation and ordinary rank-local callback exceptions after callbacks
 return are coordinated before model execution. Failures inside a callback's own
 collective still rely on the launcher's failure handler or timeout.

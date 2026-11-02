@@ -1128,7 +1128,6 @@ def test_full_sample_buffer_serialization_keeps_typed_provenance():
     restored = torch.load(buffer, weights_only=False)["buffer"][0]
     marker = restored[DPO_FEATURE_KEY]
     assert (marker.chosen, marker.rejected, marker.producer_contract_version) == (3, 1, 1)
-    assert len(marker.feature_digest) == 64
 
 
 @pytest.mark.parametrize("exhausted", [False, True])
@@ -1187,7 +1186,6 @@ def test_dynamic_batch_buffer_restore_preserves_provenance(save_by_idx):
     resumed.load_state_dict(torch.load(serialized, weights_only=False))
     marker = resumed._buffer[0][0][DPO_FEATURE_KEY]
     assert (marker.chosen, marker.rejected, marker.producer_contract_version) == (3, 1, 1)
-    assert len(marker.feature_digest) == 64
 
 
 @pytest.mark.parametrize("path_style", ["trailing_slash", "relative", "symlink"])
@@ -1257,6 +1255,7 @@ def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path,
                 self._last_saved_optimizer_generation = generation
 
         trainer.policy_model.checkpoint = CheckpointStub(
+            runtime=trainer.policy_model,
             _last_saved_step=-1 if loaded else 3,
             _last_saved_optimizer_generation=None if loaded else "source",
             _loaded_optimizer_global_step=3 if loaded else None,

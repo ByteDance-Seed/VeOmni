@@ -75,8 +75,6 @@ def _native_provenance_hccl(require_hccl=False):
     collator = DPOProvenanceCollator(data_collator.MainCollator(pad_to_length=8))
     for scenario in (
         "consistent",
-        "different_input",
-        "different_extra_metadata",
         "collator_wrong_sp_rank",
         "preexisting_mask_padding",
         "missing",
@@ -85,16 +83,12 @@ def _native_provenance_hccl(require_hccl=False):
         "one_eof",
         "microbatch_count",
         "empty_batch",
-        "mutated_labels",
-        "mutated_attention",
+        "bad_max_length",
         "different_global_metadata",
         "source_range",
         "vocab_range",
     ):
-        chosen = "xyz" if scenario == "different_input" and rank == 1 else "abc"
-        sample = feature(chosen)
-        if scenario == "different_extra_metadata":
-            sample["cur_token_num"] = 1 if rank != 1 else 2
+        sample = feature("abc")
         if scenario == "preexisting_mask_padding" and rank == 1:
             sample["attention_mask"][-1] = 0
         if scenario == "source_range" and rank == 1:
@@ -126,9 +120,7 @@ def _native_provenance_hccl(require_hccl=False):
             batch.pop(DPO_PROOF_KEY)
         if scenario == "invalid" and rank == 1:
             batch[DPO_PROOF_KEY] = DPOInvalidProof("injected invalid provenance")
-        if scenario == "mutated_labels" and rank == 1:
-            batch["labels"][0, 0] += 1
-        if scenario == "mutated_attention" and rank == 1:
+        if scenario == "bad_max_length" and rank == 1:
             batch["max_length_q"] += 1
         batches = [batch, dict(batch)] if scenario == "microbatch_count" and rank >= 2 else [batch]
         if scenario == "empty_batch" and rank == 1:

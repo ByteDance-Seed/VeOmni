@@ -24,7 +24,6 @@ from veomni.utils.dpo_provenance import (
     DPOFeatureSegments,
     dpo_declared_producer_identity,
     dpo_tokenizer_fingerprint,
-    packed_batch_digest,
 )
 from veomni.utils.registry import Registry
 
@@ -545,14 +544,7 @@ def process_dpo_example(
         "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
     }
     if record_segment_provenance:
-        feature_digest = packed_batch_digest(
-            result,
-            feature=True,
-            include_keys=("input_ids", "labels", "position_ids", "attention_mask"),
-        )
-        result[DPO_FEATURE_KEY] = DPOFeatureSegments(
-            c_len, r_len, producer_contract_version=1, feature_digest=feature_digest
-        )
+        result[DPO_FEATURE_KEY] = DPOFeatureSegments(c_len, r_len, producer_contract_version=1)
     return [result]
 
 

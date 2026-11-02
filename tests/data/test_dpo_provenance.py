@@ -31,7 +31,6 @@ from veomni.utils.dpo_provenance import (
     DPOPackedProof,
     dpo_declared_producer_identity,
     dpo_tokenizer_fingerprint,
-    packed_batch_digest,
 )
 
 
@@ -583,15 +582,10 @@ def test_conversation_pair_rejects_different_truncated_contexts():
         )
 
 
-def test_feature_content_mutation_and_old_metadata_are_rejected(monkeypatch):
+def test_old_feature_metadata_is_rejected(monkeypatch):
     from dataclasses import replace
 
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
-    feature = _feature("abc", "def", 0)
-    feature["input_ids"][0] += 1
-    result = DPOProvenanceCollator(MainCollator())([feature])
-    assert isinstance(result[DPO_PROOF_KEY], DPOInvalidProof)
-
     feature = _feature("abc", "def", 0)
     feature[DPO_FEATURE_KEY] = replace(feature[DPO_FEATURE_KEY], producer_contract_version=0)
     result = DPOProvenanceCollator(MainCollator())([feature])
@@ -599,17 +593,9 @@ def test_feature_content_mutation_and_old_metadata_are_rejected(monkeypatch):
 
 
 def test_collator_rejects_even_signed_pre_shifted_labels(monkeypatch):
-    from dataclasses import replace
-
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 0)
     feature["labels"][1] = feature["input_ids"][2]
-    feature[DPO_FEATURE_KEY] = replace(
-        feature[DPO_FEATURE_KEY],
-        feature_digest=packed_batch_digest(
-            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
-        ),
-    )
     result = DPOProvenanceCollator(MainCollator())([feature])
     assert isinstance(result[DPO_PROOF_KEY], DPOInvalidProof)
 
@@ -828,6 +814,7 @@ def test_all_legacy_features_are_not_approved_by_opt_in_collator(monkeypatch):
         "slices",
         "max_length",
         "mask_flag",
+        "mask_value",
     ],
 )
 def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, changed):
@@ -850,14 +837,14 @@ def test_preflight_rejects_changed_batch_or_out_of_range_source(monkeypatch, cha
         batch["max_length_q"] = 1
     elif changed == "mask_flag":
         batch["attention_mask_is_all_ones"] = False
+    elif changed == "mask_value":
+        batch["attention_mask"][0, -1] = 0
     with pytest.raises(RuntimeError, match="metadata failed"):
         next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, source_count=lambda: 1)
 
 
 @pytest.mark.parametrize("key", ["input_ids", "labels"])
 def test_preflight_rejects_token_ids_outside_vocabulary(monkeypatch, key):
-    from dataclasses import replace
-
     state = _state()
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
     feature = _feature("abc", "de", 0)
@@ -867,12 +854,6 @@ def test_preflight_rejects_token_ids_outside_vocabulary(monkeypatch, key):
     else:
         feature["input_ids"][0] = 100
         feature["labels"][0] = -100
-    feature[DPO_FEATURE_KEY] = replace(
-        feature[DPO_FEATURE_KEY],
-        feature_digest=packed_batch_digest(
-            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
-        ),
-    )
     batch = DPOProvenanceCollator(MainCollator())([feature])
     with pytest.raises(RuntimeError, match="outside the model vocabulary"):
         next_dpo_microbatches(iter([[batch]]), state, state, global_step=1, vocab_size=lambda: 10)
@@ -1255,19 +1236,11 @@ def test_slow_tokenizer_with_automatic_trailing_eos_keeps_completion():
 
 
 def test_source_ignored_labels_and_collator_tail_stay_distinct(monkeypatch):
-    from dataclasses import replace
-
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
     feature = _feature("abc", "def", 5)
     # Actual tokens may have ignored labels; that does not make them padding.
     feature["labels"][-3] = -100
     feature["labels"][-1] = -100
-    feature[DPO_FEATURE_KEY] = replace(
-        feature[DPO_FEATURE_KEY],
-        feature_digest=packed_batch_digest(
-            feature, feature=True, include_keys=("input_ids", "labels", "position_ids", "attention_mask")
-        ),
-    )
     batch = DPOProvenanceCollator(MainCollator(pad_to_length=8))([feature])
     proof = batch[DPO_PROOF_KEY]
     assert proof.segment_lengths == (3, 3)
@@ -1572,7 +1545,7 @@ def test_shared_meter_ignores_proof_when_opt_in_is_disabled():
     from veomni.utils import helper
     from veomni.utils.dpo_provenance import DPOPackedProof
 
-    proof = DPOPackedProof((3, 1), (4,), 0, (None,), "b" * 64, producer_contract_version=1)
+    proof = DPOPackedProof((3, 1), (4,), 0, producer_contract_version=1)
     ordinary = {"cu_seq_lens_q": torch.tensor([0, 3, 4])}
     with_proof = {**ordinary, DPO_APPROVED_KEY: proof}
     assert helper._compute_seqlens(with_proof) == helper._compute_seqlens(ordinary)

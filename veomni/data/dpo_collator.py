@@ -8,7 +8,6 @@
 
 """Opt-in DPO-specific evidence around the ordinary packing collator."""
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +22,6 @@ from ..utils.dpo_provenance import (
     DPOFeatureSegments,
     DPOInvalidProof,
     DPOPackedProof,
-    packed_batch_digest,
 )
 from . import data_collator as collator_module
 from .data_collator import (
@@ -58,9 +56,7 @@ class DPOMicroBatchCollator:
         return result
 
 
-def _source_id(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> tuple[bool, str | None]:
-    digest = hashlib.sha256()
-    found = False
+def _source_metadata_valid(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> bool:
     for key in dict.fromkeys(("ds_idx", "source_name", *extra_keys)):
         if key not in feature:
             continue
@@ -68,10 +64,8 @@ def _source_id(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> tuple[bo
         if isinstance(value, torch.Tensor) and value.device.type == "cpu" and value.numel() == 1:
             value = value.item()
         if type(value) not in (int, str):
-            return False, None
-        found = True
-        digest.update(f"{key}:{type(value).__name__}:{value!r};".encode("utf-8"))
-    return True, digest.hexdigest() if found else None
+            return False
+    return True
 
 
 def _supported_provenance_features(features: list[dict[str, Any]], source_keys: tuple[str, ...]) -> bool:
@@ -201,23 +195,14 @@ class DPOProvenanceCollator:
         can_prove = can_prove and _supported_provenance_features(clean, source_keys)
         segment_lengths: list[int] = []
         counts: list[int] = []
-        sources: list[str | None] = []
         if can_prove:
             for feature, item in zip(clean, metadata):
                 ids = feature.get("input_ids")
-                source_valid, source = _source_id(feature, self.source_keys)
                 if (
                     not isinstance(ids, torch.Tensor)
                     or ids.ndim != 1
                     or type(item.producer_contract_version) is not int
                     or item.producer_contract_version != 1
-                    or type(item.feature_digest) is not str
-                    or item.feature_digest
-                    != packed_batch_digest(
-                        feature,
-                        feature=True,
-                        include_keys=("input_ids", "labels", "position_ids", "attention_mask"),
-                    )
                     or type(item.chosen) is not int
                     or type(item.rejected) is not int
                     or item.chosen <= 0
@@ -239,13 +224,12 @@ class DPOProvenanceCollator:
                     or (item.chosen > 1 and not bool((feature["labels"][1 : item.chosen] != IGNORE_INDEX).any()))
                     or (item.rejected > 1 and not bool((feature["labels"][item.chosen + 1 :] != IGNORE_INDEX).any()))
                     or not bool((feature["position_ids"] >= 0).all())
-                    or not source_valid
+                    or not _source_metadata_valid(feature, self.source_keys)
                 ):
                     can_prove = False
                     break
                 segment_lengths.extend((item.chosen, item.rejected))
                 counts.append(get_length_fn(feature))
-                sources.append(source)
 
         batch = self.collator(clean)
         if any(key in batch for key in (DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY)):
@@ -298,8 +282,6 @@ class DPOProvenanceCollator:
             tuple(segment_lengths),
             tuple(counts),
             tail,
-            tuple(sources),
-            packed_batch_digest(batch, source_keys),
             tuple(ds_indices),
             source_keys,
             sp_size,

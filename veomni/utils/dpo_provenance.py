@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any
 
-import torch
-
 
 DPO_FEATURE_KEY = "_veomni_dpo_feature_segments"
 DPO_PROOF_KEY = "_veomni_dpo_packed_proof"
@@ -53,7 +51,6 @@ class DPOFeatureSegments:
     chosen: int
     rejected: int
     producer_contract_version: int = 0
-    feature_digest: str = ""
 
 
 def _stable_tokenizer_backend(serialized: str) -> str:
@@ -195,8 +192,6 @@ class DPOPackedProof:
     segment_lengths: tuple[int, ...]
     feature_token_counts: tuple[int, ...]
     collator_tail: int
-    source_ids: tuple[str | int | None, ...]
-    packed_digest: str
     source_indices: tuple[int, ...] = ()
     source_keys: tuple[str, ...] = ()
     layout_sp_size: int = 1
@@ -209,54 +204,3 @@ class DPOInvalidProof:
     """Inconsistent evidence; the trainer must coordinate rejection across ranks."""
 
     reason: str
-
-
-def packed_batch_digest(
-    batch: dict[str, Any],
-    source_keys: tuple[str, ...] = (),
-    *,
-    feature: bool = False,
-    include_keys: tuple[str, ...] | None = None,
-) -> str:
-    """Fingerprint the local CPU batch so later mutation cannot reuse its evidence."""
-    digest = hashlib.sha256()
-
-    def update(value: Any) -> None:
-        if isinstance(value, torch.Tensor):
-            if value.device.type != "cpu":
-                raise ValueError("DPO packed provenance tensors must be on CPU")
-            digest.update(f"tensor:{value.dtype}:{tuple(value.shape)}:".encode())
-            digest.update(memoryview(value.contiguous().reshape(-1).view(torch.uint8).numpy()))
-        elif isinstance(value, dict):
-            if any(type(key) is not str for key in value):
-                raise ValueError("DPO packed provenance has non-string keys")
-            digest.update(f"dict:{type(value).__module__}.{type(value).__qualname__}:".encode())
-            for key in sorted(value):
-                update(key)
-                update(value[key])
-        elif isinstance(value, (list, tuple)):
-            digest.update(f"{type(value).__name__}:{len(value)}:".encode())
-            for item in value:
-                update(item)
-        elif value is None or type(value) in (bool, int, float, str):
-            digest.update(f"{type(value).__name__}:{value!r};".encode())
-        else:
-            raise ValueError("DPO packed provenance has an unsupported value")
-
-    required = ("input_ids", "labels", "position_ids", "attention_mask")
-    if not feature:
-        required += ("cu_seq_lens_q",)
-    for key in required:
-        value = batch.get(key)
-        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
-            raise ValueError(f"DPO packed {key} must be a CPU tensor")
-    if any(type(key) is not str for key in batch):
-        raise ValueError("DPO packed batch has non-string keys")
-    update(source_keys)
-    ignored = {DPO_PROOF_KEY, DPO_APPROVED_KEY, DPO_AGREED_KEY}
-    for key in sorted(batch):
-        if key in ignored or (include_keys is not None and key not in include_keys):
-            continue
-        update(key)
-        update(batch[key])
-    return digest.hexdigest()

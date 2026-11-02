@@ -26,7 +26,6 @@ from veomni.utils.dpo_provenance import (
     DPO_PROOF_KEY,
     DPOInvalidProof,
     DPOPackedProof,
-    packed_batch_digest,
 )
 
 
@@ -73,8 +72,6 @@ def _worker(rank, world_size, scenario, endpoint):
             (2, 2),
             (4,),
             0,
-            ("a" * 64,),
-            packed_batch_digest(batch),
             layout_sp_size=2 if state.sp_enabled else 1,
             layout_sp_rank=rank % 2 if state.sp_enabled else 0,
             producer_contract_version=1,
@@ -85,7 +82,6 @@ def _worker(rank, world_size, scenario, endpoint):
             proof = replace(
                 proof,
                 source_indices=(index,),
-                packed_digest=packed_batch_digest(batch),
             )
         batch[DPO_PROOF_KEY] = proof
         batches = [batch]
@@ -105,16 +101,15 @@ def _worker(rank, world_size, scenario, endpoint):
             batch.pop(DPO_PROOF_KEY)
         elif scenario == "empty_batch" and rank == 1:
             batches = []
-        elif scenario == "mutated_labels" and rank == 1:
+        elif scenario == "bad_label_shape" and rank == 1:
             batch["labels"] = torch.cat((batch["labels"], batch["labels"][:, -1:]), dim=-1)
-        elif scenario == "mutated_attention" and rank == 1:
+        elif scenario == "bad_attention_cu" and rank == 1:
             batch["cu_seq_lens_k"] = torch.tensor([0, 4])
         elif scenario == "invalid_local_cu" and rank == 1:
             batch["cu_seq_lens_q"] = torch.tensor([0, 2, 2, 4])
-            batch[DPO_PROOF_KEY] = replace(proof, packed_digest=packed_batch_digest(batch))
         elif scenario == "invalid_local_tail" and rank == 1:
             batch["tail_padding_length"] = torch.tensor(1)
-            batch[DPO_PROOF_KEY] = replace(proof, collator_tail=1, packed_digest=packed_batch_digest(batch))
+            batch[DPO_PROOF_KEY] = replace(proof, collator_tail=1)
         if (scenario == "one_eof" and rank == 1) or scenario == "all_eof":
             iterator = iter([])
         elif scenario == "loader_error" and rank == 1:
@@ -191,8 +186,8 @@ def _worker(rank, world_size, scenario, endpoint):
         "all_missing",
         "dp_only",
         "dp_only_count_mismatch",
-        "mutated_labels",
-        "mutated_attention",
+        "bad_label_shape",
+        "bad_attention_cu",
         "invalid_local_cu",
         "invalid_local_tail",
         "different_global_metadata",
