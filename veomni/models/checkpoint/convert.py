@@ -384,13 +384,18 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
     """
     ps = parallel_state.get_parallel_state()
     params = model.state_dict()
-    device_type = get_device_type()
-    device = torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device("cpu")
+    device = None
     for name, param in params.items():
         # With ``CPUOffloadPolicy`` the sharded DTensor local shard lives on CPU, so an
         # unstaged ``full_tensor()`` all-gathers over gloo and hands CPU tensors to the
         # consumers (EP broadcast, quantization kernels), which require device tensors.
-        unsharded_tensor = param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
+        if isinstance(param, DTensor):
+            if device is None:
+                device_type = get_device_type()
+                device = torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device("cpu")
+            unsharded_tensor = param.to(device, non_blocking=True).full_tensor()
+        else:
+            unsharded_tensor = param
 
         is_expert_layer = "mlp.experts." in name
         is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])

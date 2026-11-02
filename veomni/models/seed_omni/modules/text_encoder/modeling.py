@@ -185,6 +185,10 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
     _no_split_modules: list = ["ShardedEmbedding"]
     main_input_name = "input_ids"
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This module embeds and projects tokens; it does not execute attention.
+        return attn_implementation
+
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
 

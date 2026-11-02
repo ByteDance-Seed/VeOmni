@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from transformers import PretrainedConfig
 
+from veomni.models.configuration_base import get_veomni_config_class
+
 
 IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
@@ -30,6 +32,8 @@ AUDIO_START_TOKEN_ID = 125
 def tiny_deepseek_v3_config(architecture: str = "DeepseekV3ForCausalLM") -> PretrainedConfig:
     """Build a four-layer toy that retains the official dense-to-MoE schedule."""
     from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+    DeepseekV3Config = get_veomni_config_class(DeepseekV3Config)
 
     return DeepseekV3Config(
         vocab_size=128,
@@ -107,6 +111,8 @@ def tiny_glm_moe_dsa_config(architecture: str = "GlmMoeDsaForCausalLM") -> Pretr
     """Build a four-layer toy that retains GLM's dense-to-MoE schedule."""
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+    GlmMoeDsaConfig = get_veomni_config_class(GlmMoeDsaConfig)
+
     return GlmMoeDsaConfig(
         vocab_size=128,
         hidden_size=64,
@@ -142,6 +148,8 @@ def tiny_gemma3_text_config(
 ) -> PretrainedConfig:
     from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
 
+    Gemma3TextConfig = get_veomni_config_class(Gemma3TextConfig)
+
     if layer_types is None:
         layer_types = ["sliding_attention", "sliding_attention", "full_attention"]
     return Gemma3TextConfig(
@@ -175,6 +183,8 @@ def tiny_gemma3_text_config(
 def tiny_gpt_oss_config(architecture: str = "GptOssForCausalLM") -> PretrainedConfig:
     from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+    GptOssConfig = get_veomni_config_class(GptOssConfig)
+
     return GptOssConfig(
         vocab_size=128,
         hidden_size=64,
@@ -206,6 +216,8 @@ def tiny_gpt_oss_config(architecture: str = "GptOssForCausalLM") -> PretrainedCo
 
 def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.llama.configuration_llama import LlamaConfig
+
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
 
     kwargs = {
         "vocab_size": 128,
@@ -254,6 +266,8 @@ def tiny_movqgan_config(architecture: str = "MoVQGAN") -> PretrainedConfig:
 
 def tiny_seed_oss_config(architecture: str = "SeedOssForCausalLM") -> PretrainedConfig:
     from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
+
+    SeedOssConfig = get_veomni_config_class(SeedOssConfig)
 
     return SeedOssConfig(
         vocab_size=128,
@@ -482,6 +496,8 @@ def tiny_qwen_image_condition_config(architecture: str = "QwenImageConditionMode
 def tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
+    Qwen2Config = get_veomni_config_class(Qwen2Config)
+
     kwargs = {
         "vocab_size": 128,
         "hidden_size": 64,
@@ -511,6 +527,10 @@ def tiny_qwen2_vl_config(architecture: str = "Qwen2VLForConditionalGeneration") 
         Qwen2VLTextConfig,
         Qwen2VLVisionConfig,
     )
+
+    Qwen2VLConfig = get_veomni_config_class(Qwen2VLConfig)
+    Qwen2VLTextConfig = get_veomni_config_class(Qwen2VLTextConfig)
+    Qwen2VLVisionConfig = get_veomni_config_class(Qwen2VLVisionConfig)
 
     text = Qwen2VLTextConfig(
         vocab_size=128,
@@ -548,6 +568,7 @@ def tiny_qwen2_vl_config(architecture: str = "Qwen2VLForConditionalGeneration") 
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -557,6 +578,10 @@ def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGenerati
         Qwen2_5_VLTextConfig,
         Qwen2_5_VLVisionConfig,
     )
+
+    Qwen2_5_VLConfig = get_veomni_config_class(Qwen2_5_VLConfig)
+    Qwen2_5_VLTextConfig = get_veomni_config_class(Qwen2_5_VLTextConfig)
+    Qwen2_5_VLVisionConfig = get_veomni_config_class(Qwen2_5_VLVisionConfig)
 
     text = Qwen2_5_VLTextConfig(
         vocab_size=128,
@@ -596,6 +621,7 @@ def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGenerati
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -603,6 +629,8 @@ def tiny_qwen2_5_omni_text_config(
     architecture: str = "Qwen2_5OmniThinkerTextModel",
 ) -> PretrainedConfig:
     from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTextConfig
+
+    Qwen2_5OmniTextConfig = get_veomni_config_class(Qwen2_5OmniTextConfig)
 
     return Qwen2_5OmniTextConfig(
         vocab_size=128,
@@ -633,6 +661,10 @@ def tiny_qwen2_5_omni_thinker_config(
         Qwen2_5OmniThinkerConfig,
         Qwen2_5OmniVisionEncoderConfig,
     )
+
+    Qwen2_5OmniAudioEncoderConfig = get_veomni_config_class(Qwen2_5OmniAudioEncoderConfig)
+    Qwen2_5OmniThinkerConfig = get_veomni_config_class(Qwen2_5OmniThinkerConfig)
+    Qwen2_5OmniVisionEncoderConfig = get_veomni_config_class(Qwen2_5OmniVisionEncoderConfig)
 
     text = tiny_qwen2_5_omni_text_config()
     vision = Qwen2_5OmniVisionEncoderConfig(
@@ -670,6 +702,7 @@ def tiny_qwen2_5_omni_thinker_config(
         vision_end_token_id=VISION_END_TOKEN_ID,
         audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -683,11 +716,14 @@ def tiny_qwen2_5_omni_config(
         thinker_config=thinker.to_dict(),
         enable_audio_output=False,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
 def tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
+    Qwen3Config = get_veomni_config_class(Qwen3Config)
 
     kwargs = {
         "vocab_size": 128,
@@ -719,6 +755,8 @@ def tiny_qwen3_5_text_config(
     layer_types: list[str] | None = None,
 ) -> PretrainedConfig:
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    Qwen3_5TextConfig = get_veomni_config_class(Qwen3_5TextConfig)
 
     layer_types = ["linear_attention"] if layer_types is None else layer_types
     return Qwen3_5TextConfig(
@@ -755,6 +793,9 @@ def tiny_qwen3_5_config(
 ) -> PretrainedConfig:
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5VisionConfig
 
+    Qwen3_5Config = get_veomni_config_class(Qwen3_5Config)
+    Qwen3_5VisionConfig = get_veomni_config_class(Qwen3_5VisionConfig)
+
     text = tiny_qwen3_5_text_config(layer_types=layer_types)
     vision = Qwen3_5VisionConfig(
         depth=2,
@@ -775,6 +816,7 @@ def tiny_qwen3_5_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -784,6 +826,8 @@ def tiny_qwen3_5_moe_text_config(
     layer_types: list[str] | None = None,
 ) -> PretrainedConfig:
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+    Qwen3_5MoeTextConfig = get_veomni_config_class(Qwen3_5MoeTextConfig)
 
     layer_types = ["linear_attention"] if layer_types is None else layer_types
     return Qwen3_5MoeTextConfig(
@@ -826,6 +870,9 @@ def tiny_qwen3_5_moe_config(
 ) -> PretrainedConfig:
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeVisionConfig
 
+    Qwen3_5MoeConfig = get_veomni_config_class(Qwen3_5MoeConfig)
+    Qwen3_5MoeVisionConfig = get_veomni_config_class(Qwen3_5MoeVisionConfig)
+
     text = tiny_qwen3_5_moe_text_config(layer_types=layer_types)
     vision = Qwen3_5MoeVisionConfig(
         depth=2,
@@ -846,6 +893,7 @@ def tiny_qwen3_5_moe_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
     config._experts_implementation = "eager"
     config.text_config._experts_implementation = "eager"
@@ -854,6 +902,8 @@ def tiny_qwen3_5_moe_config(
 
 def tiny_qwen3_moe_config(architecture: str = "Qwen3MoeForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+    Qwen3MoeConfig = get_veomni_config_class(Qwen3MoeConfig)
 
     kwargs = {
         "vocab_size": 128,
@@ -890,6 +940,8 @@ def tiny_qwen3_omni_moe_text_config(
     architecture: str = "Qwen3OmniMoeThinkerTextModel",
 ) -> PretrainedConfig:
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
+
+    Qwen3OmniMoeTextConfig = get_veomni_config_class(Qwen3OmniMoeTextConfig)
 
     config = Qwen3OmniMoeTextConfig(
         vocab_size=128,
@@ -928,6 +980,10 @@ def tiny_qwen3_omni_moe_thinker_config(
         Qwen3OmniMoeVisionEncoderConfig,
     )
 
+    Qwen3OmniMoeAudioEncoderConfig = get_veomni_config_class(Qwen3OmniMoeAudioEncoderConfig)
+    Qwen3OmniMoeThinkerConfig = get_veomni_config_class(Qwen3OmniMoeThinkerConfig)
+    Qwen3OmniMoeVisionEncoderConfig = get_veomni_config_class(Qwen3OmniMoeVisionEncoderConfig)
+
     text = tiny_qwen3_omni_moe_text_config()
     vision = Qwen3OmniMoeVisionEncoderConfig(
         depth=2,
@@ -965,6 +1021,7 @@ def tiny_qwen3_omni_moe_thinker_config(
         vision_end_token_id=VISION_END_TOKEN_ID,
         audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -980,6 +1037,7 @@ def tiny_qwen3_omni_moe_config(
         thinker_config=thinker.to_dict(),
         enable_audio_output=False,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -989,6 +1047,10 @@ def tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration") 
         Qwen3VLTextConfig,
         Qwen3VLVisionConfig,
     )
+
+    Qwen3VLConfig = get_veomni_config_class(Qwen3VLConfig)
+    Qwen3VLTextConfig = get_veomni_config_class(Qwen3VLTextConfig)
+    Qwen3VLVisionConfig = get_veomni_config_class(Qwen3VLVisionConfig)
 
     text = Qwen3VLTextConfig(
         vocab_size=128,
@@ -1029,6 +1091,7 @@ def tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration") 
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 
@@ -1040,6 +1103,10 @@ def tiny_qwen3_vl_moe_config(
         Qwen3VLMoeTextConfig,
         Qwen3VLMoeVisionConfig,
     )
+
+    Qwen3VLMoeConfig = get_veomni_config_class(Qwen3VLMoeConfig)
+    Qwen3VLMoeTextConfig = get_veomni_config_class(Qwen3VLMoeTextConfig)
+    Qwen3VLMoeVisionConfig = get_veomni_config_class(Qwen3VLMoeVisionConfig)
 
     text = Qwen3VLMoeTextConfig(
         vocab_size=128,
@@ -1086,4 +1153,5 @@ def tiny_qwen3_vl_moe_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
+        attn_implementation="eager",
     )

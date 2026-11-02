@@ -37,9 +37,6 @@ def _find_spec_without_import(fullname: str, path) -> object | None:
             continue
         lookup_name = fullname
         if path is not None and finder is importlib.machinery.PathFinder:
-            # PathFinder resolves the last component from ``path``. Giving it
-            # an unqualified name keeps a namespace spec independent of an
-            # unloaded parent entry in ``sys.modules``.
             lookup_name = fullname.rpartition(".")[2]
         spec = find_spec(lookup_name, path, None)
         if spec is not None:
@@ -52,28 +49,20 @@ def _is_package_available(name: str) -> bool:
     try:
         search_path = None
         parts = name.split(".")
-        for index, _part in enumerate(parts):
+        for index in range(len(parts)):
             fullname = ".".join(parts[: index + 1])
             if fullname in sys.modules:
                 loaded = sys.modules[fullname]
-                if loaded is None:
-                    return False
                 if index == len(parts) - 1:
-                    return True
-                loaded_path = getattr(loaded, "__path__", None)
-                if loaded_path is None:
+                    return loaded is not None
+                search_path = getattr(loaded, "__path__", None)
+            else:
+                spec = _find_spec_without_import(fullname, search_path)
+                if spec is None:
                     return False
-                search_path = tuple(loaded_path)
-                continue
-
-            spec = _find_spec_without_import(fullname, search_path)
-            if spec is None:
+                search_path = spec.submodule_search_locations
+            if index != len(parts) - 1 and search_path is None:
                 return False
-            if index != len(parts) - 1:
-                submodule_search_locations = spec.submodule_search_locations
-                if submodule_search_locations is None:
-                    return False
-                search_path = tuple(submodule_search_locations)
         return True
     except (ImportError, AttributeError, KeyError, ValueError):
         return False

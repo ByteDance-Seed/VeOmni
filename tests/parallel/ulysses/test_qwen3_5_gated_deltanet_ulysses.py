@@ -37,31 +37,6 @@ except Exception:
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
-def _install_fla_kernel_config() -> None:
-    from veomni.ops.config import set_ops_config
-
-    set_ops_config(
-        SimpleNamespace(
-            rms_norm_gated_implementation="fla",
-            causal_conv1d_implementation="fla",
-            chunk_gated_delta_rule_implementation="fla",
-        )
-    )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _configured_qwen3_5_kernels():
-    """Install the FLA selections used by directly constructed test layers."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
-    previous = get_ops_config()
-    _install_fla_kernel_config()
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
-
-
 @contextmanager
 def _deterministic_backend_flags():
     """Scope deterministic CUDA flags without assigning global cudnn state."""
@@ -152,6 +127,13 @@ class _TinyQwen3_5Config:
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
     layer_types: list[str] = field(default_factory=lambda: ["linear_attention"])
+    ops_config: SimpleNamespace = field(
+        default_factory=lambda: SimpleNamespace(
+            rms_norm_gated_implementation="fla",
+            causal_conv1d_implementation="fla",
+            chunk_gated_delta_rule_implementation="fla",
+        )
+    )
 
 
 def _assert_forward_deterministic(
@@ -268,7 +250,6 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str) -> 
 
     sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
     dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
-    _install_fla_kernel_config()
 
     shapes = list(_SP_EQUIVALENCE_SHAPES)
     if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
@@ -396,7 +377,6 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
     )
 
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-    _install_fla_kernel_config()
 
     shapes = list(_SP_DETERMINISM_SHAPES)
     if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
