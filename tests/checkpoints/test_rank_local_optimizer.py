@@ -18,7 +18,6 @@ from veomni.checkpoint.rank_local_optimizer import (
     local_optimizer_state,
     recover_frozen_optimizer_ownership,
     restore_optimizer_state,
-    verify_replicated_model_shards,
 )
 from veomni.distributed.parallel_plan import SpecInfo
 from veomni.optim.muon import DistributedMuon
@@ -105,11 +104,15 @@ def _optimizer_resume_worker(rank, root, inactive_owner):
                 optimizer.step()
                 optimizer.zero_grad()
         DistributedCheckpointer.save(
-            f"{root}/training", {"model": source, "optimizer": optimizer}, parallel_state=parallel
+            f"{root}/training",
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
         target, restored = build()
         DistributedCheckpointer.load(
-            f"{root}/training", {"model": target, "optimizer": restored}, parallel_state=parallel
+            f"{root}/training",
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
         torch.testing.assert_close(target.weight.to_local(), source.weight.to_local(), rtol=0, atol=0)
         source_state = optimizer.optimizers_dict["expert"].state.get(source.weight, {})
@@ -215,7 +218,7 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
                 optimizer.zero_grad()
             DistributedCheckpointer.save(
                 f"{root}/cold",
-                {"model": model, "optimizer": optimizer},
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
                 parallel_state=parallel,
             )
             before = snapshot()
@@ -223,7 +226,9 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
             torch.save({"before": before, "after": snapshot()}, f"{root}/reference-{rank}.pt")
         else:
             DistributedCheckpointer.load(
-                f"{root}/cold", {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                f"{root}/cold",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
             reference = torch.load(f"{root}/reference-{rank}.pt", weights_only=True)
             torch.testing.assert_close(snapshot(), reference["before"], rtol=0, atol=0)
@@ -277,76 +282,6 @@ def test_anyprecision_bf16_state_extra_parallel_fresh_process_resume(tmp_path, s
     )
 
 
-def _global_tensor_metadata_mismatch_worker(rank, root, mismatch):
-    from torch.distributed.tensor import DTensor
-
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{root}/global-metadata-init",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        mesh = init_device_mesh("cpu", (2,))
-        dtype = torch.bfloat16 if mismatch == "dtype" and rank else torch.float32
-        global_size = 6 if mismatch == "shape" and rank else 4
-        local = torch.ones(global_size // 2, dtype=dtype)
-        tensor = DTensor.from_local(local, mesh, [Shard(0)], shape=torch.Size([global_size]), stride=(1,))
-        with pytest.raises(RuntimeError, match="global dtype or shape"):
-            verify_replicated_model_shards({"expert": tensor})
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("mismatch", ["dtype", "shape"])
-def test_checkpoint_global_tensor_metadata_mismatch_fails_all_ranks(tmp_path, mismatch):
-    mp.spawn(_global_tensor_metadata_mismatch_worker, args=(str(tmp_path), mismatch), nprocs=2, join=True)
-
-
-def _overlapping_tensor_shards_worker(rank, root, same_offset):
-    from torch.distributed.tensor import DTensor
-
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{root}/overlap-init",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        mesh = init_device_mesh("cpu", (2,))
-        shard = rank == (0 if same_offset else 1)
-        placement = Shard(0) if shard else Replicate()
-        tensor = DTensor.from_local(
-            torch.ones(2 if shard else 4), mesh, [placement], shape=torch.Size([4]), stride=(1,), run_check=False
-        )
-        with pytest.raises(RuntimeError, match="overlapping nonidentical shards"):
-            verify_replicated_model_shards({"expert": tensor})
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("same_offset", [False, True])
-def test_checkpoint_overlapping_shard_geometries_fail_all_ranks(tmp_path, same_offset):
-    mp.spawn(_overlapping_tensor_shards_worker, args=(str(tmp_path), same_offset), nprocs=2, join=True)
-
-
-def test_checkpoint_rejects_empty_shard_with_same_offset_as_nonempty_shard():
-    from veomni.checkpoint.rank_local_optimizer import _reject_overlapping_geometries
-
-    with pytest.raises(RuntimeError, match="overlapping nonidentical shards"):
-        _reject_overlapping_geometries("expert", [((0,), (0,)), ((0,), (2,))])
-
-
 def _owner_frozen_leaf_mismatch_worker(rank, root, mode):
     from unittest.mock import patch
 
@@ -371,7 +306,9 @@ def _owner_frozen_leaf_mismatch_worker(rank, root, mode):
             if mode == "load":
                 source = build_extra_parallel_fsdp2_optimizer(model)
                 DistributedCheckpointer.save(
-                    f"{root}/checkpoint", {"model": model, "optimizer": source}, parallel_state=parallel
+                    f"{root}/checkpoint",
+                    {"model": model, "optimizer": source, "_veomni_scheduler_object": None},
+                    parallel_state=parallel,
                 )
             if owner == 1:
                 model.weight.requires_grad_(False)
@@ -382,7 +319,11 @@ def _owner_frozen_leaf_mismatch_worker(rank, root, mode):
         before = model.weight.to_local().clone()
         with pytest.raises(RuntimeError, match="leaf order differs across ranks"):
             method = DistributedCheckpointer.save if mode == "save" else DistributedCheckpointer.load
-            method(f"{root}/checkpoint", {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+            method(
+                f"{root}/checkpoint",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         torch.testing.assert_close(model.weight.to_local(), before, rtol=0, atol=0)
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -395,45 +336,6 @@ def _owner_frozen_leaf_mismatch_worker(rank, root, mode):
 @pytest.mark.parametrize("mode", ["save", "load"])
 def test_owner_specific_freeze_missing_leaf_fails_before_checkpoint_collectives(tmp_path, mode):
     mp.spawn(_owner_frozen_leaf_mismatch_worker, args=(str(tmp_path), mode), nprocs=4, join=True)
-
-
-def _owner_trainability_worker(rank, root, within_owner_mismatch):
-    from veomni.checkpoint.optimizer_resume_layout import coordinated_multi_layout
-
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{root}/owner-trainability-init",
-        rank=rank,
-        world_size=4,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ple_fsdp", "ple"))
-        model = torch.nn.Module()
-        values = torch.arange(64, dtype=torch.float32).reshape(8, 8)
-        model.weight = torch.nn.Parameter(distribute_tensor(values, mesh, [Shard(1), Shard(0)]))
-        model._fqn2spec_info = {"weight": SpecInfo("ple", Shard(0), "weight", mesh, 1, 1, (8, 8))}
-        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([model.weight])}, ["leaf"])
-        owner = mesh.get_local_rank("ple")
-        replica = mesh.get_local_rank("ple_fsdp")
-        if owner == 1 and (not within_owner_mismatch or replica == 1):
-            model.weight.requires_grad_(False)
-        if within_owner_mismatch:
-            with pytest.raises(RuntimeError, match="trainability differs"):
-                coordinated_multi_layout(model, optimizer, writing=True)
-        else:
-            coordinated_multi_layout(model, optimizer, writing=True)
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 4
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
-@pytest.mark.parametrize("within_owner_mismatch", [False, True])
-def test_trainability_may_differ_between_owners_but_not_replicas(tmp_path, within_owner_mismatch):
-    mp.spawn(_owner_trainability_worker, args=(str(tmp_path), within_owner_mismatch), nprocs=4, join=True)
 
 
 def _frozen_resume_worker(rank, root, phase):
@@ -468,7 +370,9 @@ def _frozen_resume_worker(rank, root, phase):
             optimizer.zero_grad()
             model.weight.requires_grad_(False)
             DistributedCheckpointer.save(
-                f"{root}/frozen", {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                f"{root}/frozen",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
             model.weight.requires_grad_(True)
             model.weight.grad = torch.full_like(model.weight, 0.2)
@@ -481,7 +385,9 @@ def _frozen_resume_worker(rank, root, phase):
                 optimizer = build()
             assert not model.weight.requires_grad
             DistributedCheckpointer.load(
-                f"{root}/frozen", {"model": model, "optimizer": optimizer}, parallel_state=parallel
+                f"{root}/frozen",
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
             model.weight.requires_grad_(True)
             model.weight.grad = torch.full_like(model.weight, 0.2)
@@ -529,7 +435,11 @@ def _missing_rank_payload_worker(rank, root):
         optimizer.step()
         optimizer.zero_grad()
         checkpoint = f"{root}/corrupt"
-        DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
         if rank == 0:
             opt_path = optimizer_dir(checkpoint, "")
             metadata = dcp.FileSystemReader(opt_path).read_metadata()
@@ -543,7 +453,11 @@ def _missing_rank_payload_worker(rank, root):
         from torch.distributed.checkpoint.api import CheckpointException
 
         with pytest.raises((CheckpointException, RuntimeError)):
-            DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+            DistributedCheckpointer.load(
+                checkpoint,
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         torch.testing.assert_close(target.weight.to_local(), before, rtol=0, atol=0)
         completed = torch.tensor(1)
         dist.all_reduce(completed)

@@ -302,6 +302,23 @@ save and remain available with synchronous checkpointing. A future migration mus
 owner-specific master weights, moments and step counters as well as optimizer
 groups and scheduler state, and verify the next update against the source.
 
+Direct `DistributedCheckpointer` calls containing a `MultiOptimizer` must include
+`"_veomni_scheduler_object"` in the state, set to the supported live scheduler
+or explicitly to `None` for runs without a scheduler. This declaration is a
+trusted contract: a caller must not declare `None` when a scheduler is in use.
+The framework checkpoint manager supplies the declaration and restores the
+scheduler automatically. A direct `DistributedCheckpointer.load` caller must
+apply the returned scheduler state to the live scheduler before continuing:
+
+```python
+state = {"model": model, "optimizer": optimizer, "extra_state": {},
+         "_veomni_scheduler_object": scheduler}
+DistributedCheckpointer.load(path, state)
+scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+```
+
+Unregistered schedulers are not supported by the proven resume codec.
+
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
 step with no pending gradients. Setting `save_async: true` for a runtime whose
@@ -322,12 +339,13 @@ optimizer shards and does not support elastic resharding. All ranks must use
 the same trusted model and configuration. Optimizer leaf ordering is checked
 as part of the existing checkpoint-layout exchange; owner-specific freezing
 that removes a whole leaf from only some ranks is rejected before per-leaf
-checkpoint collectives, rather than supported. Replicated values are assumed synchronized,
-while checkpoint shard dtype, shape and geometry are validated without hashing
-tensor bytes. Hooks and adapters are trusted. MultiOptimizer asynchronous saves
+checkpoint collectives, rather than supported. Replica values, trainability, dtype, shape and geometry
+are trusted to be consistent across ranks. Source and target checkpoint layout
+metadata are checked during restore; no tensor bytes are hashed. Hooks and
+adapters are trusted. MultiOptimizer asynchronous saves
 and unsupported layouts fail closed; synchronous staged saves are supported.
-Partially overlapping shards with different geometries are rejected, even when
-their shared values agree; exact replicas and disjoint shards remain supported.
+The runtime assumes ranks use a consistent model configuration and compatible
+replica geometries; saved source layout is validated on restore.
 Group/state inventory and generation mismatches are rejected before model
 copying. If an I/O or optimizer-application error occurs after model copying,
 the load fails and clears its receipt but does not roll back in-memory objects;

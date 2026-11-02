@@ -79,11 +79,17 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
         expected = source_optimizer._sparse_state_dict()
 
         checkpoint_dir = tmp_path / "ckpt"
-        DistributedCheckpointer.save(str(checkpoint_dir), {"model": source_model, "optimizer": source_optimizer})
+        DistributedCheckpointer.save(
+            str(checkpoint_dir),
+            {"model": source_model, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+        )
         dist.barrier()
 
         target_model, target_optimizer = build_model_and_optimizer()
-        DistributedCheckpointer.load(str(checkpoint_dir), {"model": target_model, "optimizer": target_optimizer})
+        DistributedCheckpointer.load(
+            str(checkpoint_dir),
+            {"model": target_model, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+        )
 
         actual = target_optimizer._sparse_state_dict()
         assert expected.keys() == actual.keys()
@@ -183,10 +189,14 @@ class TestMultiOptimizerState:
 
         target_model, target_optimizer = build_model_and_optimizer()
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": source_model, "optimizer": source_optimizer}, parallel_state=parallel_state
+            str(tmp_path),
+            {"model": source_model, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
         DistributedCheckpointer.load(
-            str(tmp_path), {"model": target_model, "optimizer": target_optimizer}, parallel_state=parallel_state
+            str(tmp_path),
+            {"model": target_model, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
 
         actual = target_optimizer._sparse_state_dict()
@@ -231,7 +241,9 @@ class TestMultiOptimizerState:
 
         parallel_state = SimpleNamespace(dp_mode="fsdp2")
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel_state
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
 
         reader = FileSystemReader(tmp_path / "model" / "optimizer")
