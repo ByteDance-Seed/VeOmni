@@ -216,6 +216,10 @@ class _StubConfig(OmniModuleConfig):
 
     model_type = "stub_omni_module"
 
+    def __init__(self, **kwargs):
+        kwargs.setdefault("ops_implementation", {"attn_implementation": "eager"})
+        super().__init__(**kwargs)
+
 
 class _FakeOmniModule(PretrainedOmniModule, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
     """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.

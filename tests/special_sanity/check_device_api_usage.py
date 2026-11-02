@@ -62,6 +62,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # CPU profiler fixtures mock CUDA/NPU backend names to verify memory-history
     # options; they do not select devices or execute vendor APIs.
     "tests/utils/test_profiler_config.py",
+    # CPU-only argument tests pass an accelerator name to mocked builders to
+    # exercise inherited FP8 policies without allocating accelerator tensors.
+    "tests/arguments/test_model_arguments.py",
     # EP option tests use literal backend names to verify cross-device rejection.
     "tests/ci/test_ep_hccl_options.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``

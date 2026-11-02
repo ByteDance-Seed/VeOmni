@@ -130,8 +130,8 @@ overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
 fields cannot live there either: they are `OpsImplementationConfig` fields, and
 neither dataclass can see the disagreement alone.
 `validate_build_prerequisites` is the earliest point that holds the finished model
-config and installed ops-selection config together, and it runs before any rank
-reads a weight. It reads the ops config from the installed singleton rather than taking it as an argument,
+config and its attached `self.ops_config` together, and it runs before any rank
+reads a weight. It reads `self.ops_config` off the config instance itself rather than taking an extra argument,
 which is what keeps the builder's hook a no-argument call that any config can
 implement.
 
@@ -210,11 +210,10 @@ The absent case is deliberately a no-op rather than a required empty method: a
 model with nothing to refuse should not have to say so, and
 `test_a_config_that_cannot_ask_for_the_objective_is_left_alone` pins that.
 
-The hook takes no arguments, which is the one part that needed deciding. The check
-needs the installed `OpsImplementationConfig`, so the alternative was a signature
-carrying it — and then the next hook would need the parallel state, and the one
-after that something else, until the builder's hook signature enumerates
-everything any model might want. Reading the singleton inside the method keeps the
+The hook takes no arguments, which is the one part that needed deciding. Because
+`build_foundation_model` binds `ops_implementation` onto the model config before
+running prerequisite checks, the method can read `self.ops_config` directly
+instead of taking `OpsImplementationConfig` as a separate parameter — keeping the
 contract at "a config may refuse the run it is about to be built into", which is
 the same reason `_indexer_loss_enabled` reads the parallel state rather than
 receiving it.

@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
@@ -128,8 +128,11 @@ def _rot_pos_emb_reference(visual: torch.nn.Module, grid_thw: torch.Tensor) -> t
 @pytest.fixture(scope="module")
 def visual() -> torch.nn.Module:
     device = get_device_type()
-    with ops_config_scope(eager_ops_config()):
-        model = build_foundation_model(config_path=str(_TOY_CONFIG), init_device=device)
+    model = build_foundation_model(
+        config_path=str(_TOY_CONFIG),
+        init_device=device,
+        ops_implementation=make_eager_ops_config(),
+    )
     visual = model.model.visual
     torch.manual_seed(0)
     visual.pos_embed.weight = torch.nn.Parameter(torch.randn_like(visual.pos_embed.weight))
