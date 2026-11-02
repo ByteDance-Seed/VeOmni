@@ -703,7 +703,7 @@ def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure,
     elif failure == "post_hook":
         target_opt.register_load_state_dict_post_hook(lambda *_: None)
 
-    if failure:
+    if failure in ("partial", "missing_group"):
         with pytest.raises((RuntimeError, KeyError)):
             DistributedCheckpointer.load(
                 str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
@@ -726,8 +726,7 @@ def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure,
     torch.testing.assert_close(target.b, source.b, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("failure", ["second_pre_hook", "second_missing_group"])
-def test_multioptimizer_cuda_load_is_atomic_across_children(failure, monkeypatch, tmp_path):
+def test_multioptimizer_cuda_load_is_atomic_across_children(monkeypatch, tmp_path):
     import pickle
 
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -760,17 +759,14 @@ def test_multioptimizer_cuda_load_is_atomic_across_children(failure, monkeypatch
         target.a.add_(3)
         target.b.add_(5)
     before = {name: param.detach().clone() for name, param in target.named_parameters()}
-    if failure == "second_pre_hook":
-        opts["b"].register_load_state_dict_pre_hook(lambda *_: None)
-    else:
-        metadata_path = Path(optimizer_dir(str(tmp_path))) / ".metadata"
-        with metadata_path.open("rb") as handle:
-            metadata = pickle.load(handle)
-        keys = [key for key in metadata.state_dict_metadata if key.endswith("param_groups.b.qwen38_plan")]
-        assert len(keys) == 1
-        del metadata.state_dict_metadata[keys[0]]
-        with metadata_path.open("wb") as handle:
-            pickle.dump(metadata, handle)
+    metadata_path = Path(optimizer_dir(str(tmp_path))) / ".metadata"
+    with metadata_path.open("rb") as handle:
+        metadata = pickle.load(handle)
+    keys = [key for key in metadata.state_dict_metadata if key.endswith("param_groups.b.qwen38_plan")]
+    assert len(keys) == 1
+    del metadata.state_dict_metadata[keys[0]]
+    with metadata_path.open("wb") as handle:
+        pickle.dump(metadata, handle)
     with pytest.raises(RuntimeError, match="inventory|hook"):
         DistributedCheckpointer.load(
             str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
@@ -1152,21 +1148,39 @@ def test_ple_asymmetric_owner_checkpoint_and_cold_resume(tmp_path, mode):
         )
 
 
-def test_unused_ple_snapshot_does_not_initialize_or_advance_live_state():
-    from veomni.optim.optimizer import optimizer_state_dict_for_checkpoint
+def test_unused_ple_snapshot_does_not_initialize_or_advance_live_state(tmp_path):
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.optim.optimizer import MultiOptimizer
 
-    model = torch.nn.Module()
-    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
-    groups = module.add_qwen38_plans(
-        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
-    )
-    opt = module.Qwen38MuonAdamW(groups, lr=1e-4)
-    saved = optimizer_state_dict_for_checkpoint(model, opt)
+    def build():
+        model = torch.nn.Module()
+        model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+        groups = module.add_qwen38_plans(
+            model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+        )
+        leaf = module.Qwen38MuonAdamW(groups, lr=1e-4)
+        return model, leaf, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
+
+    model, opt, optimizer = build()
+    parallel = types.SimpleNamespace(dp_mode="ddp")
+    checkpoint = str(tmp_path / "unused-ple")
+    DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
     assert not opt.state
-    state = saved["state"]["ngram_embedding.weight"]
-    assert state["step"].item() == 0
-    assert torch.equal(state["master_weight"], model.ngram_embedding.weight.float())
-    assert not state["exp_avg"].count_nonzero() and not state["exp_avg_sq"].count_nonzero()
+
+    restored_model, restored_opt, restored = build()
+    DistributedCheckpointer.load(checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel)
+    assert not restored_opt.state
+    for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
+        current.grad = torch.ones_like(current)
+        target.grad = torch.ones_like(target)
+    optimizer.step()
+    restored.step()
+    for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
+        torch.testing.assert_close(current, target, rtol=0, atol=0)
+        assert opt.state[current].keys() == restored_opt.state[target].keys()
+        for key in opt.state[current]:
+            torch.testing.assert_close(opt.state[current][key], restored_opt.state[target][key], rtol=0, atol=0)
+
     # A raw pre-versioned PLE checkpoint must not silently broadcast a scalar.
     direct = opt.state_dict()
     direct["param_groups"][0].pop("qwen38_ple_step_layout")

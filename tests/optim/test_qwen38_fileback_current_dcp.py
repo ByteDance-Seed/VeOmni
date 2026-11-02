@@ -17,11 +17,11 @@ from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _build(directory, file_mode):
+def _build(directory, file_mode, shape=(9, 5)):
     model = torch.nn.Module()
-    model.ngram_embedding = torch.nn.Embedding(9, 5, dtype=torch.bfloat16)
+    model.ngram_embedding = torch.nn.Embedding(*shape, dtype=torch.bfloat16)
     with torch.no_grad():
-        model.ngram_embedding.weight.copy_(torch.arange(45).reshape(9, 5).float() / 20)
+        model.ngram_embedding.weight.copy_(torch.arange(shape[0] * shape[1]).reshape(shape).float() / 20)
     groups = add_qwen38_plans(
         model, [{"params": [model.ngram_embedding.weight], "weight_decay": 0.0, "cpu_offload": True}]
     )
@@ -151,6 +151,64 @@ def test_file_backed_dcp_fresh_process_next_update(tmp_path):
             child.join()
             pytest.fail("cold checkpoint worker timed out")
         assert child.exitcode == 0, f"cold {'save' if save else 'load'} process failed: {child.exitcode}"
+
+
+def test_file_backed_dcp_load_releases_pages_before_and_after_apply(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    # Each FP32 moment is larger than the previous 4 MiB fingerprint chunk.
+    shape = (1025, 1024)
+    source, source_leaf, source_optimizer = _build(scratch, True, shape)
+    _update(source, source_optimizer)
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
+    target, target_leaf, target_optimizer = _build(scratch, True, shape)
+    with patch.object(
+        target_leaf, "checkpoint_evict_file_backed_state", wraps=target_leaf.checkpoint_evict_file_backed_state
+    ) as evict:
+        DistributedCheckpointer.load(
+            checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+        )
+    assert evict.call_count == 2
+    source_param, target_param = source.ngram_embedding.weight, target.ngram_embedding.weight
+    for name in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            source_leaf.state[source_param][name], target_leaf.state[target_param][name], rtol=0, atol=0
+        )
+    _update(source, source_optimizer)
+    _update(target, target_optimizer)
+    torch.testing.assert_close(source_param, target_param, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_file_backed_dcp_load_page_release_failure_poisons_state(tmp_path, failure_at):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    source, _, source_optimizer = _build(scratch, True)
+    _update(source, source_optimizer)
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": source_optimizer}, parallel_state=parallel)
+    target, target_leaf, target_optimizer = _build(scratch, True)
+    original = target_leaf.checkpoint_evict_file_backed_state
+    count = 0
+
+    def fail_release():
+        nonlocal count
+        count += 1
+        if count == failure_at:
+            raise OSError("injected page release failure")
+        original()
+
+    with patch.object(target_leaf, "checkpoint_evict_file_backed_state", side_effect=fail_release):
+        with pytest.raises((OSError, RuntimeError), match="page release|MultiOptimizer"):
+            DistributedCheckpointer.load(
+                checkpoint, {"model": target, "optimizer": target_optimizer}, parallel_state=parallel
+            )
+    assert target_leaf._ple_state_poisoned
+    with pytest.raises(RuntimeError, match="checkpoint|state failed"):
+        _update(target, target_optimizer)
 
 
 def test_file_backed_failed_load_poisons_optimizer(tmp_path):

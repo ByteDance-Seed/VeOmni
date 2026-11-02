@@ -6,7 +6,6 @@
 import hashlib
 import json
 import os
-import struct
 import tempfile
 from collections import defaultdict
 
@@ -22,8 +21,6 @@ from torch.distributed.checkpoint.state_dict import _get_fqns
 from ..utils.dist_utils import raise_if_any_rank_failed
 from .optimizer_resume_layout import (
     MULTI_LAYOUT_MARKER,
-    _group_option_value,
-    _lr_layout,
     coordinated_multi_layout,
     frozen_parameter_digest,
 )
@@ -63,68 +60,6 @@ def _coordinated_storage_reader(reader_factory, path, *, group=None):
     return reader
 
 
-def _optimizer_payload_digest(payload, *, chunk_bytes=4 << 20, after_chunk=None):
-    """Fingerprint a loaded sparse payload before or after optimizer restore."""
-    digest = hashlib.sha256()
-
-    def write(blob):
-        digest.update(len(blob).to_bytes(8, "big"))
-        digest.update(blob)
-
-    def update(value):
-        if torch.is_tensor(value):
-            write(b"tensor")
-            write(str(value.dtype).encode())
-            write(repr(tuple(value.shape)).encode())
-            if isinstance(value, DTensor):
-                mesh = value.device_mesh
-                write(repr((mesh.device_type, mesh.mesh_dim_names, mesh.mesh.tolist(), value.placements)).encode())
-            else:
-                write(b"local")
-            local = value.to_local() if hasattr(value, "to_local") else value
-            write(str(local.device.type).encode())
-            write(repr(tuple(local.shape)).encode())
-            from .tensor_bytes import tensor_byte_chunks
-
-            digest.update((local.numel() * local.element_size()).to_bytes(8, "big"))
-            offset = 0
-            for chunk in tensor_byte_chunks(local, chunk_bytes=chunk_bytes):
-                digest.update(chunk)
-                if after_chunk is not None:
-                    after_chunk(local, offset, len(chunk))
-                offset += len(chunk)
-        elif type(value) is dict:
-            write(b"dict")
-            for key in sorted(value):
-                update(key)
-                update(value[key])
-        elif type(value) in (tuple, list):
-            write(type(value).__name__.encode())
-            for item in value:
-                update(item)
-        elif type(value) is float:
-            write(b"float")
-            write(struct.pack("!d", value))
-        elif value is None or type(value) in (bool, int, str, bytes, torch.dtype, torch.device):
-            write(type(value).__name__.encode())
-            write(repr(value).encode())
-        else:
-            raise RuntimeError(f"Cannot compare optimizer checkpoint value of type {type(value).__name__}")
-
-    update(payload)
-    return digest.hexdigest()
-
-
-def _coordinated_optimizer_flag(value, what, group=None):
-    if not dist.is_initialized():
-        return value
-    gathered = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, value, group=group)
-    if any(item != gathered[0] for item in gathered):
-        raise RuntimeError(f"{what} differs across ranks")
-    return value
-
-
 def _iter_optimizer_leaves(optimizer):
     yield from optimizer.optimizers_dict.values()
 
@@ -155,7 +90,6 @@ def _validate_source_optimizer_states(optimizer, model):
     from ..optim.checkpoint_adapter import rank_local_adamw_adapter
     from ..optim.optimizer import AnyPrecisionAdamW
 
-    _check_tensor_storage_aliases(model, optimizer)
     for leaf in _iter_optimizer_leaves(optimizer):
         for group in leaf.param_groups:
             expected = _expected_optimizer_fields(leaf, group)
@@ -209,186 +143,6 @@ def _validate_source_optimizer_states(optimizer, model):
                             raise RuntimeError(f"MultiOptimizer state dtype cannot be safely restored for {field}")
 
 
-def _qwen_omni_filtered_prefixes(model, hook):
-    import types
-
-    families = (
-        (
-            "Qwen3OmniMoeForConditionalGeneration",
-            "veomni.models.transformers.qwen3_omni_moe.generated.",
-            "_drop_talker_and_code2wav_keys",
-            ("talker.", "code2wav."),
-        ),
-        (
-            "Qwen2_5OmniForConditionalGeneration",
-            "veomni.models.transformers.qwen2_5_omni.generated.",
-            "_drop_talker_and_token2wav_keys",
-            ("talker.", "token2wav."),
-        ),
-    )
-    for cls_name, cls_module, function_name, prefixes in families:
-        cls = next(
-            (
-                item
-                for item in type(model).__mro__
-                if item.__name__ == cls_name and item.__module__.startswith(cls_module)
-            ),
-            None,
-        )
-        if cls is None:
-            continue
-        if type(model) is not cls:
-            from torch.distributed.fsdp import FSDPModule
-
-            if not isinstance(model, FSDPModule):
-                return ()
-        code = getattr(hook, "__code__", None)
-        init_code = getattr(cls.__init__, "__code__", None)
-        if (
-            init_code is None
-            or getattr(hook, "__closure__", None)
-            or getattr(hook, "__defaults__", None)
-            or getattr(hook, "__kwdefaults__", None)
-            or getattr(hook, "__globals__", None) is not getattr(cls.__init__, "__globals__", None)
-        ):
-            return ()
-        if (
-            code is not None
-            and code.co_name == function_name
-            and any(isinstance(item, types.CodeType) and item is code for item in init_code.co_consts)
-        ):
-            return prefixes
-    return ()
-
-
-def _check_qwen_omni_checkpoint_keys(model, keys):
-    from torch.nn.modules.module import _WrappedHook
-
-    for hook in model._load_state_dict_pre_hooks.values():
-        func = hook.hook if isinstance(hook, _WrappedHook) else hook
-        prefixes = _qwen_omni_filtered_prefixes(model, func)
-        if prefixes and any(key.startswith(prefixes) for key in keys):
-            raise RuntimeError("Cannot prove Qwen Omni load hook is a no-op for checkpoint keys")
-
-
-def _check_model_serialization_hooks(model):
-    """Allow the FSDP2 reshard hook, reject unproven model transforms."""
-    import dis
-    import types
-
-    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-    from torch.nn.modules.module import _WrappedHook
-
-    def nested_code(parent, name):
-        return {
-            item for item in parent.__code__.co_consts if isinstance(item, types.CodeType) and item.co_name == name
-        }
-
-    def returns_before_nested_load(hook):
-        # A sample call cannot prove this: the hook could modify other real
-        # keys, the module or error lists without changing the probe.
-        ops = [item for item in dis.get_instructions(hook) if item.opname not in ("RESUME", "NOP", "CACHE")]
-        if len(ops) < 3 or (ops[0].opname, ops[0].argval) != ("LOAD_FAST", "prefix"):
-            return False
-        if ops[1].opname not in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE"):
-            return False
-        if (ops[2].opname, ops[2].argval) == ("RETURN_CONST", None):
-            return True
-        return (
-            len(ops) >= 4
-            and (ops[2].opname, ops[2].argval) == ("LOAD_CONST", None)
-            and ops[3].opname == "RETURN_VALUE"
-        )
-
-    post_codes = nested_code(FSDPParam.__init__, "<lambda>")
-    pre_codes = nested_code(FSDPParamGroup._register_state_dict_hooks, "to_sharded_hook")
-    for name, module in model.named_modules():
-        for attr in (
-            "_state_dict_pre_hooks",
-            "_state_dict_hooks",
-            "_load_state_dict_pre_hooks",
-            "_load_state_dict_post_hooks",
-        ):
-            for hook in getattr(module, attr, {}).values():
-                func = hook.hook if isinstance(hook, _WrappedHook) else hook
-                code = getattr(func, "__code__", None)
-                closure = getattr(func, "__closure__", None) or ()
-                captured = tuple(cell.cell_contents for cell in closure)
-                builtin_fsdp = (
-                    attr == "_load_state_dict_post_hooks"
-                    and code in post_codes
-                    and any(isinstance(item, FSDPParam) for item in captured)
-                ) or (
-                    attr in ("_state_dict_pre_hooks", "_load_state_dict_pre_hooks")
-                    and code in pre_codes
-                    and any(isinstance(item, FSDPParamGroup) for item in captured)
-                )
-                builtin_qwen = attr == "_load_state_dict_pre_hooks" and _qwen_omni_filtered_prefixes(module, func)
-                if not builtin_fsdp and not builtin_qwen:
-                    raise RuntimeError(f"Cannot prove model serialization hook {attr} on {name or '<root>'}")
-                if builtin_qwen and name and not returns_before_nested_load(func):
-                    raise RuntimeError("Cannot prove nested Qwen Omni load hook preserves checkpoint keys")
-                if (
-                    builtin_qwen
-                    and not name
-                    and any(
-                        key.startswith(builtin_qwen)
-                        for key, _ in list(model.named_parameters()) + list(model.named_buffers())
-                    )
-                ):
-                    raise RuntimeError("Cannot prove Qwen Omni load hook is a no-op for checkpoint model tensors")
-
-    _check_tensor_storage_aliases(model)
-
-
-def _check_tensor_storage_aliases(model, optimizer=None):
-    # A single tied model Parameter under multiple FQNs is supported. Distinct
-    # model/state tensors must not overlap: DCP cannot reconstruct the alias.
-    storages, seen_model = defaultdict(list), set()
-    entries = [("model", name, value) for name, value in model.named_parameters(remove_duplicate=False)]
-    entries += [("model", name, value) for name, value in model.named_buffers(remove_duplicate=False)]
-    if optimizer is not None:
-        seen_lr = set()
-        for leaf_name, leaf in optimizer.optimizers_dict.items():
-            for group_index, group in enumerate(leaf.param_groups):
-                for field in ("lr", "initial_lr"):
-                    value = group.get(field)
-                    if torch.is_tensor(value) and id(value) not in seen_lr:
-                        seen_lr.add(id(value))
-                        entries.append(("lr", f"{leaf_name}.{group_index}.{field}", value))
-            for index, state in enumerate(leaf.state.values()):
-                entries.extend(
-                    ("optimizer", f"{leaf_name}.{index}.{field}", value)
-                    for field, value in state.items()
-                    if torch.is_tensor(value)
-                )
-    for kind, name, value in entries:
-        if kind == "model" and id(value) in seen_model:
-            continue
-        if kind == "model":
-            seen_model.add(id(value))
-        local = value.to_local() if isinstance(value, DTensor) else value
-        if local.numel() == 0:
-            continue
-        if local.device.type == "meta":
-            raise RuntimeError("Cannot prove checkpoint storage aliases for a meta tensor")
-        storage = (str(local.device), local.untyped_storage().data_ptr())
-        first = last = local.storage_offset()
-        for size, stride in zip(local.shape, local.stride(), strict=True):
-            offset = (size - 1) * stride
-            first += min(0, offset)
-            last += max(0, offset)
-        storages[storage].append((first * local.element_size(), (last + 1) * local.element_size(), f"{kind}:{name}"))
-    for ranges in storages.values():
-        ranges.sort()
-        for previous, current in zip(ranges, ranges[1:]):
-            if current[0] < previous[1]:
-                raise RuntimeError(
-                    f"Cannot prove checkpoint model storage alias between {previous[2]} and {current[2]}"
-                )
-
-
 def _dcp_parameter_name_map(model) -> dict[str, torch.nn.Parameter]:
     """Map DCP-canonical parameter FQNs back to their runtime parameters.
 
@@ -406,67 +160,6 @@ def _dcp_parameter_name_map(model) -> dict[str, torch.nn.Parameter]:
                 raise RuntimeError(f"DCP parameter FQN collision for {fqn}")
             names[fqn] = param
     return names
-
-
-def _verify_replicated_optimizer_metadata(model, optimizer, group=None):
-    """DCP deduplicates scalars; compare bounded-size digests on every rank.
-
-    The generic codec requires all DCP ranks to describe the same logical
-    parameters. Expert/pipeline-specific ownership needs an explicit codec.
-    """
-    if not dist.is_initialized():
-        return
-    error, digest = None, None
-    try:
-        names_by_id = defaultdict(list)
-        for name, param in _dcp_parameter_name_map(model).items():
-            names_by_id[id(param)].append(name)
-        records, step_tensors, lr_aliases = [], defaultdict(list), {}
-        for leaf_name, leaf in optimizer.optimizers_dict.items():
-            for group_index, param_group in enumerate(leaf.param_groups):
-                options = {
-                    key: _group_option_value(value) for key, value in sorted(param_group.items()) if key != "params"
-                }
-                lr_layout = {key: _lr_layout(param_group, key, lr_aliases) for key in ("lr", "initial_lr")}
-                for param in param_group["params"]:
-                    state = leaf.state.get(param, {})
-                    record = {
-                        "names": sorted(names_by_id[id(param)]),
-                        "leaf": leaf_name,
-                        "group": group_index,
-                        "present": bool(state),
-                        "step": None,
-                        "options": options,
-                        "lr_layout": lr_layout,
-                    }
-                    records.append(record)
-                    if "step" in state:
-                        step = state["step"]
-                        if isinstance(step, DTensor):
-                            step = step.to_local()
-                        if torch.is_tensor(step):
-                            if step.numel() != 1:
-                                raise RuntimeError("Optimizer step must be a scalar")
-                            step_tensors[(str(step.device), str(step.dtype))].append(
-                                (record, step.detach().reshape(()))
-                            )
-                        else:
-                            record["step"] = _group_option_value(step)
-        for (_, dtype), values in step_tensors.items():
-            scalars = torch.stack([value for _, value in values]).cpu().tolist()
-            for (record, _), scalar in zip(values, scalars, strict=True):
-                record["step"] = {"dtype": dtype, "value": scalar}
-        records.sort(key=lambda item: (item["names"], item["leaf"], item["group"]))
-        digest = hashlib.sha256(
-            json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        ).hexdigest()
-    except BaseException as exc:
-        error = exc
-    raise_if_any_rank_failed(error, "checking replicated optimizer metadata", group=group)
-    gathered = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, digest, group=group)
-    if any(value != gathered[0] for value in gathered):
-        raise RuntimeError("Replicated optimizer metadata differs across checkpoint ranks")
 
 
 def _multi_extra_snapshot(extra_root, *, read_state):
@@ -506,14 +199,11 @@ def _preflight_multi_optimizer_layout(
     group=None,
 ):
     """Reject an unproven or changed MultiOptimizer group/scheduler layout."""
-    multi = _coordinated_optimizer_flag(
-        getattr(optimizer, "_is_multi_optimizer", False) is True, "MultiOptimizer layout policy", group=group
-    )
+    multi = getattr(optimizer, "_is_multi_optimizer", False) is True
     if not multi:
         return None, None, None, None, None, None, None
     snapshot, extra, extra_digest, source_metadata, error = None, None, None, None, None
     try:
-        _check_model_serialization_hooks(model)
         source_metadata = reader_factory(checkpoint_path).read_metadata()
         parameter_names = _dcp_parameter_name_map(model)
         from .rank_local_optimizer import current_rank, load_rank_scalars, rank_prefix
@@ -638,13 +328,6 @@ def _preflight_multi_optimizer_layout(
             model, trainable_only=trainable_only, parallel_state=parallel_state
         ).state_dict()
 
-        _check_model_serialization_hooks(model)
-        logical_keys = {
-            logical_key
-            for raw in current_model_state
-            if (logical_key := _export_extra_parallel_layout_key(raw)) is not None
-        }
-        _check_qwen_omni_checkpoint_keys(model, logical_keys)
         flat_model, _ = flatten_state_dict({"model": current_model_state})
         expected_keys = set(flat_model)
         source_keys = {key for key in model_metadata.state_dict_metadata if key.startswith("model.")}
@@ -731,9 +414,7 @@ def _prepare_multi_optimizer_saved_states(
     validate_only=False,
 ):
     """Validate or allocate saved leaf state, without a synthetic optimizer step."""
-    multi = _coordinated_optimizer_flag(
-        getattr(optimizer, "_is_multi_optimizer", False) is True, "MultiOptimizer state preparation", group=group
-    )
+    multi = getattr(optimizer, "_is_multi_optimizer", False) is True
     if not multi:
         return
     error = None

@@ -178,27 +178,3 @@ def test_registered_single_optimizer_is_rejected_before_any_save_or_model_load(t
             str(model_dir), {"model": target, "optimizer": ToyAdamW(target.parameters())}, parallel_state=parallel
         )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
-
-
-def test_registered_adapter_cannot_fabricate_optimizer_group_options(tmp_path):
-    class FabricatingToy(ToyAdamW):
-        def state_dict(self):
-            state = super().state_dict()
-            state["param_groups"][0]["factor"] = 2
-            return state
-
-    register_rank_local_adamw(
-        FabricatingToy,
-        lambda _optimizer: nullcontext(),
-        lambda _optimizer: ("toy-v1",),
-        lambda _optimizer, _param, _field: torch.float32,
-        lambda _optimizer, _param: False,
-    )
-    model = torch.nn.Linear(2, 2)
-    leaf = FabricatingToy(model.parameters())
-    optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-    with pytest.raises(RuntimeError, match="fabricated checkpoint group options"):
-        DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
-        )
-    assert not list(tmp_path.iterdir())

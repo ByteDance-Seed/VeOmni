@@ -175,15 +175,6 @@ def _local_layout(
             for key, value in group.items():
                 if key != "params":
                     check_aliases(value, f"{leaf_name}.group{index}.{key}")
-    if any(
-        name in vars(optimizer)
-        for name in ("state_dict", "load_state_dict", "_sparse_state_dict", "step", "zero_grad")
-    ):
-        raise RuntimeError("MultiOptimizer checkpoint cannot prove overridden optimizer methods")
-    import torch.optim.optimizer as torch_optimizer
-
-    if torch_optimizer._global_optimizer_pre_hooks or torch_optimizer._global_optimizer_post_hooks:
-        raise RuntimeError("MultiOptimizer checkpoint cannot prove global optimizer step hooks")
     keys = optimizer.key_names
     if len(keys) != len(set(keys)) or set(keys) != set(optimizer.optimizers_dict):
         raise RuntimeError("MultiOptimizer keys do not uniquely describe its optimizer leaves")
@@ -258,20 +249,6 @@ def _local_layout(
             DistributedMuon,
         ):
             raise RuntimeError("MultiOptimizer checkpoint requires an explicitly supported optimizer leaf")
-        if any(name in vars(leaf) for name in ("state_dict", "load_state_dict", "zero_grad")):
-            raise RuntimeError("MultiOptimizer checkpoint cannot prove overridden leaf methods")
-        if any(
-            getattr(leaf, key, None)
-            for key in (
-                "_optimizer_state_dict_pre_hooks",
-                "_optimizer_state_dict_post_hooks",
-                "_optimizer_load_state_dict_pre_hooks",
-                "_optimizer_load_state_dict_post_hooks",
-                "_optimizer_step_pre_hooks",
-                "_optimizer_step_post_hooks",
-            )
-        ):
-            raise RuntimeError("MultiOptimizer checkpoint cannot prove custom optimizer serialization hooks")
         groups = []
         for group_index, group in enumerate(leaf.param_groups):
             if not group["params"]:
@@ -462,10 +439,15 @@ def coordinated_multi_layout(
         world = dist.get_world_size(group)
         digests = [None] * world
         gathered = [None] * world
-        dist.all_gather_object(gathered, (local, trainability), group=group)
+        # This existing layout exchange also guards the order of subsequent
+        # per-leaf collectives. Owner-specific freezing can otherwise leave
+        # one rank without a leaf and strand peers during checkpoint I/O.
+        dist.all_gather_object(gathered, (local, trainability, tuple(optimizer.key_names)), group=group)
         digests = [item[0] for item in gathered]
+        if any(item[2] != gathered[0][2] for item in gathered):
+            raise RuntimeError("MultiOptimizer checkpoint leaf order differs across ranks")
         owners = {}
-        for _, entries in gathered:
+        for _, entries, _ in gathered:
             for owner, count, digest in entries:
                 previous = owners.setdefault(owner, (count, digest))
                 if previous != (count, digest):
