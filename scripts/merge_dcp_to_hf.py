@@ -60,6 +60,8 @@ def save_lora_adapter_weights(
     checkpoint_path: Union[str, os.PathLike],
     save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
     adapter_config_path: Optional[Union[str, os.PathLike]] = None,
+    *,
+    legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
     """Convert a DCP checkpoint that contains a PEFT LoRA adapter to ``adapter_model.safetensors``.
 
@@ -81,7 +83,9 @@ def save_lora_adapter_weights(
         )
 
     logger.info(f"Found {len(lora_keys)} LoRA tensors; loading and re-saving as adapter_model.safetensors")
-    processed_dict = _process_shard(lora_keys, checkpoint_path, save_dtype)
+    processed_dict = _process_shard(
+        lora_keys, checkpoint_path, save_dtype, legacy_expert_source_layout=legacy_expert_source_layout
+    )
 
     save_path = os.path.join(output_dir, "adapter_model.safetensors")
     save_file(processed_dict, save_path, metadata={"format": "pt"})
@@ -116,6 +120,8 @@ def save_model_weights(
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
     qwen4_gdn_fp32: bool = False,
+    *,
+    legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
     """Convert DCP checkpoint to HuggingFace format with shard-by-shard processing (memory-efficient)."""
     os.makedirs(output_dir, exist_ok=True)
@@ -184,7 +190,13 @@ def save_model_weights(
         save_path = os.path.join(output_dir, filename)
         logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
 
-        processed_dict = _process_shard(shard_keys, checkpoint_path, save_dtype, preserve_fp32_keys)
+        processed_dict = _process_shard(
+            shard_keys,
+            checkpoint_path,
+            save_dtype,
+            preserve_fp32_keys,
+            legacy_expert_source_layout=legacy_expert_source_layout,
+        )
 
         # Save shard
         if safe_serialization:
@@ -230,6 +242,9 @@ def merge_to_hf_pt(
     model_assets_dir: Optional[str] = None,
     shard_size: int = 2_000_000_000,
     qwen4_gdn_fp32: bool = False,
+    *,
+    save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
+    legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
     """Main conversion function: load DCP from load_dir and save HF format to save_path."""
     model_assets = None
@@ -252,7 +267,13 @@ def merge_to_hf_pt(
             model_assets = None
 
     save_model_weights(
-        save_path, load_dir, shard_size=shard_size, model_assets=model_assets, qwen4_gdn_fp32=qwen4_gdn_fp32
+        save_path,
+        load_dir,
+        save_dtype=save_dtype,
+        shard_size=shard_size,
+        model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
+        legacy_expert_source_layout=legacy_expert_source_layout,
     )
 
 
@@ -305,6 +326,22 @@ def main():
         ),
     )
     parser.add_argument(
+        "--legacy-expert-source-layout",
+        choices=("veomni_tp1_ep0_fsdp1", "veomni_tp1_no_ep"),
+        default=None,
+        help=(
+            "Trusted source declaration for legacy VeOmni TP1 checkpoints: expert-axis-0/FSDP-axis-1 "
+            "or no expert parallelism. "
+            "Only use after verifying the source layout; a wrong declaration can permute experts."
+        ),
+    )
+    parser.add_argument(
+        "--save-dtype",
+        choices=("bfloat16", "float32", "preserve"),
+        default="bfloat16",
+        help="Export dtype; 'preserve' retains each checkpoint tensor's original dtype (default: bfloat16).",
+    )
+    parser.add_argument(
         "--adapter-config-path",
         type=str,
         default=None,
@@ -316,6 +353,7 @@ def main():
         ),
     )
     args = parser.parse_args()
+    save_dtype = None if args.save_dtype == "preserve" else args.save_dtype
 
     # A step directory is not itself a DCP directory: it holds model/ckpt and
     # model/optimizer. Resolve to the weights, but keep the export next to the
@@ -343,12 +381,22 @@ def main():
         save_lora_adapter_weights(
             output_dir=save_dir,
             checkpoint_path=load_dir,
+            save_dtype=save_dtype,
             adapter_config_path=args.adapter_config_path,
+            legacy_expert_source_layout=args.legacy_expert_source_layout,
         )
     else:
         if args.adapter_config_path is not None:
             logger.warning("--adapter-config-path is only used in 'lora' mode; ignoring.")
-        merge_to_hf_pt(load_dir, save_dir, model_assets_dir, shard_size=shard_size, qwen4_gdn_fp32=args.qwen4_gdn_fp32)
+        merge_to_hf_pt(
+            load_dir,
+            save_dir,
+            model_assets_dir,
+            shard_size=shard_size,
+            qwen4_gdn_fp32=args.qwen4_gdn_fp32,
+            save_dtype=save_dtype,
+            legacy_expert_source_layout=args.legacy_expert_source_layout,
+        )
 
 
 if __name__ == "__main__":

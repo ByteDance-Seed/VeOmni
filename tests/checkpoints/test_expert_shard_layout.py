@@ -4,24 +4,27 @@
 """CPU/Gloo regressions for canonical EP-first DCP expert coordinates."""
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.checkpoint.dcp_checkpointer import (
     _EXPERT_LAYOUTS_KEY,
+    DistributedCheckpointer,
     _ExtraParallelSavePlanner,
     _FileBackedSavePlanner,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
     _process_shard,
+    dcp_to_torch_state_dict,
     drop_extra_parallel_dim,
     restore_extra_parallel_dim,
 )
@@ -147,6 +150,189 @@ def _layout_worker(rank, world, directory, rendezvous):
             with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
                 dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
             assert target["model"]["weight"].to_local().count_nonzero() == 0
+            dcp.load(
+                target,
+                checkpoint_id=path,
+                planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"),
+            )
+            torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
+
+        # The public model-only load/export paths accept the same independently
+        # verified declaration; unknown source and optimizer restore stay closed.
+        path = directory + "known_legacy_model_only"
+        bf16_bias = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
+        gdn_a = torch.tensor([0.12345679], dtype=torch.float32)
+        gdn_dt = torch.tensor([-0.07456543], dtype=torch.float32)
+        dcp.save(
+            {
+                "model": {
+                    "layer.experts.weight": wrap(1),
+                    "layer.bias": bf16_bias,
+                    "layers.0.linear_attn.A_log": gdn_a,
+                    "layers.0.linear_attn.dt_bias": gdn_dt,
+                }
+            },
+            checkpoint_id=path,
+        )
+
+        def make_qwen_target():
+            target = torch.nn.Module()
+            target.config = SimpleNamespace(model_type="qwen4_exp")
+            target.layer = torch.nn.Module()
+            target.layer.experts = torch.nn.Module()
+            target.layer.experts.weight = torch.nn.Parameter(torch.zeros_like(global_weight))
+            target.layers = torch.nn.ModuleList([torch.nn.Module()])
+            target.layers[0].linear_attn = torch.nn.Module()
+            target.layers[0].linear_attn.A_log = torch.nn.Parameter(torch.zeros_like(gdn_a))
+            target.layers[0].linear_attn.dt_bias = torch.nn.Parameter(torch.zeros_like(gdn_dt))
+            return target
+
+        model = make_qwen_target()
+        parallel = SimpleNamespace(dp_mode="ddp")
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            DistributedCheckpointer.load(
+                path,
+                {"model": model},
+                parallel_state=parallel,
+                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1" if rank == 0 else None,
+            )
+        assert model.layer.experts.weight.count_nonzero() == 0
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            DistributedCheckpointer.load(path, {"model": model}, parallel_state=parallel)
+        assert model.layer.experts.weight.count_nonzero() == 0
+        with pytest.raises(ValueError, match="only supported for model-only loads"):
+            DistributedCheckpointer.load(
+                path,
+                {"model": model, "optimizer": torch.optim.AdamW(model.parameters())},
+                parallel_state=parallel,
+                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+            )
+        assert model.layer.experts.weight.count_nonzero() == 0
+        DistributedCheckpointer.load(
+            path,
+            {"model": model},
+            parallel_state=parallel,
+            legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+        )
+        torch.testing.assert_close(model.layer.experts.weight, global_weight, rtol=0, atol=0)
+        torch.testing.assert_close(model.layers[0].linear_attn.A_log, gdn_a, rtol=0, atol=0)
+        torch.testing.assert_close(model.layers[0].linear_attn.dt_bias, gdn_dt, rtol=0, atol=0)
+        if rank == 0:
+            import subprocess
+            import sys
+
+            from safetensors.torch import load_file
+
+            from veomni.checkpoint import ckpt_to_state_dict
+
+            with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+                dcp_to_torch_state_dict(path)
+            exported = dcp_to_torch_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+            torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
+            exported = ckpt_to_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+            torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
+            assert exported["layer.experts.weight"].dtype == torch.float32
+            assert exported["layer.bias"].dtype == torch.bfloat16
+            cli_dir = directory + "known_legacy_hf"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/merge_dcp_to_hf.py",
+                    "--load-dir",
+                    path,
+                    "--save-dir",
+                    cli_dir,
+                    "--mode",
+                    "full",
+                    "--legacy-expert-source-layout",
+                    "veomni_tp1_ep0_fsdp1",
+                    "--save-dtype",
+                    "preserve",
+                    "--qwen4-gdn-fp32",
+                ],
+                check=True,
+                timeout=60,
+            )
+            exported = load_file(cli_dir + "/model.safetensors")
+            torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
+            assert exported["layer.experts.weight"].dtype == torch.float32
+            assert exported["layer.bias"].dtype == torch.bfloat16
+            torch.testing.assert_close(exported["layers.0.linear_attn.A_log"], gdn_a, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layers.0.linear_attn.dt_bias"], gdn_dt, rtol=0, atol=0)
+            assert exported["layers.0.linear_attn.A_log"].dtype == torch.float32
+            assert exported["layers.0.linear_attn.dt_bias"].dtype == torch.float32
+            bf16_cli_dir = directory + "known_legacy_hf_bf16"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/merge_dcp_to_hf.py",
+                    "--load-dir",
+                    path,
+                    "--save-dir",
+                    bf16_cli_dir,
+                    "--mode",
+                    "full",
+                    "--legacy-expert-source-layout",
+                    "veomni_tp1_ep0_fsdp1",
+                    "--save-dtype",
+                    "bfloat16",
+                    "--qwen4-gdn-fp32",
+                ],
+                check=True,
+                timeout=60,
+            )
+            exported = load_file(bf16_cli_dir + "/model.safetensors")
+            torch.testing.assert_close(exported["layers.0.linear_attn.A_log"], gdn_a, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layers.0.linear_attn.dt_bias"], gdn_dt, rtol=0, atol=0)
+            torch.testing.assert_close(exported["layer.experts.weight"], global_weight.bfloat16(), rtol=0, atol=0)
+            assert exported["layers.0.linear_attn.A_log"].dtype == torch.float32
+            assert exported["layers.0.linear_attn.dt_bias"].dtype == torch.float32
+            assert exported["layer.experts.weight"].dtype == torch.bfloat16
+        dist.barrier()
+
+        # A trusted legacy expert declaration must not waive GDN precision.
+        path = directory + "known_legacy_bf16_gdn"
+        dcp.save(
+            {
+                "model": {
+                    "layer.experts.weight": wrap(1),
+                    "layers.0.linear_attn.A_log": gdn_a.bfloat16(),
+                    "layers.0.linear_attn.dt_bias": gdn_dt,
+                }
+            },
+            checkpoint_id=path,
+        )
+        target = {
+            "model": {
+                "layer.experts.weight": wrap(1, empty=True),
+                "layers.0.linear_attn.A_log": torch.zeros_like(gdn_a),
+                "layers.0.linear_attn.dt_bias": torch.zeros_like(gdn_dt),
+            }
+        }
+        with pytest.raises(dcp.CheckpointException, match="Qwen4 GDN parameter"):
+            dcp.load(
+                target,
+                checkpoint_id=path,
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=True,
+                    strict_gdn_fp32=True,
+                    legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+                ),
+            )
+        assert target["model"]["layer.experts.weight"].to_local().count_nonzero() == 0
+        assert target["model"]["layers.0.linear_attn.A_log"].count_nonzero() == 0
+        assert target["model"]["layers.0.linear_attn.dt_bias"].count_nonzero() == 0
+        model = make_qwen_target()
+        with pytest.raises(dcp.CheckpointException, match="Qwen4 GDN parameter"):
+            DistributedCheckpointer.load(
+                path,
+                {"model": model},
+                parallel_state=parallel,
+                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1",
+            )
+        assert all(param.count_nonzero() == 0 for param in model.parameters())
 
         # Legacy metadata used two ordinary Shards, recording the wrong order.
         local = ep_weight.chunk(2, 0)[fsdp_rank].contiguous()
@@ -171,19 +357,33 @@ def _layout_worker(rank, world, directory, rendezvous):
                 _process_shard(plan, path)
         dist.barrier()
 
+        # A one-dimensional expert bias may also be EP-sharded. Exporting it
+        # as a plain tensor must not bypass the same unversioned-source guard.
+        bias = torch.arange(8, dtype=torch.float32)
+        local_bias = bias.chunk(2, 0)[ep_rank].chunk(2, 0)[fsdp_rank].contiguous()
+        placements = [Shard(0), Shard(0)] if world == 4 else [Replicate(), Shard(0), Shard(0)]
+        legacy_bias = DTensor.from_local(local_bias, mesh, placements)
+        path = directory + "legacy_ambiguous_bias_export"
+        dcp.save({"model": {"layer.experts.bias": legacy_bias}}, checkpoint_id=path)
+        if rank == 0:
+            with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+                dcp_to_torch_state_dict(path)
+        dist.barrier()
+
         # When the source layout is known, the guard also works for a plain
         # tensor target. Never bless legacy ordinary Shard(0)/Shard(0) saves.
         path = directory + "marked_legacy"
         dcp.save({"model": {"weight": legacy}}, checkpoint_id=path, planner=_ExtraParallelSavePlanner())
         for destination in (wrap(0, empty=True), wrap(1, empty=True), torch.zeros_like(global_weight)):
-            with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
-                dcp.load(
-                    {"model": {"weight": destination}},
-                    checkpoint_id=path,
-                    planner=_ModelStrictLoadPlanner(strict_model=True),
-                )
-            local = destination.to_local() if isinstance(destination, DTensor) else destination
-            assert local.count_nonzero() == 0
+            for declaration in (None, "veomni_tp1_ep0_fsdp1", "veomni_tp1_no_ep"):
+                with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
+                    dcp.load(
+                        {"model": {"weight": destination}},
+                        checkpoint_id=path,
+                        planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout=declaration),
+                    )
+                local = destination.to_local() if isinstance(destination, DTensor) else destination
+                assert local.count_nonzero() == 0
     finally:
         dist.destroy_process_group()
 
@@ -194,6 +394,108 @@ def test_expert_shard_layout_roundtrip_and_legacy_rejection(world, tmp_path):
     mp.spawn(
         _layout_worker, args=(world, str(tmp_path / "dcp"), f"file://{tmp_path / 'rdzv'}"), nprocs=world, join=True
     )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_unsupported_legacy_expert_source_layout_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported legacy expert source layout"):
+        _ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="unverified")
+    with pytest.raises(TypeError, match="strict_gdn_fp32 must be a bool"):
+        _ModelStrictLoadPlanner(True, None, "veomni_tp1_ep0_fsdp1")
+
+
+def _non_ep_legacy_expert_bias_worker(rank, root, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        expected = torch.arange(8, dtype=torch.float32)
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        source = DTensor.from_local(expected.chunk(2)[rank].contiguous(), mesh, [Shard(0)])
+        dcp.save({"model": {"layer.experts.bias": source}}, checkpoint_id=root, planner=_ExtraParallelSavePlanner())
+        target = {"model": {"layer.experts.bias": torch.zeros_like(expected)}}
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            dcp.load(target, checkpoint_id=root, planner=_ModelStrictLoadPlanner(strict_model=True))
+        assert target["model"]["layer.experts.bias"].count_nonzero() == 0
+        dcp.load(
+            target,
+            checkpoint_id=root,
+            planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="veomni_tp1_no_ep"),
+        )
+        torch.testing.assert_close(target["model"]["layer.experts.bias"], expected, rtol=0, atol=0)
+        if rank == 0:
+            exported = dcp_to_torch_state_dict(root, legacy_expert_source_layout="veomni_tp1_no_ep")
+            torch.testing.assert_close(exported["layer.experts.bias"], expected, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_legacy_non_ep_fsdp_expert_bias_requires_source_declaration(tmp_path):
+    spawn_with_rendezvous(_non_ep_legacy_expert_bias_worker, args=(str(tmp_path / "dcp"),), nprocs=2)
+
+
+def _unversioned_wrong_target_expert_axis_worker(rank, root, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        fsdp, ep = mesh.get_coordinate()
+        expected = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        local = expected.chunk(2, 0)[ep].chunk(2, 0)[fsdp].contiguous()
+        source = DTensor.from_local(local, mesh, [Shard(0), Shard(0)])
+        dcp.save({"model": {"layer.experts.weight": source}}, checkpoint_id=root)
+        target = DTensor.from_local(torch.zeros(4, 4), mesh, [Shard(0), Shard(1)])
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            dcp.load(
+                {"model": {"layer.experts.weight": target}},
+                checkpoint_id=root,
+                planner=_ModelStrictLoadPlanner(strict_model=True),
+            )
+        assert target.to_local().count_nonzero() == 0
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_unversioned_source_axis_is_not_inferred_from_target(tmp_path):
+    spawn_with_rendezvous(_unversioned_wrong_target_expert_axis_worker, args=(str(tmp_path / "dcp"),), nprocs=4)
+
+
+def _partial_expert_layout_metadata_worker(rank, root, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        unnamed_mesh = DeviceMesh("cpu", mesh.mesh, mesh_dim_names=("axis0", "axis1"))
+        fsdp, ep = mesh.get_coordinate()
+        expected = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        good_local = expected.chunk(2, 0)[ep].chunk(2, 1)[fsdp].contiguous()
+        bad_local = expected.chunk(2, 0)[ep].chunk(2, 0)[fsdp].contiguous()
+        good = DTensor.from_local(good_local, mesh, [Shard(1), Shard(0)])
+        bad = DTensor.from_local(bad_local, unnamed_mesh, [Shard(0), Shard(0)])
+        source = {"model": {"layer.experts.good": good, "layer.experts.bad": bad}}
+        dcp.save(source, checkpoint_id=root, planner=_ExtraParallelSavePlanner())
+        recorded = dcp.FileSystemReader(root).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+        assert "model.layer.experts.good" in recorded and "model.layer.experts.bad" not in recorded
+        target = {
+            "model": {
+                f"layer.experts.{name}": DTensor.from_local(torch.zeros(4, 4), mesh, [Shard(1), Shard(0)])
+                for name in ("good", "bad")
+            }
+        }
+        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+            dcp.load(target, checkpoint_id=root, planner=_ModelStrictLoadPlanner(strict_model=True))
+        assert all(value.to_local().count_nonzero() == 0 for value in target["model"].values())
+        if rank == 0:
+            with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+                dcp_to_torch_state_dict(root)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_partial_source_layout_metadata_does_not_authorize_other_experts(tmp_path):
+    spawn_with_rendezvous(_partial_expert_layout_metadata_worker, args=(str(tmp_path / "dcp"),), nprocs=4)
 
 
 def _unversioned_composite_expert_worker(rank, root, endpoint):
