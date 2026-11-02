@@ -31,6 +31,9 @@ from veomni.checkpoint.dcp_checkpointer import (
 from veomni.distributed.parallel_plan import SpecInfo
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=1))
+
+
 def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim):
     dist.init_process_group("gloo", init_method=f"file://{root}/init", rank=rank, world_size=4)
     try:
