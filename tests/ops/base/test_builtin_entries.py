@@ -26,6 +26,7 @@ from veomni.ops.platform import (
     NpuKernelRequirement,
     NvidiaGpuPlatform,
     RocmGpuPlatform,
+    XpuKernelRequirement,
 )
 
 
@@ -45,6 +46,7 @@ _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _GPU_ROCM = ("gpu", (("rocm", None, None),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
+_XPU = ("xpu", ())
 
 
 _BUILTIN_ENTRIES = (
@@ -58,6 +60,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "flash_attention_2", "npu", _NPU, ()),
     ("attention", "standard", "flash_attention_2", "mlu", _MLU, ("flash_attn",)),
     ("attention", "standard", "flash_attention_2_hub", "cuda", _GPU_NVIDIA_SM80, ("kernels",)),
+    ("attention", "standard", "flash_attention_2_hub", "xpu", _XPU, ("kernels",)),
     ("attention", "standard", "flash_attention_3", "cuda", _GPU_NVIDIA_SM90, ("flash_attn_interface",)),
     ("attention", "standard", "flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
@@ -74,6 +77,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
     ("attention", "standard", "veomni_flash_attention_2", "mlu", _MLU, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2_hub", "cuda", _GPU_NVIDIA_SM80, ("kernels",)),
+    ("attention", "standard", "veomni_flash_attention_2_hub", "xpu", _XPU, ("kernels",)),
     (
         "attention",
         "standard",
@@ -228,6 +232,8 @@ def _requirement_metadata(requirement):
         return "npu", ()
     if isinstance(requirement, MluKernelRequirement):
         return "mlu", ()
+    if isinstance(requirement, XpuKernelRequirement):
+        return "xpu", ()
     raise AssertionError(f"unexpected requirement type: {type(requirement).__name__}")
 
 
