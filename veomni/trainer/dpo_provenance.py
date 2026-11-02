@@ -49,15 +49,9 @@ def _validate_proof(value: Any) -> None:
         or type(value.source_ids) is not tuple
         or len(value.source_ids) != len(value.feature_token_counts)
         or any(source is not None and (type(source) is not str or len(source) != 64) for source in value.source_ids)
-        or type(value.input_digest) is not str
-        or len(value.input_digest) != 64
-        or any(char not in "0123456789abcdef" for char in value.input_digest)
         or type(value.packed_digest) is not str
         or len(value.packed_digest) != 64
         or any(char not in "0123456789abcdef" for char in value.packed_digest)
-        or type(value.global_digest) is not str
-        or len(value.global_digest) != 64
-        or any(char not in "0123456789abcdef" for char in value.global_digest)
         or type(value.source_indices) is not tuple
         or len(value.source_indices) not in (0, len(value.feature_token_counts))
         or any(type(index) is not int or index < 0 for index in value.source_indices)
