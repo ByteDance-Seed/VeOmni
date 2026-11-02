@@ -100,8 +100,34 @@ def _legacy_optimizer_checkpoints(trainer):
     runtimes = [("model", root)]
     modules = getattr(root, "module_runtimes", None)
     if isinstance(modules, Mapping) and modules:
-        if getattr(root, "checkpoint", None) is None and getattr(root, "optimizer", None) is None:
-            runtimes = []
+        if getattr(root, "checkpoint", None) is None:
+            optimizer = getattr(root, "optimizer", None)
+            owned = {
+                name: getattr(module, "optimizer", None)
+                for name, module in modules.items()
+                if getattr(module, "optimizer", None) is not None
+            }
+            aggregate = getattr(optimizer, "optimizers", None)
+            is_omni_proxy = False
+            if type(root).__module__ == "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime":
+                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+                    MultiOptimizer as OmniMultiOptimizer,
+                )
+                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+                    OmniModelRuntime,
+                )
+
+                is_omni_proxy = (
+                    type(root) is OmniModelRuntime
+                    and type(optimizer) is OmniMultiOptimizer
+                    and isinstance(aggregate, Mapping)
+                    and aggregate.keys() == owned.keys()
+                    and all(aggregate[name] is opt for name, opt in owned.items())
+                )
+            if optimizer is None or is_omni_proxy:
+                # Omni's aggregate only delegates to these module optimizers;
+                # their checkpoint managers are the actual state owners.
+                runtimes = []
         runtimes.extend((f"module:{name}", module) for name, module in sorted(modules.items()))
     result, unknown, seen = [], [], set()
     for name, runtime in runtimes:
@@ -110,6 +136,9 @@ def _legacy_optimizer_checkpoints(trainer):
         optimizer = getattr(runtime, "optimizer", None)
         checkpoint = getattr(runtime, "checkpoint", None)
         confirm = getattr(type(checkpoint), "confirm_legacy_loaded_checkpoint_for_reuse", None)
+        if checkpoint is not None and getattr(checkpoint, "runtime", None) is not runtime:
+            unknown.append(name)
+            continue
         if checkpoint is not None and id(checkpoint) in seen:
             continue
         if optimizer is None:
@@ -456,6 +485,13 @@ class GlobalStateCallback(Callback):
         return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
+        from .checkpoint_callback import CheckpointCallback
+
+        self._last_saved_step = -1
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        if isinstance(checkpoint_callback, CheckpointCallback):
+            checkpoint_callback._last_dcp_step = -1
+            checkpoint_callback._last_hf_step = -1
         args: "VeOmniArguments" = self.trainer.args
         from ...data.dynamic_batching import DynamicBatchSizeDataLoader
 
@@ -951,10 +987,17 @@ class GlobalStateCallback(Callback):
             raise_if_any_rank_failed(error, "confirming restored optimizer checkpoint")
         except BaseException:
             for _, checkpoint in (*checkpoints, *legacy_checkpoints):
-                checkpoint._last_saved_step = -1
-                checkpoint._last_saved_optimizer_generation = None
-                if hasattr(checkpoint, "_last_saved_optimizer_ref"):
-                    checkpoint._last_saved_optimizer_ref = None
+                path = getattr(checkpoint, "_last_saved_step_path", None)
+                if path is not None and hasattr(checkpoint, "_invalidated_saved_step_paths"):
+                    checkpoint._invalidated_saved_step_paths.append(path)
+                invalidate = getattr(checkpoint, "_invalidate_saved_receipt", None)
+                if callable(invalidate):
+                    invalidate()
+                else:
+                    checkpoint._last_saved_step = -1
+                    checkpoint._last_saved_optimizer_generation = None
+                    if hasattr(checkpoint, "_last_saved_optimizer_ref"):
+                        checkpoint._last_saved_optimizer_ref = None
             raise
         self._last_saved_step = step
         self._last_saved_optimizer_generations = dict(generations)
