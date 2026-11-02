@@ -253,9 +253,10 @@ def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kin
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
-def test_canonical_same_axis_muon_fresh_process_resume(tmp_path):
-    mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "save", "muon", True, True), nprocs=4, join=True)
-    mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "load", "muon", True, True), nprocs=4, join=True)
+@pytest.mark.parametrize("canonical", [False, True])
+def test_same_axis_muon_fresh_process_resume(tmp_path, canonical):
+    mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "save", "muon", canonical, True), nprocs=4, join=True)
+    mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "load", "muon", canonical, True), nprocs=4, join=True)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))

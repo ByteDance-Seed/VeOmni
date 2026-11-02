@@ -257,9 +257,10 @@ module-scope wrap. Combined `fsdp_scope: model` and active ExtraParallel is not
 supported with this option and fails before wrapping; use module scope. All
 ranks participating in a module or model scope must use the same layout flag.
 
-The EP-outer layout is opt-in through `SpecInfo.checkpoint_layout_v2`; existing
-plans remain on their original layout. A plan enabling it must retain the
-original `global_shape` and must use FSDP DTensor parameters. Every
+The versioned EP-outer tensor namespace is opt-in through
+`SpecInfo.checkpoint_layout_v2`. Ordinary ExtraParallel saves also use canonical
+EP-first shard coordinates and record per-tensor source layout. A versioned
+plan must retain the original `global_shape` and use FSDP DTensor parameters. Every
 non-persistent ExtraParallel shard in a checkpoint must use the canonical
 layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
 identifies canonical global values independently of source geometry, so DCP can
@@ -329,7 +330,16 @@ or longrope target, resume requires a matching cache contract; older checkpoints
 without that proof need a verified migration. Older checkpoints do not identify
 the source's RoPE configuration, so the operator must also independently verify
 that the source and target configurations match. Saving an expanded cache is not
-yet supported.
+yet supported. DCP training with MultiOptimizer rejects dynamic and longrope
+modes before training until their transient history can be restored exactly;
+ordinary static/default RoPE is unaffected.
+
+For unversioned expert checkpoints whose chunks divide the expert axis, the
+saved offsets alone do not prove source order, even if another axis is also
+sharded. Such known expert tensors require a verified migration with the
+original training layout. Offline export can recognize VeOmni's standard
+`experts` names; custom names require the operator to verify source layout.
+
 Mutable optimizer options must not be shared between groups or optimizer
 defaults: ordinary YAML `betas` are normalized to a tuple; custom shared lists,
 dictionaries and tensor-valued learning rates require explicitly independent

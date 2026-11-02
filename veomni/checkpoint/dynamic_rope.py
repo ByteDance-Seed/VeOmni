@@ -9,6 +9,18 @@ import math
 import torch
 
 
+def reject_dynamic_rope_multi_optimizer_training(model):
+    """Reject modes whose transient cache history cannot yet be resumed."""
+    for name, module in model.named_modules():
+        rope_type = getattr(module, "rope_type", None)
+        kinds = rope_type.values() if isinstance(rope_type, dict) else (rope_type,)
+        if any(isinstance(kind, str) and ("dynamic" in kind or kind == "longrope") for kind in kinds):
+            raise RuntimeError(
+                f"MultiOptimizer DCP training cannot yet safely resume dynamic RoPE for {name or '<root>'}; "
+                "its nonpersistent cache can depend on prior sequence lengths"
+            )
+
+
 def dynamic_rope_checkpoint_contract(model):
     """Reject dynamic caches that a fresh runtime cannot reconstruct exactly.
 
