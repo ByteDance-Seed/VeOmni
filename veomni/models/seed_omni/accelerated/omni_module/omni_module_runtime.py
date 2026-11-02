@@ -37,7 +37,7 @@ from .....distributed.parallel_state import use_parallel_state
 from .....utils import logging, recompute_utils
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
-from ....model_runtime import VeOmniModelRuntime
+from ....model_runtime import VeOmniModelRuntime, _configure_extra_parallel_checkpoint_layout
 from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
@@ -173,6 +173,24 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self.model.requires_grad_(False)
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
+                    checkpoint = getattr(self.train_args, "checkpoint", None)
+                    if getattr(checkpoint, "extra_parallel_canonical_layout", False):
+                        from .....distributed.torch_parallelize import _has_extra_parallel_plan
+                        from .....utils.dist_utils import raise_if_any_rank_failed
+
+                        error = None
+                        try:
+                            _configure_extra_parallel_checkpoint_layout(
+                                self.model,
+                                checkpoint,
+                                require_plan=(
+                                    bool(getattr(self.parallel_state, "any_extra_parallel_enabled", False))
+                                    and _has_extra_parallel_plan(self.model)
+                                ),
+                            )
+                        except BaseException as exc:
+                            error = exc
+                        raise_if_any_rank_failed(error, "configuring Omni module checkpoint layout")
                     # Parallel-state scoping for recompute rides in the policy; the
                     # apply step inside ``_build_parallelized_model`` is the last writer.
                     self._build_optimizer_checked()

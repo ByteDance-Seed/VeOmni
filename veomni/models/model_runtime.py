@@ -49,6 +49,23 @@ if TYPE_CHECKING:
     from ..trainer.callbacks import TrainerState
     from .checkpoint import ModelCheckpointManager
 
+
+def _configure_extra_parallel_checkpoint_layout(model, checkpoint, *, require_plan=True):
+    """Apply canonical ExtraParallel checkpoint layout after model wrapping."""
+    if not getattr(checkpoint, "extra_parallel_canonical_layout", False):
+        return
+    from torch.distributed.tensor import Shard
+
+    specs = getattr(model, "_fqn2spec_info", None)
+    if specs is None:
+        if require_plan:
+            raise RuntimeError("Canonical ExtraParallel checkpointing requires an ExtraParallel model plan")
+        return
+    for spec in specs.values():
+        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
+            spec.checkpoint_layout_v2 = True
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -155,15 +172,7 @@ class VeOmniModelRuntime:
             layout_error = None
             try:
                 if canonical:
-                    from torch.distributed.tensor import Shard
-
-                    if not has_specs:
-                        raise RuntimeError(
-                            "Canonical ExtraParallel checkpointing requires an ExtraParallel model plan"
-                        )
-                    for spec in specs.values():
-                        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
-                            spec.checkpoint_layout_v2 = True
+                    _configure_extra_parallel_checkpoint_layout(self.model, self.train_args.checkpoint)
             except BaseException as exc:
                 layout_error = exc
             raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")

@@ -252,6 +252,11 @@ resume instead of falling back.
 
 ## Versioned ExtraParallel layout
 
+For SeedOmni, `extra_parallel_canonical_layout: true` is applied after each
+module-scope wrap. Combined `fsdp_scope: model` and active ExtraParallel is not
+supported with this option and fails before wrapping; use module scope. All
+ranks participating in a module or model scope must use the same layout flag.
+
 The EP-outer layout is opt-in through `SpecInfo.checkpoint_layout_v2`; existing
 plans remain on their original layout. A plan enabling it must retain the
 original `global_shape` and must use FSDP DTensor parameters. Every
