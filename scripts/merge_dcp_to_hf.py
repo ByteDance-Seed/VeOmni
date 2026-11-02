@@ -46,6 +46,7 @@ def save_lora_adapter_weights(
     checkpoint_path: Union[str, os.PathLike],
     save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
     adapter_config_path: Optional[Union[str, os.PathLike]] = None,
+    *,
     legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
     """Convert a DCP checkpoint that contains a PEFT LoRA adapter to ``adapter_model.safetensors``.
@@ -104,6 +105,7 @@ def save_model_weights(
     shard_size: int = 2_000_000_000,
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
+    *,
     legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
     """Convert DCP checkpoint to HuggingFace format with shard-by-shard processing (memory-efficient)."""
@@ -186,6 +188,7 @@ def merge_to_hf_pt(
     save_path: str,
     model_assets_dir: Optional[str] = None,
     shard_size: int = 2_000_000_000,
+    *,
     save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
     legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
