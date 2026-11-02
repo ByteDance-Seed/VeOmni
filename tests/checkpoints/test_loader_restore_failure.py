@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -17,7 +18,7 @@ from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchin
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 
 
 def _restore_worker(rank, root, failure, dpo):
@@ -77,13 +78,12 @@ def _restore_worker(rank, root, failure, dpo):
         def saved_state(_path):
             if rank == 0 and failure == "not_mapping":
                 return []
-            if rank == 0 and failure == "missing_step":
-                return {}
-            return {
+            state = {
                 "global_step": 1,
+                "torch_rng_state": torch.get_rng_state(),
                 "dpo_position": {"epoch": 0, "step_in_epoch": 1, "epoch_complete": False},
                 "train_dataloader": {
-                    "_veomni_source_exhausted": rank == 0,
+                    "_veomni_source_exhausted": rank == 0 and failure == "exhausted",
                     "_veomni_resume_phase": "after_yield",
                     "num_micro_batch": 1,
                     "step": 1,
@@ -93,15 +93,28 @@ def _restore_worker(rank, root, failure, dpo):
                     "batching_strategy": TextBatchingStrategy(token_micro_bsz=1, buffer_size=1),
                 },
             }
+            if rank == 0 and failure == "missing_step":
+                state.pop("global_step")
+            return state
 
         callback._read_current = saved_state
-        with pytest.raises(
-            (RuntimeError, AttributeError, KeyError, ValueError),
-            match=(
-                "exhausted one-shot|validating the training data cursor|reading the trainer state|"
-                "has no attribute|global_step|DPO checkpoint recovery"
-            ),
-        ):
+        if rank == 0:
+            expected_type, expected_message = {
+                "exhausted": (RuntimeError, "exhausted one-shot"),
+                "not_mapping": (AttributeError, "object has no attribute 'get'"),
+                "missing_step": (
+                    ValueError if dpo else KeyError,
+                    "valid nonnegative global_step" if dpo else "global_step",
+                ),
+            }[failure]
+        else:
+            expected_type = RuntimeError
+            expected_message = (
+                "reading the trainer state failed on another rank"
+                if dpo and failure in ("not_mapping", "missing_step")
+                else "validating the training data cursor failed on another rank"
+            )
+        with pytest.raises(expected_type, match=expected_message):
             callback.load_global_state()
         assert trainer.state.global_step == 0
     finally:
