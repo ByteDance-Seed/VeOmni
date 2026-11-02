@@ -25,6 +25,7 @@ python3 tests/special_sanity/check_device_api_usage.py --directory ./tasks
 python3 tests/special_sanity/check_device_api_usage.py --directory ./veomni
 """
 
+import ast
 import os
 from argparse import ArgumentParser
 from pathlib import Path
@@ -34,8 +35,6 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
-    # Muon validates CUDA matmul precision with backend-specific APIs.
-    "veomni/optim/qwen38_muon.py",
     # The optimizer factory identifies the CUDA/NCCL domain for Muon's
     # collective IEEE-FP32 preflight, including CPU-offloaded parameters.
     "veomni/optim/optimizer.py",
@@ -101,6 +100,43 @@ SEARCH_WHITELIST = CUDA_KEYWORD_CHECK_WHITELIST + NCCL_KEYWORD_CHECK_WHITELIST
 
 SEARCH_KEYWORDS = [".cuda", '"cuda"', '"nccl"']
 
+# Only these existing Muon lines need backend-specific precision inspection or
+# device dispatch. The existing keyword scan still checks every other line.
+LINE_EXCEPTIONS = {
+    "veomni/optim/qwen38_muon.py": {
+        "_check_cuda_fp32_policy": {"backend = torch.backends.cuda.matmul"},
+        "_optimizer_uses_cuda": {
+            'return any(param.device.type == "cuda" for group in optimizer.param_groups for param in group["params"])'
+        },
+        "_strict_matmul": {'elif device_type == "cuda":'},
+    }
+}
+
+
+def _remove_scoped_exceptions(path: str, content: str) -> str:
+    rules = next(
+        (rules for suffix, rules in LINE_EXCEPTIONS.items() if path.endswith(suffix.replace("/", os.sep))), None
+    )
+    if rules is None:
+        return content
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return content
+
+    lines = content.splitlines()
+    excluded = set()
+    for name, permitted_lines in rules.items():
+        functions = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        if len(functions) != 1:
+            continue
+        function = functions[0]
+        for permitted in permitted_lines:
+            matches = [i for i in range(function.lineno - 1, function.end_lineno) if lines[i].strip() == permitted]
+            if len(matches) == 1:
+                excluded.add(matches[0])
+    return "\n".join(line for i, line in enumerate(lines) if i not in excluded)
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -127,7 +163,7 @@ if __name__ == "__main__":
             continue
 
         with open(path_in_str, encoding="utf-8") as f:
-            file_content = f.read()
+            file_content = _remove_scoped_exceptions(path_in_str, f.read())
 
             find_invalid_device_management = False
 

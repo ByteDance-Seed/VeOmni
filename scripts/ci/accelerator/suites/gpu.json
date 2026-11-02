@@ -1,5 +1,10 @@
 [
   {
+    "name": "device-api-scoped-exceptions-unit",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/special_sanity/test_device_api_usage.py"]
+  },
+  {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
     "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
