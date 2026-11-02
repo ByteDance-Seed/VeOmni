@@ -29,6 +29,40 @@ def _worker(rank, rendezvous, root, mode):
         runtime.optimizer = MagicMock(spec=[])
         with patch("veomni.models.checkpoint.manager.build_checkpointer"):
             manager = ModelCheckpointManager(runtime)
+            if mode in ("same_output", "legacy_incomplete"):
+                from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+                trainer = _make_mock_trainer(save_path=root)
+                trainer.args.train.world_size = 2
+                callback = GlobalStateCallback(trainer)
+                checkpoint = MagicMock()
+                manifest = {"model_state": True, "global_step": 3, "world_size": 2}
+                same = rank == 0 if mode == "same_output" else True
+                complete = rank != 0
+                with (
+                    patch(
+                        "veomni.trainer.callbacks.global_state_callback.layout.same_checkpoint_path", return_value=same
+                    ),
+                    patch(
+                        "veomni.trainer.callbacks.global_state_callback.layout.read_manifest", return_value=manifest
+                    ),
+                    patch(
+                        "veomni.trainer.callbacks.global_state_callback.layout.checkpoint_is_complete",
+                        return_value=complete,
+                    ),
+                    pytest.raises(RuntimeError),
+                ):
+                    callback._confirm_same_output_checkpoint(
+                        3,
+                        root,
+                        (),
+                        {},
+                        legacy_checkpoints=(("model", checkpoint),) if mode == "legacy_incomplete" else (),
+                    )
+                checkpoint.confirm_loaded_checkpoint_for_reuse.assert_not_called()
+                checkpoint.confirm_legacy_loaded_checkpoint_for_reuse.assert_not_called()
+                dist.barrier()
+                return
             if mode in ("dcp_reader", "model_state", "optimizer_state"):
                 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, ModelState, OptimizerState
 
@@ -107,15 +141,15 @@ def _worker(rank, rendezvous, root, mode):
                 manager.wait_for_pending_save = wait
             error = None
             try:
-                if mode in ("epoch", "cadence"):
+                if mode in ("epoch", "receipt"):
                     from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 
                     trainer = _make_mock_trainer(save_path=root)
-                    trainer.args.train.checkpoint.save_epochs = 0 if mode == "cadence" and rank == 1 else 1
+                    trainer.args.train.checkpoint.save_epochs = 1
                     trainer.args.train.checkpoint.save_hf_weights = False
                     trainer.model.checkpoint = manager
                     callback = CheckpointCallback(trainer)
-                    callback._last_dcp_step = 3
+                    callback._last_dcp_step = 3 if mode == "epoch" or rank == 0 else -1
                     callback.on_epoch_end(TrainerState(global_step=3, epoch=0))
                 else:
                     manager.prepare_export(TrainerState(global_step=3), "step_end")
@@ -124,7 +158,7 @@ def _worker(rank, rendezvous, root, mode):
             result = torch.tensor(int(error is not None))
             dist.all_reduce(result)
             assert result.item() == 2, (rank, mode, error)
-            if mode not in ("epoch", "cadence"):
+            if mode not in ("epoch", "receipt"):
                 assert manager._last_saved_step == -1
                 assert manager._last_saved_optimizer_ref is None
     finally:
@@ -138,7 +172,9 @@ def _worker(rank, rendezvous, root, mode):
         "before",
         "during",
         "epoch",
-        "cadence",
+        "receipt",
+        "same_output",
+        "legacy_incomplete",
         "load_kwargs",
         "save_kwargs",
         "dcp_reader",

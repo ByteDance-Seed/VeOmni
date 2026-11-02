@@ -30,8 +30,6 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
-import hashlib
-import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -65,6 +63,8 @@ def _confirmed_export_optimizer(checkpoint, step):
 
 def _check_same_step_receipt(trainer, step, same_step):
     """Never skip a same-step save after optimizer identity has changed."""
+    # This is an actual save receipt, which may differ after a rank-local I/O
+    # failure; it is not a comparison of the shared checkpoint schedule.
     if dist.is_initialized():
         decisions = [None] * dist.get_world_size()
         dist.all_gather_object(decisions, (step, same_step))
@@ -127,30 +127,6 @@ def _export_wrote_dcp(trainer, step):
     return saved
 
 
-def _agree_checkpoint_load_path(path):
-    """Reject inconsistent checkpoint paths before any rank enters DCP."""
-    if not dist.is_initialized():
-        return
-    error = None
-    digest = None
-    try:
-        raw = None if path is None else os.fspath(path)
-        if raw is not None and not isinstance(raw, str):
-            raise TypeError("checkpoint load path must be a string")
-        encoded = b"\0" if raw is None else b"\1" + os.fsencode(raw)
-        digest = hashlib.sha256(encoded).digest()
-    except BaseException as exc:
-        error = exc
-    raise_if_any_rank_failed(error, "validating checkpoint load path", group=dist.group.WORLD)
-    device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
-    low = torch.tensor(list(digest), dtype=torch.int32, device=device)
-    high = low.clone()
-    dist.all_reduce(low, op=dist.ReduceOp.MIN)
-    dist.all_reduce(high, op=dist.ReduceOp.MAX)
-    if not torch.equal(low, high):
-        raise RuntimeError("Ranks disagree on checkpoint load path")
-
-
 class CheckpointCallback(Callback):
     """Schedule DCP / HF / LoRA I/O and the one-shot tokenizer/config export."""
 
@@ -167,7 +143,6 @@ class CheckpointCallback(Callback):
         self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        _agree_checkpoint_load_path(self.trainer.args.train.checkpoint.load_path)
         self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
@@ -196,12 +171,6 @@ class CheckpointCallback(Callback):
         hf_due = bool(
             self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
         )
-        if dist.is_initialized():
-            decisions = [None] * dist.get_world_size()
-            local = (state.epoch, state.global_step, dcp_due, hf_due)
-            dist.all_gather_object(decisions, local)
-            if any(decision != local for decision in decisions):
-                raise RuntimeError("Checkpoint epoch schedule differs across ranks")
         if dcp_due:
             same_step = state.global_step == self._last_dcp_step
             _check_same_step_receipt(self.trainer, state.global_step, same_step)

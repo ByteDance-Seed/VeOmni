@@ -214,16 +214,18 @@ def _json_signature(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).digest()
 
 
-def _agree_dynamic_resume_signature(signature, group):
+def _agree_restored_position(global_step, saved_epoch, group):
+    """Check loaded state, not the job configuration replicated by the launcher."""
     if not dist.is_initialized():
         return
+    signature = _json_signature({"global_step": global_step, "saved_epoch": saved_epoch})
     device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
     low = torch.tensor(list(signature), dtype=torch.int32, device=device)
     high = low.clone()
     dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
     dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
     if not torch.equal(low, high):
-        raise RuntimeError("Ranks disagree on dynamic loader resume context")
+        raise RuntimeError("Ranks restored different training positions")
 
 
 class GlobalStateCallback(Callback):
@@ -550,7 +552,14 @@ class GlobalStateCallback(Callback):
             and type(getattr(self.trainer, "train_dataloader", None)) is DynamicBatchSizeDataLoader
         )
         load_path = args.train.checkpoint.load_path
-        checkpoints = _multi_optimizer_checkpoints(self.trainer) if load_path is not None else []
+        if load_path is None:
+            return None
+        checkpoints, error = [], None
+        try:
+            checkpoints = _multi_optimizer_checkpoints(self.trainer)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "checking restored optimizer providers")
         steps = [getattr(checkpoint, "_loaded_optimizer_global_step", None) for _, checkpoint in checkpoints]
         generations = {
             name: getattr(checkpoint, "_loaded_optimizer_generation", None) for name, checkpoint in checkpoints
@@ -562,34 +571,15 @@ class GlobalStateCallback(Callback):
             error = RuntimeError("Model modules did not restore a proven optimizer checkpoint generation")
         raise_if_any_rank_failed(error, "checking restored optimizer steps")
         optimizer_step = steps[0] if steps else None
+        _agree_restored_position(optimizer_step, None, dist.group.WORLD if dist.is_initialized() else None)
         strict_optimizer = type(optimizer_step) is int
         strict_resume = strict_sft or strict_optimizer
-        if dist.is_initialized():
-            group = dist.group.WORLD
-            device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
-            low = torch.tensor(
-                [int(load_path is not None), int(strict_sft), int(strict_optimizer)], dtype=torch.int32, device=device
-            )
-            high = low.clone()
-            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
-            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
-            if not torch.equal(low, high):
-                raise RuntimeError("Ranks disagree on trainer-state resume mode")
-        if load_path is None:
-            return None
-
         legacy_checkpoints, unknown_checkpoints, error = [], [], None
         try:
             legacy_checkpoints, unknown_checkpoints = _legacy_optimizer_checkpoints(self.trainer)
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
-        if dist.is_initialized():
-            names = (tuple(name for name, _ in legacy_checkpoints), tuple(unknown_checkpoints))
-            all_names = [None] * dist.get_world_size()
-            dist.all_gather_object(all_names, names)
-            if any(item != names for item in all_names):
-                raise RuntimeError("Legacy optimizer checkpoint managers differ across ranks")
         coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
 
         if strict_optimizer:
@@ -784,6 +774,8 @@ class GlobalStateCallback(Callback):
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "checking weights-only checkpoint output path")
+            # Resolved paths depend on each node's actual filesystem, not just
+            # the common launcher configuration.
             if dist.is_initialized():
                 decisions = [None] * dist.get_world_size()
                 dist.all_gather_object(decisions, same_output)
@@ -806,10 +798,12 @@ class GlobalStateCallback(Callback):
         cursor_error = None
         sft_next_epoch = False
         prepared_sft_buffer = None
-        resume_signature = None
+        saved_epoch = None
         try:
             cursor = global_state.get("train_dataloader")
             global_step = global_state["global_step"]
+            if type(global_step) is not int or global_step < 0:
+                raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
             loader = self.trainer.train_dataloader
             if strict_optimizer:
                 if global_step != optimizer_step:
@@ -959,20 +953,13 @@ class GlobalStateCallback(Callback):
                 if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
                     _check_legacy_exhausted_cursor(cursor)
             if strict_sft:
-                resume_signature = _json_signature(
-                    {
-                        "dynamic": type(loader) is DynamicBatchSizeDataLoader,
-                        "checkpoint_path": os.fspath(load_path),
-                        "global_step": global_step,
-                        "context": global_state.get("_veomni_dynamic_context") if cursor is not None else None,
-                    }
-                )
+                context = global_state.get("_veomni_dynamic_context")
+                saved_epoch = context.get("saved_epoch") if isinstance(context, dict) else None
         except BaseException as exc:
             cursor_error = exc
         default_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
-        if strict_sft:
-            _agree_dynamic_resume_signature(resume_signature, default_group)
+        _agree_restored_position(global_step, saved_epoch, default_group)
 
         if dpo_recovery and dist.is_initialized():
             steps = [None] * dist.get_world_size()
@@ -1181,6 +1168,8 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored checkpoint output path")
+        # Resolving symlinks and mount visibility is an actual filesystem
+        # result and must agree before any rank enters the receipt collectives.
         if dist.is_initialized():
             decisions = [None] * dist.get_world_size()
             dist.all_gather_object(decisions, same_output)
@@ -1207,18 +1196,14 @@ class GlobalStateCallback(Callback):
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "checking legacy checkpoint completeness")
-            if dist.is_initialized():
-                decisions = [None] * dist.get_world_size()
-                dist.all_gather_object(decisions, complete)
-                if any(decision != complete for decision in decisions):
-                    raise RuntimeError("Legacy checkpoint completeness differs across ranks")
             if not complete:
                 self._last_saved_step = -1
                 self._last_saved_optimizer_generations = {}
-                raise RuntimeError(
+                error = RuntimeError(
                     "Cannot safely reuse an incomplete legacy checkpoint in its output directory; "
                     "use a different output directory."
                 )
+            raise_if_any_rank_failed(error, "checking legacy checkpoint completeness")
         error = None
         try:
             if unknown_checkpoints:

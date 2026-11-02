@@ -231,11 +231,6 @@ class ModelCheckpointManager:
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing checkpoint load path")
-        if dist.is_initialized():
-            paths = [None] * dist.get_world_size()
-            dist.all_gather_object(paths, load_dir)
-            if any(path != load_dir for path in paths):
-                raise RuntimeError("Checkpoint load path differs across ranks")
         if load_dir is None:
             return
 

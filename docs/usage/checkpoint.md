@@ -5,6 +5,11 @@ under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
 (`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
+All ranks must use the same checkpoint paths, save schedule and model/parallel
+configuration. The trainer does not compare a copy of that shared configuration
+on every rank. Some rank-local checkpoint and cursor operations coordinate
+failures; this is not a guarantee for every I/O path.
+
 ```
 checkpoints/global_step_{N}/
 ├── checkpoint_manifest.json      # completion marker, rank 0 writes it last

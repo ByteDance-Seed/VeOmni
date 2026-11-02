@@ -448,6 +448,16 @@ class TestModelCheckpointManagerSaveContract:
 class TestGlobalStateCallbackJobState:
     """Job-level state — dataloader, rng, meters, channel-loss — is not in the DCP sidecar."""
 
+    def test_fresh_run_does_not_coordinate_resume(self, mock_dist):
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = None
+        mock_dist.is_initialized.return_value = True
+        with patch("veomni.trainer.callbacks.global_state_callback.raise_if_any_rank_failed") as coordinate:
+            assert GlobalStateCallback(trainer).load_global_state() is None
+        coordinate.assert_not_called()
+        mock_dist.all_reduce.assert_not_called()
+        mock_dist.all_gather_object.assert_not_called()
+
     def test_state_dict_includes_channel_loss_callback_state(self, mock_dist):
         trainer = _make_mock_trainer()
         trainer.channel_loss_callback.state_dict.return_value = {
