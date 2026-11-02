@@ -167,6 +167,10 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
         model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", mesh, fsdp_axis, None, (8, 4), canonical)}
         if kind == "muon":
             leaf = DistributedMuon([model.weight], lr=0.01, ns_implementation="std")
+        elif kind == "anyprecision":
+            from veomni.optim.optimizer import AnyPrecisionAdamW
+
+            leaf = AnyPrecisionAdamW([model.weight], lr=0.01)
         else:
             leaf = torch.optim.AdamW([model.weight], lr=0.01)
         leaves = {"expert": leaf}
@@ -178,6 +182,10 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
 
         def snapshot():
             state = optimizer.optimizers_dict["expert"].state.get(model.weight, {})
+            if kind == "anyprecision" and state:
+                assert set(state) == {"step", "exp_avg", "exp_avg_sq", "compensation"}
+                assert state["step"].dtype == torch.float32
+                assert all(state[key].dtype == torch.bfloat16 for key in ("exp_avg", "exp_avg_sq", "compensation"))
             result = {
                 "weight": model.weight.to_local().detach().clone(),
                 "state": {
@@ -248,6 +256,24 @@ def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kin
 def test_canonical_same_axis_muon_fresh_process_resume(tmp_path):
     mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "save", "muon", True, True), nprocs=4, join=True)
     mp.spawn(_cold_optimizer_worker, args=(str(tmp_path), False, "load", "muon", True, True), nprocs=4, join=True)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+@pytest.mark.parametrize("same_axis", [False, True])
+@pytest.mark.parametrize("inactive_owner", [False, True])
+def test_anyprecision_bf16_state_extra_parallel_fresh_process_resume(tmp_path, same_axis, inactive_owner):
+    mp.spawn(
+        _cold_optimizer_worker,
+        args=(str(tmp_path), inactive_owner, "save", "anyprecision", same_axis, same_axis),
+        nprocs=4,
+        join=True,
+    )
+    mp.spawn(
+        _cold_optimizer_worker,
+        args=(str(tmp_path), inactive_owner, "load", "anyprecision", same_axis, same_axis),
+        nprocs=4,
+        join=True,
+    )
 
 
 def _replica_check_worker(rank, root):

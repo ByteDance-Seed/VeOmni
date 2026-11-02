@@ -167,12 +167,26 @@ def _validate_source_optimizer_states(optimizer, model):
                     if field == "step":
                         if tuple(value.shape) != ():
                             raise RuntimeError("MultiOptimizer step must be a scalar")
+                        if isinstance(leaf, AnyPrecisionAdamW) and isinstance(value, DTensor):
+                            raise RuntimeError("AnyPrecisionAdamW step must be an ordinary scalar tensor")
                         adapter = rank_local_adamw_adapter(leaf)
                         if adapter is not None and value.dtype != adapter.state_dtype(leaf, param, field):
                             raise RuntimeError("MultiOptimizer step dtype differs from its registered policy")
                     else:
                         if tuple(value.shape) != tuple(param.shape):
                             raise RuntimeError(f"MultiOptimizer state shape differs for {field}")
+                        if isinstance(leaf, AnyPrecisionAdamW) and (
+                            isinstance(param, DTensor) != isinstance(value, DTensor)
+                            or (
+                                isinstance(param, DTensor)
+                                and (
+                                    value.device_mesh != param.device_mesh
+                                    or value.placements != param.placements
+                                    or value.to_local().shape != param.to_local().shape
+                                )
+                            )
+                        ):
+                            raise RuntimeError(f"AnyPrecisionAdamW state layout differs for {field}")
                         adapter = rank_local_adamw_adapter(leaf)
                         expected_dtype = (
                             adapter.state_dtype(leaf, param, field)
@@ -187,7 +201,7 @@ def _validate_source_optimizer_states(optimizer, model):
                             if isinstance(leaf, AnyPrecisionAdamW)
                             else param.dtype
                         )
-                        if (adapter is None and expected_dtype != param.dtype) or value.dtype != expected_dtype:
+                        if value.dtype != expected_dtype:
                             raise RuntimeError(f"MultiOptimizer state dtype cannot be safely restored for {field}")
 
 
@@ -474,14 +488,9 @@ def _preflight_multi_optimizer_layout(
         return None, None, None, None, None, None, None
     snapshot, extra, extra_digest, source_metadata, error = None, None, None, None, None
     try:
-        from ..optim.optimizer import AnyPrecisionAdamW
-
         _check_model_serialization_hooks(model)
         source_metadata = reader_factory(checkpoint_path).read_metadata()
         parameter_names = _dcp_parameter_name_map(model)
-        parameter_names_by_id = defaultdict(list)
-        for name, param in parameter_names.items():
-            parameter_names_by_id[id(param)].append(name)
         from .rank_local_optimizer import current_rank, load_rank_scalars, rank_prefix
 
         rank_local = (
@@ -505,22 +514,6 @@ def _preflight_multi_optimizer_layout(
                 raise RuntimeError("MultiOptimizer checkpoint resume requires a fresh optimizer without state")
             if any(param.grad is not None for param_group in leaf.param_groups for param in param_group["params"]):
                 raise RuntimeError("MultiOptimizer checkpoint resume requires cleared gradients")
-            if isinstance(leaf, AnyPrecisionAdamW):
-                for param_group in leaf.param_groups:
-                    fields = ["momentum_dtype", "variance_dtype"]
-                    if param_group.get("use_kahan_summation"):
-                        fields.append("compensation_buffer_dtype")
-                    incompatible = False
-                    for param in param_group["params"]:
-                        if not any(param_group[field] != param.dtype for field in fields):
-                            continue
-                        names = parameter_names_by_id[id(param)]
-                        incompatible |= any(f"optimizer.state.{name}" in source_bases for name in names)
-                    if incompatible:
-                        raise RuntimeError(
-                            "AnyPrecisionAdamW requires explicit precision-preserving migration when optimizer "
-                            "state and parameter dtypes differ"
-                        )
         extra_digest, extra = _multi_extra_snapshot(extra_root, read_state=True)
         if extra is not None:
             snapshot = extra.get("lr_scheduler")
@@ -851,11 +844,6 @@ def _prepare_multi_optimizer_saved_states(
                                     "compensation": "compensation_buffer_dtype",
                                 }[field]
                             ]
-                            if dtype != param.dtype:
-                                raise RuntimeError(
-                                    "AnyPrecisionAdamW cannot restore moments at a dtype different from its parameter; "
-                                    "explicit precision-preserving migration is required"
-                                )
                         else:
                             dtype = param.dtype
                         if entry.properties.dtype != dtype:
