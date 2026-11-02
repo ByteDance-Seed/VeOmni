@@ -496,7 +496,8 @@ def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, m
         import weakref
 
         manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
-        trainer.model = SimpleNamespace(optimizer=runtime.optimizer, checkpoint=manager)
+        runtime.checkpoint = manager
+        trainer.model = runtime
         trainer.checkpoint_callback = CheckpointCallback(trainer)
         callback = GlobalStateCallback(trainer)
         monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
@@ -558,7 +559,8 @@ def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage,
         result.environ_meter.state_dict.return_value = {}
         result.channel_loss_callback = None
         result.offline_cache_writer = None
-        result.model = SimpleNamespace(optimizer=obj.optimizer, checkpoint=manager)
+        obj.checkpoint = manager
+        result.model = obj
         result.save_dcp.side_effect = manager.save_dcp
         return result
 
@@ -732,7 +734,9 @@ def test_legacy_omni_missing_trainable_provider_is_not_certified(tmp_path, monke
     manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
     manager._loaded_checkpoint_path = load_path
     manager._loaded_checkpointer = DistributedCheckpointer
-    present = SimpleNamespace(optimizer=runtime.optimizer, checkpoint=manager, has_trainable_parameters=True)
+    runtime.checkpoint = manager
+    runtime.has_trainable_parameters = True
+    present = runtime
     missing = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=True)
     frozen = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
     root = SimpleNamespace(
@@ -753,6 +757,61 @@ def test_legacy_omni_missing_trainable_provider_is_not_certified(tmp_path, monke
     with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
         callback._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
     assert manager._last_saved_step == -1
+
+
+def test_legacy_omni_aggregate_optimizer_uses_child_checkpoint_managers(tmp_path, monkeypatch):
+    import weakref
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+    from veomni.trainer.callbacks.global_state_callback import _legacy_optimizer_checkpoints
+
+    child = _make_mock_runtime(save_path=str(tmp_path))
+    child.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
+        child.checkpoint = ModelCheckpointManager(child)
+    root = OmniModelRuntime(model=None, module_runtimes={"child": child})
+    root._build_optimizer()
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.model = root
+
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert known == [("module:child", child.checkpoint)]
+    assert unknown == []
+    load_path = layout.step_dir(str(tmp_path), 2)
+    child.checkpoint._loaded_optimizer_ref = weakref.ref(child.optimizer)
+    child.checkpoint._loaded_checkpoint_path = load_path
+    child.checkpoint._loaded_checkpointer = DistributedCheckpointer
+    trainer.checkpoint_callback = CheckpointCallback(trainer)
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(layout, "read_manifest", lambda _: {"model_state": True, "global_step": 2, "world_size": 1})
+    GlobalStateCallback(trainer)._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
+    assert child.checkpoint._last_saved_step == 2
+
+    # Do not certify an aggregate whose members are not exactly the child
+    # optimizers: its additional state would have no checkpoint manager.
+    root.optimizer.optimizers["unexpected"] = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert known == [("module:child", child.checkpoint)]
+    assert unknown == ["model"]
+
+    other = _make_mock_runtime(save_path=str(tmp_path))
+    other.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    other.checkpoint = child.checkpoint
+    root.module_runtimes["other"] = other
+    root._build_optimizer()
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert known == [("module:child", child.checkpoint)]
+    assert unknown == ["module:other"]
+
+    # Sharing both objects still does not prove the other model's state.
+    other.optimizer = child.optimizer
+    root._build_optimizer()
+    known, unknown = _legacy_optimizer_checkpoints(trainer)
+    assert known == [("module:child", child.checkpoint)]
+    assert unknown == ["module:other"]
 
 
 def test_mixed_omni_receipt_confirms_every_optimizer(tmp_path, monkeypatch):

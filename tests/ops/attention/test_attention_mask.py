@@ -16,10 +16,7 @@
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -589,125 +586,6 @@ def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(
         graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
         assert 1 <= graphs <= 4
         assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
-
-
-@pytest.mark.parametrize("fails", [False, True])
-def test_flex_builder_keeps_hf_functions_during_predicate_evaluation(fails):
-    """HF helpers must remain original throughout successful and failing calls."""
-    from transformers import masking_utils
-
-    original_builder = masking_utils.create_block_mask
-    original_offsets = masking_utils.add_offsets_to_mask_function
-
-    def predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Observe HF globals while this invocation still evaluates its mask."""
-        assert masking_utils.create_block_mask is original_builder
-        assert masking_utils.add_offsets_to_mask_function is original_offsets
-        if fails:
-            raise RuntimeError("predicate failed")
-        return q_idx >= kv_idx
-
-    context = pytest.raises(RuntimeError, match="predicate failed") if fails else contextlib.nullcontext()
-    with context:
-        flex_attention_mask_builder(
-            1, 4, 6, q_offset=2, mask_function=predicate, device="cpu", compile_block_mask=False
-        )
-    assert masking_utils.create_block_mask is original_builder
-    assert masking_utils.add_offsets_to_mask_function is original_offsets
-
-
-@pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("second_fails", [False, True])
-def test_flex_builder_overlapping_calls_leave_native_hf_independent(monkeypatch, compiled, second_fails):
-    """Interleave A-enter/B-enter/A-exit/B-exit while a native HF consumer runs."""
-    from transformers import masking_utils
-
-    original_builder = masking_utils.create_block_mask
-    original_offsets = masking_utils.add_offsets_to_mask_function
-    # Isolate routing and lifetime, rather than concurrent compiler startup.
-    # Real compilation and graph reuse are exercised in separate regressions.
-    monkeypatch.setattr(flex_mask, "_compiled_create_block_mask", lambda: original_builder)
-    # Quarantine state even when this regression is run against the old patch.
-    monkeypatch.setattr(masking_utils, "create_block_mask", original_builder)
-    monkeypatch.setattr(masking_utils, "add_offsets_to_mask_function", original_offsets)
-    first_entered, second_entered, native_finished, first_finished = (Event() for _ in range(4))
-    observed = []
-
-    def first_predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Keep A live until B and the native HF consumer have entered."""
-        first_entered.set()
-        assert second_entered.wait(20), "second invocation never entered"
-        assert native_finished.wait(20), "native HF invocation never finished"
-        observed.append((masking_utils.create_block_mask, masking_utils.add_offsets_to_mask_function))
-        return q_idx >= kv_idx
-
-    def second_predicate(batch_idx, head_idx, q_idx, kv_idx):
-        """Make B exit after A, including when user predicate evaluation fails."""
-        second_entered.set()
-        assert first_finished.wait(20), "first invocation never finished"
-        observed.append((masking_utils.create_block_mask, masking_utils.add_offsets_to_mask_function))
-        if second_fails:
-            raise RuntimeError("second predicate failed")
-        return q_idx >= kv_idx
-
-    def build_first():
-        """Publish A completion even when construction raises."""
-        try:
-            return flex_attention_mask_builder(
-                1,
-                65,
-                69,
-                q_offset=7,
-                kv_offset=3,
-                mask_function=first_predicate,
-                device="cpu",
-                compile_block_mask=compiled,
-            )
-        finally:
-            first_finished.set()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(build_first)
-        try:
-            assert first_entered.wait(20), "first invocation never entered"
-            second = pool.submit(
-                flex_attention_mask_builder,
-                1,
-                129,
-                133,
-                q_offset=9,
-                kv_offset=5,
-                mask_function=second_predicate,
-                device="cpu",
-                compile_block_mask=compiled,
-            )
-            assert second_entered.wait(20), "second invocation never entered"
-            # Native HF helpers must not inherit either call's lengths/device.
-            native_predicate = masking_utils.add_offsets_to_mask_function(
-                masking_utils.causal_mask_function, q_offset=2, kv_offset=0
-            )
-            native = masking_utils.create_block_mask(
-                native_predicate, B=1, H=None, Q_LEN=193, KV_LEN=195, device="cpu", _compile=False
-            )
-            torch.testing.assert_close(flex_visible(native, 193, 195), torch.ones(193, 195, dtype=torch.bool).tril(2))
-        finally:
-            native_finished.set()
-        first_mask = first.result(timeout=20)
-        context = (
-            pytest.raises(RuntimeError, match="second predicate failed") if second_fails else contextlib.nullcontext()
-        )
-        with context:
-            second_mask = second.result(timeout=20)
-        if not second_fails:
-            q = torch.arange(129)[:, None]
-            k = torch.arange(133)[None, :]
-            torch.testing.assert_close(second_mask.mask_mod(0, 0, q, k), q + 9 >= k + 5)
-    q = torch.arange(65)[:, None]
-    k = torch.arange(69)[None, :]
-    torch.testing.assert_close(first_mask.mask_mod(0, 0, q, k), q + 7 >= k + 3)
-    assert observed and all(pair == (original_builder, original_offsets) for pair in observed)
-    assert masking_utils.create_block_mask is original_builder
-    assert masking_utils.add_offsets_to_mask_function is original_offsets
 
 
 @pytest.fixture

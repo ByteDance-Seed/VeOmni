@@ -114,8 +114,30 @@ def _legacy_optimizer_checkpoints(trainer):
     runtimes = [("model", root)]
     modules = getattr(root, "module_runtimes", None)
     if isinstance(modules, Mapping) and modules:
-        if getattr(root, "checkpoint", None) is None and getattr(root, "optimizer", None) is None:
-            runtimes = []
+        if getattr(root, "checkpoint", None) is None:
+            optimizer = getattr(root, "optimizer", None)
+            if optimizer is None:
+                runtimes = []
+            else:
+                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+                    MultiOptimizer as OmniMultiOptimizer,
+                )
+                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+
+                child_optimizers = {
+                    name: module.optimizer
+                    for name, module in modules.items()
+                    if getattr(module, "optimizer", None) is not None
+                }
+                if (
+                    type(root) is OmniModelRuntime
+                    and type(optimizer) is OmniMultiOptimizer
+                    and optimizer.optimizers.keys() == child_optimizers.keys()
+                    and all(optimizer.optimizers[name] is value for name, value in child_optimizers.items())
+                ):
+                    # Omni's root is only an optimizer proxy; its children own
+                    # the actual state and must each prove a completed load.
+                    runtimes = []
         runtimes.extend((f"module:{name}", module) for name, module in sorted(modules.items()))
     result, unknown, seen = [], [], set()
     for name, runtime in runtimes:
@@ -124,6 +146,12 @@ def _legacy_optimizer_checkpoints(trainer):
         optimizer = getattr(runtime, "optimizer", None)
         checkpoint = getattr(runtime, "checkpoint", None)
         confirm = getattr(type(checkpoint), "confirm_legacy_loaded_checkpoint_for_reuse", None)
+        owner = getattr(checkpoint, "runtime", None)
+        if owner is not None and (owner is not runtime or getattr(owner, "optimizer", None) is not optimizer):
+            # A manager proves its own runtime and optimizer, not another
+            # child that happens to share either object.
+            unknown.append(name)
+            continue
         if checkpoint is not None and id(checkpoint) in seen:
             continue
         if optimizer is None:

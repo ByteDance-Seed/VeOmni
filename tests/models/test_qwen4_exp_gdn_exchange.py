@@ -9,6 +9,7 @@ import torch.distributed as dist
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed.sequence_parallel.gdn_exchange import coalesced_gather_aligned, pack
+from veomni.models.configuration_base import as_veomni_config
 
 
 def _worker(rank, world, endpoint):
@@ -71,7 +72,6 @@ def _native_exchange_worker(rank, device_type, family, mixed_dtype, endpoint):
 
     from transformers import AutoConfig
 
-    from tests.models.compare import ops_config_scope
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.utils.device import get_dist_comm_backend, get_torch_device
@@ -119,8 +119,8 @@ def _native_exchange_worker(rank, device_type, family, mixed_dtype, endpoint):
             ops = make_eager_ops_config(
                 causal_conv1d_implementation=kernel, chunk_gated_delta_rule_implementation=kernel
             )
-            with ops_config_scope(ops):
-                models.append(model_class(config).to(device=device, dtype=torch.bfloat16))
+            as_veomni_config(config, validate=False)._set_ops_implementation(ops)
+            models.append(model_class(config).to(device=device, dtype=torch.bfloat16))
         for tensor in (*models[0].parameters(), *models[0].buffers()):
             dist.broadcast(tensor.detach(), src=0)
         models[1].load_state_dict(models[0].state_dict())
