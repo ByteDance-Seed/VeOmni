@@ -421,3 +421,104 @@ def test_bagel_modules_keep_construction_ops_when_config_mutated() -> None:
     torch.testing.assert_close(k_out, k_ref)
     assert rope_counter.calls == 2
     assert torch.isfinite(mlp_ref).all()
+
+
+@pytest.mark.parametrize("target_proj", ("qkv_proj_und", "qkv_proj_gen", "o_proj", "o_proj_moe_gen"))
+def test_bagel_qwen2_mot_async_ulysses_falls_back_to_sync_on_lora_projections(
+    monkeypatch: pytest.MonkeyPatch,
+    target_proj: str,
+) -> None:
+    """Verify ``BagelQwen2MoTAttentionAccelerated.forward_packed_train`` falls back to synchronous projections when LoRA wraps any projection layer."""
+    from types import SimpleNamespace
+
+    from veomni.lora.layers import LoraLinear
+
+    cfg = _flex_config()
+    attn = accelerated.BagelQwen2MoTAttentionAccelerated(cfg, layer_idx=0).eval()
+    base_linear = getattr(attn, target_proj)
+    lora_linear = LoraLinear(base_linear, adapter_name="default", r=2, lora_alpha=4)
+    with torch.no_grad():
+        lora_linear.lora_B["default"].weight.fill_(0.25)
+    setattr(attn, target_proj, lora_linear)
+
+    def _fake_attn_op(module, q, k, v, mask, **kwargs):
+        del module, k, mask, kwargs
+        v_expanded = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+        return (q + v_expanded).transpose(1, 2).contiguous(), None
+
+    attn.veomni_attn = _fake_attn_op
+    async_qkv_counter = _CallCounter(lambda **kwargs: (_ for _ in ()).throw(AssertionError("async qkv called")))
+    async_o_counter = _CallCounter(lambda **kwargs: (_ for _ in ()).throw(AssertionError("async o called")))
+    attn.veomni_async_ulysses_qkv = async_qkv_counter
+    attn.veomni_async_ulysses_o = async_o_counter
+
+    packed_sequence = torch.randn(4, cfg.hidden_size)
+    cos = torch.ones(4, attn.head_dim)
+    sin = torch.zeros(4, attn.head_dim)
+    und_idx = torch.tensor([0, 2], dtype=torch.long)
+    gen_idx = torch.tensor([1, 3], dtype=torch.long)
+
+    monkeypatch.setattr(
+        accelerated,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=False, async_enabled=False, ulysses_size=1, ulysses_group=None),
+    )
+    with torch.no_grad():
+        sync_ref = attn.forward_packed_train(packed_sequence, None, cos, sin, und_idx, gen_idx)
+
+    monkeypatch.setattr(
+        accelerated,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=True, async_enabled=True, ulysses_size=2, ulysses_group=None),
+    )
+    with torch.no_grad():
+        async_with_lora = attn.forward_packed_train(packed_sequence, None, cos, sin, und_idx, gen_idx)
+
+    assert async_qkv_counter.calls == 0
+    assert async_o_counter.calls == 0
+    torch.testing.assert_close(async_with_lora, sync_ref)
+
+
+def test_bagel_siglip_navit_multi_image_sample_flops_and_seqlens() -> None:
+    """Verify multi-image samples preserve per-sample token counts while using per-image lengths for attention FLOPs."""
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.accelerated.accelerated import BagelSiglipNavitAccelerated
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.configuration import BagelSiglipNavitConfig
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN
+    from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+    cfg = BagelSiglipNavitConfig(
+        num_hidden_layers=1,
+        ops_implementation={
+            "attn_implementation": "eager",
+            "rotary_pos_emb_vision_implementation": "eager",
+        },
+    )
+    model = BagelSiglipNavitAccelerated(cfg)
+    model.config.num_hidden_layers = 26
+
+    patch_dim = cfg.num_channels * cfg.patch_size * cfg.patch_size
+    items = [
+        ConversationItem(
+            type="image",
+            role="user",
+            value=torch.zeros(1024, patch_dim, dtype=torch.bfloat16),
+            meta={
+                BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT,
+                _OMNI_TOKEN_LEN: 1024,
+                _OMNI_POSITION_IDS: torch.zeros(1024, dtype=torch.long),
+            },
+        )
+        for _ in range(2)
+    ]
+    model.forward_pre(conversation_list=[items])
+    model.metric_meter_add("forward")
+    flops, seqlens = model.metric_meter_collect()
+
+    assert seqlens == [2048]
+    expected_per_image_flops = model.estimate_flops([1024, 1024])
+    overcounted_sample_flops = model.estimate_flops([2048])
+    assert flops == pytest.approx(expected_per_image_flops)
+    assert flops == pytest.approx(5.834821, rel=1e-4)
+    assert overcounted_sample_flops == pytest.approx(6.588592, rel=1e-4)
+    assert flops < overcounted_sample_flops

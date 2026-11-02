@@ -598,6 +598,17 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         )
         return packed_attn_output.squeeze(0)
 
+    def _has_plain_linear_projections(self) -> bool:
+        """Whether async Ulysses may read this layer's projection weights directly.
+
+        A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
+        its own forward, so attention falls back to the synchronous projection path.
+        """
+        return all(
+            isinstance(getattr(self, name), torch.nn.Linear)
+            for name in ("qkv_proj_und", "qkv_proj_gen", "o_proj", "o_proj_moe_gen")
+        )
+
     def forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
@@ -609,7 +620,11 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
     ) -> torch.Tensor:
         """Run packed training attention, using async Ulysses when enabled on the active parallel state."""
         parallel_state = get_parallel_state()
-        use_async_ulysses = parallel_state.ulysses_enabled and bool(parallel_state.async_enabled)
+        use_async_ulysses = (
+            parallel_state.ulysses_enabled
+            and bool(parallel_state.async_enabled)
+            and self._has_plain_linear_projections()
+        )
         if not use_async_ulysses:
             return super().forward_packed_train(
                 packed_sequence,
