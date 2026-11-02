@@ -567,6 +567,10 @@ their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
+Channel-loss logging is rejected with `model.accelerator.cp_size > 1` and
+`cp_layout: zigzag`: per-source aggregation requires contiguous rank slices.
+Keep `train.channel_loss.enable: false` for USP training.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable channel loss logging. |

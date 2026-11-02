@@ -499,6 +499,11 @@ softcap, attention sinks, nonzero attention dropout, and deterministic backward
 (`train.enable_full_determinism` / `FLASH_ATTENTION_DETERMINISTIC=1`) are unsupported and
 rejected. Other models require a separate compatibility check before enabling USP.
 
+Per-source channel-loss logging (`train.channel_loss.enable: true`) is also
+rejected when `cp_size > 1` and `cp_layout: zigzag`. Its aggregation assumes
+contiguous rank slices and cannot attribute USP's reordered document fragments
+to their sources. Leave channel-loss logging disabled for USP training.
+
 For packed input, the CPU `SequenceParallelCollator` prepares
 `usp_cu_seqlens` (CP-local int32 offsets), `usp_max_seqlen` (local maximum
 document length), and `usp_half0` / `usp_half1` (int64 gather indices for the

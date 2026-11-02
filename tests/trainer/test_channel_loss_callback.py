@@ -997,6 +997,28 @@ def test_channel_loss_rejects_classification_objective():
         ChannelLossCallback(trainer)
 
 
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("strict", [False, True])
+def test_channel_loss_rejects_zigzag_cp_before_capture(monkeypatch, cp_size, strict):
+    _stub_parallel_state(monkeypatch, cp_size=cp_size, cp_layout="zigzag")
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True, strict=strict)))
+    )
+    with pytest.raises(ValueError, match="channel_loss.*zigzag"):
+        ChannelLossCallback(trainer)
+
+
+@pytest.mark.parametrize(
+    "cp_size, cp_layout, enabled", [(1, "zigzag", True), (2, "contiguous", True), (2, "zigzag", False)]
+)
+def test_channel_loss_preserves_supported_layouts_and_disabled_logging(monkeypatch, cp_size, cp_layout, enabled):
+    _stub_parallel_state(monkeypatch, cp_size=cp_size, cp_layout=cp_layout)
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=enabled)))
+    )
+    assert ChannelLossCallback(trainer).enabled is enabled
+
+
 def test_channel_loss_rejects_base_rl_trainer():
     trainer = object.__new__(BaseRLTrainer)
     trainer.args = SimpleNamespace(

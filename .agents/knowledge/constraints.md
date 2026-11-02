@@ -265,6 +265,10 @@ Core files:
   and reorders them. Include layout in the parallel-state cache key.
 - Reject CP with async Ulysses in both accelerator arguments and direct ParallelState
   construction, before mesh initialization. Async callers skip attention-side collectives.
+- Reject enabled channel-loss logging with zigzag CP when constructing the
+  callback. Its SP aggregation assumes contiguous rank slices and cannot infer
+  source identities for reordered document fragments; strict metadata checks
+  alone do not detect the wrong attribution.
 - USP model builds currently allow only Qwen3 with VeOmni FA2/FA4 and
   `MODELING_BACKEND=veomni`. RL/DPO, deterministic backward and
   unsupported attention modifiers must fail before training rather than silently

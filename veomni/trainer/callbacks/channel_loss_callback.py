@@ -819,6 +819,15 @@ class ChannelLossCallback(Callback):
     def __init__(self, trainer: BaseTrainer) -> None:
         super().__init__(trainer)
         self.config = trainer.args.train.channel_loss
+        if (
+            self.config.enable
+            and getattr(self.parallel_state, "cp_size", 1) > 1
+            and getattr(self.parallel_state, "cp_layout", "contiguous") == "zigzag"
+        ):
+            raise ValueError(
+                "train.channel_loss.enable=True is unsupported with zigzag context parallelism: "
+                "source aggregation requires contiguous rank slices. Set train.channel_loss.enable=False."
+            )
         data_type = getattr(getattr(trainer.args, "data", None), "data_type", None)
         if self.config.enable and data_type == "classification":
             raise ValueError(
