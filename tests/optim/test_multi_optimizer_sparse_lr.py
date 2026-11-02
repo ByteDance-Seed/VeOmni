@@ -146,7 +146,9 @@ def test_pytorch_patched_adamw_dcp_resume_preserves_next_update(tmp_path, initia
     ]
     parallel = SimpleNamespace(dp_mode="ddp")
     checkpoint = str(tmp_path / "patched")
-    DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     for actual, expected, expected_state in zip(model.parameters(), before, before_states, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert leaf.state.get(actual, {}).keys() == expected_state.keys()
@@ -158,7 +160,11 @@ def test_pytorch_patched_adamw_dcp_resume_preserves_next_update(tmp_path, initia
     if target_patched:
         _patch_optimizer_state_dict(restored_model, optimizers=(restored_leaf,))
     restored = MultiOptimizer(restored_model, {"leaf": restored_leaf}, ["leaf"])
-    DistributedCheckpointer.load(checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        checkpoint,
+        {"model": restored_model, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert bool(restored_leaf.state) is initialized
     assert restored_leaf.param_groups[0]["lr"] == 0.0025
     for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
@@ -202,11 +208,17 @@ def test_sparse_leaf_learning_rate_survives_dcp_roundtrip(tmp_path):
     weight.zero_grad()
     bias.param_groups[0]["lr"] = 0.0025
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert not bias.state
     restored_model, _, restored_bias, restored = _build()
     DistributedCheckpointer.load(
-        str(tmp_path), {"model": restored_model, "optimizer": restored}, parallel_state=parallel
+        str(tmp_path),
+        {"model": restored_model, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     assert restored_bias.param_groups[0]["lr"] == 0.0025
 

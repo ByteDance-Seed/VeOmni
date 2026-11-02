@@ -190,7 +190,11 @@ def test_v2_optimizer_fails_before_model_or_checkpoint_mutation(tmp_path):
     with pytest.raises(RuntimeError, match="owner-aware checkpoint codec"):
         adapter.load_state_dict({})
     with pytest.raises(RuntimeError, match="owner-aware checkpoint codec"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     assert not list(tmp_path.iterdir())
 
 

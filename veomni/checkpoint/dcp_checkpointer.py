@@ -928,7 +928,6 @@ class _ProvenModelState(ModelState):
         super().__init__(*args, **kwargs)
         self.optimizer = optimizer
         self.group = group
-        self.writing = writing
 
     def state_dict(self):
         result, error = None, None
@@ -945,10 +944,6 @@ class _ProvenModelState(ModelState):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "constructing proven model state", group=self.group)
-        if self.writing:
-            from .rank_local_optimizer import verify_replicated_model_shards
-
-            verify_replicated_model_shards(result, group=self.group)
         return result
 
     def load_state_dict(self, state_dict):
@@ -1773,6 +1768,11 @@ class DistributedCheckpointer(CheckpointerBase):
             error = None
             try:
                 parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+                if "_veomni_scheduler_object" not in state:
+                    raise RuntimeError(
+                        "MultiOptimizer checkpoint requires an explicit scheduler declaration; "
+                        "set _veomni_scheduler_object to the scheduler or None"
+                    )
                 if save_async:
                     raise RuntimeError("Proven MultiOptimizer checkpoints currently require synchronous DCP save")
                 _validate_source_optimizer_states(optimizer, source_model)
@@ -2072,6 +2072,11 @@ class DistributedCheckpointer(CheckpointerBase):
             error = None
             try:
                 parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+                if "_veomni_scheduler_object" not in state:
+                    raise RuntimeError(
+                        "MultiOptimizer checkpoint requires an explicit scheduler declaration; "
+                        "set _veomni_scheduler_object to the scheduler or None"
+                    )
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy", group=process_group)

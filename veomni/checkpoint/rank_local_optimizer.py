@@ -9,7 +9,6 @@ for exact state preservation and requires an independently verified rank and
 mesh identity before use. It does not support elastic resharding.
 """
 
-import heapq
 import io
 import json
 from contextlib import contextmanager
@@ -160,87 +159,6 @@ def zeros_like_parameter_on_cpu(param, *, dtype):
     """Allocate one local optimizer shard on CPU with the parameter's DTensor spec."""
     local = param.to_local() if isinstance(param, DTensor) else param
     return wrap_local_like_parameter(torch.zeros_like(local, dtype=dtype, device="cpu"), param)
-
-
-def _reject_overlapping_geometries(name, geometries):
-    """Reject distinct overlapping boxes before DCP deduplicates by offset."""
-    offsets_to_size = {}
-    nonempty = []
-    for offsets, size in geometries:
-        old_size = offsets_to_size.setdefault(offsets, size)
-        if old_size != size:
-            raise RuntimeError(f"Checkpoint tensor {name} has overlapping nonidentical shards")
-        if all(size):
-            nonempty.append((offsets, size))
-    if len(nonempty) < 2 or not nonempty[0][0]:
-        return
-    # Choose a dimension with the most distinct intervals to keep the sweep
-    # active set small for both row- and column-sharded tensors.
-    axis = max(
-        range(len(nonempty[0][0])),
-        key=lambda dim: len({(offsets[dim], size[dim]) for offsets, size in nonempty}),
-    )
-    ordered = sorted(nonempty, key=lambda item: item[0][axis])
-    active, expiration = {}, []
-    for index, (offsets, size) in enumerate(ordered):
-        start = offsets[axis]
-        while expiration and expiration[0][0] <= start:
-            _, previous = heapq.heappop(expiration)
-            del active[previous]
-        for other_offsets, other_size in active.values():
-            if all(
-                start < other_start + other_length and other_start < start + length
-                for start, length, other_start, other_length in zip(
-                    offsets, size, other_offsets, other_size, strict=True
-                )
-            ):
-                raise RuntimeError(f"Checkpoint tensor {name} has overlapping nonidentical shards")
-        active[index] = (offsets, size)
-        heapq.heappush(expiration, (start + size[axis], index))
-
-
-def verify_replicated_model_shards(state: dict, *, group=None):
-    """Validate shard geometry without reading or hashing tensor values."""
-    from ..utils.dist_utils import raise_if_any_rank_failed
-
-    error, records = None, []
-    try:
-        flattened, _ = flatten_state_dict({"model": state})
-        for name, value in sorted(flattened.items()):
-            if not torch.is_tensor(value):
-                continue
-            if isinstance(value, DTensor):
-                chunks = value.__create_chunk_list__()
-                if len(chunks) != 1:
-                    raise RuntimeError(f"Cannot prove model shard geometry for {name}")
-                offsets, size = tuple(chunks[0].offsets), tuple(chunks[0].sizes)
-                local = value.to_local()
-            else:
-                local = value
-                offsets, size = (0,) * value.ndim, tuple(value.shape)
-            if tuple(local.shape) != size:
-                raise RuntimeError(f"Cannot prove model shard shape for {name}")
-            records.append((name, offsets, size, str(local.dtype), tuple(value.shape)))
-    except BaseException as exc:
-        error = exc
-    raise_if_any_rank_failed(error, "checking model shard geometry", group=group)
-    if not dist.is_initialized():
-        return
-    gathered = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, records, group=group)
-    geometries, signatures, seen = {}, {}, set()
-    for items in gathered:
-        for name, offsets, size, dtype, global_shape in items:
-            signature = (dtype, global_shape)
-            previous = signatures.setdefault(name, signature)
-            if previous != signature:
-                raise RuntimeError(f"Checkpoint tensor {name} has different global dtype or shape across ranks")
-            identity = (name, offsets, size)
-            if identity not in seen:
-                seen.add(identity)
-                geometries.setdefault(name, []).append((offsets, size))
-    for name, shards in geometries.items():
-        _reject_overlapping_geometries(name, shards)
 
 
 @contextmanager

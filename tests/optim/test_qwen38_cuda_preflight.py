@@ -222,13 +222,17 @@ def _checkpoint_worker(rank, rendezvous, output_dir):
             source_opt.zero_grad()
             parallel = SimpleNamespace(dp_mode="ddp")
             path = str(Path(output_dir) / f"safe-{mode}")
-            DistributedCheckpointer.save(path, {"model": source, "optimizer": source_opt}, parallel_state=parallel)
+            DistributedCheckpointer.save(
+                path,
+                {"model": source, "optimizer": source_opt, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
             target, opts, target_opt = make()
             with torch.no_grad():
                 target.a.add_(3)
                 target.b.add_(5)
             before = {name: param.detach().clone() for name, param in target.named_parameters()}
-            if mode == "layout" and rank == 1:
+            if mode == "layout":
                 target.a.requires_grad_(False)
             attempts = 0
 
@@ -257,7 +261,11 @@ def _checkpoint_worker(rank, rendezvous, output_dir):
             DistributedCheckpointer._create_storage_reader = classmethod(reader)
             message = ""
             try:
-                DistributedCheckpointer.load(path, {"model": target, "optimizer": target_opt}, parallel_state=parallel)
+                DistributedCheckpointer.load(
+                    path,
+                    {"model": target, "optimizer": target_opt, "_veomni_scheduler_object": None},
+                    parallel_state=parallel,
+                )
             except (RuntimeError, ValueError, OSError, KeyError) as exc:
                 message = str(exc)
             finally:
@@ -276,12 +284,13 @@ def test_cuda_checkpoint_preflight_rejects_all_ranks_before_model_copy(tmp_path)
     mp.spawn(_checkpoint_worker, args=(str(tmp_path / "rdzv-checkpoint"), str(tmp_path)), nprocs=2, join=True)
     results = [torch.load(tmp_path / f"checkpoint-rank{rank}.pt", weights_only=True) for rank in range(2)]
     assert all(result["failed"] and result["unchanged"] for rank in results for result in rank)
-    assert all("trainability differs" in results[rank][0]["message"] for rank in range(2))
+    assert all("layout differs" in results[rank][0]["message"] for rank in range(2))
     assert "inventory reader" in results[1][1]["message"]
     assert all("inventory" in results[1][index]["message"] for index in (2, 3))
 
 
 def _qwen_frozen_worker(rank, rendezvous, output_dir):
+    import copy
     from types import SimpleNamespace
 
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -292,34 +301,46 @@ def _qwen_frozen_worker(rank, rendezvous, output_dir):
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
     )
     try:
-        model = torch.nn.Module()
-        model.weight = torch.nn.Parameter(torch.ones(2, 2))
-        opt = implementation.Qwen38MuonAdamW(
-            [{"params": [model.weight], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
-        )
-        combined = factory.MultiOptimizer(model, {"qwen": opt}, ["qwen"])
+
+        def make():
+            model = torch.nn.Module()
+            model.weight = torch.nn.Parameter(torch.ones(2, 2))
+            leaf = implementation.Qwen38MuonAdamW(
+                [{"params": [model.weight], "qwen38_recipe": implementation.RECIPE, "qwen38_plan": '[["muon", 0, 2]]'}]
+            )
+            return model, leaf, factory.MultiOptimizer(model, {"qwen": leaf}, ["qwen"])
+
+        model, opt, combined = make()
         model.weight.grad = torch.ones_like(model.weight)
         combined.step()
         combined.zero_grad()
-        combined._qwen38_cuda_guard = True
-        combined._qwen38_cuda_group = dist.group.WORLD
-        before = model.weight.detach().clone()
-        if rank == 1:
-            model.weight.requires_grad_(False)
+        parallel = SimpleNamespace(dp_mode="ddp")
+        path = str(Path(output_dir) / "frozen-checkpoint")
+        DistributedCheckpointer.save(
+            path, {"model": model, "optimizer": combined, "_veomni_scheduler_object": None}, parallel_state=parallel
+        )
+        target, target_opt, target_combined = make()
+        with torch.no_grad():
+            target.weight.fill_(3)
+        target.weight.requires_grad_(False)
+        before = target.weight.detach().clone()
+        before_optimizer = copy.deepcopy(target_opt.state_dict())
         message = ""
         try:
-            DistributedCheckpointer.save(
-                str(Path(output_dir) / "frozen-checkpoint"),
-                {"model": model, "optimizer": combined},
-                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            DistributedCheckpointer.load(
+                path,
+                {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
         except RuntimeError as exc:
             message = str(exc)
         torch.save(
             {
                 "message": message,
-                "unchanged": torch.equal(model.weight, before),
-                "step": opt.state[model.weight]["step"],
+                "unchanged": torch.equal(target.weight, before),
+                "source_step": opt.state[model.weight]["step"],
+                "target_optimizer_unchanged": target_opt.state_dict() == before_optimizer,
+                "target_still_frozen": not target.weight.requires_grad,
             },
             Path(output_dir) / f"frozen-qwen-rank{rank}.pt",
         )
@@ -332,5 +353,11 @@ def _qwen_frozen_worker(rank, rendezvous, output_dir):
 def test_qwen_multioptimizer_freeze_rejected_on_all_checkpoint_ranks(tmp_path):
     mp.spawn(_qwen_frozen_worker, args=(str(tmp_path / "rdzv-frozen-qwen"), str(tmp_path)), nprocs=2, join=True)
     results = [torch.load(tmp_path / f"frozen-qwen-rank{rank}.pt", weights_only=True) for rank in range(2)]
-    assert all("trainability differs" in result["message"] for result in results)
-    assert all(result["unchanged"] and result["step"].item() == 1 for result in results)
+    assert all("layout differs" in result["message"] for result in results)
+    assert all(
+        result["unchanged"]
+        and result["target_optimizer_unchanged"]
+        and result["target_still_frozen"]
+        and result["source_step"].item() == 1
+        for result in results
+    )

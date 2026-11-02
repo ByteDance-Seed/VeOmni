@@ -99,14 +99,20 @@ def test_accelerator_offload_checkpoint_group_preflight(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     source.weight.requires_grad_(False)
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
 
     mismatch, mismatch_leaf, mismatch_optimizer = build(reverse=True)
     mismatch.weight.requires_grad_(False)
     before = [parameter.detach().clone() for parameter in mismatch.parameters()]
     with pytest.raises(RuntimeError, match="group|layout|identity"):
         DistributedCheckpointer.load(
-            str(tmp_path), {"model": mismatch, "optimizer": mismatch_optimizer}, parallel_state=parallel
+            str(tmp_path),
+            {"model": mismatch, "optimizer": mismatch_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     assert not mismatch_leaf.state
     for actual, expected in zip(mismatch.parameters(), before, strict=True):
@@ -114,7 +120,11 @@ def test_accelerator_offload_checkpoint_group_preflight(tmp_path):
 
     target, target_leaf, restored = build()
     target.weight.requires_grad_(False)
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert not target.weight.requires_grad
     for src, dst in zip(source.parameters(), target.parameters(), strict=True):
         torch.testing.assert_close(dst, src, rtol=0, atol=0)

@@ -49,9 +49,17 @@ def test_bf16_moments_and_fp32_step_resume_exactly(tmp_path, initialized, kind):
         optimizer.step()
         optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     source.weight.grad = torch.full_like(source.weight, 0.125)
     target.weight.grad = source.weight.grad.clone()
     optimizer.step()
@@ -106,9 +114,17 @@ def test_registered_sparse_adamw_adapter_preserves_lazy_state(tmp_path, initiali
         optimizer.step()
         optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert target.bias not in restored.optimizers_dict["leaf"].state
     for left, right in zip(source.parameters(), target.parameters(), strict=True):
         left.grad = torch.full_like(left, 0.125)
@@ -141,11 +157,19 @@ def test_registered_adapter_rejects_changed_algorithm_identity_before_loading(tm
 
     source, optimizer = build(1.0)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(2.0)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="identity|layout|checkpoint"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -184,10 +208,18 @@ def _adapter_load_failure_worker(rank, checkpoint, endpoint):
         optimizer.step()
         optimizer.zero_grad()
         parallel = SimpleNamespace(dp_mode="ddp")
-        DistributedCheckpointer.save(checkpoint, {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
         target, restored = build(rank == 1)
         with pytest.raises(RuntimeError, match="first-leaf|loading optimizer leaf"):
-            DistributedCheckpointer.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+            DistributedCheckpointer.load(
+                checkpoint,
+                {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2

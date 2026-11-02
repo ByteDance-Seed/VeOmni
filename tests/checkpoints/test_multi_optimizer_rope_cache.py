@@ -111,7 +111,9 @@ def _rope_update(model, optimizer):
 def _fresh_resume(_rank, checkpoint, expected_path):
     model, optimizer = _build()
     DistributedCheckpointer.load(
-        checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        checkpoint,
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
     trace = _rope_update(model, optimizer)
     expected = torch.load(expected_path, map_location="cpu", weights_only=True)
@@ -158,7 +160,9 @@ def test_expanded_dynamic_rope_cache_is_rejected_before_checkpoint_write(tmp_pat
     checkpoint = tmp_path / "checkpoint"
     with pytest.raises(RuntimeError, match="Dynamic RoPE cache.*depends on prior sequence lengths"):
         DistributedCheckpointer.save(
-            str(checkpoint), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(checkpoint),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not checkpoint.exists()
 
@@ -173,22 +177,38 @@ def test_old_unproven_expanded_rope_checkpoint_is_rejected_before_model_load(tmp
     parallel = SimpleNamespace(dp_mode="ddp")
     with monkeypatch.context() as old:
         old.setattr(dynamic_rope, "dynamic_rope_checkpoint_contract", lambda _model: [])
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     target, restored = _build()
     before = target.projection.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
 
 
 def test_changed_dynamic_rope_config_is_rejected_before_model_load(tmp_path):
     model, optimizer = _build()
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = _build(theta=5000)
     before = target.projection.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
 
 
@@ -201,7 +221,9 @@ def _rank_local_rope_error(rank, checkpoint, endpoint):
         error = "Dynamic RoPE cache.*prior sequence lengths" if rank == 1 else "layout failed on another rank"
         with pytest.raises(RuntimeError, match=error):
             DistributedCheckpointer.save(
-                checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+                checkpoint,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
             )
     finally:
         dist.destroy_process_group()
@@ -223,7 +245,9 @@ def test_real_qwen3_dynamic_rope_reset_is_rejected_before_save(tmp_path):
     checkpoint = tmp_path / "checkpoint"
     with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache"):
         DistributedCheckpointer.save(
-            str(checkpoint), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+            str(checkpoint),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not checkpoint.exists()
 
@@ -233,7 +257,9 @@ def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path)
     _update(model, optimizer, 1.0)
     checkpoint = str(tmp_path / "checkpoint")
     DistributedCheckpointer.save(
-        checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        checkpoint,
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
     trace = _rope_update(model, optimizer)
     expected = tmp_path / "expected.pt"
@@ -262,12 +288,20 @@ def test_nonpersistent_buffer_persistent_alias_mismatch_still_fails_before_load(
         model.weight.fill_(5)
         model.persistent.fill_(7)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(not source_alias)
     before = target.weight.detach().clone()
     persistent_before = target.persistent.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
     torch.testing.assert_close(target.persistent, persistent_before, rtol=0, atol=0)
 
@@ -291,11 +325,19 @@ def test_non_rope_transient_buffer_alias_mismatch_still_fails_before_load(tmp_pa
     with torch.no_grad():
         model.weight.fill_(5)
     parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     target, restored = build(not source_alias)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -334,6 +376,8 @@ def test_custom_dynamic_rope_alias_mismatch_still_fails_before_load(tmp_path):
     parallel = SimpleNamespace(dp_mode="ddp")
     with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache"):
         DistributedCheckpointer.save(
-            str(tmp_path / "checkpoint"), {"model": model, "optimizer": optimizer}, parallel_state=parallel
+            str(tmp_path / "checkpoint"),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     assert not (tmp_path / "checkpoint").exists()

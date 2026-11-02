@@ -587,7 +587,9 @@ def test_multioptimizer_direct_load_does_not_run_a_synthetic_cuda_step(monkeypat
     source_combined.zero_grad()
     parallel = types.SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source, "optimizer": source_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": source, "optimizer": source_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, target_opt, target_combined = make()
     monkeypatch.setattr(implementation, "_optimizer_uses_cuda", lambda _: True)
@@ -598,7 +600,9 @@ def test_multioptimizer_direct_load_does_not_run_a_synthetic_cuda_step(monkeypat
 
     monkeypatch.setattr(implementation, "_cuda_step_preflight", unexpected_step)
     DistributedCheckpointer.load(
-        str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     assert torch.equal(target.weight, source.weight)
     for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
@@ -681,7 +685,9 @@ def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure,
     source_opt.param_groups[0]["lr"] = 0.0025
     parallel = types.SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source, "optimizer": source_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": source, "optimizer": source_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, target_opt, target_combined = make()
     with torch.no_grad():
@@ -706,7 +712,9 @@ def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure,
     if failure in ("partial", "missing_group"):
         with pytest.raises((RuntimeError, KeyError)):
             DistributedCheckpointer.load(
-                str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+                str(tmp_path),
+                {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
         torch.testing.assert_close(target.a, before_weight, rtol=0, atol=0)
         assert target_opt.state_dict()["param_groups"] == before_state["param_groups"]
@@ -715,7 +723,9 @@ def test_multioptimizer_load_preserves_lazy_parameters_and_failed_state(failure,
         return
 
     DistributedCheckpointer.load(
-        str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     assert not target_opt.state.get(target.b)
     source.a.grad = target.a.grad = None
@@ -752,7 +762,9 @@ def test_multioptimizer_cuda_load_is_atomic_across_children(monkeypatch, tmp_pat
     source_combined.zero_grad()
     parallel = types.SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source, "optimizer": source_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": source, "optimizer": source_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, opts, target_combined = make()
     with torch.no_grad():
@@ -769,7 +781,9 @@ def test_multioptimizer_cuda_load_is_atomic_across_children(monkeypatch, tmp_pat
         pickle.dump(metadata, handle)
     with pytest.raises(RuntimeError, match="inventory|hook"):
         DistributedCheckpointer.load(
-            str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+            str(tmp_path),
+            {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
     for name, param in target.named_parameters():
         torch.testing.assert_close(param, before[name], rtol=0, atol=0)
@@ -810,7 +824,9 @@ def test_multioptimizer_cuda_load_initializes_adam_without_synthetic_step(monkey
     source_combined.zero_grad()
     parallel = types.SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source, "optimizer": source_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": source, "optimizer": source_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target, target_adam, target_combined = make(target=True)
     before = target.b.detach().clone()
@@ -822,13 +838,17 @@ def test_multioptimizer_cuda_load_initializes_adam_without_synthetic_step(monkey
     if kind == "amsgrad":
         with pytest.raises(RuntimeError, match="layout|group|inventory"):
             DistributedCheckpointer.load(
-                str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+                str(tmp_path),
+                {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
             )
         torch.testing.assert_close(target.b, before, rtol=0, atol=0)
         assert not target_adam.state
         return
     DistributedCheckpointer.load(
-        str(tmp_path), {"model": target, "optimizer": target_combined}, parallel_state=parallel
+        str(tmp_path),
+        {"model": target, "optimizer": target_combined, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     assert not target_adam.state.get(target.c)
     for key in source_adam.state[source.b]:
@@ -860,10 +880,18 @@ def test_multioptimizer_cuda_checkpoint_preserves_lazy_non_muon_child(monkeypatc
     optimizer.step()
     optimizer.zero_grad()
     parallel = types.SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert not source_adam.state
     target, target_adam, restored = make()
-    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert not target_adam.state
     source.b.grad = target.b.grad = torch.ones_like(source.b)
     optimizer.step()
@@ -885,7 +913,9 @@ def test_multioptimizer_rejects_empty_group_without_synthetic_step(tmp_path):
     before = model.weight.detach().clone()
     with pytest.raises(RuntimeError, match="empty parameter group"):
         DistributedCheckpointer.save(
-            str(tmp_path), {"model": model, "optimizer": combined}, parallel_state=types.SimpleNamespace(dp_mode="ddp")
+            str(tmp_path),
+            {"model": model, "optimizer": combined, "_veomni_scheduler_object": None},
+            parallel_state=types.SimpleNamespace(dp_mode="ddp"),
         )
     assert not empty.state and torch.equal(model.weight, before)
     assert not list(tmp_path.iterdir())
@@ -937,7 +967,11 @@ def test_dcp_source_metadata_requires_recipe_before_partial_load(tmp_path):
 
     source, optimizer = make()
     parallel = types.SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(str(tmp_path), {"model": source, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     metadata_path = Path(optimizer_dir(str(tmp_path))) / ".metadata"
     with metadata_path.open("rb") as handle:
         metadata = pickle.load(handle)
@@ -951,7 +985,11 @@ def test_dcp_source_metadata_requires_recipe_before_partial_load(tmp_path):
         target.weight.add_(2)
     before = target.weight.detach().clone()
     with pytest.raises(RuntimeError, match="inventory"):
-        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
@@ -1077,10 +1115,16 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
             before = {p: dict(s) for p, s in leaf.state.items()}
             if mode == "single":
                 with pytest.raises(RuntimeError, match="require MultiOptimizer"):
-                    DistributedCheckpointer.save(path, {"model": model, "optimizer": optimizer}, parallel_state=ps)
+                    DistributedCheckpointer.save(
+                        path,
+                        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                        parallel_state=ps,
+                    )
                 assert set(leaf.state) == set(before)
                 return
-            DistributedCheckpointer.save(path, {"model": model, "optimizer": optimizer}, parallel_state=ps)
+            DistributedCheckpointer.save(
+                path, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=ps
+            )
             assert set(leaf.state) == set(before)
             assert partial in leaf.state if active else partial not in leaf.state
             assert never not in leaf.state
@@ -1099,7 +1143,9 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
             # Deliberately wrong model contents expose stale lazy master copies.
             for p in model.parameters():
                 p.data.fill_(-1)
-            DistributedCheckpointer.load(path, {"model": model, "optimizer": optimizer}, parallel_state=ps)
+            DistributedCheckpointer.load(
+                path, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=ps
+            )
             assert partial in leaf.state if active else partial not in leaf.state
             if active:
                 assert leaf.state[partial]["step"].item() == 1
@@ -1164,11 +1210,17 @@ def test_unused_ple_snapshot_does_not_initialize_or_advance_live_state(tmp_path)
     model, opt, optimizer = build()
     parallel = types.SimpleNamespace(dp_mode="ddp")
     checkpoint = str(tmp_path / "unused-ple")
-    DistributedCheckpointer.save(checkpoint, {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
     assert not opt.state
 
     restored_model, restored_opt, restored = build()
-    DistributedCheckpointer.load(checkpoint, {"model": restored_model, "optimizer": restored}, parallel_state=parallel)
+    DistributedCheckpointer.load(
+        checkpoint,
+        {"model": restored_model, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
     assert not restored_opt.state
     for current, target in zip(model.parameters(), restored_model.parameters(), strict=True):
         current.grad = torch.ones_like(current)
@@ -1404,11 +1456,15 @@ def test_dcp_internal_filter_does_not_materialize_lazy_ple(tmp_path):
     optimizer.zero_grad()
     parallel = types.SimpleNamespace(dp_mode="ddp")
     DistributedCheckpointer.save(
-        str(tmp_path), {"model": source_model, "optimizer": optimizer}, parallel_state=parallel
+        str(tmp_path),
+        {"model": source_model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     target_model, target, restored = build()
     DistributedCheckpointer.load(
-        str(tmp_path), {"model": target_model, "optimizer": restored}, parallel_state=parallel
+        str(tmp_path),
+        {"model": target_model, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
     )
     assert target_model.ngram_embedding.weight not in target.state
     assert target_model.embed_tokens.weight not in target.state
