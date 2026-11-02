@@ -462,6 +462,7 @@ def save_lora_adapter_with_dcp(
 
     from ..checkpoint.dcp_checkpointer import (
         _extra_parallel_layout_key,
+        _ExtraParallelSavePlanner,
         _needs_extra_parallel_layout_marker,
         _validate_extra_parallel_tensor_v2,
     )
@@ -574,6 +575,7 @@ def save_lora_adapter_with_dcp(
     dcp.save(
         state_dict=dcp_lora_state,
         storage_writer=storage_writer,
+        planner=_ExtraParallelSavePlanner(),
     )
 
     if dist.is_initialized():

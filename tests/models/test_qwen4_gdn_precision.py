@@ -545,3 +545,40 @@ def test_versioned_ep_dcp_export_preserves_gdn_manifest_and_values(tmp_path):
         assert exported[name].dtype == torch.float32
         assert torch.equal(exported[name], state[_extra_parallel_layout_key({}) + "__" + name])
     assert exported["model.layers.0.linear_attn.proj.weight"].dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype,expected_error",
+    [
+        (torch.bfloat16, torch.float32, "GDN parameter .* is not FP32"),
+        (torch.float32, torch.bfloat16, "GDN target .* must be FP32"),
+        (torch.float32, torch.float32, None),
+    ],
+)
+def test_ep_namespace_gdn_checkpoint_dtype_is_checked_before_load(
+    tmp_path, source_dtype, target_dtype, expected_error
+):
+    import torch.distributed.checkpoint as dcp
+
+    from veomni.checkpoint.dcp_checkpointer import _extra_parallel_layout_key, _ModelStrictLoadPlanner
+
+    marker = _extra_parallel_layout_key({})
+    key = marker + "__model.layers.0.linear_attn.A_log"
+    source = torch.arange(4, dtype=source_dtype)
+    dcp.save({"model": {marker: "ep-outer-v1", key: source}}, checkpoint_id=tmp_path)
+    target = torch.full((4,), -1, dtype=target_dtype)
+
+    def load():
+        dcp.load(
+            {"model": {marker: "ep-outer-v1", key: target}},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=True, strict_gdn_fp32=True),
+        )
+
+    if expected_error:
+        with pytest.raises(dcp.CheckpointException, match=expected_error):
+            load()
+        assert torch.equal(target, torch.full_like(target, -1))
+    else:
+        load()
+        torch.testing.assert_close(target, source, rtol=0, atol=0)

@@ -18,9 +18,12 @@
 import hashlib
 import json
 import math
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from copy import deepcopy
 from functools import wraps
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -161,6 +164,58 @@ def filter_empty_param_groups(
     return non_empty
 
 
+def _same_owned_optimizer_tensor(current, incoming):
+    """Recognize a DCP-filled target tensor without taking a second copy."""
+    if current is incoming:
+        return True
+    if not torch.is_tensor(current) or not torch.is_tensor(incoming):
+        return False
+    if isinstance(current, DTensor) != isinstance(incoming, DTensor):
+        return False
+    if current.layout != torch.strided or incoming.layout != torch.strided:
+        return False
+    if (
+        current.device != incoming.device
+        or current.dtype != incoming.dtype
+        or current.shape != incoming.shape
+        or current.stride() != incoming.stride()
+    ):
+        return False
+    if isinstance(current, DTensor):
+        if current.device_mesh != incoming.device_mesh or current.placements != incoming.placements:
+            return False
+        current, incoming = current.to_local(), incoming.to_local()
+    if current.layout != torch.strided or incoming.layout != torch.strided or current.numel() == 0:
+        return False
+    return (
+        current.device == incoming.device
+        and current.dtype == incoming.dtype
+        and current.shape == incoming.shape
+        and current.stride() == incoming.stride()
+        and current.storage_offset() == incoming.storage_offset()
+        and current.data_ptr() == incoming.data_ptr()
+    )
+
+
+@contextmanager
+def _dcp_reuse_owned_anyprecision_state(optimizer):
+    """Permit reuse only for fresh state buffers created by the proven DCP loader."""
+    if type(optimizer) is not AnyPrecisionAdamW or any(
+        getattr(optimizer, name, None)
+        for name in ("_optimizer_load_state_dict_pre_hooks", "_optimizer_load_state_dict_post_hooks")
+    ):
+        yield
+        return
+    marker = "_veomni_dcp_reuse_owned_state"
+    if marker in vars(optimizer):
+        raise RuntimeError("AnyPrecisionAdamW DCP state reuse is already active")
+    setattr(optimizer, marker, True)
+    try:
+        yield
+    finally:
+        delattr(optimizer, marker)
+
+
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
     def __init__(
@@ -186,6 +241,90 @@ class AnyPrecisionAdamW(Optimizer):
             "compensation_buffer_dtype": compensation_buffer_dtype,
         }
         super().__init__(params, defaults)
+
+    def load_state_dict(self, state_dict):
+        """Restore each moment at its configured dtype without a parameter-dtype cast."""
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+        groups = self.param_groups
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        if any(
+            len(group["params"]) != len(saved["params"]) for group, saved in zip(groups, saved_groups, strict=True)
+        ):
+            raise ValueError("loaded state dict contains a parameter group that doesn't match the optimizer's group")
+
+        id_map = dict(
+            zip(
+                chain.from_iterable(group["params"] for group in saved_groups),
+                chain.from_iterable(group["params"] for group in groups),
+                strict=True,
+            )
+        )
+        group_by_id = {key: group for group in saved_groups for key in group["params"]}
+        restored = defaultdict(dict)
+        for key, saved in state_dict["state"].items():
+            if key not in id_map:
+                restored[key] = deepcopy(saved)
+                continue
+            param = id_map[key]
+            group = group_by_id[key]
+            previous = self.state.get(param, {})
+            reuse_owned = getattr(self, "_veomni_dcp_reuse_owned_state", False) is True
+            fields = {"step", "exp_avg", "exp_avg_sq"}
+            if group.get("use_kahan_summation"):
+                fields.add("compensation")
+            if saved and set(saved) != fields:
+                raise RuntimeError("AnyPrecisionAdamW checkpoint contains incomplete or unsupported state")
+            result = dict(saved)
+            if result and (
+                not torch.is_tensor(result["step"])
+                or isinstance(result["step"], DTensor)
+                or result["step"].shape != ()
+            ):
+                raise RuntimeError("AnyPrecisionAdamW checkpoint step must be a scalar tensor")
+            if result:
+                value = result["step"]
+                if reuse_owned and _same_owned_optimizer_tensor(previous.get("step"), value):
+                    result["step"] = previous["step"]
+                else:
+                    result["step"] = value.detach().clone()
+            for field, dtype_key in (
+                ("exp_avg", "momentum_dtype"),
+                ("exp_avg_sq", "variance_dtype"),
+                ("compensation", "compensation_buffer_dtype"),
+            ):
+                if field not in result:
+                    continue
+                value = result[field]
+                if not torch.is_tensor(value) or value.dtype != group[dtype_key] or value.shape != param.shape:
+                    raise RuntimeError(f"AnyPrecisionAdamW checkpoint has an incompatible {field} tensor")
+                if isinstance(param, DTensor) != isinstance(value, DTensor) or (
+                    isinstance(param, DTensor)
+                    and (
+                        value.device_mesh != param.device_mesh
+                        or value.placements != param.placements
+                        or value.to_local().shape != param.to_local().shape
+                    )
+                ):
+                    raise RuntimeError(f"AnyPrecisionAdamW checkpoint has an incompatible {field} layout")
+                if reuse_owned and _same_owned_optimizer_tensor(previous.get(field), value):
+                    result[field] = previous[field]
+                else:
+                    result[field] = value.to(device=param.device).detach().clone()
+            restored[param] = result
+
+        for group, saved in zip(groups, saved_groups, strict=True):
+            saved["params"] = group["params"]
+            if "param_names" in group and "param_names" not in saved:
+                saved["param_names"] = group["param_names"]
+        self.__setstate__({"state": restored, "param_groups": saved_groups})
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -683,6 +822,7 @@ class MultiOptimizer(Optimizer, Stateful):
                 with (
                     rank_local_adamw_context(optimizer),
                     _dcp_restore_frozen_ownership(optimizer),
+                    _dcp_reuse_owned_anyprecision_state(optimizer),
                     _dcp_avoid_synthetic_optimizer_step(optimizer),
                 ):
                     set_optimizer_state_dict(

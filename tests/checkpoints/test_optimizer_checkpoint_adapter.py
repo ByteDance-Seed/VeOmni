@@ -9,9 +9,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, OptimizerState
 from veomni.optim.checkpoint_adapter import register_rank_local_adamw
 from veomni.optim.optimizer import MultiOptimizer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class ToyAdamW(torch.optim.Optimizer):

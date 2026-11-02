@@ -37,6 +37,7 @@ On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -57,6 +58,63 @@ logger = helper.create_logger(__name__)
 
 # Keys of ``state_dict`` that belong to ``loader/`` rather than ``extra_state/``.
 _LOADER_KEYS = ("train_dataloader",)
+
+
+def _multi_optimizer_checkpoints(trainer):
+    """Find actual model checkpoint owners, including Omni module runtimes."""
+    root = getattr(trainer, "model", None)
+    runtimes = [("model", root)]
+    modules = getattr(root, "module_runtimes", None)
+    if isinstance(modules, Mapping):
+        runtimes.extend((f"module:{name}", runtime) for name, runtime in sorted(modules.items()))
+    result = []
+    seen = set()
+    for name, runtime in runtimes:
+        if runtime is None:
+            continue
+        optimizer = getattr(runtime, "optimizer", None)
+        checkpoint = getattr(runtime, "checkpoint", None)
+        loaded_step = getattr(checkpoint, "_loaded_optimizer_global_step", None)
+        saved_generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
+        if (
+            getattr(optimizer, "_is_multi_optimizer", False) is not True
+            and type(loaded_step) is not int
+            and not isinstance(saved_generation, str)
+        ):
+            continue
+        if checkpoint is None or id(checkpoint) in seen:
+            raise RuntimeError("Restored MultiOptimizer has no unique checkpoint owner")
+        owner = getattr(checkpoint, "runtime", None)
+        if owner is not None and owner is not runtime:
+            raise RuntimeError("Restored MultiOptimizer checkpoint belongs to another runtime")
+        seen.add(id(checkpoint))
+        result.append((name, checkpoint))
+    return result
+
+
+def _restored_multi_optimizer_state(trainer):
+    """Read the proven optimizer step and generations loaded by the runtimes."""
+    steps, generations = [], {}
+    for name, checkpoint in _multi_optimizer_checkpoints(trainer):
+        step = getattr(checkpoint, "_loaded_optimizer_global_step", None)
+        generation = getattr(checkpoint, "_loaded_optimizer_generation", None)
+        if type(step) is not int or step < 0 or not isinstance(generation, str) or not generation:
+            raise RuntimeError("Restored MultiOptimizer step or generation is missing")
+        steps.append(step)
+        generations[name] = generation
+    if len(set(steps)) > 1:
+        raise RuntimeError("Model runtimes restored different MultiOptimizer steps")
+    return (steps[0] if steps else None), generations
+
+
+def _saved_multi_optimizer_generations(trainer, step):
+    generations = {}
+    for name, checkpoint in _multi_optimizer_checkpoints(trainer):
+        generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
+        if getattr(checkpoint, "_last_saved_step", None) != step or not isinstance(generation, str) or not generation:
+            raise RuntimeError("Trainer state has no matching MultiOptimizer checkpoint generation")
+        generations[name] = generation
+    return generations
 
 
 class GlobalStateCallback(Callback):
@@ -160,8 +218,16 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-        payload = self.state_dict(state)
+        step_root, payload, generations, error = None, None, {}, None
+        try:
+            step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+            payload = self.state_dict(state)
+            generations = _saved_multi_optimizer_generations(self.trainer, state.global_step)
+        except Exception as exc:  # noqa: BLE001 - all ranks must fail before writing
+            error = exc
+        raise_if_any_rank_failed(error, "preparing trainer checkpoint state")
+        if generations:
+            payload["_veomni_optimizer_generations"] = generations
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
@@ -247,6 +313,13 @@ class GlobalStateCallback(Callback):
         if load_path is None:
             return None
 
+        restored_step, generations, optimizer_error = None, {}, None
+        try:
+            restored_step, generations = _restored_multi_optimizer_state(self.trainer)
+        except Exception as exc:  # noqa: BLE001 - coordinate before any rank reads state
+            optimizer_error = exc
+        raise_if_any_rank_failed(optimizer_error, "checking the restored MultiOptimizer step")
+
         state_path = layout.extra_state_path(load_path, self.rank)
         # A file that is present but unreadable is not the same as an absent one:
         # the reduction below treats absence as "resume weights only", which would
@@ -269,17 +342,39 @@ class GlobalStateCallback(Callback):
 
         found = current_state is not None or legacy_state is not None
         if dist.is_initialized():
-            flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
+            device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+            flag = torch.tensor([int(found)], dtype=torch.int32, device=device)
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
             found = bool(flag.item())
-            if not found:
+            strict = torch.tensor([int(restored_step is not None)], dtype=torch.int32, device=device)
+            dist.all_reduce(strict, op=torch.distributed.ReduceOp.MAX)
+            if strict.item():
+                status = torch.tensor(
+                    [restored_step if restored_step is not None else -1], dtype=torch.int64, device=device
+                )
+                statuses = [torch.empty_like(status) for _ in range(dist.get_world_size())]
+                dist.all_gather(statuses, status)
+                if len({int(item.item()) for item in statuses}) != 1:
+                    raise RuntimeError("Restored MultiOptimizer steps differ across ranks")
+        if not found:
+            if restored_step is not None:
+                raise RuntimeError("Trainer state is missing; exact MultiOptimizer resume is unsafe")
+            if dist.is_initialized():
                 logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
-                return None
-        elif not found:
-            logger.warning(f"No trainer state at {state_path}; resuming weights only.")
+            else:
+                logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
         global_state = current_state if current_state is not None else legacy_state
+        error = None
+        if restored_step is not None:
+            if not isinstance(global_state, dict) or type(global_state.get("global_step")) is not int:
+                error = RuntimeError("Trainer checkpoint step is missing or invalid")
+            elif global_state["global_step"] != restored_step:
+                error = RuntimeError("Trainer and MultiOptimizer checkpoint steps differ")
+            elif global_state.get("_veomni_optimizer_generations") != generations:
+                error = RuntimeError("Trainer and MultiOptimizer checkpoint generations differ or are missing")
+        raise_if_any_rank_failed(error, "checking the trainer checkpoint step")
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 

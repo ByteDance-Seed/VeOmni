@@ -153,6 +153,14 @@ earlier checkpoint, write the new run to a different output directory to avoid
 colliding with checkpoints from the previous run. A same-step export can
 reuse an existing checkpoint only when its model, optimizer and trainer state
 have been proven to belong to the same completed save.
+Trainer sidecars record the generation of each `MultiOptimizer` checkpoint.
+An absent sidecar, a missing generation, or a trainer step/generation that
+differs from the restored optimizer stops resume before training. An older
+unversioned sidecar requires a verified migration or a fresh weights-only run;
+it is not silently combined with a restored optimizer and scheduler. Matching
+step and generation alone do not prove exact dataloader or RNG recovery.
+If a restored run has not established a same-step save receipt, an immediate
+export to the already completed step fails rather than overwriting that DCP.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -244,9 +252,15 @@ resume instead of falling back.
 
 ## Versioned ExtraParallel layout
 
-The EP-outer layout is opt-in through `SpecInfo.checkpoint_layout_v2`; existing
-plans remain on their original layout. A plan enabling it must retain the
-original `global_shape` and must use FSDP DTensor parameters. Every
+For SeedOmni, `extra_parallel_canonical_layout: true` is applied after each
+module-scope wrap. Combined `fsdp_scope: model` and active ExtraParallel is not
+supported with this option and fails before wrapping; use module scope. All
+ranks participating in a module or model scope must use the same layout flag.
+
+The versioned EP-outer tensor namespace is opt-in through
+`SpecInfo.checkpoint_layout_v2`. Ordinary ExtraParallel saves also use canonical
+EP-first shard coordinates and record per-tensor source layout. A versioned
+plan must retain the original `global_shape` and use FSDP DTensor parameters. Every
 non-persistent ExtraParallel shard in a checkpoint must use the canonical
 layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
 identifies canonical global values independently of source geometry, so DCP can
@@ -268,6 +282,9 @@ Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_par
 supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
 ## MultiOptimizer recovery identity
+
+Optimizer authors can find the registration callbacks and precision/placement
+contract in the [rank-local AdamW adapter guide](../design/rank_local_adamw_checkpoint_adapter.md).
 
 Use `DistributedCheckpointer` for training checkpoints containing a
 `MultiOptimizer`. The save is synchronous and requires a completed optimizer
@@ -303,6 +320,29 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec also rejects tensor learning rates shared between groups and
 overlapping storage between distinct model or optimizer tensors. Its byte-range
 check is conservative for non-contiguous interleaved views.
+The saved alias identity covers parameters and buffers, including
+nonpersistent buffer aliases; the separate conservative storage-overlap check
+still applies to distinct buffer views. A reset dynamic RoPE cache can have a
+different alias graph from a newly constructed model and is conservatively
+rejected on resume until that cache state can be restored safely.
+Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
+the cache grew beyond its original context and has not reset, a fresh process
+can compute different later outputs. MultiOptimizer checkpoints therefore
+reject a non-reconstructible dynamic or longrope cache at save. With a dynamic
+or longrope target, resume requires a matching cache contract; older checkpoints
+without that proof need a verified migration. Older checkpoints do not identify
+the source's RoPE configuration, so the operator must also independently verify
+that the source and target configurations match. Saving an expanded cache is not
+yet supported. DCP training with MultiOptimizer rejects dynamic and longrope
+modes before training until their transient history can be restored exactly;
+ordinary static/default RoPE is unaffected.
+
+For unversioned expert checkpoints whose chunks divide the expert axis, the
+saved offsets alone do not prove source order, even if another axis is also
+sharded. Such known expert tensors require a verified migration with the
+original training layout. Offline export can recognize VeOmni's standard
+`experts` names; custom names require the operator to verify source layout.
+
 Mutable optimizer options must not be shared between groups or optimizer
 defaults: ordinary YAML `betas` are normalized to a tuple; custom shared lists,
 dictionaries and tensor-valued learning rates require explicitly independent
@@ -330,5 +370,6 @@ checkpoints and changed freeze configurations require verified migration.
 ## Related pages
 
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
+- [Rank-local AdamW checkpoint adapters](../design/rank_local_adamw_checkpoint_adapter.md) — registration, ownership and save/load contract.
 - [Trainer callbacks](trainer.md#callbacks) — `CheckpointCallback` (when) vs `GlobalStateCallback` (job cursor).
 - [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving) — adapter export under `lora_ckpt/`.
