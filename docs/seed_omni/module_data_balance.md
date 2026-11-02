@@ -40,7 +40,8 @@ any such consumer or implement halo exchange.
 
 `model_config.data_balance_override: off` is an explicit diagnostic escape
 hatch disabling only cross-DP balancing; it does not disable the module's SP
-execution. `auto` (or absence of the key) derives participation from structure.
+execution. A bare YAML or CLI `off` parses as boolean `False` and is accepted
+as `off`. `auto` (or absence of the key) derives participation from structure.
 There is no flag in `auto.py` and no requirement for a YAML opt-in.
 
 The module reads its scoped `dp_group` inside the pre-forward hook. The
