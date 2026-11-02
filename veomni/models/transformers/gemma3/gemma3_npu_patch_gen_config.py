@@ -42,7 +42,6 @@ from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
     config as gpu_config,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
@@ -270,7 +269,7 @@ def gemma3_for_conditional_generation_init_npu(self, config):
         r"^vision_tower\.vision_model\.": "model.vision_tower.",
         r"^multi_modal_projector\.": "model.multi_modal_projector.",
     }
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

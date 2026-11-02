@@ -176,3 +176,14 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
     overrides = training_utils.resolve_ops_overrides("deepseek_v3")
 
     assert not any(flag.startswith("--model.ops_implementation.moe_implementation=") for flag in overrides)
+
+
+def test_make_eager_ops_config_covers_every_kernel_field():
+    from dataclasses import fields
+
+    from veomni.arguments import OpsImplementationConfig
+
+    selection = training_utils.make_eager_ops_config()
+    for field in fields(OpsImplementationConfig):
+        expected = "none" if field.name == "qat_implementation" else "eager"
+        assert getattr(selection, field.name) == expected, field.name

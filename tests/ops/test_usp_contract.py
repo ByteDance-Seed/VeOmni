@@ -25,6 +25,8 @@ from veomni.models import auto
 from veomni.ops.kernels.attention.standard import flash
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer
 
+from ..tools.training_utils import make_eager_ops_config
+
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
@@ -174,20 +176,22 @@ def test_contiguous_cp_keeps_standard_flash_path(monkeypatch, layout):
 
 
 @pytest.mark.parametrize("backend", ["flash_attention_2", "flash_attention_4"])
-def test_installed_ops_cannot_bypass_usp_with_plain_attention(monkeypatch, backend):
+def test_model_ops_cannot_bypass_usp_with_plain_attention(monkeypatch, backend):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(
         auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", device_type="cuda")
     )
-    monkeypatch.setattr(
-        auto, "get_ops_config", lambda: SimpleNamespace(attn_implementation="veomni_flash_attention_2")
-    )
     config = auto.PretrainedConfig()
     config.model_type = "qwen3"
     with pytest.raises(NotImplementedError, match="VeOmni FlashAttention"):
-        auto.build_foundation_model(config, attn_implementation=backend, init_device="meta")
+        auto.build_foundation_model(
+            config,
+            ops_implementation=make_eager_ops_config(attn_implementation="veomni_flash_attention_2"),
+            attn_implementation=backend,
+            init_device="meta",
+        )
 
 
 @pytest.mark.parametrize("kind", ["plain", "zigzag", "varlen"])

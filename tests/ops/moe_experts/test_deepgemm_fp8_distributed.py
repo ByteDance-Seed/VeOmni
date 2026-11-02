@@ -99,7 +99,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous
             y = module(xi, ri, indices[rank])
             assert y.dtype == xi.dtype
             y.backward(grad[rank])
-            xr, rr, wr1, wr2 = [a.detach().clone().requires_grad_() for a in (x, routing, w1, w2)]
+            xr, rr, wr1, wr2 = (a.detach().clone().requires_grad_() for a in (x, routing, w1, w2))
             gate, up = wr1.bfloat16().chunk(2, dim=1)
             yr = standard_ep_reference(
                 xr.flatten(0, 1),
