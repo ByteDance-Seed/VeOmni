@@ -47,6 +47,13 @@ from .utils import check_fqn_match, sort_fqn_by_submodule_first
 logger = logging.get_logger(__name__)
 
 
+def _validate_dense_mlp_prefetch_next() -> str:
+    value = os.environ.get("VEOMNI_DENSE_MLP_PREFETCH_NEXT", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VEOMNI_DENSE_MLP_PREFETCH_NEXT must be 0 or 1")
+    return value
+
+
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
     if hasattr(module, "_is_hf_initialized"):
         module._is_hf_initialized = False
@@ -466,6 +473,8 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    dense_mlp_path = os.environ.get("VEOMNI_DENSE_MLP_LAYERS", "")
+    prefetch_next = _validate_dense_mlp_prefetch_next() if dense_mlp_path else "0"
 
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
@@ -779,7 +788,6 @@ def parallelize_model_fsdp2(
     # Not approved for checkpointed training on unpatched older FSDP runtimes:
     # nested recomputation needs the lifecycle fix discussed in pytorch#164009
     # (or equivalent integration). This patch does NOT backport that fix.
-    dense_mlp_path = os.environ.get("VEOMNI_DENSE_MLP_LAYERS", "")
     dense_mlp_pairs = {}
     dense_mlp_prefetch_enabled = False
     if dense_mlp_path:
@@ -948,9 +956,6 @@ def parallelize_model_fsdp2(
             if dense_mlp_prefetch_enabled:
                 block.set_modules_to_forward_prefetch([dense_mlp])
         # Optionally gather the next parent's non-MLP parameters at the MLP boundary.
-        prefetch_next = os.environ.get("VEOMNI_DENSE_MLP_PREFETCH_NEXT", "0")
-        if prefetch_next not in {"0", "1"}:
-            raise ValueError("VEOMNI_DENSE_MLP_PREFETCH_NEXT must be 0 or 1")
         next_block_prefetch_enabled = prefetch_next == "1" and dense_mlp_prefetch_enabled
         if next_block_prefetch_enabled:
             ordered_blocks = [b for b, _ in dense_mlp_pairs.values()]
@@ -1110,6 +1115,21 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+    if parallel_state.fsdp_enabled and parallel_state.dp_mode == "fsdp2" and os.environ.get("VEOMNI_DENSE_MLP_LAYERS"):
+        _validate_dense_mlp_prefetch_next()
+        if (
+            os.environ.get("VEOMNI_DENSE_MLP_PREFETCH", "1") == "1"
+            and kwargs.get("enable_forward_prefetch", True)
+            and recompute_policy is not None
+            and recompute_policy.enabled
+            and recompute_policy.context_fn is not None
+        ):
+            raise ValueError(
+                "Dense MLP prefetch is not approved with selective activation checkpointing: "
+                "nesting an FSDP2 group inside a selectively checkpointed block can fail during "
+                "recomputation. Set selective_recompute_layers=0, or disable "
+                "VEOMNI_DENSE_MLP_PREFETCH."
+            )
     if low_precision_reduce_scatter_comm is not False:
         # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
@@ -1170,20 +1190,6 @@ def build_parallelize_model(
     if parallel_state.fsdp_enabled:
         logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
         if parallel_state.dp_mode == "fsdp2":
-            if (
-                os.environ.get("VEOMNI_DENSE_MLP_LAYERS")
-                and os.environ.get("VEOMNI_DENSE_MLP_PREFETCH", "1") == "1"
-                and kwargs.get("enable_forward_prefetch", True)
-                and recompute_policy is not None
-                and recompute_policy.enabled
-                and recompute_policy.context_fn is not None
-            ):
-                raise ValueError(
-                    "Dense MLP prefetch is not approved with selective activation checkpointing: "
-                    "nesting an FSDP2 group inside a selectively checkpointed block can fail during "
-                    "recomputation. Set selective_recompute_layers=0, or disable "
-                    "VEOMNI_DENSE_MLP_PREFETCH."
-                )
             model = parallelize_model_fsdp2(
                 model=model,
                 weights_path=weights_path,
