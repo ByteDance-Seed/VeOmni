@@ -18,6 +18,14 @@ from ..utils.dist_utils import raise_if_any_rank_failed
 MULTI_LAYOUT_MARKER = "__veomni_multi_optimizer_layout_v1__"
 
 
+def persistent_named_buffers(model):
+    """Yield all persistent buffer aliases using their runtime module paths."""
+    for prefix, module in model.named_modules(remove_duplicate=False):
+        for name, value in module._buffers.items():
+            if value is not None and name not in module._non_persistent_buffers_set:
+                yield f"{prefix}.{name}" if prefix else name, value
+
+
 def _immutable_value(value):
     if value is None or type(value) in (bool, int, float, str):
         return value
@@ -202,6 +210,8 @@ def _local_layout(
     if names != optimizer_names:
         raise RuntimeError("MultiOptimizer and checkpoint model have different canonical parameter identities")
     model_aliases = {}
+    persistent_objects = set(names)
+    persistent_objects.update(id(value) for _, value in persistent_named_buffers(model))
     for kind, items in (
         ("parameter", model.named_parameters(remove_duplicate=False)),
         ("buffer", model.named_buffers(remove_duplicate=False)),
@@ -210,7 +220,14 @@ def _local_layout(
             model_aliases.setdefault(id(value), set()).update(
                 f"{kind}:{name}" for name in _get_fqns(model, runtime_name)
             )
-    alias_graph = sorted(sorted(aliases) for aliases in model_aliases.values() if len(aliases) > 1)
+    # Ignore aliases consisting exclusively of transient caches. A transient
+    # buffer that aliases a parameter or persistent buffer still affects model
+    # behavior and must remain bound to the checkpoint's ownership identity.
+    alias_graph = sorted(
+        sorted(aliases)
+        for object_id, aliases in model_aliases.items()
+        if object_id in persistent_objects and len(aliases) > 1
+    )
 
     leaves = []
     seen_param_ids, seen_fqns, lr_aliases, lr_owners = set(), set(), {}, {}

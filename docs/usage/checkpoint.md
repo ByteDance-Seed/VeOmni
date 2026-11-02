@@ -311,6 +311,16 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec also rejects tensor learning rates shared between groups and
 overlapping storage between distinct model or optimizer tensors. Its byte-range
 check is conservative for non-contiguous interleaved views.
+The saved alias identity covers parameters and persistent buffers, including
+their aliases to nonpersistent buffers. Aliases solely among transient buffers,
+such as dynamic RoPE caches, are not part of that identity. The separate
+conservative storage-overlap check still applies to distinct buffer views.
+Older checkpoints whose identity included such aliases can require an
+independently verified migration.
+Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
+the cache grew beyond its original context and has not reset, a fresh process
+can compute different later outputs; exact resume for that case is not yet
+supported.
 Mutable optimizer options must not be shared between groups or optimizer
 defaults: ordinary YAML `betas` are normalized to a tuple; custom shared lists,
 dictionaries and tensor-valued learning rates require explicitly independent
