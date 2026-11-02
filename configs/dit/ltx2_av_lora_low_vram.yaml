@@ -74,10 +74,13 @@ model:
     # NOTE: "adamw8bit" is not a supported OptimizerConfig.type in VeOmni.
     # VeOmni supports: "adamw", "anyprecision_adamw", "muon".
     # For memory-efficient training, consider "anyprecision_adamw",
-    # state_offload: cpu, or reduce global_batch_size / use gradient checkpointing.
-    # NOTE: state_offload: cpu requires model.accelerator.fsdp_config.offload: false
-    # (this config enables that offload below; the combination is rejected at
-    # config parse time because both move training state to host).
+    # optimizer.state_offload: cpu, or reduce global_batch_size / use gradient
+    # checkpointing.
+    # NOTE: state_offload: cpu requires model.accelerator.fsdp_config.offload:
+    # false, and THIS config enables that offload below, so the two cannot be
+    # combined here (the combination is rejected at config parse time because
+    # both move training state to host). Set fsdp_config.offload: false first if
+    # you want to try state_offload: cpu.
     type: adamw
     lr: 1.0e-4
     lr_decay_style: linear

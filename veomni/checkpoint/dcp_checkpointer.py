@@ -480,8 +480,15 @@ def restore_extra_parallel_dim(
             placements=placements,
         )
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        # If there is no FSDP but only ExtraParallel. Use the helper here too:
+        # ``DTensor.from_local`` copies a host-resident local onto the mesh
+        # device, which would materialize the swap optimizer's host state on the
+        # accelerator during a save.
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor,
+            mesh=extra_parallel_fsdp_mesh,
+            placements=[Shard(0)],
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 

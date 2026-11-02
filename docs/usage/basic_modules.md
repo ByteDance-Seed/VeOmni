@@ -377,7 +377,7 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports four optimizer types via `model.optimizer.type`:
+`build_optimizer` supports three optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|

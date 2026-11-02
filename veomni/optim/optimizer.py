@@ -515,6 +515,10 @@ def build_optimizer(
     arguments, because callers such as the VLM trainer drive the AdamW side from
     their own param groups. ``muon_kwargs`` overrides the config key by key, for
     callers that build Muon without an ``OptimizerConfig`` at all.
+
+    ``fused`` drives the stock ``AdamW`` path only: the state-offload optimizer
+    selects the fused kernel from the backend (``FUSED_ADAMW_DEVICE_TYPES``) and
+    takes the elementwise path elsewhere.
     """
     if optimizer_type == "muon":
         if optimizer_config is not None:

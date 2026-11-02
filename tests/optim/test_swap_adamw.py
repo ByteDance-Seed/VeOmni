@@ -149,14 +149,25 @@ def test_mixed_dtype_group_fused_matches_torch(cpu_mesh, monkeypatch):
         torch.testing.assert_close(swap_opt._host_states[par_f][key], ref_opt.state[ref_f][key], atol=1e-6, rtol=1e-6)
 
 
-def test_pinned_allocation_degrades_to_pageable(cpu_mesh, monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("simulated pinned-memory exhaustion"),
+        NotImplementedError("simulated backend without pin_memory"),
+        TypeError("simulated backend rejecting the pin_memory argument"),
+    ],
+    ids=["runtime", "not-implemented", "type"],
+)
+def test_pinned_allocation_degrades_to_pageable(cpu_mesh, monkeypatch, error):
     # Page-locked host memory is finite; exhaustion at build must degrade with
     # a warning instead of killing the run (the async_offload fallback pattern).
+    # Backends that cannot pin at all report it as NotImplementedError/TypeError,
+    # which must take the same fallback rather than failing construction.
     real_zeros = torch.zeros
 
     def failing_pinned_zeros(*args, **kwargs):
         if kwargs.get("pin_memory"):
-            raise RuntimeError("simulated pinned-memory exhaustion")
+            raise error
         return real_zeros(*args, **kwargs)
 
     monkeypatch.setattr(torch, "zeros", failing_pinned_zeros)
@@ -460,6 +471,7 @@ def test_add_param_group_matches_eager_groups(cpu_mesh):
     ref_opt = torch.optim.AdamW(
         [{"params": [ref_a], "weight_decay": 0.1}, {"params": [ref_b], "weight_decay": 0.0}],
         lr=1e-2,
+        betas=(0.9, 0.95),
         foreach=False,
     )
     swap_opt = SwapAdamW([{"params": [par_a], "weight_decay": 0.1}], lr=1e-2, pin_memory=False)

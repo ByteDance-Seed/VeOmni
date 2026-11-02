@@ -219,11 +219,14 @@ class SwapAdamW(Optimizer):
         Page-locked host memory is a finite machine resource: on exhaustion the
         optimizer degrades to pageable buffers once — the same fallback
         ``async_offload`` uses — instead of failing the whole run at build time.
+        Backends that cannot pin at all report that differently (``RuntimeError``
+        for a failed allocation, ``NotImplementedError``/``TypeError`` for an
+        unsupported call), so all three fall back here.
         """
         shape = tuple(local_shard.shape)
         try:
             return torch.zeros(shape, dtype=local_shard.dtype, device="cpu", pin_memory=self.pin_memory)
-        except RuntimeError:
+        except (RuntimeError, NotImplementedError, TypeError):
             if not self.pin_memory:
                 raise
             logger.warning_rank0(
@@ -326,7 +329,11 @@ class SwapAdamW(Optimizer):
 
         As in ``torch.optim.Optimizer``, the checkpoint *replaces* the state: a
         parameter it does not carry goes back to zero moments and step 0 instead
-        of keeping this optimizer instance's history.
+        of keeping this optimizer instance's history. That applies to a direct
+        ``load_state_dict``/``set_optimizer_state_dict`` call. A DCP load whose
+        template came from an already-stepped optimizer keeps the template's own
+        values for keys the planner does not overwrite (partial loads), so resume
+        into a fresh optimizer to start omitted parameters from zero.
         """
         groups = self.param_groups
         saved_groups = state_dict["param_groups"]
@@ -388,6 +395,11 @@ class SwapAdamW(Optimizer):
                 # the construction-time step 0 in that case.
             elif key in host_state and isinstance(loaded, torch.Tensor):
                 # Same for the moments: leave the zero-initialized host buffer.
+                if loaded.shape != host_state[key].shape:
+                    raise ValueError(
+                        f"optimizer state {key!r} has shape {tuple(loaded.shape)} in the checkpoint but "
+                        f"{tuple(host_state[key].shape)} here; DCP should reshard before this point."
+                    )
                 host_state[key].copy_(loaded.to(host_state[key].device))
 
     def swap_all_to_device(self) -> None:

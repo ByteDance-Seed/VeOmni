@@ -84,6 +84,54 @@ def test_matches_torch_adamw_step_by_step_on_accelerator():
         )
 
 
+def test_fused_amsgrad_maximize_on_accelerator():
+    """The accelerator fused kernel must accept ``amsgrad`` and ``maximize``.
+
+    The CPU case pins the wiring; this one checks that the kernel the production
+    path actually calls supports the flag combination and the third moment.
+    """
+    torch.manual_seed(22)
+    device_type = get_device_type()
+    shape = (6, 4)
+    init = torch.randn(shape, device=device_type)
+
+    ref = nn.Parameter(init.clone())
+    swapped = nn.Parameter(init.clone())
+
+    ref_opt = torch.optim.AdamW(
+        [ref],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.1,
+        amsgrad=True,
+        maximize=True,
+        foreach=False,
+    )
+    swap_opt = SwapAdamW(
+        [{"params": [swapped], "weight_decay": 0.1, "maximize": True}],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        amsgrad=True,
+    )
+    assert swap_opt._use_fused == (device_type in FUSED_ADAMW_DEVICE_TYPES)
+
+    for _ in range(5):
+        grad = torch.randn(shape, device=device_type)
+        ref.grad = grad.clone()
+        swapped.grad = grad.clone()
+        ref_opt.step()
+        swap_opt.step()
+
+        torch.testing.assert_close(swapped.detach(), ref.detach(), atol=1e-5, rtol=1e-5)
+
+    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+        torch.testing.assert_close(
+            swap_opt._host_states[swapped][key], ref_opt.state[ref][key].cpu(), atol=1e-5, rtol=1e-5
+        )
+
+
 def test_dcp_roundtrip_on_device_mesh(tmp_path):
     """The production checkpoint path: DTensor parameters on a device mesh, so
     ``state_dict`` exports through ``rewrap_dtensor_local``'s mismatched-device
