@@ -24,6 +24,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
     _needs_extra_parallel_layout_marker,
+    _process_shard,
     drop_extra_parallel_dim_v2,
     restore_extra_parallel_dim,
     restore_extra_parallel_dim_v2,
@@ -314,6 +315,25 @@ def test_canonical_layout_rejects_mixed_legacy_shards():
     source_b = SpecInfo("ep", Shard(0), "b", mesh, 0, None, (4, 4), False)
     with pytest.raises(RuntimeError, match="cannot mix versioned and legacy"):
         _extra_parallel_layout_key({"a": source_a, "b": source_b})
+
+
+@pytest.mark.parametrize("shard_size", [None, 16])
+def test_v2_offline_hf_export_preserves_names_and_values(tmp_path, shard_size):
+    marker = _extra_parallel_layout_key({})
+    source = {
+        "model.layer.experts.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
+        "model.layer.other.weight": torch.arange(4, dtype=torch.bfloat16),
+    }
+    dcp.save(
+        {"model": {marker: "ep-outer-v1", **{marker + "__" + k: v for k, v in source.items()}}}, checkpoint_id=tmp_path
+    )
+    plan, _, _ = _get_sharding_plan(str(tmp_path), shard_size=shard_size)
+    actual = {}
+    for shard in plan if isinstance(plan, list) else [plan]:
+        actual.update(_process_shard(shard, str(tmp_path)))
+    assert actual.keys() == source.keys()
+    for key, value in source.items():
+        torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
 
 
 def test_hf_export_rejects_duplicate_legacy_and_canonical_source(tmp_path):

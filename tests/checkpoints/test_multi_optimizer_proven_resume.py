@@ -913,14 +913,18 @@ def test_nonfresh_target_is_rejected_before_any_checkpoint_load(tmp_path):
     torch.testing.assert_close(target.weight, original, rtol=0, atol=0)
 
 
-def test_anyprecision_fp32_moments_with_bf16_parameter_fail_closed(tmp_path):
+@pytest.mark.parametrize(
+    ("param_dtype", "moment_dtype"),
+    [(torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)],
+)
+def test_anyprecision_mixed_state_dtype_save_resume_and_update(tmp_path, monkeypatch, param_dtype, moment_dtype):
     def build():
-        model = torch.nn.Linear(2, 2, bias=False).to(torch.bfloat16)
+        model = torch.nn.Linear(2, 2, bias=False).to(param_dtype)
         leaf = AnyPrecisionAdamW(
             model.parameters(),
-            momentum_dtype=torch.float32,
-            variance_dtype=torch.float32,
-            compensation_buffer_dtype=torch.float32,
+            momentum_dtype=moment_dtype,
+            variance_dtype=moment_dtype,
+            compensation_buffer_dtype=moment_dtype,
         )
         return model, MultiOptimizer(model, {"weight": leaf}, ["weight"])
 
@@ -929,9 +933,175 @@ def test_anyprecision_fp32_moments_with_bf16_parameter_fail_closed(tmp_path):
     optimizer.step()
     optimizer.zero_grad()
     parallel = SimpleNamespace(dp_mode="ddp")
-    with pytest.raises(RuntimeError, match="state dtype cannot be safely restored"):
-        DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
-    assert not list(tmp_path.iterdir())
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target, restored = build()
+    target_leaf = restored.optimizers_dict["weight"]
+    original_load = AnyPrecisionAdamW.load_state_dict
+    owned_pointers = []
+
+    def tracked_load(self, state_dict):
+        if self is target_leaf:
+            before = {name: value.data_ptr() for name, value in self.state[target.weight].items()}
+        result = original_load(self, state_dict)
+        if self is target_leaf:
+            after = {name: value.data_ptr() for name, value in self.state[target.weight].items()}
+            owned_pointers.append((before, after))
+        return result
+
+    monkeypatch.setattr(AnyPrecisionAdamW, "load_state_dict", tracked_load)
+    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": restored}, parallel_state=parallel)
+    assert len(owned_pointers) == 1
+    before, after = owned_pointers[0]
+    assert before == after
+    assert set(before) == {"step", "exp_avg", "exp_avg_sq", "compensation"}
+    source_state = optimizer.optimizers_dict["weight"].state[model.weight]
+    target_state = restored.optimizers_dict["weight"].state[target.weight]
+    for field in ("exp_avg", "exp_avg_sq", "compensation"):
+        assert source_state[field].dtype == target_state[field].dtype == moment_dtype
+    torch.testing.assert_close(source_state, target_state, rtol=0, atol=0)
+    torch.testing.assert_close(model.weight, target.weight, rtol=0, atol=0)
+    model.weight.grad = torch.full_like(model.weight, 0.2)
+    target.weight.grad = torch.full_like(target.weight, 0.2)
+    optimizer.step()
+    restored.step()
+    torch.testing.assert_close(model.weight, target.weight, rtol=0, atol=0)
+    torch.testing.assert_close(source_state, target_state, rtol=0, atol=0)
+
+
+def test_anyprecision_direct_load_preserves_hooks_and_state_dtype():
+    source = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    first = AnyPrecisionAdamW([source], momentum_dtype=torch.bfloat16, variance_dtype=torch.bfloat16)
+    source.grad = torch.full_like(source, 0.2)
+    first.step()
+    target = torch.nn.Parameter(source.detach().clone())
+    second = AnyPrecisionAdamW([target], momentum_dtype=torch.bfloat16, variance_dtype=torch.bfloat16)
+    calls = []
+    second.register_load_state_dict_pre_hook(lambda opt, state: calls.append("pre"))
+    second.register_load_state_dict_post_hook(lambda opt: calls.append("post"))
+    second.load_state_dict(first.state_dict())
+    assert calls == ["pre", "post"]
+    assert second.state[target]["exp_avg"].dtype == torch.bfloat16
+    assert second.state[target]["exp_avg_sq"].dtype == torch.bfloat16
+    for field in ("step", "exp_avg", "exp_avg_sq", "compensation"):
+        assert first.state[source][field].data_ptr() != second.state[target][field].data_ptr()
+    source.grad = torch.full_like(source, 0.3)
+    target.grad = torch.full_like(target, 0.3)
+    first.step()
+    second.step()
+    torch.testing.assert_close(source, target, rtol=0, atol=0)
+
+
+def test_anyprecision_direct_load_does_not_reuse_preexisting_alias():
+    source = torch.nn.Parameter(torch.ones(2))
+    target = torch.nn.Parameter(torch.ones(2))
+    first = AnyPrecisionAdamW([source])
+    second = AnyPrecisionAdamW([target])
+    source.grad = torch.ones_like(source)
+    first.step()
+    second.state[target] = dict(first.state[source])
+    second.load_state_dict(first.state_dict())
+    for field in ("step", "exp_avg", "exp_avg_sq", "compensation"):
+        assert first.state[source][field].data_ptr() != second.state[target][field].data_ptr()
+
+
+def test_anyprecision_owned_buffer_reuse_requires_exact_view():
+    from veomni.optim.optimizer import _same_owned_optimizer_tensor
+
+    storage = torch.arange(8)
+    assert _same_owned_optimizer_tensor(storage[:4], storage[:4])
+    assert not _same_owned_optimizer_tensor(storage[:4], storage[1:5])
+    assert not _same_owned_optimizer_tensor(storage[:4], storage[:8:2])
+    assert not _same_owned_optimizer_tensor(storage[:0], storage[:0])
+
+
+@pytest.mark.parametrize("bad_field", ["exp_avg", "exp_avg_sq", "compensation", "step"])
+def test_anyprecision_direct_load_rejects_dtensor_state_for_plain_parameter(tmp_path, bad_field):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rdzv'}", rank=0, world_size=1)
+    try:
+        param = torch.nn.Parameter(torch.ones(2))
+        optimizer = AnyPrecisionAdamW([param])
+        param.grad = torch.full_like(param, 0.2)
+        optimizer.step()
+        bad = optimizer.state_dict()
+        mesh = init_device_mesh("cpu", (1,))
+        value = bad["state"][0][bad_field]
+        bad["state"][0][bad_field] = DTensor.from_local(value, mesh, [Replicate()])
+        target = torch.nn.Parameter(param.detach().clone())
+        restored = AnyPrecisionAdamW([target])
+        with pytest.raises(RuntimeError, match="incompatible|scalar tensor"):
+            restored.load_state_dict(bad)
+        assert not restored.state
+    finally:
+        dist.destroy_process_group()
+
+
+def test_anyprecision_direct_load_rejects_invalid_local_shard_shape(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rdzv'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        param = torch.nn.Parameter(DTensor.from_local(torch.ones(4, 4), mesh, [Shard(0)]))
+        optimizer = AnyPrecisionAdamW([param])
+        param.grad = torch.ones_like(param)
+        optimizer.step()
+        bad = optimizer.state_dict()
+        bad["state"][0]["exp_avg"] = DTensor.from_local(
+            torch.zeros(2, 4, dtype=torch.bfloat16), mesh, [Shard(0)], shape=torch.Size((4, 4)), stride=(4, 1)
+        )
+        restored = AnyPrecisionAdamW([torch.nn.Parameter(param.detach().clone())])
+        with pytest.raises(RuntimeError, match="incompatible exp_avg layout"):
+            restored.load_state_dict(bad)
+        assert not restored.state
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("bad_field", ["replicated_moment", "wrong_local_shape", "plain_moment", "dtensor_step"])
+def test_anyprecision_source_rejects_incompatible_state_layout(tmp_path, bad_field):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    from veomni.checkpoint.multi_optimizer_checkpoint import _validate_source_optimizer_states
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rdzv'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        param = torch.nn.Parameter(DTensor.from_local(torch.ones(2, 2), mesh, [Shard(0)]))
+        model = torch.nn.Linear(2, 2, bias=False)
+        model.weight = param
+        leaf = AnyPrecisionAdamW(
+            [param], momentum_dtype=torch.bfloat16, variance_dtype=torch.bfloat16, use_kahan_summation=False
+        )
+        optimizer = MultiOptimizer(model, {"weight": leaf}, ["weight"])
+        state = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.zeros_like(param, dtype=torch.bfloat16),
+            "exp_avg_sq": torch.zeros_like(param, dtype=torch.bfloat16),
+        }
+        if bad_field == "replicated_moment":
+            state["exp_avg"] = DTensor.from_local(torch.zeros(2, 2, dtype=torch.bfloat16), mesh, [Replicate()])
+        elif bad_field == "wrong_local_shape":
+            state["exp_avg"] = DTensor.from_local(
+                torch.zeros(1, 2, dtype=torch.bfloat16), mesh, [Shard(0)], shape=torch.Size((2, 2)), stride=(2, 1)
+            )
+        elif bad_field == "plain_moment":
+            state["exp_avg"] = torch.zeros(2, 2, dtype=torch.bfloat16)
+        else:
+            state["step"] = DTensor.from_local(torch.tensor(1.0), mesh, [Replicate()])
+        leaf.state[param] = state
+        with pytest.raises(RuntimeError, match="layout differs|ordinary scalar tensor"):
+            _validate_source_optimizer_states(optimizer, model)
+        assert leaf.state[param] is state
+    finally:
+        dist.destroy_process_group()
 
 
 def test_anyprecision_uninitialized_leaf_restores_and_updates(tmp_path):

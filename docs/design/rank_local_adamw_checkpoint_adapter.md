@@ -34,7 +34,8 @@ every rank. Duplicate registration raises an error. Registration does not make
 an arbitrary optimizer compatible or automatically preserve its precision: the
 optimizer and its adapter own the correctness of their serialization and load
 behavior. `MasterFP32AdamW`, `FullFP32AdamW`, and `CPUOffloadAdamW` provide
-concrete in-tree examples.
+concrete in-tree examples; the checkpoint adapter tests also contain an
+illustrative registered implementation.
 
 An initialized parameter entry must contain exactly `step`, `master_weight`,
 `exp_avg`, and `exp_avg_sq`. The step is a rank-local plain scalar tensor, not

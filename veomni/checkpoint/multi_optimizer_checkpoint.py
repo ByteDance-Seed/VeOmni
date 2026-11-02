@@ -167,12 +167,26 @@ def _validate_source_optimizer_states(optimizer, model):
                     if field == "step":
                         if tuple(value.shape) != ():
                             raise RuntimeError("MultiOptimizer step must be a scalar")
+                        if isinstance(leaf, AnyPrecisionAdamW) and isinstance(value, DTensor):
+                            raise RuntimeError("AnyPrecisionAdamW step must be an ordinary scalar tensor")
                         adapter = rank_local_adamw_adapter(leaf)
                         if adapter is not None and value.dtype != adapter.state_dtype(leaf, param, field):
                             raise RuntimeError("MultiOptimizer step dtype differs from its registered policy")
                     else:
                         if tuple(value.shape) != tuple(param.shape):
                             raise RuntimeError(f"MultiOptimizer state shape differs for {field}")
+                        if isinstance(leaf, AnyPrecisionAdamW) and (
+                            isinstance(param, DTensor) != isinstance(value, DTensor)
+                            or (
+                                isinstance(param, DTensor)
+                                and (
+                                    value.device_mesh != param.device_mesh
+                                    or value.placements != param.placements
+                                    or value.to_local().shape != param.to_local().shape
+                                )
+                            )
+                        ):
+                            raise RuntimeError(f"AnyPrecisionAdamW state layout differs for {field}")
                         adapter = rank_local_adamw_adapter(leaf)
                         expected_dtype = (
                             adapter.state_dtype(leaf, param, field)
@@ -187,7 +201,7 @@ def _validate_source_optimizer_states(optimizer, model):
                             if isinstance(leaf, AnyPrecisionAdamW)
                             else param.dtype
                         )
-                        if (adapter is None and expected_dtype != param.dtype) or value.dtype != expected_dtype:
+                        if value.dtype != expected_dtype:
                             raise RuntimeError(f"MultiOptimizer state dtype cannot be safely restored for {field}")
 
 
@@ -255,6 +269,7 @@ def _check_qwen_omni_checkpoint_keys(model, keys):
 
 def _check_model_serialization_hooks(model):
     """Allow the FSDP2 reshard hook, reject unproven model transforms."""
+    import dis
     import types
 
     from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
@@ -265,6 +280,22 @@ def _check_model_serialization_hooks(model):
         return {
             item for item in parent.__code__.co_consts if isinstance(item, types.CodeType) and item.co_name == name
         }
+
+    def returns_before_nested_load(hook):
+        # A sample call cannot prove this: the hook could modify other real
+        # keys, the module or error lists without changing the probe.
+        ops = [item for item in dis.get_instructions(hook) if item.opname not in ("RESUME", "NOP", "CACHE")]
+        if len(ops) < 3 or (ops[0].opname, ops[0].argval) != ("LOAD_FAST", "prefix"):
+            return False
+        if ops[1].opname not in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE"):
+            return False
+        if (ops[2].opname, ops[2].argval) == ("RETURN_CONST", None):
+            return True
+        return (
+            len(ops) >= 4
+            and (ops[2].opname, ops[2].argval) == ("LOAD_CONST", None)
+            and ops[3].opname == "RETURN_VALUE"
+        )
 
     post_codes = nested_code(FSDPParam.__init__, "<lambda>")
     pre_codes = nested_code(FSDPParamGroup._register_state_dict_hooks, "to_sharded_hook")
@@ -289,14 +320,18 @@ def _check_model_serialization_hooks(model):
                     and code in pre_codes
                     and any(isinstance(item, FSDPParamGroup) for item in captured)
                 )
-                builtin_qwen = (
-                    attr == "_load_state_dict_pre_hooks" and not name and _qwen_omni_filtered_prefixes(model, func)
-                )
+                builtin_qwen = attr == "_load_state_dict_pre_hooks" and _qwen_omni_filtered_prefixes(module, func)
                 if not builtin_fsdp and not builtin_qwen:
                     raise RuntimeError(f"Cannot prove model serialization hook {attr} on {name or '<root>'}")
-                if builtin_qwen and any(
-                    key.startswith(builtin_qwen)
-                    for key, _ in list(model.named_parameters()) + list(model.named_buffers())
+                if builtin_qwen and name and not returns_before_nested_load(func):
+                    raise RuntimeError("Cannot prove nested Qwen Omni load hook preserves checkpoint keys")
+                if (
+                    builtin_qwen
+                    and not name
+                    and any(
+                        key.startswith(builtin_qwen)
+                        for key, _ in list(model.named_parameters()) + list(model.named_buffers())
+                    )
                 ):
                     raise RuntimeError("Cannot prove Qwen Omni load hook is a no-op for checkpoint model tensors")
 
@@ -474,14 +509,9 @@ def _preflight_multi_optimizer_layout(
         return None, None, None, None, None, None, None
     snapshot, extra, extra_digest, source_metadata, error = None, None, None, None, None
     try:
-        from ..optim.optimizer import AnyPrecisionAdamW
-
         _check_model_serialization_hooks(model)
         source_metadata = reader_factory(checkpoint_path).read_metadata()
         parameter_names = _dcp_parameter_name_map(model)
-        parameter_names_by_id = defaultdict(list)
-        for name, param in parameter_names.items():
-            parameter_names_by_id[id(param)].append(name)
         from .rank_local_optimizer import current_rank, load_rank_scalars, rank_prefix
 
         rank_local = (
@@ -505,22 +535,6 @@ def _preflight_multi_optimizer_layout(
                 raise RuntimeError("MultiOptimizer checkpoint resume requires a fresh optimizer without state")
             if any(param.grad is not None for param_group in leaf.param_groups for param in param_group["params"]):
                 raise RuntimeError("MultiOptimizer checkpoint resume requires cleared gradients")
-            if isinstance(leaf, AnyPrecisionAdamW):
-                for param_group in leaf.param_groups:
-                    fields = ["momentum_dtype", "variance_dtype"]
-                    if param_group.get("use_kahan_summation"):
-                        fields.append("compensation_buffer_dtype")
-                    incompatible = False
-                    for param in param_group["params"]:
-                        if not any(param_group[field] != param.dtype for field in fields):
-                            continue
-                        names = parameter_names_by_id[id(param)]
-                        incompatible |= any(f"optimizer.state.{name}" in source_bases for name in names)
-                    if incompatible:
-                        raise RuntimeError(
-                            "AnyPrecisionAdamW requires explicit precision-preserving migration when optimizer "
-                            "state and parameter dtypes differ"
-                        )
         extra_digest, extra = _multi_extra_snapshot(extra_root, read_state=True)
         if extra is not None:
             snapshot = extra.get("lr_scheduler")
@@ -851,11 +865,6 @@ def _prepare_multi_optimizer_saved_states(
                                     "compensation": "compensation_buffer_dtype",
                                 }[field]
                             ]
-                            if dtype != param.dtype:
-                                raise RuntimeError(
-                                    "AnyPrecisionAdamW cannot restore moments at a dtype different from its parameter; "
-                                    "explicit precision-preserving migration is required"
-                                )
                         else:
                             dtype = param.dtype
                         if entry.properties.dtype != dtype:

@@ -49,6 +49,23 @@ if TYPE_CHECKING:
     from ..trainer.callbacks import TrainerState
     from .checkpoint import ModelCheckpointManager
 
+
+def _configure_extra_parallel_checkpoint_layout(model, checkpoint, *, require_plan=True):
+    """Apply canonical ExtraParallel checkpoint layout after model wrapping."""
+    if not getattr(checkpoint, "extra_parallel_canonical_layout", False):
+        return
+    from torch.distributed.tensor import Shard
+
+    specs = getattr(model, "_fqn2spec_info", None)
+    if specs is None:
+        if require_plan:
+            raise RuntimeError("Canonical ExtraParallel checkpointing requires an ExtraParallel model plan")
+        return
+    for spec in specs.values():
+        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
+            spec.checkpoint_layout_v2 = True
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -147,7 +164,7 @@ class VeOmniModelRuntime:
             from ..utils.dist_utils import raise_if_any_rank_failed
 
             specs = getattr(self.model, "_fqn2spec_info", None)
-            has_specs = _coordinated_optimizer_flag(specs is not None, "ExtraParallel model plan presence")
+            _coordinated_optimizer_flag(specs is not None, "ExtraParallel model plan presence")
             canonical = _coordinated_optimizer_flag(
                 getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False),
                 "canonical ExtraParallel checkpoint policy",
@@ -155,27 +172,10 @@ class VeOmniModelRuntime:
             layout_error = None
             try:
                 if canonical:
-                    from torch.distributed.tensor import Shard
-
-                    if not has_specs:
-                        raise RuntimeError(
-                            "Canonical ExtraParallel checkpointing requires an ExtraParallel model plan"
-                        )
-                    for spec in specs.values():
-                        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
-                            spec.checkpoint_layout_v2 = True
+                    _configure_extra_parallel_checkpoint_layout(self.model, self.train_args.checkpoint)
             except BaseException as exc:
                 layout_error = exc
             raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")
-            if has_specs:
-                from ..checkpoint.dcp_checkpointer import _validate_optimizer_model_layout
-
-                layout_error = None
-                try:
-                    _validate_optimizer_model_layout(self.model)
-                except BaseException as exc:
-                    layout_error = exc
-                raise_if_any_rank_failed(layout_error, "validating optimizer model checkpoint layout")
             checkpoint_path = self.train_args.checkpoint.load_path
             recover_ownership = bool(
                 checkpoint_path
@@ -232,6 +232,16 @@ class VeOmniModelRuntime:
                 else None
             )
             raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint mode")
+        if manager == "dcp":
+            error = None
+            try:
+                if getattr(self.optimizer, "_is_multi_optimizer", False) is True:
+                    from ..checkpoint.dynamic_rope import reject_dynamic_rope_multi_optimizer_training
+
+                    reject_dynamic_rope_multi_optimizer_training(self.model)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking MultiOptimizer dynamic RoPE checkpoint mode")
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""
@@ -567,6 +577,8 @@ class VeOmniModelRuntime:
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            expert_weight_fp8_all_gather=args.accelerator.fsdp_config.expert_weight_fp8_all_gather,
+            expert_fsdp_shard_dim=args.accelerator.fsdp_config.expert_fsdp_shard_dim,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,
             **kwargs,
