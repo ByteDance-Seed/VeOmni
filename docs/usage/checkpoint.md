@@ -237,9 +237,9 @@ resume instead of falling back.
 
 ## Versioned ExtraParallel layout
 
-The EP-outer layout is opt-in through `SpecInfo.checkpoint_layout_v2`; existing
-plans remain on their original layout. A plan enabling it must retain the
-original `global_shape` and must use FSDP DTensor parameters. Every
+The separately namespaced EP-outer layout is opt-in through
+`SpecInfo.checkpoint_layout_v2`. A plan enabling it must retain the original
+`global_shape` and must use FSDP DTensor parameters. Every
 non-persistent ExtraParallel shard in a checkpoint must use the canonical
 layout: mixing legacy and canonical shards is rejected. The v2 tensor namespace
 identifies canonical global values independently of source geometry, so DCP can
@@ -250,6 +250,18 @@ verified source layout information. Canonical v2 optimizer save and resume are
 rejected until an owner-aware codec can preserve rank-specific optimizer
 states; this opt-in therefore does not yet support resuming training. The
 standard VeOmni HF export strips the namespace.
+
+The standard, non-v2 writer uses canonical EP-first coordinates for same-axis
+EP/FSDP shards and records source expert layouts in DCP planner metadata.
+Older readers may ignore that metadata and interpret these shards using the old
+FSDP-first order; do not use them for these checkpoints without a verified
+migration. Conversely, an old unversioned checkpoint with expert-only chunks
+may not prove its source order even when resumed with the same topology. The
+distributed reader rejects ambiguous sources when loading into EP/FSDP DTensors.
+Offline export also rejects unversioned expert-only chunks for stacked tensors
+under an `experts` module when their source order cannot be established. Other
+legacy tensor naming schemes may still need explicit source-layout verification
+or migration before export.
 
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
