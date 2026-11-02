@@ -61,35 +61,6 @@ def combine_qkv_state_dict_pre_hook(
             state_dict[combined_key] = torch.cat([state_dict.pop(key) for key in checkpoint_keys], dim=0)
 
 
-def split_qkv_state_dict_post_hook(
-    module: torch.nn.Module,
-    state_dict: dict[str, torch.Tensor],
-    prefix: str,
-    local_metadata: dict[str, Any],
-) -> None:
-    """Expose legacy split Q/K/V keys while keeping combined runtime parameters."""
-    del local_metadata
-    split_sizes = module.qkv_split_sizes
-    for combined_name, checkpoint_names in _QKV_BRANCHES:
-        for kind in ("weight", "bias"):
-            combined_key = f"{prefix}{combined_name}.{kind}"
-            tensor = state_dict.get(combined_key)
-            if tensor is None or tensor.is_meta or hasattr(tensor, "device_mesh"):
-                # Transformers inspects a meta model's state dict to discover the
-                # runtime parameter schema before applying its weight converters.
-                # DCP likewise requires DTensor keys to remain resolvable to the
-                # live combined parameters before the HF export layer converts them.
-                continue
-
-            state_dict.pop(combined_key)
-            for checkpoint_name, chunk in zip(
-                checkpoint_names,
-                tensor.split(split_sizes, dim=0),
-                strict=True,
-            ):
-                state_dict[f"{prefix}{checkpoint_name}.{kind}"] = chunk
-
-
 class _ConcatenateQKV(ConversionOps):
     """Concatenate checkpoint Q/K/V tensors along the projection dimension."""
 

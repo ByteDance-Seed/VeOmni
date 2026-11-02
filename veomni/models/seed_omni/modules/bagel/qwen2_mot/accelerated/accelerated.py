@@ -39,7 +39,6 @@ from ..checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
     combine_qkv_state_dict_pre_hook,
     register_accelerated_qkv_conversion_mapping,
-    split_qkv_state_dict_post_hook,
 )
 from ..configuration import BagelQwen2MoTConfig
 from ..masking import build_mot_block_mask, build_mot_magi_mask, pad_mot_attention_metadata
@@ -473,7 +472,6 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         except RuntimeError:
             self.veomni_denoise_attn = None
         self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
-        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
     def _build_qkv_proj(self) -> None:
         qkv_size = sum(self.qkv_split_sizes)

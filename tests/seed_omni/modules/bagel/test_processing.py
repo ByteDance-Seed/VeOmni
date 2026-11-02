@@ -230,6 +230,50 @@ def test_bagel_flow_training_embed_treats_edit_context_as_clean_and_gen_as_targe
     assert "timestep" not in edit_context.meta
     assert gen_target.meta["flow_velocity_target"].shape == (2, 1)
     assert gen_target.meta["timestep"].shape == (2,)
+    assert torch.equal(gen_target.meta["timestep"][0], gen_target.meta["timestep"][1])
+    assert torch.equal(inputs["timesteps"][2], inputs["timesteps"][3])
+
+
+def test_bagel_flow_preprocess_latent_embed_samples_one_shared_timestep_per_image() -> None:
+    """Verify ``preprocess_latent_embed`` samples one scalar timestep per image and expands it across patch tokens."""
+    from veomni.models.seed_omni.modules.bagel.flow_connector.processing import preprocess_latent_embed
+
+    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
+    cfg = BagelFlowConnectorConfig(
+        hidden_size=4,
+        z_channels=1,
+        latent_patch_size=1,
+        patch_latent_dim=1,
+        max_latent_size=4,
+        timestep_frequency_embedding_size=4,
+        timestep_shift=3.0,
+    )
+    first = ConversationItem(
+        type="image",
+        value=torch.zeros(1, 2, 2),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
+    )
+    second = ConversationItem(
+        type="image",
+        value=torch.ones(1, 2, 3),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
+    )
+    torch.manual_seed(1234)
+    inputs, lengths = preprocess_latent_embed(
+        [first, second],
+        config=cfg,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        timestep_shift=3.0,
+    )
+    assert lengths == [4, 6]
+    assert torch.all(first.meta["timestep"] == first.meta["timestep"][0])
+    assert torch.all(second.meta["timestep"] == second.meta["timestep"][0])
+    assert not torch.equal(first.meta["timestep"][0], second.meta["timestep"][0])
+    assert torch.equal(inputs["timesteps"][:4], first.meta["timestep"])
+    assert torch.equal(inputs["timesteps"][4:], second.meta["timestep"])
 
 
 def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> None:
@@ -960,3 +1004,60 @@ def test_bagel_siglip_preprocessor_from_pretrained_applies_config_overrides(tmp_
     )
     assert pre._image_processor.image_size == 56
     assert pre._image_processor.min_image_size == 28
+
+
+def test_bagel_vae_encode_and_offline_encode_pad_per_sample_preprocessed_microbatch() -> None:
+    """Verify ``encode`` and ``offline_encode`` pad variable-shape images across per-sample-preprocessed micro-batches."""
+    pre = BagelVAEPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=8, max_pixels=64),
+        dtype=torch.float32,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.float32),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
+    )
+    # Dataset-stage transform runs preprocessor on one sample at a time:
+    sample_rect_a = [
+        ConversationItem(
+            type="image",
+            value=torch.full((3, 4, 8), 5, dtype=torch.uint8),
+            role="assistant",
+            meta={_IMG_TAG_KEY: "gen"},
+        )
+    ]
+    sample_rect_b = [
+        ConversationItem(
+            type="image",
+            value=torch.full((3, 8, 4), 7, dtype=torch.uint8),
+            role="assistant",
+            meta={_IMG_TAG_KEY: "gen"},
+        )
+    ]
+    sample_text_only = [ConversationItem(type="text", value="hello", role="user")]
+    for sample in (sample_rect_a, sample_rect_b, sample_text_only):
+        pre(_b([sample]))
+
+    assert sample_rect_a[0].value.shape == (3, 4, 8)
+    assert sample_rect_b[0].value.shape == (3, 8, 4)
+    assert sample_text_only[-1].is_dummy
+    assert sample_text_only[-1].value.shape == (3, 2, 2)
+
+    vae = _tiny_vae(downsample=2)
+
+    # 1. Online encode with ragged real + dummy micro-batch
+    online_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_text_only])
+    pre_inputs = vae.pre_forward("encode", conversation_list=online_batch)
+    assert pre_inputs["pixel_values"].shape == (3, 3, 8, 8)
+    encoded_out = vae.encode(**pre_inputs)
+    vae.post_forward("encode", **encoded_out)
+    assert online_batch[0][0].value.shape == (2, 2, 4)
+    assert online_batch[1][0].value.shape == (2, 4, 2)
+    assert online_batch[2][-1].value.shape == (2, 1, 1)
+
+    # 2. Offline encode with ragged real + dummy micro-batch
+    offline_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_text_only])
+    off_pre = vae.pre_forward("offline_encode", conversation_list=offline_batch)
+    assert off_pre["pixel_values"].shape == (3, 3, 8, 8)
+    off_out = vae.offline_encode(**off_pre)
+    vae.post_forward("offline_encode", **off_out)
+    assert offline_batch[0][0].value.shape == (2, 2, 2, 4)
+    assert offline_batch[1][0].value.shape == (2, 2, 4, 2)
+    assert offline_batch[2][-1].value.shape == (2, 2, 1, 1)

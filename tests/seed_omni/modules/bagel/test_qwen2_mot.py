@@ -133,30 +133,52 @@ def test_checkpoint_tensor_converter_combines_legacy_qkv_groups() -> None:
 
 
 def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> None:
-    """Verify fused runtime QKV parameters round-trip through split HF safetensors and ``load_model_weights``."""
+    """Verify fused runtime QKV parameters keep fused keys in ``state_dict`` / DCP and split on HF safetensors export."""
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
+
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
+    from veomni.utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
+
     torch.manual_seed(3014)
+    eager_cfg = BagelQwen2MoTConfig(**{**tiny_bagel_qwen2_cfg(), "num_key_value_heads": 1})
+    eager_ref = BagelQwen2MoT(eager_cfg)
+    eager_split_state = eager_ref.state_dict()
+    assert "model.layers.0.self_attn.q_proj.weight" in eager_split_state
+    assert "model.layers.0.self_attn.q_proj_moe_gen.weight" in eager_split_state
+
     reference = accelerated.BagelQwen2MoTAccelerated(_flex_config())
+    reference.load_state_dict(eager_split_state)
     internal_parameter_names = set(dict(reference.named_parameters()))
     assert "model.layers.0.self_attn.qkv_proj_und.weight" in internal_parameter_names
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" in internal_parameter_names
     assert "model.layers.0.self_attn.q_proj.weight" not in internal_parameter_names
     assert "model.layers.0.self_attn.q_proj_moe_gen.weight" not in internal_parameter_names
 
-    checkpoint_state = reference.state_dict()
-    assert "model.layers.0.self_attn.q_proj.weight" in checkpoint_state
-    assert "model.layers.0.self_attn.k_proj.weight" in checkpoint_state
-    assert "model.layers.0.self_attn.v_proj.weight" in checkpoint_state
-    assert "model.layers.0.self_attn.q_proj_moe_gen.weight" in checkpoint_state
-    assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_state
-    assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_state
+    # PyTorch state_dict() and DCP get_model_state_dict() keep fused parameter keys so
+    # FQN resolution works under DDP as well as FSDP2.
+    runtime_state = reference.state_dict()
+    dcp_state = get_model_state_dict(reference)
+    assert "model.layers.0.self_attn.qkv_proj_und.weight" in runtime_state
+    assert "model.layers.0.self_attn.qkv_proj_gen.weight" in runtime_state
+    assert "model.layers.0.self_attn.q_proj.weight" not in runtime_state
+    assert set(dcp_state) == set(runtime_state)
 
-    state_dict_loaded = accelerated.BagelQwen2MoTAccelerated(_flex_config())
-    state_dict_loaded.load_state_dict(checkpoint_state)
+    dcp_loaded = accelerated.BagelQwen2MoTAccelerated(_flex_config())
+    set_model_state_dict(dcp_loaded, dcp_state)
     for name in ("qkv_proj_und", "qkv_proj_gen"):
         expected = getattr(reference.model.layers[0].self_attn, name)
-        actual = getattr(state_dict_loaded.model.layers[0].self_attn, name)
+        actual = getattr(dcp_loaded.model.layers[0].self_attn, name)
         torch.testing.assert_close(actual.weight, expected.weight)
         torch.testing.assert_close(actual.bias, expected.bias)
+
+    # HF export reverts fused QKV back to split q_proj/k_proj/v_proj keys.
+    reverted_hf_state = _revert_model_weight_conversions_for_hf(reference, dict(dcp_state))
+    assert "model.layers.0.self_attn.q_proj.weight" in reverted_hf_state
+    assert "model.layers.0.self_attn.k_proj.weight" in reverted_hf_state
+    assert "model.layers.0.self_attn.v_proj.weight" in reverted_hf_state
+    assert "model.layers.0.self_attn.q_proj_moe_gen.weight" in reverted_hf_state
+    assert "model.layers.0.self_attn.qkv_proj_und.weight" not in reverted_hf_state
+    assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in reverted_hf_state
 
     reference.save_pretrained(tmp_path)
     with safe_open(tmp_path / SAFE_WEIGHTS_NAME, framework="pt", device="cpu") as checkpoint:
