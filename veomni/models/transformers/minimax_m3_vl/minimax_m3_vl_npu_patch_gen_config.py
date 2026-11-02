@@ -76,6 +76,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"],
 )
+config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_all_gather_into_tensor"])
 config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],

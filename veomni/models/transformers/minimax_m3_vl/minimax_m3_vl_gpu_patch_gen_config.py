@@ -50,6 +50,7 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
+from veomni.distributed.sequence_parallel.ulysses import _all_gather_into_tensor
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -80,6 +81,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"],
 )
+config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_all_gather_into_tensor"])
 config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["gather_seq_scatter_kv_heads", "prepare_ulysses_qkv", "restore_ulysses_output"],
@@ -336,7 +338,11 @@ def _minimax_m3_sparse_attention(
             group=parallel_state.ulysses_group,
             ulysses_size=parallel_state.ulysses_size,
         )
-        index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
+        # Index K has no grad and equal-length shards, so a fixed-size gather
+        # sizes its buffer locally and skips gather_outputs' host shape read.
+        # The gather is not differentiable: a trainable indexer needs autograd here.
+        index_key = _all_gather_into_tensor(index_key[0].contiguous(), group=parallel_state.ulysses_group)
+        index_key = index_key.unsqueeze(0)
 
     # The text model guarantees packed varlen metadata; training packs samples
     # with identical query/key boundaries.
