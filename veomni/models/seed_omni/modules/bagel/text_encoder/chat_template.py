@@ -106,6 +106,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
             if item.type != "text" or item.is_dummy or item.meta.get(_OMNI_TOKENIZED):
                 continue
 
+            raw_value = item.value
             token_ids = self._token_ids_for_text_item(item)
             loss_mask = int(item.meta.pop("loss_mask", int(item.role == "assistant")))
             item.value = token_ids
@@ -118,7 +119,8 @@ class BagelChatTemplate(TextEncoderChatTemplate):
             item.meta[_OMNI_TOKENIZED] = True
 
             if (
-                item.value in {self.chat_markers.bos_token, self.chat_markers.eos_token}
+                isinstance(raw_value, str)
+                and raw_value in {self.chat_markers.bos_token, self.chat_markers.eos_token}
                 and int(token_ids.numel()) != 1
             ):
                 raise ValueError("BAGEL start/end tokens must tokenize to exactly one token.")

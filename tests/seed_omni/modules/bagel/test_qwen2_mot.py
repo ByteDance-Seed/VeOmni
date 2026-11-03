@@ -589,3 +589,25 @@ def test_bagel_flow_connector_and_siglip_navit_support_lora_wrapped_projections(
         )
     assert siglip_out["image_embeds"].shape == (4, siglip_cfg.output_size)
     assert torch.isfinite(siglip_out["image_embeds"]).all()
+
+
+def test_bagel_qwen2_rotary_embedding_to_empty_from_meta_rebuilds_fp32_table() -> None:
+    """Verify ``BagelQwen2RotaryEmbedding`` built on ``meta`` rebuilds valid fp32 buffers on ``to_empty``."""
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2RotaryEmbedding
+
+    cfg = _flex_config()
+    ref_rotary = BagelQwen2RotaryEmbedding(cfg, device=torch.device("cpu"))
+    with torch.device("meta"):
+        meta_model = accelerated.BagelQwen2MoTAccelerated(cfg)
+    assert meta_model.model.rotary_emb.inv_freq.is_meta
+    assert meta_model.model.rotary_emb.original_inv_freq.is_meta
+
+    materialized = meta_model.to_empty(device="cpu").to(dtype=torch.bfloat16)
+    rotary = materialized.model.rotary_emb
+    assert not rotary.inv_freq.is_meta
+    assert not rotary.original_inv_freq.is_meta
+    assert rotary.inv_freq.dtype == torch.float32
+    assert rotary.original_inv_freq.dtype == torch.float32
+    assert rotary.inv_freq.data_ptr() != rotary.original_inv_freq.data_ptr()
+    torch.testing.assert_close(rotary.inv_freq, ref_rotary.inv_freq)
+    torch.testing.assert_close(rotary.original_inv_freq, ref_rotary.original_inv_freq)

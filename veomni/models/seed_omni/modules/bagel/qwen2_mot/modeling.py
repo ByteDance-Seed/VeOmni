@@ -703,15 +703,16 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
     def _apply(self, fn: Any, recurse: bool = True) -> nn.Module:
-        # Snapshot the true fp32 table before ``fn`` can quantize it (``.to(bfloat16)``).
-        # Casting first and then ``.float()`` keeps bf16 rounding, which is not official
-        # mixed-precision train (buffers stay fp32) and is not bitwise with a fresh table.
-        inv_freq = self.inv_freq.detach().to(dtype=torch.float32).clone()
-        original_inv_freq = self.original_inv_freq.detach().to(dtype=torch.float32).clone()
+        # Rebuild the true fp32 table after ``fn`` so ``.to(bfloat16)`` does not
+        # quantize rotary buffers and ``to_empty(device=...)`` from ``meta``
+        # materializes valid fp32 inverse frequencies on the target device.
         module = super()._apply(fn, recurse=recurse)
         device = self.inv_freq.device
-        self.inv_freq = inv_freq.to(device=device)
-        self.original_inv_freq = original_inv_freq.to(device=device)
+        if device.type == "meta":
+            return module
+        inv_freq, _ = self.compute_default_rope_parameters(self.config, device)
+        self.inv_freq = inv_freq
+        self.original_inv_freq = inv_freq.clone()
         return module
 
     @staticmethod

@@ -1006,19 +1006,19 @@ def test_bagel_siglip_preprocessor_from_pretrained_applies_config_overrides(tmp_
     assert pre._image_processor.min_image_size == 28
 
 
-def test_bagel_vae_encode_and_offline_encode_pad_per_sample_preprocessed_microbatch() -> None:
-    """Verify ``encode`` and ``offline_encode`` pad variable-shape images across per-sample-preprocessed micro-batches."""
+def test_bagel_vae_encode_and_offline_encode_preserve_native_shapes_and_match_independent_posteriors() -> None:
+    """Verify ``encode`` and ``offline_encode`` group equal shapes without spatial padding and match independent encoding."""
     pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=8, max_pixels=64),
         dtype=torch.float32,
-        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.float32),
-        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
+        dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.float32),
+        dummy_pixel_shape=torch.tensor([4, 4], dtype=torch.long),
     )
-    # Dataset-stage transform runs preprocessor on one sample at a time:
+    torch.manual_seed(42)
     sample_rect_a = [
         ConversationItem(
             type="image",
-            value=torch.full((3, 4, 8), 5, dtype=torch.uint8),
+            value=torch.randint(0, 255, (3, 4, 8), dtype=torch.uint8),
             role="assistant",
             meta={_IMG_TAG_KEY: "gen"},
         )
@@ -1026,38 +1026,162 @@ def test_bagel_vae_encode_and_offline_encode_pad_per_sample_preprocessed_microba
     sample_rect_b = [
         ConversationItem(
             type="image",
-            value=torch.full((3, 8, 4), 7, dtype=torch.uint8),
+            value=torch.randint(0, 255, (3, 8, 4), dtype=torch.uint8),
+            role="assistant",
+            meta={_IMG_TAG_KEY: "gen"},
+        )
+    ]
+    sample_rect_c = [
+        ConversationItem(
+            type="image",
+            value=torch.randint(0, 255, (3, 4, 8), dtype=torch.uint8),
             role="assistant",
             meta={_IMG_TAG_KEY: "gen"},
         )
     ]
     sample_text_only = [ConversationItem(type="text", value="hello", role="user")]
-    for sample in (sample_rect_a, sample_rect_b, sample_text_only):
+    for sample in (sample_rect_a, sample_rect_b, sample_rect_c, sample_text_only):
         pre(_b([sample]))
 
     assert sample_rect_a[0].value.shape == (3, 4, 8)
     assert sample_rect_b[0].value.shape == (3, 8, 4)
+    assert sample_rect_c[0].value.shape == (3, 4, 8)
     assert sample_text_only[-1].is_dummy
-    assert sample_text_only[-1].value.shape == (3, 2, 2)
+    assert sample_text_only[-1].value.shape == (3, 4, 4)
 
-    vae = _tiny_vae(downsample=2)
+    vae = _tiny_vae(ch_mult=[1, 1], downsample=2)
 
-    # 1. Online encode with ragged real + dummy micro-batch
-    online_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_text_only])
-    pre_inputs = vae.pre_forward("encode", conversation_list=online_batch)
-    assert pre_inputs["pixel_values"].shape == (3, 3, 8, 8)
-    encoded_out = vae.encode(**pre_inputs)
-    vae.post_forward("encode", **encoded_out)
-    assert online_batch[0][0].value.shape == (2, 2, 4)
-    assert online_batch[1][0].value.shape == (2, 4, 2)
-    assert online_batch[2][-1].value.shape == (2, 1, 1)
+    # Independent single-image offline_encode oracle
+    independent_posteriors = []
+    for sample in (sample_rect_a, sample_rect_b, sample_rect_c, sample_text_only):
+        single = copy.deepcopy([sample])
+        single_pre = vae.pre_forward("offline_encode", conversation_list=single)
+        single_out = vae.offline_encode(**single_pre)
+        vae.post_forward("offline_encode", **single_out)
+        independent_posteriors.append(single[0][-1].value)
 
-    # 2. Offline encode with ragged real + dummy micro-batch
-    offline_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_text_only])
+    # 1. Offline encode with ragged real + dummy micro-batch
+    offline_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_rect_c, sample_text_only])
     off_pre = vae.pre_forward("offline_encode", conversation_list=offline_batch)
-    assert off_pre["pixel_values"].shape == (3, 3, 8, 8)
+    assert isinstance(off_pre["pixel_values"], list)
+    assert [tuple(t.shape) for t in off_pre["pixel_values"]] == [(3, 4, 8), (3, 8, 4), (3, 4, 8), (3, 4, 4)]
     off_out = vae.offline_encode(**off_pre)
     vae.post_forward("offline_encode", **off_out)
     assert offline_batch[0][0].value.shape == (2, 2, 2, 4)
     assert offline_batch[1][0].value.shape == (2, 2, 4, 2)
-    assert offline_batch[2][-1].value.shape == (2, 2, 1, 1)
+    assert offline_batch[2][0].value.shape == (2, 2, 2, 4)
+    assert offline_batch[3][-1].value.shape == (2, 2, 2, 2)
+    for idx, expected_posterior in enumerate(independent_posteriors):
+        torch.testing.assert_close(offline_batch[idx][-1].value, expected_posterior)
+
+    # 2. Online encode with ragged real + dummy micro-batch (matching RNG sequence)
+    torch.manual_seed(777)
+    independent_latents = []
+    for sample in (sample_rect_a, sample_rect_b, sample_rect_c, sample_text_only):
+        single = copy.deepcopy([sample])
+        single_pre = vae.pre_forward("encode", conversation_list=single)
+        single_out = vae.encode(**single_pre)
+        vae.post_forward("encode", **single_out)
+        independent_latents.append(single[0][-1].value)
+
+    torch.manual_seed(777)
+    online_batch = copy.deepcopy([sample_rect_a, sample_rect_b, sample_rect_c, sample_text_only])
+    pre_inputs = vae.pre_forward("encode", conversation_list=online_batch)
+    encoded_out = vae.encode(**pre_inputs)
+    vae.post_forward("encode", **encoded_out)
+    assert online_batch[0][0].value.shape == (2, 2, 4)
+    assert online_batch[1][0].value.shape == (2, 4, 2)
+    assert online_batch[2][0].value.shape == (2, 2, 4)
+    assert online_batch[3][-1].value.shape == (2, 2, 2)
+    for idx, expected_latent in enumerate(independent_latents):
+        torch.testing.assert_close(online_batch[idx][-1].value, expected_latent)
+
+
+def test_bagel_flow_decode_velocity_reduces_loss_and_token_count_over_fsdp_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``decode_velocity_post`` reduces flow loss and valid-token counts over ``fsdp_group`` including zero-target ranks."""
+    import torch.distributed as dist
+
+    from veomni.models.seed_omni.modules.bagel.flow_connector.accelerated import accelerated as flow_acc
+
+    BagelFlowConnector = model_cls("bagel_flow_connector")
+    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
+    model = BagelFlowConnector(
+        BagelFlowConnectorConfig(
+            hidden_size=4,
+            z_channels=1,
+            latent_patch_size=1,
+            patch_latent_dim=2,
+            max_latent_size=4,
+            timestep_frequency_embedding_size=4,
+            timestep_shift=1.0,
+        )
+    )
+    fake_fsdp_group = object()
+    monkeypatch.setattr(
+        flow_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=1, cp_size=1, sp_group=None, fsdp_group=fake_fsdp_group),
+    )
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+
+    # Case 1: Generation rank (4 tokens) paired with a text-only rank (0 tokens on peer)
+    peer_loss_sum = 0.0
+    peer_tokens = 0
+
+    def _fake_all_reduce_gen_vs_text(tensor: torch.Tensor, group=None):
+        assert group is fake_fsdp_group
+        if tensor.dtype == torch.long:
+            tensor.add_(peer_tokens)
+        else:
+            tensor.add_(peer_loss_sum)
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce_gen_vs_text)
+
+    gen_item = ConversationItem(
+        type="image",
+        value=torch.ones(4, 4),
+        role="assistant",
+        meta={
+            BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
+            _IMG_TAG_KEY: "gen",
+            "flow_velocity_target": torch.zeros(4, 2),
+        },
+    )
+    gen_conv = [[gen_item]]
+    model.decode_velocity_pre(conversation_list=gen_conv)
+    pred_vel = torch.full((4, 2), 2.0, requires_grad=True)
+    gen_out = model.decode_velocity_post(pred_vel)
+    assert gen_out["_loss"].item() == pytest.approx(4.0)
+    gen_out["_loss"].backward()
+    # Single-rank unreduced grad per element is 2 * (2 - 0) / (4 * 2) = 0.5;
+    # with world_size=2 and peer_tokens=0, ReduceLoss scales backward by 2.0 so FSDP's /2 preserves 0.5.
+    torch.testing.assert_close(pred_vel.grad, torch.full_like(pred_vel, 1.0))
+
+    # Zero-target rank paired with the 4-token generation rank on peer (peer_loss_sum = 16.0, peer_tokens = 4)
+    peer_loss_sum = 16.0
+    peer_tokens = 4
+    text_conv = [[ConversationItem(type="text", value=torch.ones(2, 4), role="user")]]
+    model.decode_velocity_pre(conversation_list=text_conv)
+    dummy_vel = torch.ones(1, 2, requires_grad=True)
+    zero_out = model.decode_velocity_post(dummy_vel)
+    assert zero_out["_loss"].item() == pytest.approx(4.0)
+    zero_out["_loss"].backward()
+    torch.testing.assert_close(dummy_vel.grad, torch.zeros_like(dummy_vel))
+
+
+def test_bagel_chat_template_rejects_multi_token_start_or_end_markers() -> None:
+    """Verify ``BagelChatTemplate.tokenize`` raises when ``<|im_start|>`` or ``<|im_end|>`` splits into multiple tokens."""
+
+    class _SplittingTokenizer(_FakeBagelTokenizer):
+        def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
+            assert add_special_tokens is False
+            if text in {"<|im_start|>", "<|im_end|>"}:
+                return {"input_ids": [1, 2]}
+            return super().__call__(text, add_special_tokens=add_special_tokens)
+
+    template = BagelChatTemplate(_SplittingTokenizer())
+    for marker in ("<|im_start|>", "<|im_end|>"):
+        with pytest.raises(ValueError, match="BAGEL start/end tokens must tokenize to exactly one token"):
+            template.tokenize([ConversationItem(type="text", value=marker, role="user")])

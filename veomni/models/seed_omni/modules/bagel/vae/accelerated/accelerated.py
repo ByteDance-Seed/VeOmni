@@ -7,6 +7,7 @@ pre/forward/post hooks and offline-encoding-cache endpoints.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -14,7 +15,7 @@ import torch
 from veomni.utils.device import get_device_id, get_device_type
 
 from .......distributed.parallel_state import get_parallel_state
-from .......distributed.sequence_parallel import gather_outputs, slice_input_tensor
+from .......distributed.sequence_parallel import gather_outputs
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.offline_encoding_mixin import OfflineEncodingMixin
@@ -26,8 +27,8 @@ from ..modeling import BagelVAE, select_bagel_vae_context_items
 from ..processing import (
     BAGEL_VAE_PIXEL_SHAPE,
     BAGEL_VAE_POSTERIOR,
-    _pad_to_batch_size,
     crop_latent_to_image_shape,
+    unpad_vae_item_pixel_values,
 )
 
 
@@ -59,11 +60,15 @@ class BagelVAEOfflineMixin(OfflineEncodingMixin):
 
     def offline_encode(
         self,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | list[torch.Tensor],
         **kwargs: object,
     ) -> dict[str, Any]:
-        """Encode ``pixel_values`` into a stacked ``(mean, logvar)`` posterior tensor for offline caching."""
+        """Encode ``pixel_values`` into ``(mean, logvar)`` posterior tensor(s) for offline caching."""
         del kwargs
+        if isinstance(pixel_values, list):
+            posteriors = self._encode_posterior_list(pixel_values)
+            return {"encoded_cache": [torch.cat(posterior, dim=0).to(dtype=self.dtype) for posterior in posteriors]}
+
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
             posterior = self._encode_posterior(pixel_values)
@@ -89,27 +94,30 @@ class BagelVAEOfflineMixin(OfflineEncodingMixin):
         return {"latents": latents}
 
     @post_forward("offline_encode")
-    def offline_encode_post(self, encoded_cache: torch.Tensor) -> dict[str, Any]:
+    def offline_encode_post(self, encoded_cache: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
         """Gather SP shards, crop cached posteriors to each image's shape, and store on carrier items."""
         if get_parallel_state().sp_size > 1:
-            # Keep the CNN's spatial outputs intact through gather; crop each
-            # cache item from its original pixel shape only after batch unpadding.
-            encoded_cache = self._gather_encode_output(encoded_cache)
+            if isinstance(encoded_cache, list):
+                encoded_cache = self._gather_encode_output_list(encoded_cache)
+            else:
+                encoded_cache = self._gather_encode_output(encoded_cache)
 
         conversation = self._conversation_carrier
         encode_items = self._encode_items
         self._conversation_carrier = None
         self._encode_items = []
         self._sp_encode_count = None
+        self._sp_latent_shapes = None
 
+        z_channels = int(self.config.z_channels)
         for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
             item.type = "image"
-            cache_tensor = crop_latent_to_image_shape(
-                cache_tensor,
-                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
-            z_channels = int(self.config.z_channels)
+            if not isinstance(encoded_cache, list):
+                cache_tensor = crop_latent_to_image_shape(
+                    cache_tensor,
+                    item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                    downsample=int(self.config.downsample),
+                )
             if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
                 cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
@@ -172,6 +180,7 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._encode_items: list[ConversationItem] = []
         self._sp_encode_count: int | None = None
+        self._sp_latent_shapes: list[tuple[int, int]] | None = None
 
     @pre_forward("encode", "offline_encode")
     def encode_pre(
@@ -179,7 +188,7 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Stack VAE context images into a batch tensor and slice across Ulysses SP ranks if enabled."""
+        """Collect unpadded VAE context images and slice across Ulysses SP ranks if enabled."""
         del kwargs
         self._conversation_carrier = conversation_list
 
@@ -187,38 +196,46 @@ class TrainingMixin(TrainingModuleMixin):
 
         self._metric_meter_stash_latent_tokens(self._vae_latent_token_lengths())
 
-        pixel_values = torch.stack(_pad_to_batch_size([item.value for item in self._encode_items]), dim=0).to(
-            device=self.device, dtype=self.dtype, non_blocking=True
-        )
+        pixel_values = [
+            unpad_vae_item_pixel_values(item).to(device=self.device, dtype=self.dtype, non_blocking=True)
+            for item in self._encode_items
+        ]
         ps = get_parallel_state()
         if ps.sp_size == 1:
             self._sp_encode_count = None
+            self._sp_latent_shapes = None
             return {"pixel_values": pixel_values}
 
         if ps.cp_size != 1:
             raise ValueError(f"BAGEL VAE training supports Ulysses groups only; got cp_size={ps.cp_size}.")
 
-        self._sp_encode_count = int(pixel_values.shape[0])
+        self._sp_encode_count = len(pixel_values)
         if self._sp_encode_count == 0:
             raise ValueError("BAGEL VAE SP requires at least one real or dummy image.")
-        # Slice only the image-batch dimension. Processor-added spatial zero
-        # padding is part of each image canvas and must pass through the CNN.
-        pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=ps.sp_group)
-        return {"pixel_values": pixel_values}
+
+        pad_count = (-self._sp_encode_count) % ps.sp_size
+        padded_pixels = pixel_values + [pixel_values[-1]] * pad_count
+        ds = max(int(self.config.downsample), 1)
+        self._sp_latent_shapes = [(int(image.shape[-2]) // ds, int(image.shape[-1]) // ds) for image in padded_pixels]
+        per_rank = len(padded_pixels) // ps.sp_size
+        start = ps.sp_rank * per_rank
+        return {"pixel_values": padded_pixels[start : start + per_rank]}
 
     @post_forward("encode", "online_process")
     def encode_post(self, latents: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
-        """Gather SP latent shards, crop spatial padding, and write latents onto conversation items."""
-        if not isinstance(latents, list) and get_parallel_state().sp_size > 1:
-            # Remove SP's batch-padding images first. Per-image spatial latent
-            # padding is cropped below from BAGEL_VAE_PIXEL_SHAPE after gather.
-            latents = self._gather_encode_output(latents)
+        """Gather SP latent shards, crop spatial padding if needed, and write latents onto conversation items."""
+        if get_parallel_state().sp_size > 1 and self._sp_encode_count is not None:
+            if isinstance(latents, list):
+                latents = self._gather_encode_output_list(latents)
+            else:
+                latents = self._gather_encode_output(latents)
 
         conversation = self._conversation_carrier
         encode_items = self._encode_items
         self._conversation_carrier = None
         self._encode_items = []
         self._sp_encode_count = None
+        self._sp_latent_shapes = None
 
         if isinstance(latents, list):
             for item, latent in zip(encode_items, latents, strict=True):
@@ -243,6 +260,41 @@ class TrainingMixin(TrainingModuleMixin):
             raise RuntimeError("BAGEL VAE SP image count was not initialized.")
         output = gather_outputs(output, gather_dim=0, group=get_parallel_state().sp_group)
         return output.narrow(0, 0, self._sp_encode_count)
+
+    def _gather_encode_output_list(self, outputs: list[torch.Tensor]) -> list[torch.Tensor]:
+        """All-gather variable-shape per-image VAE outputs across the SP group and trim SP padding."""
+        if self._sp_encode_count is None or self._sp_latent_shapes is None:
+            raise RuntimeError("BAGEL VAE SP image shapes were not initialized.")
+        ps = get_parallel_state()
+        per_rank = len(self._sp_latent_shapes) // ps.sp_size
+        if len(outputs) != per_rank:
+            raise RuntimeError(f"BAGEL VAE SP local output count mismatch: expected {per_rank}, got {len(outputs)}.")
+        leading_shape = tuple(int(dim) for dim in outputs[0].shape[:-2])
+        leading_numel = math.prod(leading_shape)
+        rank_numels = [
+            sum(
+                leading_numel * height * width
+                for height, width in self._sp_latent_shapes[rank * per_rank : (rank + 1) * per_rank]
+            )
+            for rank in range(ps.sp_size)
+        ]
+        max_rank_numel = max(rank_numels)
+        flat_local = torch.cat([tensor.reshape(-1) for tensor in outputs], dim=0)
+        if int(flat_local.numel()) < max_rank_numel:
+            flat_local = torch.nn.functional.pad(flat_local, (0, max_rank_numel - int(flat_local.numel())))
+        gathered = gather_outputs(flat_local.unsqueeze(0), gather_dim=0, group=ps.sp_group)
+
+        restored: list[torch.Tensor] = []
+        for rank in range(ps.sp_size):
+            offset = 0
+            rank_flat = gathered[rank]
+            for height, width in self._sp_latent_shapes[rank * per_rank : (rank + 1) * per_rank]:
+                numel = leading_numel * height * width
+                restored.append(rank_flat[offset : offset + numel].reshape(*leading_shape, height, width))
+                offset += numel
+                if len(restored) == self._sp_encode_count:
+                    return restored
+        return restored
 
     def _vae_latent_token_lengths(self) -> list[int]:
         """Compute the unpadded latent grid token count per encoded image for FLOPs metering."""

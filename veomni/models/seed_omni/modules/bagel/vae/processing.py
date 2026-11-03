@@ -262,6 +262,25 @@ def _pad_to_batch_size(images: list[torch.Tensor]) -> list[torch.Tensor]:
     return padded
 
 
+def unpad_vae_item_pixel_values(item: ConversationItem) -> torch.Tensor:
+    """Return ``item.value`` cropped to its ``BAGEL_VAE_PIXEL_SHAPE`` if present."""
+    pixel_values = item.value
+    if not torch.is_tensor(pixel_values):
+        raise TypeError("BAGEL VAE item value must be a tensor.")
+    if pixel_values.dim() == 4 and int(pixel_values.shape[0]) == 1:
+        pixel_values = pixel_values.squeeze(0)
+    if pixel_values.dim() != 3:
+        raise ValueError(f"BAGEL VAE expects rank-3 [C, H, W] image tensor, got {tuple(pixel_values.shape)}.")
+    pixel_shape = item.meta.get(BAGEL_VAE_PIXEL_SHAPE)
+    if torch.is_tensor(pixel_shape):
+        dims = pixel_shape.detach().reshape(-1).tolist()
+        if len(dims) != 2:
+            raise ValueError("BAGEL VAE pixel shape metadata must contain [height, width].")
+        height, width = int(dims[0]), int(dims[1])
+        pixel_values = pixel_values[..., :height, :width]
+    return pixel_values
+
+
 def crop_latent_to_image_shape(
     latent: torch.Tensor,
     pixel_shape: torch.Tensor | None,
@@ -465,7 +484,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
 
     def bind_dummy_inputs(self, config: BagelVAEConfig, dtype: torch.dtype | None = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
-        size = max(int(config.image_stride), int(config.downsample))
+        size = max(int(config.image_stride), int(config.downsample) * 2)
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(int(config.in_channels), size, size, dtype=dtype)
         self._dummy_pixel_shape = torch.tensor([size, size], dtype=torch.long)
@@ -509,11 +528,12 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
             for item, pixels, pixel_shape in zip(
                 image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
             ):
-                item.value = pixels.to(dtype=self._dtype)
+                dims = pixel_shape.detach().reshape(-1).tolist()
+                height, width = int(dims[0]), int(dims[1])
+                item.value = pixels[..., :height, :width].contiguous().to(dtype=self._dtype)
                 item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
                 item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
-                dims = pixel_shape.detach().reshape(-1).tolist()
-                item.meta[_OMNI_TOKEN_LEN] = max(1, (int(dims[0]) // stride) * (int(dims[1]) // stride))
+                item.meta[_OMNI_TOKEN_LEN] = max(1, (height // stride) * (width // stride))
 
         if not missing_samples:
             return
@@ -560,4 +580,5 @@ __all__ = [
     "copy_image_item",
     "crop_latent_to_image_shape",
     "route_image_contexts",
+    "unpad_vae_item_pixel_values",
 ]
