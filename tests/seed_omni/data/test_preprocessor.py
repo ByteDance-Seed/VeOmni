@@ -251,3 +251,31 @@ def test_seedomni_transform_and_iterative_dataset_skip_samples_exceeding_max_seq
     yielded = list(ds)
     assert len(yielded) == 1
     assert get_length_fn(yielded[0][0]) == 8
+
+    # ShardedIterableDataset + IterativeDataset filters before DP round assignment,
+    # so a finite stream with overlong rows never exhausts unevenly across DP ranks.
+    from veomni.data.dataset import MappingDataset, ShardedIterableDataset
+
+    finite_stream = [long_example, short_example, short_example]
+    transform_fn = partial(process_seedomni_example, processor=processor, max_seq_len=10)
+    rank0_items = list(
+        IterativeDataset(
+            ShardedIterableDataset(finite_stream, dp_rank=0, dp_size=2, repeat=False), transform=transform_fn
+        )
+    )
+    rank1_items = list(
+        IterativeDataset(
+            ShardedIterableDataset(finite_stream, dp_rank=1, dp_size=2, repeat=False), transform=transform_fn
+        )
+    )
+    assert len(rank0_items) == len(rank1_items) == 1
+
+    # MappingDataset + MakeMicroBatchCollator (datasets_type="mapping", dyn_bsz=False)
+    # probes to the next valid sample instead of returning [] and raising IndexError.
+    from veomni.data.data_collator import MakeMicroBatchCollator
+
+    map_ds = MappingDataset([long_example, short_example], transform=transform_fn)
+    collator = MakeMicroBatchCollator(num_micro_batch=1, internal_data_collator=SeedOmniCollator())
+    micro_batches = collator([map_ds[0], map_ds[1]])
+    assert len(micro_batches) == 1
+    assert len(micro_batches[0]["conversation_list"]) == 2

@@ -304,6 +304,77 @@ def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatc
     scatter_llm_hidden_states(out_conv, [torch.zeros(3, 32), torch.zeros(2, 32), torch.zeros(4, 32)])
 
 
+def test_qwen3_accelerated_packed_flex_attention_builds_block_mask_and_matches_separate_forwards(monkeypatch):
+    import copy
+
+    import veomni.models.seed_omni.modules.qwen3.llm.accelerated.accelerated as qwen3_llm_acc
+    from veomni.ops.kernels.attention import lookup
+
+    class _FlexOp:
+        impl = "veomni_flex_attention"
+
+        def __init__(self):
+            self._fn = lookup("veomni_flex_attention")
+
+        def __call__(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        qwen3_llm_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=False, sp_size=1, sp_group=None),
+    )
+    Qwen3LlmAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    torch.manual_seed(42)
+    llm_packed = Qwen3LlmAcc(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
+        )
+    ).eval()
+    llm_packed.config.text_config.ops_implementation["attn_implementation"] = "veomni_flex_attention"
+    llm_packed.config.text_config._attn_implementation = "veomni_flex_attention"
+    for layer in llm_packed.language_model.layers:
+        layer.self_attn.veomni_attn = _FlexOp()
+    llm_sep = copy.deepcopy(llm_packed).eval()
+
+    s0_u = torch.randn(3, 32)
+    s0_a = torch.randn(2, 32)
+    s1_u = torch.randn(4, 32)
+
+    with torch.no_grad():
+        conversations = [
+            [
+                ConversationItem(type="text", value=s0_u.clone(), role="user"),
+                ConversationItem(type="text", value=s0_a.clone(), role="assistant"),
+            ],
+            [
+                ConversationItem(type="text", value=s1_u.clone(), role="user"),
+            ],
+        ]
+        pre_out = llm_packed.pre_forward("forward", conversation_list=conversations)
+        assert isinstance(pre_out["attention_mask"], dict) and "full_attention" in pre_out["attention_mask"]
+        out_conv = llm_packed.post_forward("forward", **llm_packed(**pre_out))["conversation_list"]
+
+        conv_0 = [
+            [
+                ConversationItem(type="text", value=s0_u.clone(), role="user"),
+                ConversationItem(type="text", value=s0_a.clone(), role="assistant"),
+            ]
+        ]
+        pre_0 = llm_sep.pre_forward("forward", conversation_list=conv_0)
+        out_0 = llm_sep.post_forward("forward", **llm_sep(**pre_0))["conversation_list"]
+
+        conv_1 = [[ConversationItem(type="text", value=s1_u.clone(), role="user")]]
+        pre_1 = llm_sep.pre_forward("forward", conversation_list=conv_1)
+        out_1 = llm_sep.post_forward("forward", **llm_sep(**pre_1))["conversation_list"]
+
+        torch.testing.assert_close(out_conv[0][0].value, out_0[0][0].value, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_conv[0][1].value, out_0[0][1].value, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_conv[1][0].value, out_1[0][0].value, atol=1e-5, rtol=1e-5)
+
+
 def test_qwen3_text_encoder_generate_works_with_omitted_generation_kwargs():
     Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
     te = Qwen3TextEncoder(Qwen3TextEncoderConfig(vocab_size=32, hidden_size=16, tie_word_embeddings=True))

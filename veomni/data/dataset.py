@@ -93,10 +93,14 @@ class MappingDataset(Dataset):
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
         mapped_idx = self._get_mapped_index(index)
-        if self._transform is not None:
-            return self._transform(self._data[mapped_idx])
-        else:
+        if self._transform is None:
             return self._data[mapped_idx]
+        for offset in range(self.data_len):
+            candidate_idx = (mapped_idx + offset) % self.data_len
+            transformed = self._transform(self._data[candidate_idx])
+            if transformed:
+                return transformed
+        raise ValueError("All samples in MappingDataset were filtered out by transform.")
 
 
 class IterativeDataset(IterableDataset):
@@ -105,6 +109,9 @@ class IterativeDataset(IterableDataset):
         self._transform = transform
 
     def __iter__(self):
+        if isinstance(self._data, ShardedIterableDataset):
+            yield from self._data.iter_with_transform(self._transform)
+            return
         for sample in self._data:
             if self._transform is not None:
                 sample = self._transform(sample)
@@ -166,7 +173,7 @@ class ShardedIterableDataset(IterableDataset):
     def set_epoch(self, epoch: int):
         self._epoch = epoch
 
-    def __iter__(self):
+    def iter_with_transform(self, transform: Optional[Callable] = None):
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
@@ -187,6 +194,10 @@ class ShardedIterableDataset(IterableDataset):
             if hasattr(dataset, "set_epoch"):
                 dataset.set_epoch(self._seed + self._epoch + pass_i)
             for sample in dataset:
+                if transform is not None:
+                    sample = transform(sample)
+                    if not sample:
+                        continue
                 if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
                     pending.append(sample)
                 index += 1
@@ -205,27 +216,39 @@ class ShardedIterableDataset(IterableDataset):
                 return
             pass_i += 1
 
+    def __iter__(self):
+        return self.iter_with_transform(None)
+
 
 class InterleavedIterableDataset(IterativeDataset):
     def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
         self._data = data
         self._transform = transform
 
+    def _transform_sample(self, sample):
+        ds_idx = sample["ds_idx"]
+        source_name = sample.get("source_name", None)
+        transformed_sample = self._transform(sample, source_name=source_name)
+        if not transformed_sample:
+            return []
+        if isinstance(transformed_sample, List):
+            for idx in range(len(transformed_sample)):
+                transformed_sample[idx]["ds_idx"] = ds_idx
+            return transformed_sample
+        transformed_sample["ds_idx"] = ds_idx
+        return transformed_sample
+
     def __iter__(self):
+        if isinstance(self._data, ShardedIterableDataset):
+            transform = self._transform_sample if self._transform is not None else None
+            yield from self._data.iter_with_transform(transform)
+            return
         for sample in self._data:
             if self._transform is not None:
-                ds_idx = sample["ds_idx"]
-                source_name = sample.get("source_name", None)
-                transformed_sample = self._transform(sample, source_name=source_name)
+                transformed_sample = self._transform_sample(sample)
                 if not transformed_sample:
                     continue
-                if isinstance(transformed_sample, List):
-                    for idx in range(len(transformed_sample)):
-                        transformed_sample[idx]["ds_idx"] = ds_idx
-                    yield transformed_sample
-                else:
-                    transformed_sample["ds_idx"] = ds_idx
-                    yield transformed_sample
+                yield transformed_sample
             else:
                 yield sample
 
@@ -233,19 +256,23 @@ class InterleavedIterableDataset(IterativeDataset):
 class InterleavedMappingDataset(MappingDataset):
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
         mapped_idx = self._get_mapped_index(index)
-        if self._transform is not None:
-            sample = self._data[mapped_idx]
+        if self._transform is None:
+            return self._data[mapped_idx]
+        for offset in range(self.data_len):
+            candidate_idx = (mapped_idx + offset) % self.data_len
+            sample = self._data[candidate_idx]
             ds_idx = sample["ds_idx"]
             source_name = sample.get("source_name", None)
             transformed_sample = self._transform(sample, source_name=source_name)
+            if not transformed_sample:
+                continue
             if isinstance(transformed_sample, List):
                 for idx in range(len(transformed_sample)):
                     transformed_sample[idx]["ds_idx"] = ds_idx
             else:
                 transformed_sample["ds_idx"] = ds_idx
             return transformed_sample
-        else:
-            return self._data[mapped_idx]
+        raise ValueError("All samples in InterleavedMappingDataset were filtered out by transform.")
 
 
 class EnergonDataset(IterativeDataset):
