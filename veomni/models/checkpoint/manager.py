@@ -33,7 +33,6 @@ import hashlib
 import marshal
 import math
 import types
-import weakref
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
@@ -204,7 +203,6 @@ class ModelCheckpointManager:
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         self._last_saved_optimizer_generation = None
-        self._last_saved_multi_optimizer_ref = None
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -328,7 +326,6 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
-        self._last_saved_multi_optimizer_ref = None
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         load_dir = self.load_dir()
@@ -420,7 +417,6 @@ class ModelCheckpointManager:
         dataloader is, the rng — has its own writer.
         """
         self._last_saved_optimizer_generation = None
-        self._last_saved_multi_optimizer_ref = None
         if self._last_saved_step == state.global_step:
             # A failed rewrite may already have invalidated the old DCP marker.
             # A later export must not reuse the previous same-step receipt.
@@ -474,17 +470,6 @@ class ModelCheckpointManager:
         clear_cache("clearing cache after MultiOptimizer checkpoint save")
         dist.barrier()
         if multi:
-            error = (
-                RuntimeError("MultiOptimizer changed while saving its checkpoint")
-                if self.runtime.optimizer is not optimizer
-                else None
-            )
-            group = dist.group.WORLD if dist.is_initialized() else None
-            raise_if_any_rank_failed(error, "checking saved MultiOptimizer identity", group=group)
-            try:
-                self._last_saved_multi_optimizer_ref = weakref.ref(optimizer)
-            except TypeError:
-                self._last_saved_multi_optimizer_ref = None
             self._last_saved_optimizer_generation = generation
         self._last_saved_step = state.global_step
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
