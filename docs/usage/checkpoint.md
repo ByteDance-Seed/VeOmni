@@ -67,14 +67,6 @@ to match the optimizer checkpoint and step. Checkpoint managers without this
 protocol retain their existing behavior; their optimizer-to-cursor identity is
 not established by the dynamic-batching cursor checks alone.
 
-When reusing a same-step checkpoint for an export or epoch save, ranks also
-compare the available optimizer generation identifiers. A disagreement fails
-the save; restart the process and restore a verified checkpoint before saving
-again. This adds a small metadata collective at
-the affected checkpoint events and does not change tensor precision. An HF or
-LoRA export may already have written files when the mismatch is discovered;
-only treat the export as complete if the save call succeeds.
-
 Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
 before training, and set `data.resume_input_deterministic=true` only when the
 input snapshot, tokenizer, chat template, processor, collator and transforms are
