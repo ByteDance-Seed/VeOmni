@@ -92,8 +92,11 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    if IS_NPU_AVAILABLE:
-        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
+    # deepseek_v4's context parallelism is validated on Ascend; every other model stays GPU-only.
+    if IS_NPU_AVAILABLE and getattr(config, "model_type", None) != "deepseek_v4":
+        raise NotImplementedError(
+            "Context parallelism is GPU-only in this release except for deepseek_v4; set cp_size=1 on Ascend/NPU runs."
+        )
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 

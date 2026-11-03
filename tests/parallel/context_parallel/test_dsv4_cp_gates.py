@@ -52,7 +52,7 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen4_exp"])
+@pytest.mark.parametrize("model_type", ["qwen4_exp"])
 def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(
@@ -64,6 +64,18 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
 
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(SimpleNamespace(model_type=model_type))
+
+
+def test_gate_allows_deepseek_v4_context_parallel_on_npu(monkeypatch):
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        auto_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True),
+    )
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+
+    check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen4_exp"])
