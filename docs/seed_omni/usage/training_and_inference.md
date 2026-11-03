@@ -129,10 +129,10 @@ Common overrides:
 
 - `--train.global_batch_size` / `--train.micro_batch_size`: global vs per-step
   micro batch.
-- `--data.max_seq_len`: full-sample (pre-SP) token cap and `dyn_bsz` pack unit.
-  Samples whose real token count (text + media) exceeds `max_seq_len` are
-  skipped in `seedomni_transform` rather than truncated. `sp_size` is **not**
-  multiplied into this cap (e.g. `max_seq_len=4096` with `ulysses_size=4` means
+- `--data.max_seq_len`: pre-SP `dyn_bsz` token budget unit
+  (`micro_batch_size * max_seq_len`). Samples exceeding that budget are skipped
+  by `dyn_bsz` rather than truncated. `sp_size` is **not** multiplied into this
+  cap (e.g. `micro_batch_size=1, max_seq_len=4096` with `ulysses_size=4` means
   at most `1024` tokens per SP rank for a single sample), so raise
   `data.max_seq_len` when training long sequences with SP/CP or multi-image /
   video data to avoid dropping the dataset.

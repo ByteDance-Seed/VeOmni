@@ -173,18 +173,19 @@ placeholders when it reaches `DynamicBatchingSizeDataset` / `TextBatchingStrateg
   `is_dummy=True` items and sums `(meta["labels"] != -100).sum()` on text items
   plus `meta["_omni_token_len"]` on `role == "assistant"` media items (`0` on
   `role == "user"` media items).
-- **Overlong sample filtering (`data.max_seq_len`):** Because multimodal
-  conversations cannot be truncated mid-turn without corrupting media
-  placeholders or vision wrapper spans, `seedomni_transform` **skips** any
-  sample whose real (non-`is_dummy`) token length exceeds `data.max_seq_len`
-  (returning `[]` with a warning). This check is **SP-agnostic** —
-  `data.max_seq_len` is the **full pre-SP sample limit**, not per-SP-rank (for
-  example, `max_seq_len: 4096` with `ulysses_size: 4` caps a single sample at
-  `4096` total tokens, i.e. at most `1024` tokens per rank). When training on
-  long multimodal samples (multi-image, video, high-resolution ViT) or scaling
-  context length with SP/CP, raise `data.max_seq_len` to cover the full global
-  sample length; leaving the default (`2048` in `OmniDataArguments`) can drop
-  most or all of the dataset.
+- **Overlong sample skipping (`dyn_bsz` + `data.max_seq_len`):** Because
+  multimodal conversations cannot be truncated mid-turn without corrupting media
+  placeholders or vision wrapper spans, `seedomni_transform` does not slice
+  samples; instead, `dyn_bsz` (`TextBatchingStrategy` and
+  `DynamicBatchingSizeDataset`) **skips** any sample whose token length exceeds
+  `micro_batch_size * data.max_seq_len` (logging a warning). This budget is
+  **SP-agnostic** — `data.max_seq_len` is the **pre-SP global limit**, not
+  per-SP-rank (for example, `micro_batch_size: 1`, `max_seq_len: 4096` with
+  `ulysses_size: 4` caps a sample at `4096` total tokens, i.e. at most `1024`
+  tokens per rank). When training on long multimodal samples (multi-image,
+  video, high-resolution ViT) or scaling context length with SP/CP, raise
+  `data.max_seq_len` to cover the full global sample length; leaving the default
+  (`2048` in `OmniDataArguments`) can drop most or all of the dataset.
 
 `SeedOmniCollator` then groups the selected per-sample dicts into a micro-batch
 `{"conversation_list": [sample_0, sample_1, ...]}` for `OmniModel.forward`

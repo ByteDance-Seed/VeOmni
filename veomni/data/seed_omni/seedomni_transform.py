@@ -246,7 +246,7 @@ def process_seedomni_example(
 
     conversation_list = _build_conversation_list(constructed, media)
     if processor is not None:
-        return _filter_overlong_sample(processor.preprocess(conversation_list), kwargs.get("max_seq_len"))
+        return [processor.preprocess(conversation_list)]
     return [{"conversation_list": conversation_list}]
 
 
@@ -262,36 +262,10 @@ def process_seedomni_cached_example(
     ``conversation_list`` as pickle bytes so cached tensors keep their exact
     dtype/shape and no source-specific raw dataset parsing runs on reload.
     """
+    del kwargs
     conversation_list = example["conversation_list"]
     if isinstance(conversation_list, (bytes, bytearray)):
         conversation_list = pickle.loads(conversation_list)
     if processor is not None:
-        return _filter_overlong_sample(processor.preprocess(conversation_list), kwargs.get("max_seq_len"))
+        return [processor.preprocess(conversation_list)]
     return [{"conversation_list": conversation_list}]
-
-
-def _filter_overlong_sample(
-    sample: dict[str, Any],
-    max_seq_len: int | None,
-) -> list[dict[str, Any]]:
-    """Skip a preprocessed sample whose real (non-dummy) token length exceeds ``max_seq_len``.
-
-    Multimodal conversations cannot be safely truncated mid-turn without
-    corrupting media placeholders or vision wrapper spans, so an oversized
-    sample is dropped (returns ``[]``) rather than sliced.
-    """
-    if max_seq_len is not None:
-        from ...utils import logging
-        from ..dataset import _conversation_total_length, get_length_fn
-
-        if "conversation_list" in sample:
-            real_items = [item for item in sample["conversation_list"] if not getattr(item, "is_dummy", False)]
-            token_len = _conversation_total_length(real_items) if real_items else 0
-        else:
-            token_len = get_length_fn(sample)
-        if token_len > max_seq_len:
-            logging.get_logger(__name__).warning(
-                f"SeedOmni sample token length {token_len} exceeds max_seq_len {max_seq_len}, skipping."
-            )
-            return []
-    return [sample]

@@ -197,10 +197,11 @@ def test_seedomni_transform_runs_processor_and_supports_dyn_bsz_lengths():
     assert get_length_by_labels_fn(cached_sample) == 2
 
 
-def test_seedomni_transform_and_iterative_dataset_skip_samples_exceeding_max_seq_len():
-    from functools import partial
+def test_dyn_bsz_skips_seedomni_samples_exceeding_token_budget():
+    from torch.utils.data import IterableDataset
 
-    from veomni.data.dataset import IterativeDataset
+    from veomni.data.dataset import DynamicBatchingSizeDataset
+    from veomni.data.dynamic_batching import TextBatchingStrategy
 
     processor = OmniProcessor(
         {
@@ -214,7 +215,7 @@ def test_seedomni_transform_and_iterative_dataset_skip_samples_exceeding_max_seq
         "images": [_png_bytes(4, 4)],  # 4 visual tokens
         "conversations": [
             {"from": "human", "value": "<image>hi"},  # 2 text tokens
-            {"from": "gpt", "value": "ok"},  # 2 text tokens -> 8 real tokens total
+            {"from": "gpt", "value": "ok"},  # 2 text tokens -> 8 tokens total
         ],
     }
     long_example = {
@@ -222,60 +223,37 @@ def test_seedomni_transform_and_iterative_dataset_skip_samples_exceeding_max_seq
         "images": [_png_bytes(8, 8)],  # 16 visual tokens
         "conversations": [
             {"from": "human", "value": "<image>hello"},  # 5 text tokens
-            {"from": "gpt", "value": "world"},  # 5 text tokens -> 26 real tokens total
+            {"from": "gpt", "value": "world"},  # 5 text tokens -> 26 tokens total
         ],
     }
 
-    assert process_seedomni_example(long_example, processor=processor, max_seq_len=10) == []
-    assert len(process_seedomni_example(short_example, processor=processor, max_seq_len=10)) == 1
+    (short_sample,) = process_seedomni_example(short_example, processor=processor)
+    (long_sample,) = process_seedomni_example(long_example, processor=processor)
+    assert get_length_fn(short_sample) == 8
+    assert get_length_fn(long_sample) == 26
 
-    # Text-only cached row has 6 real tokens ("abcd" + "ef") plus a 4-token FSDP dummy anchor;
-    # max_seq_len=6 must keep it (dummy anchor does not count against real sequence budget),
-    # while max_seq_len=5 must skip it.
-    cached_row = {
-        "conversation_list": pickle.dumps(
-            [
-                ConversationItem(type="text", value="abcd", role="user"),
-                ConversationItem(type="text", value="ef", role="assistant"),
-            ]
-        )
-    }
-    assert len(process_seedomni_cached_example(cached_row, processor=processor, max_seq_len=6)) == 1
-    assert process_seedomni_cached_example(cached_row, processor=processor, max_seq_len=5) == []
+    # 1) Main-process dyn_bsz (TextBatchingStrategy) skips overlong samples (> token_micro_bsz).
+    strategy = TextBatchingStrategy(token_micro_bsz=10, buffer_size=1)
+    strategy.put_item(long_sample)
+    assert len(strategy.buffer) == 0
+    strategy.put_item(short_sample)
+    assert len(strategy.buffer) == 1
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert len(micro_batch) == 1 and get_length_fn(micro_batch[0]) == 8
 
-    # IterativeDataset skips empty [] results from overlong samples.
-    ds = IterativeDataset(
-        [long_example, short_example],
-        transform=partial(process_seedomni_example, processor=processor, max_seq_len=10),
+    # 2) Worker-process dyn_bsz (DynamicBatchingSizeDataset) also skips overlong samples.
+    class _Stream(IterableDataset):
+        def __iter__(self):
+            yield [long_sample]
+            yield [short_sample]
+
+    dyn_ds = DynamicBatchingSizeDataset(
+        dataset=_Stream(),
+        micro_batch_seq_length=10,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=SeedOmniCollator(),
+        save_by_idx=False,
     )
-    yielded = list(ds)
-    assert len(yielded) == 1
-    assert get_length_fn(yielded[0][0]) == 8
-
-    # ShardedIterableDataset + IterativeDataset filters before DP round assignment,
-    # so a finite stream with overlong rows never exhausts unevenly across DP ranks.
-    from veomni.data.dataset import MappingDataset, ShardedIterableDataset
-
-    finite_stream = [long_example, short_example, short_example]
-    transform_fn = partial(process_seedomni_example, processor=processor, max_seq_len=10)
-    rank0_items = list(
-        IterativeDataset(
-            ShardedIterableDataset(finite_stream, dp_rank=0, dp_size=2, repeat=False), transform=transform_fn
-        )
-    )
-    rank1_items = list(
-        IterativeDataset(
-            ShardedIterableDataset(finite_stream, dp_rank=1, dp_size=2, repeat=False), transform=transform_fn
-        )
-    )
-    assert len(rank0_items) == len(rank1_items) == 1
-
-    # MappingDataset + MakeMicroBatchCollator (datasets_type="mapping", dyn_bsz=False)
-    # probes to the next valid sample instead of returning [] and raising IndexError.
-    from veomni.data.data_collator import MakeMicroBatchCollator
-
-    map_ds = MappingDataset([long_example, short_example], transform=transform_fn)
-    collator = MakeMicroBatchCollator(num_micro_batch=1, internal_data_collator=SeedOmniCollator())
-    micro_batches = collator([map_ds[0], map_ds[1]])
-    assert len(micro_batches) == 1
-    assert len(micro_batches[0]["conversation_list"]) == 2
+    batches = list(dyn_ds)
+    assert len(batches) == 1
+    assert len(batches[0]["conversation_list"]) == 1

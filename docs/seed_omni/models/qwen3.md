@@ -92,7 +92,7 @@ Key knobs (override on the CLI):
 
 - `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — full-sample (pre-SP) token cap (overlong samples are skipped in `seedomni_transform`) and `dyn_bsz` pack unit (see `train.dyn_bsz`).
+- `--data.max_seq_len` — pre-SP `dyn_bsz` token budget unit (`micro_batch_size * max_seq_len`; overlong samples are skipped by `dyn_bsz`).
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -129,10 +129,11 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
 - Every module inherits the global `ulysses_size`. The wte is a per-token lookup, so its sequence shards exactly like
   the LLM backbone.
 - `world % sp_size == 0`; a larger `micro_batch_size` gives longer packed
-  sequences to slice across SP ranks. `data.max_seq_len` is the **pre-SP full-sample**
-  cap (at `max_seq_len=4096` and `ulysses_size=4`, a single sample is capped at
-  `4096` total tokens, i.e. `1024` per SP rank, and longer samples are skipped),
-  so raise `--data.max_seq_len` when scaling sequence length with SP.
+  sequences to slice across SP ranks. `dyn_bsz`'s budget
+  `micro_batch_size * data.max_seq_len` is the **pre-SP global** cap (at
+  `micro_batch_size=1, max_seq_len=4096` and `ulysses_size=4`, a single sample
+  is capped at `4096` total tokens, i.e. `1024` per SP rank, and longer samples
+  are skipped), so raise `--data.max_seq_len` when scaling sequence length with SP.
 - If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
   `_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
   `full_tensor()` needs, which crashes any FSDP2 run (SP or not).

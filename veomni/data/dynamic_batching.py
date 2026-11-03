@@ -55,6 +55,15 @@ class DynBszBuffer:
         self._get_length_fn = get_length_fn
         self._get_physical_length_fn = get_physical_length_fn
 
+    def _measure_length(self, item: Dict[str, Any]) -> int:
+        if self._get_length_fn is not None:
+            return self._get_length_fn(item)
+        if ("conversation_list" in item or "input_ids" in item) and "attention_mask" not in item:
+            return get_length_fn(item)
+        if "attention_mask" not in item:
+            raise KeyError("Expected 'attention_mask' in item")
+        return int(item["attention_mask"].sum())
+
     def append(self, item: Dict[str, Any]):
         """
         Append a sample to the buffer.
@@ -63,15 +72,8 @@ class DynBszBuffer:
                 The sample should be a dict containing an ``attention_mask`` tensor
                 whose ``.sum()`` gives the number of valid tokens for batching.
         """
+        length = self._measure_length(item)
         self._buffer.append(item)
-        if self._get_length_fn is not None:
-            length = self._get_length_fn(item)
-        elif ("conversation_list" in item or "input_ids" in item) and "attention_mask" not in item:
-            length = get_length_fn(item)
-        else:
-            if "attention_mask" not in item:
-                raise KeyError("Expected 'attention_mask' in item")
-            length = int(item["attention_mask"].sum())
         if self._get_physical_length_fn is not None:
             physical_length = self._get_physical_length_fn(item)
         else:
@@ -222,6 +224,10 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             and "input_ids" not in item
         ):
             print("WARNING: EMPTY STRING.")
+            return
+        length = self.buffer._measure_length(item)
+        if length > self.token_micro_bsz:
+            logger.warning(f"Sample length {length} exceeds token_micro_bsz {self.token_micro_bsz}, skipping.")
             return
         self.buffer.append(item)
 

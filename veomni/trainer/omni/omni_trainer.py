@@ -289,11 +289,12 @@ class OmniTrainer:
         args: OmniArguments = self.args
         processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.resolved_model_path)
         # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
-        # branch. The model runtime is already built, so every module's resolved
-        # `ModuleRuntime.model_config` is in memory — hand that straight to the
-        # processor instead of re-reading each module's config.json from disk.
-        # Mirrors the per-module load dtype in ModuleRuntime.build_model; a single
-        # dtype is fine since dummies are re-cast to self.dtype before forward.
+        # branch. The model runtime is already built, so every module's own
+        # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
+        # straight to the processor instead of re-reading each module's config.json
+        # from disk. Mirrors the per-module load dtype resolved in
+        # ModuleRuntime.build_model; a single dtype is fine since these dummies
+        # get re-cast to each module's live self.dtype before reaching its forward.
         dummy_dtype = torch.float32 if args.model.accelerator.fsdp_config.mixed_precision.enable else torch.bfloat16
         module_configs = {name: rt.model_config for name, rt in self.model.module_runtimes.items()}
         processor.bind_dummy_inputs(module_configs, dtype=dummy_dtype)
@@ -301,7 +302,6 @@ class OmniTrainer:
         self.data_transform = build_data_transform(
             args.data.data_type,
             processor=processor,
-            max_seq_len=args.data.max_seq_len,
             **args.data.mm_configs,
         )
 
