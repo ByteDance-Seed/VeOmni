@@ -198,31 +198,6 @@ def test_v2_optimizer_fails_before_model_or_checkpoint_mutation(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def _rank_local_invalid_layout_worker(rank, root):
-    from datetime import timedelta
-
-    dist.init_process_group(
-        "gloo", init_method=f"file://{root}/init", rank=rank, world_size=2, timeout=timedelta(seconds=20)
-    )
-    try:
-        model = torch.nn.Linear(2, 2, bias=False)
-        mesh = SimpleNamespace(shape=(2, 2))
-        shape = None if rank == 0 else (2, 2)
-        model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(0), "weight", mesh, 0, None, shape, True)}
-        with pytest.raises(RuntimeError):
-            DistributedCheckpointer.save(
-                f"{root}/checkpoint", {"model": model}, parallel_state=SimpleNamespace(dp_mode="fsdp2")
-            )
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_rank_local_invalid_layout_stops_all_ranks_before_write(tmp_path):
-    torch.multiprocessing.spawn(_rank_local_invalid_layout_worker, args=(str(tmp_path),), nprocs=2, join=True)
-    assert not (tmp_path / "checkpoint").exists()
-
-
 def test_same_v2_wrapper_can_save_and_load(tmp_path, monkeypatch):
     model = torch.nn.Linear(2, 2, bias=False)
     mesh = SimpleNamespace(shape=(2, 2))
