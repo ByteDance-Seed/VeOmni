@@ -263,20 +263,14 @@ class OmniModelRuntime:
         checkpoint = getattr(self.train_args, "checkpoint", None)
         if not for_inference and getattr(checkpoint, "extra_parallel_canonical_layout", False):
             from .....distributed.parallel_state import get_parallel_state
-            from .....utils.dist_utils import raise_if_any_rank_failed
 
             with use_parallel_state("base"):
-                error = None
-                try:
-                    state = get_parallel_state()
-                    if getattr(state, "any_extra_parallel_enabled", False):
-                        raise RuntimeError(
-                            "Canonical ExtraParallel checkpoints are not supported for SeedOmni fsdp_scope='model'; "
-                            "use fsdp_scope='module'."
-                        )
-                except BaseException as exc:
-                    error = exc
-                raise_if_any_rank_failed(error, "checking composed Omni checkpoint layout")
+                state = get_parallel_state()
+                if getattr(state, "any_extra_parallel_enabled", False):
+                    raise RuntimeError(
+                        "Canonical ExtraParallel checkpoints are not supported for SeedOmni fsdp_scope='model'; "
+                        "use fsdp_scope='module'."
+                    )
 
         modules = self.module_runtimes
         # Cache readers stay on meta and must not go through the composed
