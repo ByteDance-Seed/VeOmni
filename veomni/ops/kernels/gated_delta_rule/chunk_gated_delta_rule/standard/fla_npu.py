@@ -239,6 +239,10 @@ def _ensure_fla_npu_registered() -> None:
     """
     try:
         import fla_npu  # noqa: F401
+        # fla_npu 67dc99d no longer registers torch.ops.npu.* on import; the
+        # legacy dispatcher ops this backend calls are opt-in now.
+        if hasattr(fla_npu, "is_legacy_torch_ops_loaded") and not fla_npu.is_legacy_torch_ops_loaded():
+            fla_npu.load_legacy_torch_ops()
     except ModuleNotFoundError as error:
         if error.name != "fla_npu":
             raise
