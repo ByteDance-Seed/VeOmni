@@ -266,6 +266,25 @@ under an `experts` module when their source order cannot be established. Other
 legacy tensor naming schemes may still need explicit source-layout verification
 or migration before export.
 
+New planner metadata records supported named ExtraParallel/FSDP meshes rather
+than only `ep`. Ordinary FSDP expert shards are marked canonical only when the
+actual TP1 runtime proves that every ExtraParallel dimension has size one, or
+the model's applied plan and parameter aliases prove that the expert is not
+sharded by any active ExtraParallel dimension.
+An expert on the EP-complementary FSDP mesh is accepted only for trainable
+shared-expert LoRA A/B parameters whose wrapper installs cross-EP gradient
+synchronization; other parameters on that mesh remain unproven. A normal
+single-process save assumes the caller supplied the complete model, not a
+manually extracted expert shard. The singleton case is not a source-layout
+proof for external, manually sharded tensors.
+Older version-1 metadata may omit non-`ep` shards: an unrecorded expert tensor
+is rejected unless its source layout can be verified and migrated. This also
+rejects an indistinguishable old ordinary-FSDP expert tensor. Historical non-expert tensors
+with unrecorded ExtraParallel axes require separate source-layout verification
+before loading into a different mesh or offline export; their provenance cannot
+be inferred from chunks alone, and not all such cases can be rejected
+automatically when the target has no ExtraParallel mesh.
+
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates

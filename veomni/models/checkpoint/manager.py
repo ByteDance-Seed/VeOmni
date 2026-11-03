@@ -293,6 +293,7 @@ class ModelCheckpointManager:
             model=self.runtime.model,
             save_path=self.lora_export_dir(state),
             adapter_name=adapter_name,
+            parallel_state=self.parallel_state,
         )
         helper.empty_cache()
         dist.barrier()
