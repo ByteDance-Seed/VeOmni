@@ -10,7 +10,7 @@ Launch one process per GPU. For example, to train on one GPU:
 ```bash
 uv run torchrun --standalone --nproc-per-node=<count> \
   tasks/train_decision.py configs/decision/clef_qwen3_5.yaml \
-  --model_path /path/to/Cloudflare/clef-flash
+  --model.model_path /path/to/Cloudflare/clef-flash
 ```
 
 Set `--nproc-per-node` to the number of devices used on the node. For Ascend
