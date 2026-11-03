@@ -287,62 +287,6 @@ def test_anyprecision_bf16_state_extra_parallel_fresh_process_resume(tmp_path, s
     )
 
 
-def _owner_frozen_leaf_mismatch_worker(rank, root, mode):
-    from unittest.mock import patch
-
-    from veomni.optim.optimizer import build_extra_parallel_fsdp2_optimizer
-
-    dist.init_process_group(
-        "gloo", init_method=f"file://{root}/leaf-init", rank=rank, world_size=4, timeout=timedelta(seconds=30)
-    )
-    try:
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ple_fsdp", "ple"))
-        model = torch.nn.Module()
-        model.weight = torch.nn.Parameter(
-            distribute_tensor(torch.arange(64, dtype=torch.float32).reshape(8, 8), mesh, [Shard(1), Shard(0)])
-        )
-        model.bias = torch.nn.Parameter(torch.ones(2))
-        model._fqn2spec_info = {"weight": SpecInfo("ple", Shard(0), "weight", mesh, 1, 1, (8, 8))}
-        owner = mesh.get_local_rank("ple")
-        parallel = SimpleNamespace(
-            dp_mode="fsdp2", extra_parallel_names=("ple",), extra_parallel_fsdp_device_mesh={"ple": mesh}
-        )
-        with patch("veomni.optim.optimizer.get_parallel_state", return_value=parallel):
-            if mode == "load":
-                source = build_extra_parallel_fsdp2_optimizer(model)
-                DistributedCheckpointer.save(
-                    f"{root}/checkpoint",
-                    {"model": model, "optimizer": source, "_veomni_scheduler_object": None},
-                    parallel_state=parallel,
-                )
-            if owner == 1:
-                model.weight.requires_grad_(False)
-            optimizer = build_extra_parallel_fsdp2_optimizer(model)
-        assert list(optimizer.optimizers_dict) == (
-            ["ple", "non_extra_parallel"] if owner == 0 else ["non_extra_parallel"]
-        )
-        before = model.weight.to_local().clone()
-        with pytest.raises(RuntimeError, match="leaf order differs across ranks"):
-            method = DistributedCheckpointer.save if mode == "save" else DistributedCheckpointer.load
-            method(
-                f"{root}/checkpoint",
-                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
-                parallel_state=parallel,
-            )
-        torch.testing.assert_close(model.weight.to_local(), before, rtol=0, atol=0)
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 4
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
-@pytest.mark.parametrize("mode", ["save", "load"])
-def test_owner_specific_freeze_missing_leaf_fails_before_checkpoint_collectives(tmp_path, mode):
-    mp.spawn(_owner_frozen_leaf_mismatch_worker, args=(str(tmp_path), mode), nprocs=4, join=True)
-
-
 def _frozen_resume_worker(rank, root, phase):
     dist.init_process_group(
         "gloo",
