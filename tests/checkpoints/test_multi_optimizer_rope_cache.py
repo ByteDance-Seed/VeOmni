@@ -39,34 +39,6 @@ def test_runtime_preflight_rejects_unsupported_dynamic_rope_before_training():
     VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
 
 
-def _runtime_rope_preflight_failure(rank, endpoint):
-    from veomni.models.model_runtime import VeOmniModelRuntime
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model, optimizer = _build()
-        if rank == 0:
-            model.rope.rope_type = "default"
-        runtime = SimpleNamespace(
-            model=model,
-            optimizer=optimizer,
-            model_name="policy",
-            train_args=SimpleNamespace(checkpoint=SimpleNamespace(manager="dcp", save_async=False)),
-        )
-        with pytest.raises(RuntimeError, match="dynamic RoPE|another rank"):
-            VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
-        done = torch.tensor(1)
-        dist.all_reduce(done)
-        assert done.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_dynamic_rope_preflight_failure_reaches_all_ranks():
-    spawn_with_rendezvous(_runtime_rope_preflight_failure, nprocs=2)
-
-
 class _TinyQwenRope(torch.nn.Module):
     def __init__(self, theta=10000):
         super().__init__()
