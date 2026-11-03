@@ -356,6 +356,7 @@ def save_lora_adapter_with_dcp(
     save_path: str,
     adapter_name: str = "default",
     dcp_subdir: str = ".lora_dcp_tmp",
+    parallel_state=None,
 ) -> None:
     """Save LoRA adapter with DCP parallel write and rank-0 consolidation.
 
@@ -372,6 +373,7 @@ def save_lora_adapter_with_dcp(
     """
     from torch.distributed.tensor import Shard
 
+    from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict
 
@@ -493,37 +495,39 @@ def save_lora_adapter_with_dcp(
         single_file_per_rank=True,
         sync_files=False,
     )
+    if parallel_state is None and is_parallel_state_initialized():
+        parallel_state = get_parallel_state()
     dcp.save(
         state_dict=dcp_lora_state,
         storage_writer=storage_writer,
-        planner=_ExtraParallelSavePlanner(),
+        planner=_ExtraParallelSavePlanner(parallel_state=parallel_state),
     )
 
     if dist.is_initialized():
         dist.barrier()
 
     is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-    if is_rank_0:
-        consolidated_state = ckpt_to_state_dict(
-            save_checkpoint_path=dcp_save_path,
-            ckpt_manager="dcp",
-        )
-        # safetensors needs contiguous, non-aliased tensors; consolidation returns
-        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
-        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
-        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+    error = None
+    try:
+        if is_rank_0:
+            consolidated_state = ckpt_to_state_dict(
+                save_checkpoint_path=dcp_save_path,
+                ckpt_manager="dcp",
+            )
+            # safetensors needs contiguous, non-aliased tensors; consolidation returns
+            # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+            consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+            adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
 
-        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
-        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
-        # separate sidecar).
-        model.get_lora_config().save_pretrained(save_path)
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json.
+            model.get_lora_config().save_pretrained(save_path)
 
-        shutil.rmtree(dcp_save_path, ignore_errors=True)
-        logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
-
-    if dist.is_initialized():
-        dist.barrier()
+            shutil.rmtree(dcp_save_path, ignore_errors=True)
+            logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export")
 
     gc.collect()
     helper.empty_cache()

@@ -513,10 +513,11 @@ class TestModelCheckpointManagerSaveContract:
         manager = ModelCheckpointManager(runtime)
 
         with patch.object(manager, "save_dcp") as save_dcp:
-            with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp"):
+            with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
                 manager.save_lora(TrainerState(global_step=10))
 
         save_dcp.assert_called_once()
+        assert save_adapter.call_args.kwargs["parallel_state"] is runtime.parallel_state
         assert manager.last_saved_step == -1
 
 
