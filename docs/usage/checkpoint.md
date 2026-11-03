@@ -277,6 +277,10 @@ synchronization; other parameters on that mesh remain unproven. A normal
 single-process save assumes the caller supplied the complete model, not a
 manually extracted expert shard. The singleton case is not a source-layout
 proof for external, manually sharded tensors.
+For a plain model tensor sharded on an ExtraParallel axis and replicated across
+its FSDP/HSDP axes, all replicas at the same ExtraParallel coordinate must have
+identical values; checkpoint serialization does not verify or synchronize them.
+Plain optimizer shards on multiple such ranks require a rank-local state codec.
 Older version-1 metadata may omit non-`ep` shards: an unrecorded expert tensor
 is rejected unless its source layout can be verified and migrated. This also
 rejects an indistinguishable old ordinary-FSDP expert tensor. Historical non-expert tensors

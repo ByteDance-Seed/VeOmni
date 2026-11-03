@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional, Set, Union
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Partial, Replicate, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -79,6 +79,8 @@ def _expert_layout(tensor, extra_parallel_names=()):
         return None
     mesh = tensor.device_mesh
     names = mesh.mesh_dim_names or ()
+    if any(isinstance(p, Partial) and mesh.size(axis) > 1 for axis, p in enumerate(tensor.placements)):
+        return {"expert_order": "unproven"}
     extra_names = [name for name in names if name == "ep" or name in extra_parallel_names or f"{name}_fsdp" in names]
     if not extra_names:
         return None
@@ -87,6 +89,8 @@ def _expert_layout(tensor, extra_parallel_names=()):
     extra_name = extra_names[0]
     ep_axis = names.index(extra_name)
     ep = tensor.placements[ep_axis]
+    if isinstance(ep, _StridedShard):
+        return {"expert_order": "unproven"}
     if not isinstance(ep, Shard):
         return None
     fsdp_name = f"{extra_name}_fsdp"
@@ -99,7 +103,7 @@ def _expert_layout(tensor, extra_parallel_names=()):
     shard_axes = [
         (axis, placement.dim % tensor.ndim)
         for axis, placement in enumerate(tensor.placements)
-        if isinstance(placement, Shard) and mesh.size(axis) > 1
+        if isinstance(placement, (Shard, _StridedShard)) and mesh.size(axis) > 1
     ]
     unknown_overlap = any(
         axis not in (ep_axis, fsdp_axis)
@@ -108,7 +112,15 @@ def _expert_layout(tensor, extra_parallel_names=()):
     )
     canonical = not same_axis or isinstance(fsdp, _StridedShard) or (fsdp_axis is not None and ep_axis < fsdp_axis)
     order = "canonical" if canonical else "legacy_fsdp_first"
-    if unknown_overlap:
+    unknown_strided = any(
+        axis not in (ep_axis, fsdp_axis) and isinstance(placement, _StridedShard) and mesh.size(axis) > 1
+        for axis, placement in enumerate(tensor.placements)
+    )
+    if (
+        unknown_overlap
+        or unknown_strided
+        or (isinstance(fsdp, _StridedShard) and (fsdp_dim != ep_dim or fsdp.split_factor != mesh.size(ep_axis)))
+    ):
         order = "unproven"
     return {
         "ep_shard_dim": ep_dim,
@@ -291,10 +303,15 @@ def _unidentified_same_axis_shards(tensor):
     """Do not certify a multi-axis layout whose mesh names hide its origin."""
     if not isinstance(tensor, DTensor) or not tensor.ndim:
         return False
+    if any(
+        isinstance(placement, (_StridedShard, Partial)) and tensor.device_mesh.size(axis) > 1
+        for axis, placement in enumerate(tensor.placements)
+    ):
+        return True
     dims = [
         placement.dim % tensor.ndim
         for axis, placement in enumerate(tensor.placements)
-        if isinstance(placement, Shard) and tensor.device_mesh.size(axis) > 1
+        if isinstance(placement, (Shard, _StridedShard)) and tensor.device_mesh.size(axis) > 1
     ]
     return len(dims) != len(set(dims))
 
@@ -886,6 +903,16 @@ def _apply_extra_parallel_dim(
         # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
         # when sharding the module in ``torch_parallelize``.
         fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        if (
+            action == "restore"
+            and key_match == "substring"
+            and not isinstance(tensor, DTensor)
+            and fsdp_submesh.size() > 1
+        ):
+            raise RuntimeError(
+                "Plain optimizer state on multiple ExtraParallel FSDP ranks has no proven replica layout; "
+                "use a rank-local optimizer checkpoint codec."
+            )
         # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
         # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
         # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
@@ -1042,9 +1069,10 @@ class OptimizerState(Stateful):
             MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False, process_group=None):
         self.model = model
         self.optimizer = optimizer
+        self.process_group = process_group
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self._layout_marker_key = (
@@ -1073,8 +1101,15 @@ class OptimizerState(Stateful):
                 "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
             )
             vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                vanilla_optim_sd, "restore"
+            optim_sd_with_extra_parallel_dim, error = None, None
+            try:
+                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                    vanilla_optim_sd, "restore"
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(
+                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
             )
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
                 optim_sd_with_extra_parallel_dim = _namespace_extra_parallel_layout_state(
@@ -1151,7 +1186,8 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     the Muon zero-comm layout). The number of placements on the loaded DTensor
     reflects the full saved mesh:
 
-    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * A pure ExtraParallel shard, with only replicated FSDP axes -> return the
+      plain local tensor.
     * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
       the 1D sub-mesh.
     * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
@@ -1159,7 +1195,7 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
+    if num_placements == 1 or all(isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
         tensor_to_put = DTensor.from_local(
@@ -1214,8 +1250,10 @@ def restore_extra_parallel_dim(
 
     if isinstance(orgin_tensor, DTensor):
         ndim = orgin_tensor.ndim
-        if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
+        if not -ndim <= ep_shard_dim < ndim:
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+        if not -ndim <= fsdp_shard_dim < ndim:
+            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
         ep_shard_dim %= ndim
         fsdp_shard_dim %= ndim
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
@@ -1232,15 +1270,17 @@ def restore_extra_parallel_dim(
             placements = [fsdp_placement, Shard(ep_shard_dim)]
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # A plain tensor has no FSDP shard. Restore its actual ExtraParallel
-        # axis, not the FSDP submesh, so DCP sees the complete global tensor.
+        # A plain model tensor has no FSDP shard. The caller must ensure every
+        # FSDP/HSDP replica for the same ExtraParallel coordinate has identical
+        # values; from_local does not check or synchronize them. Optimizer
+        # states without this guarantee are rejected by the caller.
         ndim = orgin_tensor.ndim
         if not -ndim <= ep_shard_dim < ndim:
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-        if fsdp_mesh.size(-2) != 1 or fsdp_mesh.mesh_dim_names is None:
-            raise RuntimeError("A plain ExtraParallel tensor requires a size-one named FSDP axis")
-        extra_mesh = fsdp_mesh[fsdp_mesh.mesh_dim_names[-1]]
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_mesh, placements=[Shard(ep_shard_dim % ndim)])
+        if fsdp_mesh.mesh_dim_names is None:
+            raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
+        placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -1969,6 +2009,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
                 load=True,
+                process_group=process_group,
             )
 
         wants_optimizer = state.get("optimizer") is not None

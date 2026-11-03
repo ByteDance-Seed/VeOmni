@@ -13,7 +13,8 @@ import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from scripts.ci.accelerator.launch_plan import from_parameter
 from tests.tools.launch_utils import spawn_with_rendezvous
@@ -361,6 +362,62 @@ def test_unexplained_mesh_axis_overlap_is_not_certified(outer):
     assert _expert_layout(value)["expert_order"] == ("unproven" if isinstance(outer, Shard) else "canonical")
 
 
+@pytest.mark.parametrize(
+    "placements",
+    [
+        [Shard(1), _StridedShard(1, split_factor=2), Shard(0)],
+        [Replicate(), _StridedShard(0, split_factor=3), Shard(0)],
+        [Replicate(), Shard(1), _StridedShard(0, split_factor=2)],
+    ],
+)
+def test_unproven_strided_extra_layout_is_not_certified(placements):
+    mesh = DeviceMesh(
+        "cpu",
+        [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+        mesh_dim_names=("x", "ep_fsdp", "ep"),
+        _init_backend=False,
+        _rank=0,
+    )
+    value = DTensor.from_local(torch.zeros(3, 4), mesh, placements, run_check=False)
+    assert _expert_layout(value)["expert_order"] == "unproven"
+
+
+def test_strided_unidentified_mesh_is_not_certified():
+    from veomni.checkpoint.dcp_checkpointer import _unidentified_same_axis_shards
+
+    mesh = DeviceMesh("cpu", [[0, 1], [2, 3]], mesh_dim_names=("x", "y"), _init_backend=False, _rank=0)
+    value = DTensor.from_local(
+        torch.zeros(2, 2), mesh, [_StridedShard(0, split_factor=2), Replicate()], run_check=False
+    )
+    assert _unidentified_same_axis_shards(value)
+
+
+def test_unexplained_strided_axis_does_not_short_circuit_provenance():
+    mesh = DeviceMesh(
+        "cpu",
+        [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+        mesh_dim_names=("x", "ep_fsdp", "ep"),
+        _init_backend=False,
+        _rank=0,
+    )
+    value = DTensor.from_local(
+        torch.zeros(3, 4, 5), mesh, [_StridedShard(1, split_factor=2), Shard(2), Shard(0)], run_check=False
+    )
+    assert _expert_layout(value)["expert_order"] == "unproven"
+
+
+def test_partial_placement_does_not_certify_source_values():
+    mesh = DeviceMesh(
+        "cpu",
+        [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+        mesh_dim_names=("x", "ep_fsdp", "ep"),
+        _init_backend=False,
+        _rank=0,
+    )
+    value = DTensor.from_local(torch.zeros(3, 4), mesh, [Partial(), Shard(1), Shard(0)], run_check=False)
+    assert _expert_layout(value)["expert_order"] == "unproven"
+
+
 def _ple_and_ordinary_expert_worker(rank, root, endpoint):
     from torch.distributed.tensor import distribute_tensor
 
@@ -686,15 +743,19 @@ def test_ep_replicated_shared_expert_lora_export(world, mode, tmp_path):
     spawn_with_rendezvous(_ep_shared_lora_worker, args=(str(tmp_path / "adapter"), mode), nprocs=world)
 
 
-def _pure_extra_parallel_worker(rank, root, name, endpoint):
+def _pure_extra_parallel_worker(rank, root, name, world, endpoint):
     from veomni.distributed.parallel_plan import SpecInfo
 
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    dist.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world, timeout=timedelta(seconds=30)
+    )
     try:
-        mesh = init_device_mesh("cpu", (1, 2), mesh_dim_names=(f"{name}_fsdp", name))
-        fsdp_mesh = mesh[f"{name}_fsdp"]
+        shape = (2, 2, 2) if world == 8 else (world // 2, 2)
+        names = (f"{name}_replicate", f"{name}_fsdp", name) if world == 8 else (f"{name}_fsdp", name)
+        mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)
+        fsdp_mesh = mesh[names[:-1]]
         expected = torch.arange(16, dtype=torch.float32).reshape(8, 2)
-        local = expected.chunk(2, dim=0)[rank].contiguous()
+        local = expected.chunk(2, dim=0)[mesh.get_local_rank(name)].contiguous()
         restored_axis = restore_extra_parallel_dim(local, mesh, fsdp_mesh, ep_shard_dim=0)
         torch.testing.assert_close(restored_axis.full_tensor(), expected, rtol=0, atol=0)
         parallel = SimpleNamespace(
@@ -739,10 +800,107 @@ def _pure_extra_parallel_worker(rank, root, name, endpoint):
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
-@pytest.mark.parametrize("world", [2])
+@pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("name", ["ep", "ple"])
 def test_plain_pure_extra_parallel_preserves_global_values(world, name, tmp_path):
-    spawn_with_rendezvous(_pure_extra_parallel_worker, args=(str(tmp_path / "dcp"), name), nprocs=world)
+    spawn_with_rendezvous(_pure_extra_parallel_worker, args=(str(tmp_path / "dcp"), name, world), nprocs=world)
+
+
+def _plain_optimizer_unproven_worker(rank, hsdp, endpoint):
+    from veomni.checkpoint.dcp_checkpointer import _apply_extra_parallel_dim
+    from veomni.distributed.parallel_plan import SpecInfo
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        shape = (2, 1, 2) if hsdp else (2, 2)
+        names = ("ep_replicate", "ep_fsdp", "ep") if hsdp else ("ep_fsdp", "ep")
+        mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)
+        parallel = SimpleNamespace(extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh})
+        spec = SpecInfo("ep", Shard(0), "experts.weight", mesh, 1)
+        # Values differ between FSDP ranks and must not be deduplicated as replicas.
+        state = {"state.experts.weight.exp_avg": torch.full((4, 4), float(rank))}
+        with pytest.raises(RuntimeError, match="no proven replica layout"):
+            _apply_extra_parallel_dim(state, {"experts.weight": spec}, parallel, "restore", key_match="substring")
+        torch.testing.assert_close(state["state.experts.weight.exp_avg"], torch.full((4, 4), float(rank)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [4])
+@pytest.mark.parametrize("hsdp", [False, True])
+def test_plain_optimizer_shards_are_not_treated_as_replicas(world, hsdp):
+    spawn_with_rendezvous(_plain_optimizer_unproven_worker, args=(hsdp,), nprocs=world)
+
+
+def _sparse_plain_optimizer_failure_worker(rank, endpoint):
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+    from veomni.distributed.parallel_plan import SpecInfo
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        parallel = SimpleNamespace(
+            dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
+        )
+        model = torch.nn.Module()
+        model._fqn2spec_info = {"experts.weight": SpecInfo("ep", Shard(0), "experts.weight", mesh, 1)}
+
+        class SparseOptimizer:
+            _is_multi_optimizer = True
+
+            def state_dict(self):
+                return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
+
+        state = OptimizerState(model, SparseOptimizer(), parallel_state=parallel)
+        with pytest.raises(RuntimeError, match="no proven replica layout|failed on another rank"):
+            state.state_dict()
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 4
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [4])
+def test_sparse_plain_optimizer_failure_exits_all_ranks(world):
+    spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(), nprocs=world)
+
+
+def _subgroup_sparse_optimizer_failure_worker(rank, endpoint):
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+    from veomni.distributed.parallel_plan import SpecInfo
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        group = dist.new_group([0, 1], timeout=timedelta(seconds=20))
+        mesh = DeviceMesh("cpu", [[0], [1]], mesh_dim_names=("ep_fsdp", "ep"))
+        if rank < 2:
+            parallel = SimpleNamespace(
+                dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
+            )
+            model = torch.nn.Module()
+            model._fqn2spec_info = {"experts.weight": SpecInfo("ep", Shard(0), "experts.weight", mesh, 1)}
+
+            class SparseOptimizer:
+                _is_multi_optimizer = True
+
+                def state_dict(self):
+                    return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
+
+            state = OptimizerState(model, SparseOptimizer(), parallel_state=parallel, load=True, process_group=group)
+            with pytest.raises(RuntimeError, match="no proven replica layout|failed on another rank"):
+                state.state_dict()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [4])
+def test_sparse_optimizer_failure_coordinates_only_the_load_group(world):
+    spawn_with_rendezvous(_subgroup_sparse_optimizer_failure_worker, args=(), nprocs=world)
 
 
 class _LegacyNamedExtraSavePlanner(DefaultSavePlanner):
