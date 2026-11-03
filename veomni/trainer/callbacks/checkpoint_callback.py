@@ -30,10 +30,13 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
+import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from ...checkpoint import layout
 from ...utils import helper
+from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
 
@@ -58,6 +61,33 @@ def _export_wrote_dcp(trainer, step):
             return False
         owners.append(checkpoint)
     return bool(owners)
+
+
+def _has_multi_optimizer(trainer):
+    root = getattr(trainer, "model", None)
+    modules = getattr(root, "module_runtimes", None)
+    runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
+    return any(
+        getattr(getattr(runtime, "optimizer", None), "_is_multi_optimizer", False) is True for runtime in runtimes
+    )
+
+
+def _check_multi_destination(trainer, step):
+    """Reject an existing transaction before any mixed-owner write begins."""
+    if not _has_multi_optimizer(trainer):
+        return
+    error = None
+    try:
+        step_root = layout.step_dir(trainer.args.train.checkpoint.save_path, step)
+        try:
+            os.stat(layout.manifest_path(step_root))
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("Cannot overwrite a completed checkpoint transaction with MultiOptimizer state")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")
 
 
 class CheckpointCallback(Callback):
@@ -146,6 +176,7 @@ class CheckpointCallback(Callback):
 
     def _save_dcp(self, state: TrainerState):
         try:
+            _check_multi_destination(self.trainer, state.global_step)
             self.trainer.save_dcp(state)
         except BaseException:
             if getattr(self.trainer.args.train.checkpoint, "save_async", False):
@@ -156,6 +187,8 @@ class CheckpointCallback(Callback):
 
     def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         try:
+            if _has_multi_optimizer(self.trainer) and self._last_dcp_step != state.global_step:
+                self._save_dcp(state)
             self.trainer.save_hf_or_lora(state, stage=stage)
         except BaseException:
             if getattr(self.trainer.args.train.checkpoint, "save_async", False):
