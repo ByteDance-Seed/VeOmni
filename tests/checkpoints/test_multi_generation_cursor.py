@@ -41,6 +41,30 @@ def test_fresh_multi_optimizer_training_needs_no_restore_receipt(tmp_path):
     assert GlobalStateCallback(trainer).load_global_state() is None
 
 
+@pytest.mark.parametrize("same_path", [True, False])
+def test_multi_optimizer_reuse_requires_the_owner_load_path(tmp_path, same_path):
+    class Owner:
+        def __init__(self, loaded_path):
+            self._loaded_checkpoint_path = loaded_path
+            self.confirmed = False
+
+        def confirm_loaded_checkpoint_for_reuse(self, step, generation):
+            assert (step, generation) == (3, "source")
+            self.confirmed = True
+
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    callback = GlobalStateCallback(trainer)
+    path = layout.step_dir(str(tmp_path), 3)
+    owner = Owner(path if same_path else layout.step_dir(str(tmp_path / "other"), 3))
+    if same_path:
+        callback._confirm_same_output_checkpoint(3, path, [("model", owner)], {"model": "source"})
+        assert owner.confirmed
+    else:
+        with pytest.raises(RuntimeError, match="different checkpoint path"):
+            callback._confirm_same_output_checkpoint(3, path, [("model", owner)], {"model": "source"})
+        assert not owner.confirmed
+
+
 def test_legacy_checkpoint_manager_does_not_opt_in_to_generation_guard(tmp_path):
     from veomni.trainer.callbacks.global_state_callback import _multi_optimizer_checkpoints
 
@@ -405,6 +429,7 @@ def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, m
         manager = ModelCheckpointManager(runtime)
         manager._loaded_optimizer_global_step = 3
         manager._loaded_optimizer_generation = "saved-generation"
+        manager._loaded_checkpoint_path = trainer.args.train.checkpoint.load_path
         import weakref
 
         manager._loaded_optimizer_ref = weakref.ref(runtime.optimizer)
@@ -893,6 +918,7 @@ def test_mixed_omni_receipt_confirms_every_optimizer(tmp_path, monkeypatch):
     strict._loaded_optimizer_ref = weakref.ref(strict_runtime.optimizer)
     strict._loaded_optimizer_global_step = 2
     strict._loaded_optimizer_generation = "test-generation"
+    strict._loaded_checkpoint_path = load_path
     legacy._loaded_optimizer_ref = weakref.ref(legacy_runtime.optimizer)
     legacy._loaded_checkpoint_path = load_path
     legacy._loaded_checkpointer = DistributedCheckpointer

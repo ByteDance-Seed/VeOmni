@@ -975,6 +975,9 @@ class GlobalStateCallback(Callback):
             if unknown_checkpoints:
                 raise RuntimeError(f"Checkpoint providers cannot confirm optimizer identity: {unknown_checkpoints}")
             for name, checkpoint in checkpoints:
+                loaded_path = getattr(checkpoint, "_loaded_checkpoint_path", None)
+                if loaded_path is None or not layout.same_checkpoint_path(loaded_path, load_path):
+                    raise RuntimeError("Optimizer owner restored from a different checkpoint path")
                 confirm = getattr(type(checkpoint), "confirm_loaded_checkpoint_for_reuse", None)
                 if not callable(confirm):
                     raise RuntimeError("Strict checkpoint provider cannot confirm restored optimizer identity")
