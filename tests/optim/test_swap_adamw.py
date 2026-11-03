@@ -868,3 +868,58 @@ def test_build_optimizer_routes_state_offload_to_swap_adamw():
 
     stock = build_optimizer(model, lr=1e-3, optimizer_type="adamw")
     assert not isinstance(stock, SwapAdamW)
+
+
+def test_state_is_created_when_a_frozen_parameter_becomes_trainable(cpu_mesh):
+    # Stock AdamW creates state on the first gradient, so a parameter that is
+    # frozen at construction must allocate its host buffers on that first step
+    # instead of dying on a missing ``_host_states`` entry.
+    torch.manual_seed(31)
+    shape = (5, 3)
+    init = torch.randn(shape)
+
+    ref = nn.Parameter(init.clone())
+    swapped = _swap_param(init, cpu_mesh)
+    swapped.requires_grad_(False)
+
+    ref_opt = torch.optim.AdamW([ref], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, foreach=False)
+    swap_opt = SwapAdamW([swapped], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, pin_memory=False)
+    assert swapped not in swap_opt._host_states
+
+    swapped.requires_grad_(True)
+    for _ in range(2):
+        grad = torch.randn(shape)
+        ref.grad = grad.clone()
+        swapped.grad = _partition(grad.clone(), cpu_mesh)
+        ref_opt.step()
+        swap_opt.step()
+
+    torch.testing.assert_close(swapped.to_local(), ref.detach(), atol=1e-6, rtol=1e-6)
+    assert int(swap_opt.state[swapped]["step"]) == 2
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(swap_opt._host_states[swapped][key], ref_opt.state[ref][key], atol=1e-6, rtol=1e-6)
+
+
+def test_direct_load_state_dict_restores_moments_for_a_frozen_parameter(cpu_mesh):
+    # Direct ``load_state_dict`` only: it ignores ``requires_grad`` like stock, so
+    # a checkpoint that carries moments for a parameter this build keeps frozen
+    # still loads them (the optimizer allocates host buffers while loading).
+    # DCP resume is different: ``set_optimizer_state_dict`` drops state for
+    # frozen parameters, and the loader template is built from the live state
+    # dict, so those moments are not restored on resume.
+    src_param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    src = SwapAdamW([src_param], lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+    src_param.grad = _partition(torch.randn(4, 3), cpu_mesh)
+    src.step()
+    state = src.state_dict()
+
+    dst_param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    dst_param.requires_grad_(False)
+    dst = SwapAdamW([dst_param], lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+    assert dst_param not in dst._host_states
+
+    dst.load_state_dict(state)
+
+    assert int(dst.state[dst_param]["step"]) == 1
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(dst._host_states[dst_param][key], src._host_states[src_param][key], atol=0, rtol=0)

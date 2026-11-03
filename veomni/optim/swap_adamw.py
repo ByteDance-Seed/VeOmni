@@ -237,35 +237,10 @@ class SwapAdamW(Optimizer):
             return torch.zeros(shape, dtype=local_shard.dtype, device="cpu", pin_memory=False)
 
     def _init_states(self) -> None:
-        """Move every parameter's moment state to host and free its device storage."""
-        for group in self.param_groups:
-            amsgrad = group["amsgrad"]
-            for p in group["params"]:
-                if not p.requires_grad or p in self._host_states:
-                    continue
-
-                host_state: dict[str, Tensor] = {}
-                device_state: dict[str, Tensor] = {}
-                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                    if key == "max_exp_avg_sq" and not amsgrad:
-                        continue
-                    # Only shape/dtype/placements are taken from this DTensor; the
-                    # zero-filled storage is freed immediately below, so skip the
-                    # fill.
-                    dtensor = torch.empty_like(p)
-                    self.state[p][key] = dtensor
-                    local_shard = _to_local(dtensor)
-                    host_state[key] = self._alloc_host_buffer(local_shard)
-                    device_state[key] = local_shard
-                    local_shard.untyped_storage().resize_(0)
-
-                if "step" not in self.state[p]:
-                    self.state[p]["step"] = 0
-                self._host_states[p] = host_state
-                self._device_states[p] = device_state
-
-        # Precompute per-step invariants: the param-to-group mapping and
-        # per-param state sizes never change during training.
+        """Migrate every trainable parameter's moment state to host buffers."""
+        # Precompute per-step invariants first: ``_ensure_param_state`` reads the
+        # param-to-group map, and the per-param state sizes never change during
+        # training (they are derived from the parameter, not from its state).
         self._group_by_param: dict[Tensor, dict[str, Any]] = {}
         self._param_bytes: dict[Tensor, int] = {}
         for group in self.param_groups:
@@ -273,6 +248,45 @@ class SwapAdamW(Optimizer):
                 self._group_by_param[p] = group
                 local_shard = _to_local(p)
                 self._param_bytes[p] = sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
+
+        # Frozen parameters get their state on the first step that sees a
+        # gradient, as stock AdamW does (see ``_ensure_param_state``).
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    self._ensure_param_state(p, bool(group["amsgrad"]))
+
+    def _ensure_param_state(self, p: Tensor, amsgrad: bool) -> None:
+        """Allocate ``p``'s host/device moment state if it has none yet.
+
+        Stock AdamW creates state when a parameter first receives a gradient, so a
+        parameter that is frozen at construction (and later unfrozen) must get its
+        buffers on that first step, not at construction. Allocation happens once
+        per parameter; when it fires from ``step()`` it briefly materializes one
+        local shard on the device (``empty_like``) and frees that storage again
+        immediately.
+        """
+        if p in self._host_states:
+            return
+
+        host_state: dict[str, Tensor] = {}
+        device_state: dict[str, Tensor] = {}
+        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            if key == "max_exp_avg_sq" and not amsgrad:
+                continue
+            # Only shape/dtype/placements are taken from this DTensor; the
+            # zero-filled storage is freed immediately below, so skip the fill.
+            dtensor = torch.empty_like(p)
+            self.state[p][key] = dtensor
+            local_shard = _to_local(dtensor)
+            host_state[key] = self._alloc_host_buffer(local_shard)
+            device_state[key] = local_shard
+            local_shard.untyped_storage().resize_(0)
+
+        if "step" not in self.state[p]:
+            self.state[p]["step"] = 0
+        self._host_states[p] = host_state
+        self._device_states[p] = device_state
 
     # -------------------------------------------------------------- checkpoint
 
@@ -379,9 +393,21 @@ class SwapAdamW(Optimizer):
             self.state[param]["step"] = 0
 
     def _load_param_state(self, p: Tensor, value: dict) -> None:
+        # Reached from a direct ``load_state_dict`` call. The DCP resume path goes
+        # through ``set_optimizer_state_dict`` instead, which both drops state for
+        # ``requires_grad=False`` parameters and builds its template from the live
+        # state dict, so moments for a frozen parameter are not restored that way.
         host_state = self._host_states.get(p)
         if host_state is None:
-            return
+            # An entry whose values are all empty dicts marks a parameter absent
+            # from the checkpoint (the flattened loader reconstructs it that way).
+            if not any(isinstance(v, torch.Tensor) for v in value.values()):
+                return
+            # The checkpoint carries state for a parameter this optimizer was built
+            # with frozen. Stock ``load_state_dict`` restores it regardless of
+            # ``requires_grad``, so allocate the host buffers first.
+            self._ensure_param_state(p, bool(self._group_by_param[p]["amsgrad"]))
+            host_state = self._host_states[p]
         for key, loaded in value.items():
             if isinstance(loaded, DTensor):
                 loaded = _to_local(loaded)
@@ -643,6 +669,9 @@ class SwapAdamW(Optimizer):
                 continue
             if param.grad.is_sparse:
                 raise RuntimeError("SwapAdamW does not support sparse gradients")
+            # A parameter frozen at construction (or added that way) has no state
+            # yet; create it here, as stock AdamW does on the first gradient.
+            self._ensure_param_state(param, bool(self._group_by_param[param]["amsgrad"]))
             active.append(param)
 
         index = 0
