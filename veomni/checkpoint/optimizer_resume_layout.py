@@ -353,7 +353,7 @@ def frozen_parameter_digest(model, *, enabled, group=None, chunk_bytes=4 << 20):
 
 def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object, *, group=None, frozen_digest=None):
     """Validate the live save layout once, before creating checkpoint files."""
-    encoded, names, error = None, None, None
+    encoded, error = None, None
     try:
         payload = _local_layout(
             model,
@@ -366,15 +366,9 @@ def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object,
             capture=True,
         )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        names = tuple(optimizer.key_names)
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "capturing MultiOptimizer checkpoint layout", group=group)
-    if dist.is_initialized():
-        gathered = [None] * dist.get_world_size(group)
-        dist.all_gather_object(gathered, names, group=group)
-        if any(name != gathered[0] for name in gathered):
-            raise RuntimeError("MultiOptimizer checkpoint leaf order differs across ranks")
     return encoded
 
 
@@ -427,14 +421,7 @@ def coordinated_multi_layout(
     if dist.is_initialized():
         world = dist.get_world_size(group)
         digests = [None] * world
-        gathered = [None] * world
-        # This existing layout exchange also guards the order of subsequent
-        # per-leaf collectives. Owner-specific freezing can otherwise leave
-        # one rank without a leaf and strand peers during checkpoint I/O.
-        dist.all_gather_object(gathered, (local, tuple(optimizer.key_names)), group=group)
-        digests = [item[0] for item in gathered]
-        if any(item[1] != gathered[0][1] for item in gathered):
-            raise RuntimeError("MultiOptimizer checkpoint leaf order differs across ranks")
+        dist.all_gather_object(digests, local, group=group)
         ranks = list(range(world)) if group is None else dist.get_process_group_ranks(group)
     else:
         ranks, digests = [0], [local]

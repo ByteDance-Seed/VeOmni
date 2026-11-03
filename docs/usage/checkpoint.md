@@ -385,10 +385,10 @@ optimizer state is stored under rank-specific keys and recovery requires the
 identical rank-to-mesh mapping. This avoids merging distinct expert-owner steps
 and uninitialized states, but increases checkpoint storage for replicated
 optimizer shards and does not support elastic resharding. All ranks must use
-the same trusted model and configuration. Optimizer leaf ordering is checked
-as part of the existing checkpoint-layout exchange; owner-specific freezing
-that removes a whole leaf from only some ranks is rejected before per-leaf
-checkpoint collectives, rather than supported. Replica values, trainability, dtype, shape and geometry
+the same trusted model and configuration, including optimizer leaf ordering.
+Owner-specific freezing that removes a whole leaf from only some ranks is not
+supported or checked and can cause checkpoint collectives to hang. Replica
+values, trainability, dtype, shape and geometry
 are trusted to be consistent across ranks. Source and target checkpoint layout
 metadata are checked during restore; tensor bytes are not hashed for replica
 consistency. Trainable-only MultiOptimizer checkpoints do hash each rank's local
@@ -399,8 +399,9 @@ preserve serializable scheduler state and implement the same learning-rate
 behavior on both sides of a restore, and hooks must not mutate checkpoint
 model, optimizer, or layout during a save/load call. The persisted recipe checks scheduler
 configuration and optimizer binding; it does not inspect arbitrary wrapper
-code. MultiOptimizer asynchronous saves
-and unsupported layouts fail closed; synchronous staged saves are supported.
+code. MultiOptimizer asynchronous saves and detected unsupported layouts fail
+closed; the cross-rank leaf mismatch above is not detected. Synchronous staged
+saves are supported.
 The runtime assumes ranks use a consistent model configuration and compatible
 replica geometries; saved source layout is validated on restore.
 Group/state inventory and generation mismatches are rejected before model
