@@ -301,7 +301,9 @@ def _run_alignment_matrix(
                         for name, param in monolithic_ref.named_parameters()
                         if param.grad is not None
                     }
-                    ref_opt = torch.optim.AdamW(monolithic_ref.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+                    ref_opt = torch.optim.AdamW(
+                        monolithic_ref.parameters(), lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False
+                    )
                     ref_opt.step()
                     ref_stepped = {name: param.detach().clone() for name, param in monolithic_ref.named_parameters()}
 
@@ -328,8 +330,8 @@ def _run_alignment_matrix(
                     loss.backward()
 
                     omni_grads = _collect_omni_as_source_dict(te, llm, grads=True)
-                    te_opt = torch.optim.AdamW(te.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
-                    llm_opt = torch.optim.AdamW(llm.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+                    te_opt = torch.optim.AdamW(te.parameters(), lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False)
+                    llm_opt = torch.optim.AdamW(llm.parameters(), lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False)
                     te_opt.step()
                     llm_opt.step()
                     omni_stepped = _collect_omni_as_source_dict(te, llm, grads=False)
