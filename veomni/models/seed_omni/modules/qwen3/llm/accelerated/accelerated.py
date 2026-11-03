@@ -11,7 +11,11 @@ import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from veomni.utils.seqlen_pos_transform_utils import (
+    coalesce_tail_padding_cu_seqlens,
+    prepare_fa_kwargs_from_position_ids,
+    valid_seqlens_from_cu_seqlens,
+)
 from veomni.utils.tensor_utils import unflatten
 
 from .....mixins.base_mixin import BaseMixin
@@ -82,7 +86,14 @@ class TrainingMixin(TrainingModuleMixin):
             embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
             mask = sp_pad(attention_mask, dim=1, pad_value=1)
             pids = sp_pad(position_ids, dim=1, pad_value=0)
+            tail_padding_length = pids.size(1) - self._sp_own_len
             (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
+            if tail_padding_length > 0:
+                cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length)
+                cu_k = cu_q
+                seqlens = cu_q[1:] - cu_q[:-1]
+                max_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                max_k = max_q
             embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
             return dict(
