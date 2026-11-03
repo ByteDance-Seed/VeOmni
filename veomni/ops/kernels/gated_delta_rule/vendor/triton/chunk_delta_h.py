@@ -557,8 +557,9 @@ def chunk_gated_delta_rule_bwd_dhu(
     dv2 = torch.zeros_like(dv) if arch35 else torch.empty_like(dv)
 
     # On arch35, wider value tiles corrupt repeated backward results due to
-    # Triton-Ascend codegen/UB pressure. Preserve the wider arch22 tile.
-    BV = 32 if arch35 else 128
+    # Triton-Ascend codegen/UB pressure. On arch22, wide key heads need
+    # smaller value tiles to fit the FP32 state and temporaries in UB on 3.2.1.
+    BV = 32 if arch35 else (64 if K > 128 else 128)
 
     g = g.permute(0, 2, 1).contiguous()
 
