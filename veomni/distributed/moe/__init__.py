@@ -13,14 +13,6 @@
 # limitations under the License.
 
 
-from .ep_load_balance import (
-    EPBalancePlan,
-    ExpertReplica,
-    ExpertReplicaTransfer,
-    attach_qwen3_5_moe_ep_load_balancers,
-    build_ep_balance_plan,
-    cat_local_and_replica_weights,
-)
 from .moe_layer import (
     EPGroupGemm,
     EPMergedFc1GroupGemm,
@@ -32,12 +24,6 @@ from .moe_layer import (
 
 
 __all__ = [
-    "EPBalancePlan",
-    "ExpertReplica",
-    "ExpertReplicaTransfer",
-    "attach_qwen3_5_moe_ep_load_balancers",
-    "build_ep_balance_plan",
-    "cat_local_and_replica_weights",
     "preprocess",
     "token_pre_all2all",
     "tokens_post_all2all",

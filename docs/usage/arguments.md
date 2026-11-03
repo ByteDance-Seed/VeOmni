@@ -546,7 +546,7 @@ distinct from the first emission.
 | --- | --- | --- | --- |
 | enabled | `bool` | `False` | Enable actual-token planning, temporary expert-weight replication, physical-alias dispatch, and owner-gradient return for compatible Qwen3.5-MoE fused EP layers. |
 | max_replicas_per_rank | `int` | `1` | Fixed temporary replica slots per EP rank. Must be positive when enabled and no greater than `num_experts / ep_size`. |
-| optimize_memory | `bool` | `False` | Experimental separate local/replica weight storage and per-layer replica-buffer reuse. Requires `enabled=true`; all existing restrictions remain. CUDA uses two-storage grouped GEMMs; NPU uses segmented grouped matmuls. Accelerator correctness, performance and peak-memory benefit remain unvalidated. |
+| optimize_memory | `bool` | `False` | Experimental separate local/replica weight storage and per-layer replica-buffer reuse. Requires `enabled=true`; all existing restrictions remain. CUDA uses two-storage grouped GEMMs; NPU uses segmented grouped matmuls. See the [validated scopes and current performance limits](../design/qwen3_5_moe_ep_load_balance.md). |
 
 ### AcceleratorConfig
 

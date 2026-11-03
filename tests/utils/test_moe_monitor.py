@@ -251,7 +251,6 @@ def test_scalar_only_metrics_skip_image_builders_and_preserve_interval_state(mon
     for router in routers:
         monitor._register_layer(router)
     monkeypatch.setattr(monitor, "build_heatmap_image", lambda *args: "logical-image")
-    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", lambda *args: "physical-image")
 
     def record_interval():
         for index, router in enumerate(routers):
@@ -268,7 +267,7 @@ def test_scalar_only_metrics_skip_image_builders_and_preserve_interval_state(mon
         pytest.fail("Scalar-only metrics must not call an image builder.")
 
     monkeypatch.setattr(monitor, "build_heatmap_image", unexpected_image)
-    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", unexpected_image)
+
     record_interval()
     actual = monitor.compute_metrics(current_step=2, render_heatmaps=False)
     assert actual == expected_scalars
@@ -588,18 +587,9 @@ def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch
     monitor.record_ep_balance(0, (2, 2), (1, 3), 2, 1)
     monitor.record_ep_balance(1, (0, 0), (0, 0), 0, 0)
 
-    heatmap_calls = []
-
-    def fake_rank_heatmap(matrix, stage):
-        heatmap_calls.append((matrix.clone(), stage))
-        return f"{stage}-image"
-
-    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", fake_rank_heatmap, raising=False)
     metrics = monitor.compute_metrics(current_step=7)
 
     required = {
-        "moe/ep_rank_load_before_heatmap",
-        "moe/ep_rank_load_after_heatmap",
         "moe/ep_rank_imbalance_before/layer_0",
         "moe/ep_rank_imbalance_before/layer_1",
         "moe/ep_rank_imbalance_before/max",
@@ -618,12 +608,6 @@ def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch
         "moe/ep_moved_token_fraction/avg",
     }
     assert required <= metrics.keys()
-    assert metrics["moe/ep_rank_load_before_heatmap"] == "before-image"
-    assert metrics["moe/ep_rank_load_after_heatmap"] == "after-image"
-    assert [stage for _, stage in heatmap_calls] == ["before", "after"]
-    assert torch.equal(heatmap_calls[0][0], torch.tensor([[10, 2], [0, 0]]))
-    assert torch.equal(heatmap_calls[1][0], torch.tensor([[5, 7], [0, 0]]))
-
     assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(2 / 3)
     assert metrics["moe/ep_rank_imbalance_before/layer_1"] == 0.0
     assert metrics["moe/ep_rank_imbalance_before/max"] == pytest.approx(2 / 3)
@@ -756,11 +740,6 @@ def test_metric_format_failure_preserves_interval_for_exact_retry(monkeypatch):
     assert monitor._last_step_range == (0, 0)
 
     monkeypatch.setattr(monitor, "build_heatmap_image", lambda *args, **kwargs: "logical-image")
-    monkeypatch.setattr(
-        monitor,
-        "build_ep_rank_heatmap_image",
-        lambda matrix, stage: f"{stage}-image",
-    )
     metrics = monitor.compute_metrics(current_step=4)
     assert metrics["moe/ep_moved_tokens/sum"] == 2
     assert metrics["moe/ep_total_routed_tokens/sum"] == 4
@@ -905,7 +884,7 @@ def test_monitor_callback_collects_without_wandb_and_propagates_only_scalars(mon
             calls.append((current_step, format_only_on, render_heatmaps))
             return {
                 "moe/ep_rank_imbalance_before/avg": 0.5,
-                "moe/ep_rank_load_before_heatmap": object(),
+                "moe/expert_load_heatmap": object(),
             }
 
     callback.monitor = FakeMonitor()
@@ -954,7 +933,7 @@ def test_monitor_callback_wandb_directly_logs_only_heatmaps_and_handles_missing_
             assert render_heatmaps is True
             return {
                 "moe/ep_rank_imbalance_before/avg": 0.5,
-                "moe/ep_rank_load_before_heatmap": image,
+                "moe/expert_load_heatmap": image,
             }
 
     logged = []
@@ -969,25 +948,11 @@ def test_monitor_callback_wandb_directly_logs_only_heatmaps_and_handles_missing_
     assert trainer.step_env_metrics["moe/ep_rank_imbalance_before/avg"] == 0.5
     assert logged == [
         (
-            {"moe/ep_rank_load_before_heatmap": (image, "Steps 1-2")},
+            {"moe/expert_load_heatmap": (image, "Steps 1-2")},
             2,
             False,
         )
     ]
-
-
-def test_monitor_callback_on_train_end_always_clears_singleton():
-    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
-
-    stale_monitor = MoERouterMonitor(num_experts=4)
-    set_active_monitor(stale_monitor)
-    callback = MoERouterMonitorCallback.__new__(MoERouterMonitorCallback)
-    callback.monitor = None
-    try:
-        callback.on_train_end(SimpleNamespace())
-        assert get_active_monitor() is None
-    finally:
-        set_active_monitor(None)
 
 
 def test_base_trainer_orders_monitor_after_metric_producers_before_wandb(monkeypatch):

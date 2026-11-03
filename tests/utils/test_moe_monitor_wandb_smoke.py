@@ -139,8 +139,6 @@ def test_full_pipeline_through_wandb_offline():
         assert summary["moe/max_vio/max"] == pytest.approx(num_experts - 1)
         # Heatmap key is recorded in summary as a media descriptor.
         assert "moe/expert_load_heatmap" in summary
-        assert "moe/ep_rank_load_before_heatmap" in summary
-        assert "moe/ep_rank_load_after_heatmap" in summary
         assert summary["moe/ep_rank_imbalance_before/avg"] > summary["moe/ep_rank_imbalance_after/avg"]
         assert summary["moe/ep_active_replicas/sum"] == 2
         assert summary["moe/ep_moved_tokens/sum"] == 11

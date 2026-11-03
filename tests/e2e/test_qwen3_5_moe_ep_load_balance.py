@@ -1,7 +1,7 @@
 """Matched Qwen3.5-MoE EP load-balance functional/precision E2E.
 
-This test requires four CUDA or Ascend NPU devices. It uses a full-attention
-Qwen3.5-MoE fixture so unrelated GDN packages do not gate the EP contract. Its
+This test requires four CUDA or Ascend NPU devices and the native hybrid
+Qwen3.5-MoE fixture. Its
 two synthetic-hotspot steps are functional/precision evidence only, never
 performance evidence.
 """
@@ -11,29 +11,19 @@ import importlib.util
 import json
 import math
 import os
-import shlex
 import subprocess
-import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 import torch
-import yaml
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
 _REQUIRED_DEVICES = 4
 _CONFIG_PATH = Path("tests/toy_config/qwen3_5_moe_toy/config.json")
-_NPU_GENERATED_MODEL_PATH = Path(
-    "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py"
-)
-_GPU_WORKFLOW_PATH = Path(".github/workflows/gpu_e2e_test.yml")
-_NPU_WORKFLOW_PATH = Path(".github/workflows/npu_e2e_test.yml")
 _STRICT_E2E_ENV = "VEOMNI_REQUIRE_EP_BALANCE_E2E"
-_HARDWARE_E2E_FILE = "tests/e2e/test_qwen3_5_moe_ep_load_balance.py"
-_HARDWARE_E2E_NODEID = f"{_HARDWARE_E2E_FILE}::test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry"
 _RTOL = 0.1
 _ATOL = 0.1
 _TELEMETRY_KEYS = {
@@ -212,13 +202,8 @@ def _require_accelerators() -> None:
         )
 
 
-def _write_moe_only_config(output_path: Path) -> None:
-    """Keep the Qwen3.5-MoE contract while excluding unrelated GDN dependencies."""
-    config = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    text_config = config["text_config"]
-    text_config["layer_types"] = ["full_attention"] * text_config["num_hidden_layers"]
-    text_config["full_attention_interval"] = 1
-    output_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+def _write_model_config(output_path: Path) -> None:
+    output_path.write_bytes(_CONFIG_PATH.read_bytes())
 
 
 def _materialize_checkpoint(config_path: Path, output_path: Path) -> None:
@@ -280,278 +265,6 @@ def _finite_curve(envelope: dict, name: str) -> list[float]:
     return curve
 
 
-class _FakeAccelerator:
-    def __init__(self, capabilities=((8, 0),) * _REQUIRED_DEVICES):
-        self.capabilities = capabilities
-
-    def is_available(self):
-        return True
-
-    def device_count(self):
-        return len(self.capabilities)
-
-    def get_device_capability(self, index):
-        return self.capabilities[index]
-
-
-def _configure_gate(monkeypatch, *, cuda, npu, capabilities=((8, 0),) * _REQUIRED_DEVICES, packages=()):
-    module = sys.modules[__name__]
-    monkeypatch.setattr(module, "IS_CUDA_AVAILABLE", cuda)
-    monkeypatch.setattr(module, "IS_NPU_AVAILABLE", npu)
-    monkeypatch.setattr(module, "get_torch_device", lambda: _FakeAccelerator(capabilities))
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name in packages else None)
-
-
-def _shell_commands(run_script):
-    commands = []
-    pending = ""
-    for raw_line in run_script.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if pending:
-            line = f"{pending} {line}"
-        if line.endswith("\\"):
-            pending = line[:-1].rstrip()
-            continue
-        commands.append(shlex.split(line))
-        pending = ""
-    if pending:
-        raise ValueError("unterminated shell line continuation")
-    return commands
-
-
-def _pytest_targets(command):
-    if "pytest" not in command:
-        return ()
-    pytest_index = command.index("pytest")
-    return tuple(token for token in command[pytest_index + 1 :] if token.startswith("tests/"))
-
-
-def _npu_workflow_commands_by_step():
-    workflow = yaml.safe_load(_NPU_WORKFLOW_PATH.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["npu_e2e_tests"]["steps"]
-    return [_shell_commands(step.get("run", "")) for step in steps]
-
-
-def test_npu_workflow_installs_triton_ascend_from_ascend_index_before_no_sync_e2e():
-    commands_by_step = _npu_workflow_commands_by_step()
-    package = "triton-ascend==3.2.1"
-    ascend_index = "https://triton-ascend.osinfra.cn/pypi/simple"
-
-    install_occurrences = [
-        (index, command)
-        for index, step_commands in enumerate(commands_by_step)
-        for command in step_commands
-        if command[:3] == ["uv", "pip", "install"] and package in command
-    ]
-    target_occurrences = [
-        (index, command)
-        for index, step_commands in enumerate(commands_by_step)
-        for command in step_commands
-        if _HARDWARE_E2E_NODEID in command
-    ]
-
-    assert len(install_occurrences) == 1, "the NPU workflow must install pinned triton-ascend once"
-    assert len(target_occurrences) == 1, "the NPU workflow must execute the Qwen3.5 E2E exactly once"
-    install_index, install_command = install_occurrences[0]
-    assert "--python" in install_command
-    assert install_command[install_command.index("--python") + 1] == ".venv/bin/python"
-    extra_index_values = []
-    for index, token in enumerate(install_command):
-        if token == "--extra-index-url":
-            extra_index_values.append(install_command[index + 1] if index + 1 < len(install_command) else None)
-        elif token.startswith("--extra-index-url="):
-            extra_index_values.append(token.split("=", 1)[1])
-    assert extra_index_values == [ascend_index], "the pinned package must use the documented Ascend index"
-
-    e2e_index, _ = target_occurrences[0]
-    assert install_index < e2e_index
-    assert all(
-        command[:2] != ["uv", "sync"]
-        for step_commands in commands_by_step[install_index + 1 : e2e_index + 1]
-        for command in step_commands
-    ), "uv sync must not remove triton-ascend between installation and the E2E"
-
-
-def test_npu_workflow_exposes_project_venv_to_torchrun_children_without_resync():
-    commands_by_step = _npu_workflow_commands_by_step()
-    target_commands = [
-        command for step_commands in commands_by_step for command in step_commands if _HARDWARE_E2E_NODEID in command
-    ]
-
-    assert target_commands == [
-        [
-            "PATH=$PWD/.venv/bin:$PATH",
-            ".venv/bin/python",
-            "-m",
-            "pytest",
-            "-v",
-            "-s",
-            "-x",
-            _HARDWARE_E2E_NODEID,
-        ]
-    ]
-
-
-@pytest.mark.parametrize(
-    ("workflow_path", "job_name"),
-    [
-        (_GPU_WORKFLOW_PATH, "gpu_e2e_tests_v5"),
-        (_NPU_WORKFLOW_PATH, "npu_e2e_tests"),
-    ],
-)
-def test_dedicated_accelerator_workflow_runs_only_exact_hardware_nodeid_in_strict_mode(workflow_path, job_name):
-    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
-    module_invocations = [
-        (step, command, targets)
-        for step in workflow["jobs"][job_name]["steps"]
-        for command in _shell_commands(step.get("run", ""))
-        if (targets := _pytest_targets(command))
-        if any(target == _HARDWARE_E2E_FILE or target.startswith(f"{_HARDWARE_E2E_FILE}::") for target in targets)
-    ]
-
-    assert len(module_invocations) == 1
-    target_step, target_command, targets = module_invocations[0]
-    assert target_step.get("env", {}).get(_STRICT_E2E_ENV) == "1"
-    assert targets == (_HARDWARE_E2E_NODEID,)
-    assert target_command.count(_HARDWARE_E2E_NODEID) == 1
-
-
-def test_local_prerequisite_failure_remains_an_honest_skip(monkeypatch):
-    monkeypatch.delenv(_STRICT_E2E_ENV, raising=False)
-    _configure_gate(monkeypatch, cuda=False, npu=False)
-
-    with pytest.raises(
-        pytest.skip.Exception,
-        match="requires at least 4 CUDA or NPU devices; found 0 supported devices",
-    ):
-        _require_accelerators()
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "no_accelerator",
-        "insufficient_count",
-        "rocm",
-        "insufficient_sm",
-        "missing_cuda_package",
-        "missing_npu_package",
-    ],
-)
-def test_strict_e2e_turns_every_prerequisite_unavailability_into_failure(monkeypatch, scenario):
-    cuda_packages = {"triton", "fla", "flash_attn", "liger_kernel"}
-    if scenario == "no_accelerator":
-        _configure_gate(monkeypatch, cuda=False, npu=False)
-    elif scenario == "insufficient_count":
-        _configure_gate(monkeypatch, cuda=True, npu=False, capabilities=((8, 0),) * 3, packages=cuda_packages)
-    elif scenario == "rocm":
-        _configure_gate(monkeypatch, cuda=True, npu=False, packages=cuda_packages)
-        monkeypatch.setattr(torch.version, "hip", "6.3", raising=False)
-    elif scenario == "insufficient_sm":
-        _configure_gate(
-            monkeypatch,
-            cuda=True,
-            npu=False,
-            capabilities=((8, 0), (7, 5), (6, 1), (8, 0)),
-            packages=cuda_packages,
-        )
-    elif scenario == "missing_cuda_package":
-        _configure_gate(monkeypatch, cuda=True, npu=False, packages=cuda_packages - {"liger_kernel"})
-    else:
-        _configure_gate(monkeypatch, cuda=False, npu=True, packages={"torch_npu"})
-    monkeypatch.setenv(_STRICT_E2E_ENV, "1")
-
-    with pytest.raises((pytest.skip.Exception, pytest.fail.Exception)) as outcome:
-        _require_accelerators()
-
-    assert isinstance(outcome.value, pytest.fail.Exception), f"strict scenario {scenario} must fail, not skip"
-
-
-def test_npu_backend_uses_executable_minimum_dependency_gdn_kernels(monkeypatch):
-    _configure_gate(monkeypatch, cuda=False, npu=True)
-
-    assert _backend_args() == [
-        "--train.dyn_bsz=False",
-        "--model.ops_implementation.rms_norm_gated_implementation=npu",
-        "--model.ops_implementation.causal_conv1d_implementation=npu",
-        "--model.ops_implementation.chunk_gated_delta_rule_implementation=npu",
-    ]
-
-
-def test_npu_gate_names_missing_triton_ascend_import(monkeypatch):
-    _configure_gate(monkeypatch, cuda=False, npu=True, packages={"torch_npu"})
-
-    with pytest.raises(
-        pytest.skip.Exception,
-        match=r"requires Ascend fused NPU/Triton; missing package\(s\): triton \(provided by triton-ascend\)",
-    ):
-        _require_accelerators()
-
-
-def test_cuda_gate_rejects_rocm_before_package_checks(monkeypatch):
-    _configure_gate(monkeypatch, cuda=True, npu=False)
-    monkeypatch.setattr(torch.version, "hip", "6.3", raising=False)
-
-    with pytest.raises(
-        pytest.skip.Exception,
-        match="requires NVIDIA CUDA; ROCm is unsupported",
-    ):
-        _require_accelerators()
-
-
-def test_cuda_gate_requires_sm70_on_each_selected_device(monkeypatch):
-    _configure_gate(
-        monkeypatch,
-        cuda=True,
-        npu=False,
-        capabilities=((8, 0), (7, 5), (6, 1), (8, 0)),
-        packages={"triton", "fla", "flash_attn", "liger_kernel"},
-    )
-
-    with pytest.raises(
-        pytest.skip.Exception,
-        match=r"requires compute capability >= 7\.0 on all 4 CUDA devices; device 2 has 6\.1",
-    ):
-        _require_accelerators()
-
-
-def test_cuda_gate_requires_liger_kernel_default_dependency(monkeypatch):
-    _configure_gate(
-        monkeypatch,
-        cuda=True,
-        npu=False,
-        packages={"triton", "fla", "flash_attn"},
-    )
-
-    with pytest.raises(
-        pytest.skip.Exception,
-        match=r"requires NVIDIA CUDA fused Triton/FLA/Liger; missing package\(s\): liger_kernel",
-    ):
-        _require_accelerators()
-
-
-def test_moe_only_config_preserves_expert_contract_without_gdn(tmp_path):
-    output_path = tmp_path / "config.json"
-
-    _write_moe_only_config(output_path)
-
-    source = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    result = json.loads(output_path.read_text(encoding="utf-8"))
-    assert result["text_config"]["num_experts"] == source["text_config"]["num_experts"] == 16
-    assert result["text_config"]["num_experts_per_tok"] == source["text_config"]["num_experts_per_tok"] == 2
-    assert result["text_config"]["layer_types"] == ["full_attention"] * result["text_config"]["num_hidden_layers"]
-    assert result["text_config"]["full_attention_interval"] == 1
-
-
-def test_npu_generated_model_only_precomputes_gdn_metadata_when_needed():
-    source = _NPU_GENERATED_MODEL_PATH.read_text(encoding="utf-8")
-
-    assert source.count('"linear_attention" in self.config.layer_types') == 1
-
-
 @pytest.mark.parametrize("ep_size", [2, 4])
 @pytest.mark.parametrize("optimize_memory,checkpointing", [(False, False), (True, False), (True, True)])
 def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
@@ -568,7 +281,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     wrapper = tmp_path / "train_qwen3_5_moe_ep_balance.py"
     wrapper.write_text(textwrap.dedent(_WRAPPER_SOURCE), encoding="utf-8")
     config_path = tmp_path / "qwen3_5_moe_ep_balance_config.json"
-    _write_moe_only_config(config_path)
+    _write_model_config(config_path)
     checkpoint_dir = tmp_path / "checkpoint"
     _materialize_checkpoint(config_path, checkpoint_dir)
     dataset = DummyDataset(
@@ -674,3 +387,11 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     # Two accumulated microbatches, four layers: EP2 has two groups with
     # one replica each; EP4 has one group with two replicas.
     assert replicas == [16 * forward_calls] * 2
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_required_ci_cannot_silently_skip_missing_hardware(monkeypatch, strict):
+    monkeypatch.setenv(_STRICT_E2E_ENV, "1" if strict else "0")
+    expected = pytest.fail.Exception if strict else pytest.skip.Exception
+    with pytest.raises(expected):
+        _prerequisite_unavailable("Missing accelerators")

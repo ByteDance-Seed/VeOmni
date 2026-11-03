@@ -621,9 +621,6 @@ class MoERouterMonitor:
                 torch.zeros_like(total_routed_tokens, dtype=torch.float),
             )
 
-            if render_heatmaps:
-                metrics[f"{prefix}/ep_rank_load_before_heatmap"] = self.build_ep_rank_heatmap_image(before, "before")
-                metrics[f"{prefix}/ep_rank_load_after_heatmap"] = self.build_ep_rank_heatmap_image(after, "after")
             for i in range(num_layers):
                 metrics[f"{prefix}/ep_rank_imbalance_before/layer_{i}"] = before_imbalance[i].item()
                 metrics[f"{prefix}/ep_rank_imbalance_after/layer_{i}"] = after_imbalance[i].item()
@@ -707,42 +704,6 @@ class MoERouterMonitor:
         if not should_format:
             return {}
         return metrics
-
-    def build_ep_rank_heatmap_image(self, rank_load_matrix: torch.Tensor, stage: str):
-        """Build a before/after PIL heatmap of normalized physical EP-rank load."""
-        import io
-
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from PIL import Image
-
-        if stage not in ("before", "after"):
-            raise ValueError("stage must be 'before' or 'after'.")
-        row_sums = rank_load_matrix.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-        normalized = rank_load_matrix.float() / row_sums
-        start, end = self._last_step_range
-        stage_title = "Before Temporary Replicas" if stage == "before" else "After Temporary Replicas"
-
-        fig, ax = plt.subplots(
-            figsize=(max(8, rank_load_matrix.shape[1] * 0.8), max(4, rank_load_matrix.shape[0] * 0.2))
-        )
-        im = ax.imshow(normalized.numpy(), aspect="auto", cmap="YlOrRd")
-        ax.set_xlabel("Physical EP Rank")
-        ax.set_ylabel("MoE Layer Index")
-        ax.set_title(f"MoE EP Rank Load {stage_title} (Steps {start}-{end})")
-        fig.colorbar(im, ax=ax, label="Normalized Routed Token Fraction")
-        fig.tight_layout()
-
-        buf = io.BytesIO()
-        try:
-            fig.savefig(buf, format="png", dpi=100)
-            plt.close(fig)
-            buf.seek(0)
-            return Image.open(buf).copy()
-        finally:
-            buf.close()
 
     def build_heatmap_image(self, load_matrix: torch.Tensor, caption: Optional[str] = None):
         """Build a PIL ``Image`` of the load matrix.

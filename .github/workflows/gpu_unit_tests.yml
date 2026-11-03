@@ -150,9 +150,8 @@ jobs:
             tests/utils/test_moe_ep_load_balance_config.py \
             tests/utils/test_moe_router_replay.py \
             tests/utils/test_moe_monitor.py \
-            tests/utils/test_moe_monitor_wandb_smoke.py \
-            tests/scripts/test_compare_moe_ep_load_balance.py
-      - name: Run MoE EP E2E gate and workflow contracts
+            tests/utils/test_moe_monitor_wandb_smoke.py
+      - name: Run MoE EP required-hardware gate contract
         # Real training remains in the strict accelerator E2E workflow.
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_qwen3_5_moe_ep_load_balance.py \

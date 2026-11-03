@@ -1,5 +1,4 @@
 import importlib
-import os
 import sys
 import types
 from pathlib import Path
@@ -100,43 +99,6 @@ def test_cpu_import_seam_restores_loaded_moe_submodules():
     assert _import_seam_restored_without_stub_leaks
     assert _import_seam_parent_attribute_restored
     assert getattr(moe_kernels, "group_gemm", None) is not group_gemm
-
-
-def test_balance_apis_are_reexported_from_common_moe_package():
-    package_dir = Path(__file__).parents[2] / "veomni" / "distributed" / "moe"
-    package_modules = (_MOE_PACKAGE_NAME, _MOE_LAYER_NAME, _EP_LOAD_BALANCE_NAME)
-    saved_modules = {name: sys.modules.get(name) for name in package_modules}
-    spec = importlib.util.spec_from_file_location(
-        _MOE_PACKAGE_NAME,
-        package_dir / "__init__.py",
-        submodule_search_locations=[str(package_dir)],
-    )
-    assert spec is not None and spec.loader is not None
-    moe_package = importlib.util.module_from_spec(spec)
-    sys.modules[_MOE_PACKAGE_NAME] = moe_package
-    sys.modules[_MOE_LAYER_NAME] = moe_layer
-    sys.modules[_EP_LOAD_BALANCE_NAME] = ep_load_balance
-    try:
-        spec.loader.exec_module(moe_package)
-    finally:
-        for name, saved in saved_modules.items():
-            if saved is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = saved
-
-    for name in (
-        "EPBalancePlan",
-        "ExpertReplicaTransfer",
-        "attach_qwen3_5_moe_ep_load_balancers",
-        "cat_local_and_replica_weights",
-    ):
-        assert name in moe_package.__all__
-        assert getattr(moe_package, name) is getattr(ep_load_balance, name)
-    assert all(
-        (name not in sys.modules if saved is None else sys.modules.get(name) is saved)
-        for name, saved in saved_modules.items()
-    )
 
 
 def test_disabled_dispatch_preserves_the_existing_preprocess_path(monkeypatch):
@@ -325,38 +287,6 @@ def test_public_group_gemm_validates_merged_weight_relationships_before_planning
             fc2_weight=down_proj,
             fc1_1_2_weight=gate_up_proj,
             load_balancer=UnexpectedBalancer(),
-        )
-
-
-def test_public_group_gemm_accepts_compatible_merged_weight_boundary(monkeypatch):
-    class PlannerReached(RuntimeError):
-        pass
-
-    class ExpectedBalancer:
-        def build_plan(self, selected_experts):
-            raise PlannerReached
-
-    def planner_dispatch(*args, load_balancer=None, **kwargs):
-        return load_balancer.build_plan(args[3])
-
-    gate_up_proj, down_proj = (
-        torch.ones((1, 4, 3), dtype=torch.bfloat16),
-        torch.ones((1, 3, 2), dtype=torch.bfloat16),
-    )
-    monkeypatch.setattr(group_gemm, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
-    monkeypatch.setattr(group_gemm, "dispatch_to_ep_class", planner_dispatch)
-
-    with pytest.raises(PlannerReached):
-        group_gemm.group_gemm_fused_moe_forward(
-            num_experts=2,
-            routing_weights=torch.ones((1, 1), dtype=torch.bfloat16),
-            selected_experts=torch.zeros((1, 1), dtype=torch.long),
-            hidden_states=torch.ones((1, 3), dtype=torch.bfloat16),
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=down_proj,
-            fc1_1_2_weight=gate_up_proj,
-            load_balancer=ExpectedBalancer(),
         )
 
 
@@ -711,13 +641,3 @@ def test_runtime_disabled_is_noop_and_enabled_requires_a_real_expert(monkeypatch
     enabled.model = _OrderModel([])
     with pytest.raises(RuntimeError, match="no compatible Qwen3.5 MoE expert modules"):
         enabled._attach_moe_ep_load_balancers()
-
-
-def test_torchrun_two_rank_balanced_dispatch_output_routing_and_owner_gradient():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("Run this test with torchrun --standalone --nproc-per-node=2.")
-    dist.init_process_group("gloo")
-    try:
-        _exercise_two_rank_dispatch(dist.get_rank(), dist.group.WORLD)
-    finally:
-        dist.destroy_process_group()

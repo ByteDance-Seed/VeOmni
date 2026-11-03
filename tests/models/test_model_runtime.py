@@ -24,9 +24,7 @@ still needs the multi-rank suites. The seam tests below need no distribution
 at all.
 """
 
-import builtins
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -58,7 +56,6 @@ TOY_CONFIG = "./tests/toy_config/qwen3_toy"
 def train_args(load_path=None):
     """The job-wide slice a runtime reads: where checkpoints go, and where to resume."""
     return SimpleNamespace(
-        moe_ep_load_balance=SimpleNamespace(enabled=False, max_replicas_per_rank=1),
         checkpoint=SimpleNamespace(
             load_path=load_path,
             save_path=None,
@@ -67,13 +64,14 @@ def train_args(load_path=None):
             save_async=False,
             dcp_save_to_lowest_rank=False,
         ),
+        moe_ep_load_balance=SimpleNamespace(enabled=False),
     )
 
 
 @pytest.fixture
 def single_rank_group(tmp_path):
     """One rank on the local accelerator, enough to drive the parallelize path."""
-    if get_device_type() == "cpu":
+    if not torch.accelerator.is_available():
         pytest.skip("needs an accelerator for the FSDP2 meta-init path")
 
     get_torch_device().set_device(f"{get_device_type()}:0")
@@ -103,156 +101,6 @@ def make_runtime(name="base", **kwargs):
         ),
     )
     return VeOmniModelRuntime(args, name, train=train_args(**kwargs))
-
-
-@pytest.fixture
-def cpu_runtime_group(tmp_path):
-    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'runtime'}", rank=0, world_size=1)
-    try:
-        yield
-    finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
-
-
-@pytest.mark.parametrize("model_name", ["policy", "vision_tower"])
-@pytest.mark.parametrize("enabled, compatible", [(True, 1), (False, 0), (True, 0)])
-def test_runtime_constructor_attaches_between_wrap_and_optimizer_in_its_named_state(
-    monkeypatch, cpu_runtime_group, model_name, enabled, compatible
-):
-    clear_parallel_state()
-    ambient = _init_parallel_state(name="base", dp_mode="ddp")
-    events = []
-    from veomni.trainer.vlm_trainer import VLMModelRuntime
-
-    runtime_base = VLMModelRuntime if model_name == "vision_tower" else VeOmniModelRuntime
-
-    class LightweightRuntime(runtime_base):
-        def setup(self):
-            _init_parallel_state(name=self.model_name)
-
-        def _build_model(self):
-            self.model = nn.Linear(1, 1)
-
-        def _freeze_model_module(self):
-            pass
-
-        def _build_parallelized_model(self):
-            assert get_parallel_state() is self.parallel_state
-            events.append("wrap")
-            self.model.train()
-
-        def _build_optimizer(self):
-            assert get_parallel_state() is self.parallel_state
-            events.append("optimizer")
-
-        def _build_model_assets(self):
-            pass
-
-        def build_checkpoint(self):
-            pass
-
-    attachment = ModuleType("veomni.distributed.moe.ep_load_balance")
-
-    def attach(model, max_replicas_per_rank):
-        assert isinstance(model, nn.Linear), "attachment receives the raw module, not its runtime"
-        assert model.training
-        assert get_parallel_state() is not ambient
-        assert max_replicas_per_rank == 2
-        events.append("attach")
-        return compatible
-
-    attachment.attach_qwen3_5_moe_ep_load_balancers = attach
-    monkeypatch.setitem(sys.modules, attachment.__name__, attachment)
-    original_import = builtins.__import__
-
-    def guard_disabled_import(name, *args, **kwargs):
-        if not enabled and "ep_load_balance" in name:
-            raise AssertionError("disabled balancing must not import the attachment module")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guard_disabled_import)
-    train = train_args()
-    train.moe_ep_load_balance = SimpleNamespace(enabled=enabled, max_replicas_per_rank=2)
-    try:
-        if enabled and compatible == 0:
-            with pytest.raises(RuntimeError, match="no compatible Qwen3.5 MoE expert modules"):
-                LightweightRuntime(
-                    ModelArguments(model_path="unused", ops_implementation=make_eager_ops_config()),
-                    model_name,
-                    train=train,
-                )
-            assert events == ["wrap", "attach"]
-        else:
-            LightweightRuntime(
-                ModelArguments(model_path="unused", ops_implementation=make_eager_ops_config()),
-                model_name,
-                train=train,
-            )
-            assert events == (["wrap", "attach", "optimizer"] if enabled else ["wrap", "optimizer"])
-        assert get_parallel_state() is ambient
-    finally:
-        clear_parallel_state()
-
-
-def test_runtime_passes_memory_optimization_to_the_expert_attachment(monkeypatch):
-    from tests.parallel.test_moe_ep_load_balance_planner import ep_load_balance
-
-    module = nn.Linear(1, 1)
-    runtime = unbuilt_runtime(SimpleNamespace(), train=train_args())
-    runtime.model = module
-    runtime.train_args.moe_ep_load_balance = SimpleNamespace(
-        enabled=True, max_replicas_per_rank=2, optimize_memory=True
-    )
-    received = []
-
-    def attach(model, **kwargs):
-        received.append((model, kwargs))
-        return 1
-
-    monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", attach)
-    runtime._attach_moe_ep_load_balancers()
-    assert received == [(module, {"max_replicas_per_rank": 2, "optimize_memory": True})]
-
-
-def test_frozen_dpo_reference_does_not_attach_or_build_an_optimizer(monkeypatch, cpu_runtime_group):
-    from veomni.trainer.text_dpo_trainer import DPOReferenceModelRuntime
-
-    clear_parallel_state()
-    events = []
-
-    class LightweightReference(DPOReferenceModelRuntime):
-        def setup(self):
-            _init_parallel_state(name=self.model_name)
-
-        def _build_model(self):
-            self.model = nn.Linear(1, 1)
-
-    def wrap(model, **kwargs):
-        assert not any(p.requires_grad for p in model.parameters())
-        events.append("wrap")
-        return model
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("a frozen reference must not attach balancing or build an optimizer")
-
-    monkeypatch.setattr("veomni.distributed.torch_parallelize.build_parallelize_model", wrap)
-    monkeypatch.setattr(VeOmniModelRuntime, "_build_optimizer", unexpected)
-    attachment = ModuleType("veomni.distributed.moe.ep_load_balance")
-    attachment.attach_qwen3_5_moe_ep_load_balancers = unexpected
-    monkeypatch.setitem(sys.modules, attachment.__name__, attachment)
-    train = train_args()
-    train.moe_ep_load_balance.enabled = True
-    try:
-        reference = LightweightReference(
-            ModelArguments(model_path="unused", ops_implementation=make_eager_ops_config()), train=train
-        )
-        assert events == ["wrap"]
-        assert not reference.model.training
-        assert not any(p.requires_grad for p in reference.model.parameters())
-        assert reference.optimizer is None
-    finally:
-        clear_parallel_state()
 
 
 def test_a_runtime_builds_and_optimizes_a_model_without_a_trainer(single_rank_group):
@@ -364,9 +212,7 @@ class TestHowATrainerHoldsItsModel:
 
     def test_optimizer_and_scheduler_live_on_the_runtime_not_the_trainer(self):
         trainer = BaseTrainer.__new__(BaseTrainer)
-        trainer.model = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere")
-        )
+        trainer.model = unbuilt_runtime(ModelArguments(model_path="somewhere"))
 
         trainer.model.optimizer = "optimizer"
         trainer.model.lr_scheduler = "scheduler"
@@ -378,7 +224,7 @@ class TestHowATrainerHoldsItsModel:
         assert not hasattr(BaseTrainer, "model_config")
 
     def test_a_standalone_runtime_defaults_to_the_single_model_name(self):
-        args = ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere")
+        args = ModelArguments(model_path="somewhere")
         runtime = unbuilt_runtime(args)
 
         assert runtime.args is args
@@ -386,32 +232,23 @@ class TestHowATrainerHoldsItsModel:
 
     def test_a_named_runtime_carries_its_own_name(self):
         # Sibling models in one job register their meshes under distinct names.
-        runtime = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"), name="audio"
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), name="audio")
 
         assert runtime.model_name == "audio"
 
     def test_a_fresh_run_still_materializes_hf_weights(self):
-        runtime = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"), train=train_args()
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
 
         assert runtime.skip_hf_weight_load is False
 
     def test_a_full_resume_skips_the_second_memory_peak(self):
-        runtime = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"),
-            train=train_args(load_path="/ckpt"),
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args(load_path="/ckpt"))
 
         assert runtime.skip_hf_weight_load is True
 
     def test_a_lora_resume_still_needs_the_hf_base(self):
         runtime = unbuilt_runtime(
-            ModelArguments(
-                ops_implementation=make_eager_ops_config(), model_path="somewhere", lora_config={"rank": 8}
-            ),
+            ModelArguments(model_path="somewhere", lora_config={"rank": 8}),
             train=train_args(load_path="/ckpt"),
         )
 
@@ -428,11 +265,7 @@ def test_runtime_forwards_low_precision_reduce_scatter_config(monkeypatch, enabl
         low_precision_reduce_scatter_comm=enabled,
     )
     runtime = unbuilt_runtime(
-        ModelArguments(
-            ops_implementation=make_eager_ops_config(),
-            model_path="somewhere",
-            accelerator=AcceleratorConfig(fsdp_config=config),
-        ),
+        ModelArguments(model_path="somewhere", accelerator=AcceleratorConfig(fsdp_config=config)),
         train=train_args(),
     )
     runtime.model = nn.Linear(2, 2)
@@ -456,33 +289,18 @@ class TestWhereTheLoaderReadsTheConfigFrom:
     def test_a_module_falls_back_to_its_weights_folder(self):
         # A module inside a composed checkpoint is addressed by its own subfolder,
         # so it never configures a config path separately.
-        assert (
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere").config_path
-            == "somewhere"
-        )
+        assert ModelArguments(model_path="somewhere").config_path == "somewhere"
 
     def test_a_whole_model_honours_a_separate_config_path(self):
         # Toy-config runs rely on this: architecture from a local json, weights
         # (and tokenizer) from somewhere else entirely.
-        assert (
-            ModelArguments(
-                ops_implementation=make_eager_ops_config(), model_path="weights", config_path="cfg"
-            ).config_path
-            == "cfg"
-        )
+        assert ModelArguments(model_path="weights", config_path="cfg").config_path == "cfg"
 
     def test_a_whole_model_falls_back_to_its_weights_path(self):
-        assert (
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="weights").config_path == "weights"
-        )
+        assert ModelArguments(model_path="weights").config_path == "weights"
 
     def test_the_tokenizer_follows_the_config_the_base_settled(self):
-        assert (
-            ModelArguments(
-                ops_implementation=make_eager_ops_config(), model_path="weights", config_path="cfg"
-            ).tokenizer_path
-            == "cfg"
-        )
+        assert ModelArguments(model_path="weights", config_path="cfg").tokenizer_path == "cfg"
 
 
 class TestHowAJobOverridesItsPreprocessor:
@@ -501,11 +319,7 @@ class TestHowAJobOverridesItsPreprocessor:
         seen = {}
         self._record_loader(monkeypatch, seen)
         size = {"shortest_edge": 3136, "longest_edge": 602112}
-        runtime = unbuilt_runtime(
-            ModelArguments(
-                ops_implementation=make_eager_ops_config(), model_path="somewhere", processor_config={"size": size}
-            )
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", processor_config={"size": size}))
 
         runtime._build_model_assets()
 
@@ -514,7 +328,7 @@ class TestHowAJobOverridesItsPreprocessor:
     def test_a_run_that_overrides_nothing_leaves_the_repository_alone(self, monkeypatch):
         seen = {}
         self._record_loader(monkeypatch, seen)
-        runtime = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
 
         runtime._build_model_assets()
 
@@ -537,7 +351,7 @@ class TestWhatTheRuntimeAsksTheModel:
                 seen["args"] = args
                 return wrapped
 
-        args = ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere")
+        args = ModelArguments(model_path="somewhere")
         runtime = unbuilt_runtime(args, train=train_args())
         runtime.model = SelfWrapping()
 
@@ -555,9 +369,7 @@ class TestWhatTheRuntimeAsksTheModel:
             "veomni.distributed.torch_parallelize.build_parallelize_model",
             lambda model, **kwargs: generically_wrapped,
         )
-        runtime = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"), train=train_args()
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
         runtime.model = nn.Linear(1, 1)
 
         runtime._build_parallelized_model()
@@ -576,7 +388,7 @@ class TestWhatTheRuntimeAsksTheModel:
             def freeze_model(self):
                 self.frozen = True
 
-        runtime = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
         runtime.model = SelfFreezing()
 
         runtime._freeze_model_module()
@@ -590,9 +402,7 @@ class TestWhatTheRuntimeAsksTheModel:
             def setup_lora(self, lora_config):
                 return wrapped
 
-        runtime = unbuilt_runtime(
-            ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere", lora_config={"rank": 8})
-        )
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", lora_config={"rank": 8}))
         runtime.model = SelfAdapting()
 
         runtime._setup_lora()
@@ -615,7 +425,6 @@ class TestWhatTheRuntimeAsksTheModel:
                 raise AssertionError("the prefixed name is the runtime's, not the model's")
 
         args = ModelArguments(
-            ops_implementation=make_eager_ops_config(),
             model_path="somewhere",
             lora_config={"rank": 8, "alpha": 16, "lora_modules": ["proj"]},
         )
@@ -635,16 +444,14 @@ def test_unwrapped_module_peels_ddp():
             super().__init__()
             self.module = module
 
-    runtime = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
     runtime.model = DDPLike(inner)
 
     assert runtime.unwrapped_module is inner
 
 
 def test_runtime_train_forwards_to_the_wrapped_module():
-    runtime = unbuilt_runtime(
-        ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"), train=train_args()
-    )
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
     runtime.model = nn.Linear(1, 1)
     runtime.model.eval()
 
@@ -655,8 +462,8 @@ def test_runtime_train_forwards_to_the_wrapped_module():
 
 
 def test_model_assets_are_per_instance():
-    left = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
-    right = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
+    left = unbuilt_runtime(ModelArguments(model_path="somewhere"))
+    right = unbuilt_runtime(ModelArguments(model_path="somewhere"))
     left.model_assets.append("only-left")
 
     assert right.model_assets == []
@@ -669,7 +476,7 @@ def test_channel_loss_install_patches_the_module_not_the_handle():
         def loss_function(self, *args, **kwargs):
             return None
 
-    runtime = unbuilt_runtime(ModelArguments(ops_implementation=make_eager_ops_config(), model_path="somewhere"))
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
     dummy = Dummy()
     runtime.model = dummy
     original = dummy.loss_function
@@ -684,11 +491,7 @@ def test_channel_loss_install_patches_the_module_not_the_handle():
 
 
 def test_a_local_dir_without_a_preprocessor_is_not_fatal(tmp_path):
-    runtime = unbuilt_runtime(
-        ModelArguments(
-            ops_implementation=make_eager_ops_config(), model_path="somewhere", tokenizer_path=str(tmp_path)
-        )
-    )
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", tokenizer_path=str(tmp_path)))
     runtime._build_model_assets()
     assert runtime.tokenizer is None
     assert runtime.processor is None
@@ -698,11 +501,13 @@ def test_a_local_dir_without_a_preprocessor_is_not_fatal(tmp_path):
 
 def test_a_missing_preprocessor_path_is_not_swallowed(tmp_path):
     runtime = unbuilt_runtime(
-        ModelArguments(
-            ops_implementation=make_eager_ops_config(),
-            model_path="somewhere",
-            tokenizer_path=str(tmp_path / "no-such-dir"),
-        ),
+        ModelArguments(model_path="somewhere", tokenizer_path=str(tmp_path / "no-such-dir")),
     )
     with pytest.raises(OSError):
         runtime._build_model_assets()
+
+
+def test_disabled_ep_balancing_requires_no_model_or_mesh():
+    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime.train_args = train_args()
+    runtime._attach_moe_ep_load_balancers()

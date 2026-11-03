@@ -37,10 +37,6 @@ data:
     use_audio_in_video: false
 
 train:
-  moe_load_balance_monitor_interval: 0
-  moe_ep_load_balance:
-    enabled: false
-    max_replicas_per_rank: 1
   wandb:
     enable: false
     project: VeOmni

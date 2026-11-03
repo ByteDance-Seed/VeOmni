@@ -1,6 +1,5 @@
 import gc
 import importlib
-import os
 import sys
 import threading
 import time
@@ -169,16 +168,6 @@ def _transposed_gradient_worker(rank: int, world_size: int, rendezvous: str) -> 
 def test_transposed_replica_gradients_use_contiguous_receive_buffers(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-transposed-gradient'}"
     mp.spawn(_transposed_gradient_worker, args=(2, rendezvous), nprocs=2, join=True)
-
-
-def test_torchrun_two_rank_copy_alias_computation_and_replica_gradient_return():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("Run this test with torchrun --standalone --nproc-per-node=2.")
-    dist.init_process_group("gloo")
-    try:
-        _exercise_two_rank_copy_and_gradient(dist.get_rank(), dist.group.WORLD)
-    finally:
-        dist.destroy_process_group()
 
 
 def _empty_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:

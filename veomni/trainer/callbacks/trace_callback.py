@@ -134,25 +134,15 @@ class MoERouterMonitorCallback(Callback):
                 wandb.log(wandb_metrics, step=state.global_step, commit=False)
 
         start, end = self.monitor._last_step_range
-        summaries = []
-        for key in (
-            "moe/avg_vio/avg",
-            "moe/ep_rank_imbalance_before/avg",
-            "moe/ep_rank_imbalance_after/avg",
-            "moe/ep_moved_tokens/sum",
-        ):
-            if key in scalar_metrics:
-                summaries.append(f"{key.rsplit('/', 2)[-2:]!s}={scalar_metrics[key]:.4f}")
-        summary = ", ".join(summaries) if summaries else "no scalar summaries"
-        logger.info_rank0(f"Step {state.global_step}: collected MoE monitor metrics (steps {start}-{end}); {summary}.")
+        logger.info_rank0(f"Step {state.global_step}: collected MoE load metrics (steps {start}-{end}).")
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        from ...utils.moe_monitor import set_active_monitor
-
-        set_active_monitor(None)
         if self.monitor is not None:
+            from ...utils.moe_monitor import set_active_monitor
+
+            set_active_monitor(None)
+            self.monitor = None
             logger.info_rank0("MoE router monitor disabled.")
-        self.monitor = None
 
 
 class WandbTraceCallback(Callback):
