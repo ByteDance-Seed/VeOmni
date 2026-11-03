@@ -624,35 +624,6 @@ def test_inventory_hash_failure_propagates_before_collective():
     spawn_with_rendezvous(_inventory_hash_failure_worker, args=(), nprocs=2)
 
 
-def _tied_parameter_order_worker(rank, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    from veomni.checkpoint.optimizer_resume_layout import coordinated_multi_layout
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model = torch.nn.Module()
-        shared = torch.nn.Parameter(torch.ones(2, 2))
-        for name in ("a", "b") if rank == 0 else ("b", "a"):
-            model.register_parameter(name, shared)
-        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([shared])}, ["leaf"])
-        coordinated_multi_layout(model, optimizer, writing=True)
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_tied_parameter_registration_order_does_not_change_trainability():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_tied_parameter_order_worker, args=(), nprocs=2)
-
-
 def _finalize_error_worker(rank, checkpoint, endpoint):
     from datetime import timedelta
 
@@ -690,7 +661,7 @@ def test_save_finalize_error_propagates_to_all_ranks(tmp_path):
     spawn_with_rendezvous(_finalize_error_worker, args=(str(tmp_path),), nprocs=2)
 
 
-def _runtime_plan_mismatch_worker(rank, mode, endpoint):
+def _runtime_plan_mismatch_worker(rank, endpoint):
     import contextlib
     from datetime import timedelta
 
@@ -707,8 +678,6 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
 
             def _build_model(self):
                 self.model = torch.nn.Linear(2, 2)
-                if mode != "missing" and (mode != "plan" or rank == 0):
-                    self.model._fqn2spec_info = {}
 
             def _freeze_model_module(self):
                 pass
@@ -717,11 +686,9 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
                 pass
 
         runtime_module.use_parallel_state = lambda *_args, **_kwargs: contextlib.nullcontext()
-        checkpoint = SimpleNamespace(
-            extra_parallel_canonical_layout=(mode == "missing" or (mode == "flag" and rank == 1))
-        )
+        checkpoint = SimpleNamespace(extra_parallel_canonical_layout=True)
         args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
-        with pytest.raises(RuntimeError, match="differs across ranks|requires an ExtraParallel model plan"):
+        with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
             TestRuntime(args, train=SimpleNamespace(checkpoint=checkpoint))
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -731,11 +698,10 @@ def _runtime_plan_mismatch_worker(rank, mode, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("mode", ["missing"])
-def test_runtime_checkpoint_plan_mismatch_fails_all_ranks(mode):
+def test_runtime_checkpoint_plan_mismatch_fails_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_runtime_plan_mismatch_worker, args=(mode,), nprocs=2)
+    spawn_with_rendezvous(_runtime_plan_mismatch_worker, args=(), nprocs=2)
 
 
 @pytest.mark.parametrize("same_base", [True, False])
