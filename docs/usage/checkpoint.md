@@ -397,9 +397,13 @@ device tensors to CPU and can add substantial time for a large frozen model.
 Hooks, adapters and scheduler method wrappers are trusted: a wrapper must
 preserve serializable scheduler state and implement the same learning-rate
 behavior on both sides of a restore, and hooks must not mutate checkpoint
-model, optimizer, or layout during a save/load call. The persisted recipe checks scheduler
-configuration and optimizer binding; it does not inspect arbitrary wrapper
-code. MultiOptimizer asynchronous saves and detected unsupported layouts fail
+model, optimizer, or layout during a save/load call. A hook may transform the
+serialized representation within the codec's supported inventory, dtypes, and
+shapes, but exact continuation requires the restored optimizer state,
+parameter-group bindings, and scheduler behavior to match; when necessary, a
+matching load hook must undo the transformation. The persisted recipe does not
+verify arbitrary hook or
+wrapper code. MultiOptimizer asynchronous saves and detected unsupported layouts fail
 closed; the cross-rank leaf mismatch above is not detected. Synchronous staged
 saves are supported.
 The runtime assumes ranks use a consistent model configuration and compatible

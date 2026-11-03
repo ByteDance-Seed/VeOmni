@@ -1898,6 +1898,67 @@ def test_model_object_alias_graph_must_match_on_resume(tmp_path, kind):
     torch.testing.assert_close(target.p, before, rtol=0, atol=0)
 
 
+def _save_destination_stat_error_worker(rank, checkpoint, location, endpoint):
+    import errno
+    import os
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.layout import manifest_path, model_dir
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        root = Path(checkpoint)
+        if rank == 0:
+            root.mkdir(parents=True)
+            (root / "sentinel").write_bytes(b"preserve-existing-data")
+        dist.barrier()
+        target = (
+            manifest_path(checkpoint)
+            if location == "manifest"
+            else os.path.join(model_dir(checkpoint, ""), "extra_state", "extra_state_rank_1.pt")
+        )
+        original_stat = os.stat
+        injected = False
+
+        def stat(path, *args, **kwargs):
+            nonlocal injected
+            if rank == 1 and isinstance(path, (str, os.PathLike)) and os.fspath(path) == target:
+                injected = True
+                raise OSError(errno.EIO, "injected checkpoint stat failure")
+            return original_stat(path, *args, **kwargs)
+
+        model, optimizer = _model_and_optimizer()
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.os.stat", side_effect=stat),
+            pytest.raises((OSError, RuntimeError), match="stat failure|failed on another rank") as captured,
+        ):
+            DistributedCheckpointer.save(
+                checkpoint,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+        if rank == 1:
+            assert injected and "injected checkpoint stat failure" in str(captured.value)
+        else:
+            assert "failed on another rank" in str(captured.value)
+            assert (root / "sentinel").read_bytes() == b"preserve-existing-data"
+            assert not Path(model_dir(checkpoint, "")).exists()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("location", ["manifest", "sidecar"])
+def test_multi_optimizer_save_coordinates_destination_stat_errors(tmp_path, location):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_save_destination_stat_error_worker, args=(str(tmp_path / "ckpt"), location), nprocs=2)
+
+
 @pytest.mark.parametrize("old_model_state", [True, False])
 def test_multi_optimizer_save_preserves_completed_checkpoint(tmp_path, old_model_state):
     from veomni.checkpoint.layout import checkpoint_is_complete, write_manifest
