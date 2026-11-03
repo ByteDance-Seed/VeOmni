@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import copy
 import math
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -51,6 +52,37 @@ def build_dataloader(dataloader_type: str, **kwargs):
 class DistributedDataloader(StatefulDataLoader):
     dataset: "Dataset"
     sampler: "StatefulDistributedSampler"
+
+    def _get_iterator(self):
+        if self.generator is None:
+            self.generator = torch.Generator().manual_seed(torch.initial_seed())
+        restored = getattr(self, "_restored_generator_state", None)
+        if restored is not None:
+            self.generator.set_state(restored["before_iterator"])
+        self._generator_before_iterator = self.generator.get_state()
+        iterator = super()._get_iterator()
+        if restored is not None:
+            self.generator.set_state(restored["at_checkpoint"])
+        self._restored_generator_state = None
+        return iterator
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["_veomni_generator"] = {
+            "before_iterator": self._generator_before_iterator.clone(),
+            "at_checkpoint": self.generator.get_state(),
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state = dict(state_dict)
+        restored = copy.deepcopy(state.pop("_veomni_generator", None))
+        super().load_state_dict(state)
+        self._restored_generator_state = restored
+        if restored is not None:
+            if self.generator is None:
+                self.generator = torch.Generator()
+            self.generator.set_state(restored["at_checkpoint"])
 
     def set_epoch(self, epoch: int) -> None:
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
@@ -268,6 +300,7 @@ def build_native_dataloader(
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
         snapshot_every_n_steps=snapshot_every_n_steps,
+        generator=torch.Generator().manual_seed(seed + parallel_state.dp_rank),
     )
 
     if dyn_bsz and dyn_bsz_runtime == "main":

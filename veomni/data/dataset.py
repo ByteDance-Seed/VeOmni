@@ -18,6 +18,7 @@ import os
 import random
 import traceback
 from functools import partial
+from itertools import islice
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import numpy as np
@@ -112,14 +113,15 @@ class IterativeDataset(IterableDataset):
                 yield sample
 
     def load_state_dict(self, state_dict):
+        if state_dict is None:
+            return
         inner = state_dict.get("dataset")
         if inner is not None and hasattr(self._data, "load_state_dict"):
             self._data.load_state_dict(inner)
 
     def state_dict(self):
-        if hasattr(self._data, "state_dict"):
-            return {"dataset": self._data.state_dict()}
-        return {"dataset": None}
+        inner = self._data.state_dict() if hasattr(self._data, "state_dict") else None
+        return {"dataset": inner} if inner is not None else None
 
     def set_epoch(self, epoch: int):
         if hasattr(self._data, "set_epoch"):
@@ -164,48 +166,125 @@ class ShardedIterableDataset(IterableDataset):
         self._repeat = repeat
         self._seed = seed
         self._epoch = 0
+        self._source = None
+        self._iterator = None
+        self._restore_pending = False
+        self._reset_state()
+
+    def _reset_state(self):
+        self._phase = "UNSTARTED"
+        self._index = 0
+        self._pass_index = 0
+        self._rows_read = 0
+        self._pending = []
+        self._source_state = None
+        self._source_started = False
 
     def set_epoch(self, epoch: int):
         self._epoch = epoch
 
     def __iter__(self):
         worker_info = get_worker_info()
-        worker_id = 0 if worker_info is None else worker_info.id
-        num_workers = 1 if worker_info is None else worker_info.num_workers
-        dataset = self._dataset
-        if _shards_across_workers(dataset):
+        self._worker_id = 0 if worker_info is None else worker_info.id
+        self._num_workers = 1 if worker_info is None else worker_info.num_workers
+        self._source_shards_workers = _shards_across_workers(self._dataset)
+        if self._source_shards_workers:
             # The wrapped stream already assigns source shards to DataLoader
             # workers, so splitting by worker a second time would silently drop
             # every row that was handed to another worker.
-            worker_id, num_workers = 0, 1
-            # HF keeps ``_epoch`` in shared memory across DataLoader workers, so the
-            # per-pass ``set_epoch`` below must run on a worker-private copy.
-            dataset = copy.deepcopy(dataset)
-        index = 0
-        pending: List[Any] = []
-        pass_i = 0
-        while True:
-            n_before = index
-            if hasattr(dataset, "set_epoch"):
-                dataset.set_epoch(self._seed + self._epoch + pass_i)
-            for sample in dataset:
-                if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
-                    pending.append(sample)
-                index += 1
-                if index % self._dp_size == 0:
-                    yield from pending
-                    pending = []
-            produced = index - n_before
-            if produced == 0 or not self._repeat:
-                return
-            # Drop an incomplete last DP round so it cannot leak into the next pass.
-            pending = []
-            remainder = index % self._dp_size
-            if remainder:
-                index += self._dp_size - remainder
-            if produced < self._dp_size:
-                return
-            pass_i += 1
+            self._worker_id, self._num_workers = 0, 1
+        if self._restore_pending:
+            self._restore_pending = False
+            if self._phase != "UNSTARTED":
+                if self._phase == "ACTIVE":
+                    skipped = self._rows_read if self._source_state is None else 0
+                    self._start_pass(self._source_state, skipped)
+                return _ShardedIterableIterator(self)
+        self._reset_state()
+        self._phase = "ACTIVE"
+        self._start_pass()
+        return _ShardedIterableIterator(self)
+
+    def _start_pass(self, source_state=None, skipped=0):
+        self._source = copy.deepcopy(self._dataset) if self._source_shards_workers else self._dataset
+        if hasattr(self._source, "set_epoch"):
+            self._source.set_epoch(self._seed + self._epoch + self._pass_index)
+        if source_state is not None:
+            self._source.load_state_dict(copy.deepcopy(source_state))
+        self._source_state = copy.deepcopy(
+            self._source.state_dict() if source_state is None and hasattr(self._source, "state_dict") else source_state
+        )
+        self._source_started = False
+        self._iterator = iter(self._source)
+        for _ in islice(self._iterator, skipped):
+            pass
+
+    def _next_row(self):
+        while self._phase == "ACTIVE":
+            if self._pending and self._index % self._dp_size == 0:
+                return self._pending.pop(0)
+            try:
+                sample = next(self._iterator)
+                self._source_started = True
+            except StopIteration:
+                self._pending = []
+                if self._rows_read == 0 or not self._repeat or self._rows_read < self._dp_size:
+                    self._phase = "EXHAUSTED"
+                    raise
+                self._index += (-self._index) % self._dp_size
+                self._rows_read = 0
+                self._pass_index += 1
+                self._start_pass()
+                continue
+            if (
+                self._index % self._dp_size == self._dp_rank
+                and (self._index // self._dp_size) % self._num_workers == self._worker_id
+            ):
+                self._pending.append(sample)
+            self._index += 1
+            self._rows_read += 1
+        raise StopIteration
+
+    def state_dict(self):
+        source_state = self._source_state
+        if self._source_started and hasattr(self._source, "state_dict"):
+            source_state = self._source.state_dict()
+        return copy.deepcopy(
+            {
+                "phase": self._phase,
+                "epoch": self._epoch,
+                "index": self._index,
+                "pass_index": self._pass_index,
+                "rows_read": self._rows_read,
+                "pending": self._pending,
+                "source_state": source_state,
+            }
+        )
+
+    def load_state_dict(self, state_dict):
+        state = copy.deepcopy(state_dict)
+        self._phase = state["phase"]
+        self._epoch = state["epoch"]
+        self._index = state["index"]
+        self._pass_index = state["pass_index"]
+        self._rows_read = state["rows_read"]
+        self._pending = state["pending"]
+        self._source_state = state["source_state"]
+        self._source_started = False
+        self._source = None
+        self._iterator = None
+        self._restore_pending = True
+
+
+class _ShardedIterableIterator:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.dataset._next_row()
 
 
 class InterleavedIterableDataset(IterativeDataset):
