@@ -437,5 +437,15 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
+  },
+  {
+    "name": "npu-unit-42",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ring"
+    ]
   }
 ]

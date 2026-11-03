@@ -215,7 +215,12 @@ def flash_attention_forward(
         )
         if expected_backend is None:
             raise NotImplementedError(f"USP does not support {selected_ring_impl!r}.")
-        ring_backend = resolve_ring_backend(expected_backend)
+        if cp_state.device_type == "npu":
+            if expected_backend != "fa2":
+                raise NotImplementedError("Ascend USP requires the VeOmni FlashAttention 2 adapter.")
+            ring_backend = None
+        else:
+            ring_backend = resolve_ring_backend(expected_backend)
         if kwargs.get("cu_seq_lens_q") is not None and kwargs["cu_seq_lens_q"].numel() > 2:
             if query.shape[0] != 1 or any(
                 kwargs.get(name) is None for name in ("usp_cu_seqlens", "usp_max_seqlen", "usp_half0", "usp_half1")
@@ -272,34 +277,27 @@ def flash_attention_forward(
         value = torch.nn.functional.pad(value, (0, head_dim - value_head_dim))
 
     if ring_enabled:
-        from .....distributed.sequence_parallel.ring_attention import (
-            zigzag_ring_flash_attn_func,
-            zigzag_ring_flash_attn_varlen_func,
-        )
+        from .....distributed.sequence_parallel.ring_attention import ring_attention
 
         if target_dtype is not None:
             query, key, value = (tensor.to(target_dtype) for tensor in (query, key, value))
+        metadata = None
         if kwargs.get("usp_cu_seqlens") is not None:
-            attn_output = zigzag_ring_flash_attn_varlen_func(
-                query.squeeze(0),
-                key.squeeze(0),
-                value.squeeze(0),
-                kwargs["usp_cu_seqlens"],
-                kwargs["usp_max_seqlen"],
-                softmax_scale=scaling,
-                group=cp_state.cp_group,
-                half_indices=(kwargs["usp_half0"], kwargs["usp_half1"]),
-                backend=ring_backend,
-            ).unsqueeze(0)
-        else:
-            attn_output = zigzag_ring_flash_attn_func(
-                query,
-                key,
-                value,
-                softmax_scale=scaling,
-                group=cp_state.cp_group,
-                backend=ring_backend,
-            )
+            metadata = {name: kwargs[name] for name in ("usp_cu_seqlens", "usp_max_seqlen", "usp_half0", "usp_half1")}
+        attn_output = ring_attention(
+            query,
+            key,
+            value,
+            group=cp_state.cp_group,
+            cp_size=cp_state.cp_size,
+            device_type=cp_state.device_type,
+            backend_name=ring_backend,
+            cu_seqlens=kwargs.get("cu_seq_lens_q"),
+            usp_metadata=metadata,
+            softmax_scale=scaling,
+            causal=is_causal,
+            dropout_p=dropout,
+        )
     else:
         attn_output = _flash_attention_forward(
             query,

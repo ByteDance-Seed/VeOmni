@@ -1,3 +1,4 @@
+# Ascend: use flash_attention_2 with the NPU extra; hardware validation is pending.
 # Qwen3 dense long-context SFT with USP (Unified Sequence Parallelism).
 #
 # USP composes Ulysses (all-to-all head/seq exchange) with Ring-Attention

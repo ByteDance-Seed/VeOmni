@@ -42,6 +42,8 @@ from .ring_attention import (
     ring_flash_attn_func,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
+    zigzag_ring_npu_flash_attn_func,
+    zigzag_ring_npu_flash_attn_varlen_func,
 )
 from .ulysses import (
     all_to_all_images,
@@ -82,5 +84,7 @@ __all__ = [
     "reduce_sequence_parallel_loss",
     "ring_flash_attn_func",
     "zigzag_ring_flash_attn_func",
+    "zigzag_ring_npu_flash_attn_func",
+    "zigzag_ring_npu_flash_attn_varlen_func",
     "zigzag_ring_flash_attn_varlen_func",
 ]
