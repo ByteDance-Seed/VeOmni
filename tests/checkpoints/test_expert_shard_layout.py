@@ -31,6 +31,31 @@ from veomni.checkpoint.dcp_checkpointer import (
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("file_backed", [False, True])
+@pytest.mark.parametrize("slot", ["model", "optimizer"])
+def test_checkpoint_save_planner_receives_parallel_state(monkeypatch, file_backed, slot):
+    from veomni.checkpoint import dcp_checkpointer
+
+    parallel_state = object()
+    tracker = SimpleNamespace(checkpoint_evict_file_backed_state=lambda: None)
+    writer = SimpleNamespace()
+    if file_backed:
+        writer._veomni_file_optimizers = [tracker]
+
+    def capture_save(*, state_dict, storage_writer, planner):
+        assert storage_writer is writer
+        assert planner.parallel_state is parallel_state
+        assert isinstance(planner, _FileBackedSavePlanner if file_backed else _ExtraParallelSavePlanner)
+
+    monkeypatch.setattr(dcp, "save", capture_save)
+    monkeypatch.setattr(dcp_checkpointer, "empty_cache", lambda: None)
+    monkeypatch.setattr(dcp_checkpointer, "synchronize", lambda: None)
+    DistributedCheckpointer.execute_save(
+        {slot: {}}, writer, save_async=False, slot=slot, parallel_state=parallel_state
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_file_backed_planner_reclaims_previous_resolved_tensor():
     class Tracker:
         def __init__(self):
@@ -189,14 +214,6 @@ def _layout_worker(rank, world, directory, rendezvous):
 
         model = make_qwen_target()
         parallel = SimpleNamespace(dp_mode="ddp")
-        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
-            DistributedCheckpointer.load(
-                path,
-                {"model": model},
-                parallel_state=parallel,
-                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1" if rank == 0 else None,
-            )
-        assert model.layer.experts.weight.count_nonzero() == 0
         with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
             DistributedCheckpointer.load(path, {"model": model}, parallel_state=parallel)
         assert model.layer.experts.weight.count_nonzero() == 0

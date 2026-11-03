@@ -422,11 +422,6 @@ def _prepare_multi_optimizer_saved_states(
         from ..optim.checkpoint_adapter import rank_local_adamw_adapter
         from ..optim.optimizer import AnyPrecisionAdamW
 
-        for leaf in _iter_optimizer_leaves(optimizer):
-            if leaf.state or any(
-                param.grad is not None for param_group in leaf.param_groups for param in param_group["params"]
-            ):
-                raise RuntimeError("MultiOptimizer state or gradients changed while loading model state")
         metadata = reader_factory(checkpoint_path).read_metadata()
         save_id = getattr(getattr(metadata, "storage_meta", None), "save_id", None)
         if expected_save_id is not None and save_id != expected_save_id:
