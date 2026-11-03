@@ -1926,20 +1926,28 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
         if multi:
-            error = (
-                RuntimeError("Cannot overwrite a completed checkpoint transaction with MultiOptimizer state")
-                if os.path.exists(manifest_path(checkpoint_dir))
-                else None
-            )
+            error = None
+            try:
+                os.stat(manifest_path(checkpoint_dir))
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                error = exc
+            else:
+                error = RuntimeError("Cannot overwrite a completed checkpoint transaction with MultiOptimizer state")
             raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")
         if multi and extra is None:
             rank = dist.get_rank() if dist.is_initialized() else 0
             extra_path = os.path.join(model_root, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
-            error = (
-                RuntimeError("Existing checkpoint sidecar cannot be reused when extra_state is omitted")
-                if os.path.exists(extra_path)
-                else None
-            )
+            error = None
+            try:
+                os.stat(extra_path)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                error = exc
+            else:
+                error = RuntimeError("Existing checkpoint sidecar cannot be reused when extra_state is omitted")
             raise_if_any_rank_failed(error, "checking for stale MultiOptimizer extra state")
 
         # Keyed on the module's own run-level path, not just ``path``: a
