@@ -874,6 +874,17 @@ implementations also differ. These timings measure collective latency, not model
 | reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
 | output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
+| mxfp8 | `MXFP8Config \| None` | `None` | Native dense Qwen3 MXFP8. Unset preserves saved recipe metadata. See [MXFP8 training](mxfp8_training.md). |
+
+### MXFP8Config
+
+`model.accelerator.fsdp_config.mixed_precision.mxfp8.*` — Native MXFP8 recipe.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable native MXFP8 compute; explicit false overrides a saved recipe. |
+| target_modules | `List[str]` | Qwen3 decoder MLP gate/up/down projection patterns | Complete module-name patterns; unmatched or unsupported targets raise. |
+| enable_fsdp_all_gather | `bool` | `False` | Gather both quantized weight orientations and block scales instead of BF16 parameters. Requires enable=true and uniform 32-row-aligned shards. |
 
 
 ### OffloadConfig

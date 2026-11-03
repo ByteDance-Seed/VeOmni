@@ -244,6 +244,17 @@ Trainer packing API; samples may differ in target geometry. See
 
 ## Parallelization Flow
 
+Dense Qwen3 can opt into native MXFP8 with
+`model.accelerator.fsdp_config.mixed_precision.mxfp8`. The parallel builder
+validates topology, targets, resolved QAT settings and the current rank's native
+GEMM before upcasting masters to FP32 and replacing selected Linears. FSDP2
+then shards/materializes the model through the ordinary loader. Optional
+quantized AllGather transports independent forward/backward orientations;
+state-dict hooks expose ordinary FP32 masters. No trainer scale-cache hooks
+are needed. Saved `config.veomni_mxfp8` is inherited only when the training
+override is unset; explicit `enable=false` disables it. See
+`docs/usage/mxfp8_training.md` for the supported scope and verification limits.
+
 VeOmni uses FSDP2 exclusively.
 
 1. `init_parallel_state_from_config()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)

@@ -21,6 +21,7 @@ from torch.distributed.fsdp import fully_shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
+from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -488,7 +489,7 @@ class TestSkipHfWeightLoadOnResume:
         assert "should_skip_hf_weight_load" in inspect.signature(parallelize_model_ddp).parameters
 
     def test_build_parallelize_model_forwards_should_skip_hf_weight_load(self, monkeypatch):
-        model = MagicMock()
+        model = MagicMock(config=None)
         parallelized_model = MagicMock()
         parallelize_fsdp2 = MagicMock(return_value=parallelized_model)
         parallel_state = SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2")
@@ -497,7 +498,7 @@ class TestSkipHfWeightLoadOnResume:
 
         result = build_parallelize_model(
             model,
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
         )
@@ -847,8 +848,8 @@ class TestDdpMetaInit:
         monkeypatch.setattr(torch_parallelize, "parallelize_model_ddp", parallelize_ddp)
 
         build_parallelize_model(
-            MagicMock(),
-            mixed_precision=SimpleNamespace(enable=False),
+            MagicMock(config=None),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
             init_device="meta",

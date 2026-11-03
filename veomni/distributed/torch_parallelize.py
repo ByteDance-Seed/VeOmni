@@ -1079,12 +1079,33 @@ def build_parallelize_model(
     if expert_weight_fp8_all_gather and compile_config.enable:
         raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
 
+    mxfp8_config = None
+    if mixed_precision.mxfp8 is not None or getattr(getattr(model, "config", None), "veomni_mxfp8", None) is not None:
+        from .mxfp8 import validate_mxfp8_training
+
+        mxfp8_config = validate_mxfp8_training(
+            model,
+            mixed_precision,
+            parallel_state,
+            compile_enabled=compile_config.enable,
+            offload=bool(kwargs.get("enable_fsdp_offload", False)),
+            activation_offload=bool(kwargs.get("enable_activation_offload", False)),
+            is_peft_model=bool(kwargs.get("is_peft_model", False)),
+            low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
+            expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
+        )
+
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
+
+    if mxfp8_config is not None:
+        from .mxfp8 import prepare_mxfp8
+
+        model = prepare_mxfp8(model, mxfp8_config)
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
