@@ -47,7 +47,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor.placement_types import _StridedShard
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState, get_parallel_state
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
@@ -74,7 +74,12 @@ from .multi_optimizer_checkpoint import (
     _prepare_multi_optimizer_saved_states,
     _validate_source_optimizer_states,
 )
-from .optimizer_resume_layout import MULTI_LAYOUT_MARKER, coordinated_multi_layout, frozen_parameter_digest
+from .optimizer_resume_layout import (
+    MULTI_LAYOUT_MARKER,
+    capture_multi_layout,
+    finish_multi_layout,
+    frozen_parameter_digest,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -85,6 +90,7 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
 _EXPERT_LAYOUTS_KEY = "__veomni_expert_layouts__"
+_UNKNOWN_EXPERT_LAYOUTS_KEY = "__veomni_unknown_expert_layouts__"
 _LEGACY_VEOMNI_TP1_EP0_FSDP1 = "veomni_tp1_ep0_fsdp1"
 _LEGACY_VEOMNI_TP1_NO_EP = "veomni_tp1_no_ep"
 
@@ -122,23 +128,91 @@ def _expert_layout(tensor):
     }
 
 
+def _no_ep_expert_layout(key, tensor, parallel_state):
+    """Record no-EP provenance only from a known TP1/EP1 VeOmni source."""
+    if "experts" not in key.split(".") or not isinstance(tensor, DTensor) or not tensor.ndim:
+        return None
+    if not isinstance(parallel_state, ParallelState):
+        return None
+    if (
+        parallel_state.tp_size != 1
+        or parallel_state.extra_parallel_sizes.get("ep") != 1
+        or parallel_state.device_mesh is None
+    ):
+        return None
+    mesh = tensor.device_mesh
+    names = mesh.mesh_dim_names or ()
+    if names not in (
+        ("dp_shard",),
+        ("dp_shard_sp",),
+        ("dp_replicate", "dp_shard"),
+        ("dp_replicate", "dp_shard_sp"),
+    ):
+        return None
+    if mesh != parallel_state.fsdp_mesh or len(tensor.placements) != len(names):
+        return None
+    if len(names) == 2 and not isinstance(tensor.placements[0], Replicate):
+        return None
+    shard = tensor.placements[-1]
+    if type(shard) not in (Shard, Replicate):
+        return None
+    return {
+        "ep_shard_dim": None,
+        "fsdp_shard_dim": shard.dim % tensor.ndim if isinstance(shard, Shard) else None,
+        "ep_size": 1,
+        "fsdp_size": mesh.size(-1),
+        "expert_order": "canonical",
+        "source_kind": "veomni_tp1_no_ep",
+    }
+
+
 class _ExtraParallelSavePlanner(DefaultSavePlanner):
     """Record per-tensor source layouts in DCP metadata, including optimizer state."""
 
+    def __init__(self, *args, parallel_state=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parallel_state = parallel_state
+
     def create_local_plan(self):
         plan = super().create_local_plan()
-        layouts = {key: layout for key, value in self.state_dict.items() if (layout := _expert_layout(value))}
-        return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
+        layouts = {
+            key: layout
+            for key, value in self.state_dict.items()
+            if (layout := _expert_layout(value) or _no_ep_expert_layout(key, value, self.parallel_state))
+        }
+        unknown = [
+            key
+            for key, value in self.state_dict.items()
+            if "experts" in key.split(".") and isinstance(value, DTensor) and key not in layouts
+        ]
+        return replace(
+            plan,
+            planner_data={
+                **(plan.planner_data or {}),
+                _EXPERT_LAYOUTS_KEY: layouts,
+                _UNKNOWN_EXPERT_LAYOUTS_KEY: unknown,
+            },
+        )
 
     def create_global_plan(self, all_plans):
         plans, metadata = super().create_global_plan(all_plans)
         # Reuse DCP's plan exchange; sparse optimizer states may appear on only
         # some ranks. Keep the ordinary FQN -> state-dict path mappings intact.
-        layouts = {}
+        layouts, unknown = {}, set()
         for plan in all_plans:
-            layouts.update(plan.planner_data[_EXPERT_LAYOUTS_KEY])
+            unknown.update(plan.planner_data[_UNKNOWN_EXPERT_LAYOUTS_KEY])
+            for key, value in plan.planner_data[_EXPERT_LAYOUTS_KEY].items():
+                if key in layouts and layouts[key] != value:
+                    raise RuntimeError(f"Checkpoint tensor {key!r} has inconsistent source layouts across ranks")
+                layouts[key] = value
+        if ambiguous := sorted(layouts.keys() & unknown):
+            raise RuntimeError(f"Checkpoint tensors have both known and unknown source layouts: {ambiguous}")
         metadata.planner_data = {
-            **(metadata.planner_data or {}),
+            **{
+                key: value
+                for key, value in (metadata.planner_data or {}).items()
+                if key != _UNKNOWN_EXPERT_LAYOUTS_KEY
+            },
             _EXPERT_LAYOUTS_KEY: {"version": 1, "tensors": layouts},
         }
         return plans, metadata
@@ -352,12 +426,12 @@ def _check_canonical_spec_coverage(model, specs, state_keys, *, trainable_only):
 def _reject_unproven_extra_parallel_optimizer(
     state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False
 ):
-    error, signature = None, None
+    error, has_canonical_layout = None, False
     try:
         specs = getattr(state.get("model"), "_fqn2spec_info", None)
         if _needs_extra_parallel_layout_marker(specs):
             _extra_parallel_layout_key(specs)
-            signature = _runtime_extra_parallel_layout_signature(specs)
+            has_canonical_layout = True
         if state.get("optimizer") is not None:
             ps = parallel_state if parallel_state is not None else get_parallel_state()
         else:
@@ -370,7 +444,7 @@ def _reject_unproven_extra_parallel_optimizer(
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel optimizer state", group=group)
     error = None
     try:
-        if signature is not None:
+        if has_canonical_layout:
             model = state["model"]
             options = StateDictOptions(ignore_frozen_params=True) if trainable_only else None
             canonical_state = get_model_state_dict(model, options=options)
@@ -407,25 +481,6 @@ def _extra_parallel_layout_key(specs):
         _normalized_extra_parallel_dims(spec)
     digest = hashlib.sha256(b"veomni-extra-parallel-canonical-v2").hexdigest()
     return f"{_EXTRA_PARALLEL_LAYOUT_MARKER}{digest}"
-
-
-def _runtime_extra_parallel_layout_signature(specs):
-    """Detect mutation while a single Stateful adapter is in use."""
-    if _needs_extra_parallel_layout_marker(specs):
-        _extra_parallel_layout_key(specs)
-    return tuple(
-        (
-            name,
-            spec.para_name,
-            repr(spec.placement),
-            spec.fsdp_shard_dim,
-            getattr(spec, "persistent_fsdp_shard_dim", None),
-            getattr(spec, "global_shape", None),
-            getattr(spec, "checkpoint_layout_v2", False),
-            tuple(spec.para_fsdp_mesh.shape) if spec.para_fsdp_mesh else None,
-        )
-        for name, spec in sorted((specs or {}).items())
-    )
 
 
 def _strip_extra_parallel_layout_marker(state_dict, required, marker_key):
@@ -721,17 +776,12 @@ class ModelState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
-        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
 
     @torch.no_grad()
     def state_dict(self):
-        if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
-            self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
-        ):
-            raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
@@ -759,10 +809,6 @@ class ModelState(Stateful):
         need to drop ExtraParallel-dim when loading from DCP checkpoints
         so that ExtraParallel-FSDP would not be confused
         """
-        if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
-            self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
-        ):
-            raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
         model_state_dict = _strip_extra_parallel_layout_marker(
             state_dict,
             self.should_extra_parallel_aware
@@ -838,7 +884,6 @@ class OptimizerState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
-        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
@@ -847,10 +892,6 @@ class OptimizerState(Stateful):
     def state_dict(self):
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
-        if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
-            self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
-        ):
-            raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
             raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if getattr(self.optimizer, "_is_multi_optimizer", False):
@@ -888,10 +929,6 @@ class OptimizerState(Stateful):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
             raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
-        if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
-            self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
-        ):
-            raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
         optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
             state_dict,
             self.should_extra_parallel_aware
@@ -975,22 +1012,14 @@ class _ProvenMultiOptimizerState(OptimizerState):
         self,
         *args,
         generation,
-        scheduler_snapshot,
-        scheduler_object,
-        extra_digest,
         expected_layout,
         group,
-        frozen_digest=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.generation = generation
-        self.scheduler_snapshot = scheduler_snapshot
-        self.scheduler_object = scheduler_object
-        self.extra_digest = extra_digest
         self.expected_layout = expected_layout
         self.group = group
-        self.frozen_digest = frozen_digest
 
     def state_dict(self):
         result, error = None, None
@@ -1019,31 +1048,10 @@ class _ProvenMultiOptimizerState(OptimizerState):
         if self._load:
             result[MULTI_LAYOUT_MARKER] = ""
             return result
-        initial = coordinated_multi_layout(
-            self.model,
-            self.optimizer,
-            self.scheduler_snapshot,
-            self.scheduler_object,
-            writing=True,
-            group=self.group,
-            frozen_digest=self.frozen_digest,
-        )
-        if initial != self.expected_layout:
-            raise RuntimeError("MultiOptimizer layout changed while saving checkpoint")
-        current = coordinated_multi_layout(
-            self.model,
-            self.optimizer,
-            self.scheduler_snapshot,
-            self.scheduler_object,
-            self.extra_digest,
-            writing=True,
-            group=self.group,
-            frozen_digest=self.frozen_digest,
-        )
         result[MULTI_LAYOUT_MARKER] = json.dumps(
             {
                 "generation": self.generation,
-                "layout": current,
+                "layout": self.expected_layout,
                 "inventory_digests": _inventory_digests(inventory, group=self.group),
             },
             sort_keys=True,
@@ -1085,19 +1093,13 @@ class _ProvenMultiOptimizerState(OptimizerState):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "validating loaded MultiOptimizer state", group=self.group)
-        if marker["inventory_digests"] != _inventory_digests(inventory, group=self.group):
-            raise RuntimeError("MultiOptimizer inventory identity changed during tensor loading")
-        current = coordinated_multi_layout(
-            self.model,
-            self.optimizer,
-            self.scheduler_snapshot,
-            self.scheduler_object,
-            self.extra_digest,
-            group=self.group,
-            frozen_digest=self.frozen_digest,
+        digests = _inventory_digests(inventory, group=self.group)
+        error = (
+            RuntimeError("MultiOptimizer inventory identity changed during tensor loading")
+            if marker["inventory_digests"] != digests
+            else None
         )
-        if current != self.expected_layout:
-            raise RuntimeError("MultiOptimizer layout changed while loading optimizer state")
+        raise_if_any_rank_failed(error, "validating MultiOptimizer inventory identity", group=self.group)
         error = None
         try:
             self.optimizer._dcp_load_state_dict(state_dict, group=self.group)
@@ -1795,8 +1797,8 @@ class DistributedCheckpointer(CheckpointerBase):
                 error = exc
             raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy")
             frozen_digest = frozen_parameter_digest(state["model"], enabled=trainable_only)
-            initial_layout = coordinated_multi_layout(
-                state["model"], optimizer, snapshot, scheduler_object, writing=True, frozen_digest=frozen_digest
+            captured_layout = capture_multi_layout(
+                state["model"], optimizer, snapshot, scheduler_object, frozen_digest=frozen_digest
             )
             error, generation_value = None, None
             if not dist.is_initialized() or dist.get_rank() == 0:
@@ -1867,6 +1869,12 @@ class DistributedCheckpointer(CheckpointerBase):
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "hashing MultiOptimizer extra state")
+            try:
+                initial_layout = finish_multi_layout(captured_layout, extra_digest)
+            except BaseException:
+                if stage_path is not None and _local_rank() == 0:
+                    shutil.rmtree(stage_path, ignore_errors=True)
+                raise
 
         def prepare_writer_state(factory, what):
             result, error = None, None
@@ -1907,18 +1915,8 @@ class DistributedCheckpointer(CheckpointerBase):
                 save_to_lowest_rank=save_to_lowest_rank,
                 slot=WEIGHTS_DIRNAME,
                 timeout_seconds=save_timeout_seconds,
+                parallel_state=parallel_state if parallel_state is not None else get_parallel_state(),
             )
-
-            if multi:
-                error = None
-                if state.get("model") is not source_model or state.get("optimizer") is not optimizer:
-                    error = RuntimeError("Model or optimizer object changed while saving model state")
-                elif (
-                    state.get("extra_state") is not extra
-                    or state.get("_veomni_scheduler_object") is not scheduler_object
-                ):
-                    error = RuntimeError("Scheduler or extra-state object changed while saving model state")
-                raise_if_any_rank_failed(error, "rechecking MultiOptimizer checkpoint ownership")
 
             if "optimizer" in state and state["optimizer"] is not None:
                 optim_state, optim_writer = prepare_writer_state(
@@ -1928,12 +1926,8 @@ class DistributedCheckpointer(CheckpointerBase):
                             optimizer=optimizer,
                             parallel_state=parallel_state,
                             generation=generation,
-                            scheduler_snapshot=snapshot,
-                            scheduler_object=scheduler_object,
-                            extra_digest=extra_digest,
                             expected_layout=initial_layout,
                             group=None,
-                            frozen_digest=frozen_digest,
                         )
                         if multi
                         else OptimizerState(model=state["model"], optimizer=optimizer, parallel_state=parallel_state),
@@ -1948,6 +1942,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     save_to_lowest_rank=save_to_lowest_rank,
                     slot=OPTIMIZER_DIRNAME,
                     timeout_seconds=save_timeout_seconds,
+                    parallel_state=parallel_state if parallel_state is not None else get_parallel_state(),
                 )
         except BaseException:
             if stage_path is not None and _local_rank() == 0:
@@ -2155,28 +2150,6 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
                 planner=planner,
             )
-            error = (
-                RuntimeError("Optimizer object changed while loading model state")
-                if state.get("optimizer") is not optimizer
-                else None
-            )
-            raise_if_any_rank_failed(error, "rechecking MultiOptimizer identity", group=process_group)
-            snapshot = extra.get("lr_scheduler") if extra is not None else None
-            current = coordinated_multi_layout(
-                state["model"],
-                optimizer,
-                snapshot,
-                scheduler_object,
-                extra_digest,
-                group=process_group,
-                frozen_digest=frozen_digest,
-            )
-            error = (
-                RuntimeError("MultiOptimizer layout changed while loading model state")
-                if current != expected_layout
-                else None
-            )
-            raise_if_any_rank_failed(error, "rechecking MultiOptimizer layout", group=process_group)
             _prepare_multi_optimizer_saved_states(
                 state["model"],
                 optimizer,
@@ -2194,12 +2167,8 @@ class DistributedCheckpointer(CheckpointerBase):
                     parallel_state=parallel_state,
                     load=True,
                     generation=generation,
-                    scheduler_snapshot=snapshot,
-                    scheduler_object=scheduler_object,
-                    extra_digest=extra_digest,
                     expected_layout=expected_layout,
                     group=process_group,
-                    frozen_digest=frozen_digest,
                 )
                 reader = cls._create_storage_reader(optimizer_path)
                 planner = _ModelStrictLoadPlanner(strict_model=False, expected_save_id=optimizer_id)
@@ -2374,6 +2343,7 @@ class DistributedCheckpointer(CheckpointerBase):
         save_to_lowest_rank: bool = False,
         slot: str = WEIGHTS_DIRNAME,
         timeout_seconds: Optional[int] = None,
+        parallel_state=None,
     ) -> None:
         """Execute DCP save with optional async support.
 
@@ -2386,7 +2356,9 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        planner = _ExtraParallelSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        planner = _ExtraParallelSavePlanner(
+            dedup_save_to_lowest_rank=save_to_lowest_rank, parallel_state=parallel_state
+        )
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save
