@@ -65,7 +65,6 @@ class TextEncoderChatTemplate:
         sample: list[ConversationItem],
         *,
         add_generation_prompt: bool = False,
-        max_seq_len: int | None = None,
     ) -> list[ConversationItem]:
         """Full text pipeline: apply chat template → tokenize → merge tokenized text.
 
@@ -73,61 +72,12 @@ class TextEncoderChatTemplate:
         prefix (:meth:`apply_generation_prompt`) between templating and tokenizing,
         so the request is left ready for the model to start decoding; training
         leaves it off (the assistant turn is already in the data).
-
-        ``max_seq_len`` (training) truncates the merged conversation to the last
-        ``max_seq_len`` tokens — same suffix-truncation contract as classic
-        ``ChatmlTemplate`` — so an overlong prompt does not discard the assistant
-        response at the tail.
         """
         parts = self.apply_chat_template(sample)
         if add_generation_prompt:
             parts = self.apply_generation_prompt(parts)
         self.tokenize(parts)
-        parts = self.merge_text_embeds(parts)
-        if max_seq_len is not None:
-            parts = self.truncate_to_max_seq_len(parts, max_seq_len)
-        return parts
-
-    @staticmethod
-    def truncate_to_max_seq_len(parts: list[ConversationItem], max_seq_len: int) -> list[ConversationItem]:
-        """Keep the last ``max_seq_len`` tokens across ``parts`` (suffix truncate).
-
-        Walks non-dummy items from the end so assistant responses at the tail of
-        long prompts are preserved (matching classic ``ChatmlTemplate``). Text rows
-        are suffix-sliced in place (``value`` / ``labels`` / ``attention_mask`` /
-        ``_omni_token_len``). Non-text rows that do not fit in the remaining budget
-        are dropped together with any earlier prefix items. ``is_dummy`` FSDP-anchor
-        items stay at the tail without consuming sequence budget.
-        """
-        if max_seq_len < 0:
-            raise ValueError(f"max_seq_len must be >= 0, got {max_seq_len}.")
-        dummy_parts = [part for part in parts if part.is_dummy]
-        non_dummy = [part for part in parts if not part.is_dummy]
-        if max_seq_len == 0 or not non_dummy:
-            return dummy_parts
-
-        kept_reversed: list[ConversationItem] = []
-        remaining = max_seq_len
-        for part in reversed(non_dummy):
-            token_len = int(part.meta.get(_OMNI_TOKEN_LEN, 0))
-            if token_len <= remaining:
-                kept_reversed.append(part)
-                remaining -= token_len
-                if remaining == 0:
-                    break
-                continue
-            if part.type != "text" or remaining == 0:
-                break
-            part.value = part.value[-remaining:]
-            part.meta["labels"] = part.meta["labels"][-remaining:]
-            part.meta["attention_mask"] = part.meta["attention_mask"][-remaining:]
-            part.meta[_OMNI_TOKEN_LEN] = remaining
-            kept_reversed.append(part)
-            break
-
-        kept = list(reversed(kept_reversed))
-        kept.extend(dummy_parts)
-        return kept
+        return self.merge_text_embeds(parts)
 
     def _build_conversation_item(
         self,

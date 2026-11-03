@@ -195,3 +195,59 @@ def test_seedomni_transform_runs_processor_and_supports_dyn_bsz_lengths():
     # Total includes the 4-token dummy; effective excludes dummy and user prompt.
     assert get_length_fn(cached_sample) == 4 + 2 + 4
     assert get_length_by_labels_fn(cached_sample) == 2
+
+
+def test_seedomni_transform_and_iterative_dataset_skip_samples_exceeding_max_seq_len():
+    from functools import partial
+
+    from veomni.data.dataset import IterativeDataset
+
+    processor = OmniProcessor(
+        {
+            "vision": _DummyImageNormalizePreprocessor(dtype=torch.bfloat16, patch_size=2),
+            "text": _DummyTextTokenizePreprocessor(),
+        }
+    )
+
+    short_example = {
+        "source_name": "sharegpt4v_sft",
+        "images": [_png_bytes(4, 4)],  # 4 visual tokens
+        "conversations": [
+            {"from": "human", "value": "<image>hi"},  # 2 text tokens
+            {"from": "gpt", "value": "ok"},  # 2 text tokens -> 8 real tokens total
+        ],
+    }
+    long_example = {
+        "source_name": "sharegpt4v_sft",
+        "images": [_png_bytes(8, 8)],  # 16 visual tokens
+        "conversations": [
+            {"from": "human", "value": "<image>hello"},  # 5 text tokens
+            {"from": "gpt", "value": "world"},  # 5 text tokens -> 26 real tokens total
+        ],
+    }
+
+    assert process_seedomni_example(long_example, processor=processor, max_seq_len=10) == []
+    assert len(process_seedomni_example(short_example, processor=processor, max_seq_len=10)) == 1
+
+    # Text-only cached row has 6 real tokens ("abcd" + "ef") plus a 4-token FSDP dummy anchor;
+    # max_seq_len=6 must keep it (dummy anchor does not count against real sequence budget),
+    # while max_seq_len=5 must skip it.
+    cached_row = {
+        "conversation_list": pickle.dumps(
+            [
+                ConversationItem(type="text", value="abcd", role="user"),
+                ConversationItem(type="text", value="ef", role="assistant"),
+            ]
+        )
+    }
+    assert len(process_seedomni_cached_example(cached_row, processor=processor, max_seq_len=6)) == 1
+    assert process_seedomni_cached_example(cached_row, processor=processor, max_seq_len=5) == []
+
+    # IterativeDataset skips empty [] results from overlong samples.
+    ds = IterativeDataset(
+        [long_example, short_example],
+        transform=partial(process_seedomni_example, processor=processor, max_seq_len=10),
+    )
+    yielded = list(ds)
+    assert len(yielded) == 1
+    assert get_length_fn(yielded[0][0]) == 8

@@ -105,61 +105,6 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline_and_sets_token_len():
     assert torch.equal(worker_shape, ref_shape)
 
 
-def _short_dialog() -> list[ConversationItem]:
-    return [
-        ConversationItem(type="text", value="hello", role="user"),
-        ConversationItem(type="text", value="hi there", role="assistant"),
-    ]
-
-
-def test_qwen3_tokenize_conversation_suffix_truncates_and_preserves_assistant_answer():
-    tmpl = _template()
-
-    def _long_prompt_short_answer() -> list[ConversationItem]:
-        return [
-            ConversationItem(type="text", value="x" * 64, role="user"),
-            ConversationItem(type="text", value="42", role="assistant"),
-        ]
-
-    full = tmpl.tokenize_conversation(_long_prompt_short_answer())
-    full_ids = torch.cat(tmpl.pack_input_ids(full))
-    full_labels = torch.cat([part.meta["labels"] for part in full])
-    full_mask = torch.cat([part.meta["attention_mask"] for part in full])
-
-    # Budget is smaller than the user prompt alone, so prefix truncation would
-    # discard the entire assistant response and leave only -100 labels.
-    budget = 40
-    assert int(full[0].meta[_OMNI_TOKEN_LEN]) > budget
-
-    truncated = tmpl.tokenize_conversation(_long_prompt_short_answer(), max_seq_len=budget)
-    trunc_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in truncated)
-    assert trunc_len == budget
-
-    trunc_ids = torch.cat(tmpl.pack_input_ids(truncated))
-    trunc_labels = torch.cat([part.meta["labels"] for part in truncated])
-    trunc_mask = torch.cat([part.meta["attention_mask"] for part in truncated])
-    assert torch.equal(trunc_ids, full_ids[-budget:])
-    assert torch.equal(trunc_labels, full_labels[-budget:])
-    assert torch.equal(trunc_mask, full_mask[-budget:])
-    assert int((trunc_labels != -100).sum()) == int((full_labels != -100).sum()) > 0
-
-
-def test_qwen3_text_preprocessor_forwards_max_seq_len_when_training():
-    tmpl = _template()
-    batch = [_short_dialog()]
-    Qwen3TextEncoderPreprocessor(tmpl)({"conversation_list": batch}, max_seq_len=8)
-    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in batch[0]) == 8
-
-    # Inference leaves the sequence uncapped even if max_seq_len is passed.
-    infer_batch = [_short_dialog()]
-    Qwen3TextEncoderPreprocessor(tmpl)(
-        {"conversation_list": infer_batch},
-        inference=True,
-        max_seq_len=8,
-    )
-    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in infer_batch[0]) > 8
-
-
 def _tiny_qwen3_cfg() -> dict:
     return {
         "vocab_size": 128,

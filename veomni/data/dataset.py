@@ -107,9 +107,10 @@ class IterativeDataset(IterableDataset):
     def __iter__(self):
         for sample in self._data:
             if self._transform is not None:
-                yield self._transform(sample)
-            else:
-                yield sample
+                sample = self._transform(sample)
+                if not sample:
+                    continue
+            yield sample
 
     def load_state_dict(self, state_dict):
         inner = state_dict.get("dataset")
@@ -128,12 +129,9 @@ class IterativeDataset(IterableDataset):
 
 def _shards_across_workers(dataset) -> bool:
     """Whether ``dataset`` already splits its source shards across DataLoader workers.
-
-    Hugging Face ``IterableDataset`` does this itself: when iterated inside a
-    DataLoader worker it dispatches to ``_iter_pytorch`` and assigns each worker
-    its own source shards. Splitting such a stream by worker again would drop
-    every row that HF handed to the other workers. Plain iterables (lists,
-    generators, custom iterables) do not do this and still need our worker split.
+    Hugging Face ``IterableDataset`` dispatches to ``_iter_pytorch`` and assigns each
+    worker its own source shards, so splitting again would drop other workers' rows.
+    Plain iterables (lists, generators, custom iterables) still need our worker split.
     """
     seen = set()
     current = dataset
@@ -219,6 +217,8 @@ class InterleavedIterableDataset(IterativeDataset):
                 ds_idx = sample["ds_idx"]
                 source_name = sample.get("source_name", None)
                 transformed_sample = self._transform(sample, source_name=source_name)
+                if not transformed_sample:
+                    continue
                 if isinstance(transformed_sample, List):
                     for idx in range(len(transformed_sample)):
                         transformed_sample[idx]["ds_idx"] = ds_idx

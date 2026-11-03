@@ -218,17 +218,11 @@ class OmniProcessor:
         conversation: list[Any],
         *,
         inference: bool = False,
-        max_seq_len: int | None = None,
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
         """Run the module preprocessor chain on an existing ``conversation_list``."""
         batch = {"conversation_list": [conversation]}
-        self.preprocess_batch(
-            batch,
-            inference=inference,
-            max_seq_len=max_seq_len,
-            **generation_kwargs,
-        )
+        self.preprocess_batch(batch, inference=inference, **generation_kwargs)
         return {"conversation_list": batch["conversation_list"][0]}
 
     def preprocess_batch(
@@ -236,7 +230,6 @@ class OmniProcessor:
         batch: dict[str, Any],
         *,
         inference: bool = False,
-        max_seq_len: int | None = None,
         **generation_kwargs: Any,
     ) -> None:
         """Run the module preprocessor chain over a batch.
@@ -248,15 +241,11 @@ class OmniProcessor:
 
         Training uses ``inference=False`` (default); single-request inference
         uses :meth:`__call__` with ``inference=True``.
-
-        ``max_seq_len`` is forwarded to text-encoder preprocessors so training
-        truncates each sample to ``data.max_seq_len`` before dyn_bsz.
         """
         for preprocessor in self._preprocessors.values():
             preprocessor(
                 batch,
                 inference=inference,
-                max_seq_len=max_seq_len,
                 generation_kwargs=generation_kwargs or None,
             )
 

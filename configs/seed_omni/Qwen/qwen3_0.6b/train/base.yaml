@@ -75,8 +75,8 @@ train:
   num_train_epochs: 1
   global_batch_size: 32
   micro_batch_size: 2
-  # Token packing uses data.max_seq_len as the per-sample truncate + pack budget.
-  # Oversized conversations are suffix-truncated in the text-encoder preprocessor;
+  # Token packing uses data.max_seq_len as the per-sample cap + pack budget.
+  # Oversized conversations (> max_seq_len) are skipped in seedomni_transform;
   # dyn_bsz then packs up to micro_batch_size * max_seq_len tokens per micro-batch.
   dyn_bsz: true
 

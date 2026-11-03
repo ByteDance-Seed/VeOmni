@@ -92,7 +92,7 @@ Key knobs (override on the CLI):
 
 - `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — per-sample truncate length and dyn_bsz pack unit (see `train.dyn_bsz`).
+- `--data.max_seq_len` — per-sample token cap (overlong samples are skipped) and dyn_bsz pack unit (see `train.dyn_bsz`).
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
