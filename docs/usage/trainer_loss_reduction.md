@@ -27,15 +27,24 @@ denominator, and reset step-local state on every call.
 
 ## Example
 
-[`DecisionTrainer.prepare_loss_reduction`](../../veomni/trainer/decision_trainer.py#L151)
+[`DecisionTrainer.prepare_loss_reduction`](../../veomni/trainer/decision_trainer.py#L157)
 sums effective question weights over the complete step and all-reduces the
-result. [`DecisionTrainer.postforward`](../../veomni/trainer/decision_trainer.py#L178)
+result. [`DecisionTrainer.postforward`](../../veomni/trainer/decision_trainer.py#L184)
 scales each weighted numerator by `dp_size / global_weight`:
 
 ```python
 class DecisionTrainer(BaseTrainer):
     def prepare_loss_reduction(self, batches):
-        self.global_weight = reduce_question_weights(batches)
+        denominator = sum(
+            float((batch["decision_supervision"]["weights"] * (batch["decision_supervision"]["counts"] > 1)).sum())
+            for batch in batches
+            if not batch.get("padding_flag", False)
+        )
+        denominator = torch.tensor(denominator, device=self.device, dtype=torch.float32)
+        dist.all_reduce(denominator, group=self.model.parallel_state.fsdp_group)
+        if denominator <= 0:
+            raise ValueError("Optimizer step has no effective supervised questions")
+        self.global_weight = denominator
 
     def prepare_micro_batch_loss(self, micro_batch):
         pass
@@ -43,7 +52,9 @@ class DecisionTrainer(BaseTrainer):
     def postforward(self, output, batch):
         numerator, _ = self.loss(output, batch, self.device)
         loss = numerator * (self.model.parallel_state.dp_size / self.global_weight)
-        return loss, {"decision_loss": loss}, {"question_weight": self.global_weight}
+        if batch.get("padding_flag", False):
+            loss = loss * 0
+        return loss, {"decision_loss": loss}, {"question_weight": self.global_weight.detach()}
 ```
 
 This keeps gradient accumulation equivalent to one weighted full batch.

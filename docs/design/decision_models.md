@@ -79,7 +79,8 @@ have zero effective weight.
 A model with weights outside the backbone checkpoint may implement
 `get_additional_weight_sources()` and return `(path, parameter_prefix)` pairs.
 [`DecisionModelRuntime._additional_weight_sources`](../../veomni/models/decision/accelerated/model_runtime.py#L37)
-forwards them to the standard weight loader before FSDP2 wrapping.
+passes them through FSDP2 setup to the standard weight loader, which materializes
+and loads them after `fully_shard()` has wrapped the model.
 
 CLEF uses this hook for `joint_head.safetensors` under the `head.` prefix. Its
 adapter also reshapes scalar release parameters to one-element vectors so FSDP2
