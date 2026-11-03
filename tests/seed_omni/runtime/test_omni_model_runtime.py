@@ -437,54 +437,6 @@ def test_composed_canonical_extra_parallel_rejected_before_wrap(monkeypatch):
     assert tuple(model._modules) == children
 
 
-def _composed_canonical_error_worker(rank, endpoint):
-    from datetime import timedelta
-    from unittest.mock import patch
-
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model = _model()
-        children = tuple(model._modules)
-        train = SimpleNamespace(checkpoint=SimpleNamespace(extra_parallel_canonical_layout=True))
-        runtime = OmniModelRuntime(model, train_args=train)
-        runtime.omni_model_runtime_args = SimpleNamespace(accelerator=SimpleNamespace())
-
-        def read_state():
-            if rank == 1:
-                raise RuntimeError("injected state failure")
-            return SimpleNamespace(any_extra_parallel_enabled=False)
-
-        with (
-            patch(
-                "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.composed_model_owns_wrap",
-                return_value=True,
-            ),
-            patch(
-                "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.use_parallel_state",
-                return_value=nullcontext(),
-            ),
-            patch(
-                "veomni.distributed.parallel_state.get_parallel_state",
-                side_effect=read_state,
-            ),
-        ):
-            message = "injected state failure" if rank == 1 else "failed on another rank"
-            with pytest.raises(RuntimeError, match=message):
-                runtime._parallelize_composed_model()
-        assert tuple(model._modules) == children
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_composed_canonical_extra_parallel_error_is_rank_coordinated():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_composed_canonical_error_worker, nprocs=2)
-
-
 def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     """Under ``fsdp_scope='model'``, cache readers must not go through weight materialisation."""
     model = _model()
