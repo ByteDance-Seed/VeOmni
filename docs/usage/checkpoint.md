@@ -102,7 +102,8 @@ checkpoint step and configure a different output directory;
 ``load_path: auto`` searches the new output directory. This workaround does not
 itself prove optimizer, data cursor or numerical recovery. A manager with
 strict generation receipts may support same-output continuation only when its
-additional identity checks pass.
+additional identity checks pass. Local checkpoint paths are resolved when
+compared, so a symlink alias does not create a different output directory.
 
 Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
 before training, and set `data.resume_input_deterministic=true` only when the
