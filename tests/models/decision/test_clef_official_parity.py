@@ -36,6 +36,7 @@ from veomni.models.decision.models.clef.modeling import (
 from veomni.models.decision.models.clef.processing import ClefPreprocessor
 from veomni.models.decision.models.clef.release import save_clef_release
 from veomni.models.decision.models.clef.specification import encode_clef
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -363,9 +364,13 @@ def test_exported_head_loads_in_unmodified_official_class(official_assets, tmp_p
         head_config=ours.head_config,
         source_dir=ours.source_dir,
         model_assets=[ours.config],
+        scalar_head_parameters=ours.scalar_head_parameters,
     )
+    exported_head = load_file(tmp_path / "joint_head.safetensors")
+    for name in scalar_values:
+        assert exported_head[name].shape == torch.Size()
     head = official.JointSchemaHead(**json.loads((tmp_path / "joint_head_config.json").read_text()))
-    head.load_state_dict(load_file(tmp_path / "joint_head.safetensors"), strict=True)
+    head.load_state_dict(exported_head, strict=True)
     for name in scalar_values:
         torch.testing.assert_close(getattr(head, name), getattr(ours.head, name).reshape(()), atol=0, rtol=0)
     reloaded = load_local_model(
@@ -396,14 +401,14 @@ def test_packed_requests_match_independent_logits_and_gradients(official_assets,
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     ops = make_eager_ops_config()
     if backend == "cuda_mixed":
-        if not torch.cuda.is_available():
+        if not IS_CUDA_AVAILABLE:
             pytest.skip("Packed mixed attention requires CUDA FLA kernels")
-        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        device = get_device_type()
+        monkeypatch.setattr(getattr(torch.backends, device).matmul, "allow_tf32", False)
         monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
         ops.causal_conv1d_implementation = "fla"
         ops.chunk_gated_delta_rule_implementation = "fla"
         layer_types = ["linear_attention", "full_attention"]
-        device = "cuda"
     else:
         layer_types = ["full_attention", "full_attention"]
         device = "cpu"

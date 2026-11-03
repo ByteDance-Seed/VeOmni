@@ -75,12 +75,16 @@ def _materialize_head_state(
     state_dict: Mapping[str, torch.Tensor],
     *,
     is_writer: bool,
+    scalar_parameters: Sequence[str] = (),
 ) -> OrderedDict[str, torch.Tensor]:
     materialized = OrderedDict()
+    scalar_parameters = frozenset(scalar_parameters)
     for name, tensor in state_dict.items():
         value = tensor.data
         if hasattr(value, "full_tensor"):
             value = value.full_tensor()
+        if name in scalar_parameters:
+            value = value.reshape(())
         if is_writer:
             materialized[name] = value.detach().cpu().contiguous()
     return materialized
@@ -93,6 +97,7 @@ def save_clef_release(
     head_config: Mapping[str, Any] | str | os.PathLike[str] | None = None,
     model_assets: Sequence[Any] | None = None,
     source_dir: str | os.PathLike[str] | None = None,
+    scalar_head_parameters: Sequence[str] = (),
     global_rank: int = 0,
 ) -> None:
     output_dir = str(output_dir)
@@ -107,7 +112,11 @@ def save_clef_release(
     )
 
     is_writer = global_rank == 0
-    materialized_head = _materialize_head_state(head_state, is_writer=is_writer)
+    materialized_head = _materialize_head_state(
+        head_state,
+        is_writer=is_writer,
+        scalar_parameters=scalar_head_parameters,
+    )
     if is_writer:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)

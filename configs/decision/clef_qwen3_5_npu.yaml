@@ -32,7 +32,6 @@ train:
   micro_batch_size: 1
   global_batch_size: 8
   num_train_epochs: 3
-  eval_steps: 50
   checkpoint:
     output_dir: outputs/decision/clef_qwen3_5_npu
     save_steps: 50

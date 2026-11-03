@@ -195,8 +195,13 @@ def test_release_head_split_load_and_fsdp_gradient_match_reference(tmp_path, pac
         source_dir=tmp_path,
         scalar_head_parameters=scalar_names,
     )
-    save_clef_release(tmp_path, model.state_dict(), head_config=HEAD_CONFIG, source_dir=tmp_path)
+    save_clef_release(
+        tmp_path,
+        model.state_dict(),
+        head_config=HEAD_CONFIG,
+        source_dir=tmp_path,
+        scalar_head_parameters=scalar_names,
+    )
     release_head = load_file(str(tmp_path / "joint_head.safetensors"))
-    release_head["scale"] = release_head["scale"].reshape(())
-    save_file(release_head, tmp_path / "joint_head.safetensors")
+    assert release_head["scale"].shape == torch.Size()
     spawn_with_rendezvous(_worker, args=(str(tmp_path), packed), nprocs=2)

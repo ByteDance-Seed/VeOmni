@@ -111,7 +111,12 @@ def build_clef_preprocessor(*args, **kwargs):
 def export_clef(*args, model, **kwargs):
     from .release import save_clef_release
 
-    return save_clef_release(*args, head_config=model.head_config, **kwargs)
+    return save_clef_release(
+        *args,
+        head_config=model.head_config,
+        scalar_head_parameters=model.scalar_head_parameters,
+        **kwargs,
+    )
 
 
 CLEF_SPEC = DecisionModelSpec(

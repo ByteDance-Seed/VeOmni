@@ -297,7 +297,7 @@ def test_decision_loss_hooks_match_weighted_update_across_steps(monkeypatch, los
     reference_optimizer = torch.optim.SGD([reference], lr=0.1)
     scheduled_steps = []
     trainer.model.lr_scheduler.step = lambda: scheduled_steps.append(trainer.state.global_step)
-    trainer._forward = lambda batch: SimpleNamespace(logits=parameter * batch.values)
+    trainer._forward = lambda batch: SimpleNamespace(logits=parameter * batch["values"])
     trainer.loss = get_decision_model("clef").build_loss(loss_type, smoothing=0.2, brier=0.7, rps=0.4)
 
     def check_gradient():
@@ -306,16 +306,22 @@ def test_decision_loss_hooks_match_weighted_update_across_steps(monkeypatch, los
 
     trainer.model.clip_grad_norm = check_gradient
 
-    def batch(values, counts, targets, weights, ordinal):
-        return SimpleNamespace(
-            features={},
-            padding=False,
-            values=torch.tensor(values),
-            counts=torch.tensor(counts),
-            targets=torch.tensor(targets),
-            weights=torch.tensor(weights),
-            ordinal_mask=torch.tensor(ordinal, dtype=torch.bool),
-        )
+    def batch(values, counts, targets, weights, ordinal, *, padding=False):
+        values = torch.tensor(values)
+        request_length = values.shape[0]
+        return {
+            "values": values,
+            "input_ids": torch.arange(request_length).unsqueeze(0),
+            "attention_mask": torch.ones(1, request_length, dtype=torch.long),
+            "decision_request_lengths": (request_length,),
+            "decision_supervision": {
+                "counts": torch.tensor(counts),
+                "targets": torch.tensor(targets),
+                "weights": torch.tensor(weights),
+                "ordinal_mask": torch.tensor(ordinal, dtype=torch.bool),
+                "padding": (padding,),
+            },
+        }
 
     steps = [
         [
@@ -327,18 +333,19 @@ def test_decision_loss_hooks_match_weighted_update_across_steps(monkeypatch, los
                 [False, True],
             ),
             batch([[4.0, 2.0, 1.0]], [1], [[1.0, 0.0, 0.0]], [9.0], [True]),
-            batch([[100.0, 0.0, 2.0]], [3], [[0.0, 0.0, 0.0]], [0.0], [True]),
+            batch([[100.0, 0.0, 2.0]], [3], [[0.0, 0.0, 0.0]], [0.0], [True], padding=True),
         ],
         [batch([[2.0, 1.0, -1.0]], [2], [[0.8, 0.2, 0.0]], [0.25], [False])],
     ]
     for step, batches in enumerate(steps, start=1):
-        values = torch.cat([batch.values for batch in batches])
+        values = torch.cat([batch["values"] for batch in batches])
+        supervision = [batch["decision_supervision"] for batch in batches]
         numerator, effective_weight = decision_loss(
             reference * values,
-            torch.cat([batch.counts for batch in batches]),
-            torch.cat([batch.targets for batch in batches]),
-            torch.cat([batch.weights for batch in batches]),
-            ordinal_mask=torch.cat([batch.ordinal_mask for batch in batches]),
+            torch.cat([item["counts"] for item in supervision]),
+            torch.cat([item["targets"] for item in supervision]),
+            torch.cat([item["weights"] for item in supervision]),
+            ordinal_mask=torch.cat([item["ordinal_mask"] for item in supervision]),
             **trainer.loss.config,
         )
         expected_loss = numerator / effective_weight

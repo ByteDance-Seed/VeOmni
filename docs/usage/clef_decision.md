@@ -5,13 +5,16 @@ VeOmni supports CLEF with a dense Qwen3.5 backbone, the released
 
 ## Run
 
-Use the GPU configuration:
+Launch one process per GPU. For example, to train on one GPU:
 
 ```bash
-uv run python tasks/train_decision.py configs/decision/clef_qwen3_5.yaml
+uv run torchrun --standalone --nproc-per-node=<count> \
+  tasks/train_decision.py configs/decision/clef_qwen3_5.yaml \
+  --model_path /path/to/Cloudflare/clef-flash
 ```
 
-For Ascend NPU, use `configs/decision/clef_qwen3_5_npu.yaml`.
+Set `--nproc-per-node` to the number of devices used on the node. For Ascend
+NPU, use the same command with `configs/decision/clef_qwen3_5_npu.yaml`.
 
 `model.model_path` must contain the backbone checkpoint and these CLEF files:
 
@@ -36,8 +39,7 @@ backbone config override.
 
 ## Data and batching
 
-The adapter loads `LocalLLaMA/typed-decisions` revision
-`1415d375cb86b418c53abec12795adf5b194e7fc`. It converts `state`, `questions`,
+The adapter loads `LocalLLaMA/typed-decisions`. It converts `state`, `questions`,
 and `gold` into typed requests and aligns target probabilities by option ID.
 Structured states are serialized to stable JSON before CLEF encoding.
 
@@ -90,8 +92,7 @@ loading.
 ## Validation
 
 The core offline comparison uses the vendored, unmodified
-`joint_schema_model.py` from `Cloudflare/clef-flash` revision
-`fb4417d31c1d0f9e7e77f1141b40aaede7491e00`, a deterministic tokenizer, and a
+`joint_schema_model.py` from `Cloudflare/clef-flash`, a deterministic tokenizer, and a
 tiny random Qwen3.5 model:
 
 ```bash
