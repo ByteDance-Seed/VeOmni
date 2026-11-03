@@ -39,6 +39,45 @@ def test_runtime_preflight_rejects_unsupported_dynamic_rope_before_training():
     VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
 
 
+def _runtime_rope_guard_io_failure(rank, endpoint):
+    from unittest.mock import patch
+
+    from veomni.checkpoint import dynamic_rope
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        torch.manual_seed(7)
+        model, optimizer = _build()
+        model.rope.rope_type = "default"  # Same supported model configuration on every rank.
+        runtime = SimpleNamespace(
+            model=model,
+            optimizer=optimizer,
+            model_name="policy",
+            train_args=SimpleNamespace(checkpoint=SimpleNamespace(manager="dcp", save_async=False)),
+        )
+        original = dynamic_rope.reject_dynamic_rope_multi_optimizer_training
+        failure = OSError("injected local RoPE validator failure") if rank == 1 else None
+        with patch.object(
+            dynamic_rope, "reject_dynamic_rope_multi_optimizer_training", wraps=original, side_effect=failure
+        ) as guard:
+            error = OSError if rank == 1 else RuntimeError
+            message = (
+                "injected local RoPE validator failure" if rank == 1 else "dynamic RoPE checkpoint mode.*another rank"
+            )
+            with pytest.raises(error, match=message):
+                VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
+            guard.assert_called_once_with(model)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_dynamic_rope_validator_local_failure_reaches_all_ranks():
+    spawn_with_rendezvous(_runtime_rope_guard_io_failure, nprocs=2)
+
+
 class _TinyQwenRope(torch.nn.Module):
     def __init__(self, theta=10000):
         super().__init__()
