@@ -274,6 +274,54 @@ def test_hf_missing_scalar_source_rejected():
         post_process_after_weight_loading(model, {}, {"linear_attn.dt_bias"})
 
 
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "qwen3_5"])
+def test_lora_bias_all_gdn_export_and_reload(tmp_path, model_type):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import load_adapter_state_dict
+    from veomni.lora.weight_loading import load_lora_weights
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    def make_model():
+        base = ToyQwen4(model_type=model_type)
+        if model_type.startswith("qwen4_exp"):
+            prepare_qwen4_gdn_precision(base)
+        else:
+            # Qwen3.5 keeps the pre-existing, generic LoRA export behavior.
+            base.linear_attn.dt_bias.data = base.linear_attn.dt_bias.data.float()
+        base.to_empty(device="cpu")
+        return VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["proj"], bias="all"))
+
+    model = make_model()
+    source = _source_values()
+    with torch.no_grad():
+        model.get_base_model().linear_attn.dt_bias.copy_(source)
+    save_lora_adapter_with_dcp(model, str(tmp_path))
+    exported = load_adapter_state_dict(str(tmp_path))
+    key = "base_model.model.linear_attn.dt_bias"
+    assert key in exported
+    assert all(not name.endswith("linear_attn.A_log") for name in exported)
+    assert any(".lora_A." in name and value.dtype == torch.bfloat16 for name, value in exported.items())
+    expected = source if model_type.startswith("qwen4_exp") else source.bfloat16()
+    assert exported[key].dtype == expected.dtype
+    assert torch.equal(exported[key], expected)
+
+    restored = make_model()
+    load_lora_weights(restored, str(tmp_path), init_device="cpu")
+    assert torch.equal(restored.get_base_model().linear_attn.dt_bias, expected.float())
+
+
+def test_lora_qwen4_rejects_bf16_gdn_source(tmp_path):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    base = ToyQwen4()
+    base.to_empty(device="cpu")
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["proj"], bias="all"))
+    with pytest.raises(RuntimeError, match="Qwen4 LoRA GDN parameter .* must be FP32"):
+        save_lora_adapter_with_dcp(model, str(tmp_path))
+    assert not (tmp_path / "adapter_model.safetensors").exists()
+
+
 @pytest.mark.parametrize("assets", [[SimpleNamespace(model_type="qwen4_exp")], None])
 def test_hf_export_preserves_scalar_values_and_casts_other_weights(tmp_path, assets):
     source = _source_values()

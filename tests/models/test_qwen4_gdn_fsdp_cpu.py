@@ -94,3 +94,58 @@ def _fsdp_gdn_worker(rank, rendezvous):
 
 def test_gdn_fp32_nested_fsdp2_cpu_forward_backward(tmp_path):
     mp.spawn(_fsdp_gdn_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True)
+
+
+def _fsdp_lora_gdn_worker(rank, rendezvous, output):
+    from unittest.mock import patch
+
+    from torch.distributed.tensor import distribute_tensor
+
+    from tests.models.test_qwen4_gdn_precision import ToyQwen4, _source_values
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import load_adapter_state_dict
+    from veomni.lora.weight_loading import load_lora_weights
+    from veomni.models.qwen4_gdn_precision import prepare_qwen4_gdn_precision
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
+        base = ToyQwen4()
+        prepare_qwen4_gdn_precision(base)
+        base.to_empty(device="cpu")
+        with torch.no_grad():
+            base.linear_attn.dt_bias.copy_(_source_values())
+        model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["proj"], bias="all"))
+        fully_shard(model, mesh=mesh)
+        save_safetensor_utils.save_lora_adapter_with_dcp(model, output)
+        state = load_adapter_state_dict(output)
+        key = "base_model.model.linear_attn.dt_bias"
+        assert state[key].dtype == torch.float32
+        assert torch.equal(state[key], _source_values())
+        with torch.no_grad():
+            model.get_base_model().linear_attn.dt_bias.to_local().zero_()
+        load_lora_weights(model, output, init_device="cpu", dtensor_factory=distribute_tensor)
+        assert torch.equal(model.get_base_model().linear_attn.dt_bias.full_tensor(), _source_values())
+
+        from veomni.lora import state_dict as lora_state_dict
+
+        original_get = lora_state_dict.get_lora_state_dict
+
+        def mismatched_dtype(*args, **kwargs):
+            values = original_get(*args, **kwargs)
+            if rank == 1:
+                values[key] = values[key].to(torch.bfloat16)
+            return values
+
+        with patch.object(lora_state_dict, "get_lora_state_dict", side_effect=mismatched_dtype):
+            with pytest.raises(RuntimeError, match="must be FP32|failed on another rank"):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, output + "-invalid")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_lora_gdn_bias_all_fsdp2_export_and_rank_validation(tmp_path):
+    mp.spawn(_fsdp_lora_gdn_worker, args=(str(tmp_path / "gloo"), str(tmp_path / "adapter")), nprocs=2, join=True)
+    assert not (tmp_path / "adapter-invalid" / "adapter_model.safetensors").exists()

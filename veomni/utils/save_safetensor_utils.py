@@ -488,7 +488,13 @@ def save_lora_adapter_with_dcp(
     lora_state, error = None, None
     try:
         lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
-        lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+        qwen4_model = is_qwen4_exp_model(model)
+        for name, value in lora_state.items():
+            if qwen4_model and is_qwen4_gdn_parameter(name):
+                if value.dtype != torch.float32:
+                    raise RuntimeError(f"Qwen4 LoRA GDN parameter {name} must be FP32, got {value.dtype}")
+            elif value.dtype == torch.float32:
+                lora_state[name] = value.to(torch.bfloat16)
         for name, value in lora_state.items():
             spec = (fqn2spec_info or {}).get(name)
             if spec is None and name.endswith(".weight"):

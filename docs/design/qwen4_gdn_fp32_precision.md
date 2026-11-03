@@ -36,6 +36,11 @@ legacy FP32 DCP without a precision inventory, provide model assets or use
 explicit flag checks present pairs but cannot infer a completely missing
 layer; pass the matching model config to check layer coverage.
 
+For DCP-based LoRA adapter export, a trainable GDN parameter (for example,
+`dt_bias` with `bias="all"`) must already be FP32 and is preserved as FP32.
+The adapter may contain only that parameter; it does not need the full base-model
+`A_log`/`dt_bias` inventory. Other LoRA export dtype rules are unchanged.
+
 Both `qwen4_exp` and `qwen4_exp_text` configurations are covered. A config
 that explicitly declares only QSA layers has no GDN tensors and needs no
 special precision group. The current Qwen4 converter does not implement online
