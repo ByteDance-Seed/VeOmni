@@ -37,16 +37,18 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
 | `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
 
-The rank-0 legacy HF writer first saves each shard in a unique temporary
-directory beside its destination. If safetensors reports an `ENOSYS` I/O
+The rank-0 legacy HF writer and DCP-based LoRA exporter first save each shard
+in a unique temporary directory beside its destination. If safetensors reports an `ENOSYS` I/O
 error, VeOmni retries by serializing one shard in the local temporary directory
 and copying it sequentially to that destination-side directory before rename.
 Set `TMPDIR` to a local filesystem with enough space for the largest shard; a
-single tensor can exceed the configured shard size. The destination must support
+single tensor can exceed the configured shard size. A DCP-based LoRA export
+writes one complete adapter file, so local staging must fit the whole adapter.
+The destination must support
 sequential writes and rename, and this fallback adds local I/O and can increase
 export time. Using a memory-backed temporary directory also consumes host memory.
 The temporary-file rename protects the staged shard, not the publication of
-the entire multi-shard checkpoint.
+the entire multi-shard checkpoint or the adapter weights and config together.
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`

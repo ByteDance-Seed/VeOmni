@@ -31,7 +31,7 @@ def _legacy_hf_failure_worker(rank, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         with (
-            patch.object(dist_utils, "get_device_type", return_value="cpu"),
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
             patch.object(save_safetensor_utils, "synchronize"),
             patch.object(save_safetensor_utils, "should_use_distributed_hf_safetensor_save", return_value=False),
             patch.object(
@@ -63,6 +63,69 @@ def test_legacy_hf_export_selects_fuse_fallback():
     ):
         save_safetensor_utils._save_hf_safetensor_legacy("checkpoint", "output", None, "dcp", None)
     save_model_weights.assert_called_once_with("output", model_state, model_assets=None, legacy_fuse_fallback=True)
+
+
+def test_lora_adapter_export_uses_fuse_fallback(tmp_path, monkeypatch):
+    from safetensors import SafetensorError
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
+    from veomni.models.checkpoint import weights
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+    with torch.no_grad():
+        for name, value in model.named_parameters():
+            if ".lora_" in name:
+                value.fill_(0.12345679)
+    expected = {
+        name: tensor.to(torch.bfloat16)
+        for name, tensor in get_lora_state_dict(model, config=model.get_lora_config()).items()
+    }
+    original_save = weights.save_file
+
+    def inject_enosys(data, path, metadata):
+        if str(path).startswith(str(tmp_path)):
+            raise SafetensorError("Error while serializing: I/O error: Function not implemented (os error 38)")
+        original_save(data, path, metadata=metadata)
+
+    monkeypatch.setattr(weights, "save_file", inject_enosys)
+    save_lora_adapter_with_dcp(model, str(tmp_path / "adapter"))
+    actual = load_adapter_state_dict(str(tmp_path / "adapter"))
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
+def _lora_export_failure_worker(rank, directory, endpoint):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        base = nn.Module()
+        base.linear = nn.Linear(4, 4, bias=False)
+        model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(save_safetensor_utils, "_save_state_dict", side_effect=OSError("injected I/O failure")),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected I/O failure|failed on another rank"):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_export_failure_reaches_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_lora_export_failure_worker, args=(str(tmp_path),), nprocs=2)
 
 
 # ---------------------------------------------------------------------------

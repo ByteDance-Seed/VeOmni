@@ -336,7 +336,8 @@ def save_hf_safetensor(
                 )
         except BaseException as exc:
             error = exc
-        raise_if_any_rank_failed(error, "rank-0 HuggingFace export")
+        group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(error, "rank-0 HuggingFace export", group=group)
         return
 
     # Ensure all ranks finish saving before anyone proceeds
@@ -440,27 +441,32 @@ def save_lora_adapter_with_dcp(
         dist.barrier()
 
     is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-    if is_rank_0:
-        consolidated_state = ckpt_to_state_dict(
-            save_checkpoint_path=dcp_save_path,
-            ckpt_manager="dcp",
-        )
-        # safetensors needs contiguous, non-aliased tensors; consolidation returns
-        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
-        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
-        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+    from .dist_utils import raise_if_any_rank_failed
 
-        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
-        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
-        # separate sidecar).
-        model.get_lora_config().save_pretrained(save_path)
+    error = None
+    try:
+        if is_rank_0:
+            consolidated_state = ckpt_to_state_dict(
+                save_checkpoint_path=dcp_save_path,
+                ckpt_manager="dcp",
+            )
+            # safetensors needs contiguous, non-aliased tensors; consolidation returns
+            # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+            consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+            adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+            _save_state_dict(
+                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
+            )
 
-        shutil.rmtree(dcp_save_path, ignore_errors=True)
-        logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json.
+            model.get_lora_config().save_pretrained(save_path)
 
-    if dist.is_initialized():
-        dist.barrier()
+            shutil.rmtree(dcp_save_path, ignore_errors=True)
+            logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+    except BaseException as exc:
+        error = exc
+    group = dist.group.WORLD if dist.is_initialized() else None
+    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export", group=group)
 
     gc.collect()
     helper.empty_cache()
