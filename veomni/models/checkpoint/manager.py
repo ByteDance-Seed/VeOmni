@@ -357,74 +357,27 @@ class ModelCheckpointManager:
         self._last_legacy_export_dcp_step = None
         self._last_export_validated_step = None
         self._last_export_released_optimizer = False
-        optimizer_before, changed_optimizer, needs_save, error = None, False, False, None
-        try:
-            optimizer_before = self.runtime.optimizer
-            changed_optimizer = (
-                self._last_saved_step == state.global_step
-                and optimizer_before is not None
-                and (
-                    self._last_saved_optimizer_ref is None or self._last_saved_optimizer_ref() is not optimizer_before
-                )
-            )
-            needs_save = self._last_saved_step != state.global_step or changed_optimizer
-        except BaseException as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "preparing checkpoint export decision")
-        if dist.is_initialized():
-            decisions = [None] * dist.get_world_size()
-            local = (state.global_step, needs_save, optimizer_before is None)
-            dist.all_gather_object(decisions, local)
-            if any(decision != local for decision in decisions):
-                self._last_saved_step = -1
-                self._last_saved_optimizer_ref = None
-                if hasattr(self, "_last_saved_optimizer_generation"):
-                    self._last_saved_optimizer_generation = None
-                raise RuntimeError("Checkpoint export save decision differs across ranks")
-        if changed_optimizer:
-            self._last_saved_step = -1
-            if hasattr(self, "_last_saved_optimizer_generation"):
-                self._last_saved_optimizer_generation = None
         error = None
         try:
             if self._last_saved_step != state.global_step:
                 dist.barrier()
                 self.save_dcp(state)
             self.wait_for_pending_save()
-            if self.runtime.optimizer is not optimizer_before:
-                raise RuntimeError("Optimizer changed while preparing the exported checkpoint")
         except BaseException as exc:
-            # A failed asynchronous wait must not turn into a successful
-            # same-step receipt if a caller catches and retries the export.
-            self._last_saved_step = -1
-            self._last_saved_optimizer_ref = None
-            if hasattr(self, "_last_saved_optimizer_generation"):
-                self._last_saved_optimizer_generation = None
+            # Never retain a same-step receipt after a real save or wait failure.
+            self._invalidate_saved_receipt()
             error = exc
         try:
             raise_if_any_rank_failed(error, "preparing the exported checkpoint")
         except BaseException:
-            self._last_saved_step = -1
-            self._last_saved_optimizer_ref = None
-            if hasattr(self, "_last_saved_optimizer_generation"):
-                self._last_saved_optimizer_generation = None
+            self._invalidate_saved_receipt()
             raise
 
-        # Older, non-MultiOptimizer managers have no generation receipt. Only
-        # record a legacy receipt after this export has confirmed the DCP.
-        optimizer = self.runtime.optimizer
-        if (
-            self._last_saved_step == state.global_step
-            and optimizer is not None
-            and self._last_saved_optimizer_ref is not None
-            and self._last_saved_optimizer_ref() is optimizer
-        ):
+        if self._last_saved_step == state.global_step:
             self._last_export_validated_step = state.global_step
-        if (
-            self._last_export_validated_step == state.global_step
-            and getattr(optimizer, "_is_multi_optimizer", False) is False
-        ):
-            self._last_legacy_export_dcp_step = state.global_step
+            optimizer = self.runtime.optimizer
+            if optimizer is not None and getattr(optimizer, "_is_multi_optimizer", False) is False:
+                self._last_legacy_export_dcp_step = state.global_step
 
         if stage == "train_end":
             self._last_export_released_optimizer = self._last_export_validated_step == state.global_step

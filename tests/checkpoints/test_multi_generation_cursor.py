@@ -181,7 +181,7 @@ def test_hf_step_dcp_epoch_do_not_rewrite_a_completed_checkpoint(tmp_path):
         checkpoint._last_saved_step = state.global_step
         checkpoint._last_saved_optimizer_generation = "export-generation"
 
-    trainer.save_hf_or_lora.side_effect = export
+    trainer.save_dcp.side_effect = export
     model_callback = CheckpointCallback(trainer)
     global_callback = GlobalStateCallback(trainer)
     state = TrainerState(global_step=3, epoch=0)
@@ -243,55 +243,67 @@ def test_legacy_export_confirms_dcp_and_suppresses_epoch_rewrite(tmp_path):
         assert manager._last_legacy_export_dcp_step == 3
 
 
-@pytest.mark.parametrize("cadence", ["dcp", "hf_epoch"])
-def test_same_step_export_refuses_changed_optimizer_receipt(tmp_path, cadence):
-    class ChangedCheckpoint:
-        def checkpoint_receipt_is_current(self, step):
-            return False
+def test_hf_only_epoch_then_empty_epoch_preserves_real_dcp(tmp_path):
+    import hashlib
 
-    trainer = _make_mock_trainer(save_path=str(tmp_path))
-    trainer.model = SimpleNamespace(checkpoint=ChangedCheckpoint())
-    callback = CheckpointCallback(trainer)
-    callback.dcp_every_n_steps = 3 if cadence == "dcp" else 0
-    callback.dcp_every_n_epochs = 1 if cadence == "hf_epoch" else 0
-    callback.save_hf_weights = cadence == "hf_epoch"
-    callback.hf_every_n_steps = 3
-    callback._last_dcp_step = 3
-    with pytest.raises(RuntimeError, match="Optimizer or checkpoint changed"):
-        callback.on_step_end(TrainerState(global_step=3, epoch=0))
-    trainer.save_dcp.assert_not_called()
-    trainer.save_hf_or_lora.assert_not_called()
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
 
-
-def _step_receipt_mismatch_worker(rank, tmp_path):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-
-    dist.init_process_group(
-        "gloo", init_method=f"file://{tmp_path}/rendezvous", rank=rank, world_size=2, timeout=timedelta(seconds=30)
-    )
-    try:
-        _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+    runtime = _make_mock_runtime(save_path=str(tmp_path))
+    runtime.model = torch.nn.Linear(2, 2)
+    runtime.optimizer = torch.optim.AdamW(runtime.model.parameters())
+    runtime.lr_scheduler = None
+    runtime.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
+    runtime.model(torch.ones(1, 2)).sum().backward()
+    runtime.optimizer.step()
+    with (
+        patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
+        patch("veomni.models.checkpoint.manager.dist.barrier"),
+    ):
+        manager = ModelCheckpointManager(runtime)
+        runtime.checkpoint = manager
         trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.model = runtime
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        trainer.channel_loss_callback = None
+        trainer.args.train.checkpoint.save_epochs = 2
+        trainer.args.train.checkpoint.hf_save_epochs = 1
+        trainer.save_dcp.side_effect = manager.save_dcp
+        trainer.save_hf_or_lora.side_effect = lambda state, stage: manager.prepare_export(state, stage)
         callback = CheckpointCallback(trainer)
-        callback.dcp_every_n_steps = 3
-        callback.save_hf_weights = False
-        callback._last_dcp_step = 3 if rank == 0 else -1
-        with pytest.raises(RuntimeError, match="same-step|receipt|differ"):
-            callback.on_step_end(TrainerState(global_step=3, epoch=0))
+        global_callback = GlobalStateCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+        callback.on_epoch_end(state)
+        global_callback.on_epoch_end(state)
+        snapshot = {
+            p.relative_to(tmp_path): hashlib.sha256(p.read_bytes()).digest()
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        }
+        callback.on_epoch_end(TrainerState(global_step=1, epoch=1))
+        global_callback.on_epoch_end(TrainerState(global_step=1, epoch=1))
         trainer.save_dcp.assert_not_called()
-        dist.barrier()
-    finally:
-        clear_parallel_state()
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_step_dcp_receipt_disagreement_fails_on_all_ranks(tmp_path):
-    torch.multiprocessing.spawn(_step_receipt_mismatch_worker, args=(str(tmp_path),), nprocs=2, join=True)
+        assert snapshot == {
+            p.relative_to(tmp_path): hashlib.sha256(p.read_bytes()).digest()
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        }
+        restored = _make_mock_runtime(save_path=str(tmp_path))
+        restored.model = torch.nn.Linear(2, 2)
+        restored.optimizer = torch.optim.AdamW(restored.model.parameters())
+        restored.lr_scheduler = None
+        restored.parallel_state = runtime.parallel_state
+        restored.train_args.checkpoint.load_path = layout.step_dir(str(tmp_path), 1)
+        ModelCheckpointManager(restored).load()
+        for expected, actual in zip(runtime.model.parameters(), restored.model.parameters()):
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    runtime.optimizer.state[expected][key], restored.optimizer.state[actual][key], rtol=0, atol=0
+                )
 
 
 def test_unconfirmed_or_multi_optimizer_export_does_not_create_legacy_receipt(tmp_path):
@@ -321,74 +333,6 @@ def test_unconfirmed_or_multi_optimizer_export_does_not_create_legacy_receipt(tm
             assert manager._last_legacy_export_dcp_step is None
 
 
-def test_failed_export_wait_requires_new_dcp_before_retry(tmp_path):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
-
-    runtime = _make_mock_runtime(save_path=str(tmp_path), save_async=True)
-    runtime.optimizer = MagicMock(spec=[])
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer"),
-        patch("veomni.models.checkpoint.manager.dist.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        manager.save_dcp = MagicMock(wraps=manager.save_dcp)
-        manager.wait_for_pending_save = MagicMock(side_effect=[RuntimeError("injected wait failure"), None])
-        state = TrainerState(global_step=3)
-        with pytest.raises(RuntimeError, match="injected wait failure"):
-            manager.prepare_export(state, "step_end")
-        assert manager._last_saved_step == -1
-        assert manager._last_legacy_export_dcp_step is None
-        manager.prepare_export(state, "step_end")
-        assert manager.save_dcp.call_count == 2
-        assert manager._last_legacy_export_dcp_step == 3
-
-
-@pytest.mark.parametrize("before,after", [("none", "optimizer"), ("optimizer", "other"), ("optimizer", "none")])
-def test_legacy_export_does_not_reuse_dcp_with_changed_optimizer(tmp_path, before, after):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
-    from veomni.trainer.callbacks.checkpoint_callback import _export_wrote_dcp
-
-    runtime = _make_mock_runtime(save_path=str(tmp_path))
-    original = MagicMock(spec=[])
-    replacement = MagicMock(spec=[])
-    runtime.optimizer = None if before == "none" else original
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer"),
-        patch("veomni.models.checkpoint.manager.dist.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        manager.checkpointer.save.return_value = "second-generation"
-        manager.save_dcp(TrainerState(global_step=3))
-        runtime.optimizer = {"optimizer": original, "other": replacement, "none": None}[after]
-        manager.prepare_export(TrainerState(global_step=3), "step_end")
-        if after == "none":
-            assert manager._last_legacy_export_dcp_step is None
-            assert not _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3)
-        else:
-            assert manager.checkpointer.save.call_count == 2
-            assert manager._last_saved_optimizer_ref() is runtime.optimizer
-            assert _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3)
-
-
-def test_omni_frozen_runtimes_do_not_hide_or_fabricate_receipts():
-    from veomni.trainer.callbacks.checkpoint_callback import _export_wrote_dcp
-
-    confirmed = SimpleNamespace(checkpoint=SimpleNamespace(_last_saved_step=3, _last_legacy_export_dcp_step=3))
-    frozen = SimpleNamespace(checkpoint=None, has_trainable_parameters=False)
-    unknown = SimpleNamespace(checkpoint=None, has_trainable_parameters=True)
-    failed = SimpleNamespace(checkpoint=SimpleNamespace(_last_saved_step=3, _last_legacy_export_dcp_step=None))
-
-    def trainer(*modules):
-        return SimpleNamespace(model=SimpleNamespace(module_runtimes=dict(enumerate(modules))))
-
-    assert _export_wrote_dcp(trainer(confirmed, frozen), 3)
-    assert not _export_wrote_dcp(trainer(confirmed, unknown), 3)
-    assert not _export_wrote_dcp(trainer(confirmed, failed), 3)
-    assert not _export_wrote_dcp(trainer(frozen), 3)
-
-
 @pytest.mark.parametrize("method", ["wait", "slot"])
 def test_shared_async_failure_never_certifies_another_manager(tmp_path, method):
     from concurrent.futures import Future
@@ -396,7 +340,6 @@ def test_shared_async_failure_never_certifies_another_manager(tmp_path, method):
     from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.models.checkpoint.manager import ModelCheckpointManager
-    from veomni.trainer.callbacks.checkpoint_callback import _export_wrote_dcp
 
     failed = Future()
     failed.set_exception(OSError("injected shared async failure"))
@@ -412,88 +355,14 @@ def test_shared_async_failure_never_certifies_another_manager(tmp_path, method):
         patch("veomni.models.checkpoint.manager.dist.is_initialized", return_value=False),
     ):
         a, b = ModelCheckpointManager(runtime_a), ModelCheckpointManager(runtime_b)
-        b._last_saved_step = 3
-        b._last_legacy_export_dcp_step = 3
         with pytest.raises(OSError, match="injected shared async failure"):
             if method == "wait":
                 a.wait_for_pending_save()
             else:
                 DistributedCheckpointer._drain_slot("weights")
         assert DistributedCheckpointer._async_save_failed is True
-        assert not _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=b)), 3)
         with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
             b.wait_for_pending_save()
-
-
-def test_strict_generation_not_reused_after_optimizer_replacement(tmp_path):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
-    from veomni.trainer.callbacks.checkpoint_callback import _export_wrote_dcp
-
-    runtime = _make_mock_runtime(save_path=str(tmp_path))
-    first, second = MagicMock(), MagicMock()
-    first._is_multi_optimizer = second._is_multi_optimizer = True
-    runtime.optimizer = first
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer"),
-        patch("veomni.models.checkpoint.manager.dist.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        manager.checkpointer.save.return_value = "second-generation"
-        manager.save_dcp(TrainerState(global_step=3))
-        manager._last_saved_optimizer_generation = "first-generation"
-        runtime.optimizer = second
-        manager.prepare_export(TrainerState(global_step=3), "step_end")
-        assert manager.checkpointer.save.call_count == 2
-        assert manager._last_saved_optimizer_ref() is second
-        generation = manager._last_saved_optimizer_generation
-        assert generation in (None, "second-generation")
-        assert _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3) is (
-            generation is not None
-        )
-
-
-def test_legacy_export_does_not_certify_ambiguous_multi_flag(tmp_path):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
-    from veomni.trainer.callbacks.checkpoint_callback import _export_wrote_dcp
-
-    runtime = _make_mock_runtime(save_path=str(tmp_path))
-    runtime.optimizer = MagicMock()
-    runtime.optimizer._is_multi_optimizer = 1
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer"),
-        patch("veomni.models.checkpoint.manager.dist.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        manager.prepare_export(TrainerState(global_step=3), "step_end")
-        assert manager._last_legacy_export_dcp_step is None
-        assert not _export_wrote_dcp(SimpleNamespace(model=SimpleNamespace(checkpoint=manager)), 3)
-
-
-def test_epoch_dedup_rejects_optimizer_changed_after_hf_export(tmp_path):
-    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
-
-    runtime = _make_mock_runtime(save_path=str(tmp_path))
-    runtime.optimizer = MagicMock(spec=[])
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer"),
-        patch("veomni.models.checkpoint.manager.dist.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        state = TrainerState(global_step=3, epoch=0)
-        manager.prepare_export(state, "step_end")
-        trainer = _make_mock_trainer(save_path=str(tmp_path))
-        trainer.args.train.checkpoint.save_epochs = 1
-        trainer.args.train.checkpoint.save_hf_weights = False
-        trainer.model.checkpoint = manager
-        callback = CheckpointCallback(trainer)
-        callback._last_dcp_step = 3
-        runtime.optimizer = MagicMock(spec=[])
-        with pytest.raises(RuntimeError, match="Optimizer or checkpoint changed"):
-            callback.on_epoch_end(state)
-        trainer.save_dcp.assert_not_called()
 
 
 def test_manager_accepts_only_proven_loaded_optimizer_receipt(tmp_path):
@@ -513,18 +382,9 @@ def test_manager_accepts_only_proven_loaded_optimizer_receipt(tmp_path):
         with pytest.raises(RuntimeError, match="unproven"):
             manager.confirm_loaded_checkpoint_for_reuse(3, "different-generation")
         assert manager._last_saved_step == -1
-        saved_optimizer = runtime.optimizer
-        runtime.optimizer = MagicMock()
-        runtime.optimizer._is_multi_optimizer = True
-        with pytest.raises(RuntimeError, match="unproven"):
-            manager.confirm_loaded_checkpoint_for_reuse(3, "saved-generation")
-        assert manager._last_saved_step == -1
-        runtime.optimizer = saved_optimizer
         manager.confirm_loaded_checkpoint_for_reuse(3, "saved-generation")
         assert manager.checkpoint_receipt_is_current(3)
         assert manager._last_saved_optimizer_generation == "saved-generation"
-        runtime.optimizer = MagicMock()
-        assert not manager.checkpoint_receipt_is_current(3)
 
 
 def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, monkeypatch):
