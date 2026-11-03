@@ -499,6 +499,7 @@ def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, m
         runtime.checkpoint = manager
         trainer.model = runtime
         trainer.checkpoint_callback = CheckpointCallback(trainer)
+        trainer.checkpoint_callback._invalid_generation_step = 3
         callback = GlobalStateCallback(trainer)
         monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
         monkeypatch.setattr(
@@ -515,6 +516,9 @@ def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, m
         )
         monkeypatch.setattr(callback, "_restore_position", lambda _: None)
         callback.load_global_state()
+        assert trainer.checkpoint_callback._invalid_generation_step == 3
+        with pytest.raises(RuntimeError, match="restart and restore"):
+            trainer.checkpoint_callback._check_failed_generation()
         assert trainer.checkpoint_callback._last_dcp_step == 3
         assert manager.checkpoint_receipt_is_current(3)
         manager.prepare_export(TrainerState(global_step=3), "train_end")

@@ -49,6 +49,21 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 
+class _CheckpointGenerationMismatch(RuntimeError):
+    pass
+
+
+def _check_checkpoint_generations(checkpoints, step):
+    """A same-step transaction must identify the same generations on every rank."""
+    if not dist.is_initialized():
+        return
+    local = (step, tuple(getattr(checkpoint, "_last_saved_optimizer_generation", None) for checkpoint in checkpoints))
+    values = [None] * dist.get_world_size()
+    dist.all_gather_object(values, local)
+    if any(value != local for value in values):
+        raise _CheckpointGenerationMismatch("Same-step checkpoint generations differ across ranks")
+
+
 def _confirmed_export_optimizer(checkpoint, step):
     if not hasattr(checkpoint, "_last_export_validated_step"):
         return True  # Compatibility with checkpoint providers that only expose a receipt.
@@ -85,6 +100,7 @@ def _check_same_step_receipt(trainer, step, same_step):
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "validating the same-step checkpoint")
+    _check_checkpoint_generations([getattr(runtime, "checkpoint", None) for runtime in runtimes], step)
 
 
 def _export_wrote_dcp(trainer, step):
@@ -124,6 +140,7 @@ def _export_wrote_dcp(trainer, step):
         flag = torch.tensor([int(saved)], dtype=torch.int32, device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
         saved = bool(flag.item())
+    _check_checkpoint_generations(checkpoints, step)
     return saved
 
 
@@ -141,6 +158,13 @@ class CheckpointCallback(Callback):
         self.hf_every_n_epochs = ckpt.hf_save_epochs
         self._last_dcp_step: int = -1
         self._last_hf_step: int = -1
+        self._invalid_generation_step = None
+
+    def _check_failed_generation(self):
+        if self._invalid_generation_step is not None:
+            raise RuntimeError(
+                "Checkpoint generations previously disagreed; restart and restore a verified checkpoint before retrying"
+            )
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.trainer.save_model_assets()
@@ -148,6 +172,7 @@ class CheckpointCallback(Callback):
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        self._check_failed_generation()
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")
@@ -161,18 +186,24 @@ class CheckpointCallback(Callback):
             self.trainer.wait_for_pending_save()
 
     def on_step_end(self, state: TrainerState, **kwargs):
+        self._check_failed_generation()
         if self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0:
             self._save_dcp(state)
         if self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0:
             self._save_hf(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
+        self._check_failed_generation()
         dcp_due = bool(self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0)
         hf_due = bool(
             self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
         )
         if dcp_due:
-            _check_same_step_receipt(self.trainer, state.global_step, state.global_step == self._last_dcp_step)
+            try:
+                _check_same_step_receipt(self.trainer, state.global_step, state.global_step == self._last_dcp_step)
+            except _CheckpointGenerationMismatch:
+                self._invalid_generation_step = state.global_step
+                raise
             if state.global_step != self._last_dcp_step:
                 self._save_dcp(state)
             else:
@@ -194,9 +225,17 @@ class CheckpointCallback(Callback):
         self._last_dcp_step = state.global_step
 
     def _save_hf(self, state: TrainerState, stage: str = "step_end"):
+        self._check_failed_generation()
+        if self._last_hf_step == state.global_step:
+            self._last_hf_step = -1
         self.trainer.save_hf_or_lora(state, stage=stage)
+        try:
+            wrote_dcp = _export_wrote_dcp(self.trainer, state.global_step)
+        except _CheckpointGenerationMismatch:
+            self._invalid_generation_step = state.global_step
+            raise
         self._last_hf_step = state.global_step
-        if _export_wrote_dcp(self.trainer, state.global_step):
+        if wrote_dcp:
             self._last_dcp_step = state.global_step
 
 

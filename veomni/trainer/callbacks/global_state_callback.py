@@ -522,6 +522,14 @@ class GlobalStateCallback(Callback):
         _agree_restored_position(optimizer_step, None, dist.group.WORLD if dist.is_initialized() else None)
         strict_optimizer = type(optimizer_step) is int
         strict_resume = strict_sft or strict_optimizer
+        if strict_optimizer and dist.is_initialized():
+            local_generations = tuple(sorted(generations.items()))
+            rank_generations = [None] * dist.get_world_size()
+            dist.all_gather_object(rank_generations, local_generations)
+            if any(value != local_generations for value in rank_generations):
+                if isinstance(checkpoint_callback, CheckpointCallback):
+                    checkpoint_callback._invalid_generation_step = optimizer_step
+                raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
         legacy_checkpoints, unknown_checkpoints, error = [], [], None
         try:
             legacy_checkpoints, unknown_checkpoints = _legacy_optimizer_checkpoints(self.trainer)
