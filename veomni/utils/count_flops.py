@@ -1193,7 +1193,7 @@ class VeomniFlopsCounter:
         attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
             self._compute_hybrid_attn_params(
                 text_config,
-                full_attention_types=("full_attention", "qwen_sparse_attention"),
+                full_attention_types=("full_attention", "qwen_sparse_attention", "indexed_attention"),
             )
         )
 
