@@ -30,6 +30,7 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from ...utils import helper
@@ -41,6 +42,22 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+def _export_wrote_dcp(trainer, step):
+    """Reuse a completed export only when each trainable owner saved this step."""
+    root = getattr(trainer, "model", None)
+    modules = getattr(root, "module_runtimes", None)
+    runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
+    owners = []
+    for runtime in runtimes:
+        checkpoint = getattr(runtime, "checkpoint", None)
+        if checkpoint is None and getattr(runtime, "has_trainable_parameters", None) is False:
+            continue
+        if checkpoint is None or getattr(checkpoint, "_last_saved_step", None) != step:
+            return False
+        owners.append(checkpoint)
+    return bool(owners)
 
 
 class CheckpointCallback(Callback):
@@ -146,6 +163,8 @@ class CheckpointCallback(Callback):
                 self._last_dcp_step = -1
             raise
         self._last_hf_step = state.global_step
+        if _export_wrote_dcp(self.trainer, state.global_step):
+            self._last_dcp_step = state.global_step
 
 
 __all__ = ["CheckpointCallback"]
