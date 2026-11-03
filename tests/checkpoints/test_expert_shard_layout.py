@@ -1099,9 +1099,7 @@ def _sparse_plain_optimizer_failure_worker(rank, endpoint):
                 return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
 
         state = OptimizerState(model, SparseOptimizer(), parallel_state=parallel)
-        with pytest.raises(
-            RuntimeError, match="Raw DCP MultiOptimizer|no proven replica layout|failed on another rank"
-        ):
+        with pytest.raises(RuntimeError, match="Raw DCP MultiOptimizer"):
             state.state_dict()
         completed = torch.tensor(1)
         dist.all_reduce(completed)
@@ -1112,7 +1110,7 @@ def _sparse_plain_optimizer_failure_worker(rank, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
-def test_sparse_plain_optimizer_failure_exits_all_ranks(world):
+def test_raw_multi_optimizer_is_rejected_on_all_ranks(world):
     spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(), nprocs=world)
 
 
@@ -1138,9 +1136,7 @@ def _subgroup_sparse_optimizer_failure_worker(rank, endpoint):
                     return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
 
             state = OptimizerState(model, SparseOptimizer(), parallel_state=parallel, load=True, process_group=group)
-            with pytest.raises(
-                RuntimeError, match="Raw DCP MultiOptimizer|no proven replica layout|failed on another rank"
-            ):
+            with pytest.raises(RuntimeError, match="Raw DCP MultiOptimizer"):
                 state.state_dict()
         dist.barrier()
     finally:
@@ -1149,7 +1145,7 @@ def _subgroup_sparse_optimizer_failure_worker(rank, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
-def test_sparse_optimizer_failure_coordinates_only_the_load_group(world):
+def test_raw_multi_optimizer_is_rejected_with_subgroup(world):
     spawn_with_rendezvous(_subgroup_sparse_optimizer_failure_worker, args=(), nprocs=world)
 
 
