@@ -62,15 +62,27 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-`optimizer_resume_layout._local_layout` records `algorithm_identity`, each
-parameter's `state_dtype`, and `state_is_offloaded` in the checkpoint identity;
-a mismatch rejects resume before applying state. During save,
-`multi_optimizer_checkpoint._validate_source_optimizer_states` uses
-`state_dtype` to check initialized fields against their declared precision.
-During load, `_prepare_multi_optimizer_saved_states` checks stored field dtypes
-and uses `state_is_offloaded` to allocate missing destination state on CPU when
-the adapter specifies offload. `context_factory` wraps the optimizer's actual
-state read and load; adapter implementations own correct placement and values.
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L105)
+records `algorithm_identity`, each parameter's `state_dtype`, and
+`state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
+before applying state. During save,
+[`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L89)
+uses `state_dtype` to check initialized fields against their declared precision.
+During load,
+[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L408)
+checks stored field dtypes and uses `state_is_offloaded` to allocate missing
+destination state on CPU when the adapter specifies offload. `context_factory`
+wraps the optimizer's actual state read and load; adapter implementations own
+correct placement and values.
+
+The adapter contract tests include the
+[`test_registered_optimizer_preserves_lazy_state_and_next_update`](../../tests/checkpoints/test_optimizer_checkpoint_adapter.py#L71)
+round trip and the policy-mismatch checks
+[`test_registered_optimizer_rejects_changed_algorithm_before_loading`](../../tests/checkpoints/test_optimizer_checkpoint_adapter.py#L114)
+and
+[`test_lazy_adapter_state_dtype_policy_is_part_of_checkpoint_identity`](../../tests/checkpoints/test_optimizer_checkpoint_adapter.py#L132).
+The toy adapter in these tests reports no offload; actual device-to-CPU placement
+must also be validated for an offloading implementation.
 
 ## Framework call sites and restore behavior
 
