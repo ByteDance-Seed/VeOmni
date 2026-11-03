@@ -90,9 +90,19 @@ are rejected because iterator initialization may advance CPU RNG.
 
 When the model checkpoint manager provides strict MultiOptimizer generation
 receipts, the trainer sidecar records that generation and recovery requires it
-to match the optimizer checkpoint and step. Checkpoint managers without this
-protocol retain their existing behavior; their optimizer-to-cursor identity is
-not established by the dynamic-batching cursor checks alone.
+to match the optimizer checkpoint and step. Dynamic-batching cursor checks
+alone do not establish optimizer-to-cursor identity for checkpoint managers
+without this protocol. In this standalone implementation, the built-in
+``ModelCheckpointManager``/``DistributedCheckpointer`` does not provide
+generation receipts when used with ``MultiOptimizer``. For such runs, including
+Muon and EP configurations, trainer-state restoration rejects a ``load_path``
+that resolves to the current ``save_path/global_step_<restored_step>``. To
+avoid that same-output guard, keep ``load_path`` pointed at the original exact
+checkpoint step and configure a different output directory;
+``load_path: auto`` searches the new output directory. This workaround does not
+itself prove optimizer, data cursor or numerical recovery. A manager with
+strict generation receipts may support same-output continuation only when its
+additional identity checks pass.
 
 Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
 before training, and set `data.resume_input_deterministic=true` only when the
@@ -104,8 +114,8 @@ same digest and settings are required on resume. A missing contract emits a
 startup warning; training and export can proceed, but dynamic SFT trainer-state
 resume is rejected because its cursor cannot be proven exact. To start a new
 data stream, load the model weights as a new run instead of resuming its trainer
-state. Other trainer paths keep their existing resume contracts, including
-their own strict optimizer and data-codec checks where applicable.
+state. Other trainer paths retain their own optimizer and data-codec checks;
+the same-output restriction above applies according to their checkpoint provider.
 
 At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
 samples and start the next epoch with a fresh sampler. Persistent workers at an
