@@ -176,14 +176,18 @@ def run(rank, phase, output_dir, ep, endpoint=None):
                     _local(state["exp_avg_sq"])[1].fill_((rank + 1) / 2048)
             optimizer.zero_grad()
             DistributedCheckpointer.save(
-                ckpt, {"model": model, "optimizer": optimizer}, parallel_state=get_parallel_state()
+                ckpt,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=get_parallel_state(),
             )
         else:
             with torch.no_grad():
                 for param in model.parameters():
                     _local(param).fill_(-0.05 - rank * 0.01)
             DistributedCheckpointer.load(
-                ckpt, {"model": model, "optimizer": optimizer}, parallel_state=get_parallel_state()
+                ckpt,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=get_parallel_state(),
             )
         before = _snapshot(model, optimizer)
         after = _step(model, optimizer, rank, ep, 2)
