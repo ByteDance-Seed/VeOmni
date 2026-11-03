@@ -20,10 +20,7 @@ from veomni.models.seed_omni.modules.base.llm_packing import (
     pack_llm_conversations_for_forward,
     scatter_llm_hidden_states,
 )
-from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
-    Qwen3ChatTemplate,
-    Qwen3VLChatTemplate,
-)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import Qwen3ChatTemplate
 from veomni.models.seed_omni.modules.qwen3.text_encoder.configuration import Qwen3TextEncoderConfig
 from veomni.models.seed_omni.modules.qwen3.text_encoder.processing import Qwen3TextEncoderPreprocessor
 from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
@@ -147,57 +144,6 @@ def test_qwen3_tokenize_conversation_suffix_truncates_and_preserves_assistant_an
     assert int((trunc_labels != -100).sum()) == int((full_labels != -100).sum()) > 0
 
 
-def test_qwen3vl_tokenize_conversation_budgets_media_rows_and_keeps_vision_wrappers_atomic():
-    tmpl = Qwen3VLChatTemplate(FakeTokenizer())
-
-    def _mm_dialog() -> list[ConversationItem]:
-        return [
-            ConversationItem(type="text", value="p" * 30, role="user"),
-            ConversationItem(
-                type="image",
-                value=torch.zeros(16, 8),
-                role="user",
-                meta={"_omni_grid": [1, 4, 4]},  # 1 * 4 * 4 // 2**2 == 4 merged visual tokens
-            ),
-            ConversationItem(type="text", value="?", role="user"),
-            ConversationItem(type="text", value="ok", role="assistant"),
-        ]
-
-    full = tmpl.tokenize_conversation(_mm_dialog())
-    img_items = [part for part in full if part.type == "image"]
-    assert len(img_items) == 1
-    assert img_items[0].meta[_OMNI_TOKEN_LEN] == 4
-
-    vs_ids = torch.tensor([ord(c) for c in "<|vision_start|>"], dtype=torch.long)
-    ve_ids = torch.tensor([ord(c) for c in "<|vision_end|>"], dtype=torch.long)
-
-    # 1) Budget fits the assistant turn, the trailing user text, the atomic
-    #    (<|vision_start|>, image, <|vision_end|>) group, and 5 tokens of the
-    #    leading user preamble.
-    tail_after_image_len = sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in full[-2:])
-    media_group_len = int(vs_ids.numel()) + 4 + int(ve_ids.numel())
-    keep_media_budget = tail_after_image_len + media_group_len + 5
-
-    kept_with_media = tmpl.tokenize_conversation(_mm_dialog(), max_seq_len=keep_media_budget)
-    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in kept_with_media) == keep_media_budget
-    img_indices = [i for i, part in enumerate(kept_with_media) if part.type == "image"]
-    assert len(img_indices) == 1
-    img_idx = img_indices[0]
-    assert torch.equal(kept_with_media[img_idx - 1].value, vs_ids)
-    assert torch.equal(kept_with_media[img_idx + 1].value, ve_ids)
-
-    # 2) Budget is 1 token short of fitting the (<|vision_start|>, image, <|vision_end|>)
-    #    group ahead of the tail text: the entire media group (image + both wrappers)
-    #    must be dropped together without leaving a partial or dangling wrapper.
-    drop_media_budget = tail_after_image_len + media_group_len - 1
-    kept_without_media = tmpl.tokenize_conversation(_mm_dialog(), max_seq_len=drop_media_budget)
-    assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in kept_without_media) == tail_after_image_len
-    assert all(part.type == "text" for part in kept_without_media)
-    for part in kept_without_media:
-        assert not torch.equal(part.value, vs_ids)
-        assert not torch.equal(part.value, ve_ids)
-
-
 def test_qwen3_text_preprocessor_forwards_max_seq_len_when_training():
     tmpl = _template()
     batch = [_short_dialog()]
@@ -212,20 +158,6 @@ def test_qwen3_text_preprocessor_forwards_max_seq_len_when_training():
         max_seq_len=8,
     )
     assert sum(int(part.meta[_OMNI_TOKEN_LEN]) for part in infer_batch[0]) > 8
-
-
-def test_qwen3_text_preprocessor_from_pretrained_applies_enable_image_override(tmp_path, monkeypatch):
-    import veomni.models.seed_omni.modules.qwen3.text_encoder.processing as qwen3_text_processing
-
-    Qwen3TextEncoderConfig(enable_image=False).save_pretrained(str(tmp_path))
-    monkeypatch.setattr(qwen3_text_processing, "build_tokenizer", lambda module_path: FakeTokenizer())
-
-    default_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path))
-    assert isinstance(default_pre._chat_template, Qwen3ChatTemplate)
-    assert not isinstance(default_pre._chat_template, Qwen3VLChatTemplate)
-
-    override_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path), config_overrides={"enable_image": True})
-    assert isinstance(override_pre._chat_template, Qwen3VLChatTemplate)
 
 
 def _tiny_qwen3_cfg() -> dict:
@@ -499,3 +431,303 @@ def test_qwen3_train_and_infer_yaml_configs_load():
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "qwen3_text_encoder.encode" in endpoints and "qwen3_llm" in endpoints
     assert cfg.generation_graph["initial"] == "text_ar"
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+_GRAPH_EDGES = [
+    {"from": "qwen3_text_encoder.encode", "to": "qwen3_llm"},
+    {"from": "qwen3_llm", "to": "qwen3_text_encoder.decode"},
+    {"from": "qwen3_text_encoder.decode", "to": "end"},
+]
+# Packed lengths 3 + 4 = 7 tokens (odd -> exercises SP=2 padding on both
+# qwen3_text_encoder.encode and qwen3_llm.forward).
+_ALIGN_CONVERSATIONS = [
+    [
+        (torch.tensor([5, 6], dtype=torch.long), torch.tensor([-100, -100], dtype=torch.long), "user"),
+        (torch.tensor([7], dtype=torch.long), torch.tensor([7], dtype=torch.long), "assistant"),
+    ],
+    [
+        (torch.tensor([11], dtype=torch.long), torch.tensor([-100], dtype=torch.long), "user"),
+        (torch.tensor([12, 13, 14], dtype=torch.long), torch.tensor([12, 13, 14], dtype=torch.long), "assistant"),
+    ],
+]
+
+
+def _build_align_conversation_list() -> list[list[ConversationItem]]:
+    out: list[list[ConversationItem]] = []
+    for sample in _ALIGN_CONVERSATIONS:
+        items: list[ConversationItem] = []
+        for ids, labels, role in sample:
+            items.append(
+                ConversationItem(
+                    type="text",
+                    value=ids.clone(),
+                    role=role,
+                    meta={
+                        "labels": labels.clone(),
+                        "attention_mask": torch.ones_like(ids),
+                        _OMNI_TOKEN_LEN: int(ids.numel()),
+                    },
+                )
+            )
+        out.append(items)
+    return out
+
+
+def _build_align_packed_features() -> list[dict[str, torch.Tensor]]:
+    features: list[dict[str, torch.Tensor]] = []
+    for sample in _ALIGN_CONVERSATIONS:
+        ids = torch.cat([seg[0] for seg in sample], dim=0)
+        labels = torch.cat([seg[1] for seg in sample], dim=0)
+        features.append(
+            {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+                "labels": labels,
+            }
+        )
+    return features
+
+
+def _monolithic_and_split_qwen3(tied: bool) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config as HFQwen3Config
+
+    from veomni.models.configuration_base import get_veomni_config_class
+    from veomni.models.seed_omni.modules.qwen3.hf_layout import QWEN3_HF_LAYOUT
+    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3ForCausalLM
+
+    Qwen3Config = get_veomni_config_class(HFQwen3Config)
+    ops = make_eager_ops_config(attn_implementation="veomni_sdpa")
+    hf_cfg = Qwen3Config(
+        **_tiny_qwen3_cfg(),
+        tie_word_embeddings=tied,
+        ops_implementation=ops,
+    )
+    hf_cfg._attn_implementation = "veomni_sdpa"
+
+    torch.manual_seed(2026)
+    monolithic = Qwen3ForCausalLM(hf_cfg)
+
+    Qwen3TextEncoderAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_text_encoder"]()
+    Qwen3LlmAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+
+    te_cfg = Qwen3TextEncoderConfig(
+        vocab_size=hf_cfg.vocab_size,
+        hidden_size=hf_cfg.hidden_size,
+        tie_word_embeddings=tied,
+        ops_implementation=make_eager_ops_config(),
+    )
+    llm_cfg = Qwen3LlmConfig(
+        text_config=_tiny_qwen3_cfg(),
+        ops_implementation=make_eager_ops_config(attn_implementation="veomni_sdpa"),
+    )
+    text_encoder = Qwen3TextEncoderAcc(te_cfg)
+    text_encoder._chat_template = _template()
+    llm = Qwen3LlmAcc(llm_cfg)
+
+    te_sd = {}
+    llm_sd = {}
+    for key, val in monolithic.state_dict().items():
+        routed = QWEN3_HF_LAYOUT.route(key)
+        if routed is None:
+            continue
+        mod_name, mod_key = routed
+        if mod_name == "qwen3_text_encoder":
+            if tied and mod_key == "lm_head.weight":
+                continue
+            te_sd[mod_key] = val.detach().clone()
+        elif mod_name == "qwen3_llm":
+            llm_sd[mod_key] = val.detach().clone()
+    text_encoder.load_state_dict(te_sd, strict=True)
+    llm.load_state_dict(llm_sd, strict=True)
+    return monolithic, text_encoder, llm
+
+
+def _run_qwen3_omni_graph_step(
+    text_encoder: torch.nn.Module,
+    llm: torch.nn.Module,
+    conversation_list: list[list[ConversationItem]],
+) -> torch.Tensor:
+    from veomni.models.seed_omni.accelerated.utils.executor import TrainNodeRunner
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.seed_omni.modeling_omni import OmniModel
+
+    omni_cfg = OmniConfig(
+        _module_entries={
+            "qwen3_text_encoder": {"model_path": "qwen3_text_encoder"},
+            "qwen3_llm": {"model_path": "qwen3_llm"},
+        },
+        training_graphs={"default": _GRAPH_EDGES},
+        generation_graphs={},
+    )
+    omni = OmniModel(
+        omni_cfg,
+        {"qwen3_text_encoder": text_encoder, "qwen3_llm": llm},
+    )
+    out = omni.forward({"conversation_list": conversation_list}, node_runner=TrainNodeRunner())
+    return out["loss"]
+
+
+def _collect_omni_as_source_dict(
+    text_encoder: torch.nn.Module,
+    llm: torch.nn.Module,
+    *,
+    grads: bool,
+) -> dict[str, torch.Tensor]:
+    from torch.distributed.tensor import DTensor
+
+    from veomni.models.seed_omni.modules.qwen3.hf_layout import QWEN3_HF_LAYOUT
+
+    def _full(t: torch.Tensor) -> torch.Tensor:
+        return t.full_tensor().detach().clone() if isinstance(t, DTensor) else t.detach().clone()
+
+    out: dict[str, torch.Tensor] = {}
+    for mod_name, mod in (("qwen3_text_encoder", text_encoder), ("qwen3_llm", llm)):
+        for name, param in mod.named_parameters():
+            src_key = QWEN3_HF_LAYOUT.source_key(mod_name, name)
+            assert src_key is not None, (mod_name, name)
+            target = param.grad if grads else param
+            assert target is not None, (mod_name, name)
+            out[src_key] = _full(target)
+    return out
+
+
+def _qwen3_fsdp2_sp_align_worker(rank: int, rendezvous: str, out_dir: str) -> None:
+    import json
+
+    import torch.distributed as dist
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.data.data_collator import MainCollator
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+
+    world = 2
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=world, rank=rank)
+    try:
+        sp1_ps = _init_parallel_state(
+            dp_size=world,
+            dp_shard_size=world,
+            ulysses_size=1,
+            dp_mode="fsdp2",
+            device_type="cpu",
+            name="sp1",
+        )
+        sp2_ps = _init_parallel_state(
+            dp_size=1,
+            dp_shard_size=1,
+            ulysses_size=world,
+            dp_mode="fsdp2",
+            device_type="cpu",
+            name="sp2",
+        )
+        _init_parallel_state(dp_size=world, ulysses_size=1, dp_mode="ddp", device_type="cpu", name="ref_sp1")
+
+        reports: dict[str, dict] = {}
+        for sp_size, ps_name, ps in ((1, "sp1", sp1_ps), (2, "sp2", sp2_ps)):
+            for tied in (True, False):
+                monolithic_ref, te, llm = _monolithic_and_split_qwen3(tied=tied)
+
+                # Reference: packed forward + backward + AdamW step on the full 2-conversation batch.
+                with use_parallel_state("ref_sp1"):
+                    ref_batch = MainCollator()(_build_align_packed_features())
+                    ref_out = monolithic_ref(
+                        input_ids=ref_batch["input_ids"],
+                        attention_mask=ref_batch["attention_mask"],
+                        position_ids=ref_batch["position_ids"],
+                        cu_seq_lens_q=ref_batch["cu_seq_lens_q"],
+                        cu_seq_lens_k=ref_batch["cu_seq_lens_k"],
+                        max_length_q=ref_batch["max_length_q"],
+                        max_length_k=ref_batch["max_length_k"],
+                        labels=ref_batch["labels"],
+                        use_cache=False,
+                    )
+                    ref_loss = ref_out.loss.detach().clone()
+                    ref_out.loss.backward()
+                    ref_grads = {
+                        name: param.grad.detach().clone()
+                        for name, param in monolithic_ref.named_parameters()
+                        if param.grad is not None
+                    }
+                    ref_opt = torch.optim.AdamW(monolithic_ref.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+                    ref_opt.step()
+                    ref_stepped = {name: param.detach().clone() for name, param in monolithic_ref.named_parameters()}
+
+                # Wrap SeedOmni modules with FSDP2 over ps.fsdp_mesh (dp_shard_sp).
+                with use_parallel_state(ps_name):
+                    fully_shard(te.embed_tokens, mesh=ps.fsdp_mesh, reshard_after_forward=True)
+                    fully_shard(te, mesh=ps.fsdp_mesh)
+                    for layer in llm.language_model.layers:
+                        fully_shard(layer, mesh=ps.fsdp_mesh, reshard_after_forward=True)
+                    fully_shard(llm, mesh=ps.fsdp_mesh)
+
+                    all_convs = _build_align_conversation_list()
+                    if sp_size == 1:
+                        # dp_size=2, sp_size=1: each DP rank takes one conversation; their
+                        # supervised token counts are [1, 3], so the token-weighted DP mean
+                        # over fsdp_group matches the packed 2-sample reference.
+                        local_convs = [all_convs[rank]]
+                    else:
+                        # dp_size=1, sp_size=2: both SP ranks receive the same packed 2-sample
+                        # batch (total length 7 -> padded to 8 across SP=2).
+                        local_convs = all_convs
+
+                    loss = _run_qwen3_omni_graph_step(te, llm, local_convs)
+                    loss.backward()
+
+                    omni_grads = _collect_omni_as_source_dict(te, llm, grads=True)
+                    te_opt = torch.optim.AdamW(te.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+                    llm_opt = torch.optim.AdamW(llm.parameters(), lr=1e-2, weight_decay=0.01, foreach=False)
+                    te_opt.step()
+                    llm_opt.step()
+                    omni_stepped = _collect_omni_as_source_dict(te, llm, grads=False)
+
+                loss_match = torch.allclose(loss.detach(), ref_loss, atol=1e-5, rtol=1e-5)
+                grad_mismatches = [
+                    key
+                    for key, ref_g in ref_grads.items()
+                    if not torch.allclose(omni_grads[key], ref_g, atol=1e-4, rtol=1e-4)
+                ]
+                step_mismatches = [
+                    key
+                    for key, ref_w in ref_stepped.items()
+                    if not torch.allclose(omni_stepped[key], ref_w, atol=1e-4, rtol=1e-4)
+                ]
+                mode_key = f"sp{sp_size}_{'tied' if tied else 'untied'}"
+                reports[mode_key] = {
+                    "loss_match": loss_match,
+                    "loss": float(loss.detach()),
+                    "ref_loss": float(ref_loss),
+                    "grad_mismatches": grad_mismatches,
+                    "step_mismatches": step_mismatches,
+                }
+        Path(out_dir, f"rank{rank}.json").write_text(json.dumps(reports), encoding="utf-8")
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
+def test_qwen3_omni_graph_matches_monolithic_qwen3_under_fsdp2_and_sp(tmp_path: Path):
+    """Full Qwen3 SeedOmni graph (encode -> llm -> decode) under FSDP2 at SP=1 and
+    SP=2 (with odd sequence length 7 requiring SP padding) matches monolithic
+    Qwen3ForCausalLM on loss, every parameter gradient, and AdamW parameter updates."""
+    import json
+
+    import torch.multiprocessing as mp
+
+    out_dir = tmp_path / "fsdp2_sp_align"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mp.spawn(
+        _qwen3_fsdp2_sp_align_worker,
+        args=(str(out_dir / "rendezvous"), str(out_dir)),
+        nprocs=2,
+        join=True,
+    )
+    for rank in range(2):
+        reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
+        assert set(reports) == {"sp1_tied", "sp1_untied", "sp2_tied", "sp2_untied"}
+        for mode, report in reports.items():
+            assert report["loss_match"], (rank, mode, report)
+            assert not report["grad_mismatches"], (rank, mode, report)
+            assert not report["step_mismatches"], (rank, mode, report)

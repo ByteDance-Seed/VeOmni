@@ -92,7 +92,7 @@ tasks/omni/infer_omni.py             -> OmniInferencer
 | `build_model_assets` | binds the preprocessor onto the model (`bind_module_assets`) so graph nodes and HF export can access it |
 | `freeze_model` | prefixes the parameter table and VRAM log with the module's name |
 | `build_parallelized_model` | supports custom `customized_build_parallelize_model` hooks; deferred to `OmniModelRuntime` when `fsdp_scope='model'` |
-| `build_optimizer` / `build_lr_scheduler` | scoped to the module's mesh and skipped when the module is frozen; passes the optimizer to `module.configure_optimizer(optimizer)` if defined |
+| `build_optimizer` / `build_lr_scheduler` | scoped to the module's mesh and skipped when the module is frozen |
 | `build_checkpoint` | creates a per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/` when trainable |
 | `clip_grad_norm` | computes this module's norm (`veomni_omni_module_clip_grad_norm`) for `OmniModelRuntime` to combine |
 | `skip_hf_weight_load` | keeps HF weight loading enabled on resume when the module is frozen and has persistent state |
