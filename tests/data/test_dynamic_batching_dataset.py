@@ -980,3 +980,17 @@ def _main_distributed_test():
 
 if __name__ == "__main__":
     _main_distributed_test()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "cp_size,layout,total", [(1, "zigzag", 5), (2, "contiguous", 5), (2, "zigzag", 8), (4, "zigzag", 8)]
+)
+def test_length_factory_accounts_for_usp_padding_without_global_state(cp_size, layout, total):
+    sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
+    topology = {"cp_size": cp_size, "cp_layout": layout}
+    assert get_length_fn_by_count_mode("total", **topology)(sample) == total
+    assert get_length_fn_by_count_mode("effective", **topology)(sample) == 3
+    # Constructing another factory must not mutate an already-selected topology.
+    unaligned = get_length_fn_by_count_mode("total")
+    assert unaligned(sample) == 5

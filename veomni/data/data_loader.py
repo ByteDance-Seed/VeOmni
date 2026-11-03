@@ -34,7 +34,6 @@ from .data_collator import (
 from .dataset import (
     DynamicBatchingSizeDataset,
     _MapStyleSamplerWrapper,
-    get_length_fn,
     get_length_fn_by_count_mode,
 )
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
@@ -175,14 +174,18 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        length_topology = {
+            "cp_size": getattr(parallel_state, "cp_size", 1),
+            "cp_layout": getattr(parallel_state, "cp_layout", "contiguous"),
+        }
+        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode, **length_topology)
         if dyn_bsz_count_mode == "effective":
             if dyn_bsz_physical_overflow_ratio < 1.0:
                 raise ValueError(
                     f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {dyn_bsz_physical_overflow_ratio}."
                 )
             physical_token_cap = math.ceil(batching_token_len * dyn_bsz_physical_overflow_ratio)
-            dyn_bsz_physical_length_fn = get_length_fn
+            dyn_bsz_physical_length_fn = get_length_fn_by_count_mode("total", **length_topology)
         else:
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
