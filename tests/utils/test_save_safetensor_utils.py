@@ -85,14 +85,18 @@ def test_lora_adapter_export_uses_fuse_fallback(tmp_path, monkeypatch):
         for name, tensor in get_lora_state_dict(model, config=model.get_lora_config()).items()
     }
     original_save = weights.save_file
+    save_attempts = []
 
     def inject_enosys(data, path, metadata):
         if str(path).startswith(str(tmp_path)):
+            save_attempts.append("destination")
             raise SafetensorError("Error while serializing: I/O error: Function not implemented (os error 38)")
+        save_attempts.append("local")
         original_save(data, path, metadata=metadata)
 
     monkeypatch.setattr(weights, "save_file", inject_enosys)
     save_lora_adapter_with_dcp(model, str(tmp_path / "adapter"))
+    assert save_attempts == ["destination", "local"]
     actual = load_adapter_state_dict(str(tmp_path / "adapter"))
     assert actual.keys() == expected.keys()
     for name in expected:
@@ -126,6 +130,68 @@ def test_lora_export_failure_reaches_all_ranks(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_lora_export_failure_worker, args=(str(tmp_path),), nprocs=2)
+
+
+def _lora_fallback_copy_failure_worker(rank, directory, local_temp, endpoint):
+    from pathlib import Path
+
+    from safetensors import SafetensorError
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.checkpoint import weights
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        base = nn.Module()
+        base.linear = nn.Linear(4, 4, bias=False)
+        model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+        original_save = weights.save_file
+        save_attempts = []
+
+        def inject_enosys(data, path, metadata):
+            if str(path).startswith(directory):
+                save_attempts.append("destination")
+                raise SafetensorError("I/O error: Function not implemented (os error 38)")
+            assert Path(path).is_relative_to(local_temp)
+            save_attempts.append("local")
+            return original_save(data, path, metadata=metadata)
+
+        def fail_after_partial_copy(source, destination, **kwargs):
+            destination.write(source.read(8))
+            raise OSError("injected fallback copy failure")
+
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(weights.tempfile, "tempdir", local_temp),
+            patch.object(weights, "save_file", side_effect=inject_enosys),
+            patch.object(weights.shutil, "copyfileobj", side_effect=fail_after_partial_copy),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected fallback copy failure|failed on another rank"):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory)
+        if rank == 0:
+            assert save_attempts == ["destination", "local"]
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_fallback_copy_failure_preserves_previous_adapter(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    output = tmp_path / "adapter"
+    output.mkdir()
+    local_temp = tmp_path / "local-temp"
+    local_temp.mkdir()
+    adapter_path = output / "adapter_model.safetensors"
+    adapter_path.write_bytes(b"previous adapter generation")
+    spawn_with_rendezvous(_lora_fallback_copy_failure_worker, args=(str(output), str(local_temp)), nprocs=2)
+    assert adapter_path.read_bytes() == b"previous adapter generation"
+    assert not list(output.glob(".veomni-safetensors-*"))
+    assert not list(local_temp.iterdir())
 
 
 # ---------------------------------------------------------------------------
