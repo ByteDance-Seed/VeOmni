@@ -54,7 +54,8 @@ class ToyQwen4(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(model_type="qwen4_exp")
+        # This expert-only fixture deliberately has no GDN layers.
+        self.config = SimpleNamespace(model_type="qwen4_exp", layer_types=["full_attention"])
         self.layer = ToyDecoder()
 
     def forward(self, x, indices, weights):
