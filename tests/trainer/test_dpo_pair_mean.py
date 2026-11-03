@@ -511,6 +511,9 @@ def test_provenance_enabled_uneven_microbatches_match_pair_mean(monkeypatch, cha
     trainer.policy_model.model_config = SimpleNamespace(vocab_size=256)
     callback = _attach_channel_callback(trainer, metrics, channel_loss)
     meter = object.__new__(EnvironMeter)
+    meter.parallel_state = state
+    meter._batch_token_stats = []
+    meter._batch_token_stats_complete = True
     meter.config = SimpleNamespace()
     meter.enable_multisource = True
     meter.dpo_provenance_enabled = True
@@ -634,6 +637,9 @@ def _channel_loss_worker(rank, world_size, parallel_options, native_npu, endpoin
             trainer, metrics = _build_trainer(state, distributed=True, device=device)
             _attach_channel_callback(trainer, metrics, enabled)
             meter = object.__new__(EnvironMeter)
+            meter.parallel_state = state
+            meter._batch_token_stats = []
+            meter._batch_token_stats_complete = True
             meter.config = SimpleNamespace()
             meter.enable_multisource = True
             meter.dpo_provenance_enabled = False
@@ -731,6 +737,9 @@ def _provenance_dp_sp_worker(rank, world_size, native_npu, endpoint):
         trainer.base.args.data = SimpleNamespace(enable_multisource=True)
         callback = _attach_channel_callback(trainer, metrics, True)
         meter = object.__new__(EnvironMeter)
+        meter.parallel_state = state
+        meter._batch_token_stats = []
+        meter._batch_token_stats_complete = True
         meter.config = SimpleNamespace()
         meter.enable_multisource = True
         meter.dpo_provenance_enabled = True

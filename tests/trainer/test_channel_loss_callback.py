@@ -113,11 +113,14 @@ def test_multisource_meter_preserves_channel_metadata_until_capture(monkeypatch,
     from veomni.trainer.callbacks.trace_callback import EnvironMeterCallback
     from veomni.utils.helper import EnvironMeter
 
-    _stub_parallel_state(monkeypatch)
+    state = _stub_parallel_state(monkeypatch)
     clock = iter((10.0, 12.0))
     monkeypatch.setattr(base_trainer_module, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
     monkeypatch.setattr(trace_callback_module, "time", SimpleNamespace(time=lambda: 100.0))
     meter = object.__new__(EnvironMeter)
+    meter.parallel_state = state
+    meter._batch_token_stats = []
+    meter._batch_token_stats_complete = True
     meter.config = SimpleNamespace()
     meter.enable_multisource = True
     meter.dpo_provenance_enabled = False

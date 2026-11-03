@@ -1545,6 +1545,9 @@ def test_dpo_multisource_counts_features_not_attention_segments(monkeypatch):
     meter = object.__new__(helper.EnvironMeter)
     meter.dpo_provenance_enabled = True
     meter.config = SimpleNamespace(condition_model_type=None)
+    meter.parallel_state = state
+    meter._batch_token_stats = []
+    meter._batch_token_stats_complete = True
     meter.batch_seqlens, meter.batch_source_seqlens, meter.batch_ds_idx, meter.images_seqlens = [], [], [], []
     meter.enable_multisource = True
     meter.add(approved)
