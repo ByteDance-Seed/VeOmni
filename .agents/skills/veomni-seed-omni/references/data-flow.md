@@ -12,6 +12,18 @@ raw data transforms, or request preprocessing.
    - Preprocessors run serially in module declaration order on each sample,
      mutating `ConversationItem.value` and `meta` (including `_omni_token_len`
      and `labels` for `dyn_bsz`, plus per-sample `is_dummy` anchors) in place.
+   - After `OmniProcessor.preprocess` finishes, `_filter_overlong_sample` checks
+     the sample's real (non-`is_dummy`) token length against `data.max_seq_len`.
+     Because multimodal conversations cannot be truncated without breaking
+     media placeholders or vision wrappers, any sample with
+     `token_len > data.max_seq_len` is **skipped** (`return []` with a warning).
+     **Note (SP & default `max_seq_len` trap):** `data.max_seq_len` is the
+     **full-sample (pre-SP-slice) global token cap**, not per-SP-rank (`sp_size`
+     is not multiplied in). For example, with `max_seq_len: 4096` and
+     `ulysses_size: 4`, a single sample is still capped at `4096` tokens total
+     (`1024` tokens per SP rank). Always size `data.max_seq_len` above the
+     longest full multimodal/SP sample so the default (`2048` in
+     `OmniDataArguments`) does not drop the entire dataset.
 2. `SeedOmniCollator` groups per-sample dicts (after optional `dyn_bsz` batching)
    into `{"conversation_list": [[...], ...]}` plus aligned extra keys.
 3. Module `pre_forward` selects items by `type`, `role`, and `meta` tags and

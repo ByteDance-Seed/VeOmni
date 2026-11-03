@@ -59,6 +59,11 @@ top-level `model.accelerator` resolve to the same `dp_size`.
 With `sp_size = cp_size * ulysses_size = S` on `W` ranks the data-parallel size
 is `W / S`. On a small machine this can reach `dp = 1`; compensate with gradient
 accumulation (a larger `global_batch_size` over the same `micro_batch_size`).
+Note that `data.max_seq_len` caps the **full pre-SP sample** in
+`seedomni_transform` (samples with `token_len > max_seq_len` are skipped rather
+than truncated): at `max_seq_len: 4096` and `sp_size = 4`, a single sample is
+still limited to `4096` global tokens (`1024` tokens per SP rank), so increase
+`data.max_seq_len` whenever SP/CP is used to train longer sequences.
 
 ## 2. Why all modules share one `dp_size`
 
