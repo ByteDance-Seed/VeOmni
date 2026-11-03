@@ -28,6 +28,76 @@ def _model_and_optimizer(*, split=True):
     return model, MultiOptimizer(model, {"merged": merged}, ["merged"])
 
 
+def test_captured_layout_binds_sidecar_without_rechecking_runtime():
+    from veomni.checkpoint.optimizer_resume_layout import (
+        capture_multi_layout,
+        coordinated_multi_layout,
+        finish_multi_layout,
+    )
+
+    model, optimizer = _model_and_optimizer()
+    captured = capture_multi_layout(model, optimizer, None, None)
+    expected = coordinated_multi_layout(model, optimizer, None, None, "sidecar-digest", writing=True)
+    assert finish_multi_layout(captured, "sidecar-digest") == expected
+    assert finish_multi_layout(captured, "other-sidecar-digest") != expected
+
+
+def _corrupt_inventory_worker(rank, endpoint):
+    import hashlib
+    import json
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.dcp_checkpointer import _ProvenMultiOptimizerState
+    from veomni.checkpoint.multi_optimizer_checkpoint import _MULTI_INVENTORY_MARKER
+    from veomni.checkpoint.optimizer_resume_layout import MULTI_LAYOUT_MARKER
+
+    class OptimizerProbe:
+        def __init__(self):
+            self.entered = False
+
+        def _dcp_load_state_dict(self, state_dict, *, group=None):
+            self.entered = True
+            dist.all_reduce(torch.ones(1), group=group)
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        optimizer = OptimizerProbe()
+        state = _ProvenMultiOptimizerState(
+            model=torch.nn.Linear(1, 1),
+            optimizer=optimizer,
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+            generation="generation",
+            expected_layout="layout",
+            group=None,
+            load=True,
+        )
+        inventory = ["optimizer.weight"]
+        digest = hashlib.sha256(json.dumps(inventory, separators=(",", ":")).encode()).hexdigest()
+        marker = {"generation": "generation", "layout": "layout", "inventory_digests": [digest, digest]}
+        if rank == 0:
+            marker["inventory_digests"][0] = "corrupt"
+        payload = {
+            "weight": torch.ones(1),
+            _MULTI_INVENTORY_MARKER: json.dumps(inventory),
+            MULTI_LAYOUT_MARKER: json.dumps(marker),
+        }
+        with pytest.raises(RuntimeError, match="inventory identity"):
+            state.load_state_dict(payload)
+        assert not optimizer.entered
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_corrupt_optimizer_inventory_fails_on_all_ranks():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_corrupt_inventory_worker, nprocs=2)
+
+
 def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
     from datetime import timedelta
     from unittest.mock import patch
@@ -284,6 +354,29 @@ def test_staged_checkpoint_refuses_uncleared_previous_sidecar(tmp_path, monkeypa
         )
     assert stale_sidecar.exists()
     assert not checkpoint.exists()
+
+
+def test_staged_layout_finalization_failure_cleans_temporary_sidecar(tmp_path, monkeypatch):
+    import veomni.checkpoint.dcp_checkpointer as checkpoint_module
+
+    checkpoint = tmp_path / "final"
+    stage = tmp_path / "stage"
+    staged = stage / checkpoint_module._STAGE_ROOT / checkpoint_module._stage_key(str(checkpoint))
+    model, optimizer = _model_and_optimizer()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected layout finalization failure")
+
+    monkeypatch.setattr(checkpoint_module, "finish_multi_layout", fail)
+    with pytest.raises(RuntimeError, match="injected layout finalization failure"):
+        DistributedCheckpointer.save(
+            str(checkpoint),
+            {"model": model, "optimizer": optimizer, "extra_state": {}, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+            stage_dir=str(stage),
+        )
+    assert not staged.exists()
+    assert not (checkpoint / "model").exists()
 
 
 def _proven_staged_resume_worker(rank, checkpoint, stage, endpoint):
