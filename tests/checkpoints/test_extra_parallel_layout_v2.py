@@ -10,16 +10,18 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import (
+    _EXPERT_LAYOUTS_KEY,
     _EXTRA_PARALLEL_LAYOUT_MARKER,
     DistributedCheckpointer,
     ModelState,
     OptimizerState,
     _apply_extra_parallel_dim,
     _export_extra_parallel_layout_key,
+    _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
@@ -35,12 +37,12 @@ from veomni.distributed.parallel_plan import SpecInfo
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim):
+def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim, rows=5):
     dist.init_process_group("gloo", init_method=f"file://{root}/init", rank=rank, world_size=4)
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("fsdp", "ep"))
         fsdp_mesh = mesh["fsdp"]
-        full = torch.arange(35, dtype=torch.float32).reshape(5, 7)
+        full = torch.arange(rows * 7, dtype=torch.float32).reshape(rows, 7)
         ep_index = mesh.get_coordinate()[1]
         local_ep = torch.chunk(full, 2, dim=ep_shard_dim)[ep_index]
         local = distribute_tensor(local_ep.contiguous(), fsdp_mesh, placements=[Shard(fsdp_shard_dim)])
@@ -82,6 +84,62 @@ def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim):
 @pytest.mark.parametrize("ep_shard_dim,fsdp_shard_dim", [(0, 0), (0, 1), (-1, -1), (-1, 1)])
 def test_composed_ep_fsdp_layout_roundtrip(tmp_path, ep_shard_dim, fsdp_shard_dim):
     torch.multiprocessing.spawn(_roundtrip, args=(str(tmp_path), ep_shard_dim, fsdp_shard_dim), nprocs=4, join=True)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_v2_strided_layout_with_uneven_fsdp_chunks(tmp_path):
+    torch.multiprocessing.spawn(_roundtrip, args=(str(tmp_path), 0, 0, 6), nprocs=4, join=True)
+
+
+def _six_rank_roundtrip(rank, root, rows):
+    dist.init_process_group("gloo", init_method=f"file://{root}/init-ep2-fsdp3", rank=rank, world_size=6)
+    try:
+        mesh = init_device_mesh("cpu", (3, 2), mesh_dim_names=("fsdp", "ep"))
+        fsdp_mesh = mesh["fsdp"]
+        full = torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6)
+        local_ep = full.chunk(2, dim=0)[mesh.get_local_rank("ep")]
+        local = distribute_tensor(local_ep.contiguous(), fsdp_mesh, placements=[Shard(0)])
+        combined = restore_extra_parallel_dim_v2(local, mesh, fsdp_mesh, 0, 0, global_shape=tuple(full.shape))
+        torch.testing.assert_close(combined.full_tensor(), full, rtol=0, atol=0)
+        dcp.save({"expert": combined}, checkpoint_id=f"{root}/ep2-fsdp3")
+        target = restore_extra_parallel_dim_v2(
+            torch.zeros_like(local), mesh, fsdp_mesh, 0, 0, global_shape=tuple(full.shape)
+        )
+        dcp.load({"expert": target}, checkpoint_id=f"{root}/ep2-fsdp3")
+        restored = drop_extra_parallel_dim_v2(target, fsdp_mesh, 0, extra_parallel_name="ep")
+        torch.testing.assert_close(restored.to_local(), local.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=6))
+@pytest.mark.parametrize("rows", [7, 10])
+def test_v2_six_rank_uneven_roundtrip(tmp_path, rows):
+    torch.multiprocessing.spawn(_six_rank_roundtrip, args=(str(tmp_path), rows), nprocs=6, join=True)
+
+
+def _ep_one_roundtrip(rank, root):
+    dist.init_process_group("gloo", init_method=f"file://{root}/init-ep1", rank=rank, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (4, 1), mesh_dim_names=("fsdp", "ep"))
+        fsdp_mesh = mesh["fsdp"]
+        full = torch.arange(35, dtype=torch.float32).reshape(5, 7)
+        local = distribute_tensor(full, fsdp_mesh, placements=[Shard(0)])
+        combined = restore_extra_parallel_dim_v2(local, mesh, fsdp_mesh, 0, 0, global_shape=tuple(full.shape))
+        dcp.save({"expert": combined}, checkpoint_id=f"{root}/ep1")
+        target = restore_extra_parallel_dim_v2(
+            torch.zeros_like(local), mesh, fsdp_mesh, 0, 0, global_shape=tuple(full.shape)
+        )
+        dcp.load({"expert": target}, checkpoint_id=f"{root}/ep1")
+        restored = drop_extra_parallel_dim_v2(target, fsdp_mesh, 0, extra_parallel_name="ep")
+        torch.testing.assert_close(restored.to_local(), local.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+def test_v2_single_ep_rank_with_uneven_fsdp_chunks(tmp_path):
+    torch.multiprocessing.spawn(_ep_one_roundtrip, args=(str(tmp_path),), nprocs=4, join=True)
 
 
 def _hsdp_roundtrip(rank, root):
@@ -274,6 +332,31 @@ def test_v2_online_hf_export_restores_fqn_and_preserves_values(monkeypatch):
     torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
 
 
+def test_v2_offline_hf_export_keeps_marker_and_tensor_values(tmp_path):
+    from veomni.checkpoint.dcp_checkpointer import dcp_to_torch_state_dict
+
+    marker = _extra_parallel_layout_key({})
+    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    mask = torch.tensor([True, False])
+    bf16_weight = expected.to(torch.bfloat16)
+    dcp.save(
+        {
+            "model": {
+                marker + "__model.foo.weight": expected,
+                marker + "__model.foo.mask": mask,
+                marker + "__model.foo.bf16_weight": bf16_weight,
+                marker: "ep-outer-v1",
+            }
+        },
+        checkpoint_id=tmp_path,
+    )
+    result = dcp_to_torch_state_dict(tmp_path)
+    assert set(result) == {"model.foo.weight", "model.foo.mask", "model.foo.bf16_weight"}
+    torch.testing.assert_close(result["model.foo.weight"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(result["model.foo.mask"], mask, rtol=0, atol=0)
+    torch.testing.assert_close(result["model.foo.bf16_weight"], bf16_weight, rtol=0, atol=0)
+
+
 def test_opted_in_layout_rejects_unversioned_checkpoint_before_tensor_copy(tmp_path):
     from torch.distributed.checkpoint.api import CheckpointException
 
@@ -413,6 +496,8 @@ def test_v2_rejects_missing_runtime_parameter_spec():
 def _high_level_roundtrip_worker(rank, root):
     from datetime import timedelta
 
+    from veomni.checkpoint.layout import weights_dir
+
     dist.init_process_group(
         "gloo", init_method=f"file://{root}/init-high", rank=rank, world_size=4, timeout=timedelta(seconds=45)
     )
@@ -432,12 +517,38 @@ def _high_level_roundtrip_worker(rank, root):
         parallel = SimpleNamespace(
             dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
         )
-        source = model_for(1, ep_local)
-        DistributedCheckpointer.save(f"{root}/high", {"model": source}, parallel_state=parallel)
-        target = model_for(0, torch.zeros_like(ep_local))
-        DistributedCheckpointer.load(f"{root}/high", {"model": target}, parallel_state=parallel)
-        expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(0)])
-        torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
+        for source_axis, target_axis in ((0, 1), (1, 0)):
+            source = model_for(source_axis, ep_local)
+            path = f"{root}/high-{source_axis}"
+            DistributedCheckpointer.save(path, {"model": source}, parallel_state=parallel)
+            metadata = dcp.FileSystemReader(weights_dir(path)).read_metadata()
+            layouts = metadata.planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+            assert layouts and all(layout["expert_order"] == "canonical" for layout in layouts.values())
+            target = model_for(target_axis, torch.zeros_like(ep_local))
+            DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
+            expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(target_axis)])
+            torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
+
+        # V2 checkpoints created before per-tensor layout metadata used the
+        # namespace marker and DCP's default planner. They must remain readable.
+        source = model_for(0, ep_local)
+        path = f"{root}/namespaced-before-planner"
+        old_state = ModelState(source, parallel_state=parallel).state_dict()
+        marker = _extra_parallel_layout_key(source._fqn2spec_info)
+        old_state[marker + "__weight"] = DTensor.from_local(
+            source.weight.to_local(),
+            _extra_parallel_first_mesh(mesh),
+            [Shard(0), Shard(0)],
+            run_check=False,
+            shape=full.shape,
+            stride=full.stride(),
+        )
+        dcp.save({"model": old_state}, checkpoint_id=path)
+        for target_axis in (0, 1):
+            target = model_for(target_axis, torch.zeros_like(ep_local))
+            DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
+            expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(target_axis)])
+            torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 

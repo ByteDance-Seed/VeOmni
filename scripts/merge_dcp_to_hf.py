@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 from safetensors.torch import save_file
+from torch.distributed.checkpoint import FileSystemReader
 from transformers import AutoConfig, AutoProcessor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
-from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _normalize_key, _process_shard
 from veomni.checkpoint.layout import weights_dir
 from veomni.utils import helper
 
@@ -61,8 +62,13 @@ def save_lora_adapter_weights(
     logger.info(f"Saving LoRA adapter to {output_dir}")
 
     # ``shard_size=None`` forces a single shard so we get ``adapter_model.safetensors`` directly.
-    all_keys, _total_size, _all_dcp_keys = _get_sharding_plan(checkpoint_path, shard_size=None, save_dtype=save_dtype)
-    lora_keys = {hf_k: dcp_k for hf_k, dcp_k in all_keys.items() if _is_lora_key(hf_k)}
+    lora_keys, _total_size, _all_dcp_keys = _get_sharding_plan(
+        checkpoint_path,
+        shard_size=None,
+        save_dtype=save_dtype,
+        legacy_expert_source_layout=legacy_expert_source_layout,
+        include_hf_key=_is_lora_key,
+    )
     if not lora_keys:
         raise RuntimeError(
             f"LoRA conversion requested but no LoRA keys (.lora_A./.lora_B./...) found under {checkpoint_path}"
@@ -117,7 +123,9 @@ def save_model_weights(
 
     # Plan shards from metadata
     logger.info("Analyzing DCP metadata and planning shards...")
-    shards, total_size, all_dcp_keys = _get_sharding_plan(checkpoint_path, shard_size, save_dtype)
+    shards, total_size, all_dcp_keys = _get_sharding_plan(
+        checkpoint_path, shard_size, save_dtype, legacy_expert_source_layout=legacy_expert_source_layout
+    )
 
     logger.info(f"Found {len(all_dcp_keys)} model tensors, total size: ~{total_size / 1e9:.2f}GB")
     logger.info(f"Split into {len(shards)} shards")
@@ -308,9 +316,9 @@ def main():
 
     mode = args.mode
     if mode == "auto":
-        _shards_for_detection, _size, _dcp_keys = _get_sharding_plan(load_dir, shard_size=None, save_dtype="bfloat16")
-        # _shards_for_detection is a single {hf_key: dcp_key} dict when shard_size is None
-        detected_lora = _detect_lora(_shards_for_detection.keys())
+        metadata = FileSystemReader(load_dir).read_metadata()
+        hf_keys = (normalized for key in metadata.state_dict_metadata if (normalized := _normalize_key(key)))
+        detected_lora = _detect_lora(hf_keys)
         mode = "lora" if detected_lora else "full"
         logger.info(
             f"Auto-detected mode: {mode} "

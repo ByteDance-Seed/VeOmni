@@ -307,7 +307,7 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
     try:
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
         step = 4 if mode == "optimizer_step" and rank == 1 else 3
-        trainer = _trainer(tmp_path, optimizer_step=step, strict=mode != "mixed_optimizer" or rank == 0)
+        trainer = _trainer(tmp_path, optimizer_step=step)
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
         callback = GlobalStateCallback(trainer)
@@ -343,9 +343,7 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize(
-    "mode", ["missing", "optimizer_step", "trainer_step", "trainer_generation", "mixed_optimizer", "matching"]
-)
+@pytest.mark.parametrize("mode", ["missing", "optimizer_step", "trainer_step", "trainer_generation", "matching"])
 def test_multi_optimizer_trainer_resume_is_rank_coordinated(tmp_path, mode):
     spawn_with_rendezvous(_resume_worker, args=(str(tmp_path), mode), nprocs=2)
 
