@@ -529,20 +529,8 @@ class MultiOptimizer(Optimizer, Stateful):
         if self._qwen38_ple_world_profile:
             from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
 
-            from ..utils.dist_utils import raise_if_any_rank_failed
-            from .ple_world_profile import require_same_rank_value
-
-            signature, error = None, None
-            try:
-                signature = tuple(_file_profile_group_signature(self.model, opt.param_groups) for opt in qwen_children)
-            except BaseException as exc:
-                error = exc
-            raise_if_any_rank_failed(error, "inspecting file-backed optimizer participants")
-            require_same_rank_value(
-                (tuple(self.optimizers_dict), tuple(opt._ple_world_profile for opt in qwen_children), signature),
-                "file-backed optimizer participants",
-            )
-            error = None
+            # Group order and configuration are uniform across ranks by contract.
+            # File allocation and gradient-traffic failures remain coordinated.
             if (
                 closure is not None
                 or _global_optimizer_pre_hooks
@@ -553,8 +541,7 @@ class MultiOptimizer(Optimizer, Stateful):
                     for opt in qwen_children
                 )
             ):
-                error = ValueError("File-backed optimizer requires coordinated children and no closures or step hooks")
-            raise_if_any_rank_failed(error, "validating file-backed optimizer participants")
+                raise ValueError("File-backed optimizer requires coordinated children and no closures or step hooks")
             for opt in qwen_children:
                 opt._prepare_file_step()
         uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)

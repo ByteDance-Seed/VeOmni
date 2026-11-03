@@ -13,11 +13,14 @@ further 64 GiB of free disk. Network and memory-backed filesystems are refused.
 Use a dedicated scratch path and monitor disk space and I/O.
 
 All ranks in WORLD must participate with matching logical parameter groups,
-optimizer hyperparameters, scratch profile and training geometry. The PLE
-lookup must use CPU optimizer offload. Synchronous DCP is required; asynchronous
-saves, closures and optimizer step hooks are rejected. An I/O failure poisons
-the optimizer and requires recovery from a complete checkpoint in a fresh
-process. Scratch files are temporary and are not themselves checkpoints.
+optimizer hyperparameters, scratch profile and training geometry throughout
+training, including scheduler updates. Per-rank changes to optimizer groups,
+hooks or hyperparameters are unsupported and may desynchronize collectives;
+they are not checked by a WORLD agreement on every step. The PLE lookup must
+use CPU optimizer offload. Synchronous DCP is required; asynchronous saves,
+closures and optimizer step hooks are rejected. An I/O failure poisons the
+optimizer and requires recovery from a complete checkpoint in a fresh process.
+Scratch files are temporary and are not themselves checkpoints.
 
 Checkpoint provenance identifies the file-backed profile. Changing an existing
 checkpoint between regular and file-backed state, changing an EP owner layout,

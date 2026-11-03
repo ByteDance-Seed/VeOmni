@@ -1,7 +1,6 @@
 """Full-world negotiation for the opt-in PLE file-state optimizer."""
 
 import copy
-import json
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -312,16 +311,6 @@ def _file_step_worker(rank, rendezvous, root, mode):
                 raise OSError("injected file-backed allocation failure")
 
             leaf._ple_moment_storage.zeros = fail_allocate
-        hook = None
-        invoked = []
-        if mode == "runtime_momentum" and rank == 1:
-            for group in leaf.param_groups:
-                if any(part[0] == "muon" for part in json.loads(group["qwen38_plan"])):
-                    group["muon_momentum"] = 0.99
-        if mode == "global_hook" and rank == 1:
-            from torch.optim.optimizer import register_optimizer_step_pre_hook
-
-            hook = register_optimizer_step_pre_hook(lambda *args: invoked.append(True))
         error = None
         try:
             optimizer.step()
@@ -330,11 +319,8 @@ def _file_step_worker(rank, rendezvous, root, mode):
         result = torch.tensor(int(error is not None))
         dist.all_reduce(result)
         assert int(result) == (0 if mode == "success" else 2), (rank, mode, error)
-        if mode in ("grad_mismatch", "runtime_momentum", "global_hook"):
+        if mode == "grad_mismatch":
             torch.testing.assert_close(original, model.ngram_embedding.weight, rtol=0, atol=0)
-        assert not invoked
-        if hook is not None:
-            hook.remove()
         if mode == "disk_failure":
             assert leaf._ple_state_poisoned
             with pytest.raises(RuntimeError, match="checkpoint|state failed"):
@@ -344,7 +330,7 @@ def _file_step_worker(rank, rendezvous, root, mode):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("mode", ["success", "grad_mismatch", "disk_failure", "runtime_momentum", "global_hook"])
+@pytest.mark.parametrize("mode", ["success", "grad_mismatch", "disk_failure"])
 def test_file_optimizer_step_coordinates_before_muon_collectives(tmp_path, mode):
     mp.start_processes(
         _file_step_worker,
