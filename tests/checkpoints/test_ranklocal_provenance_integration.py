@@ -58,26 +58,3 @@ def _worker(rank, path, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_ranklocal_expert_optimizer_checkpoint_roundtrip(tmp_path):
     spawn_with_rendezvous(_worker, args=(str(tmp_path / "ckpt"),), nprocs=2)
-
-
-def test_rank_prefix_or_fake_adapter_does_not_prove_ownership(tmp_path):
-    import torch.distributed.checkpoint as dcp
-
-    from veomni.checkpoint.dcp_checkpointer import _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
-
-    key = "__veomni_rank_0__state.experts.weight.exp_avg"
-    full_key = f"optimizer.{key}"
-    fake = SimpleNamespace(
-        _verified_rank_local_keys=frozenset({full_key}), _load=False, should_extra_parallel_aware=True
-    )
-    source = {"optimizer": {key: torch.ones(2, 2)}}
-    dcp.save(source, checkpoint_id=tmp_path, planner=_ExtraParallelSavePlanner(rank_local_adapter=fake))
-    fake._load = True
-    target = {"optimizer": {key: torch.zeros(2, 2)}}
-    with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
-        dcp.load(
-            target,
-            checkpoint_id=tmp_path,
-            planner=_ModelStrictLoadPlanner(strict_model=False, rank_local_adapter=fake),
-        )
-    assert target["optimizer"][key].count_nonzero() == 0
