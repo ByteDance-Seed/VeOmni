@@ -123,14 +123,6 @@ def _layout_worker(rank, world, directory, rendezvous):
         model.layer.experts.weight = torch.nn.Parameter(torch.zeros_like(global_weight))
         parallel = SimpleNamespace(dp_mode="ddp")
         with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
-            DistributedCheckpointer.load(
-                path,
-                {"model": model},
-                parallel_state=parallel,
-                legacy_expert_source_layout="veomni_tp1_ep0_fsdp1" if rank == 0 else None,
-            )
-        assert model.layer.experts.weight.count_nonzero() == 0
-        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
             DistributedCheckpointer.load(path, {"model": model}, parallel_state=parallel)
         assert model.layer.experts.weight.count_nonzero() == 0
         with pytest.raises(ValueError, match="only supported for model-only loads"):

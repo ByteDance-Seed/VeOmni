@@ -103,7 +103,7 @@ def _scheduler_layout(leaf):
 
 
 def _local_layout(
-    model, optimizer, scheduler_snapshot, scheduler_object, extra_digest, *, writing, frozen_digest=None
+    model, optimizer, scheduler_snapshot, scheduler_object, extra_digest, *, writing, frozen_digest=None, capture=False
 ):
     from ..optim.checkpoint_adapter import rank_local_adamw_adapter
     from ..optim.muon import DistributedMuon
@@ -320,6 +320,10 @@ def _local_layout(
         # Earlier checkpoints did not prove that transient cache history was
         # reconstructible by a fresh process.
         layout["dynamic_rope_cache_v1"] = rope_contract
+    return layout if capture else _layout_digest(layout)
+
+
+def _layout_digest(layout):
     return hashlib.sha256(
         json.dumps(layout, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     ).hexdigest()
@@ -345,6 +349,52 @@ def frozen_parameter_digest(model, *, enabled, group=None, chunk_bytes=4 << 20):
         error = exc
     raise_if_any_rank_failed(error, "hashing frozen checkpoint parameters", group=group)
     return digest.hexdigest()
+
+
+def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object, *, group=None, frozen_digest=None):
+    """Validate the live save layout once, before creating checkpoint files."""
+    encoded, names, error = None, None, None
+    try:
+        payload = _local_layout(
+            model,
+            optimizer,
+            scheduler_snapshot,
+            scheduler_object,
+            None,
+            writing=True,
+            frozen_digest=frozen_digest,
+            capture=True,
+        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        names = tuple(optimizer.key_names)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "capturing MultiOptimizer checkpoint layout", group=group)
+    if dist.is_initialized():
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, names, group=group)
+        if any(name != gathered[0] for name in gathered):
+            raise RuntimeError("MultiOptimizer checkpoint leaf order differs across ranks")
+    return encoded
+
+
+def finish_multi_layout(encoded, extra_digest, *, group=None):
+    """Bind saved sidecar bytes without inspecting live model or optimizer state again."""
+    local, error = None, None
+    try:
+        payload = json.loads(encoded)
+        payload["extra_digest"] = extra_digest
+        local = _layout_digest(payload)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "finalizing MultiOptimizer checkpoint layout", group=group)
+    if dist.is_initialized():
+        digests = [None] * dist.get_world_size(group)
+        dist.all_gather_object(digests, local, group=group)
+        ranks = list(range(len(digests))) if group is None else dist.get_process_group_ranks(group)
+    else:
+        ranks, digests = [0], [local]
+    return json.dumps({"version": 1, "ranks": ranks, "layouts": digests}, sort_keys=True, separators=(",", ":"))
 
 
 def coordinated_multi_layout(

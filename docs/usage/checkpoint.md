@@ -279,6 +279,12 @@ requires verified source layout information. Canonical v2 optimizer save and res
 the rank-local codec described below. The standard VeOmni HF export strips the
 namespace.
 
+New TP1/EP1 checkpoints also record no-EP provenance for expert tensors on the
+standard VeOmni FSDP mesh. Model and optimizer restoration can use this source
+record without a legacy declaration. The record is not inferred for custom
+meshes, tensor parallelism, active EP, or older checkpoints missing provenance;
+those cases retain the existing source-layout checks.
+
 ### Known legacy VeOmni model-only sources
 
 An unversioned checkpoint does not record its producing EP/FSDP geometry. If
@@ -390,7 +396,8 @@ frozen base parameters on save and load to verify the base identity. That may co
 device tensors to CPU and can add substantial time for a large frozen model.
 Hooks, adapters and scheduler method wrappers are trusted: a wrapper must
 preserve serializable scheduler state and implement the same learning-rate
-behavior on both sides of a restore. The persisted recipe checks scheduler
+behavior on both sides of a restore, and hooks must not mutate checkpoint
+model, optimizer, or layout during a save/load call. The persisted recipe checks scheduler
 configuration and optimizer binding; it does not inspect arbitrary wrapper
 code. MultiOptimizer asynchronous saves
 and unsupported layouts fail closed; synchronous staged saves are supported.
