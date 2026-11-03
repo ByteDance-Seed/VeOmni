@@ -1260,6 +1260,7 @@ def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path,
             _last_saved_optimizer_generation=None if loaded else "source",
             _loaded_optimizer_global_step=3 if loaded else None,
             _loaded_optimizer_generation="source" if loaded else None,
+            _loaded_checkpoint_path=train.checkpoint.load_path if loaded else None,
         )
         return trainer
 
@@ -1281,6 +1282,7 @@ def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path,
     first = GlobalStateCallback(resumed)
     first.load_global_state()
     assert resumed._dpo_pending_epoch_end == (0, 3)
+    assert resumed.model.checkpoint._last_saved_step == 3
     assert resumed.model.checkpoint._last_saved_optimizer_generation == "source"
     resumed._dpo_epoch_complete = True
     first.on_epoch_end(resumed.state)
@@ -1291,6 +1293,7 @@ def test_strict_multi_dpo_pending_epoch_sidecar_survives_second_resume(tmp_path,
     second = make_trainer(True)
     GlobalStateCallback(second).load_global_state()
     assert (second.start_epoch, second.start_step) == (1, 0)
+    assert second.model.checkpoint._last_saved_step == 3
     assert second.model.checkpoint._last_saved_optimizer_generation == "source"
     second.train_dataloader.set_epoch(second.start_epoch)
     restored_iterator = iter(second.train_dataloader)

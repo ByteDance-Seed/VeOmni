@@ -76,10 +76,28 @@ def test_dpo_pending_epoch_refresh_preserves_loaded_generation_and_cursor(tmp_pa
 def test_dpo_verified_loaded_receipt_prevents_rewriting_same_epoch_step(tmp_path):
     base = _make_mock_trainer(save_path=str(tmp_path))
     base.args.train.checkpoint.save_epochs = 1
-    base.model.checkpoint = SimpleNamespace(
-        _last_saved_step=3, _last_saved_optimizer_generation="source", _loaded_optimizer_generation="source"
+    load_path = layout.step_dir(str(tmp_path), 3)
+
+    class CheckpointStub(SimpleNamespace):
+        def confirm_loaded_checkpoint_for_reuse(self, step, generation):
+            assert (step, generation) == (self._loaded_optimizer_global_step, self._loaded_optimizer_generation)
+            self._last_saved_step = step
+            self._last_saved_optimizer_generation = generation
+
+    manager = base.model.checkpoint = CheckpointStub(
+        _loaded_checkpoint_path=load_path,
+        _loaded_optimizer_global_step=3,
+        _loaded_optimizer_generation="source",
+        _last_saved_step=-1,
+        _last_saved_optimizer_generation=None,
     )
-    callback = CheckpointCallback(_DPOTrainer(base))
+    trainer = _DPOTrainer(base)
+    callback = trainer.checkpoint_callback = CheckpointCallback(trainer)
+    restored = GlobalStateCallback(trainer)
+    restored._confirm_same_output_checkpoint(3, load_path, [("model", manager)], {"model": "source"})
+    assert manager._last_saved_step == 3
+    assert manager._last_saved_optimizer_generation == "source"
+    assert callback._last_dcp_step == 3
     callback.on_epoch_end(TrainerState(global_step=3, epoch=0))
     base.save_dcp.assert_not_called()
 
