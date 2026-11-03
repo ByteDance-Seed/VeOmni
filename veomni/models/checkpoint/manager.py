@@ -203,6 +203,7 @@ class ModelCheckpointManager:
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         self._last_saved_optimizer_generation = None
+        self._loaded_checkpoint_path = None
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -326,6 +327,9 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
+        self._last_saved_step = -1
+        self._last_saved_optimizer_generation = None
+        self._loaded_checkpoint_path = None
         self._loaded_optimizer_global_step = None
         self._loaded_optimizer_generation = None
         load_dir = self.load_dir()
@@ -345,10 +349,7 @@ class ModelCheckpointManager:
             self.checkpointer.load(load_dir, state, **self._checkpointer_kwargs())
         except BaseException as exc:
             error = exc
-        if multi:
-            raise_if_any_rank_failed(error, "loading MultiOptimizer checkpoint")
-        elif error is not None:
-            raise error
+        raise_if_any_rank_failed(error, "loading checkpoint")
         error, step = None, None
         try:
             if multi:
@@ -380,8 +381,8 @@ class ModelCheckpointManager:
             self._load_extra_state(state["extra_state"])
         except BaseException as exc:
             error = exc
+        raise_if_any_rank_failed(error, "restoring trainer step and scheduler")
         if multi:
-            raise_if_any_rank_failed(error, "restoring MultiOptimizer trainer step and scheduler")
             generation = state.get("_veomni_optimizer_checkpoint_generation")
             error = (
                 RuntimeError("MultiOptimizer checkpoint generation is missing")
@@ -389,8 +390,6 @@ class ModelCheckpointManager:
                 else None
             )
             raise_if_any_rank_failed(error, "checking restored MultiOptimizer generation")
-        elif error is not None:
-            raise error
         try:
             dist.barrier()
         except BaseException:
@@ -408,6 +407,7 @@ class ModelCheckpointManager:
         if multi:
             self._loaded_optimizer_global_step = step
             self._loaded_optimizer_generation = generation
+        self._loaded_checkpoint_path = load_dir
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
