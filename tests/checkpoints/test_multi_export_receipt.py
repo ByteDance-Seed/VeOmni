@@ -1,4 +1,4 @@
-"""Same-step MultiOptimizer DCP and HF export must share a proven receipt."""
+"""Same-step HF and epoch saves reuse the model owners' DCP transaction."""
 
 import gc
 import hashlib
@@ -6,7 +6,7 @@ import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -14,8 +14,10 @@ import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime, _make_mock_trainer
+from veomni.checkpoint import layout
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.models.checkpoint.manager import ModelCheckpointManager
+from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 from veomni.optim.optimizer import MultiOptimizer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -38,32 +40,6 @@ def _runtime(tmp_path):
     return runtime
 
 
-@pytest.mark.parametrize("replacement", ["multi", "ordinary", "none"])
-def test_replaced_optimizer_cannot_reuse_multi_receipt(tmp_path, replacement):
-    runtime = _runtime(tmp_path)
-    trainer = _make_mock_trainer(save_path=str(tmp_path))
-    state = TrainerState(global_step=1, epoch=0)
-    with (
-        patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
-        patch("torch.distributed.barrier"),
-    ):
-        manager = ModelCheckpointManager(runtime)
-        runtime.checkpoint = manager
-        trainer.model = runtime
-        trainer.save_dcp.side_effect = manager.save_dcp
-        trainer.save_hf_or_lora.side_effect = lambda state, stage="step_end": manager.prepare_export(state, stage)
-        callback = CheckpointCallback(trainer)
-        callback._save_hf(state)
-        runtime.optimizer = {
-            "multi": lambda: _multi_optimizer(runtime.model),
-            "ordinary": lambda: torch.optim.AdamW(runtime.model.parameters()),
-            "none": lambda: None,
-        }[replacement]()
-        with pytest.raises(RuntimeError, match="receipt changed"):
-            callback.on_epoch_end(state)
-        trainer.save_dcp.assert_called_once_with(state)
-
-
 def test_train_end_does_not_retain_optimizer_during_hf_export(tmp_path):
     runtime = _runtime(tmp_path)
     optimizer_ref = weakref.ref(runtime.optimizer)
@@ -76,7 +52,6 @@ def test_train_end_does_not_retain_optimizer_during_hf_export(tmp_path):
         manager = ModelCheckpointManager(runtime)
         runtime.checkpoint = manager
         trainer.model = runtime
-        trainer.save_dcp.side_effect = manager.save_dcp
 
         def export(state, stage="step_end"):
             manager.prepare_export(state, stage)
@@ -87,34 +62,32 @@ def test_train_end_does_not_retain_optimizer_during_hf_export(tmp_path):
         CheckpointCallback(trainer)._save_hf(state, stage="train_end")
 
 
-def test_unproven_same_step_receipt_is_not_overwritten(tmp_path):
-    runtime = _runtime(tmp_path)
-    trainer = _make_mock_trainer(save_path=str(tmp_path))
-    with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
-        manager = ModelCheckpointManager(runtime)
-    runtime.checkpoint = manager
-    manager._last_saved_step = 1
-    manager._last_saved_optimizer_generation = "unproven"
-    trainer.model = runtime
-    callback = CheckpointCallback(trainer)
-    with pytest.raises(RuntimeError, match="no matching same-step checkpoint receipt"):
-        callback._save_hf(TrainerState(global_step=1))
-    trainer.save_dcp.assert_not_called()
-    trainer.save_hf_or_lora.assert_not_called()
-
-
-def _real_multi_save_worker(rank, directory, endpoint):
+def _real_multi_save_worker(rank, directory, scope, endpoint):
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
         torch.manual_seed(123)
-        runtime = _runtime(directory)
-        runtime.parallel_state = SimpleNamespace(global_rank=rank, dp_mode="ddp", extra_parallel_names=[])
-        runtime.model(torch.ones(1, 2)).sum().backward()
-        runtime.optimizer.step()
-        runtime.optimizer.zero_grad()
+
+        def make_runtime(name=None):
+            runtime = _runtime(directory)
+            runtime.module_name = name
+            runtime.parallel_state = SimpleNamespace(global_rank=rank, dp_mode="ddp", extra_parallel_names=[])
+            with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
+                manager = OmniModuleCheckpointManager(runtime) if name else ModelCheckpointManager(runtime)
+            runtime.checkpoint = manager
+            runtime.save_dcp = lambda state: runtime.checkpoint.save_dcp(state)
+            runtime.save_hf_or_lora = lambda state, stage="step_end": runtime.checkpoint.prepare_export(state, stage)
+            return runtime
+
+        names = ("language", "vision") if scope == "omni" else (None,)
+        runtimes = [make_runtime(name) for name in names]
+        for runtime in runtimes:
+            runtime.model(torch.ones(1, 2)).sum().backward()
+            runtime.optimizer.step()
+            runtime.optimizer.zero_grad()
         trainer = _make_mock_trainer(save_path=directory)
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
@@ -127,19 +100,31 @@ def _real_multi_save_worker(rank, directory, endpoint):
         trainer.environ_meter.state_dict.return_value = {}
         trainer.channel_loss_callback = None
         trainer.offline_cache_writer = None
-        with patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer):
-            manager = ModelCheckpointManager(runtime)
-        runtime.checkpoint = manager
-        trainer.model = runtime
-        trainer.save_dcp.side_effect = manager.save_dcp
-        trainer.save_hf_or_lora.side_effect = lambda state, stage="step_end": manager.prepare_export(state, stage)
+        if scope == "omni":
+            modules = {runtime.module_name: runtime for runtime in runtimes}
+            modules["frozen"] = SimpleNamespace(
+                optimizer=None,
+                checkpoint=None,
+                has_trainable_parameters=False,
+                save_dcp=lambda state: None,
+                save_hf_or_lora=lambda state, stage: None,
+            )
+            trainer.model = OmniModelRuntime(SimpleNamespace(), module_runtimes=modules)
+            trainer.save_dcp.side_effect = trainer.model.save_dcp
+            trainer.save_hf_or_lora.side_effect = trainer.model.save_hf_or_lora
+        else:
+            trainer.model = runtimes[0]
+            trainer.save_dcp.side_effect = runtimes[0].save_dcp
+            trainer.save_hf_or_lora.side_effect = runtimes[0].save_hf_or_lora
+        for runtime in runtimes:
+            runtime.checkpoint.save_dcp = Mock(wraps=runtime.checkpoint.save_dcp)
         callback = CheckpointCallback(trainer)
         global_callback = GlobalStateCallback(trainer)
         state = TrainerState(global_step=1, epoch=0)
         callback.on_step_end(state)
         global_callback.on_step_end(state)
-        generation = manager._last_saved_optimizer_generation
-        assert generation and callback._last_multi_receipt == generation
+        generations = [runtime.checkpoint._last_saved_optimizer_generation for runtime in runtimes]
+        assert all(generations)
         snapshot = None
         if rank == 0:
             root = Path(directory)
@@ -150,23 +135,43 @@ def _real_multi_save_worker(rank, directory, endpoint):
         callback.on_epoch_end(state)
         global_callback.on_epoch_end(state)
         trainer.save_dcp.assert_called_once_with(state)
-        assert manager._last_saved_optimizer_generation == generation
+        for runtime in runtimes:
+            runtime.checkpoint.save_dcp.assert_called_once_with(state)
+        assert [runtime.checkpoint._last_saved_optimizer_generation for runtime in runtimes] == generations
         if rank == 0:
             assert snapshot == {
                 p.relative_to(root): hashlib.sha256(p.read_bytes()).digest() for p in root.rglob("*") if p.is_file()
             }
-        if rank == 1:
-            manager._last_saved_optimizer_generation = None
-        with pytest.raises(RuntimeError, match="receipt changed"):
-            callback.on_epoch_end(state)
+
+        restored = [make_runtime(name) for name in names]
+        for before, after, generation in zip(runtimes, restored, generations):
+            after.train_args.checkpoint.load_path = layout.step_dir(directory, 1)
+            after.checkpoint.load()
+            assert after.checkpoint._loaded_optimizer_generation == generation
+            for original_param, loaded_param in zip(before.model.parameters(), after.model.parameters()):
+                torch.testing.assert_close(original_param, loaded_param, rtol=0, atol=0)
+                original_state = before.optimizer.optimizers_dict["model"].state[original_param]
+                loaded_state = after.optimizer.optimizers_dict["model"].state[loaded_param]
+                for key in ("step", "exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(original_state[key], loaded_state[key], rtol=0, atol=0)
+        if scope == "omni":
+            modules = {runtime.module_name: runtime for runtime in restored}
+            modules["frozen"] = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+            trainer.model = OmniModelRuntime(SimpleNamespace(), module_runtimes=modules)
+        else:
+            trainer.model = restored[0]
+        trainer.args.train.checkpoint.load_path = layout.step_dir(directory, 1)
+        trainer.state = TrainerState()
+        assert GlobalStateCallback(trainer).load_global_state()["global_step"] == 1
         dist.barrier()
     finally:
         clear_parallel_state()
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("scope", ["single", "omni"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_real_multi_dcp_hf_epoch_on_two_ranks(tmp_path):
+def test_real_multi_dcp_hf_epoch_on_two_ranks(tmp_path, scope):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_real_multi_save_worker, args=(str(tmp_path),), nprocs=2)
+    spawn_with_rendezvous(_real_multi_save_worker, args=(str(tmp_path), scope), nprocs=2)
