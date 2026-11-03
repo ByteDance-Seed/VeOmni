@@ -257,3 +257,75 @@ def test_dyn_bsz_skips_seedomni_samples_exceeding_token_budget():
     batches = list(dyn_ds)
     assert len(batches) == 1
     assert len(batches[0]["conversation_list"]) == 1
+
+
+def _two_rank_rejected_shard_worker(rank: int, rendezvous: str, out_dir: str) -> None:
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch.distributed as dist
+
+    from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        overlong = {
+            "conversation_list": [
+                ConversationItem(
+                    type="text",
+                    value=torch.ones(26, dtype=torch.long),
+                    role="user",
+                    meta={_OMNI_TOKEN_LEN: 26},
+                )
+            ]
+        }
+        valid = {
+            "conversation_list": [
+                ConversationItem(
+                    type="text",
+                    value=torch.ones(8, dtype=torch.long),
+                    role="user",
+                    meta={_OMNI_TOKEN_LEN: 8},
+                )
+            ]
+        }
+        # Rank 0's shard contains only rejected (> 10 tokens) samples; Rank 1's shard has valid samples.
+        shard = [[overlong], [overlong]] if rank == 0 else [[valid], [valid]]
+        dl = DynamicBatchSizeDataLoader(
+            shard,
+            batching_strategy=TextBatchingStrategy(token_micro_bsz=10, buffer_size=1),
+            collate_fn=SeedOmniCollator(),
+            num_micro_batch=1,
+            length=2,
+            drop_last=True,
+        )
+        batches = list(dl)
+        Path(out_dir, f"rank{rank}.json").write_text(json.dumps({"num_batches": len(batches)}), encoding="utf-8")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_dyn_bsz_dataloader_stops_coordinately_when_rank_shard_has_only_rejected_samples(tmp_path):
+    """When one rank's shard contains only over-budget samples, DynamicBatchSizeDataLoader
+    must detect no progress (not loop forever) and coordinate with peer ranks to end together."""
+    import json
+
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _two_rank_rejected_shard_worker,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+    for rank in range(2):
+        report = json.loads((tmp_path / f"rank{rank}.json").read_text(encoding="utf-8"))
+        assert report["num_batches"] == 0

@@ -15,9 +15,12 @@
 
 import copy
 import sys
+import threading
 import traceback
 from collections import deque
 from typing import Any, Callable, Dict, Generator, Iterator, Optional
+
+import torch.distributed as dist
 
 from ..utils import logging
 from .dataset import get_length_fn
@@ -213,10 +216,10 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         )
         return effective_ready or physical_ready
 
-    def put_item(self, item: Dict[str, Any]):
+    def put_item(self, item: Dict[str, Any]) -> bool:
         if "input_ids" in item and item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
-            return
+            return False
         if (
             "conversation_list" in item
             and not item["conversation_list"]
@@ -224,12 +227,13 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             and "input_ids" not in item
         ):
             print("WARNING: EMPTY STRING.")
-            return
+            return False
         length = self.buffer._measure_length(item)
         if length > self.token_micro_bsz:
             logger.warning(f"Sample length {length} exceeds token_micro_bsz {self.token_micro_bsz}, skipping.")
-            return
+            return False
         self.buffer.append(item)
+        return True
 
     def get_cur_token_micro_bsz(self):
         warmup = self.bsz_warmup_steps > 0 and self._step <= self.bsz_warmup_steps
@@ -314,11 +318,39 @@ class DynamicBatchSizeDataLoader:
         self._resume = False
         return self
 
+    @staticmethod
+    def _coordinate_has_batch(has_batch: bool) -> bool:
+        if (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_world_size() <= 1
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return has_batch
+        flags = [False] * dist.get_world_size()
+        dist.all_gather_object(flags, has_batch)
+        if not all(flags):
+            if has_batch:
+                logger.warning(
+                    "Stopping DynamicBatchSizeDataLoader early because at least one rank exhausted its shard with no valid samples."
+                )
+            return False
+        return True
+
     def __next__(self):
-        return next(self._batch_data_iter)
+        try:
+            batch = next(self._batch_data_iter)
+            has_batch = True
+        except StopIteration:
+            batch = None
+            has_batch = False
+        if not self._coordinate_has_batch(has_batch):
+            raise StopIteration
+        return batch
 
     def batch_data_generator(self):
         batch = []
+        accepted_in_pass = False
 
         while True:
             if self._length and self.step >= self._length:
@@ -338,30 +370,38 @@ class DynamicBatchSizeDataLoader:
                 processing_item = next(self._data_iter)
             except Exception as e:
                 if isinstance(e, StopIteration):
-                    if self.step < self._length:
-                        # call iter until reach length
+                    processing_item = None
+                    if self.step < self._length and accepted_in_pass:
+                        # Only restart the dataloader when the completed pass
+                        # accepted at least one valid sample; otherwise a shard
+                        # whose samples are all over budget would loop forever.
+                        accepted_in_pass = False
                         self._data_iter = iter(self._dataloader)
-                        processing_item = next(self._data_iter)
-                    elif not self._drop_last and not self.batching_strategy.empty():
-                        while not self.batching_strategy.empty():
-                            micro_batch = self.batching_strategy.get_micro_batch(self.step)
-                            if self._collate_fn:
-                                micro_batch = self._collate_fn(micro_batch)
-                            batch.append(micro_batch)
-                            if len(batch) == self.num_micro_batch:
-                                yield batch
-                                self.step += 1
-                                batch = []
+                        try:
+                            processing_item = next(self._data_iter)
+                        except StopIteration:
+                            processing_item = None
+                    if processing_item is None:
+                        if not self._drop_last and not self.batching_strategy.empty():
+                            while not self.batching_strategy.empty():
+                                micro_batch = self.batching_strategy.get_micro_batch(self.step)
+                                if self._collate_fn:
+                                    micro_batch = self._collate_fn(micro_batch)
+                                batch.append(micro_batch)
+                                if len(batch) == self.num_micro_batch:
+                                    yield batch
+                                    self.step += 1
+                                    batch = []
 
-                        while len(batch) < self.num_micro_batch:
-                            padding_batch = copy.deepcopy(micro_batch)
-                            padding_batch["padding_flag"] = True
-                            batch.append(padding_batch)
-                        yield batch
-                        self.step += 1
-                        return
-                    else:
-                        return
+                            while len(batch) < self.num_micro_batch:
+                                padding_batch = copy.deepcopy(micro_batch)
+                                padding_batch["padding_flag"] = True
+                                batch.append(padding_batch)
+                            yield batch
+                            self.step += 1
+                            return
+                        else:
+                            return
                 else:
                     logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
                     raise
@@ -371,7 +411,8 @@ class DynamicBatchSizeDataLoader:
                 processing_item = [processing_item]
 
             for item in processing_item:
-                self.batching_strategy.put_item(item)
+                if self.batching_strategy.put_item(item) is not False:
+                    accepted_in_pass = True
 
     def state_dict(self):
         # save state
