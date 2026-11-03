@@ -297,7 +297,8 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 reads and converts the checkpoint. Every rank must call
+            this function to participate in distributed failure coordination.
             Required by non-dcp checkpoint managers (e.g., omnistore).
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
