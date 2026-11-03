@@ -11,16 +11,58 @@ Usage:
 """
 
 import unittest
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _legacy_hf_failure_worker(rank, endpoint):
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="cpu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(save_safetensor_utils, "should_use_distributed_hf_safetensor_save", return_value=False),
+            patch.object(
+                save_safetensor_utils, "_save_hf_safetensor_legacy", side_effect=OSError("injected I/O failure")
+            ),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected I/O failure|failed on another rank"):
+                save_safetensor_utils.save_hf_safetensor(is_rank_0=rank == 0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_legacy_hf_export_failure_reaches_all_ranks():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_legacy_hf_failure_worker, nprocs=2)
+
+
+def test_legacy_hf_export_selects_fuse_fallback():
+    from veomni.utils import save_safetensor_utils
+
+    model_state = {"weight": torch.ones(2)}
+    with (
+        patch.object(save_safetensor_utils, "ckpt_to_state_dict", return_value=model_state),
+        patch.object(save_safetensor_utils, "save_model_weights") as save_model_weights,
+    ):
+        save_safetensor_utils._save_hf_safetensor_legacy("checkpoint", "output", None, "dcp", None)
+    save_model_weights.assert_called_once_with("output", model_state, model_assets=None, legacy_fuse_fallback=True)
 
 
 # ---------------------------------------------------------------------------

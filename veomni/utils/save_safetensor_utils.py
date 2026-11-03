@@ -245,7 +245,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets, legacy_fuse_fallback=True)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -322,15 +322,22 @@ def save_hf_safetensor(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
-        if is_rank_0:
-            _save_hf_safetensor_legacy(
-                save_checkpoint_path,
-                save_hf_safetensor_path,
-                model_assets,
-                ckpt_manager,
-                output_dir,
-            )
+        from veomni.utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if is_rank_0:
+                _save_hf_safetensor_legacy(
+                    save_checkpoint_path,
+                    save_hf_safetensor_path,
+                    model_assets,
+                    ckpt_manager,
+                    output_dir,
+                )
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "rank-0 HuggingFace export")
+        return
 
     # Ensure all ranks finish saving before anyone proceeds
     if dist.is_initialized():
