@@ -34,11 +34,14 @@ the ``cp`` group on the resulting shard (see
 """
 
 import inspect
+import os
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch.distributed import ProcessGroup
+
+from veomni.utils.device import get_gpu_compute_capability
 
 from ..comm import get_context_parallel_group
 from .comm import RingComm
@@ -80,12 +83,25 @@ try:
     from flash_attn.cute.interface import _flash_attn_fwd as _fa4_fwd
 
     _FA4_AVAILABLE = _supports_fa4_interface(_fa4_fwd, _fa4_bwd)
+    _FA4_DETERMINISTIC_AVAILABLE = "deterministic" in inspect.signature(_fa4_bwd).parameters
 except ImportError:  # pragma: no cover - optional accelerator dependency
     _FA4_AVAILABLE = False
+    _FA4_DETERMINISTIC_AVAILABLE = False
 
 FA_BACKENDS = frozenset(name for name, available in (("fa2", _FA2_AVAILABLE), ("fa4", _FA4_AVAILABLE)) if available)
 # Preserve the default for direct primitive callers; production passes a backend.
 FA_BACKEND = "fa2" if _FA2_AVAILABLE else "fa4" if _FA4_AVAILABLE else None
+
+
+def _fa4_backward_options() -> dict:
+    """Keep older FA4 usable normally, but never silently ignore determinism."""
+    if os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") != "1":
+        return {}
+    if not _FA4_DETERMINISTIC_AVAILABLE:
+        raise NotImplementedError("The installed FA4 backend does not support deterministic Ring backward.")
+    if get_gpu_compute_capability() // 10 == 12:
+        raise NotImplementedError("FA4 deterministic Ring backward is unsupported on SM12x.")
+    return {"deterministic": True}
 
 
 def resolve_ring_backend(backend: Optional[str] = None) -> str:
@@ -95,6 +111,8 @@ def resolve_ring_backend(backend: Optional[str] = None) -> str:
         raise NotImplementedError(
             f"USP Ring backend {selected!r} is unavailable or incompatible; available backends: {sorted(FA_BACKENDS)}."
         )
+    if selected == "fa4":
+        _fa4_backward_options()
     return selected
 
 
@@ -153,6 +171,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0, 
             causal=causal,
             window_size_left=-1,
             window_size_right=-1,
+            **_fa4_backward_options(),
             dq=dq,
             dk=dk,
             dv=dv,
@@ -175,7 +194,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0, 
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
     return dq, dk, dv
@@ -383,6 +402,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend
                 causal=causal,
                 window_size_left=-1,
                 window_size_right=-1,
+                **_fa4_backward_options(),
                 dq=dq_b[:, :sq],
                 dk=dk_b[:, :skv],
                 dv=dv_b[:, :skv],
@@ -405,7 +425,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend
             window_size_right=-1,
             softcap=0.0,
             alibi_slopes=None,
-            deterministic=False,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             rng_state=None,
         )
 
@@ -473,6 +493,8 @@ class _RingFlashAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        if ctx.backend == "fa4":
+            _fa4_backward_options()
         q, k, v, out, lse = ctx.saved_tensors
         if ctx.zigzag:
             dq, dk, dv = _zigzag_ring_backward(
@@ -589,6 +611,7 @@ def _fa_varlen_backward(
             cu_seqlens_k=cu_k,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
+            **_fa4_backward_options(),
             dq=dq,
             dk=dk,
             dv=dv,
@@ -615,7 +638,7 @@ def _fa_varlen_backward(
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
 
@@ -832,6 +855,8 @@ class _ZigzagRingVarlenFlashAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        if ctx.backend == "fa4":
+            _fa4_backward_options()
         q, k, v, out, lse, cu_seqlens, half0, half1 = ctx.saved_tensors
         dq, dk, dv = _zigzag_ring_varlen_backward(
             ctx.group,

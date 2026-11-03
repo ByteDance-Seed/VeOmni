@@ -29,6 +29,7 @@ Each test skips unless enough GPUs and a flash-attn backend are available.
 """
 
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -65,6 +66,7 @@ from veomni.distributed.sequence_parallel.data import (
     zigzag_reorder_varlen,
 )
 from veomni.distributed.sequence_parallel.ring_attention.gpu import (
+    _FA4_DETERMINISTIC_AVAILABLE,
     FA_BACKENDS,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
@@ -137,6 +139,8 @@ class ZigzagRingAttentionTest(SequenceParallelTest):
 
 
 class _ZigzagRingVarlenTest(MultiProcessTestCase):
+    backend = None
+
     def ci_launch_plan(self):
         return LaunchSpec(nproc=self.world_size)
 
@@ -150,7 +154,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(_DIST_BACKEND, store=store, rank=self.rank, world_size=self.world_size)
 
-    def _run_case(self):
+    def _run_case(self, check_repeatability=False):
         self._init()
         world = self.world_size
         dev = torch.device(f"{get_device_type()}:{self.rank}")
@@ -178,7 +182,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         qf = q.clone().requires_grad_(True)
         kf = k.clone().requires_grad_(True)
         vf = v.clone().requires_grad_(True)
-        ref = ref_attn_varlen_func(qf, kf, vf, cu, max_seqlen, scale, causal=True)
+        ref = ref_attn_varlen_func(qf, kf, vf, cu, max_seqlen, scale, causal=True, backend=self.backend)
         ref.backward(g)
 
         def shard(t):
@@ -196,7 +200,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         gz = shard(g)
 
         out = zigzag_ring_flash_attn_varlen_func(
-            qz, kz, vz, lcu, local_max, softmax_scale=scale, causal=True, group=dist.group.WORLD
+            qz, kz, vz, lcu, local_max, softmax_scale=scale, causal=True, group=dist.group.WORLD, backend=self.backend
         )
         out.backward(gz)
 
@@ -204,6 +208,26 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         torch.testing.assert_close(qz.grad, shard(qf.grad), atol=3e-2, rtol=3e-2)
         torch.testing.assert_close(kz.grad, shard(kf.grad), atol=3e-2, rtol=3e-2)
         torch.testing.assert_close(vz.grad, shard(vf.grad), atol=3e-2, rtol=3e-2)
+
+        if check_repeatability:
+            first_grads = [t.grad.clone() for t in (qz, kz, vz)]
+            for t in (qz, kz, vz):
+                t.grad = None
+            repeated = zigzag_ring_flash_attn_varlen_func(
+                qz,
+                kz,
+                vz,
+                lcu,
+                local_max,
+                softmax_scale=scale,
+                causal=True,
+                group=dist.group.WORLD,
+                backend=self.backend,
+            )
+            repeated.backward(gz)
+            torch.testing.assert_close(repeated, out, atol=0, rtol=0)
+            for tensor, first_grad in zip((qz, kz, vz), first_grads):
+                torch.testing.assert_close(tensor.grad, first_grad, atol=0, rtol=0)
 
 
 class ZigzagRingVarlenWorld2Test(_ZigzagRingVarlenTest):
@@ -216,6 +240,13 @@ class ZigzagRingVarlenWorld2Test(_ZigzagRingVarlenTest):
     def test_varlen_ring_matches_full(self):
         self._run_case()
 
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(ATTN_IMPL_WITH_SP != "veomni_flash_attention_2", reason="FA2 determinism test")
+    def test_deterministic_varlen_backward_repeats_exactly(self):
+        with patch.dict(os.environ, {"FLASH_ATTENTION_DETERMINISTIC": "1"}):
+            self._run_case(check_repeatability=True)
+
 
 class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
     @property
@@ -226,6 +257,42 @@ class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_varlen_ring_matches_full(self):
         self._run_case()
+
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(ATTN_IMPL_WITH_SP != "veomni_flash_attention_2", reason="FA2 determinism test")
+    def test_deterministic_varlen_backward_repeats_exactly(self):
+        with patch.dict(os.environ, {"FLASH_ATTENTION_DETERMINISTIC": "1"}):
+            self._run_case(check_repeatability=True)
+
+
+@pytest.mark.skipif(
+    "fa4" not in FA_BACKENDS
+    or not _FA4_DETERMINISTIC_AVAILABLE
+    or not NvidiaGpuPlatform(min_cc=90, max_cc=119).matches(),
+    reason="FA4 deterministic backward requires a supported interface and SM90-SM11x",
+)
+class FA4ZigzagRingVarlenWorld2Test(_ZigzagRingVarlenTest):
+    backend = "fa4"
+
+    @property
+    def world_size(self):
+        return 2
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    def test_deterministic_varlen_backward_repeats_exactly(self):
+        with patch.dict(os.environ, {"FLASH_ATTENTION_DETERMINISTIC": "1"}):
+            self._run_case(check_repeatability=True)
+
+
+class FA4ZigzagRingVarlenWorld4Test(FA4ZigzagRingVarlenWorld2Test):
+    @property
+    def world_size(self):
+        return 4
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_deterministic_varlen_backward_repeats_exactly(self):
+        super().test_deterministic_varlen_backward_repeats_exactly()
 
 
 class _AttnModule(torch.nn.Module):

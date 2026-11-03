@@ -466,6 +466,18 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   above. Blackwell requires separate hardware validation.
   Direct Ring primitive callers can pass `backend="fa2"` or `backend="fa4"`;
   omitting it retains the default of FA2 when installed, otherwise FA4.
+- **CUDA primitive backward determinism**: direct dense and packed FA2/FA4
+  Ring kernels honor `FLASH_ATTENTION_DETERMINISTIC=1` at backward call time.
+  Unset or `0` keeps the non-deterministic backward. Enabling deterministic
+  backward can use more memory and be slower; it does not imply bitwise equality across USP topologies.
+  FA4 base capability is checked independently of deterministic support. Older
+  compatible FA4 kernels remain usable normally; requesting unsupported
+  deterministic backward raises explicitly before Ring communication. The pinned
+  FA4 backend does not support deterministic backward on SM12x, which is also
+  rejected before communication.
+  The model attention adapter still rejects full deterministic training pending
+  end-to-end integration; this kernel change does not enable
+  `train.enable_full_determinism` for USP. NPU behavior is unchanged.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
