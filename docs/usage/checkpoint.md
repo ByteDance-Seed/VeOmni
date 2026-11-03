@@ -317,6 +317,44 @@ be rounded to BF16; the CLI retains its historical BF16 export default. This
 preserves tensor dtypes on disk; consumers must configure their loader to avoid
 subsequently casting the FP32 tensors.
 
+The standard, non-v2 writer uses canonical EP-first coordinates for same-axis
+EP/FSDP shards and records source expert layouts in DCP planner metadata.
+Older readers may ignore that metadata and interpret these shards using the old
+FSDP-first order; do not use them for these checkpoints without a verified
+migration. Conversely, an old unversioned checkpoint with expert-only chunks
+may not prove its source order even when resumed with the same topology. The
+distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
+FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
+metadata also needs verified source-layout migration, since it cannot be
+distinguished safely from an old EP checkpoint.
+Offline export also rejects unversioned expert-only chunks for stacked tensors
+under an `experts` module when their source order cannot be established. Other
+legacy tensor naming schemes may still need explicit source-layout verification
+or migration before export.
+
+New planner metadata records supported named ExtraParallel/FSDP meshes rather
+than only `ep`. Ordinary FSDP expert shards are marked canonical only when the
+actual TP1 runtime proves that every ExtraParallel dimension has size one, or
+the model's applied plan and parameter aliases prove that the expert is not
+sharded by any active ExtraParallel dimension.
+An expert on the EP-complementary FSDP mesh is accepted only for trainable
+shared-expert LoRA A/B parameters whose wrapper installs cross-EP gradient
+synchronization; other parameters on that mesh remain unproven. A normal
+single-process save assumes the caller supplied the complete model, not a
+manually extracted expert shard. The singleton case is not a source-layout
+proof for external, manually sharded tensors.
+For a plain model tensor sharded on an ExtraParallel axis and replicated across
+its FSDP/HSDP axes, all replicas at the same ExtraParallel coordinate must have
+identical values; checkpoint serialization does not verify or synchronize them.
+Plain optimizer shards on multiple such ranks require a rank-local state codec.
+Older version-1 metadata may omit non-`ep` shards: an unrecorded expert tensor
+is rejected unless its source layout can be verified and migrated. This also
+rejects an indistinguishable old ordinary-FSDP expert tensor. Historical non-expert tensors
+with unrecorded ExtraParallel axes require separate source-layout verification
+before loading into a different mesh or offline export; their provenance cannot
+be inferred from chunks alone, and not all such cases can be rejected
+automatically when the target has no ExtraParallel mesh.
+
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates
