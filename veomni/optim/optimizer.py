@@ -401,13 +401,8 @@ class AnyPrecisionAdamW(Optimizer):
 def _empty_optimizer_state_dict(model, opt):
     packed_groups = []
     id_to_name = {}
-    captured = False
 
     def capture_params(leaf):
-        nonlocal captured
-        if captured:
-            raise RuntimeError("Cannot reenter optimizer state_dict while saving an empty optimizer")
-        captured = True
         packed_groups.extend([list(group["params"]) for group in leaf.param_groups])
 
     def capture_ids(_leaf, packed):

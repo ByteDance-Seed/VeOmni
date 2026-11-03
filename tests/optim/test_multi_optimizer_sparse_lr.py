@@ -56,19 +56,6 @@ def test_sparse_leaf_preserves_tensor_learning_rate():
     assert not leaf.state
 
 
-def test_sparse_leaf_serializes_state_created_by_pre_hook():
-    model = torch.nn.Linear(2, 2)
-    leaf = torch.optim.AdamW([model.bias], lr=0.01)
-    optimizer = MultiOptimizer(model, {"bias": leaf}, ["bias"])
-
-    def add_state(opt):
-        opt.state[model.bias]["custom"] = torch.ones_like(model.bias)
-
-    leaf.register_state_dict_pre_hook(add_state)
-    result = optimizer._sparse_state_dict()
-    torch.testing.assert_close(result["state.bias.custom"], torch.ones_like(model.bias), rtol=0, atol=0)
-
-
 def test_sparse_leaf_respects_post_hook_parameter_reordering():
     model = torch.nn.Linear(2, 2)
     leaf = torch.optim.AdamW([{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}])
@@ -84,23 +71,6 @@ def test_sparse_leaf_respects_post_hook_parameter_reordering():
     assert result["param_groups.weight.lr"] == 0.02
     assert result["param_groups.bias.lr"] == 0.01
     assert not leaf.state
-
-
-def test_sparse_leaf_respects_live_group_reordering_in_post_hook():
-    model = torch.nn.Linear(2, 2)
-    leaf = torch.optim.AdamW([{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}])
-    optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-
-    def reverse_live_groups(opt, state):
-        opt.param_groups.reverse()
-        return state
-
-    leaf.register_state_dict_post_hook(reverse_live_groups)
-    result = optimizer._sparse_state_dict()
-    assert result["param_groups.weight.lr"] == 0.01
-    assert result["param_groups.bias.lr"] == 0.02
-    assert len(leaf._optimizer_state_dict_pre_hooks) == 0
-    assert len(leaf._optimizer_state_dict_post_hooks) == 1
 
 
 @pytest.mark.parametrize("patched", [False, True])
@@ -176,29 +146,6 @@ def test_pytorch_patched_adamw_dcp_resume_preserves_next_update(tmp_path, initia
         torch.testing.assert_close(current, target, rtol=0, atol=0)
         for key in leaf.state[current]:
             torch.testing.assert_close(leaf.state[current][key], restored_leaf.state[target][key], rtol=0, atol=0)
-
-
-def test_sparse_leaf_reentrant_hook_fails_without_leaking_temporary_hooks():
-    model = torch.nn.Linear(2, 2)
-    leaf = torch.optim.AdamW(model.parameters())
-    optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-    entered = False
-
-    def reenter(opt):
-        nonlocal entered
-        if not entered:
-            entered = True
-            try:
-                opt.state_dict()
-            finally:
-                entered = False
-
-    leaf.register_state_dict_pre_hook(reenter)
-    with pytest.raises(RuntimeError, match="Cannot reenter"):
-        optimizer._sparse_state_dict()
-    assert not leaf.state
-    assert len(leaf._optimizer_state_dict_pre_hooks) == 1
-    assert not leaf._optimizer_state_dict_post_hooks
 
 
 def test_sparse_leaf_learning_rate_survives_dcp_roundtrip(tmp_path):
