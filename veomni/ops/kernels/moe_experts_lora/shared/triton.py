@@ -598,6 +598,7 @@ def group_gemm_fused_lora_moe_forward(
           with :class:`EPMergedFc1SharedLoRAGroupGemm` (mirrors the non-LoRA
           EP fused path).
     """
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     if get_parallel_state().ep_enabled:
         # Lazy import — keeps non-EP imports free of distributed deps so
         # eager-only / single-rank tests don't pay the cost.

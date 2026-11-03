@@ -420,7 +420,7 @@ def toy_base_dir(tmp_path_factory):
     in a *child process* (not in-process) so the fixture leaves the
     pytest-collection process free of foundation-model imports/state --
     which matters because the subprocess trainers also import veomni and
-    we don't want any singleton (ops config, parallel state, etc.) leaking
+    we don't want any process-level state (parallel state, etc.) leaking
     across.
     """
     import multiprocessing as mp

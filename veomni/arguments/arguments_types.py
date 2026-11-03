@@ -15,9 +15,9 @@
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -661,6 +661,12 @@ def validate_low_precision_reduce_scatter_comm(
     return True
 
 
+def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
+    """Validate an explicit expert FSDP placement independently of its optimizer."""
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+        raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -717,6 +723,18 @@ class FSDPConfig:
             )
         },
     )
+    expert_fsdp_shard_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
+        },
+    )
+    expert_weight_fp8_all_gather: bool = field(
+        default=False,
+        metadata={
+            "help": "Use FP8 payloads plus block scales for FSDP2 all-gather of DeepGEMM routed expert weights. Does not change EP token communication, gradient reduction or other parameters. Ignored without matching experts; requires BF16 mixed precision, block-aligned shards and no parameter CPU offload."
+        },
+    )
     low_precision_reduce_scatter_comm: bool = field(
         default=False,
         metadata={
@@ -748,6 +766,9 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        if not isinstance(self.expert_weight_fp8_all_gather, bool):
+            raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
+        validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
@@ -841,6 +862,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Expert parallel size."},
     )
+    npu_ep_hccl_buffer_mib: Optional[int] = field(
+        default=None,
+        metadata={"help": "Opt-in HCCL EP buffer size in MiB; may increase device memory use."},
+    )
+    npu_ep_hccl_expansion_mode: Optional[Literal["host", "device"]] = field(
+        default=None,
+        metadata={"help": "Opt-in HCCL EP operator expansion placement (host or device)."},
+    )
     ep_outside: bool = field(
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
@@ -885,6 +914,9 @@ class AcceleratorConfig:
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
     def __post_init__(self):
+        from ..distributed.hccl_options import validate_ep_hccl_options
+
+        validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
         # although expert parallel and extra parallel are both provided in the arguments,
         # the implementation is configuring extra parallelism to include expert parallelism.
         # Guarded so re-instantiating from a saved config (asdict round-trip) does not
@@ -893,6 +925,10 @@ class AcceleratorConfig:
             self.extra_parallel_sizes.append(self.ep_size)
             self.extra_parallel_names.append("ep")
             self.extra_parallel_placement_innermost.append(self.ep_outside)
+
+        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
+            raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
         # world_size and dp_size are plain attributes rather than fields: an omni model
         # builds one of these per module, and a field would let asdict() round-trip a
@@ -1347,11 +1383,23 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
+_AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
+    {"aiter", "veomni_flash_attention_aiter", "veomni_flash_attention_aiter_with_sp"}
+)
+
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
+# ``liger_kernel`` rows resolve against the Cambricon MLU liger build, which keeps
+# the upstream ``liger_kernel.ops.*`` API; ``is_liger_kernel_mlu_available`` gates it.
 _MLU_ALLOWED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
+
 
 # Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
 # the new name with a warning, and are listed in docs/usage/arguments.md.
@@ -1378,12 +1426,6 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "rms_norm_gated_implementation": {"npu": "torch_npu"},
     "causal_conv1d_implementation": {"npu": "triton"},
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
-}
-
-# Compatibility aliases for explicit values on variants without that backend.
-# Unset values remain None and use the registry's per-variant default.
-_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
 }
 
 # Values that were never implementation names and have no implementation equivalent.
@@ -1422,7 +1464,7 @@ class OpsImplementationConfig:
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"torch_npu"`` (Ascend),
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), (MLU, needs the Cambricon liger_kernel build), ``"torch_npu"`` (Ascend),
     ``"triton"`` (CUDA ``triton``, or Triton-Ascend on NPU). Load-balancing loss has a CUDA Triton
     backend; its NPU default is ``"eager"``.
     """
@@ -1437,6 +1479,7 @@ class OpsImplementationConfig:
             "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
+            "aiter",
             "magi_attention",
             "sage_attention",
             "native-sparse",
@@ -1445,6 +1488,7 @@ class OpsImplementationConfig:
             "veomni_flash_attention_3",
             "veomni_flash_attention_3_hub",
             "veomni_flash_attention_4",
+            "veomni_flash_attention_aiter",
             "veomni_flex_attention",
             "veomni_magi_attention",
             "veomni_sage_attention",
@@ -1454,7 +1498,7 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={
             "help": "Attention implementation. Short names (flash_attention_2, flex_attention, "
-            "magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
+            "aiter, magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
@@ -1462,7 +1506,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
@@ -1471,36 +1515,36 @@ class OpsImplementationConfig:
     cross_entropy_loss_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Cross-entropy loss. 'liger_kernel' (GPU; fused linear+CE — "
+            "help": "Cross-entropy loss. 'liger_kernel' (GPU, MLU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
-            "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'chunk_loss' on NPU."
         },
     )
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU) | 'torch_npu' (Ascend; the unweighted "
-            "variant has no Ascend kernel and uses 'eager') | "
+            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend weighted variants only; "
+            "unweighted requires 'eager' or an unset selection on Ascend) | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU, 'eager' on NPU and MLU."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
+            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
+            "help": "Rotary positional embedding. 'liger_kernel' (GPU, MLU) | "
             "'torch_npu' (Ascend) | 'triton' (per-model: DeepSeek-V3 deterministic, "
             "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     rotary_pos_emb_vision_implementation: Optional[str] = field(
@@ -1508,7 +1552,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
             "Uses the same 'rope' op with an independent implementation choice: 'liger_kernel' | 'torch_npu' | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' elsewhere."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     load_balancing_loss_implementation: Optional[str] = field(
@@ -1575,12 +1619,12 @@ class OpsImplementationConfig:
             "cann_ops_transformer)."
         },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={
-            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or "
-            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA (requires "
-            "cann_ops_transformer)."
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', "
+            "'tilelang', or 'triton'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA "
+            "(requires cann_ops_transformer); 'triton' is DeepSeek-V4 sparse MQA on AMD ROCm."
         },
     )
     mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
@@ -1604,7 +1648,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1630,19 +1674,45 @@ class OpsImplementationConfig:
             raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
 
     @staticmethod
+    def validate_attention_backend(implementation: Optional[str]) -> None:
+        """Reject AITER where its VeOmni ROCm adapter cannot be installed."""
+        if implementation not in _AITER_ATTENTION_IMPLEMENTATIONS:
+            return
+
+        from ..utils.device import IS_NPU_AVAILABLE
+
+        if IS_NPU_AVAILABLE:
+            raise ValueError(f"{implementation} is not supported on Ascend NPU; AITER is an AMD ROCm-only backend.")
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+        if implementation == "veomni_flash_attention_aiter_with_sp":
+            raise ValueError(
+                "veomni_flash_attention_aiter_with_sp is not a supported attention implementation; "
+                "use 'aiter' or 'veomni_flash_attention_aiter'."
+            )
+
+    @staticmethod
     def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
-        """Validate Hub requests and resolve their registered VeOmni names."""
+        """Validate Hub and AITER requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
-        return {
+        return OpsImplementationConfig.normalize_attention_backend(implementation, veomni_names=False)
+
+    @staticmethod
+    def normalize_attention_backend(implementation: Optional[str], *, veomni_names: bool = True) -> Optional[str]:
+        """Normalize names without validating an intermediate config selection."""
+        aliases = _DEPRECATED_IMPLEMENTATION_ALIASES["attn_implementation"]
+        if implementation in aliases:
+            replacement = aliases[implementation]
+            OpsImplementationConfig._warn_deprecated("attn_implementation", implementation, replacement)
+            implementation = replacement
+        implementation = {
+            "aiter": "veomni_flash_attention_aiter",
             "flash_attention_2_hub": "veomni_flash_attention_2_hub",
             "flash_attention_3_hub": "veomni_flash_attention_3_hub",
         }.get(implementation, implementation)
-
-    def __post_init__(self):
-        self._apply_deprecated_aliases()
-        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
-        if get_env("MODELING_BACKEND") == "veomni":
-            replacements = {
+        if veomni_names and get_env("MODELING_BACKEND") == "veomni":
+            return {
                 "flash_attention_2": "veomni_flash_attention_2",
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
@@ -1650,13 +1720,19 @@ class OpsImplementationConfig:
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
-            }
-            if self.attn_implementation in replacements:
-                new_impl = replacements[self.attn_implementation]
-                logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
-                self.attn_implementation = new_impl
+            }.get(implementation, implementation)
+        return implementation
 
+    def __post_init__(self):
+        self._apply_deprecated_aliases()
+        self.validate_attention_backend(self.attn_implementation)
+        self.validate_hub_attention_backend(self.attn_implementation)
+        self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize non-None op implementation selections to a dict."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""
@@ -1692,16 +1768,24 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
+            is_liger_kernel_mlu_available,
             is_torch_mlu_available,
         )
 
@@ -1729,6 +1813,12 @@ class OpsImplementationConfig:
             if on_mlu:
                 if value == "fused_mlu" and not is_apex_mlu_available():
                     raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                    raise ValueError(
+                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                        "set 'eager', or leave the field unset."
+                    )
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(

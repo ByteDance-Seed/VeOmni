@@ -211,8 +211,11 @@ def math_sdpa_reference(
 
     repeat_count = query.shape[1] // key.shape[1]
     expanded_key = key.repeat_interleave(repeat_count, dim=1)
-    logits = torch.einsum("bhqd,bhkd->bhqk", query.float(), expanded_key.float()) * scaling
-    lse = torch.logsumexp(logits.masked_fill(~dense, -torch.inf), dim=-1)
+    # The first threaded CPU FP32 logsumexp can differ from subsequent calls.
+    # Keep the CPU oracle in FP64; native-device reference math stays FP32.
+    lse_dtype = torch.float64 if query.device.type == "cpu" else torch.float32
+    logits = torch.einsum("bhqd,bhkd->bhqk", query.to(lse_dtype), expanded_key.to(lse_dtype)) * scaling
+    lse = torch.logsumexp(logits.masked_fill(~dense, -torch.inf), dim=-1).float()
     return output, lse
 
 
