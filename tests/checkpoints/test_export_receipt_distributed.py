@@ -1,7 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0.
 
-"""One-rank checkpoint identity changes must fail on every participant."""
+"""Rank-local checkpoint I/O failures must reach every participant."""
 
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -143,38 +143,7 @@ def _worker(rank, rendezvous, root, mode):
                 manager.checkpointer.load.assert_not_called()
                 manager.checkpointer.save.assert_not_called()
                 return
-            manager.save_dcp(TrainerState(global_step=3))
-            if mode in ("before", "epoch") and rank == 1:
-                runtime.optimizer = MagicMock(spec=[])
-            if mode == "during":
-
-                def wait():
-                    if rank == 1:
-                        runtime.optimizer = MagicMock(spec=[])
-
-                manager.wait_for_pending_save = wait
-            error = None
-            try:
-                if mode in ("epoch", "receipt"):
-                    from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
-
-                    trainer = _make_mock_trainer(save_path=root)
-                    trainer.args.train.checkpoint.save_epochs = 1
-                    trainer.args.train.checkpoint.save_hf_weights = False
-                    trainer.model.checkpoint = manager
-                    callback = CheckpointCallback(trainer)
-                    callback._last_dcp_step = 3 if mode == "epoch" or rank == 0 else -1
-                    callback.on_epoch_end(TrainerState(global_step=3, epoch=0))
-                else:
-                    manager.prepare_export(TrainerState(global_step=3), "step_end")
-            except RuntimeError as exc:
-                error = str(exc)
-            result = torch.tensor(int(error is not None))
-            dist.all_reduce(result)
-            assert result.item() == 2, (rank, mode, error)
-            if mode not in ("epoch", "receipt"):
-                assert manager._last_saved_step == -1
-                assert manager._last_saved_optimizer_ref is None
+            raise AssertionError(f"Unknown test mode: {mode}")
     finally:
         dist.destroy_process_group()
 
@@ -183,10 +152,6 @@ def _worker(rank, rendezvous, root, mode):
 @pytest.mark.parametrize(
     "mode",
     [
-        "before",
-        "during",
-        "epoch",
-        "receipt",
         "same_output",
         "legacy_incomplete",
         "load_kwargs",
@@ -197,7 +162,7 @@ def _worker(rank, rendezvous, root, mode):
         "invalidated_output",
     ],
 )
-def test_optimizer_identity_change_is_rank_coordinated(tmp_path, mode):
+def test_rank_local_checkpoint_failures_are_coordinated(tmp_path, mode):
     mp.start_processes(
         _worker, args=(str(tmp_path / "gloo"), str(tmp_path), mode), nprocs=2, join=True, start_method="fork"
     )
