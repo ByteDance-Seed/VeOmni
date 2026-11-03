@@ -45,7 +45,7 @@ import torch.distributed as dist
 
 from ...checkpoint import layout
 from ...utils import helper
-from ...utils.device import get_device_rng_state, get_device_type, set_device_rng_state
+from ...utils.device import get_device_rng_state, get_device_type, get_torch_device, set_device_rng_state
 from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
@@ -115,6 +115,59 @@ def _saved_multi_optimizer_generations(trainer, step):
             raise RuntimeError("Trainer state has no matching MultiOptimizer checkpoint generation")
         generations[name] = generation
     return generations
+
+
+def _same_output_resume_owners(trainer, load_path, step):
+    """Return verified owners only when this completed step is the output step."""
+    config = trainer.args.train.checkpoint
+    same_output, error = False, None
+    try:
+        same_output = layout.same_checkpoint_path(load_path, layout.step_dir(config.save_path, step))
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking restored checkpoint output path")
+    if dist.is_initialized():
+        decisions = [None] * dist.get_world_size()
+        dist.all_gather_object(decisions, same_output)
+        if any(decision != same_output for decision in decisions):
+            raise RuntimeError("Restored checkpoint output path differs across ranks")
+    if not same_output:
+        return []
+
+    owners, error = [], None
+    try:
+        from ...models.checkpoint.manager import ModelCheckpointManager
+
+        manifest = layout.read_manifest(load_path)
+        if (
+            not isinstance(manifest, dict)
+            or not layout.checkpoint_is_complete(load_path)
+            or manifest.get("model_state") is not True
+            or manifest.get("global_step") != step
+            or manifest.get("world_size") != trainer.args.train.world_size
+        ):
+            raise RuntimeError("Cannot reuse an incomplete restored optimizer checkpoint")
+        root = getattr(trainer, "model", None)
+        modules = getattr(root, "module_runtimes", None)
+        runtimes = list(modules.values()) if isinstance(modules, Mapping) and modules else [root]
+        for runtime in runtimes:
+            checkpoint = getattr(runtime, "checkpoint", None)
+            if checkpoint is None and getattr(runtime, "has_trainable_parameters", None) is False:
+                continue
+            loaded_path = getattr(checkpoint, "_loaded_checkpoint_path", None)
+            if (
+                not isinstance(checkpoint, ModelCheckpointManager)
+                or loaded_path is None
+                or not layout.same_checkpoint_path(loaded_path, load_path)
+            ):
+                raise RuntimeError("Cannot reuse an unverified model checkpoint owner")
+            owners.append(checkpoint)
+        if not owners:
+            raise RuntimeError("Cannot reuse a checkpoint without a model owner")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating the restored checkpoint for reuse")
+    return owners
 
 
 class GlobalStateCallback(Callback):
@@ -375,33 +428,97 @@ class GlobalStateCallback(Callback):
             elif global_state.get("_veomni_optimizer_generations") != generations:
                 error = RuntimeError("Trainer and MultiOptimizer checkpoint generations differ or are missing")
         raise_if_any_rank_failed(error, "checking the trainer checkpoint step")
-        self.trainer.state.global_step = global_state["global_step"]
-        self._restore_position(global_state)
+        reuse_owners = (
+            _same_output_resume_owners(self.trainer, load_path, restored_step) if restored_step is not None else []
+        )
+        error = None
+        if reuse_owners:
+            cpu_rng = global_state.get("torch_rng_state")
+            device_rng = global_state.get("device_rng_state")
+            cursor = global_state.get("train_dataloader")
+            if not torch.is_tensor(cpu_rng):
+                error = RuntimeError("Cannot reuse a checkpoint without the trainer RNG state")
+            elif (
+                get_device_type() == "cpu"
+                and device_rng is not None
+                and (not torch.is_tensor(device_rng) or not torch.equal(cpu_rng, device_rng))
+            ):
+                error = RuntimeError("Cannot reuse a checkpoint with conflicting CPU RNG states")
+            elif get_device_type() != "cpu" and (
+                device_rng is None or not callable(getattr(get_torch_device(), "set_rng_state", None))
+            ):
+                error = RuntimeError("Cannot reuse a checkpoint without the device RNG state")
+            elif self.trainer.train_dataloader is not None and (
+                not isinstance(cursor, dict) or (restored_step > 0 and not cursor)
+            ):
+                error = RuntimeError("Cannot reuse a checkpoint without a proven data cursor")
+            raise_if_any_rank_failed(error, "checking restored checkpoint RNG and cursor")
 
+        def restore_local(action, description):
+            if restored_step is None:
+                action()
+                return
+            error = None
+            try:
+                action()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, description)
+
+        def restore_position():
+            self.trainer.state.global_step = global_state["global_step"]
+            self._restore_position(global_state)
+
+        restore_local(restore_position, "restoring trainer position")
         channel_loss_state = global_state.get("channel_loss_callback")
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
-        if channel_loss_state is not None and channel_loss_callback is not None:
-            channel_loss_callback.load_state_dict(channel_loss_state)
-
+        restore_local(
+            lambda: channel_loss_callback.load_state_dict(channel_loss_state)
+            if channel_loss_state is not None and channel_loss_callback is not None
+            else None,
+            "restoring channel-loss state",
+        )
         offline_cache_writer_state = global_state.get("offline_cache_writer")
         offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
-        if offline_cache_writer_state is not None and offline_cache_writer is not None:
-            offline_cache_writer.load_state_dict(offline_cache_writer_state)
+        restore_local(
+            lambda: offline_cache_writer.load_state_dict(offline_cache_writer_state)
+            if offline_cache_writer_state is not None and offline_cache_writer is not None
+            else None,
+            "restoring offline-cache state",
+        )
+        restore_local(
+            lambda: self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
+            if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None
+            else None,
+            "restoring the training data cursor",
+        )
+        restore_local(
+            lambda: self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+            if global_state.get("environ_meter") is not None
+            else None,
+            "restoring training meter",
+        )
 
-        if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
-            self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
+        def restore_rng():
+            rng_state = global_state.get("torch_rng_state")
+            if rng_state is not None:
+                torch.set_rng_state(rng_state)
+            set_device_rng_state(global_state.get("device_rng_state"))
 
-        # OmniTrainer checkpoints written before it had a meter store None here.
-        if global_state.get("environ_meter") is not None:
-            self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
-        rng_state = global_state.get("torch_rng_state")
-        if rng_state is not None:
-            torch.set_rng_state(rng_state)
-        # ``.get`` keeps checkpoints written before these fields existed loadable;
-        # the device namespace may also not support RNG state at all.
-        set_device_rng_state(global_state.get("device_rng_state"))
+        restore_local(restore_rng, "restoring training RNG")
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
-            iter(self.trainer.train_dataloader)
+            restore_local(lambda: iter(self.trainer.train_dataloader), "initializing the restored data iterator")
+
+        if reuse_owners:
+            for checkpoint in reuse_owners:
+                checkpoint._last_saved_step = restored_step
+                checkpoint._last_saved_optimizer_generation = getattr(checkpoint, "_loaded_optimizer_generation", None)
+            self._last_saved_step = restored_step
+            from .checkpoint_callback import CheckpointCallback
+
+            checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+            if isinstance(checkpoint_callback, CheckpointCallback):
+                checkpoint_callback._last_dcp_step = restored_step
 
         logger.info_rank0(
             f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "
