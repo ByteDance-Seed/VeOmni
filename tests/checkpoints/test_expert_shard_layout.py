@@ -607,6 +607,62 @@ def _lora_export_worker(rank, world, shard_dim, directory, ep_dim, canonical, en
         dist.destroy_process_group()
 
 
+def _lora_noep_export_worker(rank, directory, fail_consolidation, endpoint):
+    from unittest.mock import patch
+
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.lora.state_dict import load_adapter_state_dict, strip_adapter_name
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        parallel_state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        model = _lora_model()
+        expected = {}
+        for name, param in model.named_parameters():
+            if ".lora_" in name:
+                value = torch.arange(param.numel(), dtype=torch.float32).reshape(param.shape) / 256 + len(expected)
+                param.data.copy_(value)
+                expected[strip_adapter_name(name, "default")] = value.to(torch.bfloat16)
+        fully_shard(model, mesh=parallel_state.fsdp_mesh)
+        if fail_consolidation:
+            with patch.object(
+                save_safetensor_utils, "ckpt_to_state_dict", side_effect=OSError("injected export failure")
+            ):
+                expected_error = OSError if rank == 0 else RuntimeError
+                with pytest.raises(expected_error, match="injected export failure|failed on another rank"):
+                    save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            dist.barrier()
+        else:
+            original_load = save_safetensor_utils.ckpt_to_state_dict
+
+            def inspect_layout(*args, **kwargs):
+                reader = dcp.FileSystemReader(kwargs["save_checkpoint_path"])
+                layouts = reader.read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+                experts = {name: layout for name, layout in layouts.items() if ".experts." in name}
+                assert experts
+                assert all(layout["source_kind"] == "veomni_tp1_no_ep" for layout in experts.values())
+                return original_load(*args, **kwargs)
+
+            with patch.object(save_safetensor_utils, "ckpt_to_state_dict", side_effect=inspect_layout):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            exported = load_adapter_state_dict(directory)
+            assert exported.keys() == expected.keys()
+            for name in expected:
+                torch.testing.assert_close(exported[name], expected[name], rtol=0, atol=0)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("fail_consolidation", [False, True])
+def test_noep_fsdp_lora_export_preserves_expert_layout(tmp_path, fail_consolidation):
+    spawn_with_rendezvous(_lora_noep_export_worker, args=(str(tmp_path), fail_consolidation), nprocs=2)
+
+
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
 @pytest.mark.parametrize("shard_dim,ep_dim", [(0, 0), (1, 0), (0, -3)])
