@@ -20,7 +20,7 @@ from veomni.models.checkpoint.manager import ModelCheckpointManager
 from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 from veomni.optim.optimizer import MultiOptimizer
 from veomni.trainer.callbacks.base import TrainerState
-from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
+from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback, _export_wrote_dcp
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
 
@@ -38,6 +38,16 @@ def _runtime(tmp_path):
     runtime.lr_scheduler = None
     runtime.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
     return runtime
+
+
+def test_export_does_not_reuse_an_unknown_owner():
+    saved = SimpleNamespace(checkpoint=SimpleNamespace(_last_saved_step=1))
+    frozen = SimpleNamespace(checkpoint=None, has_trainable_parameters=False)
+    unknown = SimpleNamespace(checkpoint=None)
+    trainer = SimpleNamespace(model=SimpleNamespace(module_runtimes={"saved": saved, "frozen": frozen}))
+    assert _export_wrote_dcp(trainer, 1)
+    trainer.model.module_runtimes["unknown"] = unknown
+    assert not _export_wrote_dcp(trainer, 1)
 
 
 def test_train_end_does_not_retain_optimizer_during_hf_export(tmp_path):
@@ -62,7 +72,7 @@ def test_train_end_does_not_retain_optimizer_during_hf_export(tmp_path):
         CheckpointCallback(trainer)._save_hf(state, stage="train_end")
 
 
-def _real_multi_save_worker(rank, directory, scope, endpoint):
+def _real_multi_save_worker(rank, directory, scope, cadence, endpoint):
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
@@ -92,9 +102,9 @@ def _real_multi_save_worker(rank, directory, scope, endpoint):
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
         trainer.args.train.checkpoint.save_steps = 0
-        trainer.args.train.checkpoint.save_epochs = 1
-        trainer.args.train.checkpoint.hf_save_steps = 1
-        trainer.args.train.checkpoint.hf_save_epochs = 0
+        trainer.args.train.checkpoint.save_epochs = 1 if cadence == "step" else 2
+        trainer.args.train.checkpoint.hf_save_steps = 1 if cadence == "step" else 0
+        trainer.args.train.checkpoint.hf_save_epochs = 0 if cadence == "step" else 1
         trainer.train_dataloader = None
         trainer.data_iterator = None
         trainer.environ_meter.state_dict.return_value = {}
@@ -121,8 +131,12 @@ def _real_multi_save_worker(rank, directory, scope, endpoint):
         callback = CheckpointCallback(trainer)
         global_callback = GlobalStateCallback(trainer)
         state = TrainerState(global_step=1, epoch=0)
-        callback.on_step_end(state)
-        global_callback.on_step_end(state)
+        if cadence == "step":
+            callback.on_step_end(state)
+            global_callback.on_step_end(state)
+        else:
+            callback.on_epoch_end(state)
+            global_callback.on_epoch_end(state)
         generations = [runtime.checkpoint._last_saved_optimizer_generation for runtime in runtimes]
         assert all(generations)
         snapshot = None
@@ -132,9 +146,13 @@ def _real_multi_save_worker(rank, directory, scope, endpoint):
                 p.relative_to(root): hashlib.sha256(p.read_bytes()).digest() for p in root.rglob("*") if p.is_file()
             }
             assert snapshot
-        callback.on_epoch_end(state)
-        global_callback.on_epoch_end(state)
-        trainer.save_dcp.assert_called_once_with(state)
+        next_state = state if cadence == "step" else TrainerState(global_step=1, epoch=1)
+        callback.on_epoch_end(next_state)
+        global_callback.on_epoch_end(next_state)
+        if cadence == "step":
+            trainer.save_dcp.assert_called_once_with(state)
+        else:
+            trainer.save_dcp.assert_not_called()
         for runtime in runtimes:
             runtime.checkpoint.save_dcp.assert_called_once_with(state)
         assert [runtime.checkpoint._last_saved_optimizer_generation for runtime in runtimes] == generations
@@ -170,8 +188,9 @@ def _real_multi_save_worker(rank, directory, scope, endpoint):
 
 
 @pytest.mark.parametrize("scope", ["single", "omni"])
+@pytest.mark.parametrize("cadence", ["step", "empty_epoch"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_real_multi_dcp_hf_epoch_on_two_ranks(tmp_path, scope):
+def test_real_multi_dcp_hf_epoch_on_two_ranks(tmp_path, scope, cadence):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_real_multi_save_worker, args=(str(tmp_path), scope), nprocs=2)
+    spawn_with_rendezvous(_real_multi_save_worker, args=(str(tmp_path), scope, cadence), nprocs=2)
