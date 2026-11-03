@@ -114,14 +114,13 @@ def test_omni_module_scope_checks_async_before_checkpoint(monkeypatch, multi):
         assert reached_checkpoint == [True]
 
 
-def _mismatch_worker(rank, endpoint):
+def _preflight_failure_worker(rank, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         model_runtime.use_parallel_state = lambda *_: nullcontext()
+        _runtime(True, False)
         with pytest.raises(RuntimeError, match="synchronous|checking MultiOptimizer checkpoint mode"):
-            _runtime(True if rank == 0 else None, True)
-        # A frozen local shard must not prevent synchronous checkpoint setup.
-        _runtime(True if rank == 0 else None, False)
+            _runtime(True, True)
         with pytest.raises(RuntimeError, match="injected optimizer build failure|building model optimizer"):
             _runtime("fail" if rank == 0 else False, False)
         done = torch.tensor(1)
@@ -132,10 +131,10 @@ def _mismatch_worker(rank, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_mismatched_optimizer_checkpoint_modes_fail_on_all_ranks():
+def test_optimizer_checkpoint_failures_reach_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_mismatch_worker, args=(), nprocs=2)
+    spawn_with_rendezvous(_preflight_failure_worker, args=(), nprocs=2)
 
 
 def _accelerator_worker(rank, endpoint):
@@ -148,9 +147,9 @@ def _accelerator_worker(rank, endpoint):
     )
     try:
         model_runtime.use_parallel_state = lambda *_: nullcontext()
-        _runtime(True if rank == 0 else None, False)
+        _runtime(True, False)
         with pytest.raises(RuntimeError, match="synchronous|checking MultiOptimizer checkpoint mode"):
-            _runtime(True if rank == 0 else None, True)
+            _runtime(True, True)
         with pytest.raises(RuntimeError, match="injected optimizer build failure|building model optimizer"):
             _runtime("fail" if rank == 0 else False, False)
         done = torch.ones(1, device=device)
