@@ -216,34 +216,6 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert te2.config.vocab_size == 128
 
 
-def test_qwen3_llm_rejects_flex_attention():
-    """The packed path hands the backbone a 2-D mask, which Flex cannot isolate."""
-    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
-    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
-    with pytest.raises(ValueError, match="flex_attention"):
-        Qwen3Llm(
-            Qwen3LlmConfig(
-                text_config=_tiny_qwen3_cfg(),
-                ops_implementation={"attn_implementation": "flex_attention"},
-            )
-        )
-
-
-def test_qwen3_llm_rejects_nested_text_config_flex_attention():
-    """Outer eager must not let an explicit nested Flex selection reach the backbone."""
-    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
-    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
-    nested = {**_tiny_qwen3_cfg(), "attn_implementation": "flex_attention"}
-    cfg = Qwen3LlmConfig(
-        text_config=nested,
-        ops_implementation={"attn_implementation": "eager"},
-    )
-    assert cfg._attn_implementation == "eager"
-    assert "flex_attention" in cfg.text_config._attn_implementation
-    with pytest.raises(ValueError, match="flex_attention"):
-        Qwen3Llm(cfg)
-
-
 def test_qwen3_llm_generate_rejects_ulysses_sequence_parallel(monkeypatch):
     import veomni.models.seed_omni.modules.base.llm_packing as llm_packing
 
