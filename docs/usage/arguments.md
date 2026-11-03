@@ -495,7 +495,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer algorithm. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
 | state_offload | `Literal["none", "cpu"]` | `"none"` | Where the optimizer moment states live. `cpu` keeps them in host buffers and streams one batch to the device per step, lowering peak device memory (only with `type="adamw"`). |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
