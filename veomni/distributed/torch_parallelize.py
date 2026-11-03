@@ -14,7 +14,7 @@
 
 
 import types
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -145,6 +145,7 @@ def _materialize_and_load_weights(
     module_skip_hf_weight_load: Optional[Mapping[str, bool]] = None,
     module_is_peft_model: Optional[Mapping[str, bool]] = None,
     module_adapter_path: Optional[Mapping[str, Optional[str]]] = None,
+    additional_weight_sources: Sequence[tuple[str, str]] = (),
 ) -> None:
     """Move meta-initialized parameters onto a real device and fill them in.
 
@@ -159,6 +160,8 @@ def _materialize_and_load_weights(
     when the mapping form is used.
     """
     if isinstance(weights_path, Mapping):
+        if additional_weight_sources:
+            raise ValueError("additional_weight_sources require a single root weights_path")
         children = dict(model.named_children())
         missing = [name for name in weights_path if name not in children]
         if missing:
@@ -181,6 +184,7 @@ def _materialize_and_load_weights(
                 max_load_broadcast_size=max_load_broadcast_size,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 ep_sharded_stream_load=ep_sharded_stream_load,
+                additional_weight_sources=additional_weight_sources,
             )
         leftover_meta = [
             name
@@ -202,7 +206,7 @@ def _materialize_and_load_weights(
             "trainable-only and the frozen base must still be loaded from weights_path."
         )
 
-    if weights_path is None or should_skip_hf_weight_load:
+    if (weights_path is None and not additional_weight_sources) or should_skip_hf_weight_load:
         if should_skip_hf_weight_load:
             logger.info_rank0(
                 "Skipping pretrained weight load for checkpoint resume; "
@@ -245,10 +249,15 @@ def _materialize_and_load_weights(
             is_peft_model=is_peft_model,
             adapter_path=adapter_path,
             fqn_to_index_mapping=fqn_to_index_mapping,
+            additional_weight_sources=additional_weight_sources,
         )
     else:
         _dt_local_split = partial(distribute_tensor, src_data_rank=None)
         if ep_sharded_stream_load and _has_extra_parallel_plan(model):
+            if additional_weight_sources:
+                raise NotImplementedError(
+                    "additional_weight_sources are not supported together with ep_sharded_stream_load"
+                )
             # Opt-in fast/low-memory path for large MoE checkpoints: each rank
             # reads only its ExtraParallel dim-0 slice of the expert tensors
             # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
@@ -287,6 +296,7 @@ def _materialize_and_load_weights(
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
                 fqn_to_index_mapping=fqn_to_index_mapping,
+                additional_weight_sources=additional_weight_sources,
             )
 
 
@@ -922,8 +932,8 @@ def parallelize_model_fsdp2(
         module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
+        additional_weight_sources=tuple(kwargs.pop("additional_weight_sources", ())),
     )
-
     if expert_weight_fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
@@ -995,6 +1005,7 @@ def parallelize_model_ddp(
             cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
             max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+            additional_weight_sources=tuple(kwargs.pop("additional_weight_sources", ())),
         )
 
         # Anything the loader left behind would otherwise surface as

@@ -1,0 +1,54 @@
+# Correctness-first Ascend configuration; eager GDN kernels are not optimized.
+model:
+  model_path: /path/to/Cloudflare/clef-flash
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: eager
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+    load_balancing_loss_implementation: eager
+    rms_norm_gated_implementation: eager
+    causal_conv1d_implementation: eager
+    chunk_gated_delta_rule_implementation: eager
+  accelerator:
+    dp_replicate_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  optimizer:
+    type: adamw
+    lr: 0.00002
+    lr_min: 0.000002
+    lr_warmup_ratio: 0.05
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+train:
+  dyn_bsz: true
+  micro_batch_size: 1
+  global_batch_size: 8
+  num_train_epochs: 3
+  eval_steps: 50
+  checkpoint:
+    output_dir: outputs/decision/clef_qwen3_5_npu
+    save_steps: 50
+    save_hf_weights: true
+data:
+  dataset: LocalLLaMA/typed-decisions
+  validation_fraction: 0.1
+  max_seq_len: 8192
+  train_size: 10000000
+  shuffle_choices: false
+  dataloader:
+    num_workers: 2
+    pin_memory: false
+    drop_last: false
+decision:
+  decision_model: clef
+  decision_model_config: {}  # Optional CLEF head_config / head_path overrides.
+  loss_type: soft_ce

@@ -152,24 +152,28 @@ def init_empty_weights():
 @dataclass
 class StateDictIterator:
     filepath: str
+    key_prefix: str = ""
     # Keys for which this returns True are passed over without reading their tensor.
     skip_key: Optional[Callable[[str], bool]] = None
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         skip_key = self.skip_key
+        key_prefix = self.key_prefix
         if self.filepath.endswith(".safetensors"):
             with safe_open(self.filepath, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if skip_key is not None and skip_key(key):
+                for source_key in f.keys():
+                    target_key = f"{key_prefix}{source_key}"
+                    if skip_key is not None and skip_key(target_key):
                         continue
-                    yield key, f.get_tensor(key)
+                    yield target_key, f.get_tensor(source_key)
 
         else:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
             for key in state_dict.keys():
-                if skip_key is not None and skip_key(key):
+                prefixed_key = f"{key_prefix}{key}"
+                if skip_key is not None and skip_key(prefixed_key):
                     continue
-                yield key, state_dict[key]
+                yield prefixed_key, state_dict[key]
 
 
 @dataclass
@@ -181,7 +185,10 @@ class BroadcastMetadata:
 
 
 def _load_state_dict(
-    weights_path: str, skip_key: Optional[Callable[[str], bool]] = None, **kwargs
+    weights_path: str,
+    skip_key: Optional[Callable[[str], bool]] = None,
+    key_prefix: str = "",
+    **kwargs,
 ) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
@@ -189,6 +196,7 @@ def _load_state_dict(
     iterators = _resolve_state_dict_iterators(weights_path, **kwargs)
     for iterator in iterators:
         iterator.skip_key = skip_key
+        iterator.key_prefix = key_prefix
     return iterators
 
 
@@ -210,6 +218,9 @@ def _skip_without_loading_fn(
 
 
 def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
+    if os.path.isfile(weights_path):
+        return [StateDictIterator(weights_path)]
+
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -243,6 +254,26 @@ def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDic
             return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
+
+
+def _load_weight_sources(
+    weights_path: Optional[str],
+    *,
+    skip_key: Optional[Callable[[str], bool]],
+    additional_weight_sources: Sequence[Tuple[str, str]] = (),
+    **kwargs,
+) -> List["StateDictIterator"]:
+    iterators = [] if weights_path is None else _load_state_dict(weights_path, skip_key=skip_key, **kwargs)
+    for source_path, key_prefix in additional_weight_sources:
+        iterators.extend(
+            _load_state_dict(
+                source_path,
+                skip_key=skip_key,
+                key_prefix=key_prefix,
+                **kwargs,
+            )
+        )
+    return iterators
 
 
 def _find_submodule(module: "nn.Module", name: str) -> Tuple["nn.Module", str]:
@@ -409,7 +440,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
 @torch.no_grad()
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
-    weights_path: str,
+    weights_path: Optional[str],
     init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     **kwargs,
@@ -445,7 +476,12 @@ def load_model_weights(
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
-    state_dict_iterators = _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
+    additional_weight_sources = tuple(kwargs.pop("additional_weight_sources", ()))
+    state_dict_iterators = _load_weight_sources(
+        weights_path,
+        skip_key=_skip_without_loading_fn(model, converter),
+        additional_weight_sources=additional_weight_sources,
+    )
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
         if name in buffer_dict.keys():  # persistent buffers
@@ -1207,7 +1243,7 @@ def _stream_lora_adapter_ep_sharded(
 @torch.no_grad()
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
-    weights_path: str,
+    weights_path: Optional[str],
     init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     cpu_load_param_name: List[str] = None,
@@ -1248,6 +1284,7 @@ def rank0_load_and_broadcast_weights(
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
+    additional_weight_sources = tuple(kwargs.pop("additional_weight_sources", ()))
     global_rank = get_parallel_state().global_rank
     torch_device = _get_communication_device(init_device)
 
@@ -1485,7 +1522,11 @@ def rank0_load_and_broadcast_weights(
 
     # --- Broadcast shard count ---
     state_dict_iterators = (
-        _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
+        _load_weight_sources(
+            weights_path,
+            skip_key=_skip_without_loading_fn(model, converter),
+            additional_weight_sources=additional_weight_sources,
+        )
         if global_rank == 0
         else None
     )

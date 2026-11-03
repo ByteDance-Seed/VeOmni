@@ -37,15 +37,20 @@ import torch
 
 import veomni.trainer.base as base_trainer_module
 import veomni.trainer.callbacks.trace_callback as trace_callback_module
+import veomni.trainer.decision_trainer as decision_trainer_module
 import veomni.trainer.text_trainer as text_trainer_module
 import veomni.trainer.vlm_trainer as vlm_trainer_module
+import veomni.utils.loss_utils as loss_utils_module
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OffloadConfig
+from veomni.models.decision import get_decision_model
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.trace_callback import RESERVED_TRAINING_METRIC_NAMES
+from veomni.trainer.decision_trainer import DecisionTrainer
 from veomni.trainer.text_trainer import TextTrainer
 from veomni.trainer.vlm_trainer import VLMTrainer
+from veomni.utils.decision_loss import decision_loss
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -250,6 +255,160 @@ def run_train_step(request, monkeypatch):
         type(driver).train_step(driver, iter([micro_batches]))
 
     return run
+
+
+def test_default_loss_reduction_weights_micro_batches_by_tokens(run_train_step, monkeypatch):
+    monkeypatch.setattr(
+        loss_utils_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False, fsdp_size=1)
+    )
+    recorded = {}
+    trainer = _accumulating_trainer([_PlainOutput(torch.tensor(2.0)), _PlainOutput(torch.tensor(4.0))], recorded)
+    run_train_step(
+        trainer,
+        [{"labels": torch.tensor([[1, -100, -100]])}, {"labels": torch.tensor([[1, 2, 3]])}],
+    )
+
+    assert recorded["loss"] == pytest.approx(3.5)
+    assert recorded["loss_dict"]["foundation_loss"] == pytest.approx(3.5)
+    assert trainer.global_micro_batches_token_len == {"foundation_tokens": 4}
+
+
+@pytest.mark.parametrize("loss_type", ["soft_ce", "smooth_brier", "distill_rps"])
+def test_decision_loss_hooks_match_weighted_update_across_steps(monkeypatch, loss_type):
+    """Typed batches share one denominator; padding contributes no gradient."""
+    denominators = []
+    monkeypatch.setattr(
+        decision_trainer_module.dist, "all_reduce", lambda value, group=None: denominators.append(value.item())
+    )
+    monkeypatch.setattr(decision_trainer_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(decision_trainer_module, "use_parallel_state", lambda state: nullcontext())
+    monkeypatch.setattr(base_trainer_module, "mark_compile_step_begin", lambda *args: None)
+    recorded = {}
+    trainer = object.__new__(DecisionTrainer)
+    trainer.__dict__.update(_accumulating_trainer([], recorded).__dict__)
+    del trainer.forward_backward_step
+    trainer.device = torch.device("cpu")
+    trainer.world = 1
+    trainer.model.parallel_state = SimpleNamespace(dp_size=1, fsdp_group=None)
+    trainer.model_fwd_context = trainer.model_bwd_context = nullcontext()
+    parameter = torch.nn.Parameter(torch.tensor([0.5, -0.4, 0.1]))
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    trainer.model.optimizer = torch.optim.SGD([parameter], lr=0.1)
+    reference_optimizer = torch.optim.SGD([reference], lr=0.1)
+    scheduled_steps = []
+    trainer.model.lr_scheduler.step = lambda: scheduled_steps.append(trainer.state.global_step)
+    trainer._forward = lambda batch: SimpleNamespace(logits=parameter * batch.values)
+    trainer.loss = get_decision_model("clef").build_loss(loss_type, smoothing=0.2, brier=0.7, rps=0.4)
+
+    def check_gradient():
+        torch.testing.assert_close(parameter.grad, reference.grad)
+        return 0.0
+
+    trainer.model.clip_grad_norm = check_gradient
+
+    def batch(values, counts, targets, weights, ordinal):
+        return SimpleNamespace(
+            features={},
+            padding=False,
+            values=torch.tensor(values),
+            counts=torch.tensor(counts),
+            targets=torch.tensor(targets),
+            weights=torch.tensor(weights),
+            ordinal_mask=torch.tensor(ordinal, dtype=torch.bool),
+        )
+
+    steps = [
+        [
+            batch(
+                [[1.0, 2.0, 3.0], [2.0, -1.0, 0.5]],
+                [2, 3],
+                [[0.2, 0.8, 0.0], [0.5, 0.25, 0.25]],
+                [0.5, 2.0],
+                [False, True],
+            ),
+            batch([[4.0, 2.0, 1.0]], [1], [[1.0, 0.0, 0.0]], [9.0], [True]),
+            batch([[100.0, 0.0, 2.0]], [3], [[0.0, 0.0, 0.0]], [0.0], [True]),
+        ],
+        [batch([[2.0, 1.0, -1.0]], [2], [[0.8, 0.2, 0.0]], [0.25], [False])],
+    ]
+    for step, batches in enumerate(steps, start=1):
+        values = torch.cat([batch.values for batch in batches])
+        numerator, effective_weight = decision_loss(
+            reference * values,
+            torch.cat([batch.counts for batch in batches]),
+            torch.cat([batch.targets for batch in batches]),
+            torch.cat([batch.weights for batch in batches]),
+            ordinal_mask=torch.cat([batch.ordinal_mask for batch in batches]),
+            **trainer.loss.config,
+        )
+        expected_loss = numerator / effective_weight
+        expected_loss.backward()
+        trainer.train_step(iter([batches]))
+        reference_optimizer.step()
+        reference_optimizer.zero_grad()
+
+        torch.testing.assert_close(parameter, reference)
+        assert parameter.grad is None
+        assert trainer.state.global_step == step
+        assert recorded["loss"] == pytest.approx(expected_loss.item())
+        assert recorded["aux_metrics"]["question_weight"] == pytest.approx(effective_weight.item())
+        assert trainer.global_weight.item() == pytest.approx(effective_weight.item())
+
+    assert denominators == [2.5, 0.25]
+    assert scheduled_steps == [1, 2]
+
+
+def test_decision_task_accepts_explicit_evaluation_and_rejects_training_on_test():
+    from veomni.arguments.decision_arguments import DecisionTaskArguments
+
+    task = DecisionTaskArguments(
+        decision_model="clef",
+        decision_model_config={"head_path": "/fixture/head.safetensors"},
+        mode="evaluate",
+        eval_split="test",
+    )
+    assert task.mode == "evaluate"
+    assert task.decision_model == "clef"
+    assert task.decision_model_config == {"head_path": "/fixture/head.safetensors"}
+    with pytest.raises(ValueError, match="Official test"):
+        DecisionTaskArguments(mode="train", eval_split="test")
+
+
+def test_decision_trainer_passes_architecture_config_from_decision_section(monkeypatch):
+    from veomni.arguments.decision_arguments import DecisionTaskArguments
+
+    captured = {}
+    expected_loss = object()
+
+    class Runtime:
+        spec = SimpleNamespace(build_loss=lambda *args, **kwargs: expected_loss)
+
+        def __init__(self, model, model_name, **kwargs):
+            captured.update(model=model, model_name=model_name, **kwargs)
+
+    monkeypatch.setattr(decision_trainer_module, "DecisionModelRuntime", Runtime)
+    trainer = object.__new__(DecisionTrainer)
+    trainer.args = SimpleNamespace(
+        model=object(),
+        train=object(),
+        decision=DecisionTaskArguments(
+            decision_model="clef",
+            decision_model_config={"head_path": "/fixture/head.safetensors"},
+            loss_type="soft_ce",
+        ),
+    )
+
+    model = trainer._build_model_runtime("decision")
+
+    assert isinstance(model, Runtime)
+    assert captured == {
+        "model": trainer.args.model,
+        "model_name": "decision",
+        "train": trainer.args.train,
+        "decision_model": "clef",
+        "decision_model_config": {"head_path": "/fixture/head.safetensors"},
+    }
+    assert trainer.loss is expected_loss
 
 
 def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(run_train_step, identity_loss):
