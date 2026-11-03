@@ -16,6 +16,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _QWEN4_GDN_FP32_LEGACY_MARKER,
     _QWEN4_GDN_FP32_MARKER,
     _get_sharding_plan,
+    _normalize_key,
     _process_shard,
     read_qwen4_gdn_manifest,
 )
@@ -75,8 +76,13 @@ def save_lora_adapter_weights(
     logger.info(f"Saving LoRA adapter to {output_dir}")
 
     # ``shard_size=None`` forces a single shard so we get ``adapter_model.safetensors`` directly.
-    all_keys, _total_size, _all_dcp_keys = _get_sharding_plan(checkpoint_path, shard_size=None, save_dtype=save_dtype)
-    lora_keys = {hf_k: dcp_k for hf_k, dcp_k in all_keys.items() if _is_lora_key(hf_k)}
+    lora_keys, _total_size, _all_dcp_keys = _get_sharding_plan(
+        checkpoint_path,
+        shard_size=None,
+        save_dtype=save_dtype,
+        legacy_expert_source_layout=legacy_expert_source_layout,
+        include_hf_key=_is_lora_key,
+    )
     if not lora_keys:
         raise RuntimeError(
             f"LoRA conversion requested but no LoRA keys (.lora_A./.lora_B./...) found under {checkpoint_path}"
@@ -152,7 +158,9 @@ def save_model_weights(
             logger.warning("GDN model identity is unknown; supply --model-assets-dir or --qwen4-gdn-fp32 for Qwen4.")
     preserve_fp32_keys = set()
     if qwen4_gdn_fp32 or preserve_qwen4_gdn_fp32(model_assets):
-        all_keys, _, _ = _get_sharding_plan(checkpoint_path, shard_size=None, save_dtype=None)
+        all_keys, _, _ = _get_sharding_plan(
+            checkpoint_path, shard_size=None, save_dtype=None, legacy_expert_source_layout=legacy_expert_source_layout
+        )
         preserve_fp32_keys = {key for key in all_keys if is_qwen4_gdn_parameter(key)}
         if manifest is not None and preserve_fp32_keys != manifest:
             raise RuntimeError("Qwen4 GDN checkpoint inventory does not match model tensors")
@@ -165,7 +173,11 @@ def save_model_weights(
                     f"Cannot export non-FP32 Qwen4 GDN parameters without explicit migration: {invalid}"
                 )
     shards, total_size, all_dcp_keys = _get_sharding_plan(
-        checkpoint_path, shard_size, save_dtype, preserve_fp32_keys=preserve_fp32_keys
+        checkpoint_path,
+        shard_size,
+        save_dtype,
+        preserve_fp32_keys=preserve_fp32_keys,
+        legacy_expert_source_layout=legacy_expert_source_layout,
     )
 
     logger.info(f"Found {len(all_dcp_keys)} model tensors, total size: ~{total_size / 1e9:.2f}GB")
@@ -368,9 +380,9 @@ def main():
 
     mode = args.mode
     if mode == "auto":
-        _shards_for_detection, _size, _dcp_keys = _get_sharding_plan(load_dir, shard_size=None, save_dtype="bfloat16")
-        # _shards_for_detection is a single {hf_key: dcp_key} dict when shard_size is None
-        detected_lora = _detect_lora(_shards_for_detection.keys())
+        metadata = FileSystemReader(load_dir).read_metadata()
+        hf_keys = (normalized for key in metadata.state_dict_metadata if (normalized := _normalize_key(key)))
+        detected_lora = _detect_lora(hf_keys)
         mode = "lora" if detected_lora else "full"
         logger.info(
             f"Auto-detected mode: {mode} "

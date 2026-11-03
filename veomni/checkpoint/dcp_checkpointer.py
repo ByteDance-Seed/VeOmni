@@ -17,6 +17,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import uuid
@@ -30,7 +31,7 @@ from typing import Any, Dict, Optional, Set, Union
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Partial, Replicate, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -48,7 +49,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor.placement_types import _StridedShard
 
-from ..distributed.parallel_state import ParallelState, get_parallel_state
+from ..distributed.parallel_state import ParallelState, get_parallel_state, is_parallel_state_initialized
 from ..models.qwen4_gdn_precision import (
     is_qwen4_exp_model,
     is_qwen4_gdn_parameter,
@@ -139,56 +140,216 @@ def _validate_legacy_expert_source_layout(value):
         raise ValueError(f"Unsupported legacy expert source layout: {value!r}")
 
 
-def _expert_layout(tensor):
-    """Describe the source EP/FSDP layout, independently of the load target."""
+def _expert_layout(tensor, extra_parallel_names=()):
+    """Describe a source ExtraParallel/FSDP layout independently of the target."""
     if not isinstance(tensor, DTensor):
         return None
     mesh = tensor.device_mesh
     names = mesh.mesh_dim_names or ()
-    if "ep" not in names:
+    if any(isinstance(p, Partial) and mesh.size(axis) > 1 for axis, p in enumerate(tensor.placements)):
+        return {"expert_order": "unproven"}
+    extra_names = [name for name in names if name == "ep" or name in extra_parallel_names or f"{name}_fsdp" in names]
+    if not extra_names:
         return None
-    ep_axis = names.index("ep")
+    if len(extra_names) != 1:
+        raise RuntimeError(f"Cannot determine the ExtraParallel axis from mesh names {names}")
+    extra_name = extra_names[0]
+    ep_axis = names.index(extra_name)
     ep = tensor.placements[ep_axis]
+    if isinstance(ep, _StridedShard):
+        return {"expert_order": "unproven"}
     if not isinstance(ep, Shard):
         return None
-    fsdp_axis = names.index("ep_fsdp") if "ep_fsdp" in names else None
+    fsdp_name = f"{extra_name}_fsdp"
+    fsdp_axis = names.index(fsdp_name) if fsdp_name in names else None
     fsdp = tensor.placements[fsdp_axis] if fsdp_axis is not None else Replicate()
     fsdp_dim = fsdp.dim % tensor.ndim if isinstance(fsdp, (Shard, _StridedShard)) else None
     ep_dim = ep.dim % tensor.ndim
     fsdp_size = mesh.size(fsdp_axis) if fsdp_axis is not None else 1
     same_axis = ep_dim == fsdp_dim and mesh.size(ep_axis) > 1 and fsdp_size > 1
+    shard_axes = [
+        (axis, placement.dim % tensor.ndim)
+        for axis, placement in enumerate(tensor.placements)
+        if isinstance(placement, (Shard, _StridedShard)) and mesh.size(axis) > 1
+    ]
+    unknown_overlap = any(
+        axis not in (ep_axis, fsdp_axis)
+        and any(other_axis != axis and other_dim == dim for other_axis, other_dim in shard_axes)
+        for axis, dim in shard_axes
+    )
     canonical = not same_axis or isinstance(fsdp, _StridedShard) or (fsdp_axis is not None and ep_axis < fsdp_axis)
+    order = "canonical" if canonical else "legacy_fsdp_first"
+    unknown_strided = any(
+        axis not in (ep_axis, fsdp_axis) and isinstance(placement, _StridedShard) and mesh.size(axis) > 1
+        for axis, placement in enumerate(tensor.placements)
+    )
+    if (
+        unknown_overlap
+        or unknown_strided
+        or (isinstance(fsdp, _StridedShard) and (fsdp_dim != ep_dim or fsdp.split_factor != mesh.size(ep_axis)))
+    ):
+        order = "unproven"
     return {
         "ep_shard_dim": ep_dim,
         "fsdp_shard_dim": fsdp_dim,
         "ep_size": mesh.size(ep_axis),
         "fsdp_size": fsdp_size,
-        "expert_order": "canonical" if canonical else "legacy_fsdp_first",
+        "expert_order": order,
     }
 
 
-def _no_ep_expert_layout(key, tensor, parallel_state):
-    """Record no-EP provenance only from a known TP1/EP1 VeOmni source."""
-    if "experts" not in key.split(".") or not isinstance(tensor, DTensor) or not tensor.ndim:
+def _ordinary_expert_fqns(model, parallel_state):
+    """Prove which parameters are outside every active ExtraParallel plan."""
+    if not isinstance(model, torch.nn.Module) or not isinstance(getattr(model, "_fqn2spec_info", None), dict):
+        return set()
+    from torch.distributed.checkpoint.state_dict import _get_fqns
+
+    from ..distributed.parallel_plan import ParallelPlan, SpecInfo, get_runtime_parallel_plan
+
+    plan = get_runtime_parallel_plan(model)
+    if not isinstance(plan, ParallelPlan):
+        return set()
+    patterns = [
+        pattern
+        for name, entries in plan.extra_parallel_plan.items()
+        if parallel_state.extra_parallel_sizes.get(name, 1) > 1
+        for pattern in entries
+    ]
+    exact_patterns = {pattern for pattern in patterns if "*" not in pattern}
+    wildcard_patterns = [
+        re.compile("^" + re.escape(pattern).replace(r"\*", ".*") + "$") for pattern in patterns if "*" in pattern
+    ]
+    aliases = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(param), []).append(name)
+    result, owners, ambiguous = set(), {}, set()
+    for owner, raw_names in aliases.items():
+        if not any("experts" in name.split(".") for name in raw_names):
+            continue
+        names = [(name, _get_fqns(model, name)) for name in raw_names]
+        specs = [model._fqn2spec_info.get(name) for name in raw_names]
+        if any(
+            not isinstance(spec, SpecInfo)
+            or not isinstance(spec.placement, Replicate)
+            or parallel_state.extra_parallel_sizes.get(spec.para_name, 1) <= 1
+            or spec.para_fsdp_mesh != parallel_state.extra_parallel_fsdp_device_mesh.get(spec.para_name)
+            for spec in specs
+        ):
+            continue
+        if any(
+            name in exact_patterns or any(pattern.match(name) for pattern in wildcard_patterns) for name in raw_names
+        ):
+            continue
+        if any(len(canonical) != 1 for _, canonical in names):
+            continue
+        for _, canonical in names:
+            fqn = next(iter(canonical))
+            if fqn in owners and owners[fqn] != owner:
+                ambiguous.add(fqn)
+            owners[fqn] = owner
+            result.add(fqn)
+    return result - ambiguous
+
+
+def _key_belongs_to_fqns(key, fqns):
+    if key.startswith("model.") and (key in fqns or key.removeprefix("model.") in fqns):
+        return True
+    if key.startswith("optimizer.state."):
+        rest = key.removeprefix("optimizer.state.")
+        while "." in rest:
+            rest = rest.rsplit(".", 1)[0]
+            if rest in fqns:
+                return True
+    return False
+
+
+def _shared_lora_fqns(model, ordinary_fqns):
+    """Identify the shared LoRA parameters whose EP gradients are synchronized."""
+    from torch.distributed.checkpoint.state_dict import _get_fqns
+
+    from ..lora.moe_layers import LoraSharedExperts, _is_lora_param_name
+
+    shared_ids = {
+        id(param)
+        for module in model.modules()
+        if isinstance(module, LoraSharedExperts)
+        for name, param in module.named_parameters(remove_duplicate=False)
+        if _is_lora_param_name(name) and param.requires_grad
+    }
+    return {
+        fqn
+        for name, param in model.named_parameters(remove_duplicate=False)
+        if id(param) in shared_ids
+        for fqn in _get_fqns(model, name)
+        if fqn in ordinary_fqns
+    }
+
+
+def _no_ep_expert_layout(key, tensor, parallel_state, ordinary_fqns=(), shared_lora_fqns=()):
+    """Prove ordinary FSDP from the actual runtime and, if needed, model plan."""
+    if "experts" not in key.split(".") or not torch.is_tensor(tensor) or not tensor.ndim:
         return None
     if not isinstance(parallel_state, ParallelState):
         return None
+    if parallel_state.tp_size != 1 or not parallel_state.extra_parallel_sizes:
+        return None
+    single_process = dist.get_world_size() == 1 if dist.is_initialized() else os.environ.get("WORLD_SIZE", "1") == "1"
     if (
-        parallel_state.tp_size != 1
-        or parallel_state.extra_parallel_sizes.get("ep") != 1
-        or parallel_state.device_mesh is None
+        parallel_state.device_mesh is None
+        and single_process
+        and all(size == 1 for size in parallel_state.extra_parallel_sizes.values())
+        and (not isinstance(tensor, DTensor) or tensor.device_mesh.size() == 1)
     ):
+        return {
+            "ep_shard_dim": None,
+            "fsdp_shard_dim": None,
+            "ep_size": 1,
+            "fsdp_size": 1,
+            "expert_order": "canonical",
+            "source_kind": "veomni_tp1_no_ep",
+        }
+    ordinary = _key_belongs_to_fqns(key, ordinary_fqns)
+    if any(size != 1 for size in parallel_state.extra_parallel_sizes.values()) and not ordinary:
+        return None
+    if parallel_state.device_mesh is None and (
+        not is_parallel_state_initialized()
+        or parallel_state is not get_parallel_state()
+        or (dist.is_initialized() and dist.get_world_size() != 1)
+    ):
+        return None
+    if not isinstance(tensor, DTensor):
+        if any(size != 1 for size in parallel_state.extra_parallel_sizes.values()):
+            return None
+        return {
+            "ep_shard_dim": None,
+            "fsdp_shard_dim": None,
+            "ep_size": 1,
+            "fsdp_size": 1,
+            "expert_order": "canonical",
+            "source_kind": "veomni_tp1_no_ep",
+        }
+    if parallel_state.device_mesh is None:
         return None
     mesh = tensor.device_mesh
     names = mesh.mesh_dim_names or ()
-    if names not in (
-        ("dp_shard",),
-        ("dp_shard_sp",),
-        ("dp_replicate", "dp_shard"),
-        ("dp_replicate", "dp_shard_sp"),
-    ):
-        return None
-    if mesh != parallel_state.fsdp_mesh or len(tensor.placements) != len(names):
+    normal_fsdp = (
+        names
+        in (
+            ("dp_shard",),
+            ("dp_shard_sp",),
+            ("dp_replicate", "dp_shard"),
+            ("dp_replicate", "dp_shard_sp"),
+        )
+        and mesh == parallel_state.fsdp_mesh
+    )
+    # Only the shared-LoRA wrapper installs the cross-EP gradient hooks needed
+    # to keep replicas on complementary FSDP meshes consistent.
+    shared_lora = _key_belongs_to_fqns(key, shared_lora_fqns)
+    ep_mesh = parallel_state.extra_parallel_fsdp_device_mesh.get("ep")
+    replicated_extra_fsdp = (
+        ordinary and shared_lora and ep_mesh is not None and mesh == ep_mesh[ep_mesh.mesh_dim_names[:-1]]
+    )
+    if not (normal_fsdp or replicated_extra_fsdp) or len(tensor.placements) != len(names):
         return None
     if len(names) == 2 and not isinstance(tensor.placements[0], Replicate):
         return None
@@ -205,53 +366,102 @@ def _no_ep_expert_layout(key, tensor, parallel_state):
     }
 
 
+def _unidentified_same_axis_shards(tensor):
+    """Do not certify a multi-axis layout whose mesh names hide its origin."""
+    if not isinstance(tensor, DTensor) or not tensor.ndim:
+        return False
+    if any(
+        isinstance(placement, (_StridedShard, Partial)) and tensor.device_mesh.size(axis) > 1
+        for axis, placement in enumerate(tensor.placements)
+    ):
+        return True
+    dims = [
+        placement.dim % tensor.ndim
+        for axis, placement in enumerate(tensor.placements)
+        if isinstance(placement, (Shard, _StridedShard)) and tensor.device_mesh.size(axis) > 1
+    ]
+    return len(dims) != len(set(dims))
+
+
+def _verified_rank_local_keys(adapter, *, loading):
+    """Only the proven optimizer adapter can supply rank-local inventory keys."""
+    if (
+        type(adapter) is not _ProvenMultiOptimizerState
+        or adapter._load is not loading
+        or not adapter.should_extra_parallel_aware
+    ):
+        return frozenset()
+    return adapter._verified_rank_local_keys
+
+
 class _ExtraParallelSavePlanner(DefaultSavePlanner):
     """Record per-tensor source layouts in DCP metadata, including optimizer state."""
 
-    def __init__(self, *args, parallel_state=None, **kwargs):
+    def __init__(
+        self, *args, parallel_state=None, source_model=None, adapter_name=None, rank_local_adapter=None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.parallel_state = parallel_state
+        self.rank_local_adapter = rank_local_adapter
+        self.ordinary_fqns = (
+            _ordinary_expert_fqns(source_model, parallel_state)
+            if isinstance(parallel_state, ParallelState)
+            and any(size != 1 for size in parallel_state.extra_parallel_sizes.values())
+            else set()
+        )
+        self.shared_lora_fqns = _shared_lora_fqns(source_model, self.ordinary_fqns) if self.ordinary_fqns else set()
+        if adapter_name is not None and self.ordinary_fqns:
+            from torch.distributed.checkpoint.state_dict import _get_fqns
+
+            from ..lora.state_dict import get_lora_state_dict, strip_adapter_name
+
+            exported = get_lora_state_dict(
+                source_model, adapter_name=adapter_name, config=source_model.get_lora_config()
+            )
+            owners, candidates, shared_candidates = {}, set(), set()
+            for name, param in source_model.named_parameters(remove_duplicate=False):
+                exported_name = strip_adapter_name(name, adapter_name)
+                if exported_name not in exported:
+                    continue
+                owners.setdefault(exported_name, set()).add(id(param))
+                if name in self.ordinary_fqns or _get_fqns(source_model, name) & self.ordinary_fqns:
+                    candidates.add(exported_name)
+                if name in self.shared_lora_fqns or _get_fqns(source_model, name) & self.shared_lora_fqns:
+                    shared_candidates.add(exported_name)
+            self.ordinary_fqns = {name for name in candidates if len(owners[name]) == 1}
+            self.shared_lora_fqns = {name for name in shared_candidates if len(owners[name]) == 1}
 
     def create_local_plan(self):
         plan = super().create_local_plan()
-        layouts = {
-            key: layout
-            for key, value in self.state_dict.items()
-            if (layout := _expert_layout(value) or _no_ep_expert_layout(key, value, self.parallel_state))
-        }
-        unknown = [
-            key
-            for key, value in self.state_dict.items()
-            if "experts" in key.split(".") and isinstance(value, DTensor) and key not in layouts
-        ]
-        return replace(
-            plan,
-            planner_data={
-                **(plan.planner_data or {}),
-                _EXPERT_LAYOUTS_KEY: layouts,
-                _UNKNOWN_EXPERT_LAYOUTS_KEY: unknown,
-            },
-        )
+        layouts = {}
+        rank_local_keys = _verified_rank_local_keys(self.rank_local_adapter, loading=False)
+        for key, value in self.state_dict.items():
+            if key in rank_local_keys:
+                continue
+            extra_names = getattr(self.parallel_state, "extra_parallel_names", ())
+            layout = _expert_layout(value, extra_names) or _no_ep_expert_layout(
+                key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns
+            )
+            if layout is not None:
+                layouts[key] = layout
+            elif _unidentified_same_axis_shards(value) or (
+                "experts" in key.split(".") and torch.is_tensor(value) and value.ndim > 0
+            ):
+                layouts[key] = {"expert_order": "unproven"}
+        return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
 
     def create_global_plan(self, all_plans):
         plans, metadata = super().create_global_plan(all_plans)
         # Reuse DCP's plan exchange; sparse optimizer states may appear on only
         # some ranks. Keep the ordinary FQN -> state-dict path mappings intact.
-        layouts, unknown = {}, set()
+        layouts = {}
         for plan in all_plans:
-            unknown.update(plan.planner_data[_UNKNOWN_EXPERT_LAYOUTS_KEY])
             for key, value in plan.planner_data[_EXPERT_LAYOUTS_KEY].items():
                 if key in layouts and layouts[key] != value:
                     raise RuntimeError(f"Checkpoint tensor {key!r} has inconsistent source layouts across ranks")
                 layouts[key] = value
-        if ambiguous := sorted(layouts.keys() & unknown):
-            raise RuntimeError(f"Checkpoint tensors have both known and unknown source layouts: {ambiguous}")
         metadata.planner_data = {
-            **{
-                key: value
-                for key, value in (metadata.planner_data or {}).items()
-                if key != _UNKNOWN_EXPERT_LAYOUTS_KEY
-            },
+            **(metadata.planner_data or {}),
             _EXPERT_LAYOUTS_KEY: {"version": 1, "tensors": layouts},
         }
         return plans, metadata
@@ -285,6 +495,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         strict_gdn_fp32: bool = False,
         *,
         legacy_expert_source_layout=None,
+        rank_local_adapter=None,
     ):
         super().__init__(allow_partial_load=True)
         if type(strict_gdn_fp32) is not bool:
@@ -294,6 +505,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.expected_save_id = expected_save_id
         self.strict_gdn_fp32 = strict_gdn_fp32
         self.legacy_expert_source_layout = legacy_expert_source_layout
+        self.rank_local_adapter = rank_local_adapter
 
     def create_local_plan(self):
         assert self.metadata is not None
@@ -370,12 +582,15 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     def _validate_expert_layouts(self):
         planner_data = self.metadata.planner_data or {}
         source = planner_data.get(_EXPERT_LAYOUTS_KEY)
+        rank_local_keys = _verified_rank_local_keys(self.rank_local_adapter, loading=True)
         source_tensors = {}
         if source is not None:
             if source["version"] != 1:
                 raise RuntimeError(f"Unsupported checkpoint expert layout version: {source['version']}")
             source_tensors = source["tensors"]
             for key in self.state_dict.keys() & source_tensors.keys():
+                if key in rank_local_keys:
+                    continue
                 if source_tensors[key]["expert_order"] != "canonical":
                     raise RuntimeError(
                         f"Checkpoint tensor {key!r} has noncanonical expert order: {source_tensors[key]}. "
@@ -394,12 +609,22 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             return
 
         for key, value in self.state_dict.items():
-            if key in source_tensors:
+            if key in source_tensors or key in rank_local_keys:
                 continue
             layout = _expert_layout(value)
             saved = self.metadata.state_dict_metadata.get(key)
             if saved is None or not torch.is_tensor(value) or not hasattr(saved, "size"):
                 continue
+            if (
+                source is not None
+                and "experts" in key.split(".")
+                and bool(saved.size)
+                and self.legacy_expert_source_layout is None
+            ):
+                raise RuntimeError(
+                    f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                    "Verify and migrate the original training layout before loading."
+                )
             # Unversioned chunks cannot identify the source EP axis. The
             # target axis is not source evidence: a source sharded along one
             # axis can appear whole along a different target expert axis.
@@ -708,7 +933,7 @@ def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, e
         coordinate = mesh.get_coordinate()
         ep_rank, fsdp_rank = coordinate[ep_dim], coordinate[fsdp_dim]
         extent = shape[ep_shard_dim]
-        if ep_dim < fsdp_dim:
+        if ep_dim < fsdp_dim or ep_size == 1 or isinstance(loaded_tensor.placements[fsdp_dim], _StridedShard):
             # restore_extra_parallel_dim lays same-dimension checkpoints out as
             # EP-outer / FSDP-inner nested chunks. Mirror that layout instead
             # of flat chunking when the extent is not evenly divisible.
@@ -799,6 +1024,16 @@ def _apply_extra_parallel_dim(
         # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
         # when sharding the module in ``torch_parallelize``.
         fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        if (
+            action == "restore"
+            and key_match == "substring"
+            and not isinstance(tensor, DTensor)
+            and fsdp_submesh.size() > 1
+        ):
+            raise RuntimeError(
+                "Plain optimizer state on multiple ExtraParallel FSDP ranks has no proven replica layout; "
+                "use a rank-local optimizer checkpoint codec."
+            )
         # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
         # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
         # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
@@ -966,9 +1201,10 @@ class OptimizerState(Stateful):
             MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False, process_group=None):
         self.model = model
         self.optimizer = optimizer
+        self.process_group = process_group
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self._layout_marker_key = (
@@ -999,8 +1235,15 @@ class OptimizerState(Stateful):
                 "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
             )
             vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                vanilla_optim_sd, "restore"
+            optim_sd_with_extra_parallel_dim, error = None, None
+            try:
+                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                    vanilla_optim_sd, "restore"
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(
+                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
             )
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
                 optim_sd_with_extra_parallel_dim = _namespace_extra_parallel_layout_state(
@@ -1112,6 +1355,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
         self.generation = generation
         self.expected_layout = expected_layout
         self.group = group
+        self._verified_rank_local_keys = frozenset()
 
     def state_dict(self):
         result, error = None, None
@@ -1126,6 +1370,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
                 )
 
                 inventory = rank_inventory(result, current_rank())
+                self._verified_rank_local_keys = frozenset(inventory)
                 result = local_optimizer_state(result, current_rank())
                 result[rank_inventory_key(current_rank())] = "" if self._load else json.dumps(inventory)
             else:
@@ -1221,7 +1466,8 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     the Muon zero-comm layout). The number of placements on the loaded DTensor
     reflects the full saved mesh:
 
-    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * A pure ExtraParallel shard, with only replicated FSDP axes -> return the
+      plain local tensor.
     * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
       the 1D sub-mesh.
     * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
@@ -1229,7 +1475,7 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
+    if num_placements == 1 or all(isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
         tensor_to_put = DTensor.from_local(
@@ -1281,16 +1527,14 @@ def restore_extra_parallel_dim(
         DCP metadata without communication or copying the local tensor.
     """
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
-    if not torch.is_tensor(orgin_tensor):
-        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
-    ndim = orgin_tensor.ndim
-    if not -ndim <= ep_shard_dim < ndim:
-        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-    ep_shard_dim %= ndim
 
     if isinstance(orgin_tensor, DTensor):
+        ndim = orgin_tensor.ndim
+        if not -ndim <= ep_shard_dim < ndim:
+            raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
         if not -ndim <= fsdp_shard_dim < ndim:
             raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+        ep_shard_dim %= ndim
         fsdp_shard_dim %= ndim
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
@@ -1306,12 +1550,17 @@ def restore_extra_parallel_dim(
             placements = [fsdp_placement, Shard(ep_shard_dim)]
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # No FSDP: each rank owns an EP slice. The supplied submesh is the
-        # FSDP mesh; use the final (EP) dimension of the full mesh instead.
+        # A plain model tensor has no FSDP shard. The caller must ensure every
+        # FSDP/HSDP replica for the same ExtraParallel coordinate has identical
+        # values; from_local does not check or synchronize them. Optimizer
+        # states without this guarantee are rejected by the caller.
+        ndim = orgin_tensor.ndim
+        if not -ndim <= ep_shard_dim < ndim:
+            raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
         if fsdp_mesh.mesh_dim_names is None:
-            raise RuntimeError("ExtraParallel mesh must have named dimensions")
-        ep_mesh = fsdp_mesh[fsdp_mesh.mesh_dim_names[-1]]
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(ep_shard_dim)])
+            raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
+        placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -2047,6 +2296,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 slot=WEIGHTS_DIRNAME,
                 timeout_seconds=save_timeout_seconds,
                 parallel_state=parallel_state if parallel_state is not None else get_parallel_state(),
+                source_model=state["model"],
             )
 
             if "optimizer" in state and state["optimizer"] is not None:
@@ -2074,6 +2324,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     slot=OPTIMIZER_DIRNAME,
                     timeout_seconds=save_timeout_seconds,
                     parallel_state=parallel_state if parallel_state is not None else get_parallel_state(),
+                    source_model=state["model"],
                 )
         except BaseException:
             if stage_path is not None and _local_rank() == 0:
@@ -2221,6 +2472,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
                 load=True,
+                process_group=process_group,
             )
 
         wants_optimizer = state.get("optimizer") is not None
@@ -2341,7 +2593,11 @@ class DistributedCheckpointer(CheckpointerBase):
                     group=process_group,
                 )
                 reader = cls._create_storage_reader(optimizer_path)
-                planner = _ModelStrictLoadPlanner(strict_model=False, expected_save_id=optimizer_id)
+                planner = _ModelStrictLoadPlanner(
+                    strict_model=False,
+                    expected_save_id=optimizer_id,
+                    rank_local_adapter=optimizer_state if optimizer_state.should_extra_parallel_aware else None,
+                )
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "preparing proven optimizer checkpoint state", group=process_group)
@@ -2518,6 +2774,7 @@ class DistributedCheckpointer(CheckpointerBase):
         slot: str = WEIGHTS_DIRNAME,
         timeout_seconds: Optional[int] = None,
         parallel_state=None,
+        source_model=None,
     ) -> None:
         """Execute DCP save with optional async support.
 
@@ -2533,17 +2790,25 @@ class DistributedCheckpointer(CheckpointerBase):
         file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
         if file_optimizers is not None and save_async:
             raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
-        planner = (
-            _FileBackedSavePlanner(
-                optimizers=file_optimizers,
+        planner, error = None, None
+        try:
+            optimizer_adapter = save_state.get("optimizer")
+            planner_kwargs = dict(
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
                 parallel_state=parallel_state,
+                source_model=source_model,
+                rank_local_adapter=optimizer_adapter
+                if type(optimizer_adapter) is _ProvenMultiOptimizerState
+                else None,
             )
-            if file_optimizers is not None
-            else _ExtraParallelSavePlanner(
-                dedup_save_to_lowest_rank=save_to_lowest_rank, parallel_state=parallel_state
+            planner = (
+                _FileBackedSavePlanner(optimizers=file_optimizers, **planner_kwargs)
+                if file_optimizers is not None
+                else _ExtraParallelSavePlanner(**planner_kwargs)
             )
-        )
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing the checkpoint save planner")
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save
@@ -2691,12 +2956,55 @@ def _normalize_key(key: str) -> Optional[str]:
         return key[6:]
 
 
+def _validate_expert_export_provenance(metadata: Metadata, model_keys, legacy_expert_source_layout=None) -> None:
+    """Reject expert layouts that a plain CPU export cannot prove safe."""
+    planner_data = metadata.planner_data or {}
+    recorded = planner_data.get(_EXPERT_LAYOUTS_KEY)
+    layouts = {}
+    if recorded is not None:
+        if recorded["version"] != 1:
+            raise RuntimeError(f"Unsupported checkpoint expert layout version: {recorded['version']}")
+        layouts = recorded["tensors"]
+        for key in model_keys & layouts.keys():
+            if layouts[key]["expert_order"] != "canonical":
+                raise RuntimeError(
+                    f"Checkpoint tensor {key!r} has noncanonical expert order; migrate it before export"
+                )
+
+    marker_key = "model." + _extra_parallel_layout_key({})
+    if marker_key in metadata.state_dict_metadata or planner_data.get("__veomni_ep_first_layout__") == 1:
+        return
+
+    # An old expert-only chunk may use either EP-first or FSDP-first order.
+    # Plain CPU export targets do not carry the EP mesh needed to distinguish it.
+    for key in model_keys:
+        tensor_metadata = metadata.state_dict_metadata[key]
+        shape = getattr(tensor_metadata, "size", ())
+        if "experts" not in key.split(".") or not shape or key in layouts:
+            continue
+        if recorded is not None and legacy_expert_source_layout is None:
+            raise RuntimeError(
+                f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                "Verify and migrate the original training layout before exporting."
+            )
+        if legacy_expert_source_layout is None and not all(
+            tuple(chunk.sizes) == tuple(shape) for chunk in tensor_metadata.chunks
+        ):
+            raise RuntimeError(
+                f"Cannot determine source expert order for {key!r} in this unversioned checkpoint. "
+                "Verify and migrate the original training layout before exporting."
+            )
+
+
 def _get_sharding_plan(
     checkpoint_path: Union[str, os.PathLike],
     shard_size: int = None,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
     drop_hf_keys: Optional[Set[str]] = None,
     preserve_fp32_keys: Optional[Set[str]] = None,
+    *,
+    legacy_expert_source_layout=None,
+    include_hf_key=None,
 ):
     """
     Create sharding plan from checkpoint metadata without loading weights.
@@ -2706,6 +3014,7 @@ def _get_sharding_plan(
         total_size: Total size in bytes
         all_dcp_keys: All valid DCP model keys
     """
+    _validate_legacy_expert_source_layout(legacy_expert_source_layout)
     reader = FileSystemReader(checkpoint_path)
     metadata = reader.read_metadata()
 
@@ -2732,6 +3041,8 @@ def _get_sharding_plan(
     for key, tensor_meta in metadata.state_dict_metadata.items():
         hf_key = _normalize_key(key)
         if hf_key:
+            if include_hf_key is not None and not include_hf_key(hf_key):
+                continue
             if drop_hf_keys and hf_key in drop_hf_keys:
                 dropped += 1
                 continue
@@ -2764,6 +3075,8 @@ def _get_sharding_plan(
             tensor_infos.append({"dcp_key": key, "hf_key": hf_key, "size": byte_size, "metadata": tensor_meta})
             all_dcp_keys.append(key)
 
+    _validate_expert_export_provenance(metadata, set(all_dcp_keys), legacy_expert_source_layout)
+
     if dropped:
         logger.info(f"Excluded {dropped} tensor(s) named by `drop_hf_keys` from the plan")
 
@@ -2792,6 +3105,8 @@ def _get_sharding_plan(
     if current_shard:
         shards.append(current_shard)
     if shard_size is None:
+        if not shards and include_hf_key is not None:
+            return {}, total_size, all_dcp_keys
         assert len(shards) == 1, "Shard size None should result in a single shard"
         shards = shards[0]
     return shards, total_size, all_dcp_keys
@@ -2883,7 +3198,7 @@ def dcp_to_torch_state_dict(
     .. warning::
         To avoid OOM, it's recommended to only run this function on a single rank.
     """
-    shard, _, _ = _get_sharding_plan(save_checkpoint_path)
+    shard, _, _ = _get_sharding_plan(save_checkpoint_path, legacy_expert_source_layout=legacy_expert_source_layout)
 
     processed_dict = _process_shard(
         shard, save_checkpoint_path, legacy_expert_source_layout=legacy_expert_source_layout

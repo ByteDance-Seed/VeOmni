@@ -158,9 +158,9 @@ def _unproven_source_worker(rank, directory, mode, endpoint):
             planner=_ExtraParallelSavePlanner(parallel_state=parallel_state),
         )
         layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
-        assert key not in layouts
+        assert layouts[key]["expert_order"] == "unproven"
         target = {"model": {"layer.experts.weight": torch.zeros(8, 4)}}
-        with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+        with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
             dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
         assert target["model"]["layer.experts.weight"].count_nonzero() == 0
     finally:
