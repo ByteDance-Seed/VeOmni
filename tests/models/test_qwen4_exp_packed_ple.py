@@ -586,6 +586,7 @@ def test_packed_cache_rejection_precedes_mutation(target):
 
 
 def lookup_local_rows_method():
+    """Return the production local-row lookup extracted from the patchgen config."""
     return production_method(
         "_lookup_local_rows",
         "PatchedQwen4ExpTextNGramEmbedding",
@@ -594,6 +595,7 @@ def lookup_local_rows_method():
 
 
 def local_rows_embedding(num_shards=4, rows=5, hidden=3, seed=2027):
+    """Build a stub n-gram embedding holding independent per-shard tables."""
     from types import SimpleNamespace
 
     torch.manual_seed(seed)
@@ -608,6 +610,7 @@ def local_rows_embedding(num_shards=4, rows=5, hidden=3, seed=2027):
     ],
 )
 def test_production_lookup_local_rows_matches_per_row_gather(shard_ids, row_ids):
+    """Match a per-row gather reference, in request order, including its gradients."""
     embeddings = local_rows_embedding()
     expected_embeddings = copy.deepcopy(embeddings)
     shard_ids = torch.tensor(shard_ids)
@@ -628,6 +631,7 @@ def test_production_lookup_local_rows_matches_per_row_gather(shard_ids, row_ids)
 
 
 def test_production_lookup_local_rows_handles_empty_input_and_output_dtype():
+    """Return an empty result for no requests and honour the requested output dtype."""
     embeddings = local_rows_embedding()
     method = lookup_local_rows_method()
 

@@ -1203,6 +1203,7 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         row_ids: torch.Tensor,
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        """Gather each request's row from the checkpoint-native shard that owns it."""
         first_embedding = self.ngram_embedding["shard_0"]
         first_weight = first_embedding.weight
         if hasattr(first_weight, "to_local"):
