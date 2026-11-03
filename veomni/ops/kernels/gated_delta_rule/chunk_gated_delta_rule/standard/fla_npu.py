@@ -14,10 +14,13 @@
 
 """standard chunk_gated_delta_rule AscendC pair.
 
-Heavy compute is ``torch.ops.npu.*`` from ``fla_npu``. Glue around those
-kernels lives in ``vendor/triton_core`` and ``vendor/triton``.
-The kernel contract is FLA ``[B, T, H, D]``; the fused ``torch.ops.npu``
-path wants ``[B, H, T, D]``.
+Heavy compute is ``fla_npu.ops.ascendc`` (fla_npu 67dc99d). ``import fla_npu``
+does not register ``torch.ops.npu.*``. Glue around those kernels lives in
+``vendor/triton_core`` and ``vendor/triton``.
+The kernel contract is FLA ``[B, T, H, D]``; the fused ops want ``[B, H, T, D]``.
+``npu_chunk_gated_delta_rule_fwd_h`` takes ``state_v_first=False`` (layout
+``[..., K, V]``) and no longer accepts ``save_new_value`` / ``use_exp2`` /
+``transpose_state_layout``.
 """
 
 from __future__ import annotations
@@ -195,6 +198,9 @@ def precompute_varlen_metadata(
     """
     if cu_seqlens.device.type != "cpu":
         cu_seqlens = cu_seqlens.cpu()
+    # Match `_ensure_varlen_metadata`: chunk-index tables there are built from the
+    # int64 cumulative lengths, so hoist with the same dtype to stay identical.
+    cu_seqlens = cu_seqlens.to(dtype=torch.int64)
     cu_seqlens_list = _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
     cumsum_block_size = _next_power_of_2((1 << 17) // max(1, int(num_heads) * int(chunk_size)))
@@ -230,19 +236,16 @@ def _chunk_list(
     return chunk_indices_list.get(str(chunk_size))
 
 
-def _ensure_fla_npu_registered() -> None:
-    """Import ``fla_npu`` for its ``torch.ops.npu.*`` GDN op registration.
+def _fla_ops():
+    """Return ``fla_npu.ops.ascendc``.
 
     Deferred off module top so ``precompute_varlen_metadata`` and the other
-    fla_npu-free helpers can load on NPU images that only install ``fla_npu``
-    for this backend. Idempotent: Python caches the module in ``sys.modules``.
+    fla_npu-free helpers can load on images without ``fla_npu``. fla_npu
+    67dc99d does not register ``torch.ops.npu.*`` on import.
     """
     try:
         import fla_npu  # noqa: F401
-        # fla_npu 67dc99d no longer registers torch.ops.npu.* on import; the
-        # legacy dispatcher ops this backend calls are opt-in now.
-        if hasattr(fla_npu, "is_legacy_torch_ops_loaded") and not fla_npu.is_legacy_torch_ops_loaded():
-            fla_npu.load_legacy_torch_ops()
+        from fla_npu.ops import ascendc as ascendc_ops
     except ModuleNotFoundError as error:
         if error.name != "fla_npu":
             raise
@@ -252,6 +255,12 @@ def _ensure_fla_npu_registered() -> None:
             "(https://github.com/flashserve/flash-linear-attention-npu), or set "
             "chunk_gated_delta_rule_implementation to 'triton' (vendored Triton-Ascend) or 'eager'."
         ) from error
+    return ascendc_ops
+
+
+def _ensure_fla_npu_registered() -> None:
+    """Resolve ``fla_npu.ops.ascendc``, raising if the package is missing."""
+    _fla_ops()
 
 
 def _chunk_fwd(
@@ -270,7 +279,7 @@ def _chunk_fwd(
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
     """Run the AscendC forward stages and return backward intermediates."""
-    _ensure_fla_npu_registered()
+    ops = _fla_ops()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
     from ...vendor.triton.utils import is_arch35
@@ -304,7 +313,7 @@ def _chunk_fwd(
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
     a = a.transpose(1, 2).contiguous()
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    w, u = ops.npu_recompute_w_u_fwd(
         k,
         v,
         beta,
@@ -315,7 +324,7 @@ def _chunk_fwd(
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
-    h, v_new, final_state = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
+    h, v_new, final_state = ops.npu_chunk_gated_delta_rule_fwd_h(
         k,
         w,
         u,
@@ -324,15 +333,13 @@ def _chunk_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
-        save_new_value=True,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        use_exp2=False,
-        transpose_state_layout=False,
+        state_v_first=False,
     )
     if not output_final_state:
         final_state = None
-    output = torch.ops.npu.npu_chunk_fwd_o(
+    output = ops.npu_chunk_fwd_o(
         q,
         k,
         v_new,
@@ -367,13 +374,13 @@ def _chunk_bwd(
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run the AscendC backward stages for the chunked recurrence."""
-    _ensure_fla_npu_registered()
+    ops = _fla_ops()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
 
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    w, u = ops.npu_recompute_w_u_fwd(
         k,
         v,
         beta,
@@ -385,7 +392,7 @@ def _chunk_bwd(
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
     grad_output = grad_output.transpose(1, 2).contiguous()
-    h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
+    h, v_new, _ = ops.npu_chunk_gated_delta_rule_fwd_h(
         k,
         w,
         u,
@@ -394,13 +401,11 @@ def _chunk_bwd(
         initial_state=initial_state,
         output_final_state=False,
         chunk_size=chunk_size,
-        save_new_value=True,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        use_exp2=False,
-        transpose_state_layout=False,
+        state_v_first=False,
     )
-    grad_v = torch.ops.npu.npu_chunk_bwd_dv_local(
+    grad_v = ops.npu_chunk_bwd_dv_local(
         q,
         k,
         grad_output,
@@ -412,7 +417,7 @@ def _chunk_bwd(
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
-    _dh, _dh0, grad_v = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
+    _dh, _dh0, grad_v = ops.npu_chunk_gated_delta_rule_bwd_dhu(
         q,
         k,
         w,
@@ -429,7 +434,7 @@ def _chunk_bwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    grad_q, grad_k, grad_w, grad_g = torch.ops.npu.npu_chunk_bwd_dqkwg(
+    grad_q, grad_k, grad_w, grad_g = ops.npu_chunk_bwd_dqkwg(
         q,
         k,
         v_new,
@@ -447,7 +452,7 @@ def _chunk_bwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    grad_a = torch.ops.npu.npu_prepare_wy_repr_bwd_da(
+    grad_a = ops.npu_prepare_wy_repr_bwd_da(
         k,
         v,
         beta.float(),
@@ -459,7 +464,7 @@ def _chunk_bwd(
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
-    grad_k2, grad_v, grad_beta, grad_g2 = torch.ops.npu.npu_prepare_wy_repr_bwd_full(
+    grad_k2, grad_v, grad_beta, grad_g2 = ops.npu_prepare_wy_repr_bwd_full(
         k,
         v,
         beta,
