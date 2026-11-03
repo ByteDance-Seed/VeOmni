@@ -1166,8 +1166,8 @@ def _ep_shared_lora_worker(rank, root, mode, endpoint):
         model = _lora_model(config)
         base = model.base_model.model
         assert isinstance(base.experts, LoraSharedExperts)
-        if mode == "rank_divergent_bias":
-            base.experts.bias = torch.nn.Parameter(torch.full((8, 8), float(rank)))
+        if mode == "unproven_bias":
+            base.experts.bias = torch.nn.Parameter(torch.ones(8, 8))
         base.get_parallel_plan = lambda: ParallelPlan(
             {"ep": {"experts.gate_up_proj": Shard(0), "experts.down_proj": Shard(0)}}
         )
@@ -1210,7 +1210,7 @@ def _ep_shared_lora_worker(rank, root, mode, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [2])
-@pytest.mark.parametrize("mode", ["valid", "plan_conflict", "rank_divergent_bias"])
+@pytest.mark.parametrize("mode", ["valid", "plan_conflict", "unproven_bias"])
 def test_ep_replicated_shared_expert_lora_export(world, mode, tmp_path):
     spawn_with_rendezvous(_ep_shared_lora_worker, args=(str(tmp_path / "adapter"), mode), nprocs=world)
 
