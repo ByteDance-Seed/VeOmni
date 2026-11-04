@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -29,7 +30,7 @@ from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -1116,3 +1117,68 @@ def test_convolution_boundary_cache_inference_to_training():
     SaveBoundaries.apply(value).sum().backward()
     assert value.grad.item() == 1
     _cached_boundary_tensor.cache_clear()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
+def test_causal_conv1d_npu_boundary_cache_inference_to_training():
+    """A real NPU cache hit after inference must remain usable by backward."""
+    explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    require_npu = explicitly_required or (
+        bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
+    )
+    if not IS_NPU_AVAILABLE:
+        if require_npu:
+            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
+        pytest.skip("causal_conv1d npu needs torch_npu")
+    try:
+        _require_npu_gdr_dependencies()
+    except pytest.skip.Exception as exc:
+        if require_npu:
+            pytest.fail(f"NPU causal convolution dependencies are missing: {exc}")
+        raise
+
+    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import (
+        _cached_boundary_tensor,
+        _stage_boundaries,
+    )
+    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
+
+    if is_arch35():
+        if explicitly_required:
+            pytest.fail("vendored NPU causal_conv1d does not support arch35")
+        pytest.skip("vendored NPU causal_conv1d does not support arch35")
+
+    eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
+    native = resolve_op("causal_conv1d", "standard", "triton").wrapper
+    torch.manual_seed(137)
+    x = torch.randn(1, 64, 256, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(256, 4, device="npu", dtype=torch.bfloat16)
+    bias = torch.randn(256, device="npu", dtype=torch.bfloat16)
+    boundaries = torch.tensor([0, 17, 64], dtype=torch.int32)
+
+    _cached_boundary_tensor.cache_clear()
+    try:
+        with torch.inference_mode():
+            native(x, weight, bias, activation="silu", cu_seqlens=boundaries)
+        assert _cached_boundary_tensor.cache_info().misses == 1
+        staged = _stage_boundaries(boundaries, x.device)
+        assert staged.device == x.device and not staged.is_inference()
+
+        x_native, weight_native, bias_native = make_grad_leaves(x, weight, bias)
+        actual = native(x_native, weight_native, bias_native, activation="silu", cu_seqlens=boundaries)
+        assert _cached_boundary_tensor.cache_info().hits >= 2
+
+        x_ref, weight_ref, bias_ref = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
+        expected = torch.cat(
+            [eager(part, weight_ref, bias_ref, activation="silu") for part in x_ref.split((17, 47), dim=1)], dim=1
+        )
+        torch.testing.assert_close(actual.float().cpu(), expected.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+        grad_output = torch.randn_like(actual)
+        actual.backward(grad_output)
+        expected.backward(grad_output.cpu().double())
+        for got, ref in zip((x_native, weight_native, bias_native), (x_ref, weight_ref, bias_ref), strict=True):
+            torch.testing.assert_close(
+                got.grad.float().cpu(), ref.grad.float(), atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL
+            )
+    finally:
+        _cached_boundary_tensor.cache_clear()
