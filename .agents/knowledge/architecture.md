@@ -351,3 +351,27 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
+
+### DeepGEMM FP8 expert parameter transport
+
+`FSDPConfig.expert_weight_fp8_all_gather` flows through `VeOmniModelRuntime` and
+`build_parallelize_model` into `parallelize_model_fsdp2`. After materialization,
+`distributed/fsdp2/fp8_all_gather.py` attaches native FSDP pre/post all-gather
+hooks to expert parameters selected by their actual DeepGEMM op handle.
+Before wrapping, the builders resolve the flag against those same handles:
+no matches means no FP8 hooks or FP8-specific compatibility checks, for all
+model scopes. Selected experts still require BF16 FSDP2 without CPU offload
+or compilation. Config parsing always validates the flag's boolean type.
+The pre-hook quantizes local shards and separately gathers compact scales;
+native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
+`GroupedLinear`, preserving BF16-facing autograd and high-precision master
+shards. Native FSDP manages both payload and scale storage on reshard.
+Synchronous activation offload skips the opaque weight container and leaves
+that lifecycle to FSDP, while ordinary saved activations still offload.
+
+`FSDPConfig.expert_fsdp_shard_dim` follows the same runtime path and optionally
+overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
+`Shard(0)` avoids hidden-dimension gather/scatter reordering; the selected
+dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
+uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
+GPUs and eager PyTorch on other devices, retaining FP32 accumulation.

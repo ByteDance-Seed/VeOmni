@@ -845,3 +845,14 @@ Temporary packing storage trades memory traffic for fewer collective launches.
 `tests/models/test_qwen4_exp_gdn_exchange.py` covers exact CPU/Gloo permutations,
 projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
 CPU tests do not establish native throughput or numerical acceptance.
+
+### EP-weighted token combine
+
+The shared EP dispatcher uses `moe_unpermute/standard/triton` on NVIDIA GPUs
+and `moe_unpermute/standard/eager` elsewhere or when deterministic algorithms
+are enabled. This internal device selection
+applies to BF16 and FP8 MoE backends and has no separate YAML switch. The fused
+implementation requires Triton and does not silently fall back if it is
+unavailable. It preserves promoted-dtype multiplication followed by FP32
+scatter accumulation; the EP dispatcher casts the combined result back to the
+original token dtype. See [FP8 MoE](deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine).
