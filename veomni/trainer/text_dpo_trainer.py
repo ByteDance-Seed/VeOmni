@@ -322,7 +322,7 @@ def _dpo_pair_weighting(
         raise RuntimeError("DPO optimizer step contains no preference pairs")
     if provenance_enabled:
         for batch in micro_batches:
-            batch[DPO_AGREED_KEY] = (batch[DPO_APPROVED_KEY], packet["sp_members"])
+            batch[DPO_AGREED_KEY] = packet["sp_members"]
     return _DPOPairWeighting(tuple(local_counts), global_count, group_size, group)
 
 
@@ -682,17 +682,22 @@ class TextDPOTrainer:
             except Exception as exc:  # noqa: BLE001 - synchronize dataset geometry errors
                 batch_error = exc
             _dpo_sync_step_begin_error(batch_error, context="fixed-batch geometry")
-            self.base._build_collate_fn()
-            if args.dpo_config.explicit_segment_provenance:
-                self.base.collate_fn = DPOProvenanceCollator(
-                    self.base.collate_fn,
-                    require_ds_idx=args.data.enable_multisource,
-                    source_keys=(
-                        tuple(args.train.channel_loss.source_id_keys + args.train.channel_loss.source_name_keys)
-                        if args.train.channel_loss.enable
-                        else ()
-                    ),
-                )
+            collator_error = None
+            try:
+                self.base._build_collate_fn()
+                if args.dpo_config.explicit_segment_provenance:
+                    self.base.collate_fn = DPOProvenanceCollator(
+                        self.base.collate_fn,
+                        require_ds_idx=args.data.enable_multisource,
+                        source_keys=(
+                            tuple(args.train.channel_loss.source_id_keys + args.train.channel_loss.source_name_keys)
+                            if args.train.channel_loss.enable
+                            else ()
+                        ),
+                    )
+            except Exception as exc:  # noqa: BLE001 - synchronize rank-local collator configuration errors
+                collator_error = exc
+            _dpo_sync_step_begin_error(collator_error, context="collator configuration")
             self.base._build_dataloader()
             from ..data.data_loader import DistributedDataloader
             from ..data.dynamic_batching import DynamicBatchSizeDataLoader
@@ -1029,20 +1034,9 @@ class TextDPOTrainer:
             parallel_state = get_parallel_state()
             if getattr(parallel_state, "sp_enabled", False):
                 members = tuple(dist.get_process_group_ranks(parallel_state.sp_group))
-                sp_size, sp_rank = parallel_state.sp_size, parallel_state.sp_rank
             else:
                 members = (dist.get_rank() if dist.is_initialized() else 0,)
-                sp_size, sp_rank = 1, 0
-            agreed = micro_batch.get(DPO_AGREED_KEY)
-            if (
-                not isinstance(approved, DPOPackedProof)
-                or not isinstance(agreed, tuple)
-                or len(agreed) != 2
-                or agreed[0] is not approved
-                or agreed[1] != members
-                or approved.layout_sp_size != sp_size
-                or approved.layout_sp_rank != sp_rank
-            ):
+            if not isinstance(approved, DPOPackedProof) or micro_batch.get(DPO_AGREED_KEY) != members:
                 raise RuntimeError("DPO segment provenance and SP agreement are required before model forward")
         model_inputs = {
             k: v

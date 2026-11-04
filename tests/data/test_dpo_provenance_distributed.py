@@ -29,6 +29,37 @@ from veomni.utils.dpo_provenance import (
 )
 
 
+def _stale_collator_worker(rank, endpoint):
+    import veomni.data.data_collator as data_collator
+    from veomni.data.dpo_collator import DPOProvenanceCollator
+    from veomni.trainer.text_dpo_trainer import _dpo_sync_step_begin_error
+
+    dist.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=datetime.timedelta(seconds=30)
+    )
+    try:
+        data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=0)
+        collator = data_collator.MainCollator()
+        data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=rank)
+        error = None
+        try:
+            DPOProvenanceCollator(collator)
+        except Exception as exc:
+            error = exc
+        with pytest.raises(RuntimeError, match="collator configuration failed"):
+            _dpo_sync_step_begin_error(error, context="collator configuration")
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_stale_collator_topology_is_rejected_on_all_ranks():
+    spawn_with_rendezvous(_stale_collator_worker, nprocs=2)
+
+
 def _worker(rank, world_size, scenario, endpoint):
     dist.init_process_group(
         "gloo",

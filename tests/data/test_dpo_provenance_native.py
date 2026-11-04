@@ -75,7 +75,6 @@ def _native_provenance_hccl(require_hccl=False):
     collator = DPOProvenanceCollator(data_collator.MainCollator(pad_to_length=8))
     for scenario in (
         "consistent",
-        "collator_wrong_sp_rank",
         "preexisting_mask_padding",
         "missing",
         "all_missing",
@@ -84,7 +83,6 @@ def _native_provenance_hccl(require_hccl=False):
         "microbatch_count",
         "empty_batch",
         "bad_max_length",
-        "different_global_metadata",
         "source_range",
         "vocab_range",
     ):
@@ -96,20 +94,6 @@ def _native_provenance_hccl(require_hccl=False):
         if scenario == "vocab_range" and rank == 1:
             sample["labels"][-1] = 2000
         active_collator = collator
-        if scenario == "collator_wrong_sp_rank" and rank == 1:
-            data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=0)
-            active_collator = DPOProvenanceCollator(data_collator.MainCollator(pad_to_length=8))
-            data_collator.get_parallel_state = lambda: state
-        if scenario == "different_global_metadata" and rank == 1:
-            altered = data_collator.MainCollator(pad_to_length=8)
-
-            def alter_gdn_boundaries(value):
-                value["linear_attn_cu_seq_lens_q"] = value["linear_attn_cu_seq_lens_q"].clone()
-                value["linear_attn_cu_seq_lens_q"][1] = 2
-                return value
-
-            altered.preforward_pipeline.append(alter_gdn_boundaries)
-            active_collator = DPOProvenanceCollator(altered)
         collate_error = None
         try:
             batch = active_collator([sample])

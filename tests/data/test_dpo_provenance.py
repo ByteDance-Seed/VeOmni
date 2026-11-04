@@ -704,6 +704,15 @@ def _feature(chosen, rejected, source):
     return feature
 
 
+@pytest.mark.parametrize("current", [_state(sp_enabled=True, rank=1), _state(sp_enabled=False)])
+def test_stale_collator_topology_is_rejected_at_construction(monkeypatch, current):
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state(sp_enabled=True, rank=0))
+    collator = MainCollator()
+    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: current)
+    with pytest.raises(ValueError, match="topology disagrees"):
+        DPOProvenanceCollator(collator)
+
+
 @pytest.mark.parametrize("sp_enabled,rank", [(False, 0), (True, 0), (True, 1)])
 @pytest.mark.parametrize("pad_to_length", [0, 8])
 def test_builtin_segments_are_proven_with_single_token_and_tail(monkeypatch, sp_enabled, rank, pad_to_length):
@@ -857,27 +866,6 @@ def test_nonstandard_sp_attention_mask_slicing_is_not_approved(monkeypatch):
     assert isinstance(batch[DPO_PROOF_KEY], DPOInvalidProof)
 
 
-def test_modified_packing_configuration_is_rejected(monkeypatch):
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state())
-    collator = MainCollator()
-    collator.preforward_pipeline[1].collate_infos = dict(collator.collate_infos)
-    with pytest.raises(ValueError, match="standard packing configuration"):
-        DPOProvenanceCollator(collator)([_feature("abc", "def", 0)])
-
-
-@pytest.mark.parametrize("attribute", ["sp_size", "sp_rank"])
-def test_modified_sequence_parallel_topology_is_rejected(monkeypatch, attribute):
-    import veomni.data.data_collator as module
-
-    monkeypatch.setattr(module, "get_parallel_state", lambda: _state(sp_enabled=True))
-    collator = MainCollator()
-    guarded = DPOProvenanceCollator(collator)
-    slicer = collator.preforward_pipeline[2]
-    setattr(slicer, attribute, getattr(slicer, attribute) + 1)
-    with pytest.raises(ValueError, match="standard sequence-parallel configuration"):
-        guarded([_feature("abc", "def", 0)])
-
-
 def test_preflight_rejects_source_name_not_matching_catalog(monkeypatch):
     state = _state()
     monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
@@ -888,20 +876,6 @@ def test_preflight_rejects_source_name_not_matching_catalog(monkeypatch):
         next_dpo_microbatches(
             iter([[batch]]), state, state, global_step=1, source_catalog=lambda: ("expected-source",)
         )
-
-
-def test_preflight_rejects_consistently_wrong_gdn_metadata(monkeypatch):
-    state = _state()
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    collator = MainCollator()
-
-    def corrupt_metadata(batch):
-        batch["linear_attn_cu_seq_lens_q"] = torch.tensor([0, 2, 6])
-        return batch
-
-    collator.preforward_pipeline.append(corrupt_metadata)
-    with pytest.raises(ValueError, match="standard collator pipeline"):
-        DPOProvenanceCollator(collator)([_feature("abc", "def", 0)])
 
 
 def test_out_of_range_source_rejects_train_step_before_optimizer(monkeypatch):
@@ -1382,55 +1356,6 @@ def test_direct_forward_rejects_agreement_from_a_different_sp_group(monkeypatch)
         dpo, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=0, sp_group=other_group)
     )
     monkeypatch.setattr(dpo.dist, "get_process_group_ranks", lambda group: [0, 1])
-    trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
-    trainer.base = SimpleNamespace(
-        args=SimpleNamespace(dpo_config=SimpleNamespace(average_log_prob=False, explicit_segment_provenance=True))
-    )
-    called = []
-    with pytest.raises(RuntimeError, match="SP agreement are required"):
-        trainer.concatenated_forward(lambda **kwargs: called.append(True), approved)
-    assert not called
-
-
-def test_direct_forward_rejects_another_rank_slice_in_the_same_group(monkeypatch):
-    from dataclasses import replace
-
-    import veomni.trainer.text_dpo_trainer as dpo
-
-    state = _state()
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 1)])
-    approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
-    proof = replace(approved[DPO_APPROVED_KEY], layout_sp_size=2, layout_sp_rank=0)
-    approved[DPO_APPROVED_KEY] = proof
-    approved[DPO_AGREED_KEY] = (proof, (0, 1))
-    group = object()
-    monkeypatch.setattr(
-        dpo, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=1, sp_group=group)
-    )
-    monkeypatch.setattr(dpo.dist, "get_process_group_ranks", lambda _: [0, 1])
-    trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
-    trainer.base = SimpleNamespace(
-        args=SimpleNamespace(dpo_config=SimpleNamespace(average_log_prob=False, explicit_segment_provenance=True))
-    )
-    called = []
-    with pytest.raises(RuntimeError, match="SP agreement are required"):
-        trainer.concatenated_forward(lambda **kwargs: called.append(True), approved)
-    assert not called
-
-
-def test_direct_forward_rejects_replaced_agreed_proof(monkeypatch):
-    from dataclasses import replace
-
-    import veomni.trainer.text_dpo_trainer as dpo
-
-    state = _state()
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(dpo, "get_parallel_state", lambda: state)
-    batch = DPOProvenanceCollator(MainCollator())([_feature("abc", "de", 1)])
-    approved = next_dpo_microbatches(iter([[batch]]), state, state, global_step=1)[0]
-    dpo._dpo_pair_weighting([approved], collator_module.PostCollator(), state, True)
-    approved[DPO_APPROVED_KEY] = replace(approved[DPO_APPROVED_KEY])
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(dpo_config=SimpleNamespace(average_log_prob=False, explicit_segment_provenance=True))

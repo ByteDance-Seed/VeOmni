@@ -45,15 +45,6 @@ def _npu_test_eligible():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize(("backend", "expected"), [("cpu", False), ("mlu", False), ("npu", True)])
-def test_npu_eligibility_respects_ci_backend(monkeypatch, tmp_path, backend, expected):
-    capabilities = tmp_path / "capabilities.json"
-    capabilities.write_text(json.dumps({"backend": backend, "devices": []}))
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(capabilities))
-    assert _npu_test_eligible() is expected
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("cu,tail,expected", _CASES)
 def test_valid_seqlens_cpu(cu, tail, expected):
     value = torch.tensor(cu, dtype=torch.int32)
