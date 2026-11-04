@@ -35,9 +35,6 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-
 def _layout_worker(rank, world, directory, rendezvous):
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=180)
@@ -107,6 +104,22 @@ def _layout_worker(rank, world, directory, rendezvous):
             local_dt = drop_extra_parallel_dim(loaded, submesh, 1 - source_dim)
             torch.testing.assert_close(local_dt.full_tensor(), ep_weight, rtol=0, atol=0)
 
+        # An unversioned row-sharded source can have identical chunks to a
+        # misordered composite TP+EP source. Require source layout evidence.
+        path = directory + "legacy_rows"
+        dcp.save({"model": {"weight": wrap(1)}}, checkpoint_id=path)
+        for target_dim in (0, 1):
+            target = {"model": {"weight": wrap(target_dim, empty=True)}}
+            with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
+                dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
+            assert target["model"]["weight"].to_local().count_nonzero() == 0
+            dcp.load(
+                target,
+                checkpoint_id=path,
+                planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"),
+            )
+            torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
+
         if world == 4:
             from veomni.distributed.parallel_plan import SpecInfo
 
@@ -130,22 +143,6 @@ def _layout_worker(rank, world, directory, rendezvous):
                 target = model_for(torch.zeros_like(ep_weight))
                 DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
                 torch.testing.assert_close(target.weight.to_local(), source.weight.to_local(), rtol=0, atol=0)
-
-        # Unversioned chunks may be indistinguishable from a misordered
-        # composite TP+EP source, so require independent source evidence.
-        path = directory + "legacy_rows"
-        dcp.save({"model": {"weight": wrap(1)}}, checkpoint_id=path)
-        for target_dim in (0, 1):
-            target = {"model": {"weight": wrap(target_dim, empty=True)}}
-            with pytest.raises(dcp.CheckpointException, match="Cannot determine source expert order"):
-                dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
-            assert target["model"]["weight"].to_local().count_nonzero() == 0
-            dcp.load(
-                target,
-                checkpoint_id=path,
-                planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"),
-            )
-            torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
 
         # The public model-only load/export paths accept the same independently
         # verified declaration; unknown source and optimizer restore stay closed.
@@ -271,6 +268,9 @@ def _layout_worker(rank, world, directory, rendezvous):
                 assert local.count_nonzero() == 0
     finally:
         dist.destroy_process_group()
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))

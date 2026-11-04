@@ -275,6 +275,11 @@ reuse it. A custom HF-only exporter will also receive a DCP save at that HF
 step. Callers that save DCP outside the trainer callback must coordinate that
 save with the trainer's cadence to avoid writing the same step twice.
 
+Checkpoints from older layouts have no manifest; discovery falls back to a
+`.metadata` at the step root, which is what marked those steps complete, but
+only while the step is still entirely pre-split. See
+[Resuming older checkpoints](#resuming-older-checkpoints).
+
 When resuming a legacy Adam checkpoint into its original output directory, the
 trainer reuses an unchanged same-step checkpoint only after a successful model
 and optimizer load and validation of the completed manifest, RNG state and
@@ -285,11 +290,6 @@ If those cannot be established, use a different output directory: this avoids
 overwriting the source checkpoint during an immediate epoch-end or HF export.
 This guard does not prove optimizer group identity or claim exact recovery for
 legacy optimizer formats.
-
-Checkpoints from older layouts have no manifest; discovery falls back to a
-`.metadata` at the step root, which is what marked those steps complete, but
-only while the step is still entirely pre-split. See
-[Resuming older checkpoints](#resuming-older-checkpoints).
 
 SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
 `ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half

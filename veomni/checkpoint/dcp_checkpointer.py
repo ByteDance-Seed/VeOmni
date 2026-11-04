@@ -2679,8 +2679,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 storage_reader=model_reader,
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(
-                    strict_model=not trainable_only,
-                    legacy_expert_source_layout=legacy_expert_source_layout,
+                    strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
                 ),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
@@ -2693,8 +2692,7 @@ class DistributedCheckpointer(CheckpointerBase):
             storage_reader=model_reader,
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(
-                strict_model=not trainable_only,
-                legacy_expert_source_layout=legacy_expert_source_layout,
+                strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
             ),
         )
         if wants_optimizer:
@@ -2859,9 +2857,9 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
+        planner, error = None, None
         if cls._async_save_failed:
             raise RuntimeError("A previous asynchronous DCP save failed; restart from a complete checkpoint")
-        planner, error = None, None
         try:
             optimizer_adapter = save_state.get("optimizer")
             planner = _ExtraParallelSavePlanner(
