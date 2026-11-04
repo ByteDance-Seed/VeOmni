@@ -166,10 +166,16 @@ KERNEL_REGISTRY.register(
 
 
 def _fla_chunk_gated_delta_rule_factory():
-    """Return ``fla.ops.gated_delta_rule.chunk_gated_delta_rule``."""
+    """Return native FLA GDN without its optional backend dispatch."""
+    import inspect
+
+    import torch
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-    return chunk_gated_delta_rule
+    # FLA 0.5.2 dispatches eligible calls to FlashQLA by default. Explicit
+    # selection of "fla" must keep the native Triton fallback independent.
+    # Unwrap both dispatch and Dynamo wrappers, then restore the compile boundary.
+    return torch.compiler.disable(inspect.unwrap(chunk_gated_delta_rule))
 
 
 KERNEL_REGISTRY.register(
