@@ -336,6 +336,57 @@ def test_signed_zero_in_rope_table_is_not_a_canonical_match(tmp_path):
     assert not checkpoint.exists()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+def test_nonfinite_canonical_rope_is_rejected(tmp_path, monkeypatch, dtype):
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    model, optimizer = _build()
+    nonfinite_table = model.rope.inv_freq.clone()
+    nonfinite_table[0] = float("nan")
+    model.rope.inv_freq = nonfinite_table.to(dtype)
+    model.rope.original_inv_freq = nonfinite_table.to(dtype)
+    original = ROPE_INIT_FUNCTIONS["dynamic"]
+
+    def nonfinite(config, device, seq_len=None, **kwargs):
+        value, scale = original(config, device, seq_len=seq_len, **kwargs)
+        value[0] = float("nan")
+        return value, scale
+
+    monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "dynamic", nonfinite)
+    checkpoint = tmp_path / "checkpoint"
+    with pytest.raises(RuntimeError, match="Cannot prove|Dynamic RoPE cache"):
+        DistributedCheckpointer.save(
+            str(checkpoint),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+        )
+    assert not checkpoint.exists()
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+def test_finite_float8_rope_tables_keep_exact_checkpoint_identity(tmp_path, dtype):
+    def build():
+        model, optimizer = _build()
+        model.rope.inv_freq = model.rope.inv_freq.to(dtype)
+        model.rope.original_inv_freq = model.rope.original_inv_freq.to(dtype)
+        return model, optimizer
+
+    model, optimizer = build()
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = build()
+    DistributedCheckpointer.load(
+        checkpoint, {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    expected, actual = _rope_transitions(model, optimizer), _rope_transitions(target, restored)
+    assert expected.keys() == actual.keys()
+    for name in expected:
+        torch.testing.assert_close(expected[name], actual[name], rtol=0, atol=0)
+
+
 def test_changed_qwen3_rope_implementation_is_rejected_before_restore(tmp_path):
     model, optimizer = _build()
     checkpoint = str(tmp_path / "checkpoint")
