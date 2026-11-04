@@ -12,6 +12,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -50,7 +51,7 @@ def _native_provenance_hccl(require_hccl=False):
     import veomni.data.data_collator as data_collator
     from veomni.data.dpo_collator import DPOProvenanceCollator
     from veomni.trainer.dpo_provenance import next_dpo_microbatches
-    from veomni.trainer.text_dpo_trainer import _dpo_pair_weighting
+    from veomni.trainer.text_dpo_trainer import _dpo_pair_weighting, _dpo_sync_step_begin_error
 
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == 4
@@ -62,6 +63,23 @@ def _native_provenance_hccl(require_hccl=False):
         sp_enabled=True, sp_size=2, sp_rank=rank % 2, sp_group=groups[group_id], fsdp_group=dist.group.WORLD
     )
     data_collator.get_parallel_state = lambda: state
+
+    # A rank-local stale slicer must be reported by all ranks before the
+    # dataloader or model can enter another collective.
+    data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=True, sp_size=2, sp_rank=0)
+    stale_collator = data_collator.MainCollator(pad_to_length=8)
+    data_collator.get_parallel_state = lambda: state
+    collator_error = None
+    try:
+        DPOProvenanceCollator(stale_collator)
+    except Exception as exc:
+        collator_error = exc
+    with pytest.raises(RuntimeError, match="collator configuration failed"):
+        _dpo_sync_step_begin_error(collator_error, context="collator configuration")
+    device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+    value = torch.ones(1, device=device)
+    dist.all_reduce(value)
+    assert value.item() == world
 
     def feature(text):
         out = _native_feature(text)
