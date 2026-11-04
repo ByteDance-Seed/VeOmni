@@ -1482,6 +1482,37 @@ def test_profile_callback_skips_elapsed_window(monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["cuda", "mlu"])
+def test_non_npu_trace_upload_timeout_is_nonfatal(monkeypatch, tmp_path, backend):
+    warnings, commands = [], []
+    fake_profiler = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", CUDA="cuda", MLU="mlu"),
+        schedule=lambda **kwargs: kwargs,
+        profile=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", backend == "cuda")
+    monkeypatch.setattr(helper, "IS_MLU_AVAILABLE", backend == "mlu")
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace {trace}")
+    monkeypatch.setattr(helper.torch, "profiler", fake_profiler)
+    monkeypatch.setattr(
+        helper, "get_torch_device", lambda: SimpleNamespace(memory=SimpleNamespace(_dump_snapshot=lambda _: None))
+    )
+    monkeypatch.setattr(helper.logger, "warning", warnings.append)
+
+    def timeout(command, **kwargs):
+        commands.append((command, kwargs))
+        raise helper.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(helper.subprocess, "run", timeout)
+    profiler = helper.create_profiler(1, 2, str(tmp_path), False, False, False, False, 0)
+    profiler.on_trace_ready(SimpleNamespace(export_chrome_trace=lambda _: None))
+    assert len(commands) == 1
+    assert commands[0][1] == {"check": True, "timeout": 300}
+    assert commands[0][0][0] == "upload-trace"
+    assert any("failed to upload trace file" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "mlu"])
 @pytest.mark.parametrize("profile_memory", [False, True])
 def test_non_npu_profiler_records_allocator_history(monkeypatch, tmp_path, backend, profile_memory):
     events = []

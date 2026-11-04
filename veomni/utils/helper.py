@@ -1047,7 +1047,7 @@ def create_profiler(
                     command2 = [arg.replace("{trace}", trace_file) for arg in command2]
                 else:
                     command2.append(trace_file)
-                subprocess.run(command2, check=True)
+                subprocess.run(command2, check=True, timeout=300)
             except Exception as e:
                 logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
 
