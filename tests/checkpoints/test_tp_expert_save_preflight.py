@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -94,3 +95,40 @@ def test_tp_expert_target_can_load_canonical_checkpoint(tmp_path):
     restored = _model("parameter")
     DistributedCheckpointer.load(path, {"model": restored}, parallel_state=SimpleNamespace(tp_size=2, dp_mode="ddp"))
     torch.testing.assert_close(restored.experts.weight, model.experts.weight, rtol=0, atol=0)
+
+
+def _uniform_tp_expert_worker(rank, checkpoint, stage, endpoint):
+    from datetime import timedelta
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        torch.manual_seed(1)
+        with (
+            patch(
+                "veomni.checkpoint.dcp_checkpointer.raise_if_any_rank_failed", wraps=raise_if_any_rank_failed
+            ) as agree,
+            pytest.raises(RuntimeError, match="tensor.parallel.*expert"),
+        ):
+            DistributedCheckpointer.save(
+                checkpoint,
+                {"model": _model("parameter")},
+                stage_dir=stage,
+                parallel_state=SimpleNamespace(tp_size=2, dp_mode="ddp"),
+            )
+        assert isinstance(agree.call_args.args[0], RuntimeError)
+        assert agree.call_args.args[1] == "checking canonical ExtraParallel optimizer state"
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_uniform_tp_expert_rejection_reaches_all_ranks_before_writes(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    checkpoint, stage = tmp_path / "checkpoint", tmp_path / "stage"
+    spawn_with_rendezvous(_uniform_tp_expert_worker, args=(str(checkpoint), str(stage)), nprocs=2)
+    assert not checkpoint.exists()
+    assert not stage.exists()
