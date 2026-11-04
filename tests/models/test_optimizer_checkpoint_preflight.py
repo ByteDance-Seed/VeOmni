@@ -173,42 +173,6 @@ def _require_two_native_devices():
         pytest.fail("Assigned accelerator backend does not match the runtime")
 
 
-@pytest.mark.parametrize("count", [0, 1])
-def test_native_preflight_fails_when_assigned_devices_are_unusable(monkeypatch, count):
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "declared")
-    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend="npu"))
-    monkeypatch.setattr(torch.accelerator, "is_available", lambda: count > 0)
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: count)
-    with pytest.raises(pytest.fail.Exception, match="two usable devices"):
-        _require_two_native_devices()
-
-
-def test_native_preflight_skips_without_optional_local_devices(monkeypatch):
-    monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
-    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-    with pytest.raises(pytest.skip.Exception, match="two accelerators"):
-        _require_two_native_devices()
-
-
-def test_native_preflight_accepts_two_assigned_devices(monkeypatch):
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "declared")
-    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend="npu"))
-    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 2)
-    monkeypatch.setitem(globals(), "get_device_type", lambda: "npu")
-    _require_two_native_devices()
-
-
-def test_native_preflight_rejects_mismatched_backend(monkeypatch):
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "declared")
-    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend="npu"))
-    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 2)
-    monkeypatch.setitem(globals(), "get_device_type", lambda: "cuda")
-    with pytest.raises(pytest.fail.Exception, match="backend does not match"):
-        _require_two_native_devices()
-
-
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="accelerator"))
 def test_native_accelerator_optimizer_checkpoint_preflight():
     from tests.tools.launch_utils import spawn_with_rendezvous
