@@ -1070,7 +1070,13 @@ def build_optimizer(
                     ):
                         resolved_groups.append({**group, **decay_group})
             param_groups = resolved_groups
-        param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+        resident_only = patterns is None or (isinstance(patterns, list) and not patterns)
+        if optimizer_type == "cpu_offload_adamw" or not resident_only:
+            param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+        else:
+            if any(group.get("cpu_offload", False) for group in param_groups):
+                raise ValueError("CPU offload requires explicit cpu_offload_param_patterns")
+            param_groups = [{**group, "cpu_offload": False} for group in param_groups]
         if optimizer_type == "qwen38_muon":
             param_groups = add_qwen38_plans(model, param_groups)
 
