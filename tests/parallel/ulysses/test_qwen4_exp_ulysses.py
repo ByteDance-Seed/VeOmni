@@ -47,7 +47,7 @@ _PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeli
 _TOY_CONFIG = "tests/toy_config/qwen4_exp_toy"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-if get_device_type() == "cuda":
+if IS_CUDA_AVAILABLE:
     try:
         from fla.modules.convolution import causal_conv1d as _causal_conv1d_fn  # noqa: F401
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chunk_gated_delta_rule_fn  # noqa: F401
