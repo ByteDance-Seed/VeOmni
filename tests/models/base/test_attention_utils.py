@@ -312,3 +312,100 @@ def test_prepare_dense_attention_inputs_with_ulysses_uses_post_ulysses_lengths_w
     )
     assert mask_skip is not None and mask_skip.shape == (1, 1, 4, 4)
     assert not _mask_kept(mask_skip, 2, 0)
+
+
+@pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_sdpa", "veomni_flex_attention", "veomni_magi_attention"])
+def test_mask_utils_create_causal_mask_isolates_packed_samples_with_2d_all_ones_mask(impl):
+    """mask_utils.create_causal_mask routes packed cu_seq_lens_q through veomni.ops.mask even when
+    attention_mask is a 2D all-ones tensor."""
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers import PreTrainedConfig
+
+    from veomni.models.utils.mask_utils import create_causal_mask
+    from veomni.ops.mask import MagiAttentionMask
+
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    inputs_embeds = torch.randn(1, 8, 16)
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+    )
+
+    if impl == "veomni_flex_attention":
+        assert isinstance(mask, BlockMask)
+        assert mask.shape == (1, 1, 8, 8)
+        zero = torch.tensor(0)
+        assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+        assert mask.mask_mod(zero, zero, torch.tensor(4), torch.tensor(3))
+    elif impl == "veomni_magi_attention":
+        assert isinstance(mask, MagiAttentionMask)
+        assert mask.q_ranges.tolist() == [[0, 3], [3, 8]]
+        assert mask.k_ranges.tolist() == [[0, 3], [3, 8]]
+    else:
+        assert isinstance(mask, torch.Tensor)
+        assert mask.shape == (1, 1, 8, 8)
+        assert not _mask_kept(mask, 3, 2)
+        assert _mask_kept(mask, 4, 3)
+
+
+def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers import PreTrainedConfig
+
+    from veomni.models.utils.mask_utils import create_sliding_window_causal_mask
+
+    config = PreTrainedConfig()
+    config._attn_implementation = "veomni_flex_attention"
+    config.sliding_window = 3
+    inputs_embeds = torch.randn(1, 8, 16)
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    mask = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+        cu_seq_lens_q=cu_seqlens,
+    )
+    assert isinstance(mask, BlockMask)
+    zero = torch.tensor(0)
+    assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+    assert not mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
+    assert mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
+
+
+def test_mask_utils_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
+    from transformers import PreTrainedConfig
+
+    from veomni.models.utils.mask_utils import create_causal_mask
+
+    config = PreTrainedConfig()
+    config._attn_implementation = "eager"
+    hidden = torch.zeros(1, 4, 1)
+    attention_mask = torch.ones(1, 4, dtype=torch.long)
+    attention_mask[0, :2] = 0
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    assert isinstance(mask, torch.Tensor)
+    assert torch.isneginf(mask[0, 0, 0, 2:4]).all()
+    assert torch.isneginf(mask[0, 0, 2, 0:2]).all()
+    assert not _mask_kept(mask, 0, 0)
+    assert _mask_kept(mask, 3, 2)
