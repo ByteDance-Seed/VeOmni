@@ -287,8 +287,9 @@ class TestCheckpointCallbackTrainEndWait:
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             callback.on_epoch_end(state)
         assert not DistributedCheckpointer._save_futures
+        assert DistributedCheckpointer._async_save_failed is True
         with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
-            callback.on_epoch_end(state)
+            DistributedCheckpointer.wait_for_pending_save()
         trainer.save_dcp.assert_not_called()
 
     def test_train_end_waits_even_without_async(self, mock_helper):

@@ -407,7 +407,8 @@ def test_manager_accepts_only_proven_loaded_optimizer_receipt(tmp_path):
             manager.confirm_loaded_checkpoint_for_reuse(3, "different-generation")
         assert manager._last_saved_step == -1
         manager.confirm_loaded_checkpoint_for_reuse(3, "saved-generation")
-        assert manager.checkpoint_receipt_is_current(3)
+        assert manager._last_saved_step == 3
+        assert manager._last_saved_optimizer_ref() is runtime.optimizer
         assert manager._last_saved_optimizer_generation == "saved-generation"
 
 
@@ -453,7 +454,8 @@ def test_same_output_strict_sft_resume_binds_optimizer_for_train_end(tmp_path, m
         monkeypatch.setattr(callback, "_restore_position", lambda _: None)
         callback.load_global_state()
         assert trainer.checkpoint_callback._last_dcp_step == 3
-        assert manager.checkpoint_receipt_is_current(3)
+        assert manager._last_saved_step == 3
+        assert manager._last_saved_optimizer_ref() is runtime.optimizer
         manager.prepare_export(TrainerState(global_step=3), "train_end")
         manager.checkpointer.save.assert_not_called()
         assert manager._last_saved_optimizer_generation == "saved-generation"
@@ -585,7 +587,7 @@ def test_reloading_manager_cannot_reuse_or_overwrite_previous_step(tmp_path):
         manager.config.load_path = b_dir
         manager.load()
         assert source.model.weight.item() == 7.0
-        assert not manager.checkpoint_receipt_is_current(1)
+        assert manager._last_saved_step == -1
         # A later valid save must not accidentally reauthorize the old path.
         manager.save_dcp(TrainerState(global_step=3))
         with pytest.raises(RuntimeError, match="Cannot overwrite a checkpoint after loading"):
@@ -633,7 +635,6 @@ def test_failed_or_absent_reload_invalidates_old_manager_receipt(tmp_path, mode)
         else:
             with pytest.raises(OSError, match="wait failed|load failed"):
                 manager.load()
-    assert not manager.checkpoint_receipt_is_current(3)
     assert manager._last_saved_step == -1
     assert manager._last_saved_optimizer_ref is None
     assert not manager._last_export_released_optimizer
@@ -817,7 +818,8 @@ def test_legacy_omni_aggregate_uses_real_module_owners(tmp_path, monkeypatch, ag
     )
     if aggregate_case == "exact":
         callback._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
-        assert manager.checkpoint_receipt_is_current(2)
+        assert manager._last_saved_step == 2
+        assert manager._last_saved_optimizer_ref() is runtime.optimizer
     else:
         with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
             callback._confirm_same_output_checkpoint(2, load_path, [], {}, known, unknown)
@@ -934,8 +936,9 @@ def test_mixed_omni_receipt_confirms_every_optimizer(tmp_path, monkeypatch):
     callback._confirm_same_output_checkpoint(
         2, load_path, [("module:strict", strict)], {"module:strict": "test-generation"}, [("module:legacy", legacy)]
     )
-    assert strict.checkpoint_receipt_is_current(2)
-    assert legacy.checkpoint_receipt_is_current(2)
+    assert strict._last_saved_step == legacy._last_saved_step == 2
+    assert strict._last_saved_optimizer_ref() is strict_runtime.optimizer
+    assert legacy._last_saved_optimizer_ref() is legacy_runtime.optimizer
     assert trainer.checkpoint_callback._last_dcp_step == 2
     assert not layout.same_checkpoint_path("hdfs://one/a", "hdfs://two/a")
 

@@ -49,6 +49,29 @@ def test_empty_source_fails_with_actionable_restart_error():
         next(iter(loader))
 
 
+def test_callable_code_identity_is_stable_across_python_hash_seeds():
+    import os
+    import subprocess
+    import sys
+
+    script = """
+from veomni.data.dynamic_batching import _resume_callable_identity
+def length(sample):
+    return 1 if sample in {'alpha', 'beta', 'gamma', 'delta', 'epsilon'} else 0
+length.__code__ = length.__code__.replace(
+    co_consts=length.__code__.co_consts + ((frozenset({'one', 'two', 'three'}),),)
+)
+print(_resume_callable_identity(length)['code_sha256'])
+"""
+    digests = []
+    for seed in ("0", "1", "2", "3"):
+        output = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, "PYTHONHASHSEED": seed}, text=True
+        )
+        digests.append(output.strip().splitlines()[-1])
+    assert len(set(digests)) == 1
+
+
 def test_exhausted_iterator_fails_before_replaying_a_sample():
     sample = {"id": 7, "attention_mask": torch.ones(1, dtype=torch.int64)}
     loader = DynamicBatchSizeDataLoader(
@@ -1048,6 +1071,73 @@ def test_non_sft_loader_retains_legacy_resume_path(monkeypatch):
     monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.set_device_rng_state", lambda _: None)
     callback.load_global_state()
     assert loader._dataloader.cursor == source._dataloader.cursor
+
+
+def test_sft_iterable_source_uses_legacy_cursor_path(monkeypatch):
+    from types import SimpleNamespace
+
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    class Stream(torch.utils.data.IterableDataset):
+        def __iter__(self):
+            for sample_id in range(10):
+                yield {"id": sample_id, "attention_mask": torch.ones(1, dtype=torch.int64)}
+
+    def make_loader():
+        source = StatefulDataLoader(Stream(), batch_size=None, num_workers=0)
+        return DynamicBatchSizeDataLoader(source, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1), length=6)
+
+    source = make_loader()
+    iterator = iter(source)
+    next(iterator)
+    trainer = _native_resume_trainer(source)
+    trainer.environ_meter = SimpleNamespace(state_dict=lambda: {})
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    saved = callback.state_dict(SimpleNamespace(global_step=1, epoch=0))
+    assert "_veomni_dynamic_context" not in saved
+    assert "_veomni_resume_geometry" not in saved["train_dataloader"]
+
+    target = make_loader()
+    resumed_trainer = _native_resume_trainer(target)
+    resumed_trainer.environ_meter = SimpleNamespace(load_state_dict=lambda _: None)
+    resumed = GlobalStateCallback.__new__(GlobalStateCallback)
+    resumed.trainer = resumed_trainer
+    resumed._read_current = lambda _: saved
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.set_device_rng_state", lambda _: None)
+    resumed.load_global_state()
+    assert next(iter(target))[0][0]["id"] == next(iterator)[0][0]["id"]
+
+
+@pytest.mark.parametrize("target_kind", ["iterable", "classification"])
+def test_strict_sft_cursor_cannot_silently_downgrade_to_legacy(monkeypatch, target_kind):
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback, _dynamic_resume_context
+
+    class Stream(torch.utils.data.IterableDataset):
+        def __iter__(self):
+            return iter(())
+
+    source = _native_mapping_loader()
+    next(iter(source))
+    target = _loader()
+    trainer = _native_resume_trainer(target)
+    if target_kind == "iterable":
+        target._dataloader.dataset = Stream()
+    else:
+        trainer._sft_dynamic_exact_resume = False
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 1,
+        "train_dataloader": source.state_dict(),
+        "_veomni_dynamic_context": _dynamic_resume_context(trainer.args, 0),
+    }
+    monkeypatch.setattr(target, "load_state_dict", lambda _: pytest.fail("cursor must not be restored"))
+    with pytest.raises(ValueError, match="strict dynamic SFT cursor"):
+        callback.load_global_state()
+    assert trainer.state.global_step == 0
 
 
 def _native_test_update(weight, optimizer, batch):
