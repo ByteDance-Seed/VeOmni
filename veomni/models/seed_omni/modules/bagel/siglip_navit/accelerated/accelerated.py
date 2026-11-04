@@ -115,8 +115,12 @@ class TrainingMixin(TrainingModuleMixin):
             and self.training
             and float(getattr(self.config, "attention_dropout", 0.0)) > 0.0
         ):
-            devices = [self.device] if self.device.type != "cpu" else []
-            with torch.random.fork_rng(devices=devices):
+            fork_kwargs: dict[str, Any] = (
+                {"devices": []}
+                if self.device.type == "cpu"
+                else {"devices": [self.device], "device_type": self.device.type}
+            )
+            with torch.random.fork_rng(**fork_kwargs):
                 return super().forward(*args, **kwargs)
         return super().forward(*args, **kwargs)
 
