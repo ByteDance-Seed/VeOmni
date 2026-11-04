@@ -267,6 +267,7 @@ def _two_rank_rejected_shard_worker(rank: int, rendezvous: str, out_dir: str) ->
     import torch.distributed as dist
 
     from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
+    from veomni.trainer.base import VeOmniIter
 
     dist.init_process_group(
         "gloo",
@@ -298,16 +299,23 @@ def _two_rank_rejected_shard_worker(rank: int, rendezvous: str, out_dir: str) ->
         }
         # Rank 0's shard contains only rejected (> 10 tokens) samples; Rank 1's shard has valid samples.
         shard = [[overlong], [overlong]] if rank == 0 else [[valid], [valid]]
-        dl = DynamicBatchSizeDataLoader(
-            shard,
-            batching_strategy=TextBatchingStrategy(token_micro_bsz=10, buffer_size=1),
-            collate_fn=SeedOmniCollator(),
-            num_micro_batch=1,
-            length=2,
-            drop_last=True,
-        )
-        batches = list(dl)
-        Path(out_dir, f"rank{rank}.json").write_text(json.dumps({"num_batches": len(batches)}), encoding="utf-8")
+        reports = {}
+        for use_prefetcher in (False, True):
+            dl = DynamicBatchSizeDataLoader(
+                shard,
+                batching_strategy=TextBatchingStrategy(token_micro_bsz=10, buffer_size=1),
+                collate_fn=SeedOmniCollator(),
+                num_micro_batch=1,
+                length=2,
+                drop_last=True,
+            )
+            data_iter = VeOmniIter(dl, use_background_prefetcher=use_prefetcher)
+            try:
+                batches = list(data_iter)
+            finally:
+                data_iter.stop()
+            reports[f"prefetch_{int(use_prefetcher)}"] = len(batches)
+        Path(out_dir, f"rank{rank}.json").write_text(json.dumps(reports), encoding="utf-8")
     finally:
         dist.destroy_process_group()
 
@@ -315,7 +323,8 @@ def _two_rank_rejected_shard_worker(rank: int, rendezvous: str, out_dir: str) ->
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 def test_dyn_bsz_dataloader_stops_coordinately_when_rank_shard_has_only_rejected_samples(tmp_path):
     """When one rank's shard contains only over-budget samples, DynamicBatchSizeDataLoader
-    must detect no progress (not loop forever) and coordinate with peer ranks to end together."""
+    must detect no progress (not loop forever) and coordinate with peer ranks to end together
+    both on direct iteration and through VeOmniIter(use_background_prefetcher=True)."""
     import json
 
     import torch.multiprocessing as mp
@@ -328,4 +337,4 @@ def test_dyn_bsz_dataloader_stops_coordinately_when_rank_shard_has_only_rejected
     )
     for rank in range(2):
         report = json.loads((tmp_path / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert report["num_batches"] == 0
+        assert report == {"prefetch_0": 0, "prefetch_1": 0}

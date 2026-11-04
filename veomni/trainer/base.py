@@ -101,6 +101,7 @@ class BackgroundPrefetcher:
         self.stop_event = threading.Event()
         self.original_state_dict = getattr(dataloader, "state_dict", None)
         self.current_state = None
+        self._exhausted = False
         self.thread = threading.Thread(target=self._worker)
         self.thread.daemon = True
         self.thread.start()
@@ -114,6 +115,8 @@ class BackgroundPrefetcher:
                     self.queue.put((StopIteration, None))
                     break
 
+                if self.stop_event.is_set():
+                    break
                 # Ensure we capture the state so that subsequent dataloader advances
                 # don't mutate the captured state in-place. The underlying dataloader's
                 # state_dict() should handle deepcopying if necessary.
@@ -126,20 +129,30 @@ class BackgroundPrefetcher:
         return self
 
     def __next__(self):
+        from ..data.dynamic_batching import DynamicBatchSizeDataLoader
+
+        if self._exhausted:
+            raise StopIteration
         res = self.queue.get()
         if isinstance(res, tuple) and len(res) == 2:
             item, state = res
-            if item is StopIteration:
-                raise StopIteration
             if isinstance(item, Exception):
                 raise item
+            has_batch = item is not StopIteration
+            if not DynamicBatchSizeDataLoader._coordinate_has_batch(has_batch):
+                self._exhausted = True
+                self.stop()
+                raise StopIteration
             self.current_state = state
             return item
         else:
-            if res is StopIteration:
-                raise StopIteration
             if isinstance(res, Exception):
                 raise res
+            has_batch = res is not StopIteration
+            if not DynamicBatchSizeDataLoader._coordinate_has_batch(has_batch):
+                self._exhausted = True
+                self.stop()
+                raise StopIteration
             return res
 
     def state_dict(self):

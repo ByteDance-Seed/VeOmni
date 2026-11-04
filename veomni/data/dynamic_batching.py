@@ -316,6 +316,7 @@ class DynamicBatchSizeDataLoader:
             self._data_iter = iter(self._dataloader)
             self._batch_data_iter = self.batch_data_generator()
         self._resume = False
+        self._exhausted = False
         return self
 
     @staticmethod
@@ -338,6 +339,8 @@ class DynamicBatchSizeDataLoader:
         return True
 
     def __next__(self):
+        if getattr(self, "_exhausted", False):
+            raise StopIteration
         try:
             batch = next(self._batch_data_iter)
             has_batch = True
@@ -345,6 +348,7 @@ class DynamicBatchSizeDataLoader:
             batch = None
             has_batch = False
         if not self._coordinate_has_batch(has_batch):
+            self._exhausted = True
             raise StopIteration
         return batch
 
