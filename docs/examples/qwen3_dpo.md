@@ -146,6 +146,11 @@ do not change the loss, gradients, or optimizer update.
 The trainer passes configured source ID/name aliases to the DPO wrapper's
 `source_keys`; direct `DPOProvenanceCollator` callers should do the same for
 custom aliases. The ordinary packing collator needs no channel-loss settings.
+Direct callers must construct both `MainCollator` and its DPO wrapper within the
+same policy `use_parallel_state` scope and must not reuse them with a different
+SP geometry. The built-in trainer does this automatically. The wrapper trusts
+that construction contract; mismatched scopes can produce incorrect token slices
+and gradients without being detected by provenance metadata.
 
 `dpo_config.explicit_segment_provenance: true` is the default and is required
 for DPO training. It retains the physical

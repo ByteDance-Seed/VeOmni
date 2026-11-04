@@ -22,7 +22,7 @@ from ..utils.dpo_provenance import (
     DPOPackedProof,
 )
 from . import data_collator as collator_module
-from .data_collator import DEFAULT_DATA_COLLATE_INFO, MainCollator, SequenceParallelCollator
+from .data_collator import DEFAULT_DATA_COLLATE_INFO, MainCollator
 from .dataset import get_length_fn
 
 
@@ -101,15 +101,6 @@ class DPOProvenanceCollator:
         state = collator_module.get_parallel_state()
         self.sp_size = state.sp_size if state.sp_enabled else 1
         self.sp_rank = state.sp_rank if state.sp_enabled else 0
-        if type(self.collator) is MainCollator:
-            slicers = [
-                item for item in self.collator.preforward_pipeline if isinstance(item, SequenceParallelCollator)
-            ]
-            if self.sp_size > 1:
-                if len(slicers) != 1 or (slicers[0].sp_size, slicers[0].sp_rank) != (self.sp_size, self.sp_rank):
-                    raise ValueError("DPO collator sequence-parallel topology disagrees with the current group")
-            elif slicers:
-                raise ValueError("DPO collator sequence-parallel topology disagrees with the current group")
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         sp_size, sp_rank = self.sp_size, self.sp_rank

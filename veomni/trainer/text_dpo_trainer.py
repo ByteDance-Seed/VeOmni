@@ -682,22 +682,17 @@ class TextDPOTrainer:
             except Exception as exc:  # noqa: BLE001 - synchronize dataset geometry errors
                 batch_error = exc
             _dpo_sync_step_begin_error(batch_error, context="fixed-batch geometry")
-            collator_error = None
-            try:
-                self.base._build_collate_fn()
-                if args.dpo_config.explicit_segment_provenance:
-                    self.base.collate_fn = DPOProvenanceCollator(
-                        self.base.collate_fn,
-                        require_ds_idx=args.data.enable_multisource,
-                        source_keys=(
-                            tuple(args.train.channel_loss.source_id_keys + args.train.channel_loss.source_name_keys)
-                            if args.train.channel_loss.enable
-                            else ()
-                        ),
-                    )
-            except Exception as exc:  # noqa: BLE001 - synchronize rank-local collator configuration errors
-                collator_error = exc
-            _dpo_sync_step_begin_error(collator_error, context="collator configuration")
+            self.base._build_collate_fn()
+            if args.dpo_config.explicit_segment_provenance:
+                self.base.collate_fn = DPOProvenanceCollator(
+                    self.base.collate_fn,
+                    require_ds_idx=args.data.enable_multisource,
+                    source_keys=(
+                        tuple(args.train.channel_loss.source_id_keys + args.train.channel_loss.source_name_keys)
+                        if args.train.channel_loss.enable
+                        else ()
+                    ),
+                )
             self.base._build_dataloader()
             from ..data.data_loader import DistributedDataloader
             from ..data.dynamic_batching import DynamicBatchSizeDataLoader

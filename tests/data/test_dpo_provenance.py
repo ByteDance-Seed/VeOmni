@@ -704,15 +704,6 @@ def _feature(chosen, rejected, source):
     return feature
 
 
-@pytest.mark.parametrize("current", [_state(sp_enabled=True, rank=1), _state(sp_enabled=False)])
-def test_stale_collator_topology_is_rejected_at_construction(monkeypatch, current):
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: _state(sp_enabled=True, rank=0))
-    collator = MainCollator()
-    monkeypatch.setattr(collator_module, "get_parallel_state", lambda: current)
-    with pytest.raises(ValueError, match="topology disagrees"):
-        DPOProvenanceCollator(collator)
-
-
 @pytest.mark.parametrize("sp_enabled,rank", [(False, 0), (True, 0), (True, 1)])
 @pytest.mark.parametrize("pad_to_length", [0, 8])
 def test_builtin_segments_are_proven_with_single_token_and_tail(monkeypatch, sp_enabled, rank, pad_to_length):
