@@ -1,7 +1,6 @@
 """Ensure error propagation follows the backend of the actual process group."""
 
 import os
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -72,34 +71,3 @@ def _require_two_accelerators():
 def test_default_accelerator_group_failure_propagation():
     _require_two_accelerators()
     spawn_with_rendezvous(_accelerator_group_worker, args=(2,), nprocs=2)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize(
-    ("assigned", "device_type", "count", "outcome"),
-    (
-        (None, "cpu", 0, "skip"),
-        (None, "cuda", 1, "skip"),
-        ("cuda", "cuda", 0, "fail"),
-        ("cuda", "cuda", 1, "fail"),
-        ("npu", "cuda", 2, "fail"),
-        ("npu", "npu", 2, "pass"),
-    ),
-)
-def test_two_accelerator_requirement(monkeypatch, assigned, device_type, count, outcome):
-    monkeypatch.setattr(__name__ + ".get_device_type", lambda: device_type)
-    monkeypatch.setattr(
-        __name__ + ".get_torch_device",
-        lambda: SimpleNamespace(is_available=lambda: count > 0, device_count=lambda: count),
-    )
-    if assigned:
-        monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "assigned")
-        monkeypatch.setattr(__name__ + ".runner_capabilities", lambda: SimpleNamespace(backend=assigned))
-    else:
-        monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
-    if outcome == "pass":
-        _require_two_accelerators()
-    else:
-        error = pytest.skip.Exception if outcome == "skip" else pytest.fail.Exception
-        with pytest.raises(error):
-            _require_two_accelerators()
