@@ -16,10 +16,11 @@ import os
 from dataclasses import dataclass
 
 import torch
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from .....utils import logging
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.utils import logging
+
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3DiT, unpack_audio, unpatchify_video
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
@@ -45,6 +46,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     _checkpoint_conversion_mapping = {"^": "dit."}
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention validates and binds its backend on the first forward.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
         # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
@@ -69,6 +74,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+            config=config,
         )
 
         if os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION"):

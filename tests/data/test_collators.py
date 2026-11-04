@@ -3,9 +3,13 @@ import types
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.chat_template import add_mtp_labels
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _assert_host_packed_metadata(out, slices):
@@ -114,9 +118,8 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     _assert_host_packed_metadata(out, ((0, 3), (3, 5)))
 
 
+@pytest.mark.skipif(IS_NPU_AVAILABLE, reason="NPU does not support this padding test yet.")
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):
-    if IS_NPU_AVAILABLE:
-        pytest.skip("NPU does not support this padding test yet.")
     import veomni.data.data_collator as m
 
     pad_to_length = 8

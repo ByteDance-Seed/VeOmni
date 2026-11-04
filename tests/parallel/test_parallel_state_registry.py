@@ -36,6 +36,8 @@ from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_paral
 
 _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 @pytest.fixture
 def single_rank_group(tmp_path):

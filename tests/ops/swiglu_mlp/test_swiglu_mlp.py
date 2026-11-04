@@ -25,6 +25,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MLP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -37,6 +38,7 @@ from tests.ops.tol import (
 )
 from veomni.ops import resolve_op
 from veomni.ops.kernels.swiglu_mlp.geglu import liger_kernel as geglu_liger
+from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
 from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE
@@ -391,6 +393,37 @@ def _tiny_gemma3_mlp(hidden_size: int = 64, intermediate_size: int = 128) -> Gem
         hidden_activation="gelu_pytorch_tanh",
     )
     return Gemma3MLP(config)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))),
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.launch_plan(provider=LaunchSpec()),
+                pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GeGLU CUDA rounding needs a GPU"),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_geglu_backward_matches_autograd_rounding(dtype, transposed, device):
+    """Preserve autograd's multiply-then-GELU-backward rounding, including views."""
+    torch.manual_seed(31)
+    gate = (torch.randn(32, 64, device=device) * 2).to(dtype)
+    up = torch.randn_like(gate)
+    grad_output = torch.randn_like(gate)
+    if transposed:
+        gate, up, grad_output = (value.transpose(0, 1) for value in (gate, up, grad_output))
+    gate.requires_grad_(True)
+    up.requires_grad_(True)
+    expected = torch.autograd.grad(F.gelu(gate, approximate="tanh") * up, (gate, up), grad_output)
+    actual = gelu_tanh_mul_backward(grad_output, gate, up)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
 def test_geglu_eager_matches_hf():

@@ -2,7 +2,6 @@
 
 import copy
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +10,6 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import ops_config_scope
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
@@ -60,8 +58,7 @@ def attention_model(attn_implementation):
     On CPU, flash rows need the ``available_nvidia_ops`` fixture for the registry's CUDA
     gates and ``segmented_flash_forward`` in place of the kernel; the adapter stays real.
     """
-    with ops_config_scope(SimpleNamespace(attn_implementation=attn_implementation)):
-        return tiny_model()
+    return tiny_model(attn_implementation=attn_implementation)
 
 
 def attention_modules(model):
@@ -71,7 +68,11 @@ def attention_modules(model):
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
-def tiny_model(num_attention_heads=2):
+def tiny_model(num_attention_heads=2, *, attn_implementation="eager"):
+    from tests.models.compare import eager_ops_config
+
+    ops = eager_ops_config()
+    ops.attn_implementation = attn_implementation
     return MiniMaxH3DiTModel(
         MiniMaxH3DiTModelConfig(
             hidden_size=32,
@@ -87,6 +88,7 @@ def tiny_model(num_attention_heads=2):
             adaln_out_features=576,
             final_adaln_out_features=64,
             rope_inv_freq_len=2,
+            ops_implementation=ops,
         )
     )
 
@@ -617,16 +619,8 @@ def serial(model, samples):
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
-    from veomni.ops.config import get_ops_config, set_ops_config
-
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
-    # build_foundation_model installs process-global ops. Do not leak FA3 into later tests.
-    previous = get_ops_config()
-    set_ops_config(None)
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
+    yield
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])

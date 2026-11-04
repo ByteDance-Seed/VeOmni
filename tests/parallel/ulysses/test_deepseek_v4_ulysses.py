@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
@@ -35,11 +35,16 @@ _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
-def _load_dsv4_toy_config():
+def _load_dsv4_toy_config(**ops_overrides):
     from transformers import AutoConfig
 
+    from tests.models.compare import eager_ops_config
+
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
+    ops = eager_ops_config()
+    for key, value in ops_overrides.items():
+        setattr(ops, key, value)
+    as_veomni_config(config, validate=False)._set_ops_implementation(ops)
     return config
 
 
@@ -224,13 +229,11 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
-    from veomni.ops.config import set_ops_config
 
     sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
     dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
-    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = _load_dsv4_toy_config()
+    config = _load_dsv4_toy_config(dsa_indexer_implementation="tilelang")
     torch.manual_seed(1)
     indexer = dsv4.DeepseekV4CSACompressor(config).indexer.to(device=device_type, dtype=torch.bfloat16)
     with torch.no_grad():

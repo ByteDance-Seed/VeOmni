@@ -15,16 +15,17 @@
 """DeepSeek Sparse Attention compound kernels.
 
 ``dsa_attention`` / ``dsa_indexer`` each have ``deepseek_v4`` and ``glm``
-rows. Fused impls are opaque wrappers around TileLang or FlashMLA
+rows. Fused impls are opaque wrappers around TileLang, Triton, or FlashMLA
 ``Function.apply``. The ``deepseek_v4`` ``cann`` rows call the Ascend CANN
 Lightning Indexer and sparse FlashMLA.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .attention.deepseek_v4 import cann as dsv4_attn_cann
 from .attention.deepseek_v4 import eager as dsv4_attn_eager
 from .attention.deepseek_v4 import tilelang as dsv4_attn_tilelang
+from .attention.deepseek_v4 import triton as dsv4_attn_triton
 from .attention.glm import eager as glm_attn_eager
 from .attention.glm import flashmla_cudnn as glm_attn_flashmla
 from .indexer.deepseek_v4 import cann as dsv4_indexer_cann
@@ -35,6 +36,7 @@ from .indexer.glm import eager as glm_indexer_eager
 
 
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_ROCM = GpuKernelRequirement(platforms=(ROCM_GPU,))
 _GLM_FUSED = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 register_op(
@@ -53,6 +55,16 @@ register_op(
     wrapper=dsv4_attn_tilelang.wrapper,
     requirement=_TILELANG,
     requires=("tilelang",),
+)
+
+register_op(
+    "dsa_attention",
+    "deepseek_v4",
+    "triton",
+    description="Triton DeepSeek-V4 sparse attention for AMD ROCm",
+    wrapper=dsv4_attn_triton.wrapper,
+    requirement=_ROCM,
+    requires=("triton",),
 )
 
 register_op(

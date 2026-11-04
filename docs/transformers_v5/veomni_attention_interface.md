@@ -1,18 +1,18 @@
 # VeOmni Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention, FlexAttention, SDPA,
+VeOmni registers sequence-parallel FlashAttention, AITER, FlexAttention, SDPA,
 SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
-bind `VeomniOp("attention", "standard", config._attn_implementation)` once in `__init__` / `modify_init` and call
+bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` once in `__init__` / `modify_init` and call
 `self.veomni_attn` from `forward`.
 
 Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`
 (not a `_with_sp` suffix). Ulysses wrapping lives inside those registered
 adapters.
 
-Models continue to select an attention implementation through
-`config._attn_implementation`; modeling code stores that choice in a local
+Models select an attention implementation through
+`config.ops_config.attn_implementation` (kept in sync with `config._attn_implementation` for HF mask builders); modeling code stores that choice in a local
 `VeomniOp("attention", "standard", implementation)` handle.
 
 ## Configuration
@@ -45,6 +45,7 @@ same way:
 | `flash_attention_3_hub` | `veomni_flash_attention_3_hub` |
 | `flash_attention_4` | `veomni_flash_attention_4` |
 | `flex_attention` | `veomni_flex_attention` |
+| `aiter` | `veomni_flash_attention_aiter` |
 | `magi_attention` | `veomni_magi_attention` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
@@ -68,11 +69,18 @@ model-local VeomniOp("attention", "standard", implementation)
 `apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
 functions and matching mask builders in the Transformers registries. Each ops
 row then uses the same Transformers interface lookup as the model-facing path.
-The `eager` row falls back to the modeling module's local
-`eager_attention_forward`, because Transformers does not register eager
-attention globally. The short `flex_attention` and `magi_attention` rows resolve
+The `eager` row uses the modeling module's local `eager_attention_forward` when
+present, preserving model-specific math. Modules without that function forward
+through `veomni_sdpa`, including its packed-sequence and Ulysses handling.
+Transformers' global eager interface is unchanged. The short `flex_attention`
+and `magi_attention` rows resolve
 their `veomni_*` interfaces so they share the adapters' device and backend
 behavior when selected directly through the ops registry.
+
+The AITER row resolves `veomni_flash_attention_aiter` only on AMD ROCm. It
+reuses the flash/Ulysses adapter, while the patched local-kernel loader supplies
+AITER's dense and varlen functions. Both its public and normalized names are
+rejected on Ascend before Transformers can select an NPU attention path.
 
 The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. MagiAttention is available on NVIDIA SM100 and newer GPUs through CUTE DSL/JIT. VeOmni validates the query device once per device.
 

@@ -786,7 +786,7 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
 
-    from tests.models.compare import eager_ops_config, ops_config_scope
+    from tests.models.compare import eager_ops_config
     from tests.models.tiny_configs import tiny_deepseek_v4_config
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
@@ -795,9 +795,9 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
     seq_len = 16
     slices = ((0, 8), (8, 16))
     config = tiny_deepseek_v4_config("DeepseekV4Model")
-    with ops_config_scope(eager_ops_config()):
-        torch.manual_seed(0)
-        model = dsv4.DeepseekV4Model(config).to(device=device, dtype=dtype).eval()
+    config._set_ops_implementation(eager_ops_config())
+    torch.manual_seed(0)
+    model = dsv4.DeepseekV4Model(config).to(device=device, dtype=dtype).eval()
 
     input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device)
     position_ids = torch.cat([torch.arange(8, device=device), torch.arange(8, device=device)]).view(1, seq_len)
