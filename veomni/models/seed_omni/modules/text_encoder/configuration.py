@@ -34,6 +34,10 @@ class TextEncoderConfig(OmniModuleConfig):
     """
 
     model_type = "text_encoder"
+    # TextEncoder has no attention layers; its accelerated pre/post hooks slice
+    # and gather over the unified ``sp_group`` and reduce loss over ``fsdp_group``,
+    # which works identically under Ulysses SP or Context Parallelism.
+    _supports_context_parallel = True
 
     def __init__(
         self,

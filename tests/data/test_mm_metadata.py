@@ -32,7 +32,13 @@ and lives in the patchgen-generated helpers — its sync behaviour is gated by
 
 import os
 
+import pytest
 import torch
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # Bootstrap a single-rank "process group" env so collator import doesn't crash

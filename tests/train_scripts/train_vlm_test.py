@@ -5,6 +5,7 @@ from typing import Dict
 
 import torch
 
+from tests.tools.training_utils import dp_mean
 from veomni.arguments import parse_args
 from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMTrainer
@@ -47,9 +48,9 @@ class LogDictSaveCallback(Callback):
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        self.log_dict["loss"].append(loss)
+        self.log_dict["loss"].append(dp_mean(loss, self.trainer))
         for key, value in loss_dict.items():
-            self.log_dict[key].append(value)
+            self.log_dict[key].append(dp_mean(value, self.trainer))
         self.log_dict["grad_norm"].append(float(grad_norm))
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:

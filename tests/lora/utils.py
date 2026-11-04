@@ -44,6 +44,7 @@ import torch
 import transformers
 import yaml
 
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import MODELING_REGISTRY, build_foundation_model
 from veomni.utils.device import get_device_type
@@ -116,15 +117,7 @@ TOY_LORA_SPECS: dict[str, LoraYamlSpec] = {
 
 def full_eager_ops() -> OpsImplementationConfig:
     """Force every operator implementation to ``eager`` so wrapper code paths are exercised."""
-    return OpsImplementationConfig(
-        attn_implementation="eager",
-        moe_implementation="eager",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        load_balancing_loss_implementation="eager",
-    )
+    return make_eager_ops_config()
 
 
 def fused_triton_moe_ops() -> OpsImplementationConfig:
@@ -134,15 +127,7 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
     ``LoraSharedExperts`` / ``LoraIndependentExperts`` follow that handle to
     construct ``VeomniOp("moe_experts_lora", variant, "fused_triton")``.
     """
-    return OpsImplementationConfig(
-        attn_implementation="eager",
-        moe_implementation="fused_triton",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        load_balancing_loss_implementation="eager",
-    )
+    return make_eager_ops_config(moe_implementation="fused_triton")
 
 
 def fused_npu_moe_ops() -> OpsImplementationConfig:
@@ -151,15 +136,7 @@ def fused_npu_moe_ops() -> OpsImplementationConfig:
     The experts bind ``veomni_moe`` to ``fused_npu``, and LoRA wrappers follow
     that handle to construct ``VeomniOp("moe_experts_lora", variant, "fused_npu")``.
     """
-    return OpsImplementationConfig(
-        attn_implementation="eager",
-        moe_implementation="fused_npu",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        load_balancing_loss_implementation="eager",
-    )
+    return make_eager_ops_config(moe_implementation="fused_npu")
 
 
 def build_lora_test_model(config_path: str, **kwargs):

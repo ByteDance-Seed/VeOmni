@@ -76,6 +76,36 @@ def _scatter_tokens(hidden_states, selected_experts, num_experts):
     return scatter_output, cumsum, scatter_index
 
 
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("swiglu_limit", [None, 0.15])
+@pytest.mark.parametrize("trainable", ["all", "input", "weights"])
+def test_ep_quack_retained_graph(merged, swiglu_limit, trainable):
+    """Early saved-state release must preserve retained and fresh backwards."""
+    if not IS_CUDA_AVAILABLE or not is_quack_gemm_available():
+        pytest.skip("Quack requires CUDA SM90+.")
+
+    from veomni.ops.kernels.moe_experts.standard.quack import EPMergedFc1QuackGroupGemm, EPQuackGroupGemm
+
+    _, tokens, gate, up, merged_weight, down = _make_ep_inputs(65, 4, 256, 128, 20261024)
+    # Include empty groups and a non-aligned token count.
+    cumsum = torch.tensor([0, 17, 17, 65], device=tokens.device, dtype=torch.int64)
+    tensors = (tokens, merged_weight, down) if merged else (tokens, gate, up, down)
+    function = EPMergedFc1QuackGroupGemm if merged else EPQuackGroupGemm
+    values = tuple(
+        t.detach().requires_grad_(trainable != ("weights" if i == 0 else "input")) for i, t in enumerate(tensors)
+    )
+    leaves = tuple(t for t in values if t.requires_grad)
+    output = function.apply(values[0], cumsum, *values[1:], swiglu_limit)
+    upstream = torch.randn_like(output)
+    first = torch.autograd.grad(output, leaves, upstream, retain_graph=True)
+    second = torch.autograd.grad(output, leaves, upstream)
+    fresh_output = function.apply(values[0], cumsum, *values[1:], swiglu_limit)
+    fresh = torch.autograd.grad(fresh_output, leaves, upstream)
+    for retained, released, independent in zip(first, second, fresh):
+        torch.testing.assert_close(retained, released, rtol=0, atol=0)
+        torch.testing.assert_close(retained, independent, rtol=0, atol=0)
+
+
 def _gather_tokens(expert_output, scatter_index):
     from veomni.ops.kernels.moe_experts.shared.dispatch import moe_gather
 

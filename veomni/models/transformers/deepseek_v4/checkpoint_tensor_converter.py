@@ -59,8 +59,13 @@ logger = logging.get_logger(__name__)
 # keys (gate_proj/up_proj/down_proj), e.g.:
 #   model.layers.0.mlp.experts.3.w1.weight
 #   model.layers.0.mlp.experts.3.gate_proj.weight
+#   model.mtp.0.mlp.experts.3.w1.weight
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.weight$")
-_RAW_FP4_EXPERT_WEIGHT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
+_RAW_FP4_EXPERT_WEIGHT_PATTERN = re.compile(r"^(?:model\.)?(?:layers|mtp)\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
+_MTP_HC_HEAD_PATTERN = re.compile(r"^mtp\.(\d+)\.hc_head_(fn|base|scale)$")
+_MTP_MARKOV_W1_PATTERN = re.compile(r"^mtp\.(\d+)\.markov_head\.markov_w1\.(weight|scale)$")
+_MTP_MARKOV_W2_PATTERN = re.compile(r"^mtp\.(\d+)\.markov_head\.markov_w2\.(weight|scale)$")
+_MTP_STAGE_NORM_PATTERN = re.compile(r"^mtp\.(\d+)\.norm\.weight$")
 _PROJ_NAME_ALIASES = {
     "w1": "gate_proj",
     "w2": "down_proj",
@@ -124,7 +129,8 @@ _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS = [
     ],
 ]
 _QUANTIZED_RELEASE_WEIGHT_PATTERN = re.compile(
-    r"^layers\.\d+\.(?:"
+    r"^(?:layers|mtp)\.\d+\.(?:"
+    r"main_proj|"
     r"attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)|"
     r"attn\.indexer\.wq_b|"
     r"ffn\.shared_experts\.w[123]|"
@@ -149,7 +155,7 @@ _FP4_E2M1_VALUES = (
     -4.0,
     -6.0,
 )
-_BASE_MODEL_KEY_PREFIXES = ("embed_tokens.", "hc_head.", "layers.", "norm.")
+_BASE_MODEL_KEY_PREFIXES = ("embed_tokens.", "hc_head.", "layers.", "mtp.", "norm.")
 _FLOAT8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -169,12 +175,40 @@ def _is_mtp_checkpoint_key(name: str) -> bool:
     return name.removeprefix("model.").startswith("mtp.")
 
 
-def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = "model.") -> str:
+def _is_mtp_expert_prefix(prefix: str) -> bool:
+    return prefix.removeprefix("model.").startswith("mtp.")
+
+
+def convert_deepseek_v4_checkpoint_key(
+    name: str,
+    *,
+    target_model_prefix: str = "model.",
+    enable_mtp: bool = False,
+) -> str:
     """Convert DeepSeek's inference checkpoint names to Transformers v5 names."""
-    if _is_mtp_checkpoint_key(name):
+    if _is_mtp_checkpoint_key(name) and not enable_mtp:
         return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
+    if enable_mtp and source_name.startswith("mtp."):
+        hc_match = _MTP_HC_HEAD_PATTERN.match(source_name)
+        if hc_match is not None:
+            stage_idx, part = hc_match.groups()
+            return f"{target_model_prefix}mtp.{stage_idx}.hc_head.hc_{part}"
+        w1_match = _MTP_MARKOV_W1_PATTERN.match(source_name)
+        if w1_match is not None:
+            stage_idx, suffix = w1_match.groups()
+            return f"{target_model_prefix}mtp.{stage_idx}.markov_head.embed.{suffix}"
+        w2_match = _MTP_MARKOV_W2_PATTERN.match(source_name)
+        if w2_match is not None:
+            stage_idx, suffix = w2_match.groups()
+            return f"{target_model_prefix}mtp.{stage_idx}.markov_head.head.{suffix}"
+        # Guard ``mtp.{i}.norm.weight`` before HF's broad ``\.norm\. -> .kv_norm.`` rule
+        # (which was written for ``layers.{i}.attn.compressor.norm.weight`` where top-level
+        # ``norm.weight`` had no leading dot).
+        if _MTP_STAGE_NORM_PATTERN.match(source_name):
+            return f"{target_model_prefix}{source_name}"
+
     # Upgrade legacy VeOmni scorer keys before HF's broad inference-name
     # rewrite can add a second compressor prefix.
     if re.match(r"^layers\.\d+\.self_attn\.compressor\.indexer\.weights_proj\.", source_name):
@@ -188,13 +222,33 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
     return converted_name
 
 
-def _revert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = "model.") -> str:
+def _revert_deepseek_v4_checkpoint_key(
+    name: str,
+    *,
+    target_model_prefix: str = "model.",
+    enable_mtp: bool = False,
+) -> str:
     """Convert Transformers v5 parameter names back to DeepSeek release checkpoint names."""
-    if _is_mtp_checkpoint_key(name):
+    if _is_mtp_checkpoint_key(name) and not enable_mtp:
         return name
     source_name = name.removeprefix(target_model_prefix) if target_model_prefix else name
     if source_name.startswith("model.") and source_name.removeprefix("model.").startswith(_BASE_MODEL_KEY_PREFIXES):
         source_name = source_name.removeprefix("model.")
+    if enable_mtp and source_name.startswith("mtp."):
+        hc_reverse = re.match(r"^mtp\.(\d+)\.hc_head\.hc_(fn|base|scale)$", source_name)
+        if hc_reverse is not None:
+            stage_idx, part = hc_reverse.groups()
+            return f"mtp.{stage_idx}.hc_head_{part}"
+        w1_reverse = re.match(r"^mtp\.(\d+)\.markov_head\.embed\.(weight|scale)$", source_name)
+        if w1_reverse is not None:
+            stage_idx, suffix = w1_reverse.groups()
+            return f"mtp.{stage_idx}.markov_head.markov_w1.{suffix}"
+        w2_reverse = re.match(r"^mtp\.(\d+)\.markov_head\.head\.(weight|scale)$", source_name)
+        if w2_reverse is not None:
+            stage_idx, suffix = w2_reverse.groups()
+            return f"mtp.{stage_idx}.markov_head.markov_w2.{suffix}"
+        if _MTP_STAGE_NORM_PATTERN.match(source_name):
+            return source_name
     if "mlp.experts." in source_name:
         fields = source_name.split(".")
         if len(fields) >= 2 and fields[-2] in _PROJ_NAME_TO_W_NAME:
@@ -220,7 +274,12 @@ def _extract_quant_config(config) -> tuple[dict, int, str, bool]:
     return quant_cfg, fp8_block_size, expert_dtype, has_quant
 
 
-def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefix: str = "model.") -> dict[str, int]:
+def _build_default_deepseek_v4_fqn_to_index_mapping(
+    model,
+    *,
+    target_model_prefix: str = "model.",
+    enable_mtp: bool = False,
+) -> dict[str, int]:
     """Synthesize a 1-shard release-format ``fqn_to_index_mapping`` from *model* when none was loaded."""
     config = getattr(model, "config", None)
     _quant_cfg, fp8_block_size, expert_dtype, has_quant = _extract_quant_config(config)
@@ -231,6 +290,7 @@ def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefi
     state_dict = state_dict_fn()
     tie_word_embeddings = bool(getattr(config, "tie_word_embeddings", False))
     num_experts_cfg = getattr(config, "n_routed_experts", None) or getattr(config, "num_local_experts", None)
+    mtp_num_experts_cfg = getattr(config, "dspark_n_routed_experts", None) or num_experts_cfg
 
     mapping: dict[str, int] = {}
 
@@ -251,26 +311,34 @@ def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefi
             continue
         shape = tuple(param.shape)
         if name.endswith(".mlp.experts.gate_up_proj") and len(shape) == 3:
-            num_experts = int(num_experts_cfg or shape[0])
             prefix = name.removesuffix(".gate_up_proj")
+            target_experts_cfg = mtp_num_experts_cfg if _is_mtp_expert_prefix(prefix) else num_experts_cfg
+            num_experts = int(target_experts_cfg or shape[0])
             expert_shape = (shape[1] // 2, shape[2])
             for e in range(num_experts):
                 for w_name in ("w1", "w3"):
                     origin_key = _revert_deepseek_v4_checkpoint_key(
-                        f"{prefix}.{e}.{w_name}.weight", target_model_prefix=target_model_prefix
+                        f"{prefix}.{e}.{w_name}.weight",
+                        target_model_prefix=target_model_prefix,
+                        enable_mtp=enable_mtp,
                     )
                     _add_entry(origin_key, expert_shape)
         elif name.endswith(".mlp.experts.down_proj") and len(shape) == 3:
-            num_experts = int(num_experts_cfg or shape[0])
             prefix = name.removesuffix(".down_proj")
+            target_experts_cfg = mtp_num_experts_cfg if _is_mtp_expert_prefix(prefix) else num_experts_cfg
+            num_experts = int(target_experts_cfg or shape[0])
             expert_shape = (shape[1], shape[2])
             for e in range(num_experts):
                 origin_key = _revert_deepseek_v4_checkpoint_key(
-                    f"{prefix}.{e}.w2.weight", target_model_prefix=target_model_prefix
+                    f"{prefix}.{e}.w2.weight",
+                    target_model_prefix=target_model_prefix,
+                    enable_mtp=enable_mtp,
                 )
                 _add_entry(origin_key, expert_shape)
         else:
-            origin_key = _revert_deepseek_v4_checkpoint_key(name, target_model_prefix=target_model_prefix)
+            origin_key = _revert_deepseek_v4_checkpoint_key(
+                name, target_model_prefix=target_model_prefix, enable_mtp=enable_mtp
+            )
             _add_entry(origin_key, shape)
 
     return mapping
@@ -282,20 +350,21 @@ def validate_deepseek_v4_export_quant_support(
     model: torch.nn.Module | None = None,
     target_model_prefix: str = "model.",
     should_quantize: Callable[[str], bool] | None = None,
+    enable_mtp: bool = False,
 ) -> None:
     """Validate that SM90+ TileLang quantization is available when ``.scale`` keys will be quantized on export."""
     if fqn_to_index_mapping is None and model is not None:
         fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
         if fqn_to_index_mapping is None:
             fqn_to_index_mapping = _build_default_deepseek_v4_fqn_to_index_mapping(
-                model, target_model_prefix=target_model_prefix
+                model, target_model_prefix=target_model_prefix, enable_mtp=enable_mtp
             )
     if not fqn_to_index_mapping:
         return
 
     needs_quant = False
     for origin in fqn_to_index_mapping:
-        if _is_mtp_checkpoint_key(origin) or not origin.endswith(".weight"):
+        if (not enable_mtp and _is_mtp_checkpoint_key(origin)) or not origin.endswith(".weight"):
             continue
         scale_name = f"{origin.removesuffix('.weight')}.scale"
         if scale_name not in fqn_to_index_mapping:
@@ -386,12 +455,26 @@ class DeepseekV4CheckpointTensorConverter:
             ``0..num_experts-1``.
         target_model_prefix: Prefix prepended by :func:`convert_deepseek_v4_checkpoint_key`
             (``"model."`` for CausalLM, ``""`` for the bare Model).
+        enable_mtp: Whether ``mtp.*`` DSpark draft stages are active on the live model.
+        mtp_num_experts: Routed expert count for ``mtp.*`` stages (defaults to ``num_experts``).
     """
 
-    def __init__(self, num_experts: int, *, expert_offset: int = 0, target_model_prefix: str = "model."):
+    def __init__(
+        self,
+        num_experts: int,
+        *,
+        expert_offset: int = 0,
+        target_model_prefix: str = "model.",
+        enable_mtp: bool = False,
+        mtp_num_experts: int | None = None,
+        mtp_expert_offset: int | None = None,
+    ):
         self.num_experts = num_experts
+        self.mtp_num_experts = num_experts if mtp_num_experts is None else mtp_num_experts
         self.expert_offset = expert_offset
+        self.mtp_expert_offset = expert_offset if mtp_expert_offset is None else mtp_expert_offset
         self.target_model_prefix = target_model_prefix
+        self.enable_mtp = enable_mtp
         # {(prefix, proj_name): {local_expert_id: tensor}}
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
@@ -399,10 +482,22 @@ class DeepseekV4CheckpointTensorConverter:
         # {weight_name: {"weight": tensor, "scale": tensor}} for FP8/int8 checkpoint pairs.
         self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str | bool]] = {}
 
+    def _convert_key(self, name: str) -> str:
+        return convert_deepseek_v4_checkpoint_key(
+            name,
+            target_model_prefix=self.target_model_prefix,
+            enable_mtp=self.enable_mtp,
+        )
+
+    def _expert_range_for_prefix(self, prefix: str) -> tuple[int, int]:
+        if _is_mtp_expert_prefix(prefix):
+            return self.mtp_expert_offset, self.mtp_num_experts
+        return self.expert_offset, self.num_experts
+
     def can_handle(self, name: str) -> bool:
-        if _is_mtp_checkpoint_key(name):
+        if _is_mtp_checkpoint_key(name) and not self.enable_mtp:
             return False
-        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        converted_name = self._convert_key(name)
         return (
             converted_name != name
             or bool(_EXPERT_PATTERN.match(converted_name))
@@ -410,16 +505,16 @@ class DeepseekV4CheckpointTensorConverter:
         )
 
     def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
-        if _is_mtp_checkpoint_key(name):
+        if _is_mtp_checkpoint_key(name) and not self.enable_mtp:
             return False
-        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        converted_name = self._convert_key(name)
         return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
 
     def fused_expert_target(self, name: str) -> tuple[str, int] | None:
         """Map a per-expert weight or its scale to ``(fused_param, expert_index)``."""
-        if _is_mtp_checkpoint_key(name):
+        if _is_mtp_checkpoint_key(name) and not self.enable_mtp:
             return None
-        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        converted_name = self._convert_key(name)
         weight_name = _weight_name_from_scale_name(converted_name) or converted_name
         match = _EXPERT_PATTERN.match(weight_name)
         if not match:
@@ -429,22 +524,58 @@ class DeepseekV4CheckpointTensorConverter:
         fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
         return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
 
-    def for_expert_range(self, start: int, num_local: int) -> DeepseekV4CheckpointTensorConverter:
+    def for_expert_range(
+        self,
+        start: int,
+        num_local: int,
+        *,
+        mtp_start: int | None = None,
+        mtp_num_local: int | None = None,
+    ) -> DeepseekV4CheckpointTensorConverter:
+        if mtp_start is None and mtp_num_local is None:
+            max_experts = max(self.num_experts, self.mtp_num_experts) if self.enable_mtp else self.num_experts
+            if start < 0 or num_local <= 0 or start + num_local > max_experts:
+                raise ValueError(
+                    f"Expert range [{start}, {start + num_local}) is outside this converter's {max_experts} experts."
+                )
+            return DeepseekV4CheckpointTensorConverter(
+                num_experts=num_local,
+                expert_offset=self.expert_offset + start,
+                target_model_prefix=self.target_model_prefix,
+                enable_mtp=self.enable_mtp,
+                mtp_num_experts=num_local,
+                mtp_expert_offset=self.mtp_expert_offset + start,
+            )
+
+        resolved_mtp_start = start if mtp_start is None else mtp_start
+        resolved_mtp_local = num_local if mtp_num_local is None else mtp_num_local
         if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
             raise ValueError(
                 f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        if self.enable_mtp and (
+            resolved_mtp_start < 0
+            or resolved_mtp_local <= 0
+            or resolved_mtp_start + resolved_mtp_local > self.mtp_num_experts
+        ):
+            raise ValueError(
+                f"MTP expert range [{resolved_mtp_start}, {resolved_mtp_start + resolved_mtp_local}) "
+                f"is outside this converter's {self.mtp_num_experts} MTP experts."
             )
         return DeepseekV4CheckpointTensorConverter(
             num_experts=num_local,
             expert_offset=self.expert_offset + start,
             target_model_prefix=self.target_model_prefix,
+            enable_mtp=self.enable_mtp,
+            mtp_num_experts=resolved_mtp_local,
+            mtp_expert_offset=self.mtp_expert_offset + resolved_mtp_start,
         )
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
-        if _is_mtp_checkpoint_key(name):
+        if _is_mtp_checkpoint_key(name) and not self.enable_mtp:
             return ConvertedCheckpointTensor(name, tensor)
         packed_fp4 = tensor.dtype == torch.int8 and bool(_RAW_FP4_EXPERT_WEIGHT_PATTERN.fullmatch(name))
-        name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        name = self._convert_key(name)
         weight_name = _weight_name_from_scale_name(name)
         if weight_name is not None:
             if not _is_block_scale_tensor(tensor):
@@ -491,11 +622,12 @@ class DeepseekV4CheckpointTensorConverter:
 
         prefix, expert_id_str, proj_name = match.groups()
         proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
-        expert_id = int(expert_id_str) - self.expert_offset
-        if not 0 <= expert_id < self.num_experts:
+        expert_offset, expected_experts = self._expert_range_for_prefix(prefix)
+        expert_id = int(expert_id_str) - expert_offset
+        if not 0 <= expert_id < expected_experts:
             raise ValueError(
                 f"{name}: expert {int(expert_id_str)} is outside this converter's range "
-                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+                f"[{expert_offset}, {expert_offset + expected_experts})."
             )
         buf_key = (prefix, proj_name)
 
@@ -503,11 +635,11 @@ class DeepseekV4CheckpointTensorConverter:
             self._expert_buffer[buf_key] = {}
         self._expert_buffer[buf_key][expert_id] = tensor
 
-        if len(self._expert_buffer[buf_key]) < self.num_experts:
+        if len(self._expert_buffer[buf_key]) < expected_experts:
             return None
 
         # Stack all experts: [E, I, H] or [E, H, I]
-        stacked = torch.stack([self._expert_buffer[buf_key][i] for i in range(self.num_experts)])
+        stacked = torch.stack([self._expert_buffer[buf_key][i] for i in range(expected_experts)])
         del self._expert_buffer[buf_key]
 
         if proj_name == "down_proj":
@@ -571,6 +703,7 @@ class DeepseekV4CheckpointTensorConverter:
             model=model,
             target_model_prefix=self.target_model_prefix,
             should_quantize=should_quantize,
+            enable_mtp=self.enable_mtp,
         )
 
     def export_weights(
@@ -584,7 +717,7 @@ class DeepseekV4CheckpointTensorConverter:
         fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
         if fqn_to_index_mapping is None:
             fqn_to_index_mapping = _build_default_deepseek_v4_fqn_to_index_mapping(
-                model, target_model_prefix=self.target_model_prefix
+                model, target_model_prefix=self.target_model_prefix, enable_mtp=self.enable_mtp
             )
             model._veomni_fqn_to_index_mapping = fqn_to_index_mapping
 
@@ -598,18 +731,24 @@ class DeepseekV4CheckpointTensorConverter:
         for key, shard_idx in fqn_to_index_mapping.items():
             if key.endswith(".mlp.experts.gate_up_proj"):
                 prefix = key.removesuffix(".gate_up_proj")
-                for e in range(self.num_experts):
+                n_exp = self.mtp_num_experts if _is_mtp_expert_prefix(prefix) else self.num_experts
+                for e in range(n_exp):
                     for w_name in ("w1", "w3"):
                         origin_k = _revert_deepseek_v4_checkpoint_key(
-                            f"{prefix}.{e}.{w_name}.weight", target_model_prefix=self.target_model_prefix
+                            f"{prefix}.{e}.{w_name}.weight",
+                            target_model_prefix=self.target_model_prefix,
+                            enable_mtp=self.enable_mtp,
                         )
                         expanded_fused[origin_k] = shard_idx
                 removed_fused.append(key)
             elif key.endswith(".mlp.experts.down_proj"):
                 prefix = key.removesuffix(".down_proj")
-                for e in range(self.num_experts):
+                n_exp = self.mtp_num_experts if _is_mtp_expert_prefix(prefix) else self.num_experts
+                for e in range(n_exp):
                     origin_k = _revert_deepseek_v4_checkpoint_key(
-                        f"{prefix}.{e}.w2.weight", target_model_prefix=self.target_model_prefix
+                        f"{prefix}.{e}.w2.weight",
+                        target_model_prefix=self.target_model_prefix,
+                        enable_mtp=self.enable_mtp,
                     )
                     expanded_fused[origin_k] = shard_idx
                 removed_fused.append(key)
@@ -622,9 +761,11 @@ class DeepseekV4CheckpointTensorConverter:
         # ``attn.kv_norm``), so map names back by inverting the load-time renaming over the checkpoint index.
         origin_names: dict[str, str] = {}
         for origin in fqn_to_index_mapping:
-            if _is_mtp_checkpoint_key(origin):
+            if not self.enable_mtp and _is_mtp_checkpoint_key(origin):
                 continue
-            converted = convert_deepseek_v4_checkpoint_key(origin, target_model_prefix=self.target_model_prefix)
+            converted = convert_deepseek_v4_checkpoint_key(
+                origin, target_model_prefix=self.target_model_prefix, enable_mtp=self.enable_mtp
+            )
             if "mlp.experts." in converted:
                 fields = converted.split(".")
                 if len(fields) >= 2 and fields[-2] in _PROJ_NAME_TO_W_NAME:
@@ -644,7 +785,9 @@ class DeepseekV4CheckpointTensorConverter:
             origin = origin_names.get(name)
             if origin is None:
                 if not fqn_to_index_mapping:
-                    origin = _revert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+                    origin = _revert_deepseek_v4_checkpoint_key(
+                        name, target_model_prefix=self.target_model_prefix, enable_mtp=self.enable_mtp
+                    )
                 else:
                     is_tied_head = name in ("lm_head.weight", "model.lm_head.weight") and bool(
                         getattr(config, "tie_word_embeddings", False)
@@ -691,17 +834,23 @@ class DeepseekV4CheckpointTensorConverter:
             yield scale_name, scale
 
         missing_weight_names = fqn_to_index_mapping.keys() - export_weight_names
-        # MTP not supported for now, ignore it.
-        missing_weight_names = {name for name in missing_weight_names if not name.startswith("mtp.")}
+        if not self.enable_mtp:
+            missing_weight_names = {name for name in missing_weight_names if not _is_mtp_checkpoint_key(name)}
         if missing_weight_names:
             logger.warning(f"Export weights missing: {missing_weight_names}")
 
 
 def create_deepseek_v4_checkpoint_tensor_converter(model):
     """Factory function registered on model classes via _create_checkpoint_tensor_converter."""
+    base_model = getattr(model, "model", model)
+    mtp_modules = getattr(base_model, "mtp", None)
+    enable_mtp = bool(mtp_modules is not None and len(mtp_modules) > 0)
+    mtp_num_experts = getattr(model.config, "dspark_n_routed_experts", None) or model.config.n_routed_experts
     return DeepseekV4CheckpointTensorConverter(
         num_experts=model.config.n_routed_experts,
         target_model_prefix=_get_deepseek_v4_target_model_prefix(model),
+        enable_mtp=enable_mtp,
+        mtp_num_experts=mtp_num_experts,
     )
 
 
