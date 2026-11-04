@@ -3,27 +3,42 @@
 """Checkpoint preflight for dynamic RoPE's nonpersistent runtime state."""
 
 import hashlib
+import importlib
 import json
 import math
 
-import torch
+from .tensor_bytes import tensor_byte_chunks
+
+
+def _is_native_qwen3_dynamic(module):
+    """Recognize upstream and VeOmni-generated Qwen3 rotary implementations."""
+    cls = type(module)
+    approved_modules = {
+        "transformers.models.qwen3.modeling_qwen3",
+        "veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu",
+        "veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu",
+    }
+    if cls.__module__ not in approved_modules or cls.__name__ != "Qwen3RotaryEmbedding":
+        return False
+    return importlib.import_module(cls.__module__).Qwen3RotaryEmbedding is cls and module.rope_type == "dynamic"
 
 
 def _is_native_qwen3_dynamic_reset_alias(module):
     """Recognize the native Qwen3 reset alias, not custom mutable caches."""
-    cls = type(module)
-    if cls.__module__ != "transformers.models.qwen3.modeling_qwen3" or cls.__name__ != "Qwen3RotaryEmbedding":
-        return False
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-
     buffers = module._buffers
     return (
-        cls is Qwen3RotaryEmbedding
-        and module.rope_type == "dynamic"
+        _is_native_qwen3_dynamic(module)
         and {"inv_freq", "original_inv_freq"} <= module._non_persistent_buffers_set
         and buffers.get("inv_freq") is not None
         and buffers.get("inv_freq") is buffers.get("original_inv_freq")
     )
+
+
+def _tensor_digest(value):
+    digest = hashlib.sha256()
+    for chunk in tensor_byte_chunks(value, chunk_bytes=4 << 20):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def dynamic_rope_checkpoint_contract(model):
@@ -67,16 +82,35 @@ def dynamic_rope_checkpoint_contract(model):
                 config_hash = hashlib.sha256(
                     json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
                 ).hexdigest()
+                inv_digest = _tensor_digest(inv)
+                initial_digest = _tensor_digest(initial_inv)
+                expected_inv = expected_inv.to(dtype=inv.dtype)
+                matches_canonical = (
+                    tuple(inv.shape) == tuple(expected_inv.shape)
+                    and inv_digest == _tensor_digest(expected_inv)
+                    and scale == float(expected_scale)
+                )
+                if not matches_canonical and layer_type is None and _is_native_qwen3_dynamic(module):
+                    # HF often builds the original table on CPU before moving it
+                    # to an accelerator. Recompute that origin exactly rather
+                    # than tolerating device-dependent rounding differences.
+                    cpu_inv, cpu_scale = ROPE_INIT_FUNCTIONS[kind](module.config, device="cpu", seq_len=original)
+                    cpu_inv = cpu_inv.to(dtype=inv.dtype)
+                    matches_canonical = (
+                        tuple(inv.shape) == tuple(cpu_inv.shape)
+                        and inv_digest == _tensor_digest(cpu_inv)
+                        and scale == float(cpu_scale)
+                    )
                 valid = (
                     original > 0
                     and cached == original
                     and not inv.requires_grad
                     and not initial_inv.requires_grad
                     and inv.dtype == initial_inv.dtype
-                    and torch.equal(inv, initial_inv.to(device=inv.device))
-                    and torch.equal(inv, expected_inv.to(device=inv.device, dtype=inv.dtype))
+                    and tuple(inv.shape) == tuple(initial_inv.shape)
+                    and inv_digest == initial_digest
+                    and matches_canonical
                     and math.isfinite(scale)
-                    and scale == float(expected_scale)
                     and (kind != "longrope" or not hasattr(module, f"{prefix}long_inv_freq"))
                 )
             except Exception as exc:
@@ -86,5 +120,22 @@ def dynamic_rope_checkpoint_contract(model):
                     f"Dynamic RoPE cache for {name or '<root>'} depends on prior sequence lengths; "
                     "its nonpersistent state cannot yet be restored exactly"
                 )
-            descriptors.append((name, layer_type, kind, original, str(inv.dtype), config_hash))
+            # DCP omits these nonpersistent tables: bind the exact current and
+            # reset bytes to the layout so restore rejects another origin even
+            # when both individually match a valid canonical reconstruction.
+            descriptors.append(
+                (
+                    name,
+                    layer_type,
+                    kind,
+                    original,
+                    str(inv.dtype),
+                    config_hash,
+                    f"{type(module).__module__}.{type(module).__qualname__}",
+                    tuple(inv.shape),
+                    scale.hex(),
+                    inv_digest,
+                    initial_digest,
+                )
+            )
     return descriptors

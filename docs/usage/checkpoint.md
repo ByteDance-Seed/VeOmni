@@ -542,17 +542,24 @@ identity covers parameters and buffers, including nonpersistent buffer aliases.
 Optimizer adapters and model serialization hooks are trusted to preserve their
 state and semantics. Identity tracks repeated tensor objects, but does not detect
 distinct views sharing storage; models that rely on mutable shared views are
-outside this checkpoint contract. A reset dynamic RoPE cache can have a
-different alias graph from a newly constructed model and is conservatively
-rejected before writing until that cache state can be restored safely.
+outside this checkpoint contract. The upstream and VeOmni-generated Qwen3
+dynamic RoPE reset alias is permitted when its current and original tables match
+a valid reconstruction; other reset aliases remain outside this contract.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
 the cache grew beyond its original context and has not reset, a fresh process
 can compute different later outputs. MultiOptimizer checkpoints therefore
 reject a non-reconstructible dynamic or longrope cache at save. With a dynamic
-or longrope target, resume requires a matching cache contract; older checkpoints
-without that proof need a verified migration. Older checkpoints do not identify
-the source's RoPE configuration, so the operator must also independently verify
-that the source and target configurations match. Saving an expanded cache is not
+or longrope target, resume requires the exact saved current/reset frequency
+bytes, shape, implementation and scaling to match the fresh target. The supported
+Qwen3 classes accept an exact CPU-built table moved to the accelerator as well as
+an exact table built on that accelerator; close-but-different tables are not
+interchangeable. The byte-level contract replaces the earlier configuration-only
+contract, so older dynamic or longrope checkpoints need a verified migration.
+Unversioned sources lack the source's RoPE configuration, including when the
+target is static; the operator must independently verify source and target.
+Matching the RoPE table alone does not establish whole-training determinism: the
+runtime, hardware, topology, input and other checkpoint state must also match.
+Saving an expanded cache is not
 yet supported. Dynamic and longrope training may run without saving, but a
 MultiOptimizer DCP save fails if its cache cannot be reconstructed; operators
 should account for this when planning checkpoint cadence. Ordinary

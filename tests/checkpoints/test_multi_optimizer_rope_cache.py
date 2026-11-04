@@ -42,7 +42,7 @@ def test_runtime_preflight_allows_dynamic_rope_training_without_checkpoint():
 
 
 class _TinyQwenRope(torch.nn.Module):
-    def __init__(self, theta=10000):
+    def __init__(self, theta=10000, rope_class=Qwen3RotaryEmbedding):
         super().__init__()
         self.projection = torch.nn.Linear(8, 8)
         config = Qwen3Config(
@@ -53,13 +53,26 @@ class _TinyQwenRope(torch.nn.Module):
             max_position_embeddings=16,
             rope_parameters={"rope_type": "dynamic", "factor": 2.0, "rope_theta": theta},
         )
-        self.rope = Qwen3RotaryEmbedding(config)
+        self.rope = rope_class(config)
 
 
-def _build(theta=10000):
-    model = _TinyQwenRope(theta)
+def _build(theta=10000, rope_class=Qwen3RotaryEmbedding):
+    model = _TinyQwenRope(theta, rope_class)
     leaf = torch.optim.AdamW(model.parameters(), lr=0.01)
     return model, MultiOptimizer(model, {"model": leaf}, ["model"])
+
+
+def _registry_rope_class(backend):
+    import importlib
+    from unittest.mock import patch
+
+    from veomni.models.registry import MODELING_REGISTRY
+    from veomni.models.transformers import qwen3
+
+    with patch.object(qwen3, "IS_NPU_AVAILABLE", backend == "npu"):
+        model_class = MODELING_REGISTRY["qwen3"]("Qwen3Model")
+    assert model_class.__module__.endswith(f"patched_modeling_qwen3_{backend}")
+    return importlib.import_module(model_class.__module__).Qwen3RotaryEmbedding
 
 
 def _update(model, optimizer, value):
@@ -84,17 +97,19 @@ def _rope_update(model, optimizer, length=8):
 
 def _rope_transitions(model, optimizer):
     result = {}
-    for length in (8, 32, 24, 4):
+    for index, length in enumerate((8, 16, 17, 16, 15, 32, 24, 4)):
         trace = _rope_update(model, optimizer, length)
-        result.update({f"{length}.{key}": value for key, value in trace.items()})
-        result[f"{length}.inv_freq"] = model.rope.inv_freq.detach().clone()
-        result[f"{length}.cached_length"] = torch.tensor(int(model.rope.max_seq_len_cached))
-        result.update({f"{length}.param.{name}": value.detach().clone() for name, value in model.named_parameters()})
+        label = f"{index}:{length}"
+        result.update({f"{label}.{key}": value for key, value in trace.items()})
+        result[f"{label}.inv_freq"] = model.rope.inv_freq.detach().clone()
+        result[f"{label}.cached_length"] = torch.tensor(int(model.rope.max_seq_len_cached))
+        result.update({f"{label}.param.{name}": value.detach().clone() for name, value in model.named_parameters()})
     return result
 
 
-def _fresh_resume(_rank, checkpoint, expected_path):
-    model, optimizer = _build()
+def _fresh_resume(_rank, checkpoint, expected_path, backend=None):
+    rope_class = Qwen3RotaryEmbedding if backend is None else _registry_rope_class(backend)
+    model, optimizer = _build(rope_class=rope_class)
     DistributedCheckpointer.load(
         checkpoint,
         {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
@@ -136,6 +151,51 @@ def test_standard_qwen4_rope_128k_does_not_require_dynamic_cache_contract():
     rope(torch.zeros((1, 131072, 8)), positions)
     assert rope.max_seq_len_cached == 262144
     assert dynamic_rope_checkpoint_contract(rope) == []
+
+
+def test_qwen4_default_rope_keeps_legacy_checkpoint_layout(tmp_path):
+    import json
+
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRotaryEmbedding
+
+    from veomni.checkpoint.optimizer_resume_layout import capture_multi_layout
+
+    def build():
+        model, optimizer = _build()
+        config = Qwen4ExpTextConfig(
+            hidden_size=32,
+            head_dim=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=262144,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000000, "mrope_section": [1, 1, 2]},
+        )
+        model.rope = Qwen4ExpTextRotaryEmbedding(config)
+        return model, optimizer
+
+    model, optimizer = build()
+    _update(model, optimizer, 1.0)
+    layout = json.loads(capture_multi_layout(model, optimizer, None, None))
+    assert "dynamic_rope_cache_v1" not in layout and "dynamic_rope_cache_v2" not in layout
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = build()
+    DistributedCheckpointer.load(
+        checkpoint, {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    for actual, expected in zip(target.parameters(), model.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                restored.optimizers_dict["model"].state[actual][key],
+                optimizer.optimizers_dict["model"].state[expected][key],
+                rtol=0,
+                atol=0,
+            )
 
 
 def test_expanded_dynamic_rope_cache_is_rejected_before_checkpoint_write(tmp_path):
@@ -197,6 +257,136 @@ def test_changed_dynamic_rope_config_is_rejected_before_model_load(tmp_path):
     torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
 
 
+def _skew_device_recomputation(monkeypatch):
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    original = ROPE_INIT_FUNCTIONS["dynamic"]
+
+    def skewed(config, device, seq_len=None, **kwargs):
+        values, scale = original(config, device, seq_len=seq_len, **kwargs)
+        # Model the observed CPU/NPU 1-ULP difference without requiring an NPU.
+        if isinstance(device, torch.device):
+            values = torch.nextafter(values, torch.full_like(values, float("inf")))
+        return values, scale
+
+    monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "dynamic", skewed)
+
+
+@pytest.mark.parametrize("backend", ["hf", "gpu", "npu"])
+def test_cpu_origin_rope_with_device_rounding_difference_resumes_exactly(tmp_path, monkeypatch, backend):
+    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class(backend)
+    model, optimizer = _build(rope_class=rope_class)
+    _update(model, optimizer, 1.0)
+    _skew_device_recomputation(monkeypatch)
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = _build(rope_class=rope_class)
+    DistributedCheckpointer.load(
+        checkpoint, {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    expected = _rope_transitions(model, optimizer)
+    actual = _rope_transitions(target, restored)
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["hf", "gpu", "npu"])
+def test_distinct_cpu_and_device_origin_rope_is_rejected_before_restore(tmp_path, monkeypatch, backend):
+    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class(backend)
+    model, optimizer = _build(rope_class=rope_class)
+    _skew_device_recomputation(monkeypatch)
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = _build(rope_class=rope_class)
+    shifted = torch.nextafter(target.rope.inv_freq, torch.full_like(target.rope.inv_freq, float("inf")))
+    target.rope.inv_freq.copy_(shifted)
+    target.rope.original_inv_freq.copy_(shifted)
+    before = target.projection.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+    assert not restored.optimizers_dict["model"].state
+
+
+def test_signed_zero_in_rope_table_is_not_a_canonical_match(tmp_path):
+    model, optimizer = _build(theta=1e12)
+    model.rope.inv_freq = model.rope.inv_freq.to(torch.float16)
+    model.rope.original_inv_freq = model.rope.original_inv_freq.to(torch.float16)
+    assert model.rope.inv_freq[-1].item() == 0
+    model.rope.inv_freq[-1] = -0.0
+    model.rope.original_inv_freq[-1] = -0.0
+    checkpoint = tmp_path / "checkpoint"
+    with pytest.raises(RuntimeError, match="Dynamic RoPE cache.*depends on prior sequence lengths"):
+        DistributedCheckpointer.save(
+            str(checkpoint),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+        )
+    assert not checkpoint.exists()
+
+
+def test_changed_qwen3_rope_implementation_is_rejected_before_restore(tmp_path):
+    model, optimizer = _build()
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = _build(rope_class=_registry_rope_class("gpu"))
+    torch.testing.assert_close(model.rope.inv_freq, target.rope.inv_freq, rtol=0, atol=0)
+    before = target.projection.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+
+
+def test_old_dynamic_rope_contract_without_table_identity_is_rejected(tmp_path, monkeypatch):
+    import veomni.checkpoint.optimizer_resume_layout as layout
+
+    model, optimizer = _build()
+    original = layout._local_layout
+
+    def capture_legacy(*args, **kwargs):
+        payload = original(*args, **kwargs)
+        if kwargs.get("capture"):
+            payload["dynamic_rope_cache_v1"] = [item[:6] for item in payload.pop("dynamic_rope_cache_v2")]
+        return payload
+
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    with monkeypatch.context() as legacy:
+        legacy.setattr(layout, "_local_layout", capture_legacy)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    target, restored = _build()
+    before = target.projection.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.projection.weight, before, rtol=0, atol=0)
+
+
 def _rank_local_rope_error(rank, checkpoint, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
@@ -237,6 +427,25 @@ def test_real_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_pat
     expected = tmp_path / "expected.pt"
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
     mp.spawn(_fresh_resume, args=(checkpoint, str(expected)), nprocs=1, join=True)
+
+
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+def test_registry_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_path, backend):
+    model, optimizer = _build(rope_class=_registry_rope_class(backend))
+    _update(model, optimizer, 1.0)
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
+    assert model.rope.inv_freq is model.rope.original_inv_freq
+    checkpoint = str(tmp_path / "checkpoint")
+    DistributedCheckpointer.save(
+        checkpoint,
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=SimpleNamespace(dp_mode="ddp"),
+    )
+    trace = _rope_transitions(model, optimizer)
+    expected = tmp_path / "expected.pt"
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
+    mp.spawn(_fresh_resume, args=(checkpoint, str(expected), backend), nprocs=1, join=True)
 
 
 def _rank_local_rope_reset(rank, checkpoint, directory, phase, endpoint):
