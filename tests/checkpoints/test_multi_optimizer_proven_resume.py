@@ -665,8 +665,11 @@ def _runtime_plan_mismatch_worker(rank, endpoint):
     from datetime import timedelta
 
     import torch.distributed as dist
+    from torch.distributed.tensor import Shard
 
+    import veomni.distributed.torch_parallelize as parallelize_module
     import veomni.models.model_runtime as runtime_module
+    from veomni.distributed.parallel_plan import ParallelPlan
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
@@ -677,6 +680,7 @@ def _runtime_plan_mismatch_worker(rank, endpoint):
 
             def _build_model(self):
                 self.model = torch.nn.Linear(2, 2)
+                self.model.get_parallel_plan = lambda: ParallelPlan(extra_parallel_plan={"ep": {"weight": Shard(0)}})
 
             def _freeze_model_module(self):
                 pass
@@ -685,6 +689,13 @@ def _runtime_plan_mismatch_worker(rank, endpoint):
                 pass
 
         runtime_module.use_parallel_state = lambda *_args, **_kwargs: contextlib.nullcontext()
+        state = SimpleNamespace(
+            any_extra_parallel_enabled=True,
+            extra_parallel_sizes=("ep",),
+            extra_parallel_enabled=lambda name: name == "ep",
+        )
+        runtime_module.get_parallel_state_by_name = lambda _name: state
+        parallelize_module.get_parallel_state = lambda: state
         checkpoint = SimpleNamespace(extra_parallel_canonical_layout=True)
         args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
         with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
