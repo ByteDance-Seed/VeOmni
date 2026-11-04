@@ -305,8 +305,6 @@ class ModelCheckpointManager:
         }
         extra_state.update(self.runtime.extra_state())
         if getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True:
-            if any(key in extra_state for key in ("_veomni_optimizer_global_step", "_veomni_scheduler_recipe")):
-                raise RuntimeError("Reserved MultiOptimizer checkpoint step key is already in use")
             extra_state["_veomni_optimizer_global_step"] = int(state.global_step)
             try:
                 extra_state["_veomni_scheduler_recipe"] = {
