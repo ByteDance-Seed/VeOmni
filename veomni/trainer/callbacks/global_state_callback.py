@@ -77,6 +77,20 @@ def _agree_dpo_output_checkpoint(value, group=None):
     return value
 
 
+def _has_exact_sft_dynamic_resume(trainer):
+    """Keep iterable sources on their legacy cursor path, without relaxing mapping validation."""
+    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+    loader = getattr(trainer, "train_dataloader", None)
+    if (
+        getattr(trainer, "_sft_dynamic_exact_resume", False) is not True
+        or type(loader) is not DynamicBatchSizeDataLoader
+    ):
+        return False
+    dataset = getattr(loader._dataloader, "dataset", None)
+    return not isinstance(dataset, torch.utils.data.IterableDataset)
+
+
 def _multi_optimizer_checkpoints(trainer):
     """Return stable module names and checkpoint managers for strict resume."""
     root = getattr(trainer, "model", None)
@@ -257,13 +271,8 @@ class GlobalStateCallback(Callback):
         self._last_saved_step: int = -1
         self._last_saved_optimizer_generations = {}
         self._unadvanced_boundary_state = None
-        from ...data.dynamic_batching import DynamicBatchSizeDataLoader
-
         data = getattr(args, "data", None)
-        if (
-            getattr(trainer, "_sft_dynamic_exact_resume", False) is True
-            and type(getattr(trainer, "train_dataloader", None)) is DynamicBatchSizeDataLoader
-        ):
+        if _has_exact_sft_dynamic_resume(trainer):
             digest = getattr(data, "resume_input_contract", None)
             if (
                 not isinstance(digest, str)
@@ -345,13 +354,8 @@ class GlobalStateCallback(Callback):
         if pending is not None and state.global_step == pending["global_step"]:
             return pending.copy()
         self._unadvanced_boundary_state = None
-        from ...data.dynamic_batching import DynamicBatchSizeDataLoader
-
         loader = self.trainer.train_dataloader
-        if (
-            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
-            and type(loader) is DynamicBatchSizeDataLoader
-        ):
+        if _has_exact_sft_dynamic_resume(self.trainer):
             loader._strict_resume_contract = True
         is_dpo = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         pending_cursor = getattr(self.trainer, "_dpo_pending_loader_state", None) if is_dpo else None
@@ -399,10 +403,7 @@ class GlobalStateCallback(Callback):
                     "step_in_epoch": self.trainer._dpo_epoch_step,
                     "epoch_complete": self.trainer._dpo_epoch_complete,
                 }
-        if (
-            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
-            and type(self.trainer.train_dataloader) is DynamicBatchSizeDataLoader
-        ):
+        if _has_exact_sft_dynamic_resume(self.trainer):
             result["_veomni_dynamic_context"] = _dynamic_resume_context(
                 self.trainer.args, getattr(state, "epoch", None)
             )
@@ -555,10 +556,7 @@ class GlobalStateCallback(Callback):
         args: "VeOmniArguments" = self.trainer.args
         from ...data.dynamic_batching import DynamicBatchSizeDataLoader
 
-        strict_sft = (
-            getattr(self.trainer, "_sft_dynamic_exact_resume", False) is True
-            and type(getattr(self.trainer, "train_dataloader", None)) is DynamicBatchSizeDataLoader
-        )
+        strict_sft = _has_exact_sft_dynamic_resume(self.trainer)
         load_path = args.train.checkpoint.load_path
         if load_path is None:
             return None
@@ -813,6 +811,13 @@ class GlobalStateCallback(Callback):
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
             loader = self.trainer.train_dataloader
+            saved_sft_context = "_veomni_dynamic_context" in global_state
+            saved_geometry = isinstance(cursor, dict) and "_veomni_resume_geometry" in cursor
+            if not strict_sft and (saved_sft_context or (saved_geometry and not dpo_recovery)):
+                raise ValueError(
+                    "Cannot restore a strict dynamic SFT cursor into a different data path; "
+                    "use a verified migration or start a new weights-only run"
+                )
             if strict_optimizer:
                 if global_step != optimizer_step:
                     raise ValueError("Trainer and optimizer checkpoint steps differ")

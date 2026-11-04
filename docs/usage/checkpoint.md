@@ -85,6 +85,9 @@ The checkpoint records the data/worker geometry, epoch length, source settings
 and input-parallel settings. A changed or missing cursor, geometry, source
 fingerprint or RNG state is rejected. Worker-mode batching and custom or
 iterable sources use separate paths and are not qualified by this contract.
+Iterable sources retain their legacy cursor behavior, which does not establish
+exact continuation. Optimizers requiring a proven data-resume codec still
+reject continuation when that proof is unavailable.
 Exact continuation starts after a completed optimizer step; step-zero cursors
 are rejected because iterator initialization may advance CPU RNG.
 

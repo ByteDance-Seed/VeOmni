@@ -268,14 +268,10 @@ class ModelCheckpointManager:
         try:
             checkpointer.load(load_dir, state, **kwargs)
             self._load_extra_state(state["extra_state"])
-            if self.runtime.optimizer is not optimizer:
-                raise RuntimeError("Optimizer changed while restoring the checkpoint")
-            if self.checkpointer is not checkpointer:
-                raise RuntimeError("Checkpoint provider changed while restoring the checkpoint")
         except BaseException as exc:
             error = exc
         try:
-            raise_if_any_rank_failed(error, "checking restored optimizer identity")
+            raise_if_any_rank_failed(error, "loading model checkpoint")
         except BaseException:
             leaves = getattr(optimizer, "optimizers_dict", {})
             for leaf in leaves.values() if isinstance(leaves, dict) else ():
@@ -385,15 +381,6 @@ class ModelCheckpointManager:
             self.runtime.lr_scheduler = None
 
         return self.weights_dir(state)
-
-    def checkpoint_receipt_is_current(self, step: int) -> bool:
-        """Check that a same-step DCP still represents this optimizer."""
-        if self._last_saved_step != step or getattr(self.checkpointer, "_async_save_failed", False) is True:
-            return False
-        optimizer = self.runtime.optimizer
-        if optimizer is None:
-            return self._last_saved_without_optimizer or self._last_export_released_optimizer
-        return self._last_saved_optimizer_ref is not None and self._last_saved_optimizer_ref() is optimizer
 
     def confirm_loaded_checkpoint_for_reuse(self, step: int, generation: str) -> None:
         """Bind a proven same-output resume to the freshly restored optimizer."""
