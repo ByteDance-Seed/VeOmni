@@ -93,9 +93,10 @@ class OptimizerConfig:
         default="none",
         metadata={
             "help": (
-                "Where the optimizer moment states live. 'none' keeps them on the device "
-                "(stock behavior); 'cpu' keeps them in host buffers and streams one batch of "
-                "states to the device per step, lowering peak device memory (type='adamw' only)."
+                "Optimizer-managed state offload. 'none' disables it (training state may still be "
+                "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
+                "in host buffers and streams them to the device in batches, lowering peak device "
+                "memory (type='adamw' only)."
             )
         },
     )
@@ -156,21 +157,23 @@ class OptimizerConfig:
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
     )
     # ---- state_offload-specific (only consulted when state_offload == "cpu") ----
-    swap_mem_fraction_static: float = field(
+    state_offload_device_memory_fraction: float = field(
         default=0.8,
         metadata={
             "help": (
                 "With optimizer.state_offload='cpu', the fraction of currently free device memory "
-                "used to size one batch of optimizer states streamed from host to device."
+                "used to size one streamed batch of optimizer states. It is recomputed every step; "
+                "a parameter whose states exceed it cannot be swapped in and step() raises."
             )
         },
     )
-    swap_pin_memory: bool = field(
+    state_offload_pin_memory: bool = field(
         default=True,
         metadata={
             "help": (
                 "With optimizer.state_offload='cpu', pin the host-side optimizer state buffers. "
-                "Disable if page-locked memory is scarce."
+                "Disable if page-locked memory is scarce; a failed pinned allocation degrades to "
+                "pageable buffers (rank-0 warning)."
             )
         },
     )
@@ -288,11 +291,11 @@ class OptimizerConfig:
                 # YAML resolves an exponent literal without a decimal point
                 # (``8e-1``) to a string, so coerce before the range check (same
                 # reason as ``_collect_muon_kwargs`` does for ``muon_lr``).
-                self.swap_mem_fraction_static = float(self.swap_mem_fraction_static)
-                if not 0.0 < self.swap_mem_fraction_static <= 1.0:
+                self.state_offload_device_memory_fraction = float(self.state_offload_device_memory_fraction)
+                if not 0.0 < self.state_offload_device_memory_fraction <= 1.0:
                     raise ValueError(
-                        "model.optimizer.swap_mem_fraction_static must be in (0, 1], "
-                        f"got {self.swap_mem_fraction_static}"
+                        "model.optimizer.state_offload_device_memory_fraction must be in (0, 1], "
+                        f"got {self.state_offload_device_memory_fraction}"
                     )
             else:
                 raise ValueError(

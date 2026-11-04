@@ -44,9 +44,14 @@ class TestWhereTheLoaderReadsTheConfigFrom:
 def test_swap_fraction_is_coerced_and_ranged():
     # YAML resolves an exponent literal without a decimal point to a string; it
     # must be coerced before the range check instead of raising TypeError.
-    assert OptimizerConfig(state_offload="cpu", swap_mem_fraction_static="8e-1").swap_mem_fraction_static == 0.8
-    with pytest.raises(ValueError, match="swap_mem_fraction_static"):
-        OptimizerConfig(state_offload="cpu", swap_mem_fraction_static=1.5)
+    assert (
+        OptimizerConfig(
+            state_offload="cpu", state_offload_device_memory_fraction="8e-1"
+        ).state_offload_device_memory_fraction
+        == 0.8
+    )
+    with pytest.raises(ValueError, match="state_offload_device_memory_fraction"):
+        OptimizerConfig(state_offload="cpu", state_offload_device_memory_fraction=1.5)
 
 
 def test_state_offload_rejects_non_adamw_types_and_unknown_values():

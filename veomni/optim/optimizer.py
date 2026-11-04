@@ -452,8 +452,10 @@ def _build_state_offload_optimizer(
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            mem_fraction_static=0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static,
-            pin_memory=True if optimizer_config is None else optimizer_config.swap_pin_memory,
+            device_memory_fraction=(
+                0.8 if optimizer_config is None else optimizer_config.state_offload_device_memory_fraction
+            ),
+            pin_memory=True if optimizer_config is None else optimizer_config.state_offload_pin_memory,
         )
     else:
         raise ValueError(
@@ -479,7 +481,7 @@ def build_optimizer(
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
     that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
-    ``state_offload='cpu'``'s ``swap_mem_fraction_static``/``swap_pin_memory``)
+    ``state_offload='cpu'``'s ``state_offload_device_memory_fraction``/``state_offload_pin_memory``)
     are read here rather than unpacked by every trainer. It does *not* supply
     ``lr``, ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit
     arguments, because callers such as the VLM trainer drive the AdamW side from

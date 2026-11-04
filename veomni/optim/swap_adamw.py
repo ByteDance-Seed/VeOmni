@@ -97,9 +97,9 @@ class SwapAdamW(Optimizer):
 
     Args:
         params: Parameters or parameter groups, as for ``torch.optim.Optimizer``.
-        mem_fraction_static: Fraction of the *currently free* device memory used
-            to size one batch of streamed-in states. Must fit at least the
-            largest single parameter's states.
+        device_memory_fraction: Fraction of the *currently free* device memory used
+            to size each streamed-in batch, recomputed every step. Must fit at
+            least the largest single parameter's states.
         pin_memory: Pin the host-side state buffers. Improves transfer bandwidth
             at the cost of page-locked host memory; a failed pinned allocation
             falls back to pageable memory with a rank-0 warning.
@@ -118,13 +118,13 @@ class SwapAdamW(Optimizer):
         weight_decay: float = 1e-2,
         amsgrad: bool = False,
         *,
-        mem_fraction_static: float = 0.8,
+        device_memory_fraction: float = 0.8,
         pin_memory: bool = True,
         chunk_bytes: int = 128 << 20,
     ) -> None:
         # YAML resolves an exponent literal without a decimal point (``8e-1``) to
         # a string; coerce before the range check.
-        mem_fraction_static = float(mem_fraction_static)
+        device_memory_fraction = float(device_memory_fraction)
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
@@ -135,8 +135,8 @@ class SwapAdamW(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if not 0.0 < mem_fraction_static <= 1.0:
-            raise ValueError(f"mem_fraction_static must be in (0, 1], got {mem_fraction_static}")
+        if not 0.0 < device_memory_fraction <= 1.0:
+            raise ValueError(f"device_memory_fraction must be in (0, 1], got {device_memory_fraction}")
         if chunk_bytes < 1:
             raise ValueError(f"chunk_bytes must be >= 1, got {chunk_bytes}")
 
@@ -158,7 +158,7 @@ class SwapAdamW(Optimizer):
             decoupled_weight_decay=True,
         )
 
-        self.mem_fraction_static = mem_fraction_static
+        self.device_memory_fraction = device_memory_fraction
         # Resolve the backend before the pinning gate: pinning is only
         # meaningful when an accelerator backend exists.
         self._device_type = get_device_type()
@@ -476,11 +476,11 @@ class SwapAdamW(Optimizer):
 
         Only the moment states are budgeted: gradients and the elementwise path's
         per-parameter temporaries (the negated grad for ``maximize``, ``denom``)
-        still need headroom, so keep the static fraction below 1.0.
+        still need headroom, so keep ``device_memory_fraction`` below 1.0.
         """
         if self._device_type == "cpu":
             return _INFINITE_BUDGET
-        return max(int(self._device_free_bytes() * self.mem_fraction_static), 0)
+        return max(int(self._device_free_bytes() * self.device_memory_fraction), 0)
 
     def _release_pending_storages(self) -> None:
         """Release device storages whose host copies have finished."""
@@ -551,7 +551,7 @@ class SwapAdamW(Optimizer):
                 if bytes_moved == 0 and param_bytes > budget:
                     raise RuntimeError(
                         "SwapAdamW could not fit any optimizer state on device. "
-                        "Increase optimizer.swap_mem_fraction_static or reduce the parameter size."
+                        "Increase optimizer.state_offload_device_memory_fraction or reduce the parameter size."
                     )
                 self._swap_in_param(params[index])
                 bytes_moved += param_bytes
