@@ -272,8 +272,9 @@ indexer-loss teacher.
 On AMD ROCm GPUs, `dsa_indexer_implementation: triton` keeps the TileLang
 indexer's contract: one fused Triton kernel applies ReLU, the per-head weight,
 the head sum and each query's visible range without materializing per-head
-logits, `torch.topk` selects, and the backward recomputes only the selected
-logits. Its scores can train `dsa_indexer_loss` like the TileLang indexer's, with
+logits; bounded pool-column chunks feed a running exact `torch.topk`, so the
+full `[B, S, P]` score row is never materialized. The backward recomputes only
+the selected logits. Its scores can train `dsa_indexer_loss` like the TileLang indexer's, with
 the teacher running as a Triton kernel on ROCm. The objective accepts the
 TileLang indexer/attention pair on NVIDIA or the Triton pair on ROCm.
 
