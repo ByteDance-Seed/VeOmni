@@ -53,6 +53,14 @@ python3 -c "from fla_npu.ops.ascendc import chunk_kda_fwd, chunk_kda_bwd; \
 from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda_fwd as t; print('KDA deps OK')"
 ```
 
+Both packages stay outside VeOmni's lockfile (same policy as the
+`gated_delta_rule` `fla_npu` backend), so stock NPU CI images do not ship
+them. Without them the `chunk_kda` op resolves to the eager reference - the
+registry records `requires=("fla_npu", "triton_ascend_kernels")` on the
+`ascendc` row and falls back automatically - and the AscendC contract tests
+skip with a `missing: ...` reason. Install both packages on production NPU
+hosts as above before selecting `chunk_kda_implementation: ascendc`.
+
 ## Prepare dataset
 
 One JSONL record per sample (image path + caption; `width`/`height` let the

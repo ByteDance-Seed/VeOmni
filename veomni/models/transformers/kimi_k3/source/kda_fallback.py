@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from veomni.utils.device import create_event
+
 
 def tensor_cache(fn):
     """Identity stand-in for ``fla.utils.tensor_cache``.
@@ -477,9 +479,8 @@ def _kda_timeit(phase: str):
 
     class _PhaseTimer:
         def __init__(self):
-            _ev = torch.npu if hasattr(torch, "npu") else torch.cuda
-            self.e0 = _ev.Event(enable_timing=True)
-            self.e1 = _ev.Event(enable_timing=True)
+            self.e0 = create_event(enable_timing=True)
+            self.e1 = create_event(enable_timing=True)
             self.e0.record()
 
         def __exit__(self, *exc):

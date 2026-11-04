@@ -335,11 +335,14 @@ class ChunkKDAFunction(torch.autograd.Function):
         cu_seqlens_host = None
 
         # state_v_first only carries semantics when a state crosses the call
-        # boundary (initial_state consumed or a final state produced); for
-        # stateless calls normalize it away so the aclnn forward and the
-        # fused backward (which only runs stateless) keep the canonical
-        # (K, V) intermediate layout -- bit-identical to state_v_first=False.
-        state_v_first = state_v_first and (initial_state is not None or output_final_state)
+        # boundary (initial_state consumed, a final state produced, or
+        # intermediate states returned to the caller -- h is caller-visible);
+        # for stateless calls without them normalize it away so the fused
+        # backward (which only runs stateless) keeps the canonical (K, V)
+        # intermediate layout -- bit-identical to state_v_first=False.
+        state_v_first = state_v_first and (
+            initial_state is not None or output_final_state or return_intermediate_states
+        )
 
         use_triton = chunk_size != 64
 
@@ -370,7 +373,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 chunk_size=chunk_size,
                 disable_recompute=disable_recompute,
                 return_intermediate_states=return_intermediate_states,
-                # state_v_first=state_v_first,
+                state_v_first=state_v_first,
             )
         else:
             # The AscendC Python entry consumes Host metadata. Prefer the CPU
@@ -727,11 +730,12 @@ def chunk_kda_ascendc(
     # state_v_first passes straight through: the aclnn chunk_kda kernel
     # natively supports both state layouts (the initial / final state and
     # the intermediate h adapt to the requested order -- see
-    # npu_chunk_kda_fwd in fla_npu). Stateless calls normalize the flag
-    # away inside ChunkKDAFunction (no state crosses the boundary, so the
-    # layout carries no semantics), keeping the fused AscendC backward
-    # eligible; stateful state_v_first=True runs the triton backward
-    # (see _can_use_fused_kda_bwd).
+    # npu_chunk_kda_fwd in fla_npu). Stateless calls without intermediate
+    # states normalize the flag away inside ChunkKDAFunction (no state
+    # crosses the boundary, so the layout carries no semantics), keeping
+    # the fused AscendC backward eligible; stateful state_v_first=True and
+    # stateless calls returning intermediate states keep the flag and run
+    # the triton backward (see _can_use_fused_kda_bwd).
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:

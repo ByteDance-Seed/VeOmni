@@ -461,8 +461,10 @@ class BaseTrainer(Stateful, ABC):
         dataloader_kwargs.pop("use_background_prefetcher", None)
         # Optional model hook: multimodal models that expand modality placeholders
         # inside the model (single-token placeholders) report the expanded length so
-        # dynamic batching budgets the true sequence cost. Text models: no-op.
-        _model = getattr(self.model, "unwrapped_module", self.model)
+        # dynamic batching budgets the true sequence cost. Text models: no-op, and
+        # mock trainers in unit tests drive this builder without any model attached.
+        _model = getattr(self, "model", None)
+        _model = getattr(_model, "unwrapped_module", _model)
         _get_length_fn = getattr(_model, "get_dyn_bsz_length_fn", None)
         if _get_length_fn is not None:
             dataloader_kwargs["dyn_bsz_length_fn"] = _get_length_fn()

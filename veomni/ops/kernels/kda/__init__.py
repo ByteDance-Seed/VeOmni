@@ -18,9 +18,9 @@
 flash-linear-attention-npu (MindSpeed-MM kimi_k3 wrapper); it covers the full
 training contract (varlen cu_seqlens, use_gate_in_kernel, beta-sigmoid) with
 initial_state=None / output_final_state=False. ``eager`` resolves the
-modeling-side reference lazily (fla ``chunk_kda`` when flash-linear-attention
-is installed, else ``chunk_kda_naive``) to avoid an ops -> models import
-cycle. The ascendc path is the production path.
+modeling-side reference lazily (fla ``chunk_kda`` for cuda tensors when
+flash-linear-attention is installed, else ``chunk_kda_naive``) to avoid an
+ops -> models import cycle. The ascendc path is the production path.
 """
 
 from ...platform import NpuKernelRequirement
@@ -28,10 +28,19 @@ from ...registry import register_op
 
 
 def _eager(q, k, v, g, beta, **kwargs):
-    try:
-        from fla.ops.kda import chunk_kda as fn
-    except ImportError:
-        from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda_naive as fn
+    # fla's chunk_kda is a CUDA-triton kernel; its autograd entry crashes on
+    # non-cuda tensors (custom_device_ctx indexes torch.<device_type>.device,
+    # which torch.cpu lacks). Dispatch to it for cuda tensors only and run the
+    # portable naive reference everywhere else.
+    if q.is_cuda:
+        try:
+            from fla.ops.kda import chunk_kda as fn
+        except ImportError:
+            fn = None
+        if fn is not None:
+            return fn(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
+    from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda_naive as fn
+
     return fn(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
 
 

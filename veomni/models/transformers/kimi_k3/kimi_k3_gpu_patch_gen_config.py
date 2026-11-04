@@ -428,6 +428,14 @@ class PatchedKimiK3Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
 
         self.is_situ = config.hidden_act == "situ"
+        if not self.is_situ and config.hidden_act != "silu":
+            # The standard MoE implementation always applies F.silu in its
+            # experts; anything else would silently train with the wrong
+            # activation.
+            raise ValueError(
+                f"KimiK3 MoE experts implement 'situ' and 'silu' activations only, "
+                f"got hidden_act={config.hidden_act!r}."
+            )
         if self.is_situ:
             beta, linear_beta = _get_situ_activation_params(config)
             self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta, config=config)
@@ -631,7 +639,7 @@ def kimi_k3_for_conditional_generation_init_patched(self, config):
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
             vision_impl = selected_attn
-            if vision_impl == "sdpa":
+            if vision_impl in ("sdpa", "veomni_sdpa"):
                 vision_impl = "eager"
             vision_config._attn_implementation = vision_impl
 
@@ -756,6 +764,37 @@ def kimi_linear_for_causal_lm_forward_patched(
     if _linear_cu is not None:
         fa_kwargs["cu_seqlens"] = _linear_cu
 
+    # Packed varlen metadata is only honored by the varlen attention
+    # implementations: the dense eager/sdpa/veomni_sdpa path would run one
+    # causal mask across the whole packed row and leak across packed
+    # samples (the same rejection KimiK3ForConditionalGeneration.forward
+    # applies). cu_seq_lens_q alone is not evidence of packing -- the
+    # collator emits [0, length] for plain un-packed sequences -- so reject
+    # only a real boundary between non-empty segments (known tail-padding
+    # segments do not count). K3_ALLOW_DENSE_PACKED=1 re-enables the
+    # documented debug-only dense path (used by the CPU packing tests).
+    _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
+    if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
+        _attn_impl = getattr(self.config, "_attn_implementation", None)
+        if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
+            _cu_t = _cu_seq_lens_q
+            if not isinstance(_cu_t, torch.Tensor):
+                _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
+            _seg_lens = torch.diff(_cu_t)
+            _tail_pads = kwargs.get("tail_padding_length", 0)
+            _tail_pads = 0 if _tail_pads is None else int(_tail_pads)
+            if _tail_pads > 0 and _seg_lens.numel() > 0 and int(_seg_lens[-1]) == _tail_pads:
+                _seg_lens = _seg_lens[:-1]
+            _num_samples = int((_seg_lens > 0).sum())
+            if _num_samples > 1:
+                raise ValueError(
+                    f"attention_implementation={_attn_impl!r} cannot run packed batches "
+                    f"({_num_samples} samples share a row): the dense causal mask does not "
+                    f"isolate them. Use a varlen implementation (flash_attention_2 / "
+                    f"veomni_flash_attention_2), disable dynamic packing, or set "
+                    f"K3_ALLOW_DENSE_PACKED=1 for the documented debug-only dense path."
+                )
+
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -845,6 +884,16 @@ def kimi_k3_for_conditional_generation_forward_patched(
     # attention_mask / position_ids / cache_position stay full-sequence.
     cache_position = None
     if get_parallel_state().sp_enabled:
+        if input_ids is None:
+            # The multimodal merge locates media placeholders via input_ids,
+            # and a sharded inputs_embeds batch cannot be gathered or merged;
+            # reject the input mode instead of passing None into the SP
+            # collective.
+            raise ValueError(
+                "KimiK3ForConditionalGeneration.forward requires input_ids under sequence "
+                "parallelism: the multimodal merge locates media placeholders via input_ids, "
+                "so an inputs_embeds-only batch cannot be gathered or merged on this path."
+            )
         sp_group = get_parallel_state().sp_group
         input_ids = gather_outputs(input_ids, gather_dim=1, group=sp_group)
         if attention_mask is not None:
@@ -1007,7 +1056,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
             fa_kwargs["cu_seqlens"] = _linear_cu
 
     # Packed varlen metadata is only honored by the varlen attention
-    # implementations: the dense eager/sdpa MLA path would run one causal
+    # implementations: the dense eager/sdpa/veomni_sdpa MLA path would run one causal
     # mask across the whole merged row and leak across packed samples
     # (eager/sdpa stay available for non-packed batches). cu_seq_lens_q
     # alone is not evidence of packing -- the collator emits [0, length]
@@ -1024,7 +1073,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
         _attn_impl = getattr(self.config, "_attn_implementation", None)
         if _attn_impl is None:
             _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
-        if _attn_impl in ("eager", "sdpa"):
+        if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
             _cu_t = _cu_seq_lens_q
             if not isinstance(_cu_t, torch.Tensor):
                 _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
