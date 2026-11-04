@@ -157,7 +157,6 @@ def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length:
         valid_end = torch.clamp(cu_seqlens[-1:] - tail_padding_length, min=0)
         return diff[cu_seqlens[1:] <= valid_end]
 
-    # Ascend's cumprod does not accept bool. The 0/1 prefix product retains
-    # the same integer semantics while using a dtype supported on all devices.
+    # Convert before flip so Ascend follows the existing int32 path throughout.
     pad = int(torch.flip((diff == 1).to(torch.int32), (0,)).cumprod(0).sum().item())
     return diff[:-pad] if pad else diff
