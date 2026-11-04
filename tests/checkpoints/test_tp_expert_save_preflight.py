@@ -66,10 +66,15 @@ def test_tp_expert_save_rejected_before_writes(tmp_path, kind, mode):
     assert stage is None or not stage.exists()
 
 
+@pytest.mark.parametrize("replicated_ep", [False, True])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_tp_dense_model_still_saves_and_loads(tmp_path):
+def test_tp_dense_model_still_saves_and_loads(tmp_path, replicated_ep):
     parallel = SimpleNamespace(tp_size=2, dp_mode="ddp")
     model = _model("dense")
+    if replicated_ep:
+        from torch.distributed.tensor import Replicate
+
+        model._fqn2spec_info = {"dense.weight": SpecInfo("ep", Replicate(), "dense.weight", None)}
     path = str(tmp_path / "checkpoint")
     DistributedCheckpointer.save(path, {"model": model}, parallel_state=parallel)
     restored = _model("dense")
