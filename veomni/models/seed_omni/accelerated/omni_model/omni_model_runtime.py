@@ -260,6 +260,18 @@ class OmniModelRuntime:
         if not composed_model_owns_wrap(acc):
             return
 
+        checkpoint = getattr(self.train_args, "checkpoint", None)
+        if not for_inference and getattr(checkpoint, "extra_parallel_canonical_layout", False):
+            from .....distributed.parallel_state import get_parallel_state
+
+            with use_parallel_state("base"):
+                state = get_parallel_state()
+                if getattr(state, "any_extra_parallel_enabled", False):
+                    raise RuntimeError(
+                        "Canonical ExtraParallel checkpoints are not supported for SeedOmni fsdp_scope='model'; "
+                        "use fsdp_scope='module'."
+                    )
+
         modules = self.module_runtimes
         # Cache readers stay on meta and must not go through the composed
         # materialisation path: ``skip_hf_weight_load`` still calls ``to_empty``.

@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -217,6 +222,16 @@
       "-s",
       "-x",
       "tests/checkpoints/"
+    ]
+  },
+  {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
     ]
   },
   {

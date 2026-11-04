@@ -78,31 +78,35 @@ def _has_exact_sft_dynamic_resume(trainer):
 
 
 def _multi_optimizer_checkpoints(trainer):
-    """Return stable module names and checkpoint managers for strict resume."""
+    """Find every MultiOptimizer owner without silently dropping one."""
     root = getattr(trainer, "model", None)
     runtimes = [("model", root)]
     modules = getattr(root, "module_runtimes", None)
-    if isinstance(modules, Mapping):
+    if isinstance(modules, Mapping) and modules:
+        if getattr(root, "checkpoint", None) is None:
+            runtimes = []
         runtimes.extend((f"module:{name}", module) for name, module in sorted(modules.items()))
     result, seen = [], set()
     for name, runtime in runtimes:
-        checkpoint = getattr(runtime, "checkpoint", None)
-        if checkpoint is None or id(checkpoint) in seen:
-            continue
-        # The generation receipt is supplied by the strict MultiOptimizer
-        # checkpoint codec. Older checkpointers keep their existing behavior.
-        if not hasattr(checkpoint, "_loaded_optimizer_generation"):
+        if runtime is None:
             continue
         optimizer = getattr(runtime, "optimizer", None)
-        if optimizer is None:
-            optimizer = getattr(getattr(checkpoint, "runtime", None), "optimizer", None)
+        checkpoint = getattr(runtime, "checkpoint", None)
+        loaded_step = getattr(checkpoint, "_loaded_optimizer_global_step", None)
+        saved_generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
         if (
-            getattr(optimizer, "_is_multi_optimizer", False) is True
-            or type(getattr(checkpoint, "_loaded_optimizer_global_step", None)) is int
-            or isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
+            getattr(optimizer, "_is_multi_optimizer", False) is not True
+            and type(loaded_step) is not int
+            and not isinstance(saved_generation, str)
         ):
-            result.append((name, checkpoint))
-            seen.add(id(checkpoint))
+            continue
+        if checkpoint is None or id(checkpoint) in seen:
+            raise RuntimeError("Restored MultiOptimizer has no unique checkpoint owner")
+        owner = getattr(checkpoint, "runtime", None)
+        if owner is not None and owner is not runtime:
+            raise RuntimeError("Restored MultiOptimizer checkpoint belongs to another runtime")
+        result.append((name, checkpoint))
+        seen.add(id(checkpoint))
     return result
 
 
@@ -337,7 +341,7 @@ class GlobalStateCallback(Callback):
                     or not isinstance(generation, str)
                     or not generation
                 )
-                if not valid and require_optimizer_checkpoint:
+                if not valid:
                     raise RuntimeError("Trainer cursor requires the same-step MultiOptimizer checkpoint generation")
                 if valid:
                     receipts[name] = generation
@@ -576,7 +580,10 @@ class GlobalStateCallback(Callback):
                     raise ValueError("Trainer cursor and optimizer checkpoint generations differ")
                 dpo_proven = getattr(self.trainer, "_dpo_resume_proven", False) is True
                 if loader is not None and not strict_sft and not dpo_proven:
-                    raise ValueError("MultiOptimizer cursor recovery requires a verified data-resume codec")
+                    logger.warning_rank0(
+                        "Resuming the existing loader cursor without a verified exact data-resume contract; "
+                        "the optimizer state is validated, but the subsequent data sequence may differ."
+                    )
                 if loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                     raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
                 rng = global_state.get("torch_rng_state")
@@ -810,13 +817,17 @@ class GlobalStateCallback(Callback):
             # immediately without a step, serialize the original boundary
             # cursor rather than overwriting it with an unconsumed new epoch.
             self._unadvanced_boundary_state = global_state
-        if (
-            not strict_sft
-            and self.trainer.start_step == 0
-            and not sft_next_epoch
-            and self.trainer.train_dataloader is not None
-        ):
-            restore_local(lambda: iter(self.trainer.train_dataloader), "initializing the restored data iterator")
+        restore_local(
+            lambda: iter(self.trainer.train_dataloader)
+            if (
+                not strict_sft
+                and self.trainer.start_step == 0
+                and not sft_next_epoch
+                and self.trainer.train_dataloader is not None
+            )
+            else None,
+            "initializing the restored data iterator",
+        )
 
         legacy_cursor_proven = True
         if legacy_checkpoints:

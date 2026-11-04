@@ -248,6 +248,12 @@ class OptimizerConfig:
         },
     )
 
+    def __post_init__(self):
+        # YAML sequences arrive as lists; the declared tuple also prevents
+        # optimizer defaults and groups from sharing mutable beta options.
+        if isinstance(self.betas, list):
+            self.betas = tuple(self.betas)
+
 
 @dataclass
 class WandbConfig:
@@ -1039,6 +1045,12 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+    extra_parallel_canonical_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
+        },
+    )
 
     def __post_init__(self):
         """Reject a save configuration that cannot do what it says.
@@ -1047,6 +1059,12 @@ class CheckpointConfig:
         ``save_async`` too, but not until the first checkpoint is due -- a
         ``save_steps``-long wait to be told the configuration was never valid.
         """
+        if not isinstance(self.extra_parallel_canonical_layout, bool):
+            raise ValueError(
+                "extra_parallel_canonical_layout must be a boolean; use unquoted true or false in YAML, "
+                f"got {self.extra_parallel_canonical_layout!r}."
+            )
+
         if self.stage_dir and self.save_async:
             raise ValueError(
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "

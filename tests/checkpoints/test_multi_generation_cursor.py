@@ -65,13 +65,13 @@ def test_multi_optimizer_reuse_requires_the_owner_load_path(tmp_path, same_path)
         assert not owner.confirmed
 
 
-def test_legacy_checkpoint_manager_does_not_opt_in_to_generation_guard(tmp_path):
-    from veomni.trainer.callbacks.global_state_callback import _multi_optimizer_checkpoints
-
+def test_legacy_multi_optimizer_manager_without_generation_fails_resume(tmp_path):
     trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.args.train.checkpoint.load_path = str(tmp_path)
     trainer.model.optimizer = SimpleNamespace(_is_multi_optimizer=True)
     trainer.model.checkpoint = SimpleNamespace(_last_saved_step=1)
-    assert _multi_optimizer_checkpoints(trainer) == []
+    with pytest.raises(RuntimeError, match="optimizer checkpoint steps"):
+        GlobalStateCallback(trainer).load_global_state()
 
 
 def test_same_step_cursor_from_another_generation_fails_before_position_or_rng(tmp_path, monkeypatch):
@@ -114,19 +114,38 @@ def test_save_requires_same_step_generation_before_writing_cursor(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_hf_only_export_does_not_require_a_same_step_optimizer_checkpoint(tmp_path):
+def test_hf_only_export_requires_and_creates_same_step_optimizer_checkpoint(tmp_path):
     trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.args.train.checkpoint.save_steps = 0
+    trainer.args.train.checkpoint.save_epochs = 0
+    trainer.args.train.checkpoint.save_hf_weights = True
+    trainer.args.train.checkpoint.hf_save_steps = 3
+    trainer.args.train.checkpoint.hf_save_epochs = 0
     trainer.model.optimizer = SimpleNamespace(_is_multi_optimizer=True)
-    trainer.model.checkpoint = SimpleNamespace(
+    checkpoint = trainer.model.checkpoint = SimpleNamespace(
         _last_saved_step=2, _last_saved_optimizer_generation="source", _loaded_optimizer_generation=None
     )
     trainer.train_dataloader = None
     trainer.data_iterator = None
     trainer.environ_meter.state_dict.return_value = {}
-    GlobalStateCallback(trainer).save_global_state(TrainerState(global_step=3))
+    state = TrainerState(global_step=3)
+    callback = GlobalStateCallback(trainer)
+    with pytest.raises(RuntimeError, match="same-step"):
+        callback.save_global_state(state)
+    assert not list(tmp_path.iterdir())
+
+    def save_dcp(saved_state):
+        checkpoint._last_saved_step = saved_state.global_step
+        checkpoint._last_saved_optimizer_generation = "new-generation"
+
+    trainer.save_dcp.side_effect = save_dcp
+    CheckpointCallback(trainer).on_step_end(state)
+    callback.on_step_end(state)
+    trainer.save_dcp.assert_called_once_with(state)
+    trainer.save_hf_or_lora.assert_called_once_with(state, stage="step_end")
     path = layout.extra_state_path(layout.step_dir(str(tmp_path), 3), trainer.args.train.global_rank)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    assert "_veomni_optimizer_generations" not in payload
+    assert payload["_veomni_optimizer_generations"] == {"model": "new-generation"}
 
 
 def test_save_records_generation_in_the_trainer_sidecar(tmp_path):
