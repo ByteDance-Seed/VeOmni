@@ -319,8 +319,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Meta-init this module's sub-model from ``module_config``.
 
         The config comes from the composed :class:`OmniConfig`, which already
-        applied this module's ``model_config`` overwrites; :attr:`weights_path`
-        is read only for the weights.
+        applied this module's ``model_config`` and ``ops_implementation``
+        overwrites; :attr:`weights_path` is read only for the weights.
 
         Under an HF ``model_path`` the module is built on meta first so the
         :class:`~veomni.models.seed_omni.utils.hf_layout.HFSourceKeyConverter`
@@ -338,7 +338,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             weights_path=args.model_path if self.hf_source is None else None,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=init_device if self.hf_source is None else "meta",
-            ops_implementation=args.ops_implementation,
+            ops_implementation=self.module_config.ops_config,
         )
         if self.hf_source is not None:
             from ....checkpoint.weights import load_model_weights

@@ -51,13 +51,18 @@ def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     Recursively update the source dictionary with the overrides dictionary.
     This ensures nested dictionaries are merged rather than overwritten.
 
+    An empty mapping is a merge of nothing, not an erasure: an override that names
+    a key without saying anything under it (``accelerator: {}``, a bare module
+    name under ``modules:``) leaves what is already there alone. Lists and scalars
+    replace, and an explicit ``None`` still clears.
+
     A key the source holds as ``None`` counts as absent, so an override's mapping
     fills it in. Saved configs make that the normal case: they serialize every
     field, so an optional block that was never configured comes back as ``null``,
     and a nested override onto it would otherwise be merged into ``None``.
     """
     for key, value in overrides.items():
-        if isinstance(value, dict) and value:
+        if isinstance(value, dict):
             current = source.get(key)
             if not isinstance(current, dict):
                 current = {}

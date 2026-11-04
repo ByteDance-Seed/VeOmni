@@ -126,7 +126,12 @@ class OmniModel(PreTrainedModel):
     supports_gradient_checkpointing = False
     _no_split_modules = []
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The graph runtime delegates attention to its independently configured modules.
+        return attn_implementation
+
     def __init__(self, config: OmniConfig, modules: Mapping[str, PretrainedOmniModule]):
+        # Root ops are inheritance defaults; each built module validates its final selection.
         super().__init__(config)
         self.config = config
 
@@ -298,45 +303,32 @@ class OmniModel(PreTrainedModel):
         ``kwargs`` are HF load options here (``torch_dtype``, ``device_map``,
         …). A caller's kernel selections were absorbed into ``config`` by
         :meth:`OmniConfig.apply_omni_kwargs` before this runs, so kernels are
-        read from the config like every other layer.
+        read from each module's own :class:`OmniModuleConfig` during
+        construction without relying on the process-global ops config.
         """
-
-        from ...arguments import OpsImplementationConfig
-        from ...ops.config import get_ops_config, set_ops_config
-
-        base_ops = get_ops_config()
         modules: dict[str, PretrainedOmniModule] = {}
-        try:
-            for name in config.module_names:
-                entry = config._module_entries[name]
-                module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
-                module_config = config._module_configs[name]
-                mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-                module_ops = OpsImplementationConfig(**dict(module_config.ops_implementation or {}))
-                # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
-                # TODO: make it per module kwargs
-                module_kwargs = dict(kwargs)
+        for name in config.module_names:
+            entry = config._module_entries[name]
+            module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
+            module_config = config._module_configs[name]
+            mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
+            # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
+            # TODO: make it per module kwargs
+            module_kwargs = dict(kwargs)
 
-                # Install this module's kernels for the duration of its own load, so
-                # a module's kernels do not depend on its position in
-                # ``config.module_names``.
-                set_ops_config(module_ops)
-                if load_weights and config._hf_source is not None:
-                    if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
-                        raise ValueError(
-                            f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
-                            f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
-                        )
-                    modules[name] = cls._load_module_from_hf_source(
-                        mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
+            if load_weights and config._hf_source is not None:
+                if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
+                    raise ValueError(
+                        f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
+                        f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
                     )
-                elif load_weights:
-                    modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
-                else:
-                    modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
-        finally:
-            # Don't leave the caller's config holding the last module's override.
-            set_ops_config(base_ops)
+                modules[name] = cls._load_module_from_hf_source(
+                    mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
+                )
+            elif load_weights:
+                modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
+            else:
+                modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
         return modules
 
     @staticmethod
@@ -674,9 +666,11 @@ class OmniModel(PreTrainedModel):
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        max_steps = max_new_tokens
         total_steps = 0
-        while not self.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not self.generation_graph.is_done() and total_steps < max_steps:
             self._emit_progress(total_steps)
+            emitted_before = len(self._generated)
             for node in self.generation_graph.iter_nodes(ctx):
                 module = getattr(self, node.module)
                 self._run_generation_node(module, node, ctx, generation_kwargs)
@@ -686,6 +680,10 @@ class OmniModel(PreTrainedModel):
                 self._collect_generated(ctx)
             total_steps += 1
             self.generation_graph.maybe_transition(ctx)
+            if total_steps == 1 and len(self._generated) == emitted_before:
+                # Pass 1 emitted nothing: it was prompt prefill, so it must not
+                # consume the token budget.
+                max_steps += 1
 
         self._emit_progress(total_steps)
 

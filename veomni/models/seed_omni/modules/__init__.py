@@ -39,7 +39,9 @@ Shared bases live next to the families, not at the ``seed_omni/`` package root:
 Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
-than re-spelling ``<family>_<sub_module>`` per file.
+than re-spelling ``<family>_<sub_module>`` per file.  The shared
+word-token embedding + LM head module lives at ``modules/text_encoder/``, and
+cross-family packing helpers live under ``modules/base/``.
 """
 
 from transformers import PretrainedConfig
@@ -99,13 +101,7 @@ def read_model_type(model_path: str) -> str:
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
     # decide registration explicitly.
-    config_keys = set(OMNI_CONFIG_REGISTRY.valid_keys())
     model_keys = set(OMNI_MODEL_REGISTRY.valid_keys())
-    if model_type in config_keys:
-        # Validate the config can be re-read by the registered subclass so
-        # downstream `from_pretrained` doesn't hit a surprise schema gap.
-        cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
             f"Module model_type {model_type!r} (from {model_path}) is not registered in "
@@ -114,7 +110,8 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-from . import fake_model  # noqa: F401  E402
+# Side-effect only: attach @register factories under base/, fake_model/, qwen3/, text_encoder/.
+from . import base, fake_model, qwen3, text_encoder  # noqa: F401  E402
 
 
 __all__ = [

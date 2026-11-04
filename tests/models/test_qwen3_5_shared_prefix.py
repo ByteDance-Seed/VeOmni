@@ -276,6 +276,7 @@ def test_forward_missing_cu_seq_lens_q_raises_value_error():
     mock_self.mtp = None
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    mock_self.config.text_config.ops_config.attn_implementation = "flash_attention_2"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(ValueError, match="Shared-prefix training requires packed-sequence metadata"):
@@ -297,6 +298,7 @@ def test_forward_incompatible_attn_impl_raises_not_implemented():
     mock_self.mtp = None
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "eager"
+    mock_self.config.text_config.ops_config.attn_implementation = "eager"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(NotImplementedError, match="Shared-prefix training needs a varlen attention backend"):
@@ -321,6 +323,7 @@ def test_forward_sp_enabled_raises_not_implemented(monkeypatch):
     mock_self = MagicMock()
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    mock_self.config.text_config.ops_config.attn_implementation = "flash_attention_2"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(NotImplementedError, match="Shared-prefix training does not support sequence parallelism yet."):

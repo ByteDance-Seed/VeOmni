@@ -9,6 +9,7 @@ VeOmni uses custom attention implementation names:
 - `veomni_flash_attention_3`
 - `veomni_flash_attention_3_hub`
 - `veomni_flash_attention_4`
+- `veomni_flash_attention_aiter`
 
 These names are registered into `ALL_ATTENTION_FUNCTIONS` and routed to VeOmni's SP-aware attention wrapper.
 
@@ -44,13 +45,14 @@ For VeOmni names, the adapter returns a kernel-like object exposing:
 - `flash_attn_func`
 - `flash_attn_varlen_func`
 
-mapped to local or explicitly selected Hub FA2/FA3/FA4 backends:
+mapped to local or explicitly selected Hub FA2/FA3/FA4/AITER backends:
 
 - `veomni_flash_attention_2` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
 - `veomni_flash_attention_2_hub` -> pinned `kernels-community/flash-attn2` version 1 functions
 - `veomni_flash_attention_3` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
 - `veomni_flash_attention_3_hub` -> pinned `kernels-community/flash-attn3` version 1 functions
 - `veomni_flash_attention_4` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
+- `veomni_flash_attention_aiter` -> AITER's FMHA-v3 dense / varlen functions through VeOmni's calling-convention adapter
 
 For simplicity, paged VeOmni aliases (for example `paged|veomni_flash_attention_2`) are not handled by this adapter.
 
@@ -69,7 +71,7 @@ All non-VeOmni implementations are delegated to the original Transformers loader
 After `import veomni`:
 
 - VeOmni custom names remain registered in `ALL_ATTENTION_FUNCTIONS`.
-- `_lazy_imports("veomni_flash_attention_2")` and `_lazy_imports("veomni_flash_attention_4")` can resolve through the adapter.
+- `_lazy_imports("veomni_flash_attention_2")`, `_lazy_imports("veomni_flash_attention_4")`, and `_lazy_imports("veomni_flash_attention_aiter")` can resolve through the adapter.
 - No spurious "kernel hub name not found" error for VeOmni custom names.
 - Paged VeOmni aliases are outside the adapter scope.
 
@@ -78,13 +80,17 @@ After `import veomni`:
 - This adapter is a compatibility bridge for Transformers 5.x behavior around flash preload.
 - It does not change VeOmni SP attention semantics.
 - Hub FA2/FA3 require `MODELING_BACKEND=veomni` and are rejected on Ascend NPU, including their normalized `veomni_*_hub` aliases. Config parsing and model construction reject these requests before HF preloading, which would otherwise silently select built-in NPU attention instead of the requested Hub kernel.
-- Local FA2/FA3/FA4 names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively.
+- Local FA2/FA3/FA4/AITER names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively.
 - FA2 and local FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
   no-op for those two in practice, but is kept for safety.
 - FA4 (`veomni_flash_attention_4`) has no such branch in
   `_lazy_imports` and always falls through to the hub-kernel path. The
   adapter is the **critical** component that makes FA4 usable.
+- AITER (`veomni_flash_attention_aiter`) follows the same local-loader path.
+  Its registry row is restricted to AMD ROCm and requires the importable
+  `aiter` module. Both its public and normalized names are rejected on Ascend
+  before Transformers can select the NPU attention path.
 - FA4 requires the `flash-attn-4` package (`flash_attn.cute`), shipped
   in the `gpu` extra; `uv sync --extra gpu` installs it from PyPI.
   MagiAttention's companion `flash-attn-cute` package (`flash_attn_cute`)
