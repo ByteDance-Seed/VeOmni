@@ -19,6 +19,16 @@
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen2MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen2_5_VLPatchMerger.__init__
+#      Pass config to Qwen2_5_VLRMSNorm
+#    - method_override: Qwen2_5_VLVisionBlock.__init__
+#      Pass config to Qwen2_5_VLRMSNorm instances
+#    - method_override: Qwen2_5_VisionTransformerPretrainedModel.__init__
+#      Pass config to Qwen2_5_VLPatchMerger
+#    - method_override: Qwen2_5_VLDecoderLayer.__init__
+#      Pass config to Qwen2_5_VLRMSNorm instances
+#    - method_override: Qwen2_5_VLTextModel.__init__
+#      Pass config to final Qwen2_5_VLRMSNorm
 #    - method_override: Qwen2MLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: Qwen2_5_VLVisionAttention
@@ -54,7 +64,6 @@
 #
 # ==============================================================================
 
-# Additional imports for patches
 import copy
 import itertools
 import warnings
@@ -77,7 +86,6 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
@@ -104,9 +112,11 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
@@ -312,11 +322,12 @@ logger = logging.get_logger(__name__)
 
 
 class Qwen2_5_VLRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -341,7 +352,7 @@ class Qwen2_5_VLMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, hidden_state):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -395,11 +406,17 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5_VLPatchMerger
+# Methods patched: __init__
+# ======================================================================
+
+
 class Qwen2_5_VLPatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
+    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2, config=None) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = Qwen2_5_VLRMSNorm(context_dim, eps=1e-6)
+        self.ln_q = Qwen2_5_VLRMSNorm(context_dim, eps=1e-6, config=config)  # noqa: F821
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
@@ -469,8 +486,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -520,17 +537,17 @@ class Qwen2_5_VLVisionAttention(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5_VLVisionBlock
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Qwen2_5_VLVisionBlock(GradientCheckpointingLayer):
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
-        self.norm1 = Qwen2_5_VLRMSNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = Qwen2_5_VLRMSNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen2_5_VLVisionAttention(config=config)
-        self.mlp = Qwen2_5_VLMLP(config, bias=True)
+        self.norm1 = Qwen2_5_VLRMSNorm(config.hidden_size, eps=1e-6, config=config)  # noqa: F821
+        self.norm2 = Qwen2_5_VLRMSNorm(config.hidden_size, eps=1e-6, config=config)  # noqa: F821
+        self.attn = Qwen2_5_VLVisionAttention(config=config)  # noqa: F821
+        self.mlp = Qwen2_5_VLMLP(config, bias=True)  # noqa: F821
 
     # ================================================================
     # Patch: Qwen2_5_VLVisionBlock.forward
@@ -594,7 +611,7 @@ class Qwen2_5_VLPreTrainedModel(PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5_VisionTransformerPretrainedModel
-# Methods patched: forward, dummy_forward
+# Methods patched: __init__, forward, dummy_forward
 # ======================================================================
 
 
@@ -615,7 +632,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         self.window_size = config.window_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
 
-        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(  # noqa: F821
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
             in_channels=config.in_channels,
@@ -623,13 +640,14 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
 
         head_dim = config.hidden_size // config.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)  # noqa: F821
 
-        self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlock(config) for _ in range(config.depth)])
-        self.merger = Qwen2_5_VLPatchMerger(
+        self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlock(config) for _ in range(config.depth)])  # noqa: F821
+        self.merger = Qwen2_5_VLPatchMerger(  # noqa: F821
             dim=config.out_hidden_size,
             context_dim=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
+            config=config,
         )
         self.gradient_checkpointing = False
 
@@ -875,28 +893,30 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 self.patch_size,
             )
 
+        merge = self.spatial_merge_size
+        patch_dim = self.config.in_channels * self.config.temporal_patch_size * self.patch_size**2
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             if getattr(self, "_sp_dummy_data", None) is None:
                 # --- Patch.2 ---
                 sp_size = get_parallel_state().sp_size
-                pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-                grid_thw = torch.tensor([[1, 2 * sp_size, 2]], dtype=torch.int32, device=self.device)
+                pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
+                grid_thw = torch.tensor([[1, merge * sp_size, merge]], dtype=torch.int32, device=self.device)
                 # --- Patch.2 ---
                 self._sp_dummy_data = {
                     "hidden_states": pixel_values,
                     "grid_thw": grid_thw,
-                    "vit_metadata": _dummy_vit_metadata(1, 2 * sp_size, 2),
+                    "vit_metadata": _dummy_vit_metadata(1, merge * sp_size, merge),
                 }
             outputs = self(**self._sp_dummy_data)
         else:
             if getattr(self, "_dummy_data", None) is None:
-                pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
-                grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.int32, device=self.device)
+                pixel_values = torch.randn((merge * merge, patch_dim), dtype=self.dtype, device=self.device)
+                grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.int32, device=self.device)
                 self._dummy_data = {
                     "hidden_states": pixel_values,
                     "grid_thw": grid_thw,
-                    "vit_metadata": _dummy_vit_metadata(1, 2, 2),
+                    "vit_metadata": _dummy_vit_metadata(1, merge, merge),
                 }
             outputs = self(**self._dummy_data)
         return outputs
@@ -986,7 +1006,7 @@ class Qwen2MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -1049,7 +1069,7 @@ class Qwen2_5_VLAttention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "mrope", "eager")
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -1110,21 +1130,27 @@ class Qwen2_5_VLAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5_VLDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class Qwen2_5_VLDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        if config.use_sliding_window and not is_flash_attention_requested(config):
-            logger.warning_once(
-                f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
+        if config.use_sliding_window and not is_flash_attention_requested(config):  # noqa: F821
+            logger.warning_once(  # noqa: F821
+                f"Sliding Window Attention is enabled but not implemented for `{config.ops_config.attn_implementation}`; "
                 "unexpected results may be encountered."
             )
-        self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
+        self.self_attn = Qwen2_5_VLAttention(config, layer_idx)  # noqa: F821
 
-        self.mlp = Qwen2MLP(config)
-        self.input_layernorm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen2MLP(config)  # noqa: F821
+        self.input_layernorm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.post_attention_layernorm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
 
     def forward(
         self,
@@ -1178,6 +1204,12 @@ class Qwen2_5_VLDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5_VLTextModel
+# Methods patched: __init__
+# ======================================================================
+
+
 @auto_docstring
 class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
     config: Qwen2_5_VLTextConfig
@@ -1187,22 +1219,21 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         "attentions": Qwen2_5_VLAttention,
     }
 
-    def __init__(self, config: Qwen2_5_VLTextConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen2_5_VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2_5_VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
         )
-        self._attn_implementation = config._attn_implementation
-        self.norm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._attn_implementation = config.ops_config.attn_implementation
+        self.norm = Qwen2_5_VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)  # noqa: F821
 
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -1867,7 +1898,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

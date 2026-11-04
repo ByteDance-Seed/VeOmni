@@ -23,10 +23,12 @@ from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config imp
     _DEEPSEEK_V3_NAME_MAP,
     glm_moe_dsa_attention_forward_patched,
     glm_moe_dsa_attention_init_patched,
+    glm_moe_dsa_decoder_layer_init_patched,
     glm_moe_dsa_forcausallm_forward_patched,
     glm_moe_dsa_forcausallm_init_patched,
     glm_moe_dsa_mlp_forward_patched,
     glm_moe_dsa_mlp_init_patched,
+    glm_moe_dsa_model_init_patched,
     glm_moe_dsa_rmsnorm_forward_patched,
     glm_moe_dsa_rmsnorm_init_patched,
 )
@@ -116,6 +118,16 @@ config.override_method(
     "GlmMoeDsaMLP.forward",
     replacement=glm_moe_dsa_mlp_forward_patched,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.override_method(
+    "GlmMoeDsaDecoderLayer.__init__",
+    replacement=glm_moe_dsa_decoder_layer_init_patched,
+    description="Pass config to GlmMoeDsaRMSNorm instances",
+)
+config.override_method(
+    "GlmMoeDsaModel.__init__",
+    replacement=glm_moe_dsa_model_init_patched,
+    description="Pass config to final GlmMoeDsaRMSNorm",
 )
 config.replace_class(
     "GlmMoeDsaExperts",

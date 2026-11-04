@@ -67,6 +67,11 @@ _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ..
         bind_flash_attention_forward("veomni_flash_attention_4"),
         flash_attention_mask_builder,
     ),
+    (
+        "veomni_flash_attention_aiter",
+        bind_flash_attention_forward("veomni_flash_attention_aiter"),
+        flash_attention_mask_builder,
+    ),
     ("veomni_flex_attention", flex_attention_forward, flex_attention_mask_builder),
     ("veomni_magi_attention", magi_attention_forward, magi_attention_mask_builder),
     ("veomni_sage_attention", sage_attention_forward, flash_attention_mask_builder),
@@ -79,6 +84,7 @@ VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_3": "flash_attention_3",
     "veomni_flash_attention_3_hub": "flash_attention_3_hub",
     "veomni_flash_attention_4": "flash_attention_4",
+    "veomni_flash_attention_aiter": "aiter",
 }
 
 _HUB_FLASH_REPOS = {
@@ -136,6 +142,10 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace | ob
             raise ImportError(
                 f"VeOmni attention implementation `{implementation}` requires `flash_attn.cute` (FA4) to be importable."
             ) from e
+    elif stock == "aiter":
+        from .kernels.attention.standard.aiter import build_aiter_flash_kernels
+
+        return build_aiter_flash_kernels()
     else:
         raise ValueError(f"Unknown VeOmni flash attention implementation: {implementation}")
 
@@ -148,9 +158,10 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace | ob
 def patch_transformers_hub_kernel_loader_for_veomni() -> None:
     """Intercept VeOmni flash names before Transformers treats them as hub ids.
 
-    FA2 and FA3 have explicit ``_lazy_imports`` branches. Hub FA2/FA3 and FA4
+    FA2 and FA3 have explicit ``_lazy_imports`` branches. Hub FA2/FA3, FA4,
+    and AITER
     keep their VeOmni names, so this patch loads a pinned Hub artifact or
-    ``flash_attn.cute`` locally instead of treating those names as hub ids.
+    local vendor module instead of treating those names as hub ids.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel

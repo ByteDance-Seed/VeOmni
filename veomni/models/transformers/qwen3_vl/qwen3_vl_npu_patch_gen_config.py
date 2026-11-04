@@ -34,10 +34,13 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_init_patched,
     qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_rmsnorm_init_patched,
+    qwen3_vl_text_attention_bind_ops,
     qwen3_vl_text_attention_forward_patched,
+    qwen3_vl_text_decoder_layer_init_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
     qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_text_model_init_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -96,6 +99,16 @@ config.override_method(
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 config.override_method(
+    "Qwen3VLTextDecoderLayer.__init__",
+    replacement=qwen3_vl_text_decoder_layer_init_patched,
+    description="Pass config to Qwen3VLTextRMSNorm instances",
+)
+config.override_method(
+    "Qwen3VLTextModel.__init__",
+    replacement=qwen3_vl_text_model_init_patched,
+    description="Pass config to final Qwen3VLTextRMSNorm",
+)
+config.override_method(
     "Qwen3VLVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
     description="Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync",
@@ -126,6 +139,11 @@ config.override_method(
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
 config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3VLTextAttention.__init__",
+    replacement=qwen3_vl_text_attention_bind_ops,
+    description="Pass config to Qwen3VLTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
 config.override_method(
     "Qwen3VLTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,

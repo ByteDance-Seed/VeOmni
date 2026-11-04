@@ -37,6 +37,7 @@ _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
 _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
+_GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
@@ -48,6 +49,8 @@ _MLU = ("mlu", ())
 
 
 _BUILTIN_ENTRIES = (
+    ("moe_unpermute", "standard", "eager", "any", _ANY, ()),
+    ("moe_unpermute", "standard", "triton", "cuda", _GPU_NVIDIA_SM70, ("triton",)),
     ("async_ulysses_qkv", "standard", "eager", "any", _ANY, ()),
     ("async_ulysses_qkv", "dit", "eager", "any", _ANY, ()),
     ("async_ulysses_o", "standard", "eager", "any", _ANY, ()),
@@ -84,6 +87,7 @@ _BUILTIN_ENTRIES = (
     ),
     ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
+    ("attention", "standard", "veomni_flash_attention_aiter", "cuda", _GPU_ROCM, ("aiter",)),
     ("attention", "standard", "veomni_flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
@@ -137,6 +141,9 @@ _BUILTIN_ENTRIES = (
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
+    ("token_logprobs", "standard", "eager", "any", _ANY, ()),
+    ("token_logprobs", "standard", "flash_attn", "cuda", _GPU, ("flash_attn.ops.triton.cross_entropy",)),
+    ("token_logprobs", "standard", "torch_npu", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
     ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
     ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
@@ -256,6 +263,8 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
+    ("token_logprobs", "standard", "flash_attn", "cuda"),
+    ("token_logprobs", "standard", "torch_npu", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
     ("moe_experts", "standard", "fused_mlu", "mlu"),

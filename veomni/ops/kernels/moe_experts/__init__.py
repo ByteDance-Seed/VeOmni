@@ -33,6 +33,7 @@ from ...platform import (
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .shared import unpermute
 from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
@@ -46,6 +47,24 @@ from .swiglu_oai import triton as swiglu_oai_triton
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+
+
+register_op(
+    "moe_unpermute",
+    "standard",
+    "eager",
+    wrapper=unpermute.eager,
+    description="Weighted token scatter with FP32 accumulation",
+)
+register_op(
+    "moe_unpermute",
+    "standard",
+    "triton",
+    wrapper=unpermute.triton,
+    description="Fused weighted token scatter with FP32 accumulation",
+    requirement=GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS,)),
+    requires=("triton",),
+)
 
 
 register_op(
