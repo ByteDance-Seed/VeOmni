@@ -69,6 +69,16 @@
     ]
   },
   {
+    "name": "npu-module-balance-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_module_balance.py"
+    ]
+  },
+  {
     "name": "npu-unit-06",
     "suite": "unit",
     "args": [

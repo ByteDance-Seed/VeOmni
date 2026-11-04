@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -53,7 +54,11 @@ def check_recover_precision(pixel_values, image_grid_thw):
         balanced_image_grid_thw.shape == image_grid_thw.shape and balanced_image_grid_thw.equal(image_grid_thw)
     ), f"rank {dist.get_rank()}: expected cross-rank redistribution for imbalanced inputs"
     if image_grid_thw.shape[0] < dist.get_world_size():
-        assert any(length == 0 for (length,) in databalance.state_buffer["image"]["pixel_values_origin"]), (
+        plan = databalance.state_buffer["image"]
+        send_lengths = [
+            sum(item.output_length for item in bucket if item.owner == plan.rank) for bucket in plan.buckets
+        ]
+        assert any(length == 0 for length in send_lengths), (
             f"rank {dist.get_rank()}: expected at least one empty send bucket when image count < world_size"
         )
     # recover
@@ -93,6 +98,7 @@ def main():
     pixel_values, image_grid_thw = construct_data()
     # spatial_merge_unit = 1
     check_recover_precision(pixel_values, image_grid_thw)
+    check_merged_bridge_gradients()
 
     print("all test passed")
 
@@ -100,14 +106,66 @@ def main():
     dist.destroy_process_group()
 
 
+def check_merged_bridge_gradients():
+    """Keep legacy image/video entry points while sharing inverse and VJP routing."""
+    rank = dist.get_rank()
+    grid = torch.tensor([[1, 2, 2]] * (rank + 1), device=get_device_type(), dtype=torch.long)
+    pixels = torch.arange((rank + 1) * 4 * 3, device=get_device_type(), dtype=torch.float32).reshape(-1, 3)
+    pixels = pixels + 1000 * rank
+    balancer = Qwen3VLEncoderDataBalance(spatial_merge_unit=4)
+    balanced_image, _ = balancer.balance_data(pixels, grid, data_type="image")
+    # A later video invocation must not overwrite the image inverse plan.
+    balancer.balance_data(pixels + 17, grid, data_type="video")
+    merged = balanced_image.reshape(-1, 4, 3).mean(dim=1)
+    hidden = merged.detach().clone().requires_grad_()
+    features = [merged.detach().clone().requires_grad_() for _ in range(2)]
+    restored, deepstack = balancer.data_bridge(hidden, features, data_type="image")
+    expected = pixels.reshape(-1, 4, 3).mean(dim=1)
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+    for feature in deepstack:
+        torch.testing.assert_close(feature, expected, rtol=0, atol=0)
+    loss = (restored * expected).sum()
+    for index, feature in enumerate(deepstack, start=2):
+        loss = loss + (feature * expected * index).sum()
+    loss.backward()
+    torch.testing.assert_close(hidden.grad, merged, rtol=0, atol=0)
+    for index, feature in enumerate(features, start=2):
+        torch.testing.assert_close(feature.grad, merged * index, rtol=0, atol=0)
+    video, _ = balancer.data_bridge((merged + 17).detach().requires_grad_(), [], require_grad=False, data_type="video")
+    assert not video.requires_grad
+    torch.testing.assert_close(video, expected + 17, rtol=0, atol=0)
+    with torch.no_grad():
+        recovered, _ = balancer.data_bridge(hidden, [], data_type="image")
+    assert not recovered.requires_grad
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("outer_no_grad", [False, True])
+def test_singleton_bridge_disabled_grad(monkeypatch, empty, outer_no_grad):
+    monkeypatch.setattr(
+        "veomni.utils.data_balance.data_balance.get_parallel_state", lambda: SimpleNamespace(dp_group=None)
+    )
+    count = 0 if empty else 2
+    balancer = Qwen3VLEncoderDataBalance(spatial_merge_unit=1)
+    balancer.balance_data(torch.ones(count, 3), torch.ones(count, 3, dtype=torch.long))
+    hidden = torch.ones(count, 3, requires_grad=True)
+    with torch.set_grad_enabled(not outer_no_grad):
+        restored, features = balancer.data_bridge(hidden, [hidden], require_grad=outer_no_grad)
+    assert not restored.requires_grad and not features[0].requires_grad
+    torch.testing.assert_close(restored, hidden, rtol=0, atol=0)
+
+
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_encoder_balance():
+    world_size = int(os.getenv("VEOMNI_BALANCE_WORLD_SIZE", str(_CI_LAUNCH.nproc)))
+    if world_size < 1:
+        raise ValueError("VEOMNI_BALANCE_WORLD_SIZE must be positive.")
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        f"--nproc-per-node={_CI_LAUNCH.nproc}",
+        f"--nproc-per-node={world_size}",
         "--node-rank=0",
         "--master_addr=localhost",
         "--standalone",
