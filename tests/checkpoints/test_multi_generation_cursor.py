@@ -164,28 +164,6 @@ def test_train_end_export_retains_receipt_after_optimizer_is_released(tmp_path):
     assert payload["_veomni_optimizer_generations"] == {"model": "source"}
 
 
-def test_same_step_new_generation_rebinds_existing_cursor(tmp_path):
-    trainer = _make_mock_trainer(save_path=str(tmp_path))
-    trainer.model.optimizer = SimpleNamespace(_is_multi_optimizer=True)
-    checkpoint = trainer.model.checkpoint = SimpleNamespace(
-        _last_saved_step=3, _last_saved_optimizer_generation="first", _loaded_optimizer_generation=None
-    )
-    trainer.train_dataloader = None
-    trainer.data_iterator = None
-    trainer.environ_meter.state_dict.return_value = {}
-    callback = GlobalStateCallback(trainer)
-    callback.dcp_every_n_epochs = 1
-    state = TrainerState(global_step=3, epoch=0)
-    callback.save_global_state(state, require_optimizer_checkpoint=True)
-    path = layout.extra_state_path(layout.step_dir(str(tmp_path), 3), trainer.args.train.global_rank)
-    before = torch.load(path, map_location="cpu", weights_only=False)
-    checkpoint._last_saved_optimizer_generation = "second"
-    callback.on_epoch_end(state)
-    after = torch.load(path, map_location="cpu", weights_only=False)
-    assert after["_veomni_optimizer_generations"] == {"model": "second"}
-    assert torch.equal(after["torch_rng_state"], before["torch_rng_state"])
-
-
 def test_hf_step_dcp_epoch_do_not_rewrite_a_completed_checkpoint(tmp_path):
     trainer = _make_mock_trainer(save_path=str(tmp_path))
     trainer.args.train.checkpoint.save_steps = 0

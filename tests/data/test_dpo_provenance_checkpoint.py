@@ -434,7 +434,6 @@ def test_dpo_epoch_end_refreshes_checkpoint_position_without_changing_sft_behavi
     callback.dcp_every_n_epochs = 0
     callback.save_hf_weights = False
     callback._last_saved_step = 3
-    callback._last_saved_optimizer_generations = {}
     callback.save_global_state = MagicMock()
     state = SimpleNamespace(epoch=0, global_step=3)
     callback.on_epoch_end(state)
@@ -464,7 +463,6 @@ def test_finished_dpo_resume_preserves_position_at_train_end(monkeypatch, same_o
     position = {"epoch": 0, "step_in_epoch": 2, "epoch_complete": True}
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
-    callback._last_saved_optimizer_generations = {}
     callback._read_current = lambda _: {
         "global_step": 2,
         "torch_rng_state": torch.get_rng_state(),

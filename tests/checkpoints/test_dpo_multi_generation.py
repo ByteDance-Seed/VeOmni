@@ -63,7 +63,6 @@ def test_dpo_pending_epoch_refresh_preserves_loaded_generation_and_cursor(tmp_pa
     trainer._dpo_epoch_complete = True
     resumed = GlobalStateCallback(trainer)
     resumed._last_saved_step = 3
-    resumed._last_saved_optimizer_generations = {"model": "source"}
     resumed.on_epoch_end(state)
     root = layout.step_dir(str(tmp_path), 3)
     extra = torch.load(layout.extra_state_path(root, 0), map_location="cpu", weights_only=False)

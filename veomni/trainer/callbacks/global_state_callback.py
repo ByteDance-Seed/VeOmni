@@ -234,7 +234,6 @@ class GlobalStateCallback(Callback):
         self.hf_every_n_steps = ckpt.hf_save_steps
         self.hf_every_n_epochs = ckpt.hf_save_epochs
         self._last_saved_step: int = -1
-        self._last_saved_optimizer_generations = {}
         self._unadvanced_boundary_state = None
         data = getattr(args, "data", None)
         if _has_exact_sft_dynamic_resume(trainer):
@@ -274,11 +273,7 @@ class GlobalStateCallback(Callback):
             and state.global_step == self._last_saved_step
         )
         if dcp_due or hf_due or dpo_saved_this_step:
-            if (
-                state.global_step != self._last_saved_step
-                or dpo_saved_this_step
-                or self._same_step_generation_changed(state)
-            ):
+            if state.global_step != self._last_saved_step or dpo_saved_this_step:
                 self.save_global_state(
                     state, require_optimizer_checkpoint=bool(dcp_due), refresh_epoch_state=dpo_saved_this_step
                 )
@@ -290,22 +285,13 @@ class GlobalStateCallback(Callback):
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.save_hf_weights:
-            if state.global_step != self._last_saved_step or self._same_step_generation_changed(state):
+            if state.global_step != self._last_saved_step:
                 self.save_global_state(state)
             else:
                 logger.info_rank0(
                     f"Skipping duplicate trainer state save at train_end (global_step {state.global_step} "
                     f"already saved)."
                 )
-
-    def _same_step_generation_changed(self, state: TrainerState) -> bool:
-        current = {
-            name: getattr(checkpoint, "_last_saved_optimizer_generation", None)
-            for name, checkpoint in _multi_optimizer_checkpoints(self.trainer)
-            if getattr(checkpoint, "_last_saved_step", None) == state.global_step
-            and isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
-        }
-        return current != self._last_saved_optimizer_generations
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
         pending = getattr(self, "_unadvanced_boundary_state", None)
@@ -387,12 +373,7 @@ class GlobalStateCallback(Callback):
         payload = None
         state_error = None
         try:
-            if self._last_saved_step == state.global_step and not refresh_epoch_state:
-                payload = self._read_current(step_root)
-                if payload is None:
-                    raise RuntimeError("Cannot rebind a missing same-step trainer cursor")
-            else:
-                payload = self.state_dict(state)
+            payload = self.state_dict(state)
             receipts = {}
             for name, checkpoint in _multi_optimizer_checkpoints(self.trainer):
                 generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
@@ -481,7 +462,6 @@ class GlobalStateCallback(Callback):
         raise_if_any_rank_failed(manifest_error, "writing the checkpoint manifest")
 
         self._last_saved_step = state.global_step
-        self._last_saved_optimizer_generations = receipts
 
     def _read_current(self, load_path: str) -> Optional[Dict[str, Any]]:
         """Merge this rank's ``extra_state/`` and ``loader/`` back into one dict.
@@ -993,8 +973,6 @@ class GlobalStateCallback(Callback):
                 )
                 self._dpo_finished_cursor = cursor if self.trainer.start_epoch >= args.train.num_train_epochs else None
                 self._last_saved_step = global_step if same_output_checkpoint else -1
-                if self._last_saved_step == global_step and strict_optimizer:
-                    self._last_saved_optimizer_generations = dict(generations)
 
         restore_local(restore_position, "restoring trainer position")
         dpo_new_epoch = dpo_recovery and self.trainer.start_epoch != global_state["dpo_position"]["epoch"]
@@ -1101,7 +1079,6 @@ class GlobalStateCallback(Callback):
                 legacy_cursor_proven = all(proofs)
             if not legacy_cursor_proven:
                 self._last_saved_step = -1
-                self._last_saved_optimizer_generations = {}
                 if strict_optimizer:
                     raise RuntimeError("Mixed optimizer resume lacks proven legacy trainer RNG or cursor state")
         if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
@@ -1169,7 +1146,6 @@ class GlobalStateCallback(Callback):
             raise_if_any_rank_failed(error, "checking legacy checkpoint completeness")
             if not complete:
                 self._last_saved_step = -1
-                self._last_saved_optimizer_generations = {}
                 error = RuntimeError(
                     "Cannot safely reuse an incomplete legacy checkpoint in its output directory; "
                     "use a different output directory."
@@ -1203,7 +1179,6 @@ class GlobalStateCallback(Callback):
                     checkpoint._last_saved_optimizer_generation = None
             raise
         self._last_saved_step = step
-        self._last_saved_optimizer_generations = dict(generations)
         from .checkpoint_callback import CheckpointCallback
 
         callback = getattr(self.trainer, "checkpoint_callback", None)
