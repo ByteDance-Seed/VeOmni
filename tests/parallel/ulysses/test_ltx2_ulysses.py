@@ -16,7 +16,8 @@ import pytest
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from scripts.ci.accelerator.launch_plan import runner_device_count
+from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 
 if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
@@ -25,6 +26,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 from torch.testing._internal.common_utils import run_tests
 
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
     LTXVideoTransformerModelConfig,
@@ -62,6 +64,7 @@ def _build_model(device, with_audio, gradient_checkpointing):
         audio_in_channels=8,
         audio_out_channels=8,
         audio_cross_attention_dim=32,
+        ops_implementation=make_eager_ops_config(),
     )
     torch.manual_seed(0)
     model = LTXVideoTransformerModel(config).to(device).float()
@@ -102,7 +105,7 @@ class LTX2UlyssesTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         apply_veomni_ltx_transformer_patch()
         group = self._get_process_group()

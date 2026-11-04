@@ -25,13 +25,18 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 from transformers.utils import auto_docstring, logging
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
+from veomni.ops.kernels.moe_experts.standard.activation_gate import (
+    refuse_fused_moe_on_unsupported_activation,
+)
+
 
 logger = logging.get_logger(__name__)
 
 
 @auto_docstring(checkpoint="google/diffusiongemma-26B-A4B-it")
 @strict
-class DiffusionGemmaTextConfig(PreTrainedConfig):
+class DiffusionGemmaTextConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     r"""
     use_bidirectional_attention (`str`, *optional*):
         Controls bidirectional attention behavior. When set to `"vision"`, vision tokens
@@ -160,12 +165,7 @@ class DiffusionGemmaTextConfig(PreTrainedConfig):
         return kwargs
 
     def _validate_build_prerequisites(self) -> None:
-        from ....ops.config import get_ops_config
-        from ....ops.kernels.moe_experts.standard.activation_gate import (
-            refuse_fused_moe_on_unsupported_activation,
-        )
-
-        ops_config = get_ops_config()
+        ops_config = getattr(self, "ops_config", None)
         if ops_config is None:
             return
         moe_impl = getattr(ops_config, "moe_implementation", "eager")
@@ -175,10 +175,21 @@ class DiffusionGemmaTextConfig(PreTrainedConfig):
 
     validate_build_prerequisites = _validate_build_prerequisites
 
+    @property
+    def _attn_implementation(self) -> str | None:
+        selected = self.ops_implementation.get("attn_implementation")
+        if selected is not None:
+            return selected
+        return "sdpa"
+
+    @_attn_implementation.setter
+    def _attn_implementation(self, value: str | dict[str, Any] | None) -> None:
+        VeOmniPretrainedConfig._attn_implementation.fset(self, value)
+
 
 @auto_docstring(checkpoint="google/diffusiongemma-26B-A4B-it")
 @strict
-class DiffusionGemmaConfig(PreTrainedConfig):
+class DiffusionGemmaConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     r"""
     boi_token_id (`int`, *optional*, defaults to 255999):
         The begin-of-image token index to wrap the image prompt.
@@ -377,6 +388,17 @@ class DiffusionGemmaConfig(PreTrainedConfig):
             self.text_config.validate_build_prerequisites()
 
     validate_build_prerequisites = _validate_build_prerequisites
+
+    @property
+    def _attn_implementation(self) -> str | None:
+        selected = self.ops_implementation.get("attn_implementation")
+        if selected is not None:
+            return selected
+        return "sdpa"
+
+    @_attn_implementation.setter
+    def _attn_implementation(self, value: str | dict[str, Any] | None) -> None:
+        VeOmniPretrainedConfig._attn_implementation.fset(self, value)
 
 
 # Attach after @strict has built __class_validators__ (which scans every public

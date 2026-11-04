@@ -12,14 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cross-family OmniModule mixins.
+"""Cross-family OmniModule helpers (`llm_packing`, `packing`)."""
 
-Currently:
-* :class:`TextEncoder` — generic word-token embedding + LM head, reusable
-  across LLM families (model_type ``text_encoder``).
-* :mod:`llm_packing` — shared ``conversation_list`` ↔ LLM backbone carrier helpers:
-  ``pack_llm_conversations_for_forward`` (1-D position backbones) and
-  ``scatter_llm_hidden_states`` (all families).
-"""
-
-from . import text_encoder  # noqa: F401
+from . import llm_packing, packing  # noqa: F401

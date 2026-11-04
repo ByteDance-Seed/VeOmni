@@ -35,7 +35,20 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel.loss import SumOverShards
 from ....utils.constants import IGNORE_INDEX
 from ...loss_utils.dllm import dllm_masked_cross_entropy
-from ...utils.attention_utils import VARLEN_ATTENTION_TYPES
+
+
+VARLEN_ATTENTION_TYPES = (
+    "flash_attention_2",
+    "flash_attention_2_hub",
+    "flash_attention_3",
+    "flash_attention_3_hub",
+    "flash_attention_4",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_2_hub",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_3_hub",
+    "veomni_flash_attention_4",
+)
 
 
 def bidirectional_attention_mask(

@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.dsa.topk import local_topk_to_global, mask_topk_indices_to_query_range
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_local_topk_to_global_masks_out_of_range_indices():

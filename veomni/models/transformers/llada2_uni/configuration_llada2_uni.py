@@ -24,9 +24,11 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.models.glm_image.configuration_glm_image import GlmImageVisionConfig, GlmImageVQVAEConfig
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
+
 
 @strict
-class LLaDA2UniConfig(PreTrainedConfig):
+class LLaDA2UniConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     r"""LLaDA2.0-Uni config.
 
     use_qk_norm (`bool`): RMSNorm over the head dim of queries and keys.

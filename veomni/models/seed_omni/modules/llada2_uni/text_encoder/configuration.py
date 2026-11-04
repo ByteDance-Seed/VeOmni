@@ -21,7 +21,7 @@ LLaDA2.0-Uni shares one **unified vocabulary** (text + 16384 image VQ codes at
 
 from typing import Optional
 
-from ...base.text_encoder.configuration import TextEncoderConfig
+from ...text_encoder.configuration import TextEncoderConfig
 
 
 class LladaUniTextEncoderConfig(TextEncoderConfig):

@@ -213,3 +213,19 @@ class Arguments(VeOmniArguments):
 ```
 
 By following this pattern, you can leverage the robust infrastructure of `BaseTrainer` while tailoring the training process to your specific model and data requirements.
+
+### Token accounting diagnostics
+
+When the batch contains sufficient global length and padding metadata,
+`EnvironMeter` reports `token_accounting/*` diagnostics. The physical count is
+the SP-padded input window, the aligned count removes its known tail padding,
+and the source count uses valid global sequence lengths. Ambiguous batches omit
+these metrics. Existing `consume_tokens` and multi-source dataloader accounting
+retain their previous behavior and can therefore differ from the new source
+count.
+
+`loss_tokens` is a generic shifted-label count, not an objective-specific loss
+denominator. In particular, do not compare it across SP configurations for
+objectives whose collator does not shift labels, or treat it as the exact DPO,
+classification, or MTP target count. Token throughput uses the step timer,
+which starts after meter input collection and does not include its overhead.

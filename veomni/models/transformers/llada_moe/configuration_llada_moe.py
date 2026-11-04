@@ -31,9 +31,11 @@ from huggingface_hub.dataclasses import strict
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
+
 
 @strict
-class LLaDAMoEConfig(PreTrainedConfig):
+class LLaDAMoEConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     r"""Qwen3-MoE-compatible config for LLaDA-MoE mask-predictor models.
 
     Mirrors every Qwen3-MoE field (so a Qwen3-MoE-layout checkpoint loads unchanged) and

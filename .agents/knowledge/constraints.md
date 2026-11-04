@@ -101,10 +101,13 @@ Core entry points:
 
 8. **EP shards expert weights and exchanges tokens via all-to-all**
    - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
+   - Synchronous activation offload must skip `FP8ExpertWeight` containers saved by DeepGEMM: native FSDP owns their payload/scale storage and repopulates it before backward. Copying the opaque container to CPU is unsupported; it must not consume the activation offloader's GPU budget either. Ordinary activations still follow the configured offload policy.
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
-   - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+   - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` by default. `expert_fsdp_shard_dim=0` explicitly selects whole-expert FSDP shards after validating the EP plan and even local expert divisibility; `None` preserves the existing placement/Muon policy. Record the selected FSDP dimension in `SpecInfo`. If EP/FSDP split the same tensor dimension, DCP must use `_StridedShard(dim, split_factor=ep_size)` on the FSDP mesh axis: physical sharding is EP-first even though the mesh lists FSDP first. Two ordinary `Shard(0)` placements silently permute global expert IDs. VeOmni DCP save/load planners record per-tensor source EP/FSDP dimensions, sizes and expert order in `planner_data`; load compatibility depends on saved coordinates, not the target shard dimension. Unmarked legacy chunks that split only the expert axis are ambiguous and must be migrated using the original training layout; do not bypass the planners for production resumes.
+
+   - LoRA adapter export must pass both `SpecInfo.placement.dim` and `SpecInfo.fsdp_shard_dim` to `restore_extra_parallel_dim`, just like regular model checkpoints. Assuming dim-1 FSDP for whole-expert shards corrupts global adapter shapes and expert order during safetensors consolidation.
 
 8a. **Persistent 2D ExtraParallel parameters require a complete 2D mesh**
    - Persistent ExtraParallel parameters currently require a 2D `(<para>_fsdp, <para>)` mesh covering the complete world. HSDP replicas and FSDP CPU offload remain unsupported.
@@ -145,8 +148,8 @@ Core files:
     - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
 
 11. **Dynamic batching token counting must match `dyn_bsz_count_mode`**
-    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `attention_mask.sum()` as the length function in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
-    - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
+    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `get_length_fn` (`attention_mask.sum()` with `input_ids` fallback, or the sum of `item.meta["_omni_token_len"]` across all items—including `is_dummy=True` placeholders—for SeedOmni `conversation_list` samples) in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
+    - Optional effective-token mode (`"effective"`) uses `get_length_by_labels_fn` (`(labels != IGNORE_INDEX).sum()` when `labels` are present, or non-dummy supervised text/assistant-media token lengths for SeedOmni `conversation_list` samples, falling back to `get_length_fn` otherwise).
     - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
     - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
@@ -228,6 +231,7 @@ Core files:
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU and MLU compatibility.
+   - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 ## Trainer Extensions
 
@@ -236,8 +240,10 @@ Core files:
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
 25. **Kernel handles belong to model instances**
-   - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
+   - Modeling classes construct `VeomniOp` handles from `self.config.ops_config` and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
+   - Attention-free containers and embedding/projecting modules override HF's `_check_and_adjust_attn_implementation` to return the canonical selection. Do not advertise a backend capability they do not execute, preload its kernel on the container, or bypass checks on the shared model base; attention-owning components validate themselves. A model with its own deferred dispatch (MiniMax packed attention) may return the canonical selection from this hook only when its bind boundary validates the backend before execution.
+   - Native configs created inside VeOmni models must explicitly opt in before calling VeOmni helpers; the native HF classes are never globally patched. Remote adapters export a native copy to preserve their source files and `auto_map`.
 
 26. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
@@ -254,9 +260,7 @@ Core files:
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
-    - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
-    - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
-    - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+    - `_Gather.backward` uses out-of-place NCCL reduce-scatter (`reduce_scatter_tensor` for equal shards, `reduce_scatter` for uneven shards) into a freshly allocated local `grad_input` buffer, and clones `grad_output` (`grad_output.clone(memory_format=torch.contiguous_format)`) before running an in-place `dist.all_reduce` on other backends (`_GatherConcatSP.backward` likewise clones before `dist.all_reduce`). Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients across layouts for `_Gather`.
 
 29. **Saved RoPE table metadata must stay stable across checkpoint recomputation**
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
@@ -267,11 +271,12 @@ Core files:
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
 
-30. **FLASH execution uses fixed-shape compilation**
-    - Compile FLASH with `dynamic=False, fullgraph=True`; variable lengths can require new specializations. Do not increase global cache limits or fall back to dense eager attention on cache exhaustion.
-    - Validate exact BlockMask bounds against normalized post-Ulysses Q/K lengths. Keep custom predicates compatible with the pinned FLASH lowering.
-    - BlockMask construction remains eager; compiled creation and dynamic-length graph reuse belong to a follow-up change.
-    - See [FLASH compilation](../../docs/transformers_v5/veomni_attention_interface.md#flash-compilation-and-mask-construction).
+30. **FLASH compilation uses tensor-derived bounds**
+    - BlockMask construction has a separate cached `torch.compile(create_block_mask)` using automatic dynamic generalization. Test the real public `cu_seqlens` path, not only attention with prebuilt masks or compile spies. Keep packed compilation enabled by default; a Python length argument alone does not prove unbounded recompilation. Explicit eager construction can allocate token-square intermediates; see [compiled masks](../../docs/transformers_v5/veomni_attention_interface.md#compiled-mask-construction).
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - Prefer indexed per-token metadata buffers. The pinned CuteDSL lowering can also fail on zero-dimensional scalar-tensor captures; converting a Python scalar to a scalar tensor alone does not establish callback compatibility.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
 
 30a. **Q/K/V layouts and visibility are explicit**
     - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
@@ -280,10 +285,36 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
 
 30b. **Pinned FA4 auxiliary callbacks require bounds protection**
     - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
-    - For affected auxiliary callbacks with bounds disabled, restore full native Q/K bounds. Keep this correctness baseline independent of tail-only or Q-only optimizations.
+    - Apply Q-only protection only on physically padded Q tiles (account for PackGQA). Check K completeness on every Q tile before either fast path. Q-only callback clamping requires a proven complete K tile; ragged/negative K tiles retain native full bounds. Never use the incoming false flag as proof of K bounds.
     - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
     - Native b16 omits broadcast strides from its forward cache key. Materialize zero-stride Q/K/V views after KV expansion, bump the cache namespace, and test mixed layouts through the same production cache. Automatic FLASH routing must retain Triton for unsupported sparse dimensions, missing full-block tables, architecture-mismatched BlockMask tiles (128×128 on SM90; 256×128 on SM100/110), and trainable score bias. Explicit backend selection retains native validation.
     - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.
+
+30c. **Framework callbacks must preserve FLASH's scalar and index contracts**
+    - Sliding-window, softcap and offset callbacks use device buffers indexed by token positions, including uniform broadcast views. A constant `buffer[0]` index fails the pinned CuteDSL SSA conversion. Skip zero offsets entirely.
+    - Represent packed rows as metadata tensor dimensions; precompute flattened-coordinate arithmetic outside the callback. The pinned lowering rejects symbolic row-width arithmetic (`index_expr`), and even a dead integer comparison can leave a rejected capture. Preserve the caller's index dtype when forwarding mapped positions into another predicate (Int32 on FLASH).
+    - Cover the public builder and real forced FLASH outputs/QKV gradients/graph reuse, including changing scalar values, packed rows, cached offsets, default mask compilation and outer static compilation.
+    - Build masks with invocation-local predicates and explicit `create_block_mask` arguments. Never temporarily replace HF module helpers: overlapping exits can restore another invocation's device/length closure and affect native HF consumers. Preserve pinned HF padding/offset composition; test overlapping success/error paths and native HF calls during construction.
+
+## DeepGEMM FP8 all-gather
+
+- Native Torch 2.11 nonzero-dimension FSDP copy-out reshapes each extension
+  output using the parameter shard shape. Compact block scales must therefore
+  use their own all-gather; only the same-shaped FP8 payload goes through the
+  native extension output list. Do not add scales as a second output for Shard(1).
+- Weight shard boundaries must align to complete 128x128 blocks. Preserve
+  BF16 rounding before quantizing FP32 master shards to match BF16 parameter
+  all-gather numerics. Quantizing FP32 directly changes scales and rounding.
+- Install parameter extensions after materialization and before FSDP lazy
+  initialization. Normal full reshard uses `post_forward_mesh_info is mesh_info`;
+  a non-None post-forward mesh alone does not mean integer partial resharding.
+- Keep the FP8 container opaque outside DeepGEMM; optimizer and checkpoint
+  operations use the ordinary master shards. Do not move/replace wrapped
+  parameters after hook registration.
+- Transport and copy FP8 payloads as `uint8` views, restoring E4M3 views for
+  GEMM. The generic ATen float8-copy path can spend more time converting and
+  moving values than FP8 all-gather saves. Use the tiled byte transpose for
+  dgrad; square block scales transpose without requantization.
 
 ## DiffusionGemma and dLLM
 

@@ -15,6 +15,7 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import CheckpointError, _CheckpointFrame
 
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_device_count
 from tests.models.test_qwen_image_training import cpu_diffusers_normalization, snapshot, transformer
 from tests.precision import qwen_image as precision_module
 from tests.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture
@@ -23,6 +24,10 @@ from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+
+_SINGLE_LAUNCH = LaunchSpec(nproc=1)
+_SHARDED_LAUNCH = LaunchSpec(nproc=2)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -249,18 +254,25 @@ def test_fixed_step_toolchain(runs):
 
 
 @pytest.mark.skipif(
-    get_device_type() not in ("cuda", "npu") or get_torch_device().device_count() < 2,
+    get_device_type() not in ("cuda", "npu") or runner_device_count() < 2,
     reason="requires two GPU or NPU devices for FSDP2 capture",
 )
+@pytest.mark.launch_plan(provider=CasePlan.sequential(_SINGLE_LAUNCH, _SHARDED_LAUNCH))
 def test_accelerator_capture_matches_two_rank_fsdp2(runs, tmp_path):
     # Fresh processes use the real accelerator kernels without CPU-test fixtures.
     environment = os.environ.copy()
     for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
         environment.pop(name, None)
-    for ranks, name in ((1, "single"), (2, "sharded")):
+    for ranks, name in ((_SINGLE_LAUNCH.nproc, "single"), (_SHARDED_LAUNCH.nproc, "sharded")):
         command = [sys.executable]
         if ranks > 1:
-            command += ["-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc-per-node=2"]
+            command += [
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc-per-node={_SHARDED_LAUNCH.nproc}",
+            ]
         command += [
             "-m",
             "tests.precision.qwen_image",

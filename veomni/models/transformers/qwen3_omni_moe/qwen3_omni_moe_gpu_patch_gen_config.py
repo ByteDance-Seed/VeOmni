@@ -50,10 +50,19 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
     MoeModelOutputWithPast,
 )
-from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     BaseModelOutputWithDeepstackFeatures,
+    Qwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeTextRMSNorm,
     Qwen3OmniMoeThinkerForConditionalGeneration,
+    Qwen3OmniMoeThinkerTextAttention,
+    Qwen3OmniMoeThinkerTextDecoderLayer,
+    Qwen3OmniMoeThinkerTextMLP,
+    Qwen3OmniMoeThinkerTextModel,
+    Qwen3OmniMoeThinkerTextRMSNorm,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextSparseMoeBlock,
+    Qwen3OmniMoeVisionEncoder,
     _get_feat_extract_output_lengths,
 )
 from transformers.processing_utils import Unpack
@@ -68,10 +77,9 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
@@ -88,6 +96,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_omni_moe_gpu.py",
     description="Qwen3-Omni-MoE thinker with VeOmni v5 compatibility (SP + FSDP + fused MoE + fused loss)",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 
 config.add_import("typing", names=["Optional"])
 
@@ -110,13 +122,12 @@ config.add_import(
     ],
 )
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
 )
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -219,11 +230,12 @@ config.drop_import_names("use_kernel_forward_from_hub")
     "Qwen3OmniMoeThinkerTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_omni_moe_thinker_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_omni_moe_thinker_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 
 @config.override_method(
@@ -238,11 +250,12 @@ def qwen3_omni_moe_thinker_text_rmsnorm_forward_patched(self, hidden_states: tor
     "Qwen3OmniMoeTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_omni_moe_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_omni_moe_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 
 @config.override_method(
@@ -266,7 +279,7 @@ def qwen3_omni_moe_thinker_text_mlp_init_patched(self, config, intermediate_size
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
 
 @config.override_method(
@@ -285,6 +298,45 @@ def qwen3_omni_moe_thinker_text_mlp_forward_patched(self, x):
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextDecoderLayer.__init__",
+    description="Pass config to Qwen3OmniMoeThinkerTextRMSNorm",
+)
+def qwen3_omni_moe_thinker_text_decoder_layer_init_patched(self, config, layer_idx):
+    nn.Module.__init__(self)
+    self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_idx)
+    if (layer_idx not in config.mlp_only_layers) and (
+        config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+    ):
+        self.mlp = Qwen3OmniMoeThinkerTextSparseMoeBlock(config)
+    else:
+        self.mlp = Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.intermediate_size)
+    self.input_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(
+        config.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.hidden_size = config.hidden_size
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextModel.__init__",
+    description="Pass config to Qwen3OmniMoeTextRMSNorm",
+)
+def qwen3_omni_moe_thinker_text_model_init_patched(self, config):
+    super(Qwen3OmniMoeThinkerTextModel, self).__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3OmniMoeThinkerTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3OmniMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
+    self.gradient_checkpointing = False
+    self.post_init()
 
 
 # ================================================================
@@ -621,22 +673,20 @@ def qwen3_omni_moe_get_rope_index_patched(
 
 # ================================================================
 # Patch: Qwen3OmniMoeVisionAttention.forward
-# 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-#    custom names) instead of v5 upstream `is_flash_attention_requested`,
-#    which only recognizes HF built-in flash attention names. Without this
-#    dispatch the SP-appended cu_seqlens-padding entry would run through the
-#    non-varlen split branch and size-mismatch.
+# 1. Always route through the instance-local `self.veomni_attn` with packed
+#    `cu_seq_lens_q/k` metadata; non-FlashAttention backends split per segment
+#    inside the attention op wrapper (after any Ulysses all-to-all).
 # ================================================================
 @config.modify_init("Qwen3OmniMoeVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
     "Qwen3OmniMoeVisionAttention.forward",
-    description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen3_omni_moe_vision_attention_forward_patched(
     self,
@@ -657,45 +707,24 @@ def qwen3_omni_moe_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
     # --- Patch.1 ---
-    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    if max_seqlen is None:
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
     # --- Patch.1 ---
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -1182,7 +1211,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -1229,13 +1258,13 @@ def qwen3_omni_moe_thinker_init_patched(self, config):
     self.num_experts = config.text_config.num_experts
     self.num_experts_per_tok = config.text_config.num_experts_per_tok
     self.router_aux_loss_coef = config.text_config.router_aux_loss_coef
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
@@ -1887,17 +1916,18 @@ def qwen3_omni_moe_text_get_parallel_plan_patched(self):
 @config.modify_init("Qwen3OmniMoeAudioAttention", description="Bind instance-local attention VeomniOp")
 def qwen3_omni_moe_audio_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
     "Qwen3OmniMoeAudioAttention.forward",
-    description="Always call the local attention VeomniOp",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen3_omni_moe_audio_attention_forward_patched(
     self,
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    max_seqlen: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
@@ -1910,54 +1940,56 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
-    if is_flash_attention_requested(self.config):
+    if max_seqlen is None:
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.out_proj(attn_output)
     return attn_output
 
 
-@config.modify_init("Qwen3OmniMoeThinkerTextAttention", description="Bind instance-local rope and attention VeomniOps")
-def qwen3_omni_moe_thinker_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextAttention.__init__",
+    description="Pass config to Qwen3OmniMoeThinkerTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
+def qwen3_omni_moe_thinker_text_attention_init_patched(self, config, layer_idx):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen3OmniMoeThinkerTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # unlike olmo, only on the head dim!
+    self.k_norm = Qwen3OmniMoeThinkerTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # thus post q_norm does not need reshape
+    self.sliding_window = None
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -1985,6 +2017,13 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=self.veomni_attn.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
+
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -1994,7 +2033,7 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **kwargs,
+        **attn_kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

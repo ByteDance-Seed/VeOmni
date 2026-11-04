@@ -9,8 +9,12 @@ import torch
 from tools import hf_local_or_remote
 from transformers import AutoTokenizer
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_transform import process_classification_example
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class DummyTokenizer:

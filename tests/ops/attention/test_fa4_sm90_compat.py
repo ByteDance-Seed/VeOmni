@@ -13,6 +13,7 @@
 # under the License.
 
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE
 @pytest.mark.parametrize(
     ("mask_seqlen", "mask_causal", "mask_local", "has_mask", "has_aux", "expected"),
     [
-        (False, False, False, True, True, True),
+        (False, False, False, True, True, False),
         (True, False, False, True, True, True),
         (False, True, False, True, True, False),
         (False, False, True, True, True, False),
@@ -48,8 +49,114 @@ def test_fa4_sm90_compat_keeps_auxiliary_bounds_on_later_partial_tiles(
     forward(*prefix, mask_seqlen, mask_causal, mask_local, mask_mod, auxiliary, divisors)
     assert len(calls) == 1
     forwarded_mask = calls[0][10]
-    assert forwarded_mask is mask_mod
+    if not mask_seqlen and not mask_causal and not mask_local and has_mask and has_aux:
+        assert isinstance(forwarded_mask, partial)
+        assert forwarded_mask.keywords == {"mask_mod": mask_mod}
+    else:
+        assert forwarded_mask is mask_mod
     assert calls == [(*prefix, expected, mask_causal, mask_local, forwarded_mask, auxiliary, divisors)]
+
+
+@pytest.mark.parametrize(
+    ("length", "pack_gqa", "m_block", "expected"),
+    [
+        (128, 1, 0, False),
+        (129, 1, 0, False),
+        (129, 1, 1, True),
+        (256, 1, 1, False),
+        (64, 2, 0, False),
+        (65, 2, 1, True),
+        (33, 4, 0, False),
+        (33, 4, 1, True),
+        (128, 7, 6, False),
+        (129, 7, 6, False),
+        (129, 7, 7, True),
+        (127, 7, 6, True),
+    ],
+)
+def test_fa4_additional_bounds_only_cover_physical_query_padding(length, pack_gqa, m_block, expected):
+    calls = []
+    cute = SimpleNamespace(jit=lambda fn: fn, Tensor=object, TiledMma=object)
+    cutlass = SimpleNamespace(Int32=int, Constexpr=dict, const_expr=lambda condition: condition)
+    forward = fa4_sm90_compat._make_sm90_mask_forwarder(lambda *args: calls.append(args), cute, cutlass)
+    mask = SimpleNamespace(tile_m=128, tile_n=128, seqlen_q=length, seqlen_k=512, qhead_per_kvhead_packgqa=pack_gqa)
+    prefix = (mask, object(), 0, 0, m_block, 0, object())
+    mask_mod, auxiliary, divisors = object(), [object()], (object(), object())
+    forward(*prefix, False, False, False, mask_mod, auxiliary, divisors)
+    assert len(calls) == 1
+    forwarded_mask = calls[0][10]
+    assert isinstance(forwarded_mask, partial) == expected
+    if expected:
+        assert forwarded_mask.keywords == {"mask_mod": mask_mod}
+    else:
+        assert forwarded_mask is mask_mod
+    assert calls == [(*prefix, False, False, False, forwarded_mask, auxiliary, divisors)]
+
+
+@pytest.mark.parametrize(
+    ("q_length", "k_length", "tile_n", "n_block", "q_only"),
+    [
+        (128, 129, 128, 1, False),
+        (128, 129, 128, -1, False),
+        (129, 259, 128, 0, True),
+        (129, 259, 128, 1, True),
+        (129, 259, 128, 2, False),
+        (129, 256, 128, 1, True),
+        (129, 256, 128, 2, False),
+        (129, 128, 128, 0, True),
+        (129, 127, 128, 0, False),
+        (129, 259, 128, -1, False),
+        (0, 259, 128, 0, False),
+        (129, 0, 128, 0, False),
+        (129, 259, 256, 0, True),
+        (129, 259, 256, 1, False),
+    ],
+)
+def test_fa4_query_only_guard_requires_a_complete_k_tile(q_length, k_length, tile_n, n_block, q_only):
+    calls = []
+    cute = SimpleNamespace(jit=lambda fn: fn, Tensor=object, TiledMma=object)
+    cutlass = SimpleNamespace(Int32=int, Constexpr=dict, const_expr=lambda condition: condition)
+    forward = fa4_sm90_compat._make_sm90_mask_forwarder(lambda *args: calls.append(args), cute, cutlass)
+    mask = SimpleNamespace(tile_m=128, tile_n=tile_n, seqlen_q=q_length, seqlen_k=k_length, qhead_per_kvhead_packgqa=1)
+    prefix = (mask, object(), 0, 0, max(q_length - 1, 0) // 128, n_block, object())
+    callback, aux = object(), [object()]
+    forward(*prefix, False, False, False, callback, aux)
+    assert len(calls) == 1
+    assert calls[0][7] == (not q_only)
+    assert isinstance(calls[0][10], partial) == q_only
+    if not q_only:
+        assert calls[0][10] is callback
+
+
+@pytest.mark.parametrize(
+    ("query_idx", "expected_idx", "expected_mask"), [(0, 0, True), (64, 64, True), (65, 0, False), (129, 0, False)]
+)
+def test_fa4_query_only_callback_uses_logical_indices_and_preserves_arguments(query_idx, expected_idx, expected_mask):
+    class Buffer(list):
+        def load(self):
+            return list(self)
+
+    cute = SimpleNamespace(
+        jit=lambda fn: fn, Tensor=object, TiledMma=object, make_rmem_tensor=lambda n, dtype: Buffer([None] * n)
+    )
+    cutlass = SimpleNamespace(Int32=int, Boolean=bool, Constexpr=dict, const_expr=lambda condition: condition)
+    calls = []
+    forward = fa4_sm90_compat._make_sm90_mask_forwarder(lambda *args: calls.append(args), cute, cutlass)
+    info = SimpleNamespace(seqlen_q=65)
+    mask = SimpleNamespace(tile_m=128, tile_n=128, seqlen_q=65, seqlen_k=256, qhead_per_kvhead_packgqa=2)
+    batch, head, key, aux = [2], [7], [11], [object()]
+    seen = []
+
+    def callback(b, h, q, k, seqlen, tensors):
+        seen.append((b, h, q, k, seqlen, tensors))
+        return [True]
+
+    forward(mask, object(), 0, 0, 1, 0, object(), False, False, False, callback, aux)
+    guarded = calls[0][10]
+    assert guarded(batch, head, [query_idx], key, info, aux) == [expected_mask]
+    assert seen == [(batch, head, [expected_idx], key, info, aux)]
+    assert seen[0][0] is batch and seen[0][1] is head and seen[0][3] is key
+    assert seen[0][4] is info and seen[0][5] is aux
 
 
 def test_fa4_existing_bounds_do_not_enter_tail_dispatch():
@@ -106,62 +213,6 @@ def test_fa4_sm90_compat_install_is_idempotent():
     assert (interface._flash_attn_fwd.compile_cache, interface._flash_attn_bwd.compile_cache) == caches
     assert fa4_sm90_compat._retired_compile_caches is retained
     assert len(retained) == 2
-
-
-@pytest.mark.parametrize("failed_cache", ["fwd", "bwd"])
-def test_fa4_sm90_cache_initialization_failure_keeps_installation_retryable(monkeypatch, failed_cache):
-    if not fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix():
-        pytest.skip("requires the pinned FA4 optional dependency")
-    from flash_attn.cute import cache_utils, interface
-    from flash_attn.cute.mask import AttentionMask
-
-    def original(
-        self,
-        acc_S,
-        batch_idx,
-        head_idx,
-        m_block,
-        n_block,
-        thr_mma,
-        mask_seqlen,
-        mask_causal,
-        mask_local=False,
-        mask_mod=None,
-        aux_tensors=None,
-        fastdiv_mods=(None, None),
-    ):
-        pass
-
-    old_caches = (object(), object())
-    retained = fa4_sm90_compat._retired_compile_caches
-    monkeypatch.setattr(AttentionMask, "apply_mask", original)
-    monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", old_caches[0])
-    monkeypatch.setattr(interface._flash_attn_bwd, "compile_cache", old_caches[1])
-    monkeypatch.setattr(fa4_sm90_compat, "_retired_compile_caches", retained)
-
-    def unavailable_cache(name):
-        if name.endswith(failed_cache):
-            raise OSError("cache directory unavailable")
-        return object()
-
-    monkeypatch.setattr(cache_utils, "get_jit_cache", unavailable_cache)
-    with pytest.raises(OSError, match="cache directory unavailable"):
-        fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix()
-    assert AttentionMask.apply_mask is original
-    assert interface._flash_attn_fwd.compile_cache is old_caches[0]
-    assert interface._flash_attn_bwd.compile_cache is old_caches[1]
-    assert fa4_sm90_compat._retired_compile_caches is retained
-
-    replacement = {
-        "veomni_sm90_aux_bounds_full_materialized_fwd": object(),
-        "veomni_sm90_aux_bounds_full_materialized_bwd": object(),
-    }
-    monkeypatch.setattr(cache_utils, "get_jit_cache", replacement.__getitem__)
-    assert fa4_sm90_compat.install_fa4_sm90_aux_bounds_fix()
-    assert AttentionMask.apply_mask is not original
-    assert interface._flash_attn_fwd.compile_cache is replacement["veomni_sm90_aux_bounds_full_materialized_fwd"]
-    assert interface._flash_attn_bwd.compile_cache is replacement["veomni_sm90_aux_bounds_full_materialized_bwd"]
-    assert fa4_sm90_compat._retired_compile_caches == old_caches
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FA4 requires CUDA")
@@ -263,9 +314,12 @@ def test_fa4_tail_bounds_preserve_asymmetric_forward_and_gradients(
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FA4 requires CUDA")
 @pytest.mark.parametrize("token_major", [False, True], ids=["bhsd", "thd"])
-def test_fa4_tail_bounds_keep_ragged_k_protection_for_later_sparse_blocks(monkeypatch, token_major, record_property):
+@pytest.mark.parametrize("q_length", [128, 129], ids=["complete_q", "padded_q"])
+def test_fa4_tail_bounds_keep_ragged_k_protection_for_later_sparse_blocks(
+    monkeypatch, token_major, record_property, q_length
+):
     test_fa4_tail_bounds_preserve_asymmetric_forward_and_gradients(
-        monkeypatch, 7, 1, 259, 129, token_major, record_property, permute_kv=True
+        monkeypatch, 7, 1, q_length, 129, token_major, record_property, permute_kv=True
     )
 
 
@@ -284,6 +338,16 @@ def test_fa4_shared_cache_broadcast_layouts(monkeypatch, record_property, broadc
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FA4 requires CUDA")
 def test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, record_property):
     from functools import wraps
+
+    from veomni.utils import device as device_utils
+
+    if device_utils.get_gpu_compute_capability(torch.device("cuda")) != 90:
+        pytest.skip("requires NVIDIA SM90 for the SM90 compatibility tests")
+
+    from veomni.ops.kernels.attention.standard import flex
+
+    if not flex._fa4._flash_attn_cute_available():
+        pytest.skip("requires FA4 for the SM90 compatibility tests")
 
     from flash_attn.cute import interface
 

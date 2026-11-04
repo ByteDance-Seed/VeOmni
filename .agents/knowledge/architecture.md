@@ -196,13 +196,33 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. `models.build_foundation_model()` installs the supplied ops selection.
-2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
+1. `models.build_foundation_model()` binds the supplied `ops_implementation` onto the model `PretrainedConfig` (`config.ops_config`).
+2. Read `config.json` -> select a registered config or a cached HF schema adapter -> initialize a real `VeOmniPretrainedConfig` tree. Native HF config classes are never monkey-patched.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Construct instance-local `VeomniOp` handles from the installed selection.
+5. Generated and handwritten execution models use `VeOmniPreTrainedModel` to adapt raw HF config inputs and validate final ops before HF initialization. Construct instance-local `VeomniOp` handles from `self.config.ops_config`. The composed `OmniModel` uses HF container initialization: root ops are inheritance defaults and effective module selections are validated by the module loaders and constructors.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
+
+`ops_implementation` is the only stored attention selection. Public and private
+HF attention accessors delegate to it; private HF initialization writes affect
+only that config, while explicit scalar/public writes propagate recursively.
+`OmniConfig` and `OmniModuleConfig` share `VeOmniPretrainedConfig`.
+Its `__init_subclass__` adapts declared `sub_configs` recursively without changing
+native HF schemas. Handwritten HF extensions inherit the VeOmni base and native
+schema directly; the cooperative constructor forwards fields along that MRO.
+For HF modeling, the loader copies adapter configs back to native HF types before
+AutoModel dispatch. See `docs/design/module_config.md` for lifecycle contracts.
+
+Config loading merges dictionaries before constructing and validating the final
+`OpsImplementationConfig`. The resolved instance is cached per config and refreshed
+after dictionary changes; runtime caches are excluded from exports. Child default
+resets use `null` markers in saved ops diffs to block parent inheritance on reload.
+
+Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attention
+`eager` row uses model-local eager math when present and otherwise forwards to
+`veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
+`torch_npu`/`npu` is rejected rather than remapped across variants.
 
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as
@@ -240,6 +260,10 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+   - `moe_experts/standard/deepgemm_fp8` uses the same dispatch with
+     Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
+     FSDP2 and EP communication retain their configured precision. Quantized
+     weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.
 6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
    persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
    `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse
@@ -272,6 +296,7 @@ configs/
 
 ```
 tests/
+├── ci/              CPU tests for CI planning, scheduling and launch validation
 ├── models/  Kernel-aware model loading, integration, and helper tests
 ├── ops/            Op registry contracts and per-family kernel tests
 ├── arguments/      Argument parsing and ops_implementation alias tests
@@ -310,13 +335,14 @@ tests/
 Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 **A passing local run does not mean CI runs it.**
-`.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
-test files one by one. Only `tests/data` runs as a whole directory in both
-workflows; `tests/ops` and `tests/parallel/context_parallel` run wholesale on
-GPU only (the NPU job enumerates three named ops files). The e2e paths belong
-to `gpu_e2e_test.yml` / `npu_e2e_test.yml` instead. A new file anywhere else is
-invisible to CI until it is added to the workflow that owns its path, usually
-both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
+`scripts/ci/accelerator/suites/gpu.json` and `suites/npu.json` enumerate unit/e2e selections.
+Both manifests collect `tests/ci`, `tests/data`, `tests/checkpoints`, `tests/models`, and
+`tests/ops` as whole directories; GPU also collects
+`tests/parallel/context_parallel`. Files outside directory selections need an
+entry in the appropriate suite manifest. Both accelerator backends use
+`scripts/ci/accelerator/runner.py`; launch plans reuse each case's actual
+`nproc/world_size` configuration. Do not add manual device quotas or per-file
+pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 
 ## Key Entry Points
 
@@ -331,3 +357,27 @@ both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
 | dLLM (LLaDA family & DiffusionGemma) | `tasks/train_dllm.py` | `DllmTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
+
+### DeepGEMM FP8 expert parameter transport
+
+`FSDPConfig.expert_weight_fp8_all_gather` flows through `VeOmniModelRuntime` and
+`build_parallelize_model` into `parallelize_model_fsdp2`. After materialization,
+`distributed/fsdp2/fp8_all_gather.py` attaches native FSDP pre/post all-gather
+hooks to expert parameters selected by their actual DeepGEMM op handle.
+Before wrapping, the builders resolve the flag against those same handles:
+no matches means no FP8 hooks or FP8-specific compatibility checks, for all
+model scopes. Selected experts still require BF16 FSDP2 without CPU offload
+or compilation. Config parsing always validates the flag's boolean type.
+The pre-hook quantizes local shards and separately gathers compact scales;
+native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
+`GroupedLinear`, preserving BF16-facing autograd and high-precision master
+shards. Native FSDP manages both payload and scale storage on reshard.
+Synchronous activation offload skips the opaque weight container and leaves
+that lifecycle to FSDP, while ordinary saved activations still offload.
+
+`FSDPConfig.expert_fsdp_shard_dim` follows the same runtime path and optionally
+overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
+`Shard(0)` avoids hidden-dimension gather/scatter reordering; the selected
+dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
+uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
+GPUs and eager PyTorch on other devices, retaining FP32 accumulation.

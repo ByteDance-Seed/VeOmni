@@ -24,7 +24,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import _reject_lora_that_matched_nothing
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _runtime(*, lora: bool, trainable: bool) -> SimpleNamespace:

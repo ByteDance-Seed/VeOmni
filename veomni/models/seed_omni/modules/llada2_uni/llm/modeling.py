@@ -59,7 +59,7 @@ class LladaUniBackbone(LLaDA2UniPreTrainedModel):
         self.layers = nn.ModuleList(
             [LLaDA2UniDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = LLaDA2UniRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.post_init()

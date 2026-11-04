@@ -39,14 +39,14 @@ from transformers.integrations import use_kernel_forward_from_hub, use_kernelize
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 
 from .configuration_llada import LLaDAConfig
@@ -58,14 +58,15 @@ logger = logging.get_logger(__name__)
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LLaDARMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         """
         LLaDARMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "rms_norm_implementation", None) or "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -170,7 +171,8 @@ class LLaDAMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "swiglu_mlp_implementation", None) or "eager"
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", impl)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -251,7 +253,8 @@ class LLaDAAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "rotary_pos_emb_implementation", None) or "eager"
+        self.veomni_rope = VeomniOp("rope", "full", impl)
 
     def forward(
         self,
@@ -302,8 +305,8 @@ class LLaDADecoderLayer(GradientCheckpointingLayer):
         self.self_attn = LLaDAAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LLaDAMLP(config)
-        self.input_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self,
@@ -367,7 +370,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
         self.layers = nn.ModuleList(
             [LLaDADecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = LLaDARotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 

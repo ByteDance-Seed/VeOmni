@@ -37,7 +37,6 @@ from transformers.activations import ACT2FN
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import check_model_build_prerequisites
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.ops.kernels.moe_experts.standard.activation_gate import (
     _KERNEL_ACTIVATIONS,
     moe_expert_activation,
@@ -229,14 +228,12 @@ def test_build_time_prerequisite_refuses_unsupported_activation():
         "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
     ).DiffusionGemmaConfig
 
-    prev = get_ops_config()
-    try:
-        set_ops_config(_all_eager_ops_config(moe_implementation="fused_triton"))
-        config = DiffusionGemmaConfig(text_config={"hidden_activation": "quick_gelu"})
-        with pytest.raises(ValueError, match="cannot compute the expert activation"):
-            check_model_build_prerequisites(config)
-    finally:
-        set_ops_config(prev)
+    config = DiffusionGemmaConfig(
+        text_config={"hidden_activation": "quick_gelu"},
+        ops_implementation=_all_eager_ops_config(moe_implementation="fused_triton"),
+    )
+    with pytest.raises(ValueError, match="cannot compute the expert activation"):
+        check_model_build_prerequisites(config)
 
 
 def test_eager_moe_keeps_serving_a_gelu_activation():
@@ -245,12 +242,8 @@ def test_eager_moe_keeps_serving_a_gelu_activation():
         "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
     ).DiffusionGemmaConfig
 
-    prev = get_ops_config()
-    try:
-        set_ops_config(_all_eager_ops_config(moe_implementation="eager"))
-        check_model_build_prerequisites(DiffusionGemmaConfig())
-    finally:
-        set_ops_config(prev)
+    config = DiffusionGemmaConfig(ops_implementation=_all_eager_ops_config(moe_implementation="eager"))
+    check_model_build_prerequisites(config)
 
 
 def test_diffusion_gemma_builds_on_fused_triton():
@@ -265,12 +258,8 @@ def test_diffusion_gemma_builds_on_fused_triton():
         "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
     ).DiffusionGemmaConfig
 
-    prev = get_ops_config()
-    try:
-        set_ops_config(_all_eager_ops_config(moe_implementation="fused_triton"))
-        check_model_build_prerequisites(DiffusionGemmaConfig())
-    finally:
-        set_ops_config(prev)
+    config = DiffusionGemmaConfig(ops_implementation=_all_eager_ops_config(moe_implementation="fused_triton"))
+    check_model_build_prerequisites(config)
 
 
 def _eager_moe_forward(

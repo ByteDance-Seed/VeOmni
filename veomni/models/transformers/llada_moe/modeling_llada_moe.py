@@ -45,7 +45,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
@@ -53,8 +53,8 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import load_balancing_loss
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -148,10 +148,15 @@ class LLaDAMoEAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = LLaDAMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = LLaDAMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.q_norm = LLaDAMoERMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, config=config
+        )  # unlike olmo, only on the head dim!
+        self.k_norm = LLaDAMoERMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, config=config
+        )  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        rope_impl = getattr(getattr(config, "ops_config", None), "rotary_pos_emb_implementation", None) or "eager"
+        self.veomni_rope = VeomniOp("rope", "full", rope_impl)
 
     def forward(
         self,
@@ -205,7 +210,8 @@ class LLaDAMoEMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        mlp_impl = getattr(getattr(config, "ops_config", None), "swiglu_mlp_implementation", None) or "eager"
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", mlp_impl)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -234,7 +240,8 @@ class LLaDAMoEExperts(torch.nn.Module):
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.hidden_act = config.hidden_act
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        moe_impl = getattr(getattr(config, "ops_config", None), "moe_implementation", None) or "eager"
+        self.veomni_moe = VeomniOp("moe_experts", "standard", moe_impl)
         if self.veomni_moe.impl != "eager":
             refuse_fused_moe_on_unsupported_activation(config, self.veomni_moe.impl)
 
@@ -340,14 +347,15 @@ class LLaDAMoESparseMoeBlock(nn.Module):
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LLaDAMoERMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         """
         LLaDAMoERMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "rms_norm_implementation", None) or "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -366,8 +374,8 @@ class LLaDAMoEDecoderLayer(GradientCheckpointingLayer):
             self.mlp = LLaDAMoESparseMoeBlock(config)
         else:
             self.mlp = LLaDAMoEMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -508,7 +516,7 @@ class LLaDAMoEModel(LLaDAMoEPreTrainedModel):
         self.layers = nn.ModuleList(
             [LLaDAMoEDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LLaDAMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = LLaDAMoERotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -665,9 +673,8 @@ class LLaDAMoEForCausalLM(LLaDAMoEPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.veomni_lb = VeomniOp(
-            "load_balancing_loss", "standard", resolve_op_impl("load_balancing_loss_implementation")
-        )
+        lb_impl = getattr(getattr(config, "ops_config", None), "load_balancing_loss_implementation", None) or "eager"
+        self.veomni_lb = VeomniOp("load_balancing_loss", "standard", lb_impl)
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
 
         # Initialize weights and apply final processing

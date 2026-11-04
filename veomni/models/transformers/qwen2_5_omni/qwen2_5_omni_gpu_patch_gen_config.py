@@ -18,14 +18,12 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
     audio_seqlens (interleaved video-with-audio / video-without-audio in the
     same batch) and tolerant of attention_mask=None
-  - Vision attention dispatch via VARLEN_ATTENTION_TYPES (covers the
-    veomni_flash_attention_* custom names)
+  - Vision and audio attention dispatch via self.veomni_attn
   - Vision encoder forward with SP gather/slice (full + windowed cu_seqlens
     extended for the SP pad tail) and a new dummy_forward for FSDP rank
     asymmetry
-  - Audio encoder _prepare_attention_mask returning None on VARLEN paths,
-    forward with input_features (len, mel) permute + SP gather/strip + SP
-    slice + cu_seqlens extension, plus a new dummy_forward
+  - Audio encoder forward with input_features (len, mel) permute + SP
+    gather/strip + SP slice + cu_seqlens extension, plus a new dummy_forward
   - Thinker.get_audio_features simplified to VeOmni's flat (len, mel) inputs
     (no feature_attention_mask)
   - Thinker.get_position_id_func — multiprocessing-safe per-sample closure
@@ -62,9 +60,24 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+    Qwen2_5_VisionPatchEmbed,
+    Qwen2_5_VisionRotaryEmbedding,
+    Qwen2_5OmniAttention,
+    Qwen2_5OmniAudioEncoder,
+    Qwen2_5OmniDecoderLayer,
+    Qwen2_5OmniMLP,
+    Qwen2_5OmniPatchMerger,
+    Qwen2_5OmniRMSNorm,
+    Qwen2_5OmniRotaryEmbedding,
     Qwen2_5OmniThinkerForConditionalGeneration,
+    Qwen2_5OmniThinkerTextModel,
+    Qwen2_5OmniVisionAttention,
+    Qwen2_5OmniVisionBlock,
+    Qwen2_5OmniVisionEncoder,
+    Qwen2MLP,
+    is_flash_attention_requested,
+    logger,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -77,9 +90,8 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
@@ -96,6 +108,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen2_5_omni_gpu.py",
     description="Qwen2.5-Omni thinker with VeOmni v5 compatibility (SP + FSDP + fused loss)",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 
 config.add_import("typing", names=["Optional"])
 
@@ -117,13 +133,12 @@ config.add_import(
         "unpad_tensor",
     ],
 )
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
 )
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -211,11 +226,12 @@ config.drop_import_names("use_kernel_forward_from_hub")
     "Qwen2_5OmniRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen2_5_omni_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen2_5_omni_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 
 @config.override_method(
@@ -239,7 +255,7 @@ def qwen2_5_omni_vision_mlp_init_patched(self, config, bias: bool = False):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
 
 @config.override_method(
@@ -273,7 +289,7 @@ def qwen2_5_omni_text_mlp_init_patched(self, config, bias: bool = False):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
 
 @config.override_method(
@@ -292,6 +308,108 @@ def qwen2_5_omni_text_mlp_forward_patched(self, hidden_state):
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+@config.override_method(
+    "Qwen2_5OmniVisionBlock.__init__",
+    description="Pass config to Qwen2_5OmniRMSNorm",
+)
+def qwen2_5_omni_vision_block_init_patched(self, config) -> None:
+    nn.Module.__init__(self)
+    self.norm1 = Qwen2_5OmniRMSNorm(config.hidden_size, eps=1e-6, config=config)
+    self.norm2 = Qwen2_5OmniRMSNorm(config.hidden_size, eps=1e-6, config=config)
+    self.attn = Qwen2_5OmniVisionAttention(config=config)
+    self.mlp = Qwen2_5OmniMLP(config, bias=True)
+
+
+@config.override_method(
+    "Qwen2_5OmniPatchMerger.__init__",
+    description="Pass config to Qwen2_5OmniRMSNorm",
+)
+def qwen2_5_omni_patch_merger_init_patched(
+    self, dim: int, context_dim: int, spatial_merge_size: int = 2, config=None
+) -> None:
+    nn.Module.__init__(self)
+    self.hidden_size = context_dim * (spatial_merge_size**2)
+    self.ln_q = Qwen2_5OmniRMSNorm(context_dim, eps=1e-6, config=config)
+    self.mlp = nn.Sequential(
+        nn.Linear(self.hidden_size, self.hidden_size),
+        nn.GELU(),
+        nn.Linear(self.hidden_size, dim),
+    )
+
+
+@config.override_method(
+    "Qwen2_5OmniVisionEncoder.__init__",
+    description="Pass config to Qwen2_5OmniPatchMerger",
+)
+def qwen2_5_omni_vision_encoder_init_patched(self, config, *inputs, **kwargs) -> None:
+    super(Qwen2_5OmniVisionEncoder, self).__init__(config, *inputs, **kwargs)
+    self.spatial_merge_size = config.spatial_merge_size
+    self.patch_size = config.patch_size
+    self.fullatt_block_indexes = config.fullatt_block_indexes
+    self.window_size = config.window_size
+    self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+    self.patch_embed = Qwen2_5_VisionPatchEmbed(
+        patch_size=config.patch_size,
+        temporal_patch_size=config.temporal_patch_size,
+        in_channels=config.in_channels,
+        embed_dim=config.hidden_size,
+    )
+
+    head_dim = config.hidden_size // config.num_heads
+    self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+    self.blocks = nn.ModuleList([Qwen2_5OmniVisionBlock(config) for _ in range(config.depth)])
+    self.merger = Qwen2_5OmniPatchMerger(
+        dim=config.out_hidden_size,
+        context_dim=config.hidden_size,
+        spatial_merge_size=config.spatial_merge_size,
+        config=config,
+    )
+    self.gradient_checkpointing = False
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen2_5OmniDecoderLayer.__init__",
+    description="Pass config to Qwen2_5OmniRMSNorm",
+)
+def qwen2_5_omni_decoder_layer_init_patched(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.hidden_size = config.hidden_size
+
+    if config.use_sliding_window and not is_flash_attention_requested(config):
+        logger.warning_once(
+            f"Sliding Window Attention is enabled but not implemented for `{config.ops_config.attn_implementation}`; "
+            "unexpected results may be encountered."
+        )
+    self.self_attn = Qwen2_5OmniAttention(config, layer_idx)
+    self.mlp = Qwen2MLP(config)
+    self.input_layernorm = Qwen2_5OmniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen2_5OmniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "Qwen2_5OmniThinkerTextModel.__init__",
+    description="Pass config to Qwen2_5OmniRMSNorm",
+)
+def qwen2_5_omni_thinker_text_model_init_patched(self, config):
+    super(Qwen2_5OmniThinkerTextModel, self).__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen2_5OmniDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self._attn_implementation = config.ops_config.attn_implementation
+    self.norm = Qwen2_5OmniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+    self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
+
+    self.gradient_checkpointing = False
+    self.post_init()
 
 
 # ================================================================
@@ -604,36 +722,6 @@ def qwen2_5_omni_pretrained_init_weights_patched(self, module):
 
 
 # ================================================================
-# Patch: Qwen2_5OmniAudioEncoder._prepare_attention_mask
-# 1. Return None for any VARLEN_ATTENTION_TYPES backend (including
-#    veomni_flash_attention_*); upstream only checks the HF built-in
-#    flash-attention name via `is_flash_attention_requested`.
-# ================================================================
-@config.override_method(
-    "Qwen2_5OmniAudioEncoder._prepare_attention_mask",
-    description="Return None on all VARLEN attention backends (veomni_flash_attention_* included)",
-)
-def qwen2_5_omni_audio_prepare_attention_mask_patched(
-    self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor
-) -> torch.Tensor:
-    # --- Patch.1 ---
-    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        return None
-    # --- Patch.1 ---
-
-    seq_length = inputs_tensor.shape[0]
-    attention_mask = torch.full(
-        [1, 1, seq_length, seq_length],
-        torch.finfo(inputs_tensor.dtype).min,
-        device=inputs_tensor.device,
-        dtype=inputs_tensor.dtype,
-    )
-    for i in range(1, len(cu_seqlens)):
-        attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
-    return attention_mask
-
-
-# ================================================================
 # Patch: Qwen2_5OmniAudioEncoder.forward
 # 1. [Data] VeOmni ships input_features as (len, num_mel_bins); permute to
 #    (num_mel_bins, len) to match the HF contract.
@@ -790,22 +878,20 @@ def qwen2_5_omni_audio_dummy_forward_patched(self):
 
 # ================================================================
 # Patch: Qwen2_5OmniVisionAttention.forward
-# 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-#    custom names) instead of v5 upstream `is_flash_attention_requested`,
-#    which only recognizes HF built-in flash-attention names. Without this
-#    the SP-appended cu_seqlens padding entry would run through the
-#    non-varlen split branch and size-mismatch.
+# 1. Always route through the instance-local `self.veomni_attn` with packed
+#    `cu_seq_lens_q/k` metadata; non-FlashAttention backends split per segment
+#    inside the attention op wrapper (after any Ulysses all-to-all).
 # ================================================================
 @config.modify_init("Qwen2_5OmniVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen2_5_omni_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
     "Qwen2_5OmniVisionAttention.forward",
-    description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen2_5_omni_vision_attention_forward_patched(
     self,
@@ -827,47 +913,24 @@ def qwen2_5_omni_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
     # --- Patch.1 ---
-    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        # Other implementations: process each chunk separately.
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    if max_seqlen is None:
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
     # --- Patch.1 ---
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -1248,7 +1311,7 @@ def qwen2_5_omni_thinker_init_patched(self, config):
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
     self.spatial_merge_size = config.vision_config.spatial_merge_size
     self.rope_deltas = None
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -1816,17 +1879,18 @@ def qwen2_5_omni_top_get_metadata_collate_func_patched(self):
 @config.modify_init("Qwen2_5OmniAudioAttention", description="Bind instance-local attention VeomniOp")
 def qwen2_5_omni_audio_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
     "Qwen2_5OmniAudioAttention.forward",
-    description="Always call the local attention VeomniOp",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen2_5_omni_audio_attention_forward_patched(
     self,
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    max_seqlen: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
@@ -1839,43 +1903,23 @@ def qwen2_5_omni_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
-    if is_flash_attention_requested(self.config):
+    if max_seqlen is None:
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.out_proj(attn_output)
@@ -1886,7 +1930,7 @@ def qwen2_5_omni_audio_attention_forward_patched(
 def qwen2_5_omni_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "mrope", "eager")
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -1927,6 +1971,13 @@ def qwen2_5_omni_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=self.veomni_attn.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
+
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -1937,7 +1988,7 @@ def qwen2_5_omni_attention_forward_patched(
         scaling=self.scaling,
         sliding_window=self.sliding_window,
         position_ids=position_ids,
-        **kwargs,
+        **attn_kwargs,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

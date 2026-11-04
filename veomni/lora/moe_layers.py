@@ -117,7 +117,8 @@ EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
 follows the wrapped experts' ``veomni_moe`` handle when that LoRA row is
-available on this device, and falls back to ``eager`` otherwise.
+available on this device, and falls back to ``eager`` otherwise. The FP8
+``deepgemm_fp8`` backend rejects expert LoRA rather than changing precision.
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -162,11 +163,17 @@ logger = logging.get_logger(__name__)
 
 
 def _moe_lora_op(base_layer: nn.Module, variant: str):
-    """Bind ``moe_experts_lora`` to the wrapped experts' impl, or ``eager`` when no LoRA row is available."""
+    """Reject unsupported FP8 expert LoRA; otherwise bind the matching row or fall back to ``eager``."""
     from veomni.ops import OP_REGISTRY, VeomniOp
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
+    if impl == "deepgemm_fp8":
+        raise ValueError(
+            "moe_implementation='deepgemm_fp8' does not support MoE-LoRA on expert weights. "
+            "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "
+            "or exclude expert weights from the LoRA targets."
+        )
     if impl not in OP_REGISTRY.list_available("moe_experts_lora", variant):
         impl = "eager"
     return VeomniOp("moe_experts_lora", variant, impl)
@@ -417,6 +424,7 @@ class LoraSharedExperts(nn.Module):
         # base_layer would get a confusing error.
         _validate_fused_layout(base_layer)
         _validate_silu_act_fn(base_layer)
+        self.veomni_moe_lora = _moe_lora_op(base_layer, "shared")
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -494,7 +502,6 @@ class LoraSharedExperts(nn.Module):
         # sync inside the autograd.Function. Kept in lock-step with
         # ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_op(base_layer, "shared")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name``
         # detects the canonical ``lora_A`` / ``lora_B`` segments in the
@@ -693,6 +700,7 @@ class LoraSharedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with shared LoRA adapters through ``veomni_moe_lora``."""
         # Lazy-install cross-EP gradient sync on shared LoRA params (idempotent).
         # Must run after FSDP wrapping has converted params to DTensors, hence
         # the lazy install at first forward rather than in ``__init__``.
@@ -707,7 +715,7 @@ class LoraSharedExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
@@ -821,6 +829,7 @@ class LoraIndependentExperts(nn.Module):
         # rationale on this ordering.
         _validate_fused_layout(base_layer)
         _validate_silu_act_fn(base_layer)
+        self.veomni_moe_lora = _moe_lora_op(base_layer, "independent")
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -881,7 +890,6 @@ class LoraIndependentExperts(nn.Module):
         # the scale as a plain float to avoid a host/device sync inside the
         # autograd.Function. Kept in lock-step with ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_op(base_layer, "independent")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name`` looks
         # at canonical ``lora_A`` / ``lora_B`` segments so it works under
@@ -996,6 +1004,7 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
@@ -1005,7 +1014,7 @@ class LoraIndependentExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,

@@ -102,7 +102,7 @@ class GptOssQuackFusedMoeExpertFunction(torch.autograd.Function):
 
         fc2_output = gemm(fc1_activation, down_proj, bias=down_proj_bias, cu_seqlens_m=cu_seqlens_m, tuned=False)
 
-        reshaped_gate_weight = routing_weights.to(hidden_states.dtype).reshape(-1, 1)
+        reshaped_gate_weight = routing_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
         fc2_weighted_output = fc2_output * scattered_gate_weight
@@ -288,6 +288,7 @@ def quack_gemm_gpt_oss_fused_moe_forward(
     limit: float = 7.0,
 ):
     """GPT-OSS quack MoE forward with native interleaved gate/up layout."""
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all

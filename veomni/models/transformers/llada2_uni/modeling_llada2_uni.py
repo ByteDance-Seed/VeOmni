@@ -37,13 +37,13 @@ from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.glm_image.modeling_glm_image import GlmImageVisionModel, GlmImageVQVAE
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 
@@ -67,11 +67,12 @@ def apply_partial_rotary_pos_emb(
 
 
 class LLaDA2UniRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "rms_norm_implementation", None) or "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -120,8 +121,8 @@ class LLaDA2UniAttention(nn.Module):
             bias=config.use_qkv_bias,
         )
         if config.use_qk_norm:
-            self.query_layernorm = LLaDA2UniRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = LLaDA2UniRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.query_layernorm = LLaDA2UniRMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+            self.key_layernorm = LLaDA2UniRMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.dense = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.use_bias)
 
     def forward(
@@ -175,7 +176,8 @@ class LLaDA2UniMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        impl = getattr(getattr(config, "ops_config", None), "swiglu_mlp_implementation", None) or "eager"
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", impl)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -203,7 +205,8 @@ class LLaDA2UniExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.hidden_act = config.hidden_act
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        moe_impl = getattr(getattr(config, "ops_config", None), "moe_implementation", None) or "eager"
+        self.veomni_moe = VeomniOp("moe_experts", "standard", moe_impl)
         if self.veomni_moe.impl != "eager":
             refuse_fused_moe_on_unsupported_activation(config, self.veomni_moe.impl)
 
@@ -294,8 +297,8 @@ class LLaDA2UniDecoderLayer(GradientCheckpointingLayer):
             self.mlp = LLaDA2UniSparseMoeBlock(config)
         else:
             self.mlp = LLaDA2UniMLP(config, config.intermediate_size)
-        self.input_layernorm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self,
@@ -344,7 +347,7 @@ class LLaDA2UniModel(LLaDA2UniPreTrainedModel):
         self.layers = nn.ModuleList(
             [LLaDA2UniDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LLaDA2UniRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = LLaDA2UniRotaryEmbedding(config)
         # The tower is frozen preprocessing. Pin it to sdpa so it cannot inherit
         # `veomni_flash_*` from the backbone, which would run the text-side

@@ -81,7 +81,6 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -95,11 +94,11 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from ....distributed.parallel_state import get_parallel_state
 from ....ops import VeomniOp
-from ....ops.config import resolve_op_impl
 from ....ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
 from ....utils import logging
 from ....utils.constants import IGNORE_INDEX
 from ...loss_utils.dllm import dllm_masked_cross_entropy
+from ...modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from . import align_nemo
 from .configuration_diffusion_gemma import DiffusionGemmaConfig, DiffusionGemmaTextConfig
 from .dg_hole import (
@@ -962,7 +961,8 @@ class DiffusionGemmaTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.hidden_activation = config.hidden_activation
         self.act_fn = ACT2FN[config.hidden_activation]
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        moe_impl = getattr(getattr(config, "ops_config", None), "moe_implementation", None) or "eager"
+        self.veomni_moe = VeomniOp("moe_experts", "standard", moe_impl)
         if self.veomni_moe.impl != "eager":
             refuse_fused_moe_on_unsupported_activation(config, self.veomni_moe.impl)
 

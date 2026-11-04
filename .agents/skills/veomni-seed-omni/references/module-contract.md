@@ -8,7 +8,7 @@ also `docs/seed_omni/usage/adding_a_model.md` and
 
 ```text
 modules/<family>/<submodule>/
-├── configuration.py     # PretrainedConfig with unique model_type
+├── configuration.py     # OmniModuleConfig with unique model_type
 ├── modeling.py          # pure HF-native class + optional in-file InferenceMixin
 ├── accelerated/
 │   ├── __init__.py      # re-exports the accelerated class for the registry
@@ -18,8 +18,7 @@ modules/<family>/<submodule>/
 ```
 
 - **`modeling.py`**: pure HuggingFace-native, loadable with `from_pretrained` /
-  `AutoModel`. If inference-capable, list `InferenceMixin` (or
-  `SimpleArGenerationMixin` from `modules/base/llm_packing.py`) **before**
+  `AutoModel`. If inference-capable, list `InferenceMixin` **before**
   `PretrainedOmniModule`: `class Xxx(InferenceMixin, PretrainedOmniModule)` so
   its `generate()` / `reset_*` / `finalize` methods take precedence over
   `PretrainedOmniModule`'s no-op defaults.
@@ -41,15 +40,23 @@ modules/<family>/<submodule>/
   micro-batch (decode losses reduce over `ps.fsdp_group`; see constraint 2 in
   `.agents/knowledge/veomni-seed-omni.md`).
 - Mutate `ConversationItem` fields in place and return
-  `{"conversation_list": conversation}` (or write `packed_*` tensors on the
-  batch dict for packed graphs).
+  `{"conversation_list": conversation}`.
 - Keep tokenizers and processors inside the owning module's subfolder via
   `get_assets()` / `attach_module_assets`.
-- In training, every active node runs on every micro-batch: use CPU-preprocessor
-  dummies or `dummy_inputs()` + a `0.0` anchor when a modality is absent.
+- In training, every active node runs on every micro-batch: use per-sample
+  CPU-preprocessor dummies (with `_OMNI_TOKEN_LEN` set in `item.meta` so
+  `dyn_bsz` counts physical and effective tokens accurately) or `dummy_inputs()`
+  + a `0.0` anchor when a modality is absent.
 - For shared stateless carrier helpers called by both `modeling.py` and
   `accelerated/accelerated.py`, define plain module-level functions in
-  `modeling.py` (or reuse `modules/base/llm_packing.py`).
+  `modeling.py`.
+
+Attention-free modules such as `TextEncoder` override HF's
+`_check_and_adjust_attn_implementation` to return the canonical selection.
+Keep this override local to those modules: attention-owning modules must still
+validate their selected backend. Do not set a false `_supports_sdpa` capability
+or introduce a second HF-only attention state. See
+`docs/design/module_config.md` for the configuration boundary.
 
 ## 3. IDE Type Stubs on `TrainingMixin`
 
@@ -101,3 +108,18 @@ Workflow:
    and optional `processing.py`, then register in `modules/__init__.py`.
 3. Wire `modules_train.yaml`, `graph_train.yaml`, and `infer/` YAML configs.
 4. Validate with `pytest tests/seed_omni/ -q` and `make quality`.
+
+## Ops configuration base
+
+`OmniConfig` and `OmniModuleConfig` both inherit `VeOmniPretrainedConfig`.
+Forward `ops_implementation` to `super().__init__` in custom constructors;
+assigning it before a superclass call can lose selections during initialization.
+The sparse dictionary owns attention state, including HF attention accessors.
+An HF schema extension may inherit `(OmniModuleConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively, including on handwritten subclasses.
+Use `get_veomni_config_class` to construct an adapted native schema directly;
+importing VeOmni does not add lifecycle methods to native HF configs. The shared lifecycle
+and override contract is in `docs/design/module_config.md`.
+The composed `OmniModel` treats its root ops as inheritance defaults and validates
+effective selections on its independently built modules. An overridden root
+default must not reject a module whose final ops are valid for its device.

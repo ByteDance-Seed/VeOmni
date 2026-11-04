@@ -1,7 +1,6 @@
 # tests/utils.py
 import os
 import signal
-import socket
 import subprocess
 
 import psutil
@@ -9,14 +8,10 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.pytest_plugin import validate_launch
+from scripts.ci.accelerator.runtime.ports import find_free_port as find_free_port
+from scripts.ci.accelerator.runtime.ports import rendezvous_endpoint
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
-
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
 
 
 def _collect_process_tree(root_pid: int) -> tuple[list[psutil.Process], set[int]]:
@@ -100,20 +95,49 @@ def run_bounded_process_group(
         raise subprocess.CalledProcessError(return_code, command)
 
 
-def _dist_worker_entry(rank, world_size, port, func, args, kwargs):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
+def spawn_with_rendezvous(func, args=(), *, nprocs):
+    """Append a live rendezvous endpoint to each spawned worker's arguments.
+
+    Once spawn returns its context, join or terminate its workers before
+    closing the server, including on parent interruption. Startup failures
+    before mp.spawn returns still rely on CI's enclosing process-scope cleanup.
+    """
+    with rendezvous_endpoint() as endpoint:
+        context = mp.spawn(func, args=(*args, endpoint), nprocs=nprocs, join=False)
+        try:
+            while not context.join():
+                pass
+        finally:
+            for process in context.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in context.processes:
+                process.join(timeout=5)
+            for process in context.processes:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=5)
+
+
+def _dist_worker_entry(rank, world_size, func, args, kwargs, endpoint):
+    os.environ["MASTER_ADDR"] = endpoint.host
+    os.environ["MASTER_PORT"] = str(endpoint.port)
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
-    if get_torch_device().is_available() and get_torch_device().device_count() >= world_size:
+    if (
+        get_device_type() != "cpu"
+        and get_torch_device().is_available()
+        and get_torch_device().device_count() >= world_size
+    ):
         backend = get_dist_comm_backend()
         get_torch_device().set_device(rank)
     else:
         backend = "gloo"
 
     try:
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        dist.init_process_group(backend=backend, store=endpoint.connect(), rank=rank, world_size=world_size)
         func(*args, **kwargs)
     except Exception as e:
         raise e
@@ -123,9 +147,12 @@ def _dist_worker_entry(rank, world_size, port, func, args, kwargs):
 
 
 def torchrun(func, world_size: int = 4, *args, **kwargs):
-    if get_torch_device().is_available() and get_torch_device().device_count() < world_size:
+    validate_launch(world_size, record=False)
+    if (
+        get_device_type() != "cpu"
+        and get_torch_device().is_available()
+        and get_torch_device().device_count() < world_size
+    ):
         pytest.skip(f"Requires {world_size} {get_device_type()} devices")
 
-    port = find_free_port()
-
-    mp.spawn(_dist_worker_entry, args=(world_size, port, func, args, kwargs), nprocs=world_size, join=True)
+    spawn_with_rendezvous(_dist_worker_entry, args=(world_size, func, args, kwargs), nprocs=world_size)

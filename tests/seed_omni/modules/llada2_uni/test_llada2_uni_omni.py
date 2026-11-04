@@ -40,7 +40,6 @@ from veomni.models.seed_omni.modules.llada2_uni.image_tokenizer.processing impor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.models.transformers.llada2_uni.configuration_llada2_uni import LLaDA2UniConfig
 from veomni.models.transformers.llada2_uni.modeling_llada2_uni import LLaDA2UniForConditionalGeneration
-from veomni.ops.config import set_ops_config
 
 
 TOY_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "toy_config", "llada2_uni_toy")
@@ -85,8 +84,7 @@ def test_llada2_uni_omni_modules_are_registered():
 
 
 def test_llada2_uni_hf_layout_routes_all_toy_checkpoint_keys(tmp_path: Path):
-    set_ops_config(make_eager_ops_config())
-    cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH)
+    cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH, ops_implementation=make_eager_ops_config())
     model = LLaDA2UniForConditionalGeneration(cfg)
 
     for key in model.state_dict():
@@ -116,8 +114,7 @@ def test_llada2_uni_image_preprocessor_snaps_odd_grids():
 
 
 def test_llada2_uni_training_dag_forward_and_backward():
-    set_ops_config(make_eager_ops_config())
-    hf_cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH)
+    hf_cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH, ops_implementation=make_eager_ops_config())
     hf_cfg.vocab_size = 157250
     hf_cfg.pad_token_id = 156892
     hf_cfg.eos_token_id = 156892
@@ -128,6 +125,8 @@ def test_llada2_uni_training_dag_forward_and_backward():
     it_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_image_tokenizer"].build_config(hf_cfg)
     te_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_text_encoder"].build_config(hf_cfg)
     llm_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_llm"].build_config(hf_cfg)
+    for cfg in (it_cfg, te_cfg, llm_cfg):
+        cfg._set_ops_implementation(make_eager_ops_config())
 
     it_cls = OMNI_ACCELERATED_MODEL_REGISTRY["llada2_uni_image_tokenizer"]()
     te_cls = OMNI_ACCELERATED_MODEL_REGISTRY["llada2_uni_text_encoder"]()
@@ -182,8 +181,7 @@ def test_llada2_uni_training_dag_forward_and_backward():
 
 
 def test_llada2_uni_generation_fsm_i2t_and_t2i():
-    set_ops_config(make_eager_ops_config())
-    hf_cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH)
+    hf_cfg = LLaDA2UniConfig.from_pretrained(TOY_CONFIG_PATH, ops_implementation=make_eager_ops_config())
     hf_cfg.vocab_size = 157250
     hf_cfg.pad_token_id = 156892
     hf_cfg.eos_token_id = 156892
@@ -191,16 +189,16 @@ def test_llada2_uni_generation_fsm_i2t_and_t2i():
     hf_cfg.image_token_offset = 157184
     hf_cfg.vq_config.num_embeddings = 32
 
-    it_mod = OMNI_MODEL_REGISTRY["llada2_uni_image_tokenizer"]()(
-        LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_image_tokenizer"].build_config(hf_cfg)
-    ).eval()
-    te_mod = OMNI_MODEL_REGISTRY["llada2_uni_text_encoder"]()(
-        LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_text_encoder"].build_config(hf_cfg)
-    ).eval()
+    it_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_image_tokenizer"].build_config(hf_cfg)
+    te_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_text_encoder"].build_config(hf_cfg)
+    llm_cfg = LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_llm"].build_config(hf_cfg)
+    for cfg in (it_cfg, te_cfg, llm_cfg):
+        cfg._set_ops_implementation(make_eager_ops_config())
+
+    it_mod = OMNI_MODEL_REGISTRY["llada2_uni_image_tokenizer"]()(it_cfg).eval()
+    te_mod = OMNI_MODEL_REGISTRY["llada2_uni_text_encoder"]()(te_cfg).eval()
     te_mod.tokenizer = _DummyTokenizer()
-    llm_mod = OMNI_MODEL_REGISTRY["llada2_uni_llm"]()(
-        LLADA2_UNI_HF_LAYOUT.modules["llada2_uni_llm"].build_config(hf_cfg)
-    ).eval()
+    llm_mod = OMNI_MODEL_REGISTRY["llada2_uni_llm"]()(llm_cfg).eval()
 
     training_graphs, generation_graphs = LLADA2_UNI_HF_LAYOUT.load_graphs()
     omni_cfg = OmniConfig(

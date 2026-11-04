@@ -32,9 +32,11 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils.type_validators import interval
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
+
 
 @strict
-class LLaDAConfig(PreTrainedConfig):
+class LLaDAConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     r"""Llama-compatible config for LLaDA mask-predictor models.
 
     Mirrors every Llama field (so a Llama-layout checkpoint loads unchanged) and adds

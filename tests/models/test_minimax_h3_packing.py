@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
@@ -28,7 +29,14 @@ from veomni.trainer.dit_trainer import DiTDataCollator
 from veomni.utils.import_utils import is_torch_npu_available
 
 
-def tiny_model(num_attention_heads=2):
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+
+def tiny_model(num_attention_heads=2, *, attn_implementation="eager"):
+    from tests.models.compare import eager_ops_config
+
+    ops = eager_ops_config()
+    ops.attn_implementation = attn_implementation
     return MiniMaxH3DiTModel(
         MiniMaxH3DiTModelConfig(
             hidden_size=32,
@@ -44,6 +52,7 @@ def tiny_model(num_attention_heads=2):
             adaln_out_features=576,
             final_adaln_out_features=64,
             rope_inv_freq_len=2,
+            ops_implementation=ops,
         )
     )
 
@@ -574,16 +583,8 @@ def serial(model, samples):
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
-    from veomni.ops.config import get_ops_config, set_ops_config
-
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
-    # build_foundation_model installs process-global ops. Do not leak FA3 into later tests.
-    previous = get_ops_config()
-    set_ops_config(None)
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
+    yield
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
@@ -769,13 +770,21 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
     torch.testing.assert_close(accumulated, reference)
 
 
-def test_unsupported_backend_fails_only_on_packed_forward():
-    model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4")  # what __init__ runs; must not raise
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("attention", ["flash_attention_4", "veomni_flash_attention_4"])
+@pytest.mark.parametrize("layout", ["scalar", "singleton", "packed"])
+def test_unsupported_flash_backend_fails_before_dit_forward(monkeypatch, attention, layout):
+    model = tiny_model(attn_implementation=attention)
+    assert model.config.ops_config.attn_implementation == "veomni_flash_attention_4"
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
-    serial(model, samples)
+
+    def forbid_execution(*args, **kwargs):
+        raise AssertionError("Unsupported attention must fail before executing the DiT")
+
+    monkeypatch.setattr(model.dit, "forward", forbid_execution)
+    inputs = samples[0] if layout == "scalar" else batch(samples[:1] if layout == "singleton" else samples)
     with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
-        model(**batch(samples))
+        model(**inputs)
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -940,6 +949,7 @@ def _check_sequence_parallel_gradients(rank, init_method, cases):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
 def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
     cases = []
@@ -952,7 +962,9 @@ def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path
         loss.backward()
         grads = {name: param.grad.clone() for name, param in model.named_parameters()}
         cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
-    mp.spawn(_check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=2)
+    mp.spawn(
+        _check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=_CI_CPU_2.nproc
+    )
 
 
 _HUB_UNAVAILABLE = pytest.mark.skipif(

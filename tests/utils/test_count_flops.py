@@ -20,8 +20,12 @@ from unittest.mock import patch
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora.config import LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from veomni.utils.count_flops import VeomniFlopsCounter, get_device_flops
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _to_namespace(value):
@@ -101,6 +105,11 @@ def qwen3_counter(qwen3_config):
 
 
 @pytest.fixture
+def gemma3_config():
+    return _load_toy_config("tests/toy_config/gemma3_toy")
+
+
+@pytest.fixture
 def qwen3_5_moe_counter():
     config = _load_toy_config("tests/toy_config/qwen3_5_moe_toy")
     return VeomniFlopsCounter(config)
@@ -140,6 +149,9 @@ def deepseek_v4_counter(deepseek_v4_config):
     return VeomniFlopsCounter(deepseek_v4_config)
 
 
+# Numerical snapshots use the canonical compact fixtures: H=256, four layers
+# (three linear + one full attention), explicit head_dim=256 and vocab=248320.
+# The two-layer ViT contributes 5_536_481_280 FLOPs for image lengths [256, 512].
 class TestQwen35Flops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
@@ -147,13 +159,13 @@ class TestQwen35Flops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(106.965220982784, rel=1e-9)
+        assert flops == pytest.approx(1.729445756928, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(109.196454395904, rel=1e-9)
+        assert flops == pytest.approx(1.734982238208, rel=1e-9)
 
 
 class TestQwen35LoraFlops:
@@ -334,7 +346,7 @@ class TestQwen35MoeFlops:
         )
         # The embedding lookup is excluded. The shared-expert scalar gate is
         # an ordinary trainable linear and follows the FFT factor-six convention.
-        assert flops == pytest.approx(16.888079843328 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.749175762944 + shared_expert_gate_flops, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
@@ -343,7 +355,7 @@ class TestQwen35MoeFlops:
         shared_expert_gate_flops = (
             6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
         )
-        assert flops == pytest.approx(19.05408344064 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.754712244224 + shared_expert_gate_flops, rel=1e-9)
 
 
 class TestQwen4ExpFlops:
@@ -418,6 +430,60 @@ class TestQwen3Flops:
 
         flops, _ = qwen3_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
+
+
+class TestGemma3Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_text_flops_include_full_and_sliding_attention(self, gemma3_config):
+        batch_seqlens = [12, 5]
+        tokens_sum = sum(batch_seqlens)
+        q_size = gemma3_config.num_attention_heads * gemma3_config.head_dim
+        kv_size = gemma3_config.num_key_value_heads * gemma3_config.head_dim
+        linear_params = (
+            gemma3_config.hidden_size * gemma3_config.intermediate_size * 3
+            + gemma3_config.hidden_size * (2 * q_size + 2 * kv_size)
+        ) * gemma3_config.num_hidden_layers + gemma3_config.hidden_size * gemma3_config.vocab_size
+        full_scores = sum(seqlen * seqlen for seqlen in batch_seqlens)
+        sliding_scores = VeomniFlopsCounter._compute_sliding_attention_score_sum(
+            batch_seqlens, gemma3_config.sliding_window
+        )
+        expected_flops = 6 * linear_params * tokens_sum
+        expected_flops += (
+            12 * (full_scores + sliding_scores) * gemma3_config.head_dim * gemma3_config.num_attention_heads
+        )
+
+        flops, _ = VeomniFlopsCounter(gemma3_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
+
+    def test_vlm_dispatch_adds_vision_work_and_scales_with_time(self, gemma3_config):
+        config = SimpleNamespace(
+            model_type="gemma3",
+            text_config=gemma3_config,
+            vision_config=SimpleNamespace(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+            ),
+            mm_tokens_per_image=4,
+        )
+        counter = VeomniFlopsCounter(config)
+
+        text_flops, _ = VeomniFlopsCounter(gemma3_config).estimate_flops([12, 5], delta_time=1.0)
+        wrapped_text_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0)
+        vlm_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0, images_seqlens=[16, 16])
+        slower_vlm_flops, _ = counter.estimate_flops([12, 5], delta_time=2.0, images_seqlens=[16, 16])
+
+        vision_linear_params = 2 * (2 * 32 * 64 + 4 * 32**2)
+        expected_vision_flops = 6 * vision_linear_params * 32
+        expected_vision_flops += 12 * (16**2 + 16**2) * 8 * 4 * 2
+        expected_vision_flops += 6 * (2 * 4) * 32 * gemma3_config.hidden_size
+
+        assert wrapped_text_flops == pytest.approx(text_flops)
+        assert vlm_flops - text_flops == pytest.approx(expected_vision_flops / 1e12)
+        assert slower_vlm_flops == pytest.approx(vlm_flops / 2)
 
 
 class TestQwen25VLFlops:

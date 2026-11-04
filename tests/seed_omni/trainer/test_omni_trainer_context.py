@@ -22,8 +22,12 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import run_bounded_process_group
 from veomni.distributed.offloading import build_activation_offloading_context, custom_save_on_cpu
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_build_activation_offloading_disabled():

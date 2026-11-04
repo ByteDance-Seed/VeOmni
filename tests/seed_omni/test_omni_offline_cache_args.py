@@ -18,11 +18,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import (
     OmniDataArguments,
     OmniTrainingArguments,
     _validate_training_task_data,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_omni_training_args_default_to_online_training() -> None:

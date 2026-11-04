@@ -12,6 +12,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/**"
       - .github/workflows/gpu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -21,6 +23,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/**"
       - .github/workflows/gpu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -101,43 +105,6 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --group dev
-      - name: Run e2e tests
+      - name: Run GPU e2e tests on eight GPUs
         run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
-      - name: Free GPUs between test steps
-        # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
-        # session — they hold tens of GiB on GPU 0 and OOM the next test.
-        # Sweep again between test steps; the job-start cleanup alone
-        # isn't enough.
-        if: always()
-        run: |
-          nvidia-smi || true
-          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
-          if [ -n "$pids" ]; then
-            echo "Killing stale GPU processes: $pids"
-            kill -9 $pids 2>/dev/null || true
-            sleep 3
-            nvidia-smi || true
-          fi
-      - name: Run FSDP equivalence tests
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Run diffusers tests
-        # diffusers + ftfy + torchcodec ship under the `gpu` extra (rolled in
-        # from the dropped `dit` extra), so no extra sync step is needed.
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
-      - name: Free GPUs before SeedOmni runtime acceptance
-        if: always()
-        run: |
-          nvidia-smi || true
-          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
-          if [ -n "$pids" ]; then
-            echo "Killing stale GPU processes: $pids"
-            kill -9 $pids 2>/dev/null || true
-            sleep 3
-            nvidia-smi || true
-          fi
-      - name: Run SeedOmni runtime acceptance
-        run: |
-          uv run --frozen pytest -s -x tests/models/test_omni_fsdp.py
+          uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e

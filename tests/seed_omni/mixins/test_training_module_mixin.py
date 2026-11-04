@@ -15,7 +15,11 @@
 import pytest
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _Native(nn.Module):
@@ -53,3 +57,17 @@ def test_a_subclass_forward_calling_super_reaches_the_native_forward_once():
 def test_default_forward_without_a_native_forward_is_not_implemented():
     with pytest.raises(NotImplementedError, match="_NoNative.forward"):
         _NoNative().forward()
+
+
+def test_all_registered_classes_are_module_mixins():
+    from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY, BaseMixin
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
+    for name in OMNI_MODEL_REGISTRY.valid_keys():
+        native_cls = OMNI_MODEL_REGISTRY[name]()
+        assert name in accelerated_keys, f"{name} must register OMNI_ACCELERATED_MODEL_REGISTRY"
+        assert issubclass(native_cls, PretrainedOmniModule), f"{name} native must inherit PretrainedOmniModule"
+        assert not issubclass(native_cls, BaseMixin), f"{name} native must not inherit BaseMixin"
+        accelerated_cls = OMNI_ACCELERATED_MODEL_REGISTRY[name]()
+        assert issubclass(accelerated_cls, BaseMixin), f"{name} accelerated must inherit BaseMixin"
