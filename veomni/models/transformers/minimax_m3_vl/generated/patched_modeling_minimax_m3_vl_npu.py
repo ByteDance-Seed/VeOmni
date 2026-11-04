@@ -19,6 +19,10 @@
 #      Construct a local rms_norm offset VeomniOp
 #    - method_override: MiniMaxM3VLRMSNorm.forward
 #      Always call the local rms_norm offset VeomniOp
+#    - method_override: MiniMaxM3VLDecoderLayer.__init__
+#      Pass config to MiniMaxM3VLRMSNorm instances
+#    - method_override: MiniMaxM3VLTextModel.__init__
+#      Pass config to the final MiniMaxM3VLRMSNorm
 #    - init_modification: MiniMaxM3VLVisionAttention
 #      Bind instance-local attention VeomniOp
 #    - method_override: MiniMaxM3VLVisionAttention.forward
@@ -55,8 +59,6 @@ from dataclasses import dataclass
 from functools import partial
 
 import torch
-
-# Additional imports for patches
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,7 +69,6 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import (
     MiniMaxM3VLConfig,
     MiniMaxM3VLTextConfig,
@@ -85,8 +86,10 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import _all_gather_into_tensor
 from veomni.models.loss_utils import ForCausalLMLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.attention.ulysses import (
     gather_seq_scatter_kv_heads,
     prepare_ulysses_qkv,
@@ -379,11 +382,12 @@ class MiniMaxM3VLSparseStaticCacheLayer(StaticLayer):
 class MiniMaxM3VLRMSNorm(nn.Module):
     """Gemma-style RMSNorm: normalizes in fp32 and scales by `weight + 1`."""
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, config=None):
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -436,7 +440,7 @@ class MiniMaxM3VLExperts(nn.Module):
         self.limit = config.swiglu_limit
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
-        self.veomni_moe = VeomniOp("moe_experts", "swiglu_oai", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "swiglu_oai", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         unused = self.gate_up_proj.new_empty(0)
@@ -670,8 +674,10 @@ class MiniMaxM3VLAttention(nn.Module):
             MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
         )
         # Bind instance-local attention VeomniOps: standard attention for dense layers, MSA for sparse ones
+        self.q_norm = MiniMaxM3VLRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.k_norm = MiniMaxM3VLRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
         if self.indexer is None:
-            self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+            self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
         else:
             self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer")
             self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
@@ -796,8 +802,8 @@ class MiniMaxM3VLIndexer(nn.Module):
         self.local_blocks = config.index_local_blocks
         self.q_proj = nn.Linear(config.hidden_size, config.index_n_heads * config.index_head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
-        self.q_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
+        self.q_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps, config=config)
+        self.k_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps, config=config)
         # --- Patch.1 ---
         # The indexer is not trained: block selection is a top-k over discrete block
         # scores and no indexer loss is computed, so no gradient can reach these
@@ -895,6 +901,12 @@ class MiniMaxM3VLIndexer(nn.Module):
         return torch.zeros(keep.shape, dtype=dtype, device=device).masked_fill(~keep, min_dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] MiniMaxM3VLDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class MiniMaxM3VLDecoderLayer(GradientCheckpointingLayer):
     """M3 decoder layer: per-layer dense/MoE MLP and dense/sparse attention."""
 
@@ -907,8 +919,8 @@ class MiniMaxM3VLDecoderLayer(GradientCheckpointingLayer):
             if config.mlp_layer_types[layer_idx] == "sparse"
             else MiniMaxM3VLDenseMLP(config, intermediate_size=config.dense_intermediate_size)
         )
-        self.input_layernorm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self,
@@ -944,7 +956,8 @@ class MiniMaxM3VLDecoderLayer(GradientCheckpointingLayer):
 # Source: veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
 # ======================================================================
 class MiniMaxM3VLPreTrainedModel(PreTrainedModel):
-    config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig
+    # A single class: the VeOmni model base adapts ``config_class``, which HF derives from this annotation.
+    config: MiniMaxM3VLConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["MiniMaxM3VLDecoderLayer", "MiniMaxM3VLVisionEncoderLayer"]
@@ -988,7 +1001,7 @@ class MiniMaxM3VLPreTrainedModel(PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] MiniMaxM3VLTextModel
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -1003,7 +1016,7 @@ class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([MiniMaxM3VLDecoderLayer(config, i) for i in range(config.num_hidden_layers)])
-        self.norm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = MiniMaxM3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = MiniMaxM3VLRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -1250,7 +1263,7 @@ class MiniMaxM3VLVisionAttention(nn.Module):
         # still expects this attribute to drive its (no-op) `repeat_kv`.
         self.num_key_value_groups = 1
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
         input_shape = hidden_states.shape[:-1]
@@ -1844,7 +1857,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, Genera
         self.model = MiniMaxM3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.veomni_ce = VeomniOp(
-            "cross_entropy_loss", "standard", resolve_op_impl("cross_entropy_loss_implementation")
+            "cross_entropy_loss", "standard", config.ops_config.cross_entropy_loss_implementation
         )
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

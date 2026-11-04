@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -72,7 +74,9 @@ def _text_config(modeling, **overrides):
         eos_token_id=2,
     )
     kwargs.update(overrides)
-    return modeling.MiniMaxM3VLTextConfig(**kwargs)
+    config = modeling.MiniMaxM3VLTextConfig(**kwargs)
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
+    return config
 
 
 def _single_layer_sparse_text_model(modeling):
@@ -360,6 +364,7 @@ def _tiny_vision_model(modeling, attn_implementation):
         temporal_patch_size=1,
         spatial_merge_size=2,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     vision_model = modeling.MiniMaxM3VLVisionModel(config)
     vision_model.config._attn_implementation = attn_implementation
     vision_model.layers = torch.nn.ModuleList([_RecordingVisionLayer()])
@@ -459,6 +464,7 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
         temporal_patch_size=1,
         spatial_merge_size=2,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     vision_model = modeling.MiniMaxM3VLVisionModel(config)
     vision_model.config._attn_implementation = "veomni_flash_attention_2"
     recording_layer = _RecordingVisionLayer()
@@ -519,7 +525,7 @@ def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(modu
     from veomni.models.registry import get_model_config
 
     modeling = importlib.import_module(module_name)
-    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
     sp_size, local_len = 2, 4
     full_ids = torch.randint(0, 100, (1, sp_size * local_len))
@@ -575,7 +581,7 @@ def test_minimax_m3_vl_sp_drops_vision_padding_features(module_name, modality, w
     from veomni.models.registry import get_model_config
 
     modeling = importlib.import_module(module_name)
-    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
     assert model.vision_tower.config.spatial_merge_size == 2
     sp_size, local_len = 2, 4
@@ -640,7 +646,7 @@ def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
     from veomni.models.registry import get_model_config
 
     modeling = importlib.import_module(module_name)
-    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     with torch.device("meta"):
         model = modeling.MiniMaxM3SparseForConditionalGeneration(config)
     parameter_names = [name for name, _ in model.named_parameters()]
@@ -664,6 +670,7 @@ def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, 
         intermediate_size=3,
         swiglu_limit=0.7,
         swiglu_alpha=1.702,
+        ops_config=make_eager_ops_config(),
     )
     experts = modeling.MiniMaxM3VLExperts(config)
     torch.manual_seed(0)

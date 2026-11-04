@@ -250,6 +250,10 @@ def tiny_minimax_m3_vl_config(architecture: str = "MiniMaxM3SparseForConditional
         MiniMaxM3VLVisionConfig,
     )
 
+    MiniMaxM3VLConfig = get_veomni_config_class(MiniMaxM3VLConfig)
+    MiniMaxM3VLTextConfig = get_veomni_config_class(MiniMaxM3VLTextConfig)
+    MiniMaxM3VLVisionConfig = get_veomni_config_class(MiniMaxM3VLVisionConfig)
+
     text = MiniMaxM3VLTextConfig(
         vocab_size=128,
         hidden_size=32,
@@ -288,6 +292,7 @@ def tiny_minimax_m3_vl_config(architecture: str = "MiniMaxM3SparseForConditional
         video_token_index=VIDEO_TOKEN_ID,
         projector_hidden_size=32,
         architectures=[architecture],
+        attn_implementation="eager",
     )
 
 

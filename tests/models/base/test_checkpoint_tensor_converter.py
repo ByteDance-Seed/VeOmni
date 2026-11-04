@@ -2171,6 +2171,7 @@ class TestMiniMaxM3VLConverter:
         """
         import json
 
+        from tests.tools.training_utils import make_eager_ops_config
         from veomni.models.registry import get_model_class, get_model_config
 
         fixture = Path(__file__).resolve().parents[2] / "toy_config" / "minimax_m3_vl_public_layout"
@@ -2183,7 +2184,7 @@ class TestMiniMaxM3VLConverter:
             experts = range(layout["num_experts"]) if "{expert}" in template else [None]
             public_keys.extend(template.format(layer=layer, expert=expert) for layer in layers for expert in experts)
 
-        config = get_model_config(str(fixture))
+        config = get_model_config(str(fixture), ops_implementation=make_eager_ops_config())
         with torch.device("meta"):
             model = get_model_class(config)._from_config(config)
 

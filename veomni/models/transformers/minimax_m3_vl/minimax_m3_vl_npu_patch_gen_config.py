@@ -35,6 +35,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
     minimax_m3_vl_attention_bind_ops,
     minimax_m3_vl_attention_forward_patched,
+    minimax_m3_vl_decoder_layer_init_patched,
     minimax_m3_vl_get_metadata_collate_func_patched,
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
@@ -45,6 +46,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_init_patched,
     minimax_m3_vl_text_model_forward_patched,
+    minimax_m3_vl_text_model_init_patched,
     minimax_m3_vl_vision_attention_bind_ops,
     minimax_m3_vl_vision_attention_forward_patched,
     minimax_m3_vl_vision_dummy_forward_patched,
@@ -58,12 +60,13 @@ config = PatchConfig(
     target_file="patched_modeling_minimax_m3_vl_npu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks for NPU runtime selection",
 )
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.config", names=["resolve_op_impl"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss"])
 config.add_import(
     "veomni.utils.model_outputs",
@@ -115,6 +118,16 @@ config.override_method(
     "MiniMaxM3VLRMSNorm.forward",
     replacement=minimax_m3_vl_rmsnorm_forward_patched,
     description="Always call the local rms_norm offset VeomniOp",
+)
+config.override_method(
+    "MiniMaxM3VLDecoderLayer.__init__",
+    replacement=minimax_m3_vl_decoder_layer_init_patched,
+    description="Pass config to MiniMaxM3VLRMSNorm instances",
+)
+config.override_method(
+    "MiniMaxM3VLTextModel.__init__",
+    replacement=minimax_m3_vl_text_model_init_patched,
+    description="Pass config to the final MiniMaxM3VLRMSNorm",
 )
 config.modify_init(
     "MiniMaxM3VLVisionAttention",
