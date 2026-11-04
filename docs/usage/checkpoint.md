@@ -132,7 +132,7 @@ half-loaded.
 The one step with a single half is a run that saves no model state. SeedOmni's
 `offline_embedding` freezes every module, so no module has a checkpoint
 manager and the step has no `model/`. Its manifest records
-[`model_state: false`](../../veomni/checkpoint/layout.py#L259), and the manifest
+[`model_state: false`](../../veomni/checkpoint/layout.py#L190), and the manifest
 alone then marks the step complete. Without that field, the same tree would look
 like a step whose shards never started. A manifest written before the field
 existed counts as carrying model state.
