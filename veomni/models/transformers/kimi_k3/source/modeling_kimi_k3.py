@@ -137,7 +137,7 @@ class SituAndMul(nn.Module):
     When linear_beta is set, up is also transformed by linear_beta * tanh(up / linear_beta).
     """
 
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None, config=None):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
@@ -289,7 +289,7 @@ class KimiDynamicCache:
 
 
 class KimiRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-6, config=None):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -320,6 +320,7 @@ class KimiBlockSparseMLP(nn.Module):
             self.act_fn = SituAndMul(
                 beta=beta,
                 linear_beta=linear_beta,
+                config=config,
             )
         else:
             self.act_fn = ACT2FN[config.hidden_act]
@@ -348,6 +349,7 @@ class KimiMLP(nn.Module):
             self.act_fn = SituAndMul(
                 beta=beta,
                 linear_beta=linear_beta,
+                config=config,
             )
         else:
             self.act_fn = ACT2FN[config.hidden_act]
@@ -426,7 +428,7 @@ class KimiMLAAttention(nn.Module):
                 self.q_lora_rank,
                 bias=False,
             )
-            self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank)
+            self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank, config=config)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank,
                 self.num_heads * self.q_head_dim,
@@ -443,7 +445,7 @@ class KimiMLAAttention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank, config=config)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
@@ -1192,15 +1194,15 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
             self.block_sparse_moe = KimiSparseMoeBlock(config)
         else:
             self.mlp = KimiMLP(config)
-        self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
         # Attention residual
         self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
-            self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+            self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
             self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
             self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 

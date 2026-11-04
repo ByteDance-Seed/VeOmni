@@ -46,7 +46,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_kimi_k3_config as _tiny_config
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state_from_config
@@ -59,13 +59,12 @@ from veomni.ops.registry import VeomniOp
 
 def _build_model(ops_cfg=None):
     cfg = ops_cfg if ops_cfg is not None else eager_ops_config()
-    with ops_config_scope(None):
-        return build_foundation_model(
-            _tiny_config(),
-            torch_dtype="float32",
-            init_device="cpu",
-            ops_implementation=cfg,
-        )
+    return build_foundation_model(
+        _tiny_config(),
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=cfg,
+    )
 
 
 @pytest.fixture
@@ -499,9 +498,8 @@ def test_kda_module_matches_source_layout():
     patched_cls = type(model.language_model.model.layers[1].self_attn)
     assert patched_cls is not SourceKDA
     config = model.config.text_config
-    with ops_config_scope(eager_ops_config()):
-        source = SourceKDA(config, layer_idx=1)
-        patched = patched_cls(config, layer_idx=1)
+    source = SourceKDA(config, layer_idx=1)
+    patched = patched_cls(config, layer_idx=1)
     source_state = source.state_dict()
     patched_state = patched.state_dict()
     assert set(source_state) == set(patched_state)

@@ -16,10 +16,10 @@
 # This module is the patchgen *source* for
 from typing import Optional
 
-from transformers.configuration_utils import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class KimiLinearConfig(PretrainedConfig):
+class KimiLinearConfig(VeOmniPretrainedConfig):
     model_type = "kimi_linear"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -184,7 +184,7 @@ class KimiLinearConfig(PretrainedConfig):
         return self.linear_attn_config is not None and (layer_idx + 1) in self.linear_attn_config["kda_layers"]
 
 
-class KimiK3VisionConfig(PretrainedConfig):
+class KimiK3VisionConfig(VeOmniPretrainedConfig):
     def __init__(
         self,
         patch_size: int = 14,
@@ -198,7 +198,7 @@ class KimiK3VisionConfig(PretrainedConfig):
         vt_intermediate_size: int = 4096,
         merge_kernel_size: tuple = (2, 2),
         merge_type: str = "sd2_tpool",
-        _attn_implementation: str = "flash_attention_2",
+        _attn_implementation: str | None = None,
         # MM Projector parameters
         mm_projector_type: str = "patchmergerv2",
         mm_hidden_size: int | None = None,
@@ -231,7 +231,6 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.vt_intermediate_size = vt_intermediate_size
         self.merge_kernel_size = merge_kernel_size
         self.merge_type = merge_type
-        self._attn_implementation = _attn_implementation
 
         # MM Projector config
         self.mm_projector_type = mm_projector_type
@@ -251,9 +250,11 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.pos_emb_interpolation_mode = pos_emb_interpolation_mode
 
         super().__init__(**kwargs)
+        if _attn_implementation is not None:
+            self._attn_implementation = _attn_implementation
 
 
-class KimiK3Config(PretrainedConfig):
+class KimiK3Config(VeOmniPretrainedConfig):
     """Kimi-K3 model configuration.
 
     Args:
@@ -286,6 +287,7 @@ class KimiK3Config(PretrainedConfig):
     """
 
     model_type = "kimi_k3"
+    sub_configs = {"text_config": KimiLinearConfig, "vision_config": KimiK3VisionConfig}
 
     def __init__(
         self,

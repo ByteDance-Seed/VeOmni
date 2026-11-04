@@ -103,7 +103,6 @@ from veomni.models.transformers.kimi_k3.source.kda_fallback import (
     tensor_cache,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 # Additional imports for patches
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -184,11 +183,12 @@ class SituAndMul(nn.Module):
     """
 
     # SituGLU (instance-local VeomniOp, fused Triton kernel)
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None, config=None):
         nn.Module.__init__(self)
         self.beta = beta
         self.linear_beta = linear_beta
-        self.veomni_situ_and_mul = VeomniOp("situ_and_mul", "kimi_k3", resolve_op_impl("situ_and_mul_implementation"))
+        impl = "eager" if config is None else config.ops_config.situ_and_mul_implementation
+        self.veomni_situ_and_mul = VeomniOp("situ_and_mul", "kimi_k3", impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.veomni_situ_and_mul(x, beta=self.beta, linear_beta=self.linear_beta)
@@ -338,11 +338,12 @@ class KimiDynamicCache:
 
 class KimiRMSNorm(nn.Module):
     # RMSNorm (instance-local VeomniOp, functional fused kernel)
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-6, config=None):
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -381,13 +382,13 @@ class KimiBlockSparseMLP(nn.Module):
         self.is_situ = config.hidden_act == "situ"
         if self.is_situ:
             beta, linear_beta = _get_situ_activation_params(config)
-            self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta)
+            self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta, config=config)
         else:
             self.act_fn = ACT2FN[config.hidden_act]
         self.veomni_moe = VeomniOp(
             "moe_experts",
             "kimi_k3" if self.is_situ else "standard",
-            resolve_op_impl("moe_implementation"),
+            config.ops_config.moe_implementation,
         )
 
     def forward(
@@ -439,6 +440,7 @@ class KimiMLP(nn.Module):
             self.act_fn = SituAndMul(
                 beta=beta,
                 linear_beta=linear_beta,
+                config=config,
             )
         else:
             self.act_fn = ACT2FN[config.hidden_act]
@@ -517,7 +519,7 @@ class KimiMLAAttention(nn.Module):
                 self.q_lora_rank,
                 bias=False,
             )
-            self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank)
+            self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank, config=config)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank,
                 self.num_heads * self.q_head_dim,
@@ -534,7 +536,7 @@ class KimiMLAAttention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank, config=config)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
@@ -738,7 +740,7 @@ class KimiDeltaAttention(nn.Module):
         # Modification: rebind the source's eager ``chunk_kda`` reference to the
         # ops-configured ``VeomniOp`` (instance-local kernel handle; the fused
         # AscendC kernel when configured, the modeling reference otherwise).
-        self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", resolve_op_impl("chunk_kda_implementation"))
+        self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", config.ops_config.chunk_kda_implementation)
 
     def _forward_sp_head_shard(
         self,
@@ -1228,6 +1230,7 @@ class KimiSparseMoeBlock(nn.Module):
                 self.routed_expert_norm = KimiRMSNorm(
                     self.moe_hidden_size,
                     eps=config.rms_norm_eps,
+                    config=config,
                 )
 
     def forward(self, hidden_states):
@@ -1277,15 +1280,15 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
             self.block_sparse_moe = KimiSparseMoeBlock(config)
         else:
             self.mlp = KimiMLP(config)
-        self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
         # Attention residual
         self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
-            self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+            self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
             self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
             self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -1603,19 +1606,17 @@ class KimiLinearModel(KimiPreTrainedModel):
         self.layers = nn.ModuleList(
             [KimiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
         self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if self.use_attn_residuals:
-            self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
         # Modification: respect the caller-requested attention implementation
         # (eager / veomni_* NPU kernels) instead of forcing flash_attention_2.
         # KimiMLAAttention already dispatches through ALL_ATTENTION_FUNCTIONS with
         # an eager fallback, so any registered implementation works.
-        if getattr(config, "_attn_implementation", None) is None:
-            config._attn_implementation = "flash_attention_2"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1753,7 +1754,7 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
         self.model = KimiLinearModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
@@ -2786,11 +2787,12 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         # implementation (VL_VISION_ATTENTION_FUNCTIONS registers only
         # 'eager'/'flash_attention_2'), so an 'sdpa' request falls back to 'eager'
         # for the vision tower.
-        if getattr(config, "_attn_implementation", None) is not None:
-            config.text_config._attn_implementation = config._attn_implementation
+        selected_attn = config.ops_implementation.get("attn_implementation")
+        if isinstance(selected_attn, str):
+            config.text_config._attn_implementation = selected_attn
             vision_config = getattr(config, "vision_config", None)
             if vision_config is not None:
-                vision_impl = config._attn_implementation
+                vision_impl = selected_attn
                 if vision_impl == "sdpa":
                     vision_impl = "eager"
                 vision_config._attn_implementation = vision_impl
@@ -2813,7 +2815,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
         self.language_model = KimiLinearForCausalLM(config.text_config)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
