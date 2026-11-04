@@ -40,3 +40,21 @@ def test_muon_device_api_exceptions_are_line_scoped(tmp_path, bad_line):
         check=False,
     )
     assert (result.returncode == 0) == (bad_line is None), result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_optimizer_factory_device_exceptions_do_not_hide_other_calls(tmp_path, unsafe):
+    source = ROOT / "veomni/optim/optimizer.py"
+    target = tmp_path / "veomni/optim/optimizer.py"
+    target.parent.mkdir(parents=True)
+    contents = source.read_text(encoding="utf-8")
+    if unsafe:
+        contents += "\nunsafe_call = torch." + "cu" + "da.synchronize\n"
+    target.write_text(contents, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tests/special_sanity/check_device_api_usage.py"), "-d", str(target.parent)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) == (not unsafe), result.stdout + result.stderr

@@ -1,6 +1,7 @@
 """Regression tests for VLM-style optimizer param groups + DCP resume."""
 
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -152,6 +153,68 @@ def test_vlm_style_optimizer_dcp_roundtrip_step_succeeds():
     loss2 = model2(torch.randn(2, 4)).sum()
     loss2.backward()
     opt2.step()
+
+
+@pytest.mark.parametrize("patterns", [None, []])
+def test_qwen38_muon_without_offload_patterns_builds_resident_and_updates(patterns):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    model = torch.nn.Module()
+    model.down_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    model.lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    reference = copy.deepcopy(model)
+    reference_groups = add_qwen38_plans(
+        reference, [{"params": list(reference.parameters()), "weight_decay": 0.0, "cpu_offload": False}]
+    )
+    reference_optimizer = Qwen38MuonAdamW(reference_groups, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.0)
+    optimizer = build_optimizer(
+        model, optimizer_type="qwen38_muon", lr=1e-3, weight_decay=0.0, cpu_offload_param_patterns=patterns
+    )
+    leaves = list(optimizer.optimizers_dict.values()) if isinstance(optimizer, MultiOptimizer) else [optimizer]
+    groups = [group for leaf in leaves for group in leaf.param_groups]
+    assert all(not leaf._offloaded for leaf in leaves)
+    assert {plan[0] for group in groups for plan in json.loads(group["qwen38_plan"])} == {
+        "muon",
+        "adamw",
+    }
+    for _ in range(2):
+        for param, ref_param in zip(model.parameters(), reference.parameters(), strict=True):
+            param.grad = torch.full_like(param, 0.25)
+            ref_param.grad = param.grad.clone()
+        optimizer.step()
+        reference_optimizer.step()
+        for param, ref_param in zip(model.parameters(), reference.parameters(), strict=True):
+            state = next(leaf.state[param] for leaf in leaves if param in leaf.state)
+            torch.testing.assert_close(param, ref_param, rtol=0, atol=0)
+            for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+                assert state[key].dtype == torch.float32
+                assert state[key].device == param.device
+                torch.testing.assert_close(state[key], reference_optimizer.state[ref_param][key], rtol=0, atol=0)
+
+
+def test_cpu_offload_adamw_still_requires_patterns():
+    with pytest.raises(ValueError, match="explicit cpu_offload_param_patterns"):
+        build_optimizer(_TinyModel(), optimizer_type="cpu_offload_adamw")
+
+
+def test_qwen38_muon_does_not_silently_disable_explicit_offload():
+    model = torch.nn.Module()
+    model.down_proj = torch.nn.Linear(4, 4, bias=False)
+    with pytest.raises(ValueError, match="explicit cpu_offload_param_patterns"):
+        build_optimizer(
+            model,
+            optimizer_type="qwen38_muon",
+            param_groups=[{"params": list(model.parameters()), "cpu_offload": True}],
+        )
+
+
+@pytest.mark.parametrize("patterns", [False, "", ()])
+def test_qwen38_muon_does_not_treat_invalid_patterns_as_resident(patterns):
+    model = torch.nn.Module()
+    model.down_proj = torch.nn.Linear(4, 4, bias=False)
+    with pytest.raises(ValueError, match="explicit cpu_offload_param_patterns"):
+        build_optimizer(model, optimizer_type="qwen38_muon", cpu_offload_param_patterns=patterns)
 
 
 @pytest.mark.parametrize("extra_parallel", [False, True])

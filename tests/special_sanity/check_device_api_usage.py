@@ -35,9 +35,6 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
-    # The optimizer factory identifies the CUDA/NCCL domain for Muon's
-    # collective IEEE-FP32 preflight, including CPU-offloaded parameters.
-    "veomni/optim/optimizer.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",
@@ -106,13 +103,26 @@ SEARCH_KEYWORDS = [".cuda", '"cuda"', '"nccl"']
 # Only these existing Muon lines need backend-specific precision inspection or
 # device dispatch. The existing keyword scan still checks every other line.
 LINE_EXCEPTIONS = {
+    "veomni/optim/optimizer.py": {
+        "_qwen38_cuda_domain": {
+            'local = (mesh is not None and mesh.device_type == "cuda") or any(',
+            'return any(flags) or torch.distributed.get_backend() == "nccl"',
+        },
+        "build_optimizer": {
+            'local_cuda = any(param.device.type == "cuda" for group in param_groups for param in group["params"])',
+            'cuda_guard = any(flags) or torch.distributed.get_backend() == "nccl"',
+        },
+        "build_extra_parallel_fsdp2_optimizer": {
+            'cuda_guard = cuda_guard or torch.distributed.get_backend() == "nccl"',
+        },
+    },
     "veomni/optim/qwen38_muon.py": {
         "_check_cuda_fp32_policy": {"backend = torch.backends.cuda.matmul"},
         "_optimizer_uses_cuda": {
             'return any(param.device.type == "cuda" for group in optimizer.param_groups for param in group["params"])'
         },
         "_strict_matmul": {'elif device_type == "cuda":'},
-    }
+    },
 }
 
 

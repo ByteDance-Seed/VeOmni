@@ -3,6 +3,7 @@
 
 """Device update and exact-state recovery for mixed Qwen Muon/AdamW."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -17,12 +18,24 @@ from veomni.utils.device import get_device_type, get_torch_device
 
 def _require_native_device():
     capabilities = runner_capabilities()
+    require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS", "0") == "1"
+    if require_npu and capabilities.backend != "npu":
+        pytest.fail("NPU test was required but no NPU backend was detected")
     if capabilities.backend == "cpu":
         pytest.skip("Requires a native CUDA or Ascend device")
     runtime = get_torch_device()
     if capabilities.backend != get_device_type() or not runtime.is_available() or runtime.device_count() < 1:
         pytest.fail("Assigned accelerator device is unavailable")
     return torch.device(capabilities.backend)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("backend", ["cpu", "cuda"])
+def test_required_npu_test_fails_when_npu_is_missing(monkeypatch, backend):
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
+    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend=backend))
+    with pytest.raises(pytest.fail.Exception, match="NPU test was required"):
+        _require_native_device()
 
 
 def _build(device, dtype):
@@ -90,3 +103,67 @@ def test_native_qwen_muon_adam_offload_update_and_recovery(tmp_path, dtype):
         torch.testing.assert_close(src, dst, rtol=1e-5, atol=1e-6)
         for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
             torch.testing.assert_close(leaf.state[src][key], target_leaf.state[dst][key], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_native_qwen_muon_factory_resident_update_and_recovery(tmp_path, dtype):
+    from veomni.optim.optimizer import build_optimizer
+
+    device = _require_native_device()
+    if device.type == "cuda":
+        from veomni.optim.qwen38_muon import _check_cuda_fp32_policy
+
+        _check_cuda_fp32_policy()
+
+    def build():
+        model, _, _ = _build(device, dtype)
+        optimizer = build_optimizer(model, optimizer_type="qwen38_muon", lr=1e-3, weight_decay=0.0)
+        leaves = list(optimizer.optimizers_dict.values()) if isinstance(optimizer, MultiOptimizer) else [optimizer]
+        assert all(not leaf._offloaded for leaf in leaves)
+        return model, optimizer, leaves
+
+    def state_for(leaves, param):
+        return next(leaf.state[param] for leaf in leaves if param in leaf.state)
+
+    model, optimizer, leaves = build()
+    reference, reference_leaf, reference_optimizer = _build(torch.device("cpu"), dtype)
+    for _ in range(2):
+        _give_gradients(model)
+        _give_gradients(reference)
+        optimizer.step()
+        reference_optimizer.step()
+    optimizer.zero_grad()
+    for param, ref in zip(model.parameters(), reference.parameters(), strict=True):
+        state = state_for(leaves, param)
+        assert param.device.type == device.type
+        for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+            assert state[key].device == param.device and state[key].dtype == torch.float32
+            torch.testing.assert_close(state[key].cpu(), reference_leaf.state[ref][key], rtol=2e-5, atol=1e-6)
+
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored, target_leaves = build()
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    for src, dst in zip(model.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(src, dst, rtol=0, atol=0)
+        for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(state_for(leaves, src)[key], state_for(target_leaves, dst)[key], rtol=0, atol=0)
+    _give_gradients(model)
+    _give_gradients(target)
+    optimizer.step()
+    restored.step()
+    for src, dst in zip(model.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(src, dst, rtol=1e-5, atol=1e-6)
+        for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                state_for(leaves, src)[key], state_for(target_leaves, dst)[key], rtol=1e-5, atol=1e-6
+            )
