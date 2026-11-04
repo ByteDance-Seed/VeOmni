@@ -289,6 +289,23 @@ before loading into a different mesh or offline export; their provenance cannot
 be inferred from chunks alone, and not all such cases can be rejected
 automatically when the target has no ExtraParallel mesh.
 
+There is currently no general, verified migration utility for these ambiguous
+legacy expert layouts. Preserve the original checkpoint and its training code,
+rank-to-expert mapping, mesh, and optimizer configuration. A model-specific
+migration needs to reconstruct both the global expert tensors and their matching
+optimizer states from that provenance, compare every expert against an
+independent reference, and save to a new location with the current writer. A
+fresh-process restore and next-update comparison are required before resuming.
+Without enough provenance to establish the mapping, do not resume or export the
+ambiguous state as if it were canonical; start from independently verified
+weights and a fresh optimizer instead. This describes necessary checks, not a
+provided or generally validated migration procedure.
+
+For ordinary TP/FSDP-only models, the writer may certify a strided same-axis
+layout when the active runtime mesh and a unique source-model parameter owner
+prove its provenance. Parameters with unknown ownership, unexpected meshes,
+partial placements, or any active ExtraParallel dimension remain unproven.
+
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates
