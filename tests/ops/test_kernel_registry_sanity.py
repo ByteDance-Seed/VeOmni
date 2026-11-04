@@ -30,6 +30,10 @@ common ways the kernel registry silently breaks:
 Run on any host with ``pytest tests/ops/test_kernel_registry_sanity.py``.
 """
 
+import sys
+from functools import wraps
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -244,3 +248,41 @@ class TestKernelSpecValidation:
                     f"Spec for ({op_name}, {variant}, {impl_name}) has unexpected device_type "
                     f"{spec.hardware.device_type!r}"
                 )
+
+
+@pytest.mark.parametrize("dispatch_enabled", [True, False])
+def test_fla_gdn_preserves_native_backend(monkeypatch, dispatch_enabled):
+    """Explicit FLA selection must bypass upstream dispatch and keep autograd."""
+    from veomni.ops.kernels.gated_delta_rule import _fla_chunk_gated_delta_rule_factory
+
+    def native(q):
+        assert not torch.compiler.is_compiling()
+        return q.square()
+
+    entrypoint = torch.compiler.disable(native)
+    if dispatch_enabled:
+
+        @wraps(entrypoint)
+        def dispatch(q):
+            raise AssertionError("Explicit FLA selection reached external backend dispatch")
+
+        entrypoint = torch.compiler.disable(dispatch)
+
+    fla = ModuleType("fla")
+    ops = ModuleType("fla.ops")
+    gdn = ModuleType("fla.ops.gated_delta_rule")
+    gdn.chunk_gated_delta_rule = entrypoint
+    for module in (fla, ops, gdn):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    kernel = _fla_chunk_gated_delta_rule_factory()
+
+    @torch.compile(backend="eager")
+    def run(q):
+        return kernel(q) + 1
+
+    q = torch.tensor([2.0, 3.0], requires_grad=True)
+    out = run(q)
+    torch.testing.assert_close(out, torch.tensor([5.0, 10.0]))
+    out.sum().backward()
+    torch.testing.assert_close(q.grad, 2 * q.detach())
