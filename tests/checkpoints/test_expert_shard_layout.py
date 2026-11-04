@@ -35,6 +35,9 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _layout_worker(rank, world, directory, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=90))
     try:
