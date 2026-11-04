@@ -36,6 +36,9 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("file_backed", [False, True])
 @pytest.mark.parametrize("slot", ["model", "optimizer"])
