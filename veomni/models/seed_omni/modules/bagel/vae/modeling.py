@@ -149,7 +149,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
     preprocessor_class = BagelVAEPreprocessor
     base_model_prefix = "bagel_vae"
     main_input_name = "pixel_values"
-    _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
+    _no_split_modules: list[str] = []
     supports_gradient_checkpointing = False
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
@@ -246,6 +246,8 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
     def _encode_posterior_list(
         self,
         pixel_values: list[torch.Tensor],
+        *,
+        min_passes: int = 0,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Encode a list of ``[C, H, W]`` images at their native shapes, batching equal shapes."""
         if not pixel_values:
@@ -262,8 +264,9 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
             shape_key = (int(image.shape[-2]), int(image.shape[-1]))
             shape_groups.setdefault(shape_key, []).append(idx)
 
+        group_indices = list(shape_groups.values())
         posteriors: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(normalized)
-        for indices in shape_groups.values():
+        for indices in group_indices:
             batch = torch.stack([normalized[i] for i in indices], dim=0).to(
                 device=self._encoder_device, dtype=self.dtype
             )
@@ -271,6 +274,16 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
                 mean_batch, logvar_batch = self._encode_posterior(batch)
             for idx, mean_i, logvar_i in zip(indices, mean_batch, logvar_batch, strict=True):
                 posteriors[idx] = (mean_i.unsqueeze(0), logvar_i.unsqueeze(0))
+
+        if min_passes > len(group_indices):
+            dummy_batch = normalized[0].unsqueeze(0).to(device=self._encoder_device, dtype=self.dtype)
+            for _ in range(min_passes - len(group_indices)):
+                with self._runtime_context(dummy_batch):
+                    mean_dummy, logvar_dummy = self._encode_posterior(dummy_batch)
+                assert posteriors[0] is not None
+                anchor = (mean_dummy.sum() + logvar_dummy.sum()) * 0.0
+                posteriors[0] = (posteriors[0][0] + anchor, posteriors[0][1])
+
         return posteriors  # type: ignore[return-value]
 
     def _sample_scaled_latents(self, posterior: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:

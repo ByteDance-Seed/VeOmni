@@ -987,7 +987,6 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_key_states = self.k_norm(packed_key_states)
             return packed_query_states, packed_key_states, packed_value_states
 
-        packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
         packed_qkv_states = packed_query_sequence.new_zeros(
             (packed_query_sequence.shape[0], sum(self.qkv_split_sizes))
         )
@@ -1000,16 +999,18 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
             self.qkv_split_sizes, dim=-1
         )
-        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim).to(torch.float32)
-        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim).to(torch.float32)
+        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
-        packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
-        packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
+        normed_query_states = packed_query_states.new_zeros(packed_query_states.shape)
+        normed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
+        normed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
             packed_query_states[packed_vae_token_indexes]
         )
-        packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
-        packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
-        return packed_query_states, packed_key_states, packed_value_states
+        normed_key_states = packed_key_states.new_zeros(packed_key_states.shape)
+        normed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+        normed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
+        return normed_query_states, normed_key_states, packed_value_states
 
     def merge_kv_cache(
         self,
@@ -1096,11 +1097,10 @@ class BagelQwen2MoTAttention(nn.Module):
         if not is_gen:
             return self.o_proj(packed_attn_output)
 
-        packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-        packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(
-            packed_attn_output[packed_vae_token_indexes]
-        )
-        return packed_attn_output
+        output = packed_attn_output.new_zeros(packed_attn_output.shape)
+        output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+        output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+        return output
 
     def forward_packed_inference(
         self,
@@ -1125,6 +1125,7 @@ class BagelQwen2MoTAttention(nn.Module):
         total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
+        compute_dtype = packed_query_sequence.dtype
         packed_query_states, packed_key_states, packed_value_states = self.project_qkv_inference(
             packed_query_sequence,
             is_gen=is_gen,
@@ -1141,9 +1142,9 @@ class BagelQwen2MoTAttention(nn.Module):
             unsqueeze_dim=1,
         )
 
-        packed_query_states = packed_query_states.to(torch.bfloat16)
-        packed_key_states = packed_key_states.to(torch.bfloat16)
-        packed_value_states = packed_value_states.to(torch.bfloat16)
+        packed_query_states = packed_query_states.to(compute_dtype)
+        packed_key_states = packed_key_states.to(compute_dtype)
+        packed_value_states = packed_value_states.to(compute_dtype)
 
         merged_key_states, merged_value_states = self.merge_kv_cache(
             packed_key_states,
@@ -1166,7 +1167,7 @@ class BagelQwen2MoTAttention(nn.Module):
             max_length_k=max_length_k,
         )
         packed_attn_output = self.project_o_inference(
-            packed_attn_output,
+            packed_attn_output.to(compute_dtype),
             is_gen=is_gen,
             packed_text_indexes=packed_text_indexes,
             packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1293,13 +1294,11 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         if not is_gen:
             return self.mlp(self.post_attention_layernorm(packed_query_sequence))
 
-        packed_text_query_sequence = self.post_attention_layernorm(packed_query_sequence[packed_text_indexes]).to(
-            torch.bfloat16
-        )
+        packed_text_query_sequence = self.post_attention_layernorm(packed_query_sequence[packed_text_indexes])
         packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(
             packed_query_sequence[packed_vae_token_indexes]
-        ).to(torch.bfloat16)
-        mlp_output = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
+        )
+        mlp_output = torch.zeros_like(packed_query_sequence)
         mlp_output[packed_text_indexes] = self.mlp(packed_text_query_sequence)
         mlp_output[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
         return mlp_output

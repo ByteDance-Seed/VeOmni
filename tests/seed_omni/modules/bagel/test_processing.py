@@ -1185,3 +1185,51 @@ def test_bagel_chat_template_rejects_multi_token_start_or_end_markers() -> None:
     for marker in ("<|im_start|>", "<|im_end|>"):
         with pytest.raises(ValueError, match="BAGEL start/end tokens must tokenize to exactly one token"):
             template.tokenize([ConversationItem(type="text", value=marker, role="user")])
+
+
+def test_bagel_vae_aligns_encoder_passes_across_shard_group_and_keeps_blocks_unsplit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``BagelVAE`` keeps ``_no_split_modules`` empty and aligns ``_encode_posterior_list`` pass counts across ``fsdp_group``."""
+    import torch.distributed as dist
+
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import accelerated as vae_acc
+
+    vae = _tiny_vae(ch_mult=[1, 1], downsample=2)
+    assert not vae._no_split_modules
+
+    # Reference single-rank posterior for two equal-shape images (1 shape group natively)
+    img_a = torch.randn(3, 4, 8)
+    img_b = torch.randn(3, 4, 8)
+    ref_out = vae.offline_encode([img_a, img_b])["encoded_cache"]
+
+    fake_fsdp_group = object()
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        vae_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=2, cp_size=1, sp_group=object(), fsdp_group=fake_fsdp_group),
+    )
+
+    def _fake_all_reduce_max(tensor: torch.Tensor, op=None, group=None):
+        assert group is fake_fsdp_group
+        assert op == dist.ReduceOp.MAX
+        # Peer rank has 3 distinct image shapes, while this rank has only 1 shape group.
+        tensor.fill_(3)
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce_max)
+
+    encoder_calls = 0
+    orig_encoder_forward = vae.encoder.forward
+
+    def _counting_encoder_forward(x: torch.Tensor) -> torch.Tensor:
+        nonlocal encoder_calls
+        encoder_calls += 1
+        return orig_encoder_forward(x)
+
+    monkeypatch.setattr(vae.encoder, "forward", _counting_encoder_forward)
+
+    aligned_out = vae.offline_encode([img_a, img_b])["encoded_cache"]
+    assert encoder_calls == 3
+    for actual, expected in zip(aligned_out, ref_out, strict=True):
+        torch.testing.assert_close(actual, expected)

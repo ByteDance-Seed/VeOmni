@@ -20,14 +20,15 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_START_TOKEN,
 )
 from veomni.models.seed_omni.utils.conversation import ConversationItem
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _eager_config(**overrides):
     return config_cls("bagel_qwen2_mot")(**{**tiny_bagel_qwen2_cfg(), **overrides, "attn_implementation": "sdpa"})
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_eager_packed_train_forward_runs() -> None:
     """Verify eager packed MoT forward and backward populate both und and gen expert gradients."""
     model = native_model_cls("bagel_qwen2_mot")(_eager_config()).train()
@@ -53,15 +54,14 @@ def test_eager_packed_train_forward_runs() -> None:
     assert gen_query_grad.abs().max() > 0
 
 
-def _eager_cuda_model():
-    device = torch.device(get_device_type())
-    return native_model_cls("bagel_qwen2_mot")(_eager_config()).to(device=device, dtype=torch.bfloat16).eval()
+def _eager_model(dtype: torch.dtype):
+    return native_model_cls("bagel_qwen2_mot")(_eager_config()).to(device="cpu", dtype=dtype).eval()
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="eager sequential infer smoke uses CUDA bf16")
-def test_eager_und_generate_runs() -> None:
-    """Verify eager understanding generation populates the KV cache on prefill and emits a finite output embedding on decode."""
-    model = _eager_cuda_model()
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+def test_eager_und_generate_runs(dtype: torch.dtype) -> None:
+    """Verify eager understanding generation preserves the configured dtype across FP32, FP16, and BF16."""
+    model = _eager_model(dtype)
     prompt = ConversationItem(
         type="text",
         value=torch.randn(4, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
@@ -84,14 +84,15 @@ def test_eager_und_generate_runs() -> None:
     assert tail.type == "output"
     assert BAGEL_PHASE_KEY not in tail.meta
     assert torch.is_tensor(tail.value)
+    assert tail.value.dtype == dtype
     assert tail.value.shape == (1, int(model.config.hidden_size))
     assert torch.isfinite(tail.value).all()
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="eager sequential infer smoke uses CUDA bf16")
-def test_eager_gen_denoise_runs() -> None:
-    """Verify eager ``denoise_branch`` transitions ``flow_query`` into ``flow_hidden``."""
-    model = _eager_cuda_model()
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+def test_eager_gen_denoise_runs(dtype: torch.dtype) -> None:
+    """Verify eager ``denoise_branch`` preserves the configured dtype across FP32, FP16, and BF16."""
+    model = _eager_model(dtype)
     hidden_size = int(model.config.hidden_size)
     prompt = ConversationItem(
         type="text",
@@ -113,6 +114,7 @@ def test_eager_gen_denoise_runs() -> None:
     tail = outputs["conversation_list"][-1]
     assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_HIDDEN
     assert torch.is_tensor(tail.value)
+    assert tail.value.dtype == dtype
     assert tail.value.shape[0] == 5
     assert tail.value.shape[-1] == hidden_size
     assert torch.isfinite(tail.value).all()

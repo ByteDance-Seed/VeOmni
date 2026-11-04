@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from veomni.utils.device import get_device_id, get_device_type
 
@@ -253,6 +254,27 @@ class TrainingMixin(TrainingModuleMixin):
                 item.value = latent
                 item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
+
+    def _encode_posterior_list(
+        self,
+        pixel_values: list[torch.Tensor],
+        *,
+        min_passes: int = 0,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Align the number of encoder passes across ``fsdp_group`` / ``sp_group`` so FSDP unshards stay in lockstep."""
+        if pixel_values and dist.is_initialized():
+            ps = get_parallel_state()
+            shard_group = ps.fsdp_group if ps.fsdp_group is not None else (ps.sp_group if ps.sp_size > 1 else None)
+            if shard_group is not None:
+                local_shapes = {(int(image.shape[-2]), int(image.shape[-1])) for image in pixel_values}
+                passes_tensor = torch.tensor(
+                    max(len(local_shapes), min_passes),
+                    device=self._encoder_device,
+                    dtype=torch.int64,
+                )
+                dist.all_reduce(passes_tensor, op=dist.ReduceOp.MAX, group=shard_group)
+                min_passes = int(passes_tensor.item())
+        return super()._encode_posterior_list(pixel_values, min_passes=min_passes)
 
     def _gather_encode_output(self, output: torch.Tensor) -> torch.Tensor:
         """All-gather batch-sharded VAE outputs across the SP group and trim SP batch padding."""
