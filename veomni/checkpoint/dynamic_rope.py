@@ -7,6 +7,8 @@ import importlib
 import json
 import math
 
+import torch
+
 from .tensor_bytes import tensor_byte_chunks
 
 
@@ -35,6 +37,19 @@ def _is_native_qwen3_dynamic_reset_alias(module):
 
 
 def _tensor_digest(value):
+    value = value.detach().cpu()
+    if not value.is_floating_point():
+        raise ValueError("Dynamic RoPE frequencies must be finite floating-point values")
+    try:
+        finite = torch.isfinite(value).all()
+    except NotImplementedError:
+        if not str(value.dtype).startswith("torch.float8_"):
+            raise
+        # Every finite FP8 value is exactly representable in FP32. Check there
+        # only when the CPU backend lacks isfinite for the FP8 storage dtype.
+        finite = torch.isfinite(value.float()).all()
+    if not bool(finite):
+        raise ValueError("Dynamic RoPE frequencies must be finite floating-point values")
     digest = hashlib.sha256()
     for chunk in tensor_byte_chunks(value, chunk_bytes=4 << 20):
         digest.update(chunk)
