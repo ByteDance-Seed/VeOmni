@@ -731,19 +731,50 @@ def _check_canonical_spec_coverage(model, specs, state_keys, *, trainable_only):
             raise RuntimeError(f"ExtraParallel checkpoint spec is not present in the canonical state dict: {name}")
 
 
+def _has_live_expert_checkpoint_tensors(model):
+    """Conservatively include aliases, frozen parameters, and persistent buffers."""
+    if not isinstance(model, torch.nn.Module):
+        return False
+
+    specs = getattr(model, "_fqn2spec_info", None) or {}
+
+    def is_expert(name, tensor):
+        spec = specs.get(name)
+        return tensor.ndim and (
+            "experts" in name.split(".")
+            or (getattr(spec, "para_name", None) == "ep" and isinstance(getattr(spec, "placement", None), Shard))
+        )
+
+    if any(is_expert(name, param) for name, param in model.named_parameters(remove_duplicate=False)):
+        return True
+    for prefix, module in model.named_modules(remove_duplicate=False):
+        for name, buffer in module._buffers.items():
+            fqn = f"{prefix}.{name}" if prefix else name
+            if name not in module._non_persistent_buffers_set and buffer is not None and is_expert(fqn, buffer):
+                return True
+    return False
+
+
 def _reject_unproven_extra_parallel_optimizer(
-    state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False
+    state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False, saving=False
 ):
     error, has_canonical_layout = None, False
     try:
-        specs = getattr(state.get("model"), "_fqn2spec_info", None)
+        model = state.get("model")
+        ps = (
+            (parallel_state if parallel_state is not None else get_parallel_state())
+            if saving or state.get("optimizer") is not None
+            else None
+        )
+        if saving and getattr(ps, "tp_size", 1) > 1 and _has_live_expert_checkpoint_tensors(model):
+            raise RuntimeError(
+                "Cannot save a tensor-parallel model containing expert tensors: "
+                "the expert checkpoint source layout is not proven for TP > 1"
+            )
+        specs = getattr(model, "_fqn2spec_info", None)
         if _needs_extra_parallel_layout_marker(specs):
             _extra_parallel_layout_key(specs)
             has_canonical_layout = True
-        if state.get("optimizer") is not None:
-            ps = parallel_state if parallel_state is not None else get_parallel_state()
-        else:
-            ps = None
         if state.get("optimizer") is not None and getattr(ps, "dp_mode", None) == "fsdp2":
             if _needs_extra_parallel_layout_marker(specs) and not allow_proven_optimizer:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
@@ -2130,7 +2161,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if single_exact:
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         _reject_unproven_extra_parallel_optimizer(
-            state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi
+            state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi, saving=True
         )
         scheduler_object = state.get("_veomni_scheduler_object") if multi else None
         source_model = state.get("model")

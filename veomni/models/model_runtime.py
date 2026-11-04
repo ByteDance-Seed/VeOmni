@@ -216,10 +216,6 @@ class VeOmniModelRuntime:
                 else None
             )
             raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint mode")
-        if manager == "dcp" and getattr(self.optimizer, "_is_multi_optimizer", False) is True:
-            from ..checkpoint.dynamic_rope import reject_dynamic_rope_multi_optimizer_training
-
-            reject_dynamic_rope_multi_optimizer_training(self.model)
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""
