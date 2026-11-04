@@ -50,7 +50,7 @@ from tests.ops.tol import (
 from tests.ops.utils import is_nvidia_cuda_available, make_grad_leaves
 from veomni.ops import resolve_op
 from veomni.ops.registry import OpEntry
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 _FLA_DEVICE_CASES = (
@@ -1130,6 +1130,10 @@ def _native_convolution_launch_plan(context):
 def test_causal_conv1d_npu_boundary_cache_inference_to_training():
     """A real NPU cache hit after inference must remain usable by backward."""
     explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    if not os.environ.get("VEOMNI_CI_CAPABILITIES") and get_device_type() == "mlu":
+        if explicitly_required:
+            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
+        pytest.skip("causal_conv1d npu needs torch_npu")
     backend = runner_capabilities().backend
     require_npu = explicitly_required or (bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and backend == "npu")
     available = backend == "npu" and IS_NPU_AVAILABLE and torch.npu.is_available()
