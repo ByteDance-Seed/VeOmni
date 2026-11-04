@@ -11,7 +11,11 @@ import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from veomni.utils.seqlen_pos_transform_utils import (
+    coalesce_tail_padding_cu_seqlens,
+    prepare_fa_kwargs_from_position_ids,
+    valid_seqlens_from_cu_seqlens,
+)
 from veomni.utils.tensor_utils import unflatten
 
 from .....mixins.base_mixin import BaseMixin
@@ -37,6 +41,44 @@ class TrainingMixin(TrainingModuleMixin):
         # Active sample's pre-pad packed length. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
+
+    def _build_packed_attention_mask_if_needed(
+        self,
+        *,
+        q_len: int,
+        attention_mask: torch.Tensor,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+    ) -> torch.Tensor | Dict[str, Any]:
+        """Pre-build a packed BlockMask / MagiAttentionMask when the backend does not use prepare_dense_attention_inputs."""
+        impl = getattr(self.config.text_config.ops_config, "attn_implementation", None) or getattr(
+            self.config.text_config, "_attn_implementation", "eager"
+        )
+        backend = impl.removeprefix("veomni_")
+        if backend not in ("flex_attention", "magi_attention"):
+            return attention_mask
+        from veomni.ops.mask import packed_causal_mask, sliding_window_mask
+
+        packed_kwargs: Dict[str, Any] = {
+            "impl": impl,
+            "device": self.device,
+            "cu_seqlens": cu_seq_lens_q,
+            "cu_seq_lens_k": cu_seq_lens_k,
+        }
+        if backend == "flex_attention":
+            packed_kwargs["attention_mask"] = attention_mask
+            packed_kwargs["compile_block_mask"] = self.device.type != "cpu"
+        causal_mask_mapping: Dict[str, Any] = {
+            "full_attention": packed_causal_mask(q_len, q_len, **packed_kwargs),
+        }
+        if getattr(self.language_model, "has_sliding_layers", False):
+            causal_mask_mapping["sliding_attention"] = sliding_window_mask(
+                q_len,
+                q_len,
+                sliding_window=self.config.text_config.sliding_window,
+                **packed_kwargs,
+            )
+        return causal_mask_mapping
 
     @pre_forward("forward")
     def forward_pre(
@@ -82,9 +124,22 @@ class TrainingMixin(TrainingModuleMixin):
             embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
             mask = sp_pad(attention_mask, dim=1, pad_value=1)
             pids = sp_pad(position_ids, dim=1, pad_value=0)
+            tail_padding_length = pids.size(1) - self._sp_own_len
             (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
+            if tail_padding_length > 0:
+                cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length)
+                cu_k = cu_q
+                seqlens = cu_q[1:] - cu_q[:-1]
+                max_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                max_k = max_q
             embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
+            mask = self._build_packed_attention_mask_if_needed(
+                q_len=embeds.size(1),
+                attention_mask=mask,
+                cu_seq_lens_q=cu_q,
+                cu_seq_lens_k=cu_k,
+            )
             return dict(
                 inputs_embeds=embeds,
                 attention_mask=mask,
@@ -94,6 +149,12 @@ class TrainingMixin(TrainingModuleMixin):
                 max_length_q=max_q,
                 max_length_k=max_k,
             )
+        attention_mask = self._build_packed_attention_mask_if_needed(
+            q_len=inputs_embeds.size(1),
+            attention_mask=attention_mask,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+        )
         return dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,

@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.arguments import OpsImplementationConfig
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
@@ -575,7 +577,7 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph_without_fsdp(mo
 def test_janus_siglip_forward_returns_image_embeds():
     JanusSiglip = _model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
+    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg(), ops_implementation=make_eager_ops_config()))
     pixels = torch.randn(1, 3, 64, 64)
     out = js(pixel_values=pixels)
     assert "image_embeds" in out and out["image_embeds"].dim() >= 2
@@ -590,7 +592,9 @@ def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeyp
 
     JanusSiglipAccelerated = _accelerated_model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglipAccelerated(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
+    js = JanusSiglipAccelerated(
+        JanusSiglipConfig(vision_config=_tiny_vision_cfg(), ops_implementation=make_eager_ops_config())
+    )
     pixels = torch.zeros(3, 3, 64, 64)
     real = js._encode_pixel_values(pixels)
     out = js.forward(pixel_values=pixels, is_dummy=True)
@@ -622,7 +626,7 @@ def test_janus_siglip_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatc
 def test_janus_llama_forward_returns_hidden_states():
     JanusLlama = _model_cls("janus_llama")
     JanusLlamaConfig = _config_cls("janus_llama")
-    jl = JanusLlama(JanusLlamaConfig(text_config=_tiny_text_cfg()))
+    jl = JanusLlama(JanusLlamaConfig(text_config=_tiny_text_cfg(), ops_implementation=make_eager_ops_config()))
     embeds = torch.randn(1, 4, 64)
     out = jl(inputs_embeds=embeds)
     assert out["hidden_states"].shape == (1, 4, 64)
@@ -631,7 +635,9 @@ def test_janus_llama_forward_returns_hidden_states():
 def test_accelerated_forward_delegates_to_native_modeling():
     JanusLlamaAccelerated = _accelerated_model_cls("janus_llama")
     JanusLlamaConfig = _config_cls("janus_llama")
-    model = JanusLlamaAccelerated(JanusLlamaConfig(text_config=_tiny_text_cfg()))
+    model = JanusLlamaAccelerated(
+        JanusLlamaConfig(text_config=_tiny_text_cfg(), ops_implementation=make_eager_ops_config())
+    )
     embeds = torch.randn(1, 4, 64)
     out = model.forward(inputs_embeds=embeds)
     assert out["hidden_states"].shape == (1, 4, 64)
@@ -901,5 +907,5 @@ def test_seed_omni_modules_select_ops_from_module_config_not_global_ops_config()
         vision_config={"hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4},
         ops_implementation={"attn_implementation": "sdpa"},
     )
-    assert siglip_cfg._attn_implementation == "sdpa"
-    assert siglip_cfg.vision_config._attn_implementation == "sdpa"
+    assert siglip_cfg._attn_implementation == OpsImplementationConfig.normalize_attention_backend("sdpa")
+    assert siglip_cfg.vision_config._attn_implementation == siglip_cfg._attn_implementation

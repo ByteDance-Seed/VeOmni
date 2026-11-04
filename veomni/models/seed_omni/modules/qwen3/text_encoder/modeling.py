@@ -18,8 +18,8 @@ class Qwen3TextEncoder(TextEncoder):
     sibling vision module supplies the projected patch embeds) — the CPU
     preprocessor (see :class:`Qwen3TextEncoderPreprocessor`) picks the right
     template at bind time. Only the ChatML autoregression (keyed on eos /
-    ``<|im_end|>``) is implemented here; accelerated-only behavior (SP,
-    vision-freeze) lives in ``accelerated.py``.
+    ``<|im_end|>``) is implemented here; SP-aware training hooks and the
+    image-mode vision-token freeze live in ``accelerated.py``.
     """
 
     config_class = Qwen3TextEncoderConfig

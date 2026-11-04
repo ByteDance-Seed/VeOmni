@@ -1,10 +1,13 @@
 """Qwen3 ChatML template as readable Python.
 
 Wraps each turn in ``<|im_start|>{role}\\n{content}<|im_end|>\\n`` (standard Qwen
-ChatML — every turn is closed, matching :class:`Qwen3VLChatTemplate`); the closing
-``<|im_end|>`` is supervised only on assistant turns. Reuses
-:class:`TextEncoderChatTemplate` for tokenize / merge / pack; only the ChatML
-templating and generation prompt are model-specific.
+ChatML — every turn is closed); the closing ``<|im_end|>`` is supervised only on
+assistant turns. Reuses :class:`TextEncoderChatTemplate` for tokenize / merge /
+pack; only the ChatML templating and generation prompt are model-specific.
+
+:class:`Qwen3VLChatTemplate` extends the same template with the image / video
+wrap tokens; it is selected per module through
+:attr:`~.configuration.Qwen3TextEncoderConfig.enable_image`.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ class Qwen3ChatMarkers:
 
 @dataclass(frozen=True)
 class Qwen3VLChatMarkers(Qwen3ChatMarkers):
-    """Wire-format ChatML markers with vision start/end delimiters."""
+    """ChatML markers with the vision start / end wrap tokens."""
 
     vision_start_token: str = "<|vision_start|>"
     vision_end_token: str = "<|vision_end|>"
@@ -45,9 +48,8 @@ class Qwen3ChatTemplate(TextEncoderChatTemplate):
     def apply_chat_template(self, sample: list[ConversationItem]) -> list[ConversationItem]:
         """Apply ChatML template to a raw text-only conversation.
 
-        Every turn is closed with ``<|im_end|>\\n`` (standard Qwen ChatML, matching
-        :class:`Qwen3VLChatTemplate`); the closing marker is supervised only for
-        assistant turns.
+        Every turn is closed with ``<|im_end|>\\n`` (standard Qwen ChatML); the
+        closing marker is supervised only for assistant turns.
         """
         markers = self.chat_markers
         out: list[ConversationItem] = []
@@ -101,7 +103,11 @@ class Qwen3VLChatTemplate(Qwen3ChatTemplate):
         self.chat_markers = Qwen3VLChatMarkers()
 
     def apply_chat_template(self, sample: list[ConversationItem]) -> list[ConversationItem]:
-        """Apply Qwen3-VL ChatML to a raw conversation (text + image + video)."""
+        """Apply Qwen3-VL ChatML to a raw conversation (text + image + video).
+
+        Qwen3-VL has no audio modality (audio-in-video is an Omni feature — see
+        ``docs/seed_omni/design/media.md``, design-only).
+        """
         markers = self.chat_markers
         out: list[ConversationItem] = []
         dummy_parts: list[ConversationItem] = []
@@ -131,6 +137,8 @@ class Qwen3VLChatTemplate(Qwen3ChatTemplate):
             if item.type == "text":
                 out.append(self._build_conversation_item("text", str(item.value), role))
             elif item.type in ("image", "video"):
+                # The media row is passed through verbatim so it keeps its
+                # ``value`` / ``role`` / ``meta`` tags for the vision module.
                 out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
                 out.append(item)
                 out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))

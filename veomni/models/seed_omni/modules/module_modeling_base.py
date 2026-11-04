@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from transformers import PreTrainedModel
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 
 class PretrainedOmniModule(PreTrainedModel):

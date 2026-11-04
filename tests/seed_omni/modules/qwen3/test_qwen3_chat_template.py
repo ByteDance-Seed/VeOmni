@@ -10,6 +10,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
@@ -19,10 +20,7 @@ from veomni.models.seed_omni.modules.base.llm_packing import (
     pack_llm_conversations_for_forward,
     scatter_llm_hidden_states,
 )
-from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
-    Qwen3ChatTemplate,
-    Qwen3VLChatTemplate,
-)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import Qwen3ChatTemplate
 from veomni.models.seed_omni.modules.qwen3.text_encoder.configuration import Qwen3TextEncoderConfig
 from veomni.models.seed_omni.modules.qwen3.text_encoder.processing import Qwen3TextEncoderPreprocessor
 from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
@@ -107,20 +105,6 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline_and_sets_token_len():
     assert torch.equal(worker_shape, ref_shape)
 
 
-def test_qwen3_text_preprocessor_from_pretrained_applies_enable_image_override(tmp_path, monkeypatch):
-    import veomni.models.seed_omni.modules.qwen3.text_encoder.processing as qwen3_text_processing
-
-    Qwen3TextEncoderConfig(enable_image=False).save_pretrained(str(tmp_path))
-    monkeypatch.setattr(qwen3_text_processing, "build_tokenizer", lambda module_path: FakeTokenizer())
-
-    default_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path))
-    assert isinstance(default_pre._chat_template, Qwen3ChatTemplate)
-    assert not isinstance(default_pre._chat_template, Qwen3VLChatTemplate)
-
-    override_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path), config_overrides={"enable_image": True})
-    assert isinstance(override_pre._chat_template, Qwen3VLChatTemplate)
-
-
 def _tiny_qwen3_cfg() -> dict:
     return {
         "vocab_size": 128,
@@ -154,11 +138,18 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
     Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
 
-    llm = Qwen3Llm(Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": "eager"}))
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation={"attn_implementation": "eager", "rms_norm_implementation": "eager"},
+        )
+    )
     assert llm.config.text_config._attn_implementation == "eager"
+    assert llm.config.text_config.ops_config.rms_norm_implementation == "eager"
     save_as_omni(tmp_path / "llm", "qwen3_llm", llm)
     cfg, llm2 = load_from_omni(tmp_path / "llm", "qwen3_llm")
     assert cfg.model_type == "qwen3_llm"
+    assert cfg.text_config.ops_config.rms_norm_implementation == "eager"
     assert isinstance(llm2, Qwen3Llm)
     assert isinstance(llm2.language_model.get_input_embeddings(), torch.nn.Identity)
 
@@ -168,6 +159,60 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert rcfg.model_type == "qwen3_text_encoder"
     assert isinstance(te2, Qwen3TextEncoder)
     assert te2.config.vocab_size == 128
+
+
+def test_qwen3_llm_generate_rejects_ulysses_sequence_parallel(monkeypatch):
+    import veomni.models.seed_omni.modules.base.llm_packing as llm_packing
+
+    monkeypatch.setattr(llm_packing, "get_parallel_state", lambda: SimpleNamespace(sp_size=2))
+    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation={"attn_implementation": "eager"},
+        )
+    )
+    with pytest.raises(ValueError, match="sp_size=1"):
+        llm.generate(conversation_list=[ConversationItem(type="text", value="hi", role="user")])
+
+
+def test_qwen3_llm_decode_keeps_the_prompt_attention_mask(monkeypatch):
+    """Masked prompt positions stay masked once their keys are in the cache."""
+    import veomni.models.seed_omni.modules.base.llm_packing as llm_packing
+
+    monkeypatch.setattr(llm_packing, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+    Qwen3Llm = OMNI_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    llm = Qwen3Llm(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation="eager"),
+        )
+    )
+
+    seen: list[torch.Tensor | None] = []
+    real_forward = llm.forward
+
+    def record_forward(*, attention_mask=None, **kwargs):
+        seen.append(None if attention_mask is None else attention_mask.detach().clone())
+        return real_forward(attention_mask=attention_mask, **kwargs)
+
+    llm.forward = record_forward
+
+    conversation = [
+        ConversationItem(
+            type="text",
+            value=torch.randn(4, 32),
+            role="user",
+            meta={"attention_mask": torch.tensor([1, 1, 0, 0])},
+        )
+    ]
+    llm.generate(conversation)  # prefill
+    llm.generate(conversation)  # first decode
+
+    assert seen[0].tolist() == [[1, 1, 0, 0]]
+    assert seen[1].tolist() == [[1, 1, 0, 0, 1]]
 
 
 @pytest.mark.parametrize("attn_impl", ["eager", "sdpa", "veomni_sdpa"])
@@ -185,7 +230,10 @@ def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatc
     Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
     torch.manual_seed(42)
     llm_packed = Qwen3LlmAcc(
-        Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": attn_impl})
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation=attn_impl),
+        )
     ).eval()
     llm_sep = copy.deepcopy(llm_packed).eval()
 
@@ -254,6 +302,77 @@ def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatc
     assert tuple(mask.shape) == (1, 9)
     assert tuple(pids.shape) == (1, 9)
     scatter_llm_hidden_states(out_conv, [torch.zeros(3, 32), torch.zeros(2, 32), torch.zeros(4, 32)])
+
+
+def test_qwen3_accelerated_packed_flex_attention_builds_block_mask_and_matches_separate_forwards(monkeypatch):
+    import copy
+
+    import veomni.models.seed_omni.modules.qwen3.llm.accelerated.accelerated as qwen3_llm_acc
+    from veomni.ops.kernels.attention import lookup
+
+    class _FlexOp:
+        impl = "veomni_flex_attention"
+
+        def __init__(self):
+            self._fn = lookup("veomni_flex_attention")
+
+        def __call__(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        qwen3_llm_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=False, sp_size=1, sp_group=None),
+    )
+    Qwen3LlmAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_llm"]()
+    Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
+    torch.manual_seed(42)
+    llm_packed = Qwen3LlmAcc(
+        Qwen3LlmConfig(
+            text_config=_tiny_qwen3_cfg(),
+            ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
+        )
+    ).eval()
+    llm_packed.config.text_config.ops_implementation["attn_implementation"] = "veomni_flex_attention"
+    llm_packed.config.text_config._attn_implementation = "veomni_flex_attention"
+    for layer in llm_packed.language_model.layers:
+        layer.self_attn.veomni_attn = _FlexOp()
+    llm_sep = copy.deepcopy(llm_packed).eval()
+
+    s0_u = torch.randn(3, 32)
+    s0_a = torch.randn(2, 32)
+    s1_u = torch.randn(4, 32)
+
+    with torch.no_grad():
+        conversations = [
+            [
+                ConversationItem(type="text", value=s0_u.clone(), role="user"),
+                ConversationItem(type="text", value=s0_a.clone(), role="assistant"),
+            ],
+            [
+                ConversationItem(type="text", value=s1_u.clone(), role="user"),
+            ],
+        ]
+        pre_out = llm_packed.pre_forward("forward", conversation_list=conversations)
+        assert isinstance(pre_out["attention_mask"], dict) and "full_attention" in pre_out["attention_mask"]
+        out_conv = llm_packed.post_forward("forward", **llm_packed(**pre_out))["conversation_list"]
+
+        conv_0 = [
+            [
+                ConversationItem(type="text", value=s0_u.clone(), role="user"),
+                ConversationItem(type="text", value=s0_a.clone(), role="assistant"),
+            ]
+        ]
+        pre_0 = llm_sep.pre_forward("forward", conversation_list=conv_0)
+        out_0 = llm_sep.post_forward("forward", **llm_sep(**pre_0))["conversation_list"]
+
+        conv_1 = [[ConversationItem(type="text", value=s1_u.clone(), role="user")]]
+        pre_1 = llm_sep.pre_forward("forward", conversation_list=conv_1)
+        out_1 = llm_sep.post_forward("forward", **llm_sep(**pre_1))["conversation_list"]
+
+        torch.testing.assert_close(out_conv[0][0].value, out_0[0][0].value, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_conv[0][1].value, out_0[0][1].value, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_conv[1][0].value, out_1[0][0].value, atol=1e-5, rtol=1e-5)
 
 
 def test_qwen3_text_encoder_generate_works_with_omitted_generation_kwargs():

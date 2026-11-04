@@ -15,6 +15,10 @@
 #      Always call the local rms_norm VeomniOp
 #    - method_override: Qwen3MoeMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen3MoeDecoderLayer.__init__
+#      Pass config to Qwen3MoeRMSNorm instances
+#    - method_override: Qwen3MoeModel.__init__
+#      Pass config to final Qwen3MoeRMSNorm
 #    - method_override: Qwen3MoeMLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - class_replacement: Qwen3MoeExperts
@@ -49,7 +53,6 @@
 from collections.abc import Callable
 from functools import partial
 
-# Additional imports for patches
 import torch
 from torch import nn
 from transformers import initialization as init
@@ -67,7 +70,6 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import MoeModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -76,10 +78,12 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss, load_balancing_loss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -158,8 +162,10 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -223,7 +229,7 @@ class Qwen3MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -257,7 +263,7 @@ class Qwen3MoeExperts(torch.nn.Module):
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -373,11 +379,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3MoeRMSNorm(nn.Module):
     # ── RMSNorm (always call local VeomniOp) ─────────────────────────────────
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -386,8 +393,14 @@ class Qwen3MoeRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
@@ -396,8 +409,8 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             self.mlp = Qwen3MoeSparseMoeBlock(config)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -521,13 +534,13 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3MoeModel
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 @auto_docstring
 class Qwen3MoeModel(Qwen3MoePreTrainedModel):
-    def __init__(self, config: Qwen3MoeConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -536,11 +549,10 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -703,13 +715,13 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_op_impl("load_balancing_loss_implementation"),
+            config.ops_config.load_balancing_loss_implementation,
         )
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
@@ -814,7 +826,7 @@ class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3M
         self.num_labels = config.num_labels
         self.model = Qwen3MoeModel(config)
         self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
         self.post_init()

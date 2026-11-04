@@ -29,6 +29,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build synthetic BF16 activations, FP32 routing weights, and expert tensors."""
     hidden = torch.randn(2, 4, dtype=torch.bfloat16)
     routing = torch.ones(2, 1, dtype=torch.float32)
     selected = torch.zeros(2, 1, dtype=torch.int64)
@@ -37,13 +38,32 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, t
     return hidden, routing, selected, fc1, fc2
 
 
+def test_triton_casts_routing_weights(monkeypatch):
+    """Standard Triton MoE entry casts FP32 routing weights to activation dtype."""
+    from veomni.ops.kernels.moe_experts.standard import triton
+
+    hidden, routing, selected, fc1, fc2 = _inputs()
+    seen: dict[str, torch.dtype] = {}
+
+    def apply(*args):
+        """Record the routing-weight dtype passed to the autograd Function."""
+        seen["dtype"] = args[1].dtype
+        return hidden
+
+    monkeypatch.setattr(triton.TritonFusedMoeExpertFunction, "apply", apply)
+    triton.group_gemm_fused_moe_forward(2, routing, selected, hidden, fc1, fc1, fc2)
+    assert seen["dtype"] == torch.bfloat16
+
+
 def test_quack_casts_routing_weights(monkeypatch):
+    """Standard Quack MoE entry casts FP32 routing weights to activation dtype."""
     from veomni.ops.kernels.moe_experts.standard import quack
 
     hidden, routing, selected, fc1, fc2 = _inputs()
     seen: dict[str, torch.dtype] = {}
 
     def apply(*args):
+        """Record the routing-weight dtype passed to the autograd Function."""
         seen["dtype"] = args[1].dtype
         return hidden
 
@@ -52,13 +72,33 @@ def test_quack_casts_routing_weights(monkeypatch):
     assert seen["dtype"] == torch.bfloat16
 
 
+def test_gpt_oss_quack_casts_routing_weights(monkeypatch):
+    """GPT-OSS Quack MoE entry casts FP32 routing weights to activation dtype."""
+    from veomni.ops.kernels.moe_experts.gpt_oss import quack
+
+    hidden, routing, selected, fc1, fc2 = _inputs()
+    bias = torch.randn(2, 4, dtype=torch.bfloat16)
+    seen: dict[str, torch.dtype] = {}
+
+    def apply(*args):
+        """Record the routing-weight dtype passed to the autograd Function."""
+        seen["dtype"] = args[1].dtype
+        return hidden
+
+    monkeypatch.setattr(quack.GptOssQuackFusedMoeExpertFunction, "apply", apply)
+    quack.quack_gemm_gpt_oss_fused_moe_forward(2, routing, selected, hidden, fc1, bias, fc2, bias)
+    assert seen["dtype"] == torch.bfloat16
+
+
 def test_npu_casts_routing_weights(monkeypatch):
+    """Standard NPU MoE entry casts FP32 routing weights to activation dtype."""
     from veomni.ops.kernels.moe_experts.standard import npu
 
     hidden, routing, selected, fc1, fc2 = _inputs()
     seen: dict[str, torch.dtype] = {}
 
     def forward(*args, **kwargs):
+        """Record the routing-weight dtype passed to the NPU forward helper."""
         seen["dtype"] = args[1].dtype
         return hidden
 
@@ -68,6 +108,7 @@ def test_npu_casts_routing_weights(monkeypatch):
 
 
 def test_mlu_casts_routing_weights(monkeypatch):
+    """Standard MLU MoE entry casts FP32 routing weights to activation dtype."""
     from veomni.ops.kernels.moe_experts.standard import mlu
 
     hidden, routing, selected, fc1, fc2 = _inputs()
@@ -77,6 +118,7 @@ def test_mlu_casts_routing_weights(monkeypatch):
     permute_mod.permute = lambda hidden_states, experts, dim: (hidden_states, torch.arange(hidden_states.shape[0]))
 
     def unpermute(tokens, indices, routing_weights):
+        """Record the routing-weight dtype passed to MLU unpermute."""
         seen["dtype"] = routing_weights.dtype
         return tokens
 
@@ -87,8 +129,134 @@ def test_mlu_casts_routing_weights(monkeypatch):
     monkeypatch.setitem(sys.modules, "apex.contrib.unpermute", unpermute_mod)
 
     def apply(*args, **kwargs):
+        """Return unchanged activations from the mocked MLU grouped GEMM."""
         return hidden
 
     monkeypatch.setattr(mlu.MLUGroupGemm, "apply", apply)
     mlu.mlu_group_gemm_fused_moe_forward(2, routing, selected, hidden, fc1, fc1, fc2)
     assert seen["dtype"] == torch.bfloat16
+
+
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_lora_triton_casts_routing_weights(monkeypatch, variant: str):
+    """MoE-LoRA Triton entries cast FP32 routing weights to activation dtype."""
+    from veomni.ops.kernels.moe_experts_lora.independent import triton as indep_triton
+    from veomni.ops.kernels.moe_experts_lora.shared import triton as shared_triton
+
+    hidden, routing, selected, fc1, fc2 = _inputs()
+    seen: dict[str, torch.dtype] = {}
+
+    def apply(*args):
+        """Record the routing-weight dtype passed to the LoRA autograd Function."""
+        seen["dtype"] = args[1].dtype
+        return hidden
+
+    if variant == "shared":
+        monkeypatch.setattr(shared_triton.MergedFc1TritonFusedLoRAMoeExpertFunction, "apply", apply)
+        loras = [torch.randn(2, 4, dtype=torch.bfloat16) for _ in range(6)]
+        shared_triton.group_gemm_fused_lora_moe_forward(2, routing, selected, hidden, fc1, fc2, *loras, 0.5, 0.5, 0.5)
+    else:
+        monkeypatch.setattr(indep_triton.MergedFc1IndependentTritonFusedLoRAMoeExpertFunction, "apply", apply)
+        loras = [torch.randn(2, 2, 4, dtype=torch.bfloat16) for _ in range(6)]
+        indep_triton.group_gemm_fused_independent_lora_moe_forward(
+            2, routing, selected, hidden, fc1, fc2, *loras, 0.5, 0.5, 0.5
+        )
+    assert seen["dtype"] == torch.bfloat16
+
+
+def test_lora_npu_helper_casts_routing_weights(monkeypatch):
+    """MoE-LoRA NPU non-EP and EP helpers cast FP32 routing weights to activation dtype."""
+    from veomni.ops.kernels.moe_experts_lora import helper
+
+    hidden, routing, selected, fc1, fc2 = _inputs()
+    seen: list[torch.dtype] = []
+
+    npu_mod = types.ModuleType("torch_npu")
+    npu_mod.npu_moe_token_permute = lambda h, s: (h, torch.arange(h.shape[0]))
+    npu_mod.npu_swiglu = lambda x, dim=-1: x[:, : x.shape[-1] // 2]
+
+    def unpermute(output, row_ids_map, probs=None):
+        """Record the routing-weight dtype passed to NPU token unpermute."""
+        seen.append(probs.dtype)
+        return output
+
+    npu_mod.npu_moe_token_unpermute = unpermute
+    monkeypatch.setitem(sys.modules, "torch_npu", npu_mod)
+
+    from veomni.ops.kernels.moe_experts.standard import npu as std_npu
+
+    monkeypatch.setattr(std_npu, "npu_group_gemm", lambda a, b, g: a)
+    monkeypatch.setattr(
+        std_npu,
+        "dispatch_preprocess",
+        lambda s, e, g: ([1], [1], torch.ones(1, e, dtype=torch.int64), torch.ones(e, dtype=torch.int64)),
+    )
+    monkeypatch.setattr(std_npu, "alltoall_dispatch", lambda h, *args: (h, torch.arange(h.shape[0])))
+
+    def combine(output, routing_weights, *args):
+        """Record the routing-weight dtype passed to NPU EP combine."""
+        seen.append(routing_weights.dtype)
+        return output
+
+    monkeypatch.setattr(std_npu, "alltoall_combine", combine)
+
+    def zero_delta(x, _g):
+        """Return a zero LoRA delta matching ``x``."""
+        return torch.zeros_like(x)
+
+    helper.npu_non_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
+    helper.npu_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
+    assert seen == [torch.bfloat16, torch.bfloat16]
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_lora_moe_layers_preserve_routing_weight_dtype(mode: str):
+    """MoE-LoRA expert wrappers forward ``top_k_weights`` without casting."""
+    from veomni.lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
+
+    class _BaseExperts(torch.nn.Module):
+        def __init__(self) -> None:
+            """Initialize minimal fused expert parameters for LoRA wrapping."""
+            super().__init__()
+            self.num_experts = 2
+            self.hidden_dim = 4
+            self.intermediate_dim = 4
+            self.act_fn = torch.nn.SiLU()
+            self.gate_up_proj = torch.nn.Parameter(torch.randn(2, 8, 4, dtype=torch.bfloat16))
+            self.down_proj = torch.nn.Parameter(torch.randn(2, 4, 4, dtype=torch.bfloat16))
+
+    wrapper_cls = LoraSharedExperts if mode == "shared" else LoraIndependentExperts
+    layer = wrapper_cls(_BaseExperts(), r=2, lora_alpha=4)
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    top_k_index = torch.zeros(3, 1, dtype=torch.long)
+    top_k_weights = torch.ones(3, 1, dtype=torch.float32)
+    captured: dict[str, torch.Tensor] = {}
+
+    class _RecordingOp:
+        impl = "fused_triton"
+
+        def __call__(self, *args, **kwargs):
+            """Capture the routing weights forwarded by the LoRA expert layer."""
+            captured["routing_weights"] = args[1]
+            return torch.zeros_like(hidden)
+
+    layer.veomni_moe_lora = _RecordingOp()
+    layer(hidden, top_k_index, top_k_weights)
+    assert captured["routing_weights"] is top_k_weights
+    assert captured["routing_weights"].dtype == torch.float32
+
+
+def test_unpermute_preserves_tokens_dtype_with_fp32_routing_weights():
+    """EP ``unpermute`` returns activations in ``tokens.dtype`` when ``routing_weights`` is FP32."""
+    from veomni.distributed.moe.moe_utils import unpermute
+
+    tokens = torch.randn(4, 8, dtype=torch.bfloat16, requires_grad=True)
+    routing_weights = torch.full((2, 2), 0.5, dtype=torch.float32, requires_grad=True)
+    routing_map = torch.ones((2, 2), dtype=torch.long)
+    permutation_mapping = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    out = unpermute(tokens, routing_weights, torch.Size([2, 8]), permutation_mapping, routing_map)
+    assert out.dtype == torch.bfloat16
+    out.sum().backward()
+    assert tokens.grad is not None and tokens.grad.dtype == torch.bfloat16
+    assert routing_weights.grad is not None and routing_weights.grad.dtype == torch.float32

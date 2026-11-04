@@ -75,7 +75,7 @@ train:
   num_train_epochs: 1
   global_batch_size: 32
   micro_batch_size: 2
-  dyn_bsz: false
+  dyn_bsz: true
 
   checkpoint:
     output_dir: outputs/qwen3_0.6b_omni_sft
