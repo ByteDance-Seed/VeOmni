@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from datasets import interleave_datasets, load_dataset
+from datasets.iterable_dataset import BufferShuffledExamplesIterable
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
@@ -128,10 +129,10 @@ class IterativeDataset(IterableDataset):
             self._data.set_epoch(epoch)
 
 
-def _shards_across_workers(dataset) -> bool:
-    """Whether ``dataset`` already splits its source shards across DataLoader workers.
+def _find_hf_iterable_dataset(dataset) -> Optional[HFIterableDataset]:
+    """Find the HF source under supported dataset wrappers.
 
-    Hugging Face ``IterableDataset`` does this itself: when iterated inside a
+    Hugging Face ``IterableDataset`` splits source shards itself: inside a
     DataLoader worker it dispatches to ``_iter_pytorch`` and assigns each worker
     its own source shards. Splitting such a stream by worker again would drop
     every row that HF handed to the other workers. Plain iterables (lists,
@@ -142,14 +143,32 @@ def _shards_across_workers(dataset) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, HFIterableDataset):
-            return True
+            return current
         for attr in ("_data", "_dataset"):
             nxt = getattr(current, attr, None)
             if nxt is not None:
                 current = nxt
                 break
         else:
-            return False
+            return None
+    return None
+
+
+def _has_hf_shuffle_buffer(dataset: HFIterableDataset) -> bool:
+    """Whether the HF iterable tree contains a buffer omitted from its cursor."""
+    pending = [dataset._ex_iterable]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BufferShuffledExamplesIterable):
+            return True
+        child = getattr(current, "ex_iterable", None)
+        if child is not None:
+            pending.append(child)
+        pending.extend(getattr(current, "ex_iterables", ()))
     return False
 
 
@@ -168,6 +187,7 @@ class ShardedIterableDataset(IterableDataset):
         self._epoch = 0
         self._source = None
         self._iterator = None
+        self._replay_source = False
         self._restore_pending = False
         self._reset_state()
 
@@ -187,7 +207,9 @@ class ShardedIterableDataset(IterableDataset):
         worker_info = get_worker_info()
         self._worker_id = 0 if worker_info is None else worker_info.id
         self._num_workers = 1 if worker_info is None else worker_info.num_workers
-        self._source_shards_workers = _shards_across_workers(self._dataset)
+        hf_source = _find_hf_iterable_dataset(self._dataset)
+        self._source_shards_workers = hf_source is not None
+        self._replay_source = hf_source is not None and _has_hf_shuffle_buffer(hf_source)
         if self._source_shards_workers:
             # The wrapped stream already assigns source shards to DataLoader
             # workers, so splitting by worker a second time would silently drop
@@ -197,8 +219,9 @@ class ShardedIterableDataset(IterableDataset):
             self._restore_pending = False
             if self._phase != "UNSTARTED":
                 if self._phase == "ACTIVE":
-                    skipped = self._rows_read if self._source_state is None else 0
-                    self._start_pass(self._source_state, skipped)
+                    source_state = None if self._replay_source else self._source_state
+                    skipped = self._rows_read if source_state is None else 0
+                    self._start_pass(source_state, skipped)
                 return _ShardedIterableIterator(self)
         self._reset_state()
         self._phase = "ACTIVE"
@@ -211,9 +234,13 @@ class ShardedIterableDataset(IterableDataset):
             self._source.set_epoch(self._seed + self._epoch + self._pass_index)
         if source_state is not None:
             self._source.load_state_dict(copy.deepcopy(source_state))
-        self._source_state = copy.deepcopy(
-            self._source.state_dict() if source_state is None and hasattr(self._source, "state_dict") else source_state
-        )
+        self._source_state = None
+        if not self._replay_source:
+            self._source_state = copy.deepcopy(
+                self._source.state_dict()
+                if source_state is None and hasattr(self._source, "state_dict")
+                else source_state
+            )
         self._source_started = False
         self._iterator = iter(self._source)
         for _ in islice(self._iterator, skipped):
@@ -247,7 +274,7 @@ class ShardedIterableDataset(IterableDataset):
 
     def state_dict(self):
         source_state = self._source_state
-        if self._source_started and hasattr(self._source, "state_dict"):
+        if self._source_started and not self._replay_source and hasattr(self._source, "state_dict"):
             source_state = self._source.state_dict()
         return copy.deepcopy(
             {

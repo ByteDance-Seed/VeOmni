@@ -83,6 +83,18 @@ state protocol. HF sources are recreated privately for each pass so a restored
 starting cursor cannot leak into later repeat passes; they are not worker-sharded
 twice. Sources without a cursor replay the consumed prefix of the current
 pass; this preserves row order only for deterministic, re-iterable sources.
+Buffered HF shuffled sources also replay the current pass through `rows_read`:
+in datasets 2.21.0 their cursor omits the shuffle buffer and may already point
+to upstream EOF while buffered rows remain. The same pass seed and output
+prefix rebuild that buffer instead of skipping rows or starting a repeat early.
+This replay also ignores incomplete source cursors saved by earlier snapshots.
+It costs a prefix scan on restart; unshuffled HF sources retain cursor restore.
+Detection walks HF internal `_ex_iterable` and its `ex_iterable`/`ex_iterables`
+children for `BufferShuffledExamplesIterable`, beneath supported
+`_data`/`_dataset` wrappers. This covers buffers hidden by map/filter, concat
+or interleave composition even when the outer `_shuffling` is `None`.
+Regressions cover datasets 2.21.0, default iterable/interleave builder shuffle,
+zero/one/two native workers and unshuffled cursor controls.
 `IterativeDataset.state_dict()` returns `None` when its upstream source has no
 cursor, so wrapping a stateless source does not suppress that replay.
 
