@@ -16,7 +16,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 
-from scripts.ci.accelerator.launch_plan import from_parameter
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.checkpoint.dcp_checkpointer import (
     _EXPERT_LAYOUTS_KEY,
@@ -30,6 +30,9 @@ from veomni.checkpoint.dcp_checkpointer import (
     drop_extra_parallel_dim,
     restore_extra_parallel_dim,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _layout_worker(rank, world, directory, rendezvous):
