@@ -13,7 +13,7 @@ from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchin
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 
 
 def _restore_worker(rank, root, failure):
