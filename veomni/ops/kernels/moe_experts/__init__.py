@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+﻿# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .kimi_k3 import eager as kimi_k3_eager
 from .kimi_k3 import fused_npu as kimi_k3_fused_npu
+from .shared import unpermute
 from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
@@ -43,6 +44,24 @@ from .standard import triton as standard_triton
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+
+
+register_op(
+    "moe_unpermute",
+    "standard",
+    "eager",
+    wrapper=unpermute.eager,
+    description="Weighted token scatter with FP32 accumulation",
+)
+register_op(
+    "moe_unpermute",
+    "standard",
+    "triton",
+    wrapper=unpermute.triton,
+    description="Fused weighted token scatter with FP32 accumulation",
+    requirement=GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS,)),
+    requires=("triton",),
+)
 
 
 register_op(

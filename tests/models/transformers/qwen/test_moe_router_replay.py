@@ -63,7 +63,7 @@ import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
-from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.moe_router_replay import set_active_replay
 
 
@@ -78,15 +78,12 @@ _DEVICE = torch.device("cpu")
 
 @pytest.fixture(autouse=True)
 def _restore_active_replay():
-    """Select eager ops for construction and restore process state even after failures."""
-    previous_ops = get_ops_config()
-    set_ops_config(eager_ops_config())
+    """Restore active replay state even after failures."""
     set_active_replay(None)
     try:
         yield
     finally:
         set_active_replay(None)
-        set_ops_config(previous_ops)
 
 
 # ----------------------------------------------------------------- mocks
@@ -140,7 +137,7 @@ def _make_qwen3_moe_config():
     """Toy ``Qwen3MoeConfig`` sized for fast invariant testing."""
     from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-    return Qwen3MoeConfig(
+    config = Qwen3MoeConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -159,13 +156,15 @@ def _make_qwen3_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return config
 
 
 def _make_qwen3_5_moe_config():
     """Toy ``Qwen3_5MoeConfig`` sized for fast invariant testing."""
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-    return Qwen3_5MoeConfig(
+    config = Qwen3_5MoeConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -185,6 +184,8 @@ def _make_qwen3_5_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return config
 
 
 def _make_qwen4_exp_config(norm_topk_prob: bool):
@@ -193,6 +194,7 @@ def _make_qwen4_exp_config(norm_topk_prob: bool):
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.norm_topk_prob = norm_topk_prob
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 

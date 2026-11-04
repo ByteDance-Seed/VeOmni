@@ -27,9 +27,10 @@ class FakeModuleB(PretrainedOmniModule):
     base_model_prefix = "fake_module_b"
     supports_gradient_checkpointing = False
     _no_split_modules = ["FakeModuleB"]
-    # See FakeModuleA: opens HF's `_sdpa_can_dispatch` gate so the omni load
-    # path can be exercised with a non-`eager` `attn_implementation`.
-    _supports_sdpa = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This fixture module only projects hidden states and executes no attention.
+        return attn_implementation
 
     def __init__(self, config: FakeModuleBConfig, **kwargs):
         super().__init__(config, **kwargs)
