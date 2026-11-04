@@ -166,7 +166,16 @@ class VeOmniModelRuntime:
             layout_error = None
             try:
                 if canonical:
-                    _configure_extra_parallel_checkpoint_layout(self.model, self.train_args.checkpoint)
+                    from ..distributed.torch_parallelize import _has_extra_parallel_plan
+
+                    _configure_extra_parallel_checkpoint_layout(
+                        self.model,
+                        self.train_args.checkpoint,
+                        require_plan=(
+                            bool(getattr(self.parallel_state, "any_extra_parallel_enabled", False))
+                            and _has_extra_parallel_plan(self.model)
+                        ),
+                    )
             except BaseException as exc:
                 layout_error = exc
             raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")

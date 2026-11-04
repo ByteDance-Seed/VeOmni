@@ -9,6 +9,23 @@ import math
 import torch
 
 
+def _is_native_qwen3_dynamic_reset_alias(module):
+    """Recognize the native Qwen3 reset alias, not custom mutable caches."""
+    cls = type(module)
+    if cls.__module__ != "transformers.models.qwen3.modeling_qwen3" or cls.__name__ != "Qwen3RotaryEmbedding":
+        return False
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+    buffers = module._buffers
+    return (
+        cls is Qwen3RotaryEmbedding
+        and module.rope_type == "dynamic"
+        and {"inv_freq", "original_inv_freq"} <= module._non_persistent_buffers_set
+        and buffers.get("inv_freq") is not None
+        and buffers.get("inv_freq") is buffers.get("original_inv_freq")
+    )
+
+
 def dynamic_rope_checkpoint_contract(model):
     """Reject dynamic caches that a fresh runtime cannot reconstruct exactly.
 
@@ -31,10 +48,10 @@ def dynamic_rope_checkpoint_contract(model):
                 cached = int(getattr(module, f"{prefix}max_seq_len_cached", module.max_seq_len_cached))
                 inv = getattr(module, f"{prefix}inv_freq")
                 initial_inv = getattr(module, f"{prefix}original_inv_freq")
-                # After a dynamic grow/reset, HF can assign the original
-                # buffer object directly. A fresh instance may not share
-                # this alias, and DCP does not persist it.
-                if inv is initial_inv:
+                # Native Qwen3 resets by reusing the original buffer. Its
+                # forward reads the buffer and growth replaces it, so object
+                # identity is not part of its recoverable numerical state.
+                if inv is initial_inv and not (layer_type is None and _is_native_qwen3_dynamic_reset_alias(module)):
                     raise RuntimeError("dynamic RoPE reset shares nonpersistent cache buffers")
                 kwargs = {} if layer_type is None else {"layer_type": layer_type}
                 expected_inv, expected_scale = ROPE_INIT_FUNCTIONS[kind](

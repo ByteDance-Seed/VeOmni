@@ -68,6 +68,47 @@ def test_other_checkpoint_managers_keep_their_own_async_policy(monkeypatch):
     assert _runtime(True, True, manager="custom").optimizer._is_multi_optimizer is True
 
 
+@pytest.mark.parametrize("active,has_plan", [(False, False), (True, False), (False, True), (True, True)])
+def test_canonical_layout_requires_only_an_active_extra_parallel_plan(monkeypatch, active, has_plan):
+    from torch.distributed.tensor import Shard
+
+    from veomni.distributed.parallel_plan import ParallelPlan
+
+    model = torch.nn.Linear(2, 2)
+    if has_plan:
+        model.get_parallel_plan = lambda: ParallelPlan(extra_parallel_plan={"ep": {"weight": Shard(0)}})
+    state = SimpleNamespace(
+        any_extra_parallel_enabled=active,
+        extra_parallel_sizes=("ep",),
+        extra_parallel_enabled=lambda name: active and name == "ep",
+    )
+    monkeypatch.setattr(model_runtime, "use_parallel_state", lambda *_: nullcontext())
+    monkeypatch.setattr(model_runtime, "get_parallel_state_by_name", lambda _name: state)
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.get_parallel_state", lambda: state)
+    for name in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_build_model_assets",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(model_runtime.VeOmniModelRuntime, name, lambda self: None)
+    monkeypatch.setattr(model_runtime.VeOmniModelRuntime, "_build_model", lambda self: setattr(self, "model", model))
+    reached = []
+    monkeypatch.setattr(
+        model_runtime.VeOmniModelRuntime, "_build_optimizer_checked", lambda self, *_: reached.append(True)
+    )
+    args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
+    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None, extra_parallel_canonical_layout=True))
+    if active and has_plan:
+        with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
+            model_runtime.VeOmniModelRuntime(args, train=train)
+        assert not reached
+    else:
+        model_runtime.VeOmniModelRuntime(args, train=train)
+        assert reached == [True]
+
+
 def test_omni_composed_wrap_rejects_async_multi_optimizer_before_checkpoint(monkeypatch):
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 

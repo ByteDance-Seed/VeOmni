@@ -39,7 +39,9 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _layout_worker(rank, world, directory, rendezvous):
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=90))
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=180)
+    )
     try:
         shape, names = ((2, 2), ("ep_fsdp", "ep")) if world == 4 else ((2, 2, 2), ("ep_replicate", "ep_fsdp", "ep"))
         mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)

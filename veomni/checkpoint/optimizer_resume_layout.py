@@ -159,7 +159,7 @@ def _local_layout(
         optimizer_names.setdefault(id(param), set()).update(_get_fqns(optimizer.model, runtime_name))
     if names != optimizer_names:
         raise RuntimeError("MultiOptimizer and checkpoint model have different canonical parameter identities")
-    from .dynamic_rope import dynamic_rope_checkpoint_contract
+    from .dynamic_rope import _is_native_qwen3_dynamic_reset_alias, dynamic_rope_checkpoint_contract
 
     model_aliases = {}
     for kind, items in (
@@ -170,7 +170,21 @@ def _local_layout(
             model_aliases.setdefault(id(value), set()).update(
                 f"{kind}:{name}" for name in _get_fqns(model, runtime_name)
             )
-    alias_graph = sorted(sorted(aliases) for aliases in model_aliases.values() if len(aliases) > 1)
+    safe_rope_pairs = set()
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        if _is_native_qwen3_dynamic_reset_alias(module):
+            rope_names = {
+                f"buffer:{fqn}"
+                for buffer_name in ("inv_freq", "original_inv_freq")
+                for fqn in _get_fqns(model, f"{module_name}.{buffer_name}" if module_name else buffer_name)
+            }
+            if len(rope_names) == 2:
+                safe_rope_pairs.add(frozenset(rope_names))
+    alias_graph = sorted(
+        sorted(aliases)
+        for aliases in model_aliases.values()
+        if len(aliases) > 1 and frozenset(aliases) not in safe_rope_pairs
+    )
 
     leaves = []
     seen_param_ids, seen_fqns, lr_aliases, lr_owners = set(), set(), {}, {}
