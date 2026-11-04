@@ -1022,17 +1022,29 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    if parallel_mode not in ("ulysses", "cp", "hybrid"):
+        raise ValueError(f"Unsupported parallel mode: {parallel_mode}")
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            cp_size=world_size if parallel_mode == "cp" else 1,
-            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
+            cp_size=2 if parallel_mode == "hybrid" else world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size // 2
+            if parallel_mode == "hybrid"
+            else world_size
+            if parallel_mode == "ulysses"
+            else 1,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
             name="sp",
         )
+        if parallel_mode == "hybrid":
+            assert world_size == 4
+            assert sp_state.sp_rank == rank
+            assert sp_state.ulysses_rank == rank % 2
+            assert sp_state.cp_rank == rank // 2
         dp_state = _init_parallel_state(
             dp_size=world_size,
             cp_size=1,
@@ -1062,6 +1074,10 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         image_mask = torch.zeros_like(full_input_ids, dtype=torch.bool)
         image_mask[:, local_seq_len - 1] = True
         image_mask[:, local_seq_len] = True
+        if parallel_mode == "hybrid":
+            # Exercise both Ulysses and CP shard boundaries with four image tokens.
+            image_mask[:, 2 * local_seq_len - 1] = True
+            image_mask[:, 2 * local_seq_len] = True
         full_input_ids.masked_fill_(image_mask, 0)
         video_mask = torch.zeros_like(image_mask)
         full_position_ids = torch.arange(seq_len, dtype=torch.long, device=device).view(1, 1, -1).expand(1, 3, -1)
@@ -1071,12 +1087,14 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
             * config.vision_config.temporal_patch_size
             * config.vision_config.patch_size**2
         )
+        image_grid = [1, 4, 4] if parallel_mode == "hybrid" else [1, 2, 4]
+        patch_rows = image_grid[0] * image_grid[1] * image_grid[2]
         if rank == 0:
-            full_pixels = torch.randn(8, flattened_patch_size, device=device, dtype=torch.bfloat16)
+            full_pixels = torch.randn(patch_rows, flattened_patch_size, device=device, dtype=torch.bfloat16)
         else:
-            full_pixels = torch.empty(8, flattened_patch_size, device=device, dtype=torch.bfloat16)
+            full_pixels = torch.empty(patch_rows, flattened_patch_size, device=device, dtype=torch.bfloat16)
         dist.broadcast(full_pixels, src=0)
-        image_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long, device=device)
+        image_grid_thw = torch.tensor([image_grid], dtype=torch.long, device=device)
         cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
 
         expected_output = None
@@ -1122,9 +1140,9 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
                 video_mask=video_mask,
                 qwen4_exp_position_ids_layout="batch_first",
                 multimodal_metadata={
-                    "image_grid_thw_list": [[1, 2, 4]],
-                    "vit_image_cu_seqlens": torch.tensor([0, 8], dtype=torch.int32, device=device),
-                    "vit_image_max_seqlen": 8,
+                    "image_grid_thw_list": [image_grid],
+                    "vit_image_cu_seqlens": torch.tensor([0, patch_rows], dtype=torch.int32, device=device),
+                    "vit_image_max_seqlen": patch_rows,
                 },
                 cu_seq_lens_q=cu_seq_lens,
             ).last_hidden_state
@@ -1163,6 +1181,12 @@ def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence():
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
     torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_2.nproc, "cp")
+
+
+@_CUDA_ONLY
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_hybrid():
+    torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_4.nproc, "hybrid")
 
 
 def _run_vision_real_image_cp_non_fa_rejection() -> None:
