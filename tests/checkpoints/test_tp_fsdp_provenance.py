@@ -221,18 +221,19 @@ def test_tp_fsdp_checkpoint_requires_provenance(tmp_path):
 
 
 def _npu_launch_plan(context):
-    if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" and context.capabilities.backend != "npu":
-        # Let the test fail explicitly even under --ci-batch on a CPU runner.
+    if context.capabilities.backend != "npu":
+        # Non-NPU runners need no accelerator lease to skip (or to fail
+        # explicitly when VEOMNI_REQUIRE_NPU_TESTS=1).
         return LaunchSpec(device="cpu")
     return LaunchSpec(nproc=4)
 
 
 @pytest.mark.launch_plan(provider=_npu_launch_plan)
 def test_tp_fsdp_checkpoint_native_npu(tmp_path):
-    if not IS_NPU_AVAILABLE:
-        require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or (
-            bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
-        )
+    ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
+    available = ci_backend in (None, "npu") and IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
         if require_npu:
             pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
         pytest.skip("native TP/FSDP requires NPU")

@@ -70,8 +70,12 @@ def _step(model, optimizer, value):
     optimizer.zero_grad(set_to_none=True)
 
 
+def _noep_world(geometry):
+    return 4 if geometry == "hsdp" else 2
+
+
 def _noep_worker(rank, directory, geometry, optimizer_kind, phase, endpoint):
-    world = 4 if geometry == "hsdp" else 2
+    world = _noep_world(geometry)
     dist.init_process_group(
         "gloo", store=endpoint.connect(), rank=rank, world_size=world, timeout=timedelta(seconds=60)
     )
@@ -113,9 +117,9 @@ def _noep_worker(rank, directory, geometry, optimizer_kind, phase, endpoint):
 
 @pytest.mark.parametrize("geometry", ["fsdp", "fsdp2", "sp", "hsdp"])
 @pytest.mark.parametrize("optimizer_kind", ["adamw", "multi"])
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+@pytest.mark.launch_plan(provider=lambda ctx: LaunchSpec(device="cpu", nproc=_noep_world(ctx.params["geometry"])))
 def test_new_noep_expert_checkpoint_fresh_process_roundtrip(tmp_path, geometry, optimizer_kind):
-    world = 4 if geometry == "hsdp" else 2
+    world = _noep_world(geometry)
     spawn_with_rendezvous(_noep_worker, args=(str(tmp_path), geometry, optimizer_kind, "save"), nprocs=world)
     model_dir = tmp_path / "checkpoint" / "model" / "ckpt"
     optimizer_dir = tmp_path / "checkpoint" / "model" / "optimizer"
@@ -131,8 +135,12 @@ def test_new_noep_expert_checkpoint_fresh_process_roundtrip(tmp_path, geometry, 
     spawn_with_rendezvous(_noep_worker, args=(str(tmp_path), geometry, optimizer_kind, "resume"), nprocs=world)
 
 
+def _unproven_world(mode):
+    return 4 if mode == "tp" else 2
+
+
 def _unproven_source_worker(rank, directory, mode, endpoint):
-    world = 4 if mode == "tp" else 2
+    world = _unproven_world(mode)
     dist.init_process_group(
         "gloo", store=endpoint.connect(), rank=rank, world_size=world, timeout=timedelta(seconds=60)
     )
@@ -169,9 +177,9 @@ def _unproven_source_worker(rank, directory, mode, endpoint):
 
 
 @pytest.mark.parametrize("mode", ["ep", "tp", "custom"])
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+@pytest.mark.launch_plan(provider=lambda ctx: LaunchSpec(device="cpu", nproc=_unproven_world(ctx.params["mode"])))
 def test_ep_tp_and_custom_mesh_are_not_inferred_as_noep(tmp_path, mode):
-    spawn_with_rendezvous(_unproven_source_worker, args=(str(tmp_path), mode), nprocs=4 if mode == "tp" else 2)
+    spawn_with_rendezvous(_unproven_source_worker, args=(str(tmp_path), mode), nprocs=_unproven_world(mode))
 
 
 def _uninitialized_parallel_state_worker(rank, directory, endpoint):
