@@ -100,8 +100,8 @@ def test_triton_indexer_scores_given_indices_and_rejects_invisible_ones():
 
 
 @requires_rocm
-def test_triton_indexer_packed_ranges_select_like_the_reference():
-    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+def test_triton_indexer_streaming_topk_matches_packed_reference(monkeypatch):
+    from veomni.ops.kernels.dsa.vendor import triton_indexer
 
     segment_len, heads, dim, compress_ratio, topk = 64, 8, 128, 4, 7
     seqlen = 2 * segment_len
@@ -115,8 +115,10 @@ def test_triton_indexer_packed_ranges_select_like_the_reference():
         ]
     )
     cu_seqlen_ke = cu_seqlen_ks + (local_positions + 1) // compress_ratio
+    # Seven pool columns force multiple chunks, including a short final chunk.
+    monkeypatch.setattr(triton_indexer, "_SCORES_CHUNK_BYTES", seqlen * torch.float32.itemsize * 7)
 
-    actual, actual_indices = triton_lighting_indexer(
+    actual, actual_indices = triton_indexer.triton_lighting_indexer(
         q, k, weights, compress_ratio, topk, cu_seqlen_ks=cu_seqlen_ks, cu_seqlen_ke=cu_seqlen_ke
     )
     entries = torch.arange(2 * kv_per_segment, device="cuda")
@@ -132,6 +134,17 @@ def test_triton_indexer_packed_ranges_select_like_the_reference():
     assert torch.isneginf(actual[~valid]).all()
     grad = torch.randn_like(actual).masked_fill(~valid, 0)
     _assert_grads_match(actual, reference, grad, valid, (q, k, weights))
+
+
+@requires_rocm
+def test_triton_indexer_score_chunk_budget_bounds_long_context_memory():
+    from veomni.ops.kernels.dsa.vendor import triton_indexer
+
+    assert triton_indexer._pool_chunk_width(1, 4096, 1024) == 1024
+    seq_len, pool = 192000, 48000
+    chunk = triton_indexer._pool_chunk_width(1, seq_len, pool)
+    assert 0 < chunk < pool
+    assert seq_len * chunk * torch.float32.itemsize <= triton_indexer._SCORES_CHUNK_BYTES
 
 
 @requires_rocm

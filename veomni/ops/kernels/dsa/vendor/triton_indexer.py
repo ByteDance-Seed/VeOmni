@@ -17,9 +17,10 @@
 Same contract as the TileLang indexer: one fused kernel takes each query's
 per-head ``q @ k^T`` against a pool tile with FP32 accumulators, applies ReLU,
 the per-head weight, the head sum and the query's visible ``[ks, ke)`` range,
-and skips pool tiles the query cannot see; ``torch.topk`` selects. Only the
-selected scores are differentiable, so the backward recomputes the selected
-logits per query. Neither direction materializes ``[B, S, H, P]``.
+and skips pool tiles the query cannot see. Pool-column chunks feed a running
+``torch.topk``, so the full ``[B, S, P]`` row is never materialized. Only the
+selected scores are differentiable, so the backward recomputes their logits.
+Neither direction materializes ``[B, S, H, P]``.
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ __all__ = ["triton_lighting_indexer"]
 _SCORES_BLOCK_S = 16
 _SCORES_BLOCK_P = 128
 _SCORES_NUM_WARPS = 4
+# Bound the transient FP32 score chunk. Production through roughly 32K tokens
+# stays one-shot; longer contexts stream pool columns through a running exact
+# top-k. A 512 MiB budget split the 24K shape for only 64 MiB of savings and
+# regressed its forward by 22%, while 1 GiB keeps that shape on the fast path.
+_SCORES_CHUNK_BYTES = 1 << 30
+_MAX_POOL_CHUNK = 32768
 # One unpipelined wavefront per query with 16-entry tiles hides the dK atomics best on
 # gfx942 (V4 widths, S=4096: 3.0 ms against 6.7 ms for 32-entry tiles on four wavefronts).
 _BWD_BLOCK_K = 16
@@ -55,6 +62,8 @@ def _scores_kernel(
     OUT_PTR,
     S,
     P,
+    P_START,
+    P_CHUNK,
     H,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -65,10 +74,12 @@ def _scores_kernel(
     b = (tl.program_id(0) // s_blocks).to(tl.int64)
     s0 = (tl.program_id(0) % s_blocks) * BLOCK_S
     p0 = tl.program_id(1) * BLOCK_P
-    offs_p = p0 + tl.arange(0, BLOCK_P)
+    offs_local_p = p0 + tl.arange(0, BLOCK_P)
+    global_p0 = P_START + p0
+    offs_p = P_START + offs_local_p
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, D)
-    p_mask = offs_p < P
+    p_mask = (offs_local_p < P_CHUNK) & (offs_p < P)
     h_mask = offs_h < H
     k = tl.load(K_PTR + (b * P + offs_p[:, None]) * D + offs_d[None, :], mask=p_mask[:, None], other=0.0)
     for i in range(BLOCK_S):
@@ -77,16 +88,63 @@ def _scores_kernel(
             row = b * S + s
             ks = tl.load(KS_PTR + s)
             ke = tl.load(KE_PTR + s)
-            if (p0 < ke) & (p0 + BLOCK_P > ks):
+            if (global_p0 < ke) & (global_p0 + BLOCK_P > ks):
                 q = tl.load(
                     Q_PTR + row * H * D + offs_h[:, None] * D + offs_d[None, :], mask=h_mask[:, None], other=0.0
                 )
                 w = tl.load(W_PTR + row * H + offs_h, mask=h_mask, other=0.0)
                 score = tl.sum(tl.maximum(tl.dot(q, tl.trans(k)), 0.0) * w[:, None], axis=0)
                 visible = (offs_p >= ks) & (offs_p < ke)
-                tl.store(OUT_PTR + row * P + offs_p, tl.where(visible, score, float("-inf")), mask=p_mask)
+                tl.store(
+                    OUT_PTR + row * P_CHUNK + offs_local_p,
+                    tl.where(visible, score, float("-inf")),
+                    mask=p_mask,
+                )
             else:
-                tl.store(OUT_PTR + row * P + offs_p, tl.full((BLOCK_P,), float("-inf"), tl.float32), mask=p_mask)
+                tl.store(
+                    OUT_PTR + row * P_CHUNK + offs_local_p,
+                    tl.full((BLOCK_P,), float("-inf"), tl.float32),
+                    mask=p_mask,
+                )
+
+
+@triton.jit
+def _selected_scores_kernel(
+    Q_PTR,
+    K_PTR,
+    W_PTR,
+    IDX_PTR,
+    KS_PTR,
+    KE_PTR,
+    OUT_PTR,
+    S,
+    P,
+    H,
+    TOPK,
+    D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Score caller-provided candidates without materializing the full pool."""
+    row = tl.program_id(0).to(tl.int64)
+    b = row // S
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, D)
+    h_mask = offs_h < H
+    q = tl.load(Q_PTR + row * H * D + offs_h[:, None] * D + offs_d[None, :], mask=h_mask[:, None], other=0.0)
+    w = tl.load(W_PTR + row * H + offs_h, mask=h_mask, other=0.0)
+    ks = tl.load(KS_PTR + row % S)
+    ke = tl.load(KE_PTR + row % S)
+    for k0 in range(0, TOPK, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < TOPK
+        idx = tl.load(IDX_PTR + row * TOPK + offs_k, mask=k_mask, other=-1)
+        valid = k_mask & (idx >= 0) & (idx < P) & (idx >= ks) & (idx < ke)
+        kv_rows = b * P + tl.where(valid, idx, 0).to(tl.int64)
+        kk = tl.load(K_PTR + kv_rows[:, None] * D + offs_d[None, :], mask=valid[:, None], other=0.0)
+        logits = tl.dot(kk, tl.trans(q))
+        scores = tl.sum(tl.maximum(logits, 0.0) * w[None, :], axis=1)
+        tl.store(OUT_PTR + row * TOPK + offs_k, tl.where(valid, scores, float("-inf")), mask=k_mask)
 
 
 @triton.jit
@@ -142,12 +200,33 @@ def _sparse_bwd_kernel(
     tl.store(DW_PTR + row * H + offs_h, dw, mask=h_mask)
 
 
-def _visible_scores(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor):
-    """``[B, S, P]`` FP32 scores, ``-inf`` outside each query's ``[ks, ke)``."""
+def _pool_chunk_width(batch: int, seq_len: int, pool: int) -> int:
+    """Pool columns that keep one FP32 score chunk inside the memory budget."""
+    if pool <= 0:
+        return 0
+    bytes_per_column = max(1, batch * seq_len * torch.float32.itemsize)
+    by_budget = max(1, _SCORES_CHUNK_BYTES // bytes_per_column)
+    chunk = min(pool, _MAX_POOL_CHUNK, by_budget)
+    if chunk >= _SCORES_BLOCK_P:
+        chunk = max(_SCORES_BLOCK_P, chunk // _SCORES_BLOCK_P * _SCORES_BLOCK_P)
+    return chunk
+
+
+def _pool_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    pool_start: int,
+    pool_end: int,
+) -> torch.Tensor:
+    """FP32 scores for global pool columns ``[pool_start, pool_end)``."""
     batch, seq_len, heads, dim = q.shape
     pool = k.shape[1]
-    scores = torch.empty((batch, seq_len, pool), dtype=torch.float32, device=q.device)
-    _scores_kernel[(batch * triton.cdiv(seq_len, _SCORES_BLOCK_S), triton.cdiv(pool, _SCORES_BLOCK_P))](
+    width = pool_end - pool_start
+    scores = torch.empty((batch, seq_len, width), dtype=torch.float32, device=q.device)
+    _scores_kernel[(batch * triton.cdiv(seq_len, _SCORES_BLOCK_S), triton.cdiv(width, _SCORES_BLOCK_P))](
         q,
         k,
         w,
@@ -156,6 +235,8 @@ def _visible_scores(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, ks: torch
         scores,
         seq_len,
         pool,
+        pool_start,
+        width,
         heads,
         D=dim,
         BLOCK_H=max(16, triton.next_power_of_2(heads)),
@@ -167,10 +248,75 @@ def _visible_scores(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, ks: torch
     return scores
 
 
-def _gather_scores(scores: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    valid = (indices >= 0) & (indices < scores.shape[-1])
-    safe = indices.clamp(min=0, max=max(scores.shape[-1] - 1, 0)).to(torch.int64)
-    return torch.where(valid, torch.gather(scores, -1, safe), float("-inf"))
+def _streaming_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact top-k over pool-column chunks; ties may choose equivalent columns."""
+    batch, seq_len, _, _ = q.shape
+    pool = k.shape[1]
+    width = min(topk, pool)
+    if width == 0:
+        shape = (batch, seq_len, 0)
+        return q.new_empty(shape, dtype=torch.float32), torch.empty(shape, dtype=torch.int32, device=q.device)
+
+    chunk = _pool_chunk_width(batch, seq_len, pool)
+    running_values = running_indices = None
+    for pool_start in range(0, pool, chunk):
+        pool_end = min(pool_start + chunk, pool)
+        scores = _pool_scores(q, k, w, ks, ke, pool_start, pool_end)
+        values, local_indices = scores.topk(min(width, pool_end - pool_start), dim=-1)
+        indices = local_indices + pool_start
+        indices = torch.where(torch.isfinite(values), indices, -1).to(torch.int32)
+        if running_values is None:
+            running_values, running_indices = values, indices
+            continue
+        candidate_values = torch.cat((running_values, values), dim=-1)
+        candidate_indices = torch.cat((running_indices, indices), dim=-1)
+        running_values, selected = candidate_values.topk(min(width, candidate_values.shape[-1]), dim=-1)
+        running_indices = torch.gather(candidate_indices, -1, selected)
+
+    running_indices = torch.where(torch.isfinite(running_values), running_indices, -1)
+    return running_values, running_indices
+
+
+def _selected_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Score an existing ``[B, S, K]`` selection directly."""
+    batch, seq_len, heads, dim = q.shape
+    pool = k.shape[1]
+    width = indices.shape[-1]
+    scores = torch.empty(indices.shape, dtype=torch.float32, device=q.device)
+    if batch * seq_len and width:
+        _selected_scores_kernel[(batch * seq_len,)](
+            q,
+            k,
+            w,
+            indices.contiguous(),
+            ks,
+            ke,
+            scores,
+            seq_len,
+            pool,
+            heads,
+            width,
+            D=dim,
+            BLOCK_H=max(16, triton.next_power_of_2(heads)),
+            BLOCK_K=_BWD_BLOCK_K,
+            num_warps=_BWD_NUM_WARPS,
+            num_stages=_BWD_NUM_STAGES,
+        )
+    return scores
 
 
 class _TritonIndexer(torch.autograd.Function):
@@ -191,13 +337,11 @@ class _TritonIndexer(torch.autograd.Function):
             ctx.mark_non_differentiable(indices)
             return q.new_full((batch, seq_len, width), float("-inf"), dtype=torch.float32), indices
 
-        scores = _visible_scores(q, k, w, ks, ke)
         if topk_indices is None:
-            values, indices = scores.topk(min(topk, pool), dim=-1)
-            indices = torch.where(torch.isfinite(values), indices, -1).to(torch.int32)
+            selected, indices = _streaming_topk(q, k, w, ks, ke, topk)
         else:
             indices = topk_indices
-        selected = _gather_scores(scores, indices)
+            selected = _selected_scores(q, k, w, ks, ke, indices)
         visible_indices, _ = mask_topk_indices_to_query_range(indices.to(torch.int32), ks, ke)
         visible_indices = visible_indices.masked_fill(visible_indices >= pool, -1)
         ctx.save_for_backward(q, k, w, visible_indices.contiguous())
