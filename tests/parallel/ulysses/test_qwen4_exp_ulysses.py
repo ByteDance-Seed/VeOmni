@@ -1057,6 +1057,9 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
+        if parallel_mode == "hybrid":
+            # The shared toy config has two GDN key heads; U2×CP2 needs four.
+            config.text_config.linear_num_key_heads = world_size
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2"
         _install_qwen4_exp_ops_config(config)
