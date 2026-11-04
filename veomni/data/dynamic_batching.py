@@ -15,12 +15,9 @@
 
 import copy
 import sys
-import threading
 import traceback
 from collections import deque
 from typing import Any, Callable, Dict, Generator, Iterator, Optional
-
-import torch.distributed as dist
 
 from ..utils import logging
 from .dataset import get_length_fn
@@ -58,15 +55,6 @@ class DynBszBuffer:
         self._get_length_fn = get_length_fn
         self._get_physical_length_fn = get_physical_length_fn
 
-    def _measure_length(self, item: Dict[str, Any]) -> int:
-        if self._get_length_fn is not None:
-            return self._get_length_fn(item)
-        if ("conversation_list" in item or "input_ids" in item) and "attention_mask" not in item:
-            return get_length_fn(item)
-        if "attention_mask" not in item:
-            raise KeyError("Expected 'attention_mask' in item")
-        return int(item["attention_mask"].sum())
-
     def append(self, item: Dict[str, Any]):
         """
         Append a sample to the buffer.
@@ -75,8 +63,15 @@ class DynBszBuffer:
                 The sample should be a dict containing an ``attention_mask`` tensor
                 whose ``.sum()`` gives the number of valid tokens for batching.
         """
-        length = self._measure_length(item)
         self._buffer.append(item)
+        if self._get_length_fn is not None:
+            length = self._get_length_fn(item)
+        elif ("conversation_list" in item or "input_ids" in item) and "attention_mask" not in item:
+            length = get_length_fn(item)
+        else:
+            if "attention_mask" not in item:
+                raise KeyError("Expected 'attention_mask' in item")
+            length = int(item["attention_mask"].sum())
         if self._get_physical_length_fn is not None:
             physical_length = self._get_physical_length_fn(item)
         else:
@@ -216,10 +211,10 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         )
         return effective_ready or physical_ready
 
-    def put_item(self, item: Dict[str, Any]) -> bool:
+    def put_item(self, item: Dict[str, Any]):
         if "input_ids" in item and item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
-            return False
+            return
         if (
             "conversation_list" in item
             and not item["conversation_list"]
@@ -227,13 +222,8 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             and "input_ids" not in item
         ):
             print("WARNING: EMPTY STRING.")
-            return False
-        length = self.buffer._measure_length(item)
-        if length > self.token_micro_bsz:
-            logger.warning(f"Sample length {length} exceeds token_micro_bsz {self.token_micro_bsz}, skipping.")
-            return False
+            return
         self.buffer.append(item)
-        return True
 
     def get_cur_token_micro_bsz(self):
         warmup = self.bsz_warmup_steps > 0 and self._step <= self.bsz_warmup_steps
@@ -316,45 +306,13 @@ class DynamicBatchSizeDataLoader:
             self._data_iter = iter(self._dataloader)
             self._batch_data_iter = self.batch_data_generator()
         self._resume = False
-        self._exhausted = False
         return self
 
-    @staticmethod
-    def _coordinate_has_batch(has_batch: bool) -> bool:
-        if (
-            not dist.is_available()
-            or not dist.is_initialized()
-            or dist.get_world_size() <= 1
-            or threading.current_thread() is not threading.main_thread()
-        ):
-            return has_batch
-        flags = [False] * dist.get_world_size()
-        dist.all_gather_object(flags, has_batch)
-        if not all(flags):
-            if has_batch:
-                logger.warning(
-                    "Stopping DynamicBatchSizeDataLoader early because at least one rank exhausted its shard with no valid samples."
-                )
-            return False
-        return True
-
     def __next__(self):
-        if getattr(self, "_exhausted", False):
-            raise StopIteration
-        try:
-            batch = next(self._batch_data_iter)
-            has_batch = True
-        except StopIteration:
-            batch = None
-            has_batch = False
-        if not self._coordinate_has_batch(has_batch):
-            self._exhausted = True
-            raise StopIteration
-        return batch
+        return next(self._batch_data_iter)
 
     def batch_data_generator(self):
         batch = []
-        accepted_in_pass = False
 
         while True:
             if self._length and self.step >= self._length:
@@ -374,38 +332,30 @@ class DynamicBatchSizeDataLoader:
                 processing_item = next(self._data_iter)
             except Exception as e:
                 if isinstance(e, StopIteration):
-                    processing_item = None
-                    if self.step < self._length and accepted_in_pass:
-                        # Only restart the dataloader when the completed pass
-                        # accepted at least one valid sample; otherwise a shard
-                        # whose samples are all over budget would loop forever.
-                        accepted_in_pass = False
+                    if self.step < self._length:
+                        # call iter until reach length
                         self._data_iter = iter(self._dataloader)
-                        try:
-                            processing_item = next(self._data_iter)
-                        except StopIteration:
-                            processing_item = None
-                    if processing_item is None:
-                        if not self._drop_last and not self.batching_strategy.empty():
-                            while not self.batching_strategy.empty():
-                                micro_batch = self.batching_strategy.get_micro_batch(self.step)
-                                if self._collate_fn:
-                                    micro_batch = self._collate_fn(micro_batch)
-                                batch.append(micro_batch)
-                                if len(batch) == self.num_micro_batch:
-                                    yield batch
-                                    self.step += 1
-                                    batch = []
+                        processing_item = next(self._data_iter)
+                    elif not self._drop_last and not self.batching_strategy.empty():
+                        while not self.batching_strategy.empty():
+                            micro_batch = self.batching_strategy.get_micro_batch(self.step)
+                            if self._collate_fn:
+                                micro_batch = self._collate_fn(micro_batch)
+                            batch.append(micro_batch)
+                            if len(batch) == self.num_micro_batch:
+                                yield batch
+                                self.step += 1
+                                batch = []
 
-                            while len(batch) < self.num_micro_batch:
-                                padding_batch = copy.deepcopy(micro_batch)
-                                padding_batch["padding_flag"] = True
-                                batch.append(padding_batch)
-                            yield batch
-                            self.step += 1
-                            return
-                        else:
-                            return
+                        while len(batch) < self.num_micro_batch:
+                            padding_batch = copy.deepcopy(micro_batch)
+                            padding_batch["padding_flag"] = True
+                            batch.append(padding_batch)
+                        yield batch
+                        self.step += 1
+                        return
+                    else:
+                        return
                 else:
                     logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
                     raise
@@ -415,8 +365,7 @@ class DynamicBatchSizeDataLoader:
                 processing_item = [processing_item]
 
             for item in processing_item:
-                if self.batching_strategy.put_item(item) is not False:
-                    accepted_in_pass = True
+                self.batching_strategy.put_item(item)
 
     def state_dict(self):
         # save state

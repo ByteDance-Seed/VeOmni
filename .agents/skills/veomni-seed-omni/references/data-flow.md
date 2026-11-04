@@ -13,17 +13,7 @@ raw data transforms, or request preprocessing.
      mutating `ConversationItem.value` and `meta` (including `_omni_token_len`
      and `labels` for `dyn_bsz`, plus per-sample `is_dummy` anchors) in place.
 2. `SeedOmniCollator` groups per-sample dicts (after optional `dyn_bsz` batching)
-   into `{"conversation_list": [[...], ...]}` plus aligned extra keys. Because
-   multimodal conversations cannot be truncated mid-turn without corrupting
-   media placeholders or vision wrappers, `dyn_bsz` (`TextBatchingStrategy` /
-   `DynamicBatchingSizeDataset`) **skips** any sample whose token length exceeds
-   `micro_batch_size * data.max_seq_len`. **Note (SP & default `max_seq_len`
-   trap):** `data.max_seq_len` is the **pre-SP global token budget**, not
-   per-SP-rank (`sp_size` is not multiplied in). For example, with
-   `micro_batch_size: 1`, `max_seq_len: 4096`, and `ulysses_size: 4`, a sample
-   is capped at `4096` tokens total (`1024` tokens per SP rank). Always size
-   `data.max_seq_len` above the longest full multimodal/SP sample so the default
-   (`2048` in `OmniDataArguments`) does not drop the dataset.
+   into `{"conversation_list": [[...], ...]}` plus aligned extra keys.
 3. Module `pre_forward` selects items by `type`, `role`, and `meta` tags and
    moves prepared CPU tensors to the module device.
 4. Module forward/modeling runs GPU work and returns a dict.

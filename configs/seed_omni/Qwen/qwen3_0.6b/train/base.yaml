@@ -75,8 +75,6 @@ train:
   num_train_epochs: 1
   global_batch_size: 32
   micro_batch_size: 2
-  # Token packing uses micro_batch_size * data.max_seq_len as the token budget;
-  # dyn_bsz skips any sample that exceeds that budget by itself.
   dyn_bsz: true
 
   checkpoint:
