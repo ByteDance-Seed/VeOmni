@@ -320,6 +320,12 @@ distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
 FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
 metadata also needs verified source-layout migration, since it cannot be
 distinguished safely from an old EP checkpoint.
+For TP greater than one, `DistributedCheckpointer.save` currently rejects a
+model containing non-scalar `experts` parameters, persistent buffers, or tensors
+assigned to an EP shard by the model's parallel plan before writing. This is a
+conservative restriction: it also covers frozen experts and custom layouts that
+might otherwise be canonical. TP1 expert checkpoints and TP models without
+expert tensors are unaffected. Training without a checkpoint save is unaffected.
 Offline export also rejects unversioned expert-only chunks for stacked tensors
 under an `experts` module when their source order cannot be established. Other
 legacy tensor naming schemes may still need explicit source-layout verification
