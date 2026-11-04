@@ -149,13 +149,19 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         Expects both ``preprocessor_config.json`` (image) and
         ``video_preprocessor_config.json`` (video) under ``module_path`` — the
         ``qwen3_vl`` convert script writes both into ``qwen3vl_vision/``.
+
+        ``config_overrides`` mirrors the module's YAML ``model_config:`` block.
+        Only ``spatial_merge_size`` is read from it: that is the one field this
+        worker duplicates from the live model (it sizes ``_OMNI_TOKEN_LEN``), so
+        an override that changes it on the model must change it here too.
         """
+        overrides = kwargs.pop("config_overrides", None) or {}
         del kwargs
         image_processor = Qwen3VLVisionImageProcessor.from_pretrained(module_path)
         video_processor = Qwen3VLVisionVideoProcessor.from_pretrained(module_path)
         # ``spatial_merge_size`` lives on the image processor; fall back to the
         # Qwen3-VL default of 2 when an older processor config omits it.
-        merge = int(getattr(image_processor, "merge_size", 2) or 2)
+        merge = int(overrides.get("spatial_merge_size") or getattr(image_processor, "merge_size", 2) or 2)
         return cls(image_processor, video_processor, spatial_merge_size=merge)
 
     def bind_dummy_inputs(self, config: Qwen3VLVisionEncoderConfig, dtype: torch.dtype | None = None) -> None:
@@ -177,7 +183,9 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
             ]
-            sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
+            sample_video_items = [
+                it for it in iter_desired_items([sample], types=["video"], roles=["user"]) if not it.is_dummy
+            ]
             if sample_image_items or sample_video_items:
                 if sample_image_items:
                     out = self._image_processor(images=[it.value for it in sample_image_items], return_tensors="pt")

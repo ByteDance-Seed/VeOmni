@@ -60,9 +60,20 @@ class _VisualOutputSlot(NamedTuple):
 
 
 def pixels_and_grid_from_items(items: list) -> Tuple[torch.Tensor, list[list[int]]]:
-    """Concat CPU-preprocessed patch tensors and pop stashed grid metadata."""
+    """Concat CPU-preprocessed patch tensors and read their stashed grid metadata.
+
+    The grid is read with ``get``, not popped: packing is not the item's last
+    reader (an eval pass or a reference re-forward walks the same carrier), and
+    ``ConversationItem.meta`` is durable per-module baggage.
+    """
     pixel_values = torch.cat([it.value for it in items], dim=0)
-    grids = [it.meta.pop(_OMNI_GRID) for it in items]
+    grids = [it.meta.get(_OMNI_GRID) for it in items]
+    missing = [i for i, grid in enumerate(grids) if grid is None]
+    if missing:
+        raise ValueError(
+            f"pixels_and_grid_from_items: item(s) {missing} carry no {_OMNI_GRID!r}; the vision CPU "
+            "preprocessor did not run (or ran for a different module) before this forward."
+        )
     return pixel_values, grids
 
 

@@ -121,7 +121,7 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
         temporal_patch_size=2,
         in_channels=3,
     )
-    enc = Enc(Cfg(vision_config=vc)).eval()
+    enc = Enc(Cfg(vision_config=vc, ops_implementation=make_eager_ops_config())).eval()
 
     def _boom(*_a, **_k):
         raise AssertionError("ViT must not run for a dummy in eval mode")

@@ -41,6 +41,9 @@ Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 | `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
 | `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). |
+| `packed/base.yaml` | Launcher for the packed training graph. Shares `data.yaml` / `infer/graph_infer.yaml`; `model_config` points at the two files below. |
+| `packed/modules_train.yaml` | Same module overrides plus `processor_config: {packed_preprocess: true}` on the text encoder. |
+| `packed/graph_train.yaml` | Packed DAG (`pack_encode → pack_encode → pack_forward → pack_decode`). |
 
 ---
 
@@ -89,6 +92,9 @@ stopping_strategy: all_exhausted
 upstream_sharded: true
 ```
 
+The shipped file points at the maintainers' own dataset locations; replace the
+`sources` entries with your own copies.
+
 Video decoding is driven by `data.mm_configs` in `base.yaml`
 (`use_audio_in_video: false`, `fps`, `min_frames` / `max_frames`) — Qwen3-VL has
 no audio modality. The on-disk row schema is documented in
@@ -107,7 +113,7 @@ Key knobs (override on the CLI):
 
 - `--model.model_path` — split-checkpoint root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length.
+- `--data.max_seq_len` — packed sequence length (the `dyn_bsz` token budget unit when `train.dyn_bsz` is on).
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.

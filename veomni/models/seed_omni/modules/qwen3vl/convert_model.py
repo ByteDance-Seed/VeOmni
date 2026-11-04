@@ -25,14 +25,22 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
 
 
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
-        Qwen3VLForConditionalGeneration,
-    )
-else:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-        Qwen3VLForConditionalGeneration,
-    )
+def _qwen3vl_for_causal_lm():
+    """The patched Qwen3-VL class for this accelerator.
+
+    Imported inside the call, not at module import time: the family package is
+    imported by every ``veomni.models.seed_omni.modules`` load, and building the
+    patched modeling eagerly would make every SeedOmni run pay for it.
+    """
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
+            Qwen3VLForConditionalGeneration,
+        )
+    else:
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLForConditionalGeneration,
+        )
+    return Qwen3VLForConditionalGeneration
 
 
 def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
@@ -56,7 +64,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     Qwen3VLLlm = OMNI_MODEL_REGISTRY["qwen3vl_llm"]()
     Qwen3VLLlmConfig = OMNI_CONFIG_REGISTRY["qwen3vl_llm"]()
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(model_path, device_map="cpu")
+    model = _qwen3vl_for_causal_lm().from_pretrained(model_path, device_map="cpu")
     model.eval()
     cfg = model.config
     text_cfg = cfg.text_config
@@ -96,7 +104,6 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     llm_cfg = Qwen3VLLlmConfig(
         text_config=text_cfg.to_dict(),
         spatial_merge_size=cfg.vision_config.spatial_merge_size,
-        image_token_id=cfg.image_token_id,
     )
     with no_init_weights(), init_empty_weights():
         llm = Qwen3VLLlm._from_config(llm_cfg)

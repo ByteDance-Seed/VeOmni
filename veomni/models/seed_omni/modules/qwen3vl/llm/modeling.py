@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.tensor_utils import naflatten
 
@@ -139,6 +140,12 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "Qwen3VLLlm.generate feeds the full prompt to the backbone, which conflicts with "
+                "Ulysses sequence parallelism (attention expects this rank's shard); run inference "
+                "with sp_size=1."
+            )
         if self._past_key_values is None:
             packed = pack_qwen3vl_conversations_for_forward([conversation_list], self.device, self._spatial_merge_size)
             position_ids = packed["position_ids"]
