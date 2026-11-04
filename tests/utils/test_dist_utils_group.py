@@ -1,11 +1,13 @@
 """Ensure error propagation follows the backend of the actual process group."""
 
+import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch.distributed as dist
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
@@ -53,10 +55,51 @@ def _accelerator_group_worker(rank, world_size, endpoint):
         dist.destroy_process_group()
 
 
+def _require_two_accelerators():
+    """Allow optional local skips, but fail when accelerator CI is misconfigured."""
+    capabilities = runner_capabilities() if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    assigned = capabilities is not None and capabilities.backend != "cpu"
+    device_type = get_device_type()
+    if device_type == "cpu" or not get_torch_device().is_available() or get_torch_device().device_count() < 2:
+        if assigned:
+            pytest.fail("Assigned accelerator runtime must provide two usable devices")
+        pytest.skip("Requires two accelerator devices")
+    if assigned and device_type != capabilities.backend:
+        pytest.fail("Assigned accelerator backend does not match the runtime")
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="accelerator"))
-@pytest.mark.skipif(
-    get_device_type() == "cpu" or not get_torch_device().is_available() or get_torch_device().device_count() < 2,
-    reason="Requires two accelerator devices",
-)
 def test_default_accelerator_group_failure_propagation():
+    _require_two_accelerators()
     spawn_with_rendezvous(_accelerator_group_worker, args=(2,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    ("assigned", "device_type", "count", "outcome"),
+    (
+        (None, "cpu", 0, "skip"),
+        (None, "cuda", 1, "skip"),
+        ("cuda", "cuda", 0, "fail"),
+        ("cuda", "cuda", 1, "fail"),
+        ("npu", "cuda", 2, "fail"),
+        ("npu", "npu", 2, "pass"),
+    ),
+)
+def test_two_accelerator_requirement(monkeypatch, assigned, device_type, count, outcome):
+    monkeypatch.setattr(__name__ + ".get_device_type", lambda: device_type)
+    monkeypatch.setattr(
+        __name__ + ".get_torch_device",
+        lambda: SimpleNamespace(is_available=lambda: count > 0, device_count=lambda: count),
+    )
+    if assigned:
+        monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "assigned")
+        monkeypatch.setattr(__name__ + ".runner_capabilities", lambda: SimpleNamespace(backend=assigned))
+    else:
+        monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
+    if outcome == "pass":
+        _require_two_accelerators()
+    else:
+        error = pytest.skip.Exception if outcome == "skip" else pytest.fail.Exception
+        with pytest.raises(error):
+            _require_two_accelerators()
