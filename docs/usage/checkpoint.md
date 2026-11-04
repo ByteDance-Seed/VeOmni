@@ -268,7 +268,7 @@ reshard a model checkpoint across supported FSDP shard axes. Use
 `DistributedCheckpointer` for save and resume: it rejects ambiguous unversioned
 expert layouts before copying model tensors unless the model-only source is
 explicitly declared as described below. Migrating a legacy optimizer checkpoint
-requires verified source layout information. Canonical v2 optimizer save and resume use
+requires source layout information that has been verified. Canonical v2 optimizer save and resume use
 the rank-local codec described below. The standard VeOmni HF export strips the
 namespace.
 
@@ -318,7 +318,7 @@ migration. Conversely, an old unversioned checkpoint with expert-only chunks
 may not prove its source order even when resumed with the same topology. The
 distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
 FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
-metadata also needs verified source-layout migration, since it cannot be
+metadata also needs a verified source-layout migration, since it cannot be
 distinguished safely from an old EP checkpoint.
 For TP greater than one, `DistributedCheckpointer.save` currently rejects a
 model containing non-scalar `experts` parameters, persistent buffers, or tensors
