@@ -1014,8 +1014,9 @@ def kimi_k3_for_conditional_generation_forward_patched(
     # for plain un-packed sequences and the image-merge rebuild produces
     # the same single-segment shape, which the dense causal mask handles
     # exactly -- so reject only a real boundary between two non-empty
-    # segments (distinct samples sharing a row), instead of silently
-    # corrupting the packed batch. K3_ALLOW_DENSE_PACKED=1 re-enables the
+    # segments (distinct samples sharing a row; known tail-padding
+    # segments do not count), instead of silently corrupting the packed
+    # batch. K3_ALLOW_DENSE_PACKED=1 re-enables the
     # documented debug-only dense path (used by the CPU packing tests,
     # where no varlen kernel runs).
     _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
@@ -1027,7 +1028,17 @@ def kimi_k3_for_conditional_generation_forward_patched(
             _cu_t = _cu_seq_lens_q
             if not isinstance(_cu_t, torch.Tensor):
                 _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
-            _num_samples = int((torch.diff(_cu_t) > 0).sum())
+            _seg_lens = torch.diff(_cu_t)
+            # Known tail padding (SP / pad-to-length) is coalesced into one
+            # final segment by the collator and the merge rebuild: those
+            # tokens are padding, not a sample, so drop the segment before
+            # counting real samples (only when it matches the published
+            # length -- otherwise stay conservative and count it).
+            _tail_pads = kwargs.get("tail_padding_length", 0)
+            _tail_pads = 0 if _tail_pads is None else int(_tail_pads)
+            if _tail_pads > 0 and _seg_lens.numel() > 0 and int(_seg_lens[-1]) == _tail_pads:
+                _seg_lens = _seg_lens[:-1]
+            _num_samples = int((_seg_lens > 0).sum())
             if _num_samples > 1:
                 raise ValueError(
                     f"attention_implementation={_attn_impl!r} cannot run packed batches "

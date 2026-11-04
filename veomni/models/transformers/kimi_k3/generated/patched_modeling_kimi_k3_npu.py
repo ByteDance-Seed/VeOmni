@@ -122,6 +122,15 @@ logger = logging.get_logger(__name__)
 flash_attn_varlen_func = None
 
 
+def _shard_dim0_offset_length(global_size: int, num_shards: int, rank: int) -> tuple[int, int]:
+    """Offset and length of ``rank``'s shard under DTensor's even ``Shard(0)``
+    split (torch.chunk semantics: ceil-sized chunks, the last shard absorbing
+    the remainder)."""
+    chunk_size = (global_size + num_shards - 1) // num_shards
+    offset = rank * chunk_size
+    return offset, min(chunk_size, global_size - offset)
+
+
 def _zero_embedding_padding_row(weight: torch.Tensor, padding_idx: int) -> None:
     """Zero an embedding's padding row without cross-rank collectives.
 
@@ -146,9 +155,12 @@ def _zero_embedding_padding_row(weight: torch.Tensor, padding_idx: int) -> None:
             return
         rank_along_dim = coordinate[mesh_dim]
         num_shards = weight.device_mesh.size(mesh_dim)
-        base, remainder = divmod(weight.shape[0], num_shards)
-        offset = rank_along_dim * base + min(rank_along_dim, remainder)
-        length = base + (1 if rank_along_dim < remainder else 0)
+        # DTensor's even Shard(0) split is torch.chunk semantics (ceil-sized
+        # chunks, the last shard absorbing the remainder), not floor +
+        # remainder -- which indexes one row past the last uneven shard and
+        # crashes initialization (e.g. the native vocab 163840 over 3 FSDP
+        # shards).
+        offset, length = _shard_dim0_offset_length(weight.shape[0], num_shards, rank_along_dim)
         if offset <= padding_idx < offset + length:
             local[padding_idx - offset].zero_()
         return
@@ -3207,8 +3219,9 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         # for plain un-packed sequences and the image-merge rebuild produces
         # the same single-segment shape, which the dense causal mask handles
         # exactly -- so reject only a real boundary between two non-empty
-        # segments (distinct samples sharing a row), instead of silently
-        # corrupting the packed batch. K3_ALLOW_DENSE_PACKED=1 re-enables the
+        # segments (distinct samples sharing a row; known tail-padding
+        # segments do not count), instead of silently corrupting the packed
+        # batch. K3_ALLOW_DENSE_PACKED=1 re-enables the
         # documented debug-only dense path (used by the CPU packing tests,
         # where no varlen kernel runs).
         _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
@@ -3220,7 +3233,17 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 _cu_t = _cu_seq_lens_q
                 if not isinstance(_cu_t, torch.Tensor):
                     _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
-                _num_samples = int((torch.diff(_cu_t) > 0).sum())
+                _seg_lens = torch.diff(_cu_t)
+                # Known tail padding (SP / pad-to-length) is coalesced into one
+                # final segment by the collator and the merge rebuild: those
+                # tokens are padding, not a sample, so drop the segment before
+                # counting real samples (only when it matches the published
+                # length -- otherwise stay conservative and count it).
+                _tail_pads = kwargs.get("tail_padding_length", 0)
+                _tail_pads = 0 if _tail_pads is None else int(_tail_pads)
+                if _tail_pads > 0 and _seg_lens.numel() > 0 and int(_seg_lens[-1]) == _tail_pads:
+                    _seg_lens = _seg_lens[:-1]
+                _num_samples = int((_seg_lens > 0).sum())
                 if _num_samples > 1:
                     raise ValueError(
                         f"attention_implementation={_attn_impl!r} cannot run packed batches "

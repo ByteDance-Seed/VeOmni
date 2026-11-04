@@ -334,6 +334,13 @@ class ChunkKDAFunction(torch.autograd.Function):
         forward_used_ascendc = False
         cu_seqlens_host = None
 
+        # state_v_first only carries semantics when a state crosses the call
+        # boundary (initial_state consumed or a final state produced); for
+        # stateless calls normalize it away so the aclnn forward and the
+        # fused backward (which only runs stateless) keep the canonical
+        # (K, V) intermediate layout -- bit-identical to state_v_first=False.
+        state_v_first = state_v_first and (initial_state is not None or output_final_state)
+
         use_triton = chunk_size != 64
 
         if use_triton:
@@ -717,14 +724,14 @@ def chunk_kda_ascendc(
         )
         state_v_first = kwargs.pop("transpose_state_layout")
 
-    if state_v_first:
-        # The AscendC kernel only produces final states in the [B, H, K, V]
-        # layout; reject the request instead of silently returning the other
-        # axis order.
-        raise NotImplementedError(
-            "state_v_first=True is not supported by the AscendC chunk_kda path; the fused kernel only "
-            "produces final states in the [B, H, K, V] layout."
-        )
+    # state_v_first passes straight through: the aclnn chunk_kda kernel
+    # natively supports both state layouts (the initial / final state and
+    # the intermediate h adapt to the requested order -- see
+    # npu_chunk_kda_fwd in fla_npu). Stateless calls normalize the flag
+    # away inside ChunkKDAFunction (no state crosses the boundary, so the
+    # layout carries no semantics), keeping the fused AscendC backward
+    # eligible; stateful state_v_first=True runs the triton backward
+    # (see _can_use_fused_kda_bwd).
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:

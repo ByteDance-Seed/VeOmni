@@ -51,6 +51,9 @@ from tests.models.tiny_configs import tiny_kimi_k3_config as _tiny_config
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state_from_config
 from veomni.models.auto import build_foundation_model
+from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    _shard_dim0_offset_length,
+)
 from veomni.ops.registry import VeomniOp
 
 
@@ -361,6 +364,79 @@ def test_single_sample_image_merge_metadata_runs_dense():
     # The merge rebuilt single-segment metadata over the expanded row:
     # [T0 T1 PH T2 T3] -> [T0 T1 V0 V1 V2 V3 T2 T3] (8), boundary at 0.
     assert recorded["cu_seq_lens_q"].tolist() == [0, 8]
+
+
+def test_single_sample_tail_pads_run_dense():
+    """Known tail padding must not count as a packed sample.
+
+    The collator and the merge rebuild coalesce trailing pads (SP /
+    pad-to-length) into one final segment: a single-image row with two
+    tail pads publishes cu=[0, 8, 10] -- one real sample plus the pad
+    segment. Under eager attention that must still run, like an
+    un-packed sequence (no dense-attention rejection).
+    """
+    model = _build_model()
+    model.eval()
+    input_ids, labels, _, _, grid_thws, pixel_values = _single_image_batch(model)
+    ignore = model.config.ignore_index
+    pad = model.config.pad_token_id
+    input_ids = torch.cat([input_ids, torch.tensor([[pad, pad]])], dim=1)
+    labels = torch.cat([labels, torch.full((1, 2), ignore, dtype=labels.dtype)], dim=1)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4, 0, 0]])
+    attention_mask = torch.ones_like(input_ids)
+    tail_padding_length = torch.tensor(2, dtype=torch.int32)
+
+    recorded = {}
+    inner_forward = _spy_on_inner_model(model, recorded)
+    try:
+        with torch.no_grad():
+            out = model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                grid_thws=grid_thws,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                use_cache=False,
+                tail_padding_length=tail_padding_length,
+            )
+    finally:
+        model.language_model.model.forward = inner_forward
+
+    assert out.loss is not None and torch.isfinite(out.loss)
+    # [T0 T1 V V V V T2 T3][P P]: the two pads coalesce into one 2-token
+    # tail segment (8..10) -- one real sample, so dense attention runs.
+    assert recorded["cu_seq_lens_q"].tolist() == [0, 8, 10]
+
+
+def test_shard_dim0_offset_length_matches_torch_chunk():
+    """The padding-row shard math must mirror DTensor's Shard(0) even split.
+
+    DTensor shards via torch.chunk semantics (ceil-sized chunks, the
+    last shard absorbing the remainder); the offset/length math must
+    match it exactly or the padding row is zeroed on the wrong rank /
+    out of bounds.
+    """
+    for global_size, num_shards in [(163840, 3), (163840, 6), (163840, 8), (93, 4), (10, 3), (7, 3), (5, 5)]:
+        chunks = torch.empty(global_size).chunk(num_shards)
+        for rank in range(num_shards):
+            offset, length = _shard_dim0_offset_length(global_size, num_shards, rank)
+            expected_offset = sum(c.numel() for c in chunks[:rank])
+            expected_length = chunks[rank].numel() if rank < len(chunks) else 0
+            assert (offset, length) == (expected_offset, expected_length)
+
+
+def test_shard_dim0_offset_length_native_vocab_padding():
+    """The native vocab padding row stays in bounds on uneven shards.
+
+    vocab 163840 / 3 shards -> [54614, 54614, 54612]; padding id 163839
+    is local row 54611 of the last shard. The old floor + remainder
+    math computed local row 54612 -- one past the end.
+    """
+    offset, length = _shard_dim0_offset_length(163840, 3, 2)
+    assert (offset, length) == (109228, 54612)
+    assert 163839 - offset == 54611
+    assert 0 <= 163839 - offset < length
 
 
 def test_packed_forward_coalesces_collator_tail_pads(dense_packed_debug):

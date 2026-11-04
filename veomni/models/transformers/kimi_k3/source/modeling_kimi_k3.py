@@ -83,6 +83,15 @@ logger = logging.get_logger(__name__)
 flash_attn_varlen_func = None
 
 
+def _shard_dim0_offset_length(global_size: int, num_shards: int, rank: int) -> tuple[int, int]:
+    """Offset and length of ``rank``'s shard under DTensor's even ``Shard(0)``
+    split (torch.chunk semantics: ceil-sized chunks, the last shard absorbing
+    the remainder)."""
+    chunk_size = (global_size + num_shards - 1) // num_shards
+    offset = rank * chunk_size
+    return offset, min(chunk_size, global_size - offset)
+
+
 def _zero_embedding_padding_row(weight: torch.Tensor, padding_idx: int) -> None:
     """Zero an embedding's padding row without cross-rank collectives.
 
@@ -108,9 +117,12 @@ def _zero_embedding_padding_row(weight: torch.Tensor, padding_idx: int) -> None:
             return
         rank_along_dim = coordinate[mesh_dim]
         num_shards = weight.device_mesh.size(mesh_dim)
-        base, remainder = divmod(weight.shape[0], num_shards)
-        offset = rank_along_dim * base + min(rank_along_dim, remainder)
-        length = base + (1 if rank_along_dim < remainder else 0)
+        # DTensor's even Shard(0) split is torch.chunk semantics (ceil-sized
+        # chunks, the last shard absorbing the remainder), not floor +
+        # remainder -- which indexes one row past the last uneven shard and
+        # crashes initialization (e.g. the native vocab 163840 over 3 FSDP
+        # shards).
+        offset, length = _shard_dim0_offset_length(weight.shape[0], num_shards, rank_along_dim)
         if offset <= padding_idx < offset + length:
             local[padding_idx - offset].zero_()
         return
