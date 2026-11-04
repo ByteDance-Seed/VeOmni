@@ -551,7 +551,7 @@ class SwapAdamW(Optimizer):
                 if bytes_moved == 0 and param_bytes > budget:
                     raise RuntimeError(
                         "SwapAdamW could not fit any optimizer state on device. "
-                        "Increase optimizer.state_offload_device_memory_fraction or reduce the parameter size."
+                        "Increase model.optimizer.state_offload_device_memory_fraction or reduce the parameter size."
                     )
                 self._swap_in_param(params[index])
                 bytes_moved += param_bytes

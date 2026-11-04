@@ -373,11 +373,13 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.  Optimizers that
-    pre-populate their state at construction (``SwapAdamW``) are the
-    exception: their state is never empty, so their checkpoints are dense
-    and never-stepped params carry zero moments and ``step`` 0 — fresh state,
-    as a newly built optimizer has it. A stock optimizer resumed through this
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
     class instead ends an absent param at ``step`` 1 (the checkpoint
     machinery's eager zero-grad initialization); a direct ``load_state_dict``
     that omits the param leaves it stateless until its next ``step()``.

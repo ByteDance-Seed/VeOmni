@@ -438,7 +438,7 @@ def _build_state_offload_optimizer(
 ) -> "Optimizer":
     """Build the optimizer whose moment states live in host buffers.
 
-    ``optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
+    ``model.optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
     algorithm dispatch lives here, so a new offloadable algorithm is one branch
     rather than one helper per algorithm. Muon will add its own ``elif`` (its
     AdamW leaf is what carries host state today).
@@ -459,7 +459,7 @@ def _build_state_offload_optimizer(
         )
     else:
         raise ValueError(
-            f"optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+            f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
         )
 
 

@@ -41,7 +41,7 @@ class TestWhereTheLoaderReadsTheConfigFrom:
         assert ModelArguments(model_path="weights", config_path="cfg").tokenizer_path == "cfg"
 
 
-def test_swap_fraction_is_coerced_and_ranged():
+def test_state_offload_device_memory_fraction_is_coerced_and_ranged():
     # YAML resolves an exponent literal without a decimal point to a string; it
     # must be coerced before the range check instead of raising TypeError.
     assert (
@@ -65,7 +65,7 @@ def test_state_offload_rejects_non_adamw_types_and_unknown_values():
         OptimizerConfig(type="anyprecision_adamw", state_offload="cpu")
 
 
-def test_swap_rejects_fsdp_cpu_offload():
+def test_state_offload_rejects_fsdp_cpu_offload():
     with pytest.raises(ValueError, match="cannot be combined"):
         ModelArguments(
             model_path="weights",

@@ -161,7 +161,7 @@ class OptimizerConfig:
         default=0.8,
         metadata={
             "help": (
-                "With optimizer.state_offload='cpu', the fraction of currently free device memory "
+                "With model.optimizer.state_offload='cpu', the fraction of currently free device memory "
                 "used to size one streamed batch of optimizer states. It is recomputed every step; "
                 "a parameter whose states exceed it cannot be swapped in and step() raises."
             )
@@ -171,7 +171,7 @@ class OptimizerConfig:
         default=True,
         metadata={
             "help": (
-                "With optimizer.state_offload='cpu', pin the host-side optimizer state buffers. "
+                "With model.optimizer.state_offload='cpu', pin the host-side optimizer state buffers. "
                 "Disable if page-locked memory is scarce; a failed pinned allocation degrades to "
                 "pageable buffers (rank-0 warning)."
             )
