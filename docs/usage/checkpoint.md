@@ -219,11 +219,15 @@ its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
 
 When resuming a legacy Adam checkpoint into its original output directory, the
-trainer reuses an unchanged same-step checkpoint only after verifying the
-completed manifest, optimizer identity, RNG state and available data cursor.
+trainer reuses an unchanged same-step checkpoint only after a successful model
+and optimizer load and validation of the completed manifest, RNG state and
+available data cursor. This follows the built-in synchronous trainer lifecycle,
+which does not replace the optimizer or checkpoint provider between loading and
+cursor validation.
 If those cannot be established, use a different output directory: this avoids
 overwriting the source checkpoint during an immediate epoch-end or HF export.
-This guard does not claim exact recovery for legacy optimizer formats.
+This guard does not prove optimizer group identity or claim exact recovery for
+legacy optimizer formats.
 
 Checkpoints from older layouts have no manifest; discovery falls back to a
 `.metadata` at the step root, which is what marked those steps complete, but

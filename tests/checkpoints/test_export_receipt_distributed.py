@@ -29,20 +29,6 @@ def _worker(rank, rendezvous, root, mode):
         runtime.optimizer = MagicMock(spec=[])
         with patch("veomni.models.checkpoint.manager.build_checkpointer"):
             manager = ModelCheckpointManager(runtime)
-            if mode == "invalidated_output":
-                state = TrainerState(global_step=3)
-                if rank == 0:
-                    manager._invalidated_saved_step_paths.append(manager.step_dir(state))
-                error = None
-                try:
-                    manager.save_dcp(state)
-                except RuntimeError as exc:
-                    error = str(exc)
-                result = torch.tensor(int(error is not None))
-                dist.all_reduce(result)
-                assert result.item() == 2, (rank, error)
-                manager.checkpointer.save.assert_not_called()
-                return
             if mode in ("same_output", "legacy_incomplete"):
                 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
@@ -159,7 +145,6 @@ def _worker(rank, rendezvous, root, mode):
         "dcp_reader",
         "model_state",
         "optimizer_state",
-        "invalidated_output",
     ],
 )
 def test_rank_local_checkpoint_failures_are_coordinated(tmp_path, mode):

@@ -30,7 +30,6 @@ Two blobs, two owners:
 """
 
 import os
-import weakref
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
@@ -89,16 +88,7 @@ class ModelCheckpointManager:
         self.config: "CheckpointConfig" = runtime.train_args.checkpoint
         self._last_saved_step: int = -1
         self._last_saved_step_path = None
-        self._saved_step_paths = []
-        self._invalidated_saved_step_paths = []
-        self._last_legacy_export_dcp_step = None
-        self._last_saved_optimizer_ref = None
-        self._loaded_optimizer_ref = None
         self._loaded_checkpoint_path = None
-        self._loaded_checkpointer = None
-        self._last_saved_without_optimizer = False
-        self._last_export_validated_step = None
-        self._last_export_released_optimizer = False
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -187,11 +177,6 @@ class ModelCheckpointManager:
     def _invalidate_saved_receipt(self) -> None:
         self._last_saved_step = -1
         self._last_saved_step_path = None
-        self._last_legacy_export_dcp_step = None
-        self._last_saved_optimizer_ref = None
-        self._last_saved_without_optimizer = False
-        self._last_export_validated_step = None
-        self._last_export_released_optimizer = False
         if hasattr(self, "_last_saved_optimizer_generation"):
             self._last_saved_optimizer_generation = None
 
@@ -226,12 +211,8 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
-        self._invalidated_saved_step_paths.extend(self._saved_step_paths)
-        self._saved_step_paths.clear()
         self._invalidate_saved_receipt()
-        self._loaded_optimizer_ref = None
         self._loaded_checkpoint_path = None
-        self._loaded_checkpointer = None
         if hasattr(self, "_loaded_optimizer_global_step"):
             self._loaded_optimizer_global_step = None
         if hasattr(self, "_loaded_optimizer_generation"):
@@ -283,13 +264,7 @@ class ModelCheckpointManager:
                         pass  # Keep the original coordinated restore error.
             raise
         dist.barrier()
-        if optimizer is not None:
-            try:
-                self._loaded_optimizer_ref = weakref.ref(optimizer)
-            except TypeError:
-                self._loaded_optimizer_ref = None
         self._loaded_checkpoint_path = load_dir
-        self._loaded_checkpointer = checkpointer
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
@@ -299,17 +274,10 @@ class ModelCheckpointManager:
         dataloader is, the rng — has its own writer.
         """
         self._invalidate_saved_receipt()
-        optimizer, optimizer_ref, error, extra_state, kwargs, step_path = None, None, None, None, None, None
+        optimizer, error, extra_state, kwargs, step_path = None, None, None, None, None
         try:
             step_path = self.step_dir(state)
-            if any(layout.same_checkpoint_path(step_path, path) for path in self._invalidated_saved_step_paths):
-                raise RuntimeError("Cannot overwrite a checkpoint after loading without a new verified receipt")
             optimizer = self.runtime.optimizer
-            try:
-                optimizer_ref = weakref.ref(optimizer) if optimizer is not None else None
-            except TypeError:
-                # A non-weakrefable custom optimizer cannot certify a legacy save.
-                optimizer_ref = None
             extra_state = self._extra_state(state)
             kwargs = self._checkpointer_kwargs()
             helper.empty_cache()
@@ -334,9 +302,6 @@ class ModelCheckpointManager:
         dist.barrier()
         self._last_saved_step = state.global_step
         self._last_saved_step_path = step_path
-        self._saved_step_paths.append(step_path)
-        self._last_saved_optimizer_ref = optimizer_ref
-        self._last_saved_without_optimizer = optimizer is None
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
     def prepare_export(self, state: "TrainerState", stage: str) -> str:
@@ -350,9 +315,6 @@ class ModelCheckpointManager:
         ``GlobalStateCallback`` finishes such a step off with the cursor files
         and the manifest, so it resumes like any other.
         """
-        self._last_legacy_export_dcp_step = None
-        self._last_export_validated_step = None
-        self._last_export_released_optimizer = False
         error = None
         try:
             if self._last_saved_step != state.global_step:
@@ -369,14 +331,7 @@ class ModelCheckpointManager:
             self._invalidate_saved_receipt()
             raise
 
-        if self._last_saved_step == state.global_step:
-            self._last_export_validated_step = state.global_step
-            optimizer = self.runtime.optimizer
-            if optimizer is not None and getattr(optimizer, "_is_multi_optimizer", False) is False:
-                self._last_legacy_export_dcp_step = state.global_step
-
         if stage == "train_end":
-            self._last_export_released_optimizer = self._last_export_validated_step == state.global_step
             self.runtime.optimizer = None
             self.runtime.lr_scheduler = None
 
@@ -392,62 +347,30 @@ class ModelCheckpointManager:
             or getattr(self, "_loaded_optimizer_global_step", None) != step
             or getattr(self, "_loaded_optimizer_generation", None) != generation
             or getattr(optimizer, "_is_multi_optimizer", False) is not True
-            or self._loaded_optimizer_ref is None
-            or self._loaded_optimizer_ref() is not optimizer
-            or (self._invalidated_saved_step_paths and self._loaded_checkpoint_path is None)
+            or self._loaded_checkpoint_path is None
             or getattr(self.checkpointer, "_async_save_failed", False) is True
         ):
             raise RuntimeError("Cannot reuse an unproven optimizer checkpoint receipt")
-        try:
-            optimizer_ref = weakref.ref(optimizer)
-        except TypeError as exc:
-            raise RuntimeError("Restored optimizer cannot be bound to the checkpoint receipt") from exc
         self._last_saved_step = step
         self._last_saved_step_path = self._loaded_checkpoint_path
-        if self._loaded_checkpoint_path is not None:
-            self._saved_step_paths.append(self._loaded_checkpoint_path)
-        self._invalidated_saved_step_paths = [
-            path
-            for path in self._invalidated_saved_step_paths
-            if not layout.same_checkpoint_path(path, self._loaded_checkpoint_path)
-        ]
-        self._last_saved_optimizer_ref = optimizer_ref
-        self._last_saved_without_optimizer = False
         self._last_saved_optimizer_generation = generation
-        self._last_legacy_export_dcp_step = None
-        self._last_export_validated_step = None
-        self._last_export_released_optimizer = False
 
     def confirm_legacy_loaded_checkpoint_for_reuse(self, step: int, load_path: str) -> None:
         """Bind a legacy DCP only after its optimizer and trainer cursor restore."""
-        from ...checkpoint.dcp_checkpointer import DistributedCheckpointer
-
         optimizer = self.runtime.optimizer
         if (
             type(step) is not int
             or step < 0
+            or self.config.manager != "dcp"
             or optimizer is None
             or getattr(optimizer, "_is_multi_optimizer", False) is not False
-            or self._loaded_optimizer_ref is None
-            or self._loaded_optimizer_ref() is not optimizer
             or self._loaded_checkpoint_path is None
             or not layout.same_checkpoint_path(self._loaded_checkpoint_path, load_path)
-            or self._loaded_checkpointer is not DistributedCheckpointer
-            or self.checkpointer is not self._loaded_checkpointer
             or getattr(self.checkpointer, "_async_save_failed", False) is True
         ):
             raise RuntimeError("Cannot reuse an unproven legacy optimizer checkpoint receipt")
         self._last_saved_step = step
         self._last_saved_step_path = load_path
-        self._saved_step_paths.append(load_path)
-        self._invalidated_saved_step_paths = [
-            path for path in self._invalidated_saved_step_paths if not layout.same_checkpoint_path(path, load_path)
-        ]
-        self._last_saved_optimizer_ref = self._loaded_optimizer_ref
-        self._last_saved_without_optimizer = False
-        self._last_legacy_export_dcp_step = step
-        self._last_export_validated_step = step
-        self._last_export_released_optimizer = False
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ...utils.save_safetensor_utils import save_hf_safetensor

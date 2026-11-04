@@ -107,41 +107,14 @@ def _multi_optimizer_checkpoints(trainer):
 
 
 def _legacy_optimizer_checkpoints(trainer):
-    """Find built-in legacy managers that can prove a completed load."""
-    from ...checkpoint.dcp_checkpointer import DistributedCheckpointer
-
+    """Find the model runtimes responsible for legacy checkpoint recovery."""
     root = getattr(trainer, "model", None)
     runtimes = [("model", root)]
     modules = getattr(root, "module_runtimes", None)
     if isinstance(modules, Mapping) and modules:
         if getattr(root, "checkpoint", None) is None:
-            optimizer = getattr(root, "optimizer", None)
-            owned = {
-                name: getattr(module, "optimizer", None)
-                for name, module in modules.items()
-                if getattr(module, "optimizer", None) is not None
-            }
-            aggregate = getattr(optimizer, "optimizers", None)
-            is_omni_proxy = False
-            if type(root).__module__ == "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime":
-                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-                    MultiOptimizer as OmniMultiOptimizer,
-                )
-                from ...models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-                    OmniModelRuntime,
-                )
-
-                is_omni_proxy = (
-                    type(root) is OmniModelRuntime
-                    and type(optimizer) is OmniMultiOptimizer
-                    and isinstance(aggregate, Mapping)
-                    and aggregate.keys() == owned.keys()
-                    and all(aggregate[name] is opt for name, opt in owned.items())
-                )
-            if optimizer is None or is_omni_proxy:
-                # Omni's aggregate only delegates to these module optimizers;
-                # their checkpoint managers are the actual state owners.
-                runtimes = []
+            # A composed runtime delegates checkpoint ownership to its modules.
+            runtimes = []
         runtimes.extend((f"module:{name}", module) for name, module in sorted(modules.items()))
     result, unknown, seen = [], [], set()
     for name, runtime in runtimes:
@@ -149,10 +122,7 @@ def _legacy_optimizer_checkpoints(trainer):
             continue
         optimizer = getattr(runtime, "optimizer", None)
         checkpoint = getattr(runtime, "checkpoint", None)
-        confirm = getattr(type(checkpoint), "confirm_legacy_loaded_checkpoint_for_reuse", None)
-        if checkpoint is not None and getattr(checkpoint, "runtime", None) is not runtime:
-            unknown.append(name)
-            continue
+        confirm = getattr(checkpoint, "confirm_legacy_loaded_checkpoint_for_reuse", None)
         if checkpoint is not None and id(checkpoint) in seen:
             continue
         if optimizer is None:
@@ -160,12 +130,7 @@ def _legacy_optimizer_checkpoints(trainer):
                 unknown.append(name)
             continue
         multi = getattr(optimizer, "_is_multi_optimizer", False)
-        if (
-            multi is False
-            and checkpoint is not None
-            and callable(confirm)
-            and getattr(checkpoint, "checkpointer", None) is DistributedCheckpointer
-        ):
+        if multi is False and callable(confirm):
             result.append((name, checkpoint))
             seen.add(id(checkpoint))
         elif multi is True and checkpoint is not None and hasattr(checkpoint, "_loaded_optimizer_generation"):
@@ -996,17 +961,12 @@ class GlobalStateCallback(Callback):
             raise_if_any_rank_failed(error, "confirming restored optimizer checkpoint")
         except BaseException:
             for _, checkpoint in (*checkpoints, *legacy_checkpoints):
-                path = getattr(checkpoint, "_last_saved_step_path", None)
-                if path is not None and hasattr(checkpoint, "_invalidated_saved_step_paths"):
-                    checkpoint._invalidated_saved_step_paths.append(path)
                 invalidate = getattr(checkpoint, "_invalidate_saved_receipt", None)
                 if callable(invalidate):
                     invalidate()
                 else:
                     checkpoint._last_saved_step = -1
                     checkpoint._last_saved_optimizer_generation = None
-                    if hasattr(checkpoint, "_last_saved_optimizer_ref"):
-                        checkpoint._last_saved_optimizer_ref = None
             raise
         self._last_saved_step = step
         self._last_saved_optimizer_generations = dict(generations)
