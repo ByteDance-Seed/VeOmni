@@ -743,7 +743,9 @@ class VeOmniModelRuntime:
 
         Models with extra state (e.g. the DiT condition model's noise/timestep
         generator) contribute it here. The checkpoint manager merges the result
-        into the model's extra_state blob. Default: nothing.
+        into the model's extra_state blob. Keys prefixed with ``_veomni_`` are
+        reserved for framework checkpoint metadata and must not be returned by
+        custom runtimes. Default: nothing.
         """
         return {}
 
