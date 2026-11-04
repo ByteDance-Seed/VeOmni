@@ -321,7 +321,7 @@ varlen layout; kernel correctness itself is covered by
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 
-For CUDA FP16/BF16, H3 can explicitly select cuDNN for its DiT/refiner SDPA calls:
+For NVIDIA CUDA FP16/BF16, H3 can explicitly select cuDNN for its DiT/refiner SDPA calls:
 
 ```shell
 export MINIMAX_H3_ATTENTION_IMPLEMENTATION=torch_cudnn

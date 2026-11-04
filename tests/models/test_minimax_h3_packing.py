@@ -27,7 +27,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
     MiniMaxH3DiTOutput,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_torch_npu_available
 
 
@@ -62,19 +62,24 @@ def test_cudnn_env_keeps_vae_dispatch_independent(monkeypatch, modality):
     assert torch.isfinite(actual).all()
 
 
-@pytest.mark.parametrize("device,dtype", [("cpu", torch.bfloat16), ("cuda", torch.float32), ("npu", torch.float16)])
+@pytest.mark.parametrize(
+    "device,dtype,hip",
+    [("cpu", torch.bfloat16, None), ("cuda", torch.float32, None), ("cuda", torch.bfloat16, "6.0")],
+)
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_explicit_cudnn_attention_rejects_unsupported_inputs(device, dtype):
+def test_explicit_cudnn_attention_rejects_unsupported_inputs(monkeypatch, device, dtype, hip):
     """Fail before entering cuDNN for unsupported device or dtype metadata."""
-    q = SimpleNamespace(device=SimpleNamespace(type=device), dtype=dtype)
+    monkeypatch.setattr(torch.version, "hip", hip)
+    q = SimpleNamespace(device=torch.device(device), dtype=dtype)
     with pytest.raises(ValueError, match="requires CUDA FP16 or BF16"):
         minimax_h3_dit._sdpa_backend_context(q, True)
 
 
 @pytest.mark.parametrize("raises", [False, True])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_explicit_cudnn_attention_restores_backend_flags(raises):
+def test_explicit_cudnn_attention_restores_backend_flags(monkeypatch, raises):
     """Restore the caller's SDPA flags on normal return and on exceptions."""
+    monkeypatch.setattr(torch.version, "hip", None)
     q = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)
 
     def flags():
@@ -155,12 +160,12 @@ def test_cudnn_option_preserves_packed_flash_dispatch(monkeypatch):
     assert actual is expected and len(calls) == 1
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Requires CUDA cuDNN SDPA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE or torch.version.hip is not None, reason="Requires NVIDIA cuDNN SDPA")
 def test_cudnn_dit_and_audio_vae_head_dim_256_on_cuda(monkeypatch):
     """Exercise real BF16 cuDNN attention and the audio VAE's d256 attention."""
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_audio_vae import CausalAttention
 
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
     q = torch.randn(128, 2, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
     out = minimax_h3_dit._sdpa_varlen_attention(q, q, q, (0, 128), 128**-0.5, use_cudnn=True)

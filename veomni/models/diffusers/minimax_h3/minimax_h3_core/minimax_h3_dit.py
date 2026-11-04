@@ -19,6 +19,7 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _Gather,
 )
 from veomni.ops import VeomniOp
+from veomni.utils.device import is_nvidia_cuda_device
 
 from .core import (
     bind_minimax_attention,
@@ -95,7 +96,7 @@ def _sdpa_backend_context(q, use_cudnn):
     """Limit an opted-in DiT/refiner call to cuDNN and restore backend flags on exit."""
     if not use_cudnn:
         return nullcontext()
-    if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
+    if not is_nvidia_cuda_device(q.device) or q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("H3 torch_cudnn attention requires CUDA FP16 or BF16 inputs.")
     return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
 
