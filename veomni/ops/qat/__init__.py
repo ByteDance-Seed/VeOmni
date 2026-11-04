@@ -66,16 +66,34 @@ def fp8_weight_quant(*args, **kwargs):
     return impl(*args, **kwargs)
 
 
+def fp8_gemm(*args, **kwargs):
+    """Run the optional TileLang FP8 GEMM lazily."""
+    require_tilelang_sm90()
+    from .gemm import fp8_gemm as impl
+
+    return impl(*args, **kwargs)
+
+
+def fp4_gemm(*args, **kwargs):
+    """Run the optional TileLang FP8xFP4 GEMM lazily."""
+    require_tilelang_sm90()
+    from .gemm import fp4_gemm as impl
+
+    return impl(*args, **kwargs)
+
+
 __all__ = [
     "DEFAULT_SCALE_FMT",
     "FP4_BLOCK_SIZE",
     "act_quant",
     "fp4_act_quant",
     "fp4_fake_quant_weight",
+    "fp4_gemm",
     "fp8_fake_quant_act",
     "fp8_fake_quant_act_prefix",
     "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
+    "fp8_gemm",
     "fp8_weight_quant",
     "qat_linear",
 ]

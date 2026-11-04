@@ -7,7 +7,11 @@ import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
-from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group
+from .fsdp2.clip_grad_norm import (
+    _average_extra_parallel_only_replicated_grads,
+    _finalize_total_norm,
+    _fsdp2_reduce_group,
+)
 from .parallel_state import ParallelState, get_parallel_state
 
 
@@ -121,6 +125,8 @@ def veomni_omni_module_clip_grad_norm(
     ps = get_parallel_state()
     if ps.dp_mode == "ddp" and ps.sp_size > 1:
         _allreduce_ddp_sp_grads(model, ps)
+    elif getattr(model, "_extra_parallel_only", False):
+        _average_extra_parallel_only_replicated_grads(model)
 
     pth_sums: list[torch.Tensor] = []
     groups_to_clip: list[list[torch.nn.Parameter]] = []
@@ -129,7 +135,8 @@ def veomni_omni_module_clip_grad_norm(
     if ep_param_groups is not None and ps.any_extra_parallel_enabled:
         non_ep = [p for p in ep_param_groups.get("non_extra_parallel", []) if p.grad is not None]
         if non_ep:
-            pth_sums.append(_fsdp2_reduce_group(non_ep, norm_type, [("fsdp", ps.fsdp_group)]))
+            reduce_groups = [] if getattr(model, "_extra_parallel_only", False) else [("fsdp", ps.fsdp_group)]
+            pth_sums.append(_fsdp2_reduce_group(non_ep, norm_type, reduce_groups))
             groups_to_clip.append(non_ep)
         for para in ps.extra_parallel_names:
             if not ps.extra_parallel_enabled(para):

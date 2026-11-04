@@ -1,0 +1,84 @@
+# scaled64.yaml training one llm layer of every decoder-side kind plus MTP, with the
+# n-gram tables frozen. See modules_train_scaled64_decoder.yaml.
+#
+#   NNODES=8 NODE_RANK=<rank> MASTER_ADDR=<host> bash train.sh \
+#     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/train/scaled64_decoder.yaml
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train_scaled64_decoder.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    infer_graph:
+      vision_understanding: configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_min: 1.0e-7
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  # Same as full.yaml, so this run's peak memory bounds that one's.
+  # Not enforced on the SeedOmni V2 path; the tulu data is pre-filtered to it.
+  max_seq_len: 1024
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/scaled64_data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 100000
+  dataloader:
+    type: native
+    num_workers: 1
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 64
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 30
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_scaled64_decoder
+    # A save is 763 B parameters; this run only checks that training works.
+    save_steps: 100000
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: VeOmni_omni
+    name: deepseek_v41_flash_scaled64_decoder

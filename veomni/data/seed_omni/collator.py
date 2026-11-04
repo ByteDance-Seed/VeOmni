@@ -24,7 +24,8 @@ class SeedOmniCollator(DataCollator):
 
     Pairs with ``data_type: seedomni`` (see
     ``veomni/data/seed_omni/seedomni_transform.py``) which emits
-    preprocessed per-sample ``{"conversation_list": [ConversationItem, ...]}``.
+    preprocessed per-sample ``{"conversation_list": [ConversationItem, ...]}`` after running
+    each module's CPU preprocessor in ``data_transform``.
     This collator turns ``N`` such dicts into a single batched dict
     ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
     keys present in the samples (passed through unchanged as a per-sample list).

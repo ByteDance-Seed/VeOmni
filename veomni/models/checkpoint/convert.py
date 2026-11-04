@@ -111,6 +111,31 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        """Optional streaming capability: the checkpoint key ``name`` is converted
+        together with, row by row -- or ``None``.
+
+        Returning a key declares that row ``i`` of the converted ``name`` depends
+        only on row ``i`` of ``name`` and of that companion (e.g. fp8 table rows
+        and their per-row block scales, dequantized to bf16). Such a transform
+        commutes with a ``Shard(0)`` split, so a per-rank streaming loader reads
+        the same real-row slice of both keys, hands them to :meth:`convert_rows`,
+        and zero-fills any rows past the checkpoint's. That loader then skips
+        the companion's own key; a whole-tensor loader hands both keys to
+        :meth:`convert`, so it must pair them there too.
+
+        A key outside every ExtraParallel plan is read whole, with its whole
+        companion. The loader asks for every key, claimed by :meth:`can_handle`
+        or not, and only uses the companion when the checkpoint holds it;
+        without it the key falls back to :meth:`is_dim0_zero_pad`. Implementing
+        this method is optional and a missing method means ``None``.
+        """
+        ...
+
+    def convert_rows(self, name: str, rows: "torch.Tensor", companion_rows: "torch.Tensor") -> "torch.Tensor":
+        """Convert matching row slices of ``name`` and its :meth:`dim0_rowwise_companion`."""
+        ...
+
     def should_skip_without_loading(self, name: str) -> bool:
         """Optional streaming capability: whether ``name`` can be discarded
         without materializing its checkpoint tensor.
@@ -165,6 +190,22 @@ def checkpoint_converter_is_dim0_zero_pad(
         return False
     fn = getattr(converter, "is_dim0_zero_pad", None)
     return bool(fn(name)) if callable(fn) else False
+
+
+def checkpoint_converter_dim0_rowwise_companion(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> Optional[str]:
+    """Safely query the optional :meth:`CheckpointTensorConverter.dim0_rowwise_companion`.
+
+    Not gated on ``can_handle``: a converter may claim a weight only by its
+    content (``can_handle_tensor``), and the name alone is all a streaming
+    loader has before reading.
+    """
+    if converter is None:
+        return None
+    fn = getattr(converter, "dim0_rowwise_companion", None)
+    return fn(name) if callable(fn) else None
 
 
 def checkpoint_converter_should_skip_without_loading(

@@ -61,15 +61,12 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier = conversation_list
         image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))
-        real_image_items = [it for it in image_items if not it.is_dummy]
-        dummy = not (real_image_items or video_items)
-        if not dummy:
-            image_items = real_image_items
-        # Otherwise ``image_items`` holds only the worker-built dummy placeholders,
-        # fed through the same path as real images — they carry patches +
+        dummy = all(it.is_dummy for it in (*image_items, *video_items))
+        # ``image_items`` holds both real user images and worker-built dummy
+        # placeholders, fed through the same path — they carry patches +
         # ``_OMNI_GRID`` like real items. Under FSDP these run the ViT (gradient
-        # anchor); without FSDP modeling.forward emits real-shaped zeros, so the
-        # batch stays uniform either way.
+        # anchor); without FSDP modeling.forward emits real-shaped zeros when all
+        # items are dummy, so the batch stays uniform either way.
         merge = self.config.vision_config.spatial_merge_size
         pixel_values, grid_thw, output_slots = process_qwen3vl_visual_items(
             image_items,

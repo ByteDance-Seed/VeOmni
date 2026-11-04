@@ -50,6 +50,12 @@ RANK_FILE_FORMAT = "rank_{}.pt"
 # Export tree. Inference artifacts; resume never reads these.
 HF_EXPORT_DIRNAME = "hf_ckpt"
 LORA_EXPORT_DIRNAME = "lora_ckpt"
+# An HF export whose oversized row-sharded tables are still split by rank: the
+# per-rank shards stay under ``sharded/`` and this marker lists the files they
+# merge into. Loaders refuse the directory until ``scripts/merge_hf_export.py``
+# has run.
+HF_SHARDED_DIRNAME = "sharded"
+HF_PENDING_MERGE_FILENAME = "pending_merge.json"
 
 # Run-root sidecars. Written once at train start, beside ``checkpoints/``.
 ASSETS_DIRNAME = "model_assets"

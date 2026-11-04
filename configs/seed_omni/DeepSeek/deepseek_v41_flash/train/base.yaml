@@ -1,0 +1,112 @@
+# VeOmni training config for OmniModel V2 -- DeepSeek-V4.1-Flash (multimodal MoE).
+#
+# Launch training:
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/DeepSeek/deepseek_v41_flash/train/base.yaml
+#
+# Prerequisite -- split the released checkpoint into the four module folders.
+# The converter streams through the shards rather than building the model, so
+# it does not need the weights to fit in RAM. Dtypes stay as released (fp8/fp4);
+# training dequantizes the llm at load.
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+#
+# Or skip the split: set model_path to the release itself
+# (/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash). The four modules then
+# load through the `deepseek_v41` HF layout with the same weights, including
+# under ep_sharded_stream_load (a shrunk llm, as here, streams only from the
+# release, not from a split checkpoint). save_hf_weights then writes the
+# release's own keys, fp8/fp4 dtypes and shards, for the full 40-layer llm
+# beside frozen n-gram tables only: a shrunk llm or trained tables raise at
+# the first HF save.
+#
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    infer_graph:
+      vision_understanding: configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    # Context parallelism splits each packed row across `cp_size` ranks, the
+    # mesh DeepSeek-V4 uses; `deepseek_v41_llm` gathers only its single KV head
+    # (llm/sequence_shard.py) and refuses `ulysses_size > 1`. When raising
+    # `cp_size` to S > 1 here, also set `ulysses_size: S` under
+    # `deepseek_v41_vision.accelerator` in `modules_train.yaml` (where
+    # `cp_size: 1` is pinned) so the ViT runs Ulysses SP and the llm runs CP
+    # under the same `dp_size`.
+    cp_size: 1
+    # Per-module in modules_train.yaml. The ViT does not declare
+    # `gradient_checkpointing`, so a top-level enable would trip HF's check.
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    # An SFT rate for a 749 B model, an order below the 1e-4 the smaller
+    # SeedOmni configs use.
+    lr: 1.0e-5
+    lr_min: 1.0e-7
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_omni_sft
+    save_steps: 500
+    save_epochs: 0
+    # The module folders this writes are the training layout, not the released
+    # one; re-exporting to the released fp8/fp4 packing is a separate step.
+    # When enabled, a trained n-gram module's tables are left as per-rank shards; finish them
+    # with `python scripts/merge_hf_export.py <step>/hf_ckpt` before loading.
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: deepseek_v41_flash_omni_sft

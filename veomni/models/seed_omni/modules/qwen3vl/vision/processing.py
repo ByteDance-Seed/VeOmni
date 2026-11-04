@@ -30,7 +30,7 @@ from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
 from ......data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import Qwen3VLVisionEncoderConfig
 
@@ -87,27 +87,13 @@ def _video_metadata(items: list) -> list[dict]:
     return declared
 
 
-def _store_patches(items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor, dtype: Any) -> None:
-    """Split flat ViT patches by per-item grid; stash patches on ``value`` + grid on ``meta``.
-
-    Used by the CPU preprocessor (both training and inference share it) so items
-    are left in the preprocessed form that ``_pixels_and_grid`` reads back.
-    """
-    grids = grid_thw.tolist()
-    sizes = [g[0] * g[1] * g[2] for g in grids]
-    chunks = torch.split(pixel_values, sizes, dim=0)
-    for it, px, g in zip(items, chunks, grids, strict=True):
-        it.value = px.to(dtype=dtype)
-        it.meta[_OMNI_GRID] = g
-
-
 class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
     """Worker-side image/video patchify+normalize for the Qwen3-VL vision tower.
 
     Holds only the (picklable) HF image / video processors + a CPU zero-patch
     template — never the model. Runs them on **CPU** (bf16, to halve IPC), writes
     the per-item normalized patches onto ``item.value`` and stashes ``grid_thw`` on
-    ``meta``. When a whole micro-batch has no user image/video, appends one
+    ``meta``. When a sample has no user image/video, appends one
     ``is_dummy`` user-image placeholder carrying the zero patches + grid (the merger still
     runs on it in the GPU forward for the FSDP gradient anchor).
     """
@@ -119,12 +105,14 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         dtype: torch.dtype | None = None,
         dummy_pixel_values: torch.Tensor | None = None,
         dummy_grid: list | None = None,
+        spatial_merge_size: int = 2,
     ) -> None:
         self._image_processor = image_processor
         self._video_processor = video_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (t*h*w, pixel_row), model dtype
         self._dummy_grid = dummy_grid  # [t, h, w]
+        self._spatial_merge_size = int(spatial_merge_size)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> Qwen3VLVisionPreprocessor:
@@ -137,12 +125,17 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         del kwargs
         image_processor = Qwen3VLVisionImageProcessor.from_pretrained(module_path)
         video_processor = Qwen3VLVisionVideoProcessor.from_pretrained(module_path)
-        return cls(image_processor, video_processor)
+        return cls(
+            image_processor,
+            video_processor,
+            spatial_merge_size=int(getattr(image_processor, "merge_size", 2)),
+        )
 
     def bind_dummy_inputs(self, config: Qwen3VLVisionEncoderConfig, dtype: torch.dtype | None = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
         cfg = config.vision_config
-        merge = cfg.spatial_merge_size
+        merge = int(cfg.spatial_merge_size)
+        self._spatial_merge_size = merge
         t, h, w = 1, 2 * merge, 2 * merge
         pixel_row = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
         self._dtype = dtype
@@ -153,7 +146,6 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_media = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
@@ -176,28 +168,39 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
                         return_tensors="pt",
                     )
                     self._store(sample_video_items, out["pixel_values_videos"], out["video_grid_thw"])
-                saw_real_media = True
-
-        if inference or saw_real_media:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
-            )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="user",
-                is_dummy=True,
-                meta={_OMNI_GRID: self._dummy_grid, _IMG_TAG_KEY: "und"},
-            ),
-        )
+            elif not inference:
+                if self._dummy_pixel_values is None:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                        "before training use (pure inference never reaches this branch)."
+                    )
+                merge_area = max(int(self._spatial_merge_size) ** 2, 1)
+                dummy_grid = list(self._dummy_grid)
+                dummy_token_len = max((int(dummy_grid[0]) * int(dummy_grid[1]) * int(dummy_grid[2])) // merge_area, 1)
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values.clone(),
+                        role="user",
+                        is_dummy=True,
+                        meta={
+                            _OMNI_GRID: dummy_grid,
+                            _IMG_TAG_KEY: "und",
+                            _OMNI_TOKEN_LEN: dummy_token_len,
+                        },
+                    )
+                )
 
     def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
-        _store_patches(items, pixel_values, grid_thw, self._dtype)
+        """Split flat ViT patches by per-item grid; stash patches on ``value`` + grid on ``meta``."""
+        grids = grid_thw.tolist()
+        sizes = [g[0] * g[1] * g[2] for g in grids]
+        chunks = torch.split(pixel_values, sizes, dim=0)
+        merge_area = max(int(self._spatial_merge_size) ** 2, 1)
+        for it, px, g, size in zip(items, chunks, grids, sizes, strict=True):
+            it.value = px.to(dtype=self._dtype)
+            it.meta[_OMNI_GRID] = g
+            it.meta[_OMNI_TOKEN_LEN] = max(int(size) // merge_area, 1)
 
 
 __all__ = [

@@ -1,0 +1,89 @@
+# Full-parameter SFT on 128 x H20 (16 nodes x 8): llm with all 40 layers but
+# no MTP, Muon on the llm, n-gram tables frozen in fp8, text encoder and ViT
+# trainable. modules_train_full128.yaml carries the card-count arithmetic and
+# why this is borderline; full.yaml is the 256-card everything-trains run.
+#
+#   NNODES=16 NODE_RANK=<rank> MASTER_ADDR=<host> bash train.sh \
+#     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/train/full128.yaml
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train_full128.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    infer_graph:
+      vision_understanding: configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    # emb spans dp_shard x cp_size (128 at any value here); see base.yaml for
+    # what context parallelism shards.
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        # An fp32 reduce-scatter buffer per layer OOMs on the 8-card runs.
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  # The text encoder and ViT stay on AdamW; the llm overrides to Muon in
+  # modules_train_full128.yaml.
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-7
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  # Not enforced on the SeedOmni V2 path; the tulu data is pre-filtered to it.
+  max_seq_len: 1024
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 8
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 4
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 128
+  # Raise only after a run shows the peak; see modules_train_full128.yaml.
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_full128_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: deepseek_v41_flash_full128_sft

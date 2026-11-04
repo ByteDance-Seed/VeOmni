@@ -1,0 +1,91 @@
+# modules_train_scaled64.yaml with the n-gram tables frozen and one layer of
+# every encoder-side kind trained, so each shared-state path gets a gradient
+# into weights that update:
+#
+#   0      window only
+#   1      window + Engram
+#   2      encoder KV source + indexer source (compressor, wq_b, wk)
+#   3      encoder consumer: L2's compressed KV and top-k
+#   8      encoder KV + indexer source without Engram
+#   14     encoder KV + indexer source + Engram
+#   19     last encoder layer; its output is what L20's CED projection reads
+#
+# Layer 0 keeps every layer above it in the backward, so the decoder's shared
+# state carries gradient too. The decoder-side kinds are in
+# modules_train_scaled64_decoder.yaml. Six more trained layers cost ~12.8 GB a
+# card against the 18.4 GB the frozen tables free.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [64]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # Frozen here: the tables' grads + moments (18.4 GB a card) are the room
+    # the extra llm layers train in. scaled64 already covers trainable tables.
+    freeze: true
+    weight_quantization: null
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [64]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  model_config:
+    weight_quantization: null
+    dsa_indexer_loss: true
+    dspark_block_size: 5
+    num_nextn_predict_layers: 3
+    # DSpark reads the inputs of layers 37-39, so the MTP CE reaches through
+    # the frozen stack to layer 0.
+    trainable_layer_ids: [0, 1, 2, 3, 8, 14, 19]
+    freeze_mtp: false
+  ops_implementation:
+    qat_implementation: fp8_blockwise
+  accelerator:
+    # 6 experts a rank, ep_fsdp=1.
+    ep_size: 64
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false

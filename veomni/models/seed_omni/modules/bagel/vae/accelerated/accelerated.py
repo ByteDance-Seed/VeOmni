@@ -23,7 +23,12 @@ from .....utils.conversation import ConversationItem
 from ...sources import BAGEL_CONTEXT_KEY, BAGEL_VAE_CONTEXT
 from ..configuration import BagelVAEConfig
 from ..modeling import BagelVAE, select_bagel_vae_context_items
-from ..processing import BAGEL_VAE_PIXEL_SHAPE, BAGEL_VAE_POSTERIOR, crop_latent_to_image_shape
+from ..processing import (
+    BAGEL_VAE_PIXEL_SHAPE,
+    BAGEL_VAE_POSTERIOR,
+    _pad_to_batch_size,
+    crop_latent_to_image_shape,
+)
 
 
 def _posterior_from_cache(
@@ -174,7 +179,7 @@ class TrainingMixin(TrainingModuleMixin):
 
         self._metric_meter_stash_latent_tokens(self._vae_latent_token_lengths())
 
-        pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
+        pixel_values = torch.stack(_pad_to_batch_size([item.value for item in self._encode_items]), dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
         ps = get_parallel_state()

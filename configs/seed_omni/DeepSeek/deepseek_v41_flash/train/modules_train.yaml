@@ -1,0 +1,119 @@
+# Per-module overrides for DeepSeek-V4.1-Flash. Sizes and the parallelism each
+# one needs differ by two orders of magnitude across these four, so almost
+# nothing here is shareable with the top-level accelerator.
+#
+#   vision          0.49 B   FSDP2 alone
+#   text_encoder    1.32 B   emb   (vocab-parallel wte + CE head)
+#   ngram         196.61 B   emb   (row-sharded tables, frozen)
+#   llm           550.56 B   ep    (543.4 B of it is routed experts)
+#
+# The `emb` group size must match across `ngram` and `text_encoder` only in the
+# sense that each is sized to its own table; they are separate meshes.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    # ViT shards patches and scatters its 16 attention heads over Ulysses
+    # (`ulysses_size`), while the llm shards rows over `cp_size`. Keep
+    # `cp_size: 1` here and match `ulysses_size` to the top-level `cp_size` so
+    # every module resolves to the same `dp_size`.
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      # No FSDP wrap, so MixedPrecisionPolicy cannot cast weights to bf16
+      # for the fused CE. Keep the module in bf16 rather than fp32 masters.
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # G1: full-parameter training with the tables frozen. This is honoured by
+    # `DeepseekV41Ngram.freeze_model`; without that method the field would be
+    # accepted and ignored, and AdamW would allocate moments for 196.6 B rows.
+    freeze: true
+  # Rank-0 cannot hold the 196.6 B tables to broadcast them.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    # Row-sharded over 8 ranks -> ~23.6 GiB each in the released fp8. The lookup
+    # is an all-to-all gather, bit-identical to the full-table result.
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      # The trainer's mixed-precision path upcasts to fp32 for optimizer
+      # masters. These tables are frozen fp8; that cast is 393 GB.
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  model_config:
+    # Checkpoint files stay fp8/fp4. Clearing this makes the module allocate
+    # bf16 Parameters; DeepseekV41DequantConverter spends the scales at load.
+    weight_quantization: null
+    # Indexer weights only get a gradient through this KL -- top-k does not
+    # backprop into the scores. Off, the indexer is frozen in all but name.
+    dsa_indexer_loss: true
+    # No DSpark stages. A frozen DSpark only runs at inference, yet its
+    # ~14 B fp32 params (6.6 GiB/rank) OOM the 2-layer run at step 2 on
+    # 8xH20. modules_train_mtp.yaml builds and trains them instead.
+    dspark_block_size: 0
+    num_nextn_predict_layers: 0
+    # 8xH20 holds ~2.8 fully-trained layers. Freeze is not enough: 40 bf16
+    # layers still occupy the cards. Shrink to the CED pair `shrink_layer_schedule(2)`
+    # keeps released layers 2 and 20 (load remaps those keys).
+    num_hidden_layers: 2
+    compress_ratios: [2, 1]
+    kv_source_layer_ids: [0, 1]
+    index_source_layer_ids: [0, 1]
+    candidate_source_layer_id: 1
+    engram_layer_ids: [0, 1]
+    dspark_target_layer_ids: []
+    n_trainable_layers: 2
+  ops_implementation:
+    # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
+    # Needs SM90+ (the 8xH20 job); `none` trains in bf16 with no rounding.
+    # For native FP8 expert training with DeepGEMM, use
+    # `modules_train_deepgemm_fp8.yaml` (`moe_implementation: deepgemm_fp8` and
+    # `qat_implementation: none`).
+    # Resolved per-module from `config.ops_implementation` during init.
+    qat_implementation: fp8_blockwise
+  accelerator:
+    ep_size: 8
+    ep_outside: false
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    # Keep the FSDP2 wrap: extra_parallel_only would skip it, and then the
+    # dense 2-layer grads would never all-reduce across DP. Experts are still
+    # EP-sliced by the plan before wrap (ep_fsdp=1 at ep=8).
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false

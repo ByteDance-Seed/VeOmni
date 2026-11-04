@@ -15,6 +15,7 @@ plus its own chat template. VeOmni training-graph hooks (``encode_pre`` /
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
@@ -126,14 +127,25 @@ class InferenceMixin:
         last = hidden_states[:, -1, :]
         logits = self._project(last) if last.dim() == 2 else self._project(last.squeeze(0))
         if not do_sample:
-            return int(logits.argmax(dim=-1).item())
+            return self._agree_on_token(int(logits.argmax(dim=-1).item()))
         if temperature != 1.0:
             logits = logits / max(temperature, 1e-6)
         if top_p < 1.0:
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return int(token.item())
+        # An id, like the greedy branch above returns. Leaking the [1, 1] tensor
+        # instead reaches the tokenizer as a nested list and fails there, one
+        # whole decode step away from the line that produced it.
+        return self._agree_on_token(int(token.item()))
+
+    def _agree_on_token(self, token_id: int) -> int:
+        """Return rank 0's token on every rank."""
+        if not dist.is_available() or not dist.is_initialized():
+            return token_id
+        agreed = torch.tensor([token_id], dtype=torch.long, device=self.device)
+        dist.broadcast(agreed, src=0)
+        return int(agreed.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device

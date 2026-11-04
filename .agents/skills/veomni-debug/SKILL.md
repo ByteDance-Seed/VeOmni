@@ -52,6 +52,17 @@ Phase 5: Knowledge capture           -> pending
    - FSDP2: verify sharding plan matches model structure (`veomni/distributed/parallel_plan.py`).
    - Sequence parallel: check that attention inputs are properly split/gathered (`veomni/distributed/sequence_parallel/`).
    - MoE: verify expert routing and load balancing (`veomni/distributed/moe/`).
+   - Hang with no traceback: `py-spy dump --pid` every rank's main thread and
+     count distinct top frames; the few odd ranks out are the lead.
+     - Ranks in *different* collectives mean program order diverged, e.g. a
+       module whose output reaches the loss only on some ranks skips its FSDP
+       backward collectives elsewhere (fold dummy outputs in with `0 * x.mean()`).
+     - Ranks in the *same* collective (compare group size, numel and FSDP
+       `target_fqn` via `py-spy dump --locals`) mean the stall is below Python:
+       `py-spy dump --native`. A stack in `ncclCollPreconnect` /
+       `ncclTransportP2pSetup` is NCCL's lazy connection setup over the network;
+       the call never returns, so the NCCL watchdog never sees the work and the
+       job hangs indefinitely instead of aborting.
 
 ### Phase 2: Pattern Analysis
 

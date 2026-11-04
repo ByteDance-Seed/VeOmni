@@ -14,7 +14,6 @@ picklable ``Preprocessor`` run inside ``SeedOmniCollator``:
 * ``SeedOmniCollator`` groups samples then always runs ``OmniProcessor.preprocess_batch``.
 """
 
-import copy
 import pickle
 
 import torch
@@ -32,9 +31,6 @@ from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
 )
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
-from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
-    _OMNI_TOKENIZED as BAGEL_TOK,
-)
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )
@@ -237,7 +233,7 @@ def test_text_preprocessor_sets_labels_and_mask_on_cpu():
             assert part.meta["attention_mask"].shape == part.value.shape
 
 
-def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
+def test_bagel_text_preprocessor_tokenizes_plain_items():
     pre = BagelTextEncoderPreprocessor(_bagel_template())
     batch = [
         [
@@ -262,20 +258,13 @@ def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
     assert torch.equal(image_end.value, torch.tensor([8]))
     assert torch.equal(user_text.value, torch.tensor([5, ord("h"), ord("i"), 2]))
     assert user_text.value.device.type == "cpu"
-    assert user_text.meta[BAGEL_TOK] is True
+    assert torch.equal(user_text.meta["input_ids"], user_text.value)
     assert torch.equal(user_text.meta["labels"], torch.full_like(user_text.value, -100))
     assert torch.equal(user_text.meta["attention_mask"], torch.ones_like(user_text.value))
 
     assert torch.equal(assistant_text.value, torch.tensor([5, ord("o"), ord("k"), 2]))
-    assert assistant_text.meta[BAGEL_TOK] is True
+    assert torch.equal(assistant_text.meta["input_ids"], assistant_text.value)
     assert torch.equal(assistant_text.meta["labels"], assistant_text.value)
-
-    snapshot = copy.deepcopy(batch)
-    pre(_b(batch))
-    assert len(batch[0]) == len(snapshot[0])
-    for actual, expected in zip(batch[0], snapshot[0]):
-        if isinstance(actual.value, torch.Tensor):
-            assert torch.equal(actual.value, expected.value)
 
 
 def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
@@ -787,10 +776,11 @@ def test_vqvae_preprocessor_normalizes_only_assistant_images():
     assert user_img.value.dtype == torch.uint8
 
 
-# ── Collator wiring ─────────────────────────────────────────────────────────────
+# ── Data transform + Collator wiring ───────────────────────────────────────────
 
 
-def test_collator_runs_preprocessors_in_order():
+def test_data_transform_runs_preprocessors_and_collator_groups_samples():
+    from veomni.data.seed_omni.seedomni_transform import process_seedomni_example
     from veomni.models.seed_omni.processing_omni import OmniProcessor
 
     preprocessors = {
@@ -805,8 +795,8 @@ def test_collator_runs_preprocessors_in_order():
     processor = OmniProcessor(preprocessors)
     collator = SeedOmniCollator()
     features = [
-        processor.preprocess(_raw_image_sample(), inference=False),
-        processor.preprocess(_raw_text_sample(), inference=False),
+        processor.preprocess(_raw_image_sample()),
+        processor.preprocess(_raw_text_sample()),
     ]
     batch = collator(features)
     assert set(batch.keys()) == {"conversation_list"}
@@ -818,6 +808,15 @@ def test_collator_runs_preprocessors_in_order():
         for part in sample:
             if part.type == "image":
                 assert part.value.dtype == torch.bfloat16  # normalized to model dtype
+
+    # process_seedomni_example also runs processor when provided.
+    raw_example = {
+        "source_name": "sharegpt4v_sft",
+        "conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "ok"}],
+    }
+    transformed = process_seedomni_example(raw_example, processor=processor)
+    assert len(transformed) == 1
+    assert isinstance(transformed[0]["conversation_list"][0].value, torch.Tensor)
 
 
 def test_repr_after_preprocessing_does_not_raise():
@@ -838,19 +837,15 @@ def test_repr_after_preprocessing_does_not_raise():
             assert isinstance(repr(part), str)  # must not raise
 
 
-def test_collator_empty_processor_is_pure_grouper():
-    from veomni.models.seed_omni.processing_omni import OmniProcessor
-
-    processor = OmniProcessor({})
+def test_collator_is_pure_grouper():
     collator = SeedOmniCollator()
-    features = [processor.preprocess(_raw_text_sample(), inference=False)]
+    features = [{"conversation_list": _raw_text_sample()}]
     batch = collator(features)
-    # Empty OmniProcessor: text stays a raw string.
     assert batch["conversation_list"][0][0].value == "describe"
     assert isinstance(batch["conversation_list"][0][0].value, str)
 
 
-# ── Worker-built dummy placeholders (text-only / no-image micro-batches) ─────────
+# ── Worker-built dummy placeholders (per-sample dummy injection) ───────────────
 
 
 def _text_only_batch():
@@ -860,19 +855,20 @@ def _text_only_batch():
     ]
 
 
-def test_siglip_appends_one_batch_anchor_when_no_user_image():
+def test_siglip_appends_per_sample_dummy_when_no_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "user")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    d = dummies[0]
-    assert d.type == "image" and d.role == "user" and d.is_dummy
-    assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
-    assert d.meta[_IMG_TAG_KEY] == "und"
+    assert len(dummies) == 2
+    for sample, d in zip(batch, dummies):
+        assert d is sample[-1]
+        assert d.type == "image" and d.role == "user" and d.is_dummy
+        assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
+        assert d.meta[_IMG_TAG_KEY] == "und"
+        assert d.meta[BAGEL_SIGLIP_TOKEN_LEN] == 576
 
 
 def test_siglip_no_dummy_when_user_image_present():
@@ -883,9 +879,10 @@ def test_siglip_no_dummy_when_user_image_present():
     pre(_b(batch))
     assert _worker_dummies(batch, "user") == []
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
+    assert batch[0][0].meta[BAGEL_SIGLIP_TOKEN_LEN] == 576
 
 
-def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
+def test_siglip_appends_dummy_only_to_sample_missing_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -895,24 +892,26 @@ def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
     ]
     pre(_b(batch))
 
-    # The real image already anchors the tower for the whole micro-batch.
-    assert _worker_dummies(batch, "user") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    assert len(_worker_dummies(batch, "user")) == 1
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
+    assert batch[1][-1].is_dummy
 
 
-def test_vqvae_appends_one_batch_anchor_when_no_assistant_image():
+def test_vqvae_appends_per_sample_dummy_when_no_assistant_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "assistant")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    assert dummies[0].meta[_IMG_TAG_KEY] == "gen" and dummies[0].value.shape == (3, 4, 4)
+    assert len(dummies) == 2
+    for sample, d in zip(batch, dummies):
+        assert d is sample[-1]
+        assert d.meta[_IMG_TAG_KEY] == "gen" and d.value.shape == (3, 4, 4)
+        assert d.meta[BAGEL_SIGLIP_TOKEN_LEN] == 576
 
 
-def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
+def test_vqvae_appends_dummy_only_to_sample_missing_gen_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -922,11 +921,12 @@ def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "assistant") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    assert len(_worker_dummies(batch, "assistant")) == 1
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
+    assert batch[1][-1].is_dummy
 
 
-def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
+def test_qwen3vl_vision_appends_per_sample_dummy_with_grid_when_no_visual():
     proc = FakeQwen3VLImageProcessor()
     pre = Qwen3VLVisionPreprocessor(
         proc,
@@ -934,24 +934,27 @@ def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
         dummy_grid=[1, 2, 2],
+        spatial_merge_size=2,
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "user")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    d = dummies[0]
-    assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
-    assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.meta[_IMG_TAG_KEY] == "und"
+    assert len(dummies) == 2
+    for sample, d in zip(batch, dummies):
+        assert d is sample[-1]
+        assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
+        assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.meta[_IMG_TAG_KEY] == "und"
+        assert d.meta[BAGEL_SIGLIP_TOKEN_LEN] == 1
 
 
-def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
+def test_qwen3vl_vision_appends_dummy_only_to_sample_missing_visual():
     pre = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
         None,
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
         dummy_grid=[1, 2, 2],
+        spatial_merge_size=2,
     )
     batch = [
         [ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")],
@@ -959,8 +962,59 @@ def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "user") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    assert len(_worker_dummies(batch, "user")) == 1
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
+    assert batch[0][0].meta[BAGEL_SIGLIP_TOKEN_LEN] == 1
+    assert batch[1][-1].is_dummy and batch[1][-1].meta[BAGEL_SIGLIP_TOKEN_LEN] == 1
+
+
+def test_dyn_bsz_length_functions_on_preprocessed_seedomni_sample():
+    from veomni.data.dataset import get_length_by_labels_fn, get_length_fn
+    from veomni.models.seed_omni.processing_omni import OmniProcessor
+
+    processor = OmniProcessor(
+        {
+            "vision": Qwen3VLVisionPreprocessor(
+                FakeQwen3VLImageProcessor(patch_dim=8, grid=(1, 4, 4)),  # 16 patches -> 4 merged tokens
+                None,
+                dtype=torch.bfloat16,
+                dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+                dummy_grid=[1, 2, 2],  # 4 patches -> 1 merged token
+                spatial_merge_size=2,
+            ),
+            "text": Qwen3VLTextEncoderPreprocessor(_qwen3vl_template()),
+        }
+    )
+
+    # 1) Text-only sample -> vision appends a 1-token dummy; text has user + assistant tokens.
+    text_sample = processor.preprocess(
+        [
+            ConversationItem(type="text", value="hello", role="user"),
+            ConversationItem(type="text", value="world", role="assistant"),
+        ],
+    )
+    text_items = [it for it in text_sample["conversation_list"] if it.type == "text"]
+    dummy_items = [it for it in text_sample["conversation_list"] if it.is_dummy]
+    assert len(dummy_items) == 1
+    expected_text_total = sum(int(it.value.numel()) for it in text_items)
+    expected_text_effective = sum(int((it.meta["labels"] != -100).sum().item()) for it in text_items)
+    # Total includes dummy (1 token); effective excludes dummy (0 tokens).
+    assert get_length_fn(text_sample) == expected_text_total + 1
+    assert get_length_by_labels_fn(text_sample) == expected_text_effective
+
+    # 2) Image + text sample -> real user image has 4 merged tokens (total += 4, effective += 0).
+    mm_sample = processor.preprocess(
+        [
+            ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user"),
+            ConversationItem(type="text", value="hello", role="user"),
+            ConversationItem(type="text", value="world", role="assistant"),
+        ],
+    )
+    mm_text_items = [it for it in mm_sample["conversation_list"] if it.type == "text"]
+    expected_mm_text_total = sum(int(it.value.numel()) for it in mm_text_items)
+    expected_mm_text_effective = sum(int((it.meta["labels"] != -100).sum().item()) for it in mm_text_items)
+    assert get_length_fn(mm_sample) == expected_mm_text_total + 4
+    assert get_length_by_labels_fn(mm_sample) == expected_mm_text_effective
 
 
 def test_worker_dummy_routes_to_dummy_parts_in_text_template():

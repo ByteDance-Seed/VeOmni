@@ -1,0 +1,15 @@
+# Long-context sequence-parallel runs: only tulu conversations of 4k-32k
+# tokens (V4.1 tokenizer), text only. 13664 rows, 9182 tokens on average, p50
+# 7.2k, p90 17k, max 32.7k. Nothing on the SeedOmni V2 path truncates, so with
+# micro_batch_size 1 a rank holds up to 32.7k / cp_size tokens.
+sources:
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-4k32k
+# `names` picks the SeedOmni preprocessor, so it stays the upstream tulu name.
+names:
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [1.0]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

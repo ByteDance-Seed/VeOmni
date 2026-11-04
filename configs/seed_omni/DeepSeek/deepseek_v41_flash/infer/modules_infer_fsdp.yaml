@@ -1,0 +1,91 @@
+# Per-module overrides for sharded inference -- DeepSeek-V4.1-Flash, 8 ranks.
+#
+# Sized for the converted checkpoint, which keeps the released fp8 and fp4
+# weights. Training dequantizes the llm at load; inference does not. Measured
+# on disk:
+#
+#   vision          0.9 GiB   bf16, replicated (eager)
+#   text_encoder    2.5 GiB   bf16, replicated (eager) -- too small to vocab-shard
+#   ngram         188.8 GiB   fp8 rows, emb=8 -> 23.6 GiB a rank
+#   llm           275.7 GiB   fp4 experts ep=8 (33.6 GiB) + ~6.7 GiB dense replica
+#   ------------------------------------
+#   total         468   GiB   -> ~67 GiB resident a rank
+#
+# Against 8 x H20 that is ~67 of 97 GiB, leaving room per rank for the KV
+# cache and activations. Dequantizing the llm to bf16 at load is the training
+# path; it does not fit this inference layout.
+#
+# Gradient checkpointing is off everywhere, as in the eager file: it trades
+# compute for activation memory across a backward, and there is no backward.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    # Falls back to an SDPA varlen path where FA2 has no wheels (aarch64/GB200).
+    attn_implementation: flash_attention_2
+  accelerator:
+    # 0.9 GiB, so sharding it saves nothing worth an all-gather per image.
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    # 2.5 GiB of wte + lm_head. Vocab-parallel would AllToAll every embed and
+    # every head; vLLM with the usual TP=1 + EP recipe keeps the vocab replica
+    # too. Training still shards it (modules_train.yaml).
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  model_config:
+    # Also drives `freeze_model`; without it the tables would be built with
+    # grads for 196.6 B rows that are never stepped.
+    freeze: true
+  accelerator:
+    # Row-sharded over 8 ranks -> 23.6 GiB each. A lookup dispatches the ids to
+    # the rank owning each row and ships the fp8 row and its scales back, so the
+    # result is bit-identical to a full-table gather.
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      # FSDP's all-gather buffer for one 12.3 GiB table shard was the
+      # 11.45 GiB allocation that went over the card.
+      extra_parallel_only: true
+      # The tables are frozen and read once per step; re-sharding them after the
+      # lookup would buy back memory that was never gathered in the first place.
+      reshard_after_forward: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    # The routed experts are 269 of the module's 275.7 GiB, so this is the
+    # sharding that matters: 33.6 GiB a rank. Tokens are dispatched to the rank
+    # owning their expert and the fp4 GEMMs run there.
+    ep_size: 8
+    ep_outside: false
+    # The remaining ~6.7 GiB is dense fp8, replicated. FSDP2 cannot shard it
+    # here whatever we ask: one decoder layer holds four storage dtypes (int8
+    # packed fp4, fp8_e4m3, fp8_e8m0 scales, fp32 hyper-connections) and an FSDP
+    # parameter group requires a single original dtype. So the wrap is dropped
+    # and the plan does the sharding -- which at inference is all FSDP was
+    # contributing anyway, there being no gradients or optimizer state.
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+    gradient_checkpointing:
+      enable: false

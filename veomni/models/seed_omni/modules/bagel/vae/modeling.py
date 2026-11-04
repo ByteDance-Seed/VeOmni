@@ -27,7 +27,13 @@ from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_GENERATED_LATENT, BAGEL_PHASE_KEY, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
+from .processing import (
+    BAGEL_VAE_PIXEL_SHAPE,
+    BagelVAEPreprocessor,
+    BagelVAEProcessor,
+    _pad_to_batch_size,
+    crop_latent_to_image_shape,
+)
 
 
 def select_bagel_vae_context_items(
@@ -72,7 +78,7 @@ class InferenceMixin:
         if not image_items:
             return {"conversation_list": conversation_list}
 
-        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
+        pixel_values = torch.stack(_pad_to_batch_size([item.value for item in image_items]), dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
         outputs = self.encode(pixel_values=pixel_values)

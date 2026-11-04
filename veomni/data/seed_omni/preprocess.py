@@ -156,6 +156,7 @@ def sharegpt4v_cap_preprocess(conversations, example, **kwargs):
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("llava_video")
+@SEED_OMNI_PREPROCESSOR_REGISTRY.register("LLaVA-Video-178K")
 def llava_video_preprocess(conversations, example, **kwargs):
     """LLaVA-Video-178K layout — like ShareGPT4V but the media turn is a video.
 

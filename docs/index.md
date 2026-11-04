@@ -78,6 +78,7 @@ examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
+examples/deepseek_v41_verification_report.md
 ```
 
 ```{toctree}

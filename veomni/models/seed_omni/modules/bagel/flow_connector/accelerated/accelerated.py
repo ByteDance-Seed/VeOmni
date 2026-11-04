@@ -236,7 +236,7 @@ class TrainingMixin(TrainingModuleMixin):
             mse = (real_velocity - target.to(device=velocity.device, dtype=velocity.dtype)).square()
             token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
             loss = loss + mse.mean(dim=-1).sum() / token_count
-        return {"conversation_list": conversation, "_loss": loss}
+        return {"conversation_list": conversation, "_loss": {"mse_loss": loss}}
 
     def _anchor_dummy_decode_velocity_inputs(
         self,

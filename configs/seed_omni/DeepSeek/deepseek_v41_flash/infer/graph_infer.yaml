@@ -1,0 +1,50 @@
+# DeepSeek-V4.1-Flash inference — image + text understanding (I2T / VQA).
+#
+# Two states, and the split is between "seen once" and "seen per token":
+#
+#   prompt_encode  the image is encoded, the prompt is embedded, the whole
+#                  prompt is hashed and the backbone prefills. No sampling
+#                  happens here — the body's last text-encoder edge is a
+#                  feedback edge, so the node does not run a second time.
+#   text_ar        samples from the previous hidden states, hashes, steps the
+#                  backbone, then DSpark drafts the next block
+#                  (``text_encoder.draft``). A DSpark hit writes the rest of
+#                  the block onto the carrier so one body verifies several
+#                  tokens; a miss still costs one backbone step.
+#
+# Body edges are walked in declaration order under a feed-forward fan-in rule:
+# an edge into a node counts only when it appears *before* that node's first
+# use as a source; later ones are feedback and do not gate it. That is what
+# lets `deepseek_v41_text_encoder` both open the body and receive the
+# backbone's output at the end of it without forming a cycle.
+#
+# The dependencies are the training graph's, for the same reasons:
+#   vision -> ngram   an image span's length is however many tokens the ViT
+#                     produced, and the n-gram node emits one row per position
+#                     of the sequence, image spans included.
+#   ngram  -> llm     the gathered rows ride the returned dict as
+#                     `ngram_embeds`; the backbone refuses to run without them.
+#   text_encoder -> llm   the backbone reads embeddings off the carrier, so the
+#                     prompt has to be embedded before it packs.
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: deepseek_v41_vision,       to: deepseek_v41_ngram }
+      - { from: deepseek_v41_ngram,        to: deepseek_v41_llm }
+      - { from: deepseek_v41_text_encoder, to: deepseek_v41_llm }
+      - { from: deepseek_v41_llm,          to: deepseek_v41_text_encoder }
+      - { from: deepseek_v41_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: deepseek_v41_text_encoder,       to: deepseek_v41_ngram }
+      - { from: deepseek_v41_ngram,              to: deepseek_v41_llm }
+      - { from: deepseek_v41_llm,                to: deepseek_v41_text_encoder.draft }
+      - { from: deepseek_v41_text_encoder.draft, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }

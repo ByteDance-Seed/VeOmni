@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusVqvaeConfig
 
@@ -96,10 +96,14 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         image_processor: JanusVqvaeProcessor,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        num_image_tokens: Optional[int] = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        self._num_image_tokens = int(
+            num_image_tokens if num_image_tokens is not None else getattr(image_processor, "num_image_tokens", 576)
+        )
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":
@@ -116,12 +120,12 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         width = size.get("width")
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(cfg.in_channels, height, width, dtype=dtype)
+        self._num_image_tokens = int(getattr(self._image_processor, "num_image_tokens", 576))
 
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["assistant"]) if not it.is_dummy
@@ -135,25 +139,22 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
-            )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="assistant",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "gen"},
-            ),
-        )
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_image_tokens
+            elif not inference:
+                if self._dummy_pixel_values is None:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                        "before training use (pure inference never reaches this branch)."
+                    )
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values.clone(),
+                        role="assistant",
+                        is_dummy=True,
+                        meta={_IMG_TAG_KEY: "gen", _OMNI_TOKEN_LEN: self._num_image_tokens},
+                    )
+                )
 
 
 __all__ = ["JanusVqvaeProcessor", "JanusVqvaePreprocessor"]

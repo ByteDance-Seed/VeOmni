@@ -1,0 +1,25 @@
+# DeepSeek-V4.1-Flash training DAG — text + image understanding SFT.
+#
+# Flat list of edges; each endpoint is a self-describing `module[.method]`
+# string (bare module -> `.forward`). Active nodes derived from endpoints:
+#
+#   deepseek_v41_vision -> deepseek_v41_ngram
+#   {deepseek_v41_ngram, deepseek_v41_text_encoder.encode}
+#       -> deepseek_v41_llm -> deepseek_v41_text_encoder.decode -> end
+#
+# The `vision -> ngram` edge is a real dependency, not a convenience ordering.
+# The n-gram node emits one row per position of the *packed* sequence, image
+# spans included, and an image span's length is however many tokens the ViT
+# produced for it. Running the two the other way round leaves the n-gram node
+# unable to size the spans it has to cover, and the backbone rejects the short
+# row it would build.
+#
+# `ngram` and `text_encoder.encode` are siblings: neither depends on the other,
+# and the executor may run them in either order. That is why the chat template
+# stashes `meta['input_ids']` — the n-gram node hashes token ids, and `encode`
+# overwrites each text item's `value` with its embedding.
+- { from: deepseek_v41_vision,              to: deepseek_v41_ngram }   # image embeds size the spans
+- { from: deepseek_v41_ngram,               to: deepseek_v41_llm }     # hash + gather the two tables
+- { from: deepseek_v41_text_encoder.encode, to: deepseek_v41_llm }     # chat-template tokenise + wte
+- { from: deepseek_v41_llm,                 to: deepseek_v41_text_encoder.decode }  # text CE head
+- { from: deepseek_v41_text_encoder.decode, to: end }

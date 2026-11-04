@@ -1,0 +1,126 @@
+# Full-parameter training on 256 x H20 (32 nodes): every module trainable, all
+# 40 backbone layers, the three DSpark/MTP stages and the n-gram tables.
+#
+# Parameters (meta build of the released config):
+#
+#   vision          0.49 B   FSDP2 alone
+#   text_encoder    1.32 B   emb   (0.66 B wte row-sharded + 0.66 B untied lm_head, replicated)
+#   ngram         196.61 B   emb   (two row-sharded tables, trained in bf16)
+#   llm           564.78 B   ep    (545.0 B routed experts, 14.2 B MTP, 5.2 B dense, 0.3 B engram)
+#                 --------
+#                 763.2 B
+#
+# Model + gradient + AdamW state, bytes per parameter:
+#
+#   llm, vision     16   fp32 master, fp32 grad, two fp32 moments  -> 9.04 TB
+#   ngram            8   bf16 table, grad and moments (no FSDP wrap) -> 1.57 TB
+#   text_encoder     8   bf16, as ngram                              -> 0.01 TB
+#                                                                    -------
+#                                                                    10.63 TB
+#
+# Why 256 cards. At ~64 GB of state per H20 (the rest is activations) the
+# floor is 166 cards, but three counts have to divide the card count:
+#
+#   * `extra_parallel_only` needs emb to span the FSDP axis (dp_shard x
+#     cp_size), so emb is the card count.
+#   * the vocabulary (129280) and the padded table rows (384006400, 384016896)
+#     divide by 64, 128 and 256, not by 192.
+#   * EP must divide the 384 routed experts: 64 or 128, never 256.
+#
+# 128 cards would need 83 GB of state each, which does not fit; 256 needs
+# 41.5 GB plus 5.3 GB for the replicated lm_head. Muon instead of AdamW saves
+# ~2.2 TB and still does not fit 128.
+#
+# Gradient checkpointing stays on: without it every layer keeps ~3 GB of QAT
+# fake-quant expert copies plus ~0.8 MB per token alive until its backward.
+# The scaled 64-card run (modules_train_scaled64.yaml) holds more state per
+# card (~70 GB) at the same sequence length, so it bounds the memory here.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [256]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      # No FSDP wrap, so MixedPrecisionPolicy cannot cast weights to bf16
+      # for the fused CE. Keep the module in bf16 rather than fp32 masters.
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    freeze: false
+    # Allocate bf16 tables: fp8 storage cannot take a gradient. The released
+    # rows are dequantized as each rank streams its own slice in.
+    weight_quantization: null
+  # Rank 0 cannot hold the 196.6 B tables to broadcast them, and every rank
+  # reading them whole would need 393 GB in bf16.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [256]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      # An fp32 master copy of the tables would be another 786 GB.
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  # Each rank reads only its own experts' shards rather than taking a
+  # broadcast of the whole module from rank 0.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  model_config:
+    # Checkpoint files stay fp8/fp4. Clearing this makes the module allocate
+    # bf16 Parameters; DeepseekV41DequantConverter spends the scales at load.
+    weight_quantization: null
+    # Indexer weights only get a gradient through this KL -- top-k does not
+    # backprop into the scores. Off, the indexer is frozen in all but name.
+    dsa_indexer_loss: true
+    # Any positive block size builds all three stages; training ignores its
+    # value (``forward_dspark_train`` is one teacher-forced pass).
+    dspark_block_size: 5
+    num_nextn_predict_layers: 3
+    # No n_trainable_layers / trainable_layer_ids / freeze_mtp: all 40 layers
+    # and the MTP stages train.
+  ops_implementation:
+    # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
+    qat_implementation: fp8_blockwise
+  accelerator:
+    # 6 experts a rank; ep_fsdp=4 shards them further for storage.
+    ep_size: 64
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false

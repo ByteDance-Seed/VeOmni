@@ -12,9 +12,9 @@ and a generation request walk them. For running a model see
 SeedOmni is a **model-agnostic runtime**. `OmniModel` builds independent
 sub-models (each a HuggingFace `PreTrainedModel`), walks a **graph** declared in
 YAML by calling one module per node, threads a single shared **conversation
-list** through those calls, and sums the scalar `_loss` returned by each
-training node. Model-specific logic (how to embed an image, when to emit a
-boundary token, how to decode a VQ grid) lives inside the modules.
+list** through those calls, and sums each training node's `_loss` dict.
+Model-specific logic (how to embed an image, when to emit a boundary token, how
+to decode a VQ grid) lives inside the modules.
 
 ```mermaid
 flowchart LR
@@ -95,7 +95,7 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 
 | Hook | When | Purpose |
 |------|------|---------|
-| `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
+| `forward(**kwargs)` | training | the node's main compute; may return a `_loss` dict |
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
@@ -192,9 +192,13 @@ uses that method verbatim. A node's canonical identity is `"<module>.<method>"`.
 `OmniModel` holds the modules as direct attributes (parameter FQNs are
 `<module>.<rest>`), the `TrainingGraph`, and the optional `GenerationGraph`s.
 
-**Loss protocol:** each module returns at most one scalar `_loss`, already
-token-mean-reduced over its own micro-batch, and `OmniModel.forward` sums them
-so each module's token count weights its own loss.
+**Loss protocol:** each node's `post_forward` returns at most one `_loss`: a
+`{loss_name: scalar}` dict such as `{"ce_loss": ..., "mtp_loss": ...}`, each value
+already token-mean-reduced over its own micro-batch. `OmniModel.forward` logs
+every entry as `{module}.{method}.{loss_name}` (e.g.
+`deepseek_v41_text_encoder.decode.mtp_loss`) in `losses` and trains on their sum.
+A bare scalar `_loss` is still accepted and logged as `{module}.{method}.loss`.
+There is no central averaging, so token counts stay correct across modules.
 
 ## 3. Training flow
 
@@ -231,7 +235,7 @@ What each node then does to the shared carrier in the GPU training graph:
    packed `bs=1` sequence, runs the LLaMA backbone (no `wte`, no `lm_head`) and
    writes the hidden state back onto each item's `value`.
 5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** read hidden states
-   and labels off the carrier and each return one `_loss`.
+   and labels off the carrier and each return `{"_loss": {"ce_loss": ...}}`.
 
 The loop, simplified from `OmniModel.forward` and `TrainingGraph.iter_nodes`
 (which mirror `OmniModel.generate` and `GenerationGraph.iter_nodes`):
@@ -246,7 +250,7 @@ for node in training_graph.iter_nodes():
     # pre_forward -> call (through the FSDP/DDP wrapper) -> post_forward, then
     # merge conversation_list + _loss back into the shared batch.
     run_node(self.get_module(node.module), node, batch)
-    loss = batch.pop("_loss", None)          # -> self._losses[node.name]
+    loss = batch.pop("_loss", None)          # {name: v} -> self._losses[f"{node.name}.{name}"]
     ...
 total_loss = sum(self._losses.values())
 ```
@@ -307,6 +311,29 @@ full; `image_vq_end` emits `<end_of_image>`.
 mid-stream whether to open an image span (`start_image_gen` on a sampled
 `<boi>`), so `text_ar` and `image_vq` transition into each other instead of
 straight to `done`.
+
+### 4.1 One token stream, many ranks
+
+A multi-rank generate is not data-parallel: every rank holds the whole request
+and walks the *same* FSM, because the module forwards are full of collectives.
+So the same logical token is sampled once per rank, and the ranks have to agree
+on it. Each rank judges `done` locally, so a single disagreement leaves the rank
+that saw the stop token outside the loop while the others block forever in the
+next collective.
+
+Ranks agree because the text encoder's `_sample_token` broadcasts the drawn
+token from rank 0. That is the guarantee, and it holds no matter how the logits
+were produced. A sharded MoE forward does not owe anyone bit-identical logits:
+the top-k combine is a `scatter_add_` in `veomni/distributed/moe/moe_utils.py`,
+and on CUDA that is an atomicAdd whose order races. Measured on
+DeepSeek-V4.1-Flash over 8×H20: 211 of 211 decode steps had per-rank logits that
+differed by a few bf16 ULP, enough to flip `argmax` at 4 of them.
+
+`infer.enable_full_determinism` is **off** by default (same as training, same as
+vLLM serving). Turning it on asks for bitwise kernels (`NCCL_DETERMINISTIC`,
+`torch.use_deterministic_algorithms`, cuDNN disabled) so a seeded prompt gives
+the same answer twice. That is a large latency tax; pass
+`--infer.enable_full_determinism true` only when you need that.
 
 ## 5. File map
 

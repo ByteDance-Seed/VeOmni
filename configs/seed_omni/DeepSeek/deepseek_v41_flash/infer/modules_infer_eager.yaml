@@ -1,0 +1,58 @@
+# Per-module overrides for eager (unsharded) inference -- DeepSeek-V4.1-Flash.
+#
+# Eager means one rank holds each module whole, which is a statement about the
+# *model*, not the config: in bf16 these four are ~750 B parameters, and the
+# n-gram tables alone are 196.6 B of frozen rows. Nothing runs this file on one
+# device. It is the fragment for the small-config smoke runs and for the
+# sharded file to diff against, and `modules_infer_fsdp.yaml` is what a real
+# checkpoint needs.
+#
+# Gradient checkpointing is off everywhere. It trades compute for activation
+# memory during a backward, and there is no backward here -- left on it would
+# recompute every layer for nothing. Training turns it on for `llm` only, which
+# is the one module where it pays.
+#
+# Ulysses and expert parallelism are absent rather than set to 1: the training
+# file raises `ep_size` for the backbone's 543.4 B of routed experts, and a
+# single-token decode step touches only `num_experts_per_tok` of them. What that
+# working set should be sharded as is a question for the sharded file.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    # The ViT falls back to an SDPA varlen path when FA2 is missing, which is
+    # what an aarch64 host (GB200) gets -- there are no FA2 wheels for it.
+    attn_implementation: flash_attention_2
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # Frozen in training and immaterial here, but the field also drives
+    # `freeze_model`, so leaving it out would build the tables with grads.
+    freeze: true
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false

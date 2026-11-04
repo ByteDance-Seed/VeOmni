@@ -1,0 +1,82 @@
+# Per-module overrides for 8-GPU DeepSeek-V4.1-Flash with DeepGEMM FP8 routed
+# experts (`moe_implementation: deepgemm_fp8`, `qat_implementation: none`) and
+# per-rank low-precision streaming load (`ep_sharded_stream_load: true`).
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # Frozen tables keep the released fp8 rows (1 byte/parameter).
+    freeze: true
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  model_config:
+    # Checkpoint files stay fp8/fp4; each rank streams only its local experts
+    # and dequantizes them at load into bf16 parameters for DeepGEMM FP8 GEMMs.
+    weight_quantization: null
+    dsa_indexer_loss: true
+    dspark_block_size: 0
+    num_nextn_predict_layers: 0
+    num_hidden_layers: 2
+    compress_ratios: [2, 1]
+    kv_source_layer_ids: [0, 1]
+    index_source_layer_ids: [0, 1]
+    candidate_source_layer_id: 1
+    engram_layer_ids: [0, 1]
+    dspark_target_layer_ids: []
+    n_trainable_layers: 2
+  ops_implementation:
+    moe_implementation: deepgemm_fp8
+    qat_implementation: none
+  accelerator:
+    ep_size: 8
+    ep_outside: false
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        cast_forward_inputs: false

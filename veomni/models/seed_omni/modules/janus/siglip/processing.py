@@ -22,7 +22,7 @@ from typing import Any, Optional
 import torch
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusSiglipConfig
 
@@ -47,10 +47,12 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         image_processor: Any,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        num_image_tokens: int = 576,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        self._num_image_tokens = int(num_image_tokens)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusSiglipPreprocessor":
@@ -63,12 +65,12 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         cfg = config.vision_config
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=dtype)
+        self._num_image_tokens = int((cfg.image_size // cfg.patch_size) ** 2)
 
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
@@ -82,25 +84,22 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
-            )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="user",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "und"},
-            ),
-        )
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_image_tokens
+            elif not inference:
+                if self._dummy_pixel_values is None:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                        "before training use (pure inference never reaches this branch)."
+                    )
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values.clone(),
+                        role="user",
+                        is_dummy=True,
+                        meta={_IMG_TAG_KEY: "und", _OMNI_TOKEN_LEN: self._num_image_tokens},
+                    )
+                )
 
 
 __all__ = ["JanusSiglipProcessor", "JanusSiglipPreprocessor"]

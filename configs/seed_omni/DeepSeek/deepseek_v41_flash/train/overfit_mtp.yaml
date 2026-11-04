@@ -1,0 +1,84 @@
+# overfit.yaml with the MTP CE on: backbone layer 0 and the DSpark stages
+# train (modules_train_mtp.yaml). Both CEs should collapse on the ping sample.
+#
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/DeepSeek/deepseek_v41_flash/train/overfit_mtp.yaml
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train_mtp.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    infer_graph:
+      vision_understanding: configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        # fp32 reduce-scatter needed a 6.3 GiB buffer on top of 89 GiB already
+        # used (ngram fp8 + 2-layer experts + AdamW). bf16 reduce fits.
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-4
+    lr_start: 1.0e-4
+    lr_warmup_ratio: 0.0
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 512
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/overfit_data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 2048
+  dataloader:
+    type: native
+    # n_shards=1 jsonl: extra workers are dropped and take half the copies with them.
+    num_workers: 1
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 40
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_overfit_mtp
+    save_steps: 100000
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: VeOmni_omni
+    name: deepseek_v41_flash_overfit_mtp
