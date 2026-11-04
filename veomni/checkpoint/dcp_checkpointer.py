@@ -355,15 +355,132 @@ def _verified_rank_local_keys(adapter, *, loading):
     return adapter._verified_rank_local_keys
 
 
+def _tp_only_source_parameters(model, parallel_state):
+    """Identify unambiguous model owners on the runtime's TP/FSDP mesh.
+
+    This does not certify custom sharding or any active ExtraParallel plan.
+    Like the rest of the checkpointer, it assumes the supplied runtime model
+    was built from a complete logical model rather than pre-sliced parameters.
+    """
+    if not isinstance(model, torch.nn.Module) or not isinstance(parallel_state, ParallelState):
+        return {}, None
+    if (
+        parallel_state.device_mesh is None
+        or not dist.is_initialized()
+        or parallel_state.device_mesh._get_root_mesh().size() != dist.get_world_size()
+        or parallel_state.tp_size <= 1
+        or not parallel_state.extra_parallel_sizes
+        or any(size != 1 for size in parallel_state.extra_parallel_sizes.values())
+    ):
+        return {}, None
+    from ..distributed.parallel_state import _PARALLEL_STATE_CACHE
+
+    # A multi-model trainer may save a registered non-ambient state. Require a
+    # state created by the runtime's topology cache, not just matching names.
+    if not any(parallel_state is state for state in _PARALLEL_STATE_CACHE.values()):
+        return {}, None
+
+    from torch.distributed.checkpoint.state_dict import _get_fqns
+
+    try:
+        mesh = DeviceMesh._concatenate([parallel_state.fsdp_mesh, parallel_state.tp_mesh])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return {}, None
+    if mesh._get_root_mesh() is not parallel_state.device_mesh._get_root_mesh():
+        return {}, None
+
+    aliases = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(param), []).append((name, param))
+    candidates, ambiguous = {}, set()
+    for names in aliases.values():
+        if len(names) != 1:
+            continue
+        name, param = names[0]
+        fqns = _get_fqns(model, name)
+        if len(fqns) != 1:
+            continue
+        fqn = next(iter(fqns))
+        if fqn in candidates:
+            ambiguous.add(fqn)
+        candidates[fqn] = param
+    for fqn in ambiguous:
+        candidates.pop(fqn, None)
+    return candidates, mesh
+
+
+def _tp_only_source_layout(key, tensor, parameters, mesh, *, allow_staged_copies=False):
+    """Certify only a model parameter or same-layout state of its unique owner."""
+    if mesh is None or not isinstance(tensor, DTensor) or not tensor.ndim:
+        return None
+    if key.startswith("model."):
+        fqn = key.removeprefix("model.")
+    elif key.startswith("optimizer.state."):
+        fqn = key.removeprefix("optimizer.state.")
+        while fqn not in parameters and "." in fqn:
+            fqn = fqn.rsplit(".", 1)[0]
+    else:
+        return None
+    param = parameters.get(fqn)
+    if not isinstance(param, DTensor) or tuple(tensor.shape) != tuple(param.shape):
+        return None
+    if param.device_mesh._get_root_mesh() is not mesh._get_root_mesh():
+        return None
+    if tensor.device_mesh != mesh or param.device_mesh != mesh or tensor.placements != param.placements:
+        return None
+    if tensor.device_mesh._get_root_mesh() is not mesh._get_root_mesh():
+        if not allow_staged_copies:
+            return None
+        # Async CPU staging deep-copies DTensor meshes. Admit a staged copy
+        # only for the production async writer and only if every axis still
+        # resolves to the runtime's identical process group.
+        try:
+            if any(tensor.device_mesh.get_group(i) is not mesh.get_group(i) for i in range(mesh.ndim)):
+                return None
+        except (AssertionError, AttributeError, IndexError, KeyError, RuntimeError, ValueError):
+            return None
+    placements = tensor.placements
+    if len(placements) not in (2, 3) or any(isinstance(placement, Partial) for placement in placements):
+        return None
+    if len(placements) == 3 and not isinstance(placements[0], Replicate):
+        return None
+    fsdp, tp = placements[-2:]
+    if type(tp) not in (Shard, Replicate) or type(fsdp) not in (Shard, _StridedShard):
+        return None
+    same_axis = isinstance(tp, Shard) and fsdp.dim % tensor.ndim == tp.dim % tensor.ndim
+    if same_axis:
+        if type(fsdp) is not _StridedShard or fsdp.split_factor != mesh.size(-1):
+            return None
+    elif type(fsdp) is not Shard:
+        return None
+    return {
+        "ep_shard_dim": None,
+        "fsdp_shard_dim": fsdp.dim % tensor.ndim,
+        "ep_size": 1,
+        "fsdp_size": mesh.size(-2),
+        "expert_order": "canonical",
+        "source_kind": "veomni_tp_fsdp_no_extra",
+    }
+
+
 class _ExtraParallelSavePlanner(DefaultSavePlanner):
     """Record per-tensor source layouts in DCP metadata, including optimizer state."""
 
     def __init__(
-        self, *args, parallel_state=None, source_model=None, adapter_name=None, rank_local_adapter=None, **kwargs
+        self,
+        *args,
+        parallel_state=None,
+        source_model=None,
+        adapter_name=None,
+        rank_local_adapter=None,
+        allow_staged_copies=False,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.parallel_state = parallel_state
         self.rank_local_adapter = rank_local_adapter
+        self.allow_staged_copies = allow_staged_copies
+        self.tp_only_parameters, self.tp_only_mesh = _tp_only_source_parameters(source_model, parallel_state)
         self.ordinary_fqns = (
             _ordinary_expert_fqns(source_model, parallel_state)
             if isinstance(parallel_state, ParallelState)
@@ -400,8 +517,16 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
             if key in rank_local_keys:
                 continue
             extra_names = getattr(self.parallel_state, "extra_parallel_names", ())
-            layout = _expert_layout(value, extra_names) or _no_ep_expert_layout(
-                key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns
+            layout = (
+                _expert_layout(value, extra_names)
+                or _no_ep_expert_layout(key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns)
+                or _tp_only_source_layout(
+                    key,
+                    value,
+                    self.tp_only_parameters,
+                    self.tp_only_mesh,
+                    allow_staged_copies=self.allow_staged_copies,
+                )
             )
             if layout is not None:
                 layouts[key] = layout
@@ -2663,6 +2788,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 rank_local_adapter=optimizer_adapter
                 if type(optimizer_adapter) is _ProvenMultiOptimizerState
                 else None,
+                allow_staged_copies=save_async,
             )
         except BaseException as exc:
             error = exc
