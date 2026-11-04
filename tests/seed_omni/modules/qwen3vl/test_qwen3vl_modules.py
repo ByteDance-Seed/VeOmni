@@ -13,7 +13,10 @@ from veomni.models.seed_omni.modules import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
 )
-from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import qwen3vl_vision_position_ids
+from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import (
+    qwen3vl_vision_position_advance,
+    qwen3vl_vision_position_ids,
+)
 from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import build_qwen3vl_vit_metadata
 
 
@@ -148,6 +151,38 @@ def test_vision_position_ids_layout():
     assert pos[1].tolist() == [5, 5, 5, 6, 6, 6]
     # width: 0,1,2,0,1,2 + start
     assert pos[2].tolist() == [5, 6, 7, 5, 6, 7]
+
+
+def test_video_position_ids_restart_per_frame_like_hf():
+    """A video is ``t`` single-frame grids: each frame restarts h/w at its own
+    start and advances positions by ``max(h, w) // merge`` — matching
+    ``Qwen3VLModel.get_rope_index``'s per-timestamp split."""
+    grid = torch.tensor([4, 16, 16])  # 4 frames, 16x16, merge 2 -> 8x8 per frame
+    per_frame = (16 // 2) * (16 // 2)
+    pos = qwen3vl_vision_position_ids(2, grid, merge=2)
+    assert pos.shape == (3, 4 * per_frame)
+
+    # Each frame's temporal row is constant and equals that frame's start.
+    assert [int(pos[0][i * per_frame].item()) for i in range(4)] == [2, 10, 18, 26]
+    for frame in range(4):
+        chunk = pos[0][frame * per_frame : (frame + 1) * per_frame]
+        assert set(chunk.tolist()) == {2 + frame * 8}
+
+    # h/w restart at each frame's start instead of running across the clip.
+    for frame, start in enumerate([2, 10, 18, 26]):
+        rows = pos[1][frame * per_frame : (frame + 1) * per_frame]
+        assert int(rows.min().item()) == start
+        assert int(rows.max().item()) == start + 7
+
+    # The item advances by the summed per-frame steps, not just one frame's.
+    assert qwen3vl_vision_position_advance(grid, 2) == 32
+    # An image (t == 1) is unaffected by the per-frame split.
+    image = torch.tensor([1, 16, 16])
+    assert qwen3vl_vision_position_advance(image, 2) == 8
+    torch.testing.assert_close(
+        qwen3vl_vision_position_ids(2, image, merge=2),
+        qwen3vl_vision_position_ids(2, image, merge=2),
+    )
 
 
 def test_vision_preprocessor_injects_one_dummy_per_sample_and_tags_token_len():

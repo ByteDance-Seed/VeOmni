@@ -41,7 +41,7 @@ from ..base.packing import (
     masked_scatter_embeds,
     shift_packed_labels,
 )
-from .llm.modeling import qwen3vl_vision_position_ids
+from .llm.modeling import qwen3vl_vision_position_advance, qwen3vl_vision_position_ids
 from .vision.processing import _OMNI_GRID
 
 
@@ -141,7 +141,7 @@ def pack_qwen3vl_conversations(
             sample_visual.append(torch.ones(n_tok, dtype=torch.bool))
             grid_thw = torch.tensor(grid, dtype=torch.long)
             sample_pos.append(qwen3vl_vision_position_ids(current_pos, grid_thw, merge))
-            current_pos += int(max(int(grid[1]), int(grid[2])) // merge)
+            current_pos += qwen3vl_vision_position_advance(grid_thw, merge)
             real_pixels.append(_patches_2d(part.value))
             real_grids.append(grid)
 
