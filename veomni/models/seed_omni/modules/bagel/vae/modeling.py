@@ -149,7 +149,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
     preprocessor_class = BagelVAEPreprocessor
     base_model_prefix = "bagel_vae"
     main_input_name = "pixel_values"
-    _no_split_modules: list[str] = []
+    _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = False
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):

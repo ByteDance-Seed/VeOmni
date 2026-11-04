@@ -1195,6 +1195,11 @@ def test_bagel_vae_aligns_encoder_passes_across_shard_group_and_keeps_blocks_uns
 
     from veomni.models.seed_omni.modules.bagel.vae.accelerated import accelerated as vae_acc
 
+    native_vae = native_model_cls("bagel_vae")(
+        config_cls("bagel_vae")(resolution=8, ch=32, ch_mult=[1, 1], num_res_blocks=1, z_channels=2, downsample=2)
+    )
+    assert set(native_vae._no_split_modules) == {"ResnetBlock", "AttnBlock"}
+
     vae = _tiny_vae(ch_mult=[1, 1], downsample=2)
     assert not vae._no_split_modules
 

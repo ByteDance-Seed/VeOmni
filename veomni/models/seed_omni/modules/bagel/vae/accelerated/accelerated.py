@@ -405,7 +405,7 @@ class VeOmniMixin(BaseMixin, BagelVAEOfflineMixin, TrainingMixin, MeterMixin):
 
 
 class BagelVAEAccelerated(VeOmniMixin, BagelVAE):
-    pass
+    _no_split_modules: list[str] = []
 
 
 __all__ = ["BAGEL_VAE_PIXEL_SHAPE", "BagelVAEAccelerated", "BagelVAEOfflineMixin"]
