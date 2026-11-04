@@ -23,8 +23,10 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         apply_gated_attention: bool = False,
+        ff_bias: bool = True,
         config=None,
     ):
+        """Build a connector block with attention and configurable feed-forward bias."""
         super().__init__()
 
         self.attn1 = Attention(
@@ -39,6 +41,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         self.ff = FeedForward(
             dim,
             dim_out=dim,
+            bias=ff_bias,
         )
         unweighted_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
@@ -85,8 +88,10 @@ class Embeddings1DConnector(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        ff_bias: bool = True,
         config=None,
     ):
+        """Initialize connector blocks, rotary settings and optional learnable register tokens."""
         super().__init__()
         self.num_attention_heads = num_attention_heads
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -106,6 +111,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     rope_type=rope_type,
                     apply_gated_attention=apply_gated_attention,
                     config=config,
+                    ff_bias=ff_bias,
                 )
                 for _ in range(num_layers)
             ]
@@ -184,6 +190,7 @@ class Embeddings1DConnectorConfigurator:
 
     @classmethod
     def from_config(cls, config: dict, model_config=None) -> Embeddings1DConnector:
+        """Build the video text connector using checkpoint dimensions and bias settings."""
         transformer_config = config.get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
@@ -203,6 +210,7 @@ class Embeddings1DConnectorConfigurator:
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
             config=model_config,
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector
 
@@ -212,6 +220,7 @@ class AudioEmbeddings1DConnectorConfigurator:
 
     @classmethod
     def from_config(cls, config: dict, model_config=None) -> Embeddings1DConnector:
+        """Build the audio text connector, falling back to video dimensions when unspecified."""
         transformer_config = config.get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
@@ -240,5 +249,6 @@ class AudioEmbeddings1DConnectorConfigurator:
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
             config=model_config,
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector

@@ -375,3 +375,13 @@ overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
 dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
 uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
 GPUs and eager PyTorch on other devices, retaining FP32 accumulation.
+
+## LTX model versions
+
+LTX-2.3 and LTX-2.5 share `veomni/models/diffusers/ltx2_3/`. The 2.5 flags
+`ff_bias=false`, `connector_ff_bias=true`, and `use_keyframes_abs_pos_embedding=true`
+are checkpoint-defined; 2.3 defaults are preserved. `ltx_condition/ltx25.py` validates
+a split BF16 transformer and prepares a training directory, and loads the packed
+Gemma-4 text decoder/projections for offline preprocessing. The same DiT trainer,
+condition model, parquet data path, and native LoRA/checkpoint manager serve both.
+See `docs/examples/ltx-2.5.md` for the preview recipe and validation boundaries.

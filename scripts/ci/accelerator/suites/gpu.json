@@ -643,5 +643,15 @@
       "-x",
       "tests/models/test_omni_fsdp.py"
     ]
+  },
+  {
+    "name": "native-lora-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_native.py"
+    ]
   }
 ]

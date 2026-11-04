@@ -1,0 +1,30 @@
+[
+  {
+    "path": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    "revision": "45aab9e464ad9b5369ee6885c300df179793e79e",
+    "sha256": "792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584",
+    "size": 42018190584,
+    "url": "https://modelscope.cn/models/Lightricks/LTX-2.5/resolve/45aab9e464ad9b5369ee6885c300df179793e79e/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
+  },
+  {
+    "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "revision": "a14f34a9a04bc0adf394b608773c94899cd9723b",
+    "sha256": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1",
+    "size": 26263858182,
+    "url": "https://modelscope.cn/models/Lightricks/LTX-2.5/resolve/a14f34a9a04bc0adf394b608773c94899cd9723b/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+  },
+  {
+    "path": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "revision": "65c57ea625e4b1da955f35f5a7d379c067554811",
+    "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d",
+    "size": 1452269922,
+    "url": "https://modelscope.cn/models/Lightricks/LTX-2.5/resolve/65c57ea625e4b1da955f35f5a7d379c067554811/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
+  },
+  {
+    "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+    "revision": "5a5da253b8bd7ae649a8c7acdec41e6c1a1cffda",
+    "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5",
+    "size": 364866540,
+    "url": "https://modelscope.cn/models/Lightricks/LTX-2.5/resolve/5a5da253b8bd7ae649a8c7acdec41e6c1a1cffda/vae/ltx-2.5-audio-vae-bf16.safetensors"
+  }
+]
