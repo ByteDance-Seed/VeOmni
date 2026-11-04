@@ -459,9 +459,13 @@ or longrope target, resume requires a matching cache contract; older checkpoints
 without that proof need a verified migration. Older checkpoints do not identify
 the source's RoPE configuration, so the operator must also independently verify
 that the source and target configurations match. Saving an expanded cache is not
-yet supported. DCP training with MultiOptimizer rejects dynamic and longrope
-modes before training until their transient history can be restored exactly;
-ordinary static/default RoPE is unaffected.
+yet supported. Dynamic and longrope training may run without saving, but a
+MultiOptimizer DCP save fails if its cache cannot be reconstructed; operators
+should account for this when planning checkpoint cadence. Ordinary
+static/default RoPE is unaffected. Disabling only `save_steps` does not disable
+all saves: `save_epochs` defaults to 1 and `save_hf_weights` defaults to true.
+Setting both intervals to 0 and `save_hf_weights` to false disables scheduled
+DCP saves and the final HF export.
 
 For unversioned expert checkpoints whose chunks divide the expert axis, the
 saved offsets alone do not prove source order, even if another axis is also
