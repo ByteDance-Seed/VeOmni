@@ -275,7 +275,7 @@ reshard a model checkpoint across supported FSDP shard axes. Use
 `DistributedCheckpointer` for save and resume: it rejects ambiguous unversioned
 expert layouts before copying model tensors unless the model-only source is
 explicitly declared as described below. Migrating a legacy optimizer checkpoint
-requires verified source layout information. Canonical v2 optimizer save and resume use
+requires source layout information that has been verified. Canonical v2 optimizer save and resume use
 the rank-local codec described below. The standard VeOmni HF export strips the
 namespace.
 
@@ -325,8 +325,14 @@ migration. Conversely, an old unversioned checkpoint with expert-only chunks
 may not prove its source order even when resumed with the same topology. The
 distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
 FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
-metadata also needs verified source-layout migration, since it cannot be
+metadata also needs a verified source-layout migration, since it cannot be
 distinguished safely from an old EP checkpoint.
+For TP greater than one, `DistributedCheckpointer.save` currently rejects a
+model containing non-scalar `experts` parameters, persistent buffers, or tensors
+assigned to an EP shard by the model's parallel plan before writing. This is a
+conservative restriction: it also covers frozen experts and custom layouts that
+might otherwise be canonical. TP1 expert checkpoints and TP models without
+expert tensors are unaffected. Training without a checkpoint save is unaffected.
 Offline export also rejects unversioned expert-only chunks for stacked tensors
 under an `experts` module when their source order cannot be established. Other
 legacy tensor naming schemes may still need explicit source-layout verification
@@ -469,9 +475,13 @@ or longrope target, resume requires a matching cache contract; older checkpoints
 without that proof need a verified migration. Older checkpoints do not identify
 the source's RoPE configuration, so the operator must also independently verify
 that the source and target configurations match. Saving an expanded cache is not
-yet supported. DCP training with MultiOptimizer rejects dynamic and longrope
-modes before training until their transient history can be restored exactly;
-ordinary static/default RoPE is unaffected.
+yet supported. Dynamic and longrope training may run without saving, but a
+MultiOptimizer DCP save fails if its cache cannot be reconstructed; operators
+should account for this when planning checkpoint cadence. Ordinary
+static/default RoPE is unaffected. Disabling only `save_steps` does not disable
+all saves: `save_epochs` defaults to 1 and `save_hf_weights` defaults to true.
+Setting both intervals to 0 and `save_hf_weights` to false disables scheduled
+DCP saves and the final HF export.
 
 For unversioned expert checkpoints whose chunks divide the expert axis, the
 saved offsets alone do not prove source order, even if another axis is also

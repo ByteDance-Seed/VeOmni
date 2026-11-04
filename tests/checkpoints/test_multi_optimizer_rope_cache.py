@@ -22,7 +22,7 @@ from veomni.optim.optimizer import MultiOptimizer
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def test_runtime_preflight_rejects_unsupported_dynamic_rope_before_training():
+def test_runtime_preflight_allows_dynamic_rope_training_without_checkpoint():
     from veomni.models.model_runtime import VeOmniModelRuntime
 
     model, optimizer = _build()
@@ -32,11 +32,13 @@ def test_runtime_preflight_rejects_unsupported_dynamic_rope_before_training():
         model_name="policy",
         train_args=SimpleNamespace(checkpoint=SimpleNamespace(manager="dcp", save_async=False)),
     )
-    with pytest.raises(RuntimeError, match="cannot yet safely resume dynamic RoPE"):
-        VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
-    # A normal, static RoPE module and the standard optimizer remain allowed.
-    model.rope.rope_type = "default"
     VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
+    trace = _rope_update(model, optimizer)
+    assert torch.isfinite(trace["loss"])
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+    assert int(model.rope.max_seq_len_cached) == 32
+    VeOmniModelRuntime._validate_optimizer_checkpoint_mode(runtime)
+    _update(model, optimizer, 0.25)
 
 
 class _TinyQwenRope(torch.nn.Module):
