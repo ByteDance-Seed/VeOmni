@@ -333,7 +333,7 @@ def _local_layout(
     if rope_contract:
         # Earlier checkpoints did not prove that transient cache history was
         # reconstructible by a fresh process.
-        layout["dynamic_rope_cache_v1"] = rope_contract
+        layout["dynamic_rope_cache_v2"] = rope_contract
     return layout if capture else _layout_digest(layout)
 
 
