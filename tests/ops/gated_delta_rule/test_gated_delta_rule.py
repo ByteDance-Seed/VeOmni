@@ -1119,7 +1119,14 @@ def test_convolution_boundary_cache_inference_to_training():
     _cached_boundary_tensor.cache_clear()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
+def _native_convolution_launch_plan(context):
+    if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" and context.capabilities.backend != "npu":
+        # Ensure an explicitly required NPU test fails even under --ci-batch.
+        return LaunchSpec(device="cpu")
+    return LaunchSpec(nproc=1)
+
+
+@pytest.mark.launch_plan(provider=_native_convolution_launch_plan)
 def test_causal_conv1d_npu_boundary_cache_inference_to_training():
     """A real NPU cache hit after inference must remain usable by backward."""
     explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
