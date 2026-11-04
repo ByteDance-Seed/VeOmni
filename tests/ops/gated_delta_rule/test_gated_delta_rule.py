@@ -1120,8 +1120,8 @@ def test_convolution_boundary_cache_inference_to_training():
 
 
 def _native_convolution_launch_plan(context):
-    if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" and context.capabilities.backend != "npu":
-        # Ensure an explicitly required NPU test fails even under --ci-batch.
+    if context.capabilities.backend != "npu":
+        # A non-NPU runner needs no accelerator to skip, or to fail explicitly.
         return LaunchSpec(device="cpu")
     return LaunchSpec(nproc=1)
 
@@ -1130,10 +1130,10 @@ def _native_convolution_launch_plan(context):
 def test_causal_conv1d_npu_boundary_cache_inference_to_training():
     """A real NPU cache hit after inference must remain usable by backward."""
     explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
-    require_npu = explicitly_required or (
-        bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
-    )
-    if not IS_NPU_AVAILABLE:
+    backend = runner_capabilities().backend
+    require_npu = explicitly_required or (bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and backend == "npu")
+    available = backend == "npu" and IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
         if require_npu:
             pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
         pytest.skip("causal_conv1d npu needs torch_npu")
