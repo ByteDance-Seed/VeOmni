@@ -25,24 +25,43 @@ fallback reference.
 import pytest
 import torch
 
+from veomni.utils.import_utils import is_package_available
+
 
 try:
     import torch_npu  # noqa: F401
 
+    _NPU_HARDWARE_AVAILABLE = torch.npu.is_available()
+except ImportError:
+    _NPU_HARDWARE_AVAILABLE = False
+
+# fla_npu and triton_ascend_kernels are out-of-tree NPU packages that are
+# deliberately not part of the lockfile (same policy as the gated_delta_rule
+# fla_npu backend), so stock NPU CI images do not ship them. The registry
+# exposes the ascendc impl with requires=("fla_npu", "triton_ascend_kernels")
+# and resolves to eager when they are missing; these contract tests follow
+# the same rule and skip instead of failing collection.
+_MISSING_PACKAGES = tuple(pkg for pkg in ("fla_npu", "triton_ascend_kernels") if not is_package_available(pkg))
+_NPU_AVAILABLE = _NPU_HARDWARE_AVAILABLE and not _MISSING_PACKAGES
+
+if _NPU_AVAILABLE:
+    # Unexpected failures importing the implementation under test fail
+    # collection here instead of silently skipping every test.
     from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda as kda_reference
     from veomni.ops.kernels.kda.ascendc.chunk_kda_ascendc_kimi import chunk_kda_ascendc
-
-    _NPU_AVAILABLE = torch.npu.is_available()
-except Exception:
+else:
     kda_reference = None
     chunk_kda_ascendc = None
-    _NPU_AVAILABLE = False
+
+_SKIP_REASON = "AscendC chunk_kda requires an Ascend NPU with fla_npu and triton_ascend_kernels installed"
+if _NPU_HARDWARE_AVAILABLE and _MISSING_PACKAGES:
+    _SKIP_REASON += f" (missing: {', '.join(_MISSING_PACKAGES)})"
 
 
 pytestmark = [
     pytest.mark.skipif(
         not _NPU_AVAILABLE,
-        reason="AscendC chunk_kda requires an Ascend NPU (torch_npu + fla_npu + triton_ascend_kernels)",
+        reason=_SKIP_REASON,
     ),
     # The KDA callers legitimately use the deprecated transpose_state_layout kwarg.
     pytest.mark.filterwarnings("ignore::DeprecationWarning"),
@@ -173,3 +192,44 @@ def test_stateless_backward_matches_reference():
     torch.testing.assert_close(o_flag.float(), o_ref.float(), rtol=5e-2, atol=5e-2)
     for a, b in zip(grads_flag, grads_ref):
         torch.testing.assert_close(a.float(), b.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_intermediate_states_honor_transposed_layout():
+    """Intermediate states are a caller-visible state crossing the boundary.
+
+    With return_intermediate_states=True and no initial/final state the
+    AscendC forward must still build h in the requested transposed layout
+    ([B, NT, H, V, K] under transpose_state_layout=True, matching the eager
+    reference) instead of silently keeping the canonical (K, V) order used
+    by the stateless fused-backward route.
+    """
+    B, T, H, K, V = 2, 128, 2, 64, 64
+    q, k, v, g, beta = _make_inputs(B, T, H, K, V, seed=31)
+
+    # The wrapper only exposes intermediate states in inference mode.
+    with torch.inference_mode():
+        o_npu, _, h_npu = chunk_kda_ascendc(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            use_qk_l2norm_in_kernel=True,
+            return_intermediate_states=True,
+            transpose_state_layout=True,
+            chunk_size=64,
+        )
+        o_ref, _, h_ref = kda_reference(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            use_qk_l2norm_in_kernel=True,
+            return_intermediate_states=True,
+            transpose_state_layout=True,
+            chunk_size=64,
+        )
+    assert h_npu.shape == h_ref.shape
+    torch.testing.assert_close(h_npu.float(), h_ref.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=3e-2, atol=3e-2)

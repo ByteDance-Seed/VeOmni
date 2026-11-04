@@ -198,7 +198,7 @@
 
 
  ACT2FN["situ"] = SituAndMul
-@@ -288,51 +328,100 @@
+@@ -291,51 +331,108 @@
          return self.conv_states[self.last_linear_layer] is not None
 
 
@@ -272,6 +272,14 @@
 +        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
 +
 +        self.is_situ = config.hidden_act == "situ"
++        if not self.is_situ and config.hidden_act != "silu":
++            # The standard MoE implementation always applies F.silu in its
++            # experts; anything else would silently train with the wrong
++            # activation.
++            raise ValueError(
++                f"KimiK3 MoE experts implement 'situ' and 'silu' activations only, "
++                f"got hidden_act={config.hidden_act!r}."
++            )
 +        if self.is_situ:
              beta, linear_beta = _get_situ_activation_params(config)
 -            self.act_fn = SituAndMul(
@@ -333,7 +341,7 @@
 
 
  class KimiMLP(nn.Module):
-@@ -572,8 +661,23 @@
+@@ -575,8 +672,23 @@
          return attn_output
 
 
@@ -358,7 +366,7 @@
          super().__init__()
          self.config = config
          self.mode = "chunk"
-@@ -631,11 +735,10 @@
+@@ -634,11 +746,10 @@
 
          self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
          self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
@@ -374,7 +382,7 @@
 
      def _forward_sp_head_shard(
          self,
-@@ -658,7 +761,6 @@
+@@ -661,7 +772,6 @@
          operate on the padded layout (equal shard lengths); unpad/repad use
          the full-sequence attention_mask exactly like the non-SP path.
          """
@@ -382,7 +390,7 @@
 
          _timing = os.environ.get("K3_KDA_SP_TIMING") == "1"
          if _timing:
-@@ -954,6 +1056,12 @@
+@@ -957,6 +1067,12 @@
          return o
 
 
@@ -395,7 +403,7 @@
  class KimiMoEGate(nn.Module):
      """
      MoEGate adapted from Deepseek-V3.
-@@ -987,10 +1095,9 @@
+@@ -990,10 +1106,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -407,7 +415,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -1010,7 +1117,7 @@
+@@ -1013,7 +1128,7 @@
              )
 
          # select top-k experts
@@ -416,7 +424,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -1055,13 +1162,29 @@
+@@ -1058,13 +1173,29 @@
          return topk_idx, topk_weight
 
 
@@ -451,7 +459,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -1073,20 +1196,16 @@
+@@ -1076,20 +1207,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -480,7 +488,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -1109,6 +1228,7 @@
+@@ -1112,6 +1239,7 @@
                  self.routed_expert_norm = KimiRMSNorm(
                      self.moe_hidden_size,
                      eps=config.rms_norm_eps,
@@ -488,7 +496,7 @@
                  )
 
      def forward(self, hidden_states):
-@@ -1120,10 +1240,9 @@
+@@ -1123,10 +1251,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -502,7 +510,7 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -1135,41 +1254,6 @@
+@@ -1138,41 +1265,6 @@
          if self.config.num_shared_experts is not None:
              y = y + self.shared_experts(identity)
          return y
@@ -544,7 +552,7 @@
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -1401,6 +1485,12 @@
+@@ -1404,6 +1496,12 @@
          return prefix_sum, block_residual
 
 
@@ -557,7 +565,7 @@
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
      base_model_prefix = "model"
-@@ -1415,8 +1505,58 @@
+@@ -1418,8 +1516,58 @@
      }
      _is_stateful = True
 
@@ -616,7 +624,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1426,13 +1566,8 @@
+@@ -1429,13 +1577,8 @@
              if module.padding_idx is not None:
                  _zero_embedding_padding_row(module.weight.data, module.padding_idx)
          elif isinstance(module, FusedRMSNormGated):
@@ -630,7 +638,7 @@
              module.reset_parameters()
 
 
-@@ -1452,8 +1587,15 @@
+@@ -1455,8 +1598,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -647,7 +655,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1462,21 +1604,17 @@
+@@ -1465,21 +1615,17 @@
          self.layers = nn.ModuleList(
              [KimiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -675,7 +683,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1595,6 +1733,12 @@
+@@ -1598,6 +1744,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -688,7 +696,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1602,46 +1746,59 @@
+@@ -1605,46 +1757,90 @@
 
      _tied_weights_keys = ["lm_head.weight"]
 
@@ -769,10 +777,41 @@
 +            _linear_cu = kwargs.get("cu_seq_lens_q")
 +        if _linear_cu is not None:
 +            fa_kwargs["cu_seqlens"] = _linear_cu
++
++        # Packed varlen metadata is only honored by the varlen attention
++        # implementations: the dense eager/sdpa/veomni_sdpa path would run one
++        # causal mask across the whole packed row and leak across packed
++        # samples (the same rejection KimiK3ForConditionalGeneration.forward
++        # applies). cu_seq_lens_q alone is not evidence of packing -- the
++        # collator emits [0, length] for plain un-packed sequences -- so reject
++        # only a real boundary between non-empty segments (known tail-padding
++        # segments do not count). K3_ALLOW_DENSE_PACKED=1 re-enables the
++        # documented debug-only dense path (used by the CPU packing tests).
++        _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
++        if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
++            _attn_impl = getattr(self.config, "_attn_implementation", None)
++            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
++                _cu_t = _cu_seq_lens_q
++                if not isinstance(_cu_t, torch.Tensor):
++                    _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
++                _seg_lens = torch.diff(_cu_t)
++                _tail_pads = kwargs.get("tail_padding_length", 0)
++                _tail_pads = 0 if _tail_pads is None else int(_tail_pads)
++                if _tail_pads > 0 and _seg_lens.numel() > 0 and int(_seg_lens[-1]) == _tail_pads:
++                    _seg_lens = _seg_lens[:-1]
++                _num_samples = int((_seg_lens > 0).sum())
++                if _num_samples > 1:
++                    raise ValueError(
++                        f"attention_implementation={_attn_impl!r} cannot run packed batches "
++                        f"({_num_samples} samples share a row): the dense causal mask does not "
++                        f"isolate them. Use a varlen implementation (flash_attention_2 / "
++                        f"veomni_flash_attention_2), disable dynamic packing, or set "
++                        f"K3_ALLOW_DENSE_PACKED=1 for the documented debug-only dense path."
++                    )
 
          outputs = self.model(
              input_ids=input_ids,
-@@ -1654,24 +1811,46 @@
+@@ -1657,24 +1853,46 @@
              output_hidden_states=output_hidden_states,
              return_dict=return_dict,
              cache_position=cache_position,
@@ -829,7 +868,7 @@
 
 
  def multihead_attention(
-@@ -2447,6 +2626,12 @@
+@@ -2450,6 +2668,12 @@
          return x
 
 
@@ -842,7 +881,7 @@
  class KimiK3PreTrainedModel(PreTrainedModel):
      config_class = KimiK3Config
      base_model_prefix = "model"
-@@ -2464,13 +2649,59 @@
+@@ -2467,13 +2691,59 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -903,7 +942,7 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2484,13 +2715,8 @@
+@@ -2487,13 +2757,8 @@
              if module.padding_idx is not None:
                  _zero_embedding_padding_row(module.weight.data, module.padding_idx)
          elif isinstance(module, FusedRMSNormGated):
@@ -917,7 +956,7 @@
              module.reset_parameters()
 
 
-@@ -2530,13 +2756,38 @@
+@@ -2533,13 +2798,38 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -950,14 +989,14 @@
 +            vision_config = getattr(config, "vision_config", None)
 +            if vision_config is not None:
 +                vision_impl = selected_attn
-+                if vision_impl == "sdpa":
++                if vision_impl in ("sdpa", "veomni_sdpa"):
 +                    vision_impl = "eager"
 +                vision_config._attn_implementation = vision_impl
 +
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2555,7 +2806,23 @@
+@@ -2558,7 +2848,23 @@
              raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
          self.language_model = KimiLinearForCausalLM(config.text_config)
@@ -981,7 +1020,7 @@
 
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
-@@ -2580,8 +2847,14 @@
+@@ -2583,8 +2889,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -998,7 +1037,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2747,29 +3020,23 @@
+@@ -2750,29 +3062,23 @@
          image_features = self.vision_tower(pixel_values, grid_thws)
          return image_features
 
@@ -1043,7 +1082,7 @@
          assert self.vision_tower is not None, "vision_tower is not loaded"
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
-@@ -2777,6 +3044,38 @@
+@@ -2780,6 +3086,48 @@
          )
          return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1055,6 +1094,16 @@
 +        # attention_mask / position_ids / cache_position stay full-sequence.
 +        cache_position = None
 +        if get_parallel_state().sp_enabled:
++            if input_ids is None:
++                # The multimodal merge locates media placeholders via input_ids,
++                # and a sharded inputs_embeds batch cannot be gathered or merged;
++                # reject the input mode instead of passing None into the SP
++                # collective.
++                raise ValueError(
++                    "KimiK3ForConditionalGeneration.forward requires input_ids under sequence "
++                    "parallelism: the multimodal merge locates media placeholders via input_ids, "
++                    "so an inputs_embeds-only batch cannot be gathered or merged on this path."
++                )
 +            sp_group = get_parallel_state().sp_group
 +            input_ids = gather_outputs(input_ids, gather_dim=1, group=sp_group)
 +            if attention_mask is not None:
@@ -1082,7 +1131,7 @@
          if inputs_embeds is None:
              # 1. Extra the input embeddings
              inputs_embeds = self.get_input_embeddings()(input_ids)
-@@ -2787,21 +3086,23 @@
+@@ -2790,21 +3138,23 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
@@ -1120,7 +1169,7 @@
                  )
 
              # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
-@@ -2837,46 +3138,224 @@
+@@ -2840,46 +3190,224 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -1201,7 +1250,7 @@
 +                fa_kwargs["cu_seqlens"] = _linear_cu
 +
 +        # Packed varlen metadata is only honored by the varlen attention
-+        # implementations: the dense eager/sdpa MLA path would run one causal
++        # implementations: the dense eager/sdpa/veomni_sdpa MLA path would run one causal
 +        # mask across the whole merged row and leak across packed samples
 +        # (eager/sdpa stay available for non-packed batches). cu_seq_lens_q
 +        # alone is not evidence of packing -- the collator emits [0, length]
@@ -1218,7 +1267,7 @@
 +            _attn_impl = getattr(self.config, "_attn_implementation", None)
 +            if _attn_impl is None:
 +                _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
-+            if _attn_impl in ("eager", "sdpa"):
++            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
 +                _cu_t = _cu_seq_lens_q
 +                if not isinstance(_cu_t, torch.Tensor):
 +                    _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
@@ -1369,7 +1418,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2942,3 +3421,37 @@
+@@ -2945,3 +3473,37 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)

@@ -263,6 +263,9 @@ class KimiDynamicCache:
     def get_seq_length(self, layer_idx: int | None = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         # take any layer that contains cache and not empty tensor
+        if not self.transformer_layers:
+            # No full-attention layer in this configuration: nothing is ever cached.
+            return 0
         layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
         if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
             return 0

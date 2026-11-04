@@ -47,7 +47,12 @@ import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
-from tests.models.tiny_configs import tiny_kimi_k3_config as _tiny_config
+from tests.models.tiny_configs import (
+    tiny_kimi_k3_config as _tiny_config,
+)
+from tests.models.tiny_configs import (
+    tiny_kimi_linear_config as _tiny_linear_config,
+)
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state_from_config
 from veomni.models.auto import build_foundation_model
@@ -848,3 +853,83 @@ def test_init_weights_reinits_o_norm_and_vision_pos_emb():
     o_norm.weight.data.fill_(float("nan"))
     model._init_weights(o_norm)
     assert o_norm.weight.eq(1).all()
+
+
+def test_causal_lm_packed_forward_rejects_dense_attention():
+    """The text-only causal-LM entry forwards the collator's varlen metadata
+    to the inner model, so a packed row must be rejected under eager/sdpa
+    attention exactly like the multimodal forward (K3_ALLOW_DENSE_PACKED is
+    unset here)."""
+    model = build_foundation_model(
+        _tiny_linear_config(),
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=eager_ops_config(),
+    )
+    model.eval()
+    input_ids = torch.randint(3, model.config.vocab_size, (1, 8))
+    labels = input_ids.clone()
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="cannot run packed batches"):
+            model(
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=torch.ones(1, 8, dtype=torch.long),
+                cu_seq_lens_q=torch.tensor([0, 4, 8]),
+                cu_seq_lens_k=torch.tensor([0, 4, 8]),
+                max_length_q=8,
+                max_length_k=8,
+                linear_attn_cu_seq_lens_q=torch.tensor([0, 4, 8]),
+                use_cache=False,
+            )
+
+
+def test_single_sample_causal_lm_forward_runs_dense():
+    """A single-segment cu ([0, length]) is not packing: the text-only forward
+    keeps running it through the dense path without the debug escape hatch."""
+    model = build_foundation_model(
+        _tiny_linear_config(),
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=eager_ops_config(),
+    )
+    model.eval()
+    input_ids = torch.randint(3, model.config.vocab_size, (1, 8))
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones(1, 8, dtype=torch.long),
+            cu_seq_lens_q=torch.tensor([0, 8]),
+            cu_seq_lens_k=torch.tensor([0, 8]),
+            max_length_q=8,
+            max_length_k=8,
+            linear_attn_cu_seq_lens_q=torch.tensor([0, 8]),
+            use_cache=False,
+        )
+    assert out.logits.shape == (1, 8, model.config.vocab_size)
+
+
+def test_moe_rejects_unsupported_activation():
+    """The standard MoE expert path always applies F.silu; a hidden_act the
+    experts do not implement must fail construction instead of silently
+    training with the wrong activation."""
+    cfg = _tiny_config()
+    cfg.text_config.hidden_act = "gelu"
+    with pytest.raises(ValueError, match="activations only"):
+        build_foundation_model(
+            cfg,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=eager_ops_config(),
+        )
+
+
+def test_get_seq_length_with_no_full_attention_layers():
+    """A configuration with no full-attention layer has nothing cached:
+    get_seq_length must return 0 instead of indexing an empty list."""
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import KimiDynamicCache
+
+    cache = KimiDynamicCache.__new__(KimiDynamicCache)
+    cache.transformer_layers = []
+    cache.key_cache = []
+    assert cache.get_seq_length() == 0
