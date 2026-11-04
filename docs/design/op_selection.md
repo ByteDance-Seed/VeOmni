@@ -593,7 +593,7 @@ unavailable on the device.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
-ROCm `triton` attention. Its MoE path uses the independent
+ROCm `triton` indexer and attention. Its MoE path uses the independent
 `moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to the local `VeomniOp` and forwards `swiglu_limit` so every

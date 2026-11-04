@@ -120,7 +120,7 @@ def _sparse_bwd_kernel(
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_mask = offs_k < TOPK
         idx = tl.load(IDX_PTR + row * TOPK + offs_k, mask=k_mask, other=-1)
-        valid = idx >= 0
+        valid = (idx >= 0) & (idx < P)
         g = tl.where(valid, tl.load(G_PTR + row * TOPK + offs_k, mask=k_mask, other=0.0), 0.0)
         kv_rows = b * P + tl.where(valid, idx, 0).to(tl.int64)
         kk = tl.load(K_PTR + kv_rows[:, None] * D + offs_d[None, :], mask=valid[:, None], other=0.0)
@@ -199,6 +199,7 @@ class _TritonIndexer(torch.autograd.Function):
             indices = topk_indices
         selected = _gather_scores(scores, indices)
         visible_indices, _ = mask_topk_indices_to_query_range(indices.to(torch.int32), ks, ke)
+        visible_indices = visible_indices.masked_fill(visible_indices >= pool, -1)
         ctx.save_for_backward(q, k, w, visible_indices.contiguous())
         ctx.mark_non_differentiable(indices)
         return selected, indices
@@ -261,7 +262,31 @@ def triton_lighting_indexer(
         ``(scores, indices)``, both ``[B, S, K]``: FP32 scores (``-inf`` for
         unusable slots) and int32 indices (``-1`` for unusable slots).
     """
-    seq_len, _, heads, dim = index_q.shape
+    if index_q.ndim != 4:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires q [S, B, H, D], got {tuple(index_q.shape)}")
+    if index_k.ndim != 3:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires k [P, B, D], got {tuple(index_k.shape)}")
+    if weights.ndim != 3:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires weights [S, B, H], got {tuple(weights.shape)}")
+
+    seq_len, batch, heads, dim = index_q.shape
+    pool, key_batch, key_dim = index_k.shape
+    if key_batch != batch or key_dim != dim:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires k [P, B={batch}, D={dim}], got {tuple(index_k.shape)}")
+    if weights.shape != (seq_len, batch, heads):
+        raise ValueError(
+            f"DeepSeek V4 Triton indexer requires weights [S={seq_len}, B={batch}, H={heads}], "
+            f"got {tuple(weights.shape)}"
+        )
+    if index_q.device != index_k.device or index_q.device != weights.device:
+        raise ValueError(
+            "DeepSeek V4 Triton indexer requires q, k and weights on one device, got "
+            f"q={index_q.device}, k={index_k.device}, weights={weights.device}"
+        )
+    if not isinstance(compress_ratio, int) or compress_ratio <= 0:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires compress_ratio > 0, got {compress_ratio!r}")
+    if not isinstance(topk, int) or topk < 0:
+        raise ValueError(f"DeepSeek V4 Triton indexer requires topk >= 0, got {topk!r}")
     if heads > 64:
         raise ValueError(f"DeepSeek V4 Triton indexer supports at most 64 heads, got {heads}")
     if dim < 16 or dim & (dim - 1):
@@ -270,17 +295,44 @@ def triton_lighting_indexer(
         raise ValueError(f"DeepSeek V4 Triton indexer requires bfloat16 q/k, got q={index_q.dtype}, k={index_k.dtype}")
     if weights.dtype is not torch.float32:
         raise ValueError(f"DeepSeek V4 Triton indexer requires float32 weights, got {weights.dtype}")
+    if topk_indices is not None:
+        if topk_indices.ndim != 3 or topk_indices.shape[:2] != (batch, seq_len):
+            raise ValueError(
+                f"DeepSeek V4 Triton indexer requires topk_indices [B={batch}, S={seq_len}, K], "
+                f"got {tuple(topk_indices.shape)}"
+            )
+        if topk_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"DeepSeek V4 Triton indexer requires int32/int64 topk_indices, got {topk_indices.dtype}")
+        if topk_indices.device != index_q.device:
+            raise ValueError(
+                "DeepSeek V4 Triton indexer requires topk_indices on the q device, got "
+                f"q={index_q.device}, indices={topk_indices.device}"
+            )
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
     if cu_seqlen_ks is None:
         positions = torch.arange(seq_len, device=index_q.device, dtype=torch.int32)
         cu_seqlen_ks = torch.zeros_like(positions)
         cu_seqlen_ke = (positions + 1) // compress_ratio
-    elif cu_seqlen_ks.shape != (seq_len,) or cu_seqlen_ke.shape != (seq_len,):
-        raise ValueError(
-            "Packed indexer ranges must have shape "
-            f"({seq_len},), got {tuple(cu_seqlen_ks.shape)} and {tuple(cu_seqlen_ke.shape)}"
-        )
+    else:
+        if cu_seqlen_ks.shape != (seq_len,) or cu_seqlen_ke.shape != (seq_len,):
+            raise ValueError(
+                "Packed indexer ranges must have shape "
+                f"({seq_len},), got {tuple(cu_seqlen_ks.shape)} and {tuple(cu_seqlen_ke.shape)}"
+            )
+        if cu_seqlen_ks.dtype not in (torch.int32, torch.int64) or cu_seqlen_ke.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError(
+                "DeepSeek V4 Triton indexer requires int32/int64 packed ranges, got "
+                f"{cu_seqlen_ks.dtype} and {cu_seqlen_ke.dtype}"
+            )
+        if cu_seqlen_ks.device != index_q.device or cu_seqlen_ke.device != index_q.device:
+            raise ValueError(
+                "DeepSeek V4 Triton indexer requires packed ranges on the q device, got "
+                f"q={index_q.device}, ks={cu_seqlen_ks.device}, ke={cu_seqlen_ke.device}"
+            )
     return _TritonIndexer.apply(
         index_q.transpose(0, 1).contiguous(),
         index_k.transpose(0, 1).contiguous(),
