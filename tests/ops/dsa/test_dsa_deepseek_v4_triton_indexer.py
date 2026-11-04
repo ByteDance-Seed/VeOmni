@@ -194,6 +194,66 @@ def test_triton_indexer_rejects_unsupported_inputs(heads, dim, q_dtype, w_dtype,
         triton_lighting_indexer(q, k, weights, compress_ratio=4, topk=2)
 
 
+@requires_rocm
+def test_triton_indexer_rejects_mismatched_shapes_devices_and_indices():
+    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+
+    q, k, weights = _inputs(8, 1, 8, 128, 2, seed=13)
+    with pytest.raises(ValueError, match=r"q \[S, B, H, D\]"):
+        triton_lighting_indexer(q[:, 0], k, weights, 4, 2)
+    with pytest.raises(ValueError, match=r"k \[P, B=1, D=128\]"):
+        triton_lighting_indexer(q, k.expand(-1, 2, -1), weights, 4, 2)
+    with pytest.raises(ValueError, match=r"weights \[S=8, B=1, H=8\]"):
+        triton_lighting_indexer(q, k, weights[:, :, :-1], 4, 2)
+    with pytest.raises(ValueError, match="one device"):
+        triton_lighting_indexer(q, k.cpu(), weights, 4, 2)
+    with pytest.raises(ValueError, match="compress_ratio > 0"):
+        triton_lighting_indexer(q, k, weights, 0, 2)
+    with pytest.raises(ValueError, match="topk >= 0"):
+        triton_lighting_indexer(q, k, weights, 4, -1)
+
+    bad_shape = torch.zeros(2, 8, 2, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match=r"topk_indices \[B=1, S=8, K\]"):
+        triton_lighting_indexer(q, k, weights, 4, 2, bad_shape)
+    bad_dtype = torch.zeros(1, 8, 2, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="int32/int64 topk_indices"):
+        triton_lighting_indexer(q, k, weights, 4, 2, bad_dtype)
+
+    ks = torch.zeros(8, device="cuda", dtype=torch.float32)
+    ke = torch.ones(8, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="int32/int64 packed ranges"):
+        triton_lighting_indexer(q, k, weights, 4, 2, cu_seqlen_ks=ks, cu_seqlen_ke=ke)
+
+
+@requires_rocm
+def test_triton_indexer_backward_masks_indices_past_the_pool():
+    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+
+    seq_len, pool = 4, 2
+    q, k, weights = _inputs(seq_len, 1, 8, 128, pool, seed=14)
+    indices = torch.full((1, seq_len, 1), pool, device="cuda", dtype=torch.int32)
+    ks = torch.zeros(seq_len, device="cuda", dtype=torch.int32)
+    # Deliberately extend the visible range past the physical pool. The score is
+    # still invalid, and backward must not read or atomically write row ``pool``.
+    ke = torch.full((seq_len,), pool + 1, device="cuda", dtype=torch.int32)
+
+    scores, returned_indices = triton_lighting_indexer(
+        q,
+        k,
+        weights,
+        compress_ratio=4,
+        topk=1,
+        topk_indices=indices,
+        cu_seqlen_ks=ks,
+        cu_seqlen_ke=ke,
+    )
+    assert torch.equal(returned_indices, indices)
+    assert torch.isneginf(scores).all()
+    scores.backward(torch.ones_like(scores))
+    for grad in (q.grad, k.grad, weights.grad):
+        assert torch.equal(grad, torch.zeros_like(grad))
+
+
 def test_triton_indexer_adapter_delegates_to_dsa_vendor(monkeypatch):
     calls = []
     vendor = ModuleType("veomni.ops.kernels.dsa.vendor.triton_indexer")
