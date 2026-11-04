@@ -222,14 +222,26 @@ class TrainingMixin(TrainingModuleMixin):
         start = ps.sp_rank * per_rank
         return {"pixel_values": padded_pixels[start : start + per_rank]}
 
+    def encode(
+        self,
+        pixel_values: torch.Tensor | list[torch.Tensor],
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        """Encode ``pixel_values``; under SP, defer posterior sampling until ``encode_post`` gathers all shards."""
+        if get_parallel_state().sp_size > 1 and self._sp_encode_count is not None:
+            return {"latents": self.offline_encode(pixel_values=pixel_values, **kwargs)["encoded_cache"]}
+        return super().encode(pixel_values=pixel_values, **kwargs)
+
     @post_forward("encode", "online_process")
     def encode_post(self, latents: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
-        """Gather SP latent shards, crop spatial padding if needed, and write latents onto conversation items."""
+        """Gather SP posterior shards, sample scaled latents after gather, and write latents onto conversation items."""
         if get_parallel_state().sp_size > 1 and self._sp_encode_count is not None:
             if isinstance(latents, list):
-                latents = self._gather_encode_output_list(latents)
+                gathered_cache = self._gather_encode_output_list(latents)
+                latents = self._sample_posteriors_list(gathered_cache)
             else:
-                latents = self._gather_encode_output(latents)
+                gathered_cache = self._gather_encode_output(latents)
+                latents = self._sample_posterior_tensor(gathered_cache, self._encode_items)
 
         conversation = self._conversation_carrier
         encode_items = self._encode_items
@@ -254,6 +266,40 @@ class TrainingMixin(TrainingModuleMixin):
                 item.value = latent
                 item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
+
+    def _sample_posteriors_list(self, encoded_cache: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Sample scaled latents in batch order from gathered ``(mean, logvar)`` posteriors."""
+        z_channels = int(self.config.z_channels)
+        latents: list[torch.Tensor] = []
+        for cache in encoded_cache:
+            if cache.dim() == 3 and int(cache.shape[0]) == 2 * z_channels:
+                cache = cache.reshape(2, z_channels, *cache.shape[-2:])
+            posterior, is_item_cache = _posterior_from_cache(cache, z_channels=z_channels)
+            with self._runtime_context(posterior[0]):
+                latent = self._sample_scaled_latents(posterior)
+            if is_item_cache:
+                latent = latent.squeeze(0)
+            latents.append(latent.to(dtype=cache.dtype))
+        return latents
+
+    def _sample_posterior_tensor(
+        self,
+        encoded_cache: torch.Tensor,
+        encode_items: list[ConversationItem],
+    ) -> list[torch.Tensor]:
+        """Crop and sample scaled latents in batch order from a gathered 4-D posterior tensor."""
+        z_channels = int(self.config.z_channels)
+        cropped_caches: list[torch.Tensor] = []
+        for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
+            cache_tensor = crop_latent_to_image_shape(
+                cache_tensor,
+                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            )
+            if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
+                cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
+            cropped_caches.append(cache_tensor)
+        return self._sample_posteriors_list(cropped_caches)
 
     def _encode_posterior_list(
         self,

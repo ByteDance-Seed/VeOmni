@@ -108,6 +108,18 @@ class TrainingMixin(TrainingModuleMixin):
             "token_lens": local_token_lens,
         }
 
+    def forward(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Isolate SP-sharded attention dropout RNG from downstream modules when enabled."""
+        if (
+            get_parallel_state().sp_size > 1
+            and self.training
+            and float(getattr(self.config, "attention_dropout", 0.0)) > 0.0
+        ):
+            devices = [self.device] if self.device.type != "cpu" else []
+            with torch.random.fork_rng(devices=devices):
+                return super().forward(*args, **kwargs)
+        return super().forward(*args, **kwargs)
+
     @post_forward("forward")
     def forward_post(
         self,

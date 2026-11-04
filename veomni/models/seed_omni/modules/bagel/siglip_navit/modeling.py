@@ -391,9 +391,14 @@ class BagelSiglipAttention(nn.Module):
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        query_states = query_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
-        key_states = key_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
-        value_states = value_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        attn_dtype = (
+            torch.bfloat16
+            if value_states.dtype == torch.float32 and "flash_attention" in self.veomni_attn.impl
+            else value_states.dtype
+        )
+        query_states = query_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
+        key_states = key_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
+        value_states = value_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
         dropout = 0.0 if not self.training else self.attention_dropout
 
         attn_output, _ = self.veomni_attn(

@@ -1238,3 +1238,151 @@ def test_bagel_vae_aligns_encoder_passes_across_shard_group_and_keeps_blocks_uns
     assert encoder_calls == 3
     for actual, expected in zip(aligned_out, ref_out, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+def test_bagel_vae_sp_samples_posteriors_after_gather_and_keeps_flow_rng_aligned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SP-sharded VAE encoding defers posterior sampling until after gather so uneven image sizes keep flow RNG aligned across SP ranks."""
+    from veomni.models.seed_omni.modules.bagel.flow_connector.accelerated import accelerated as flow_acc
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import accelerated as vae_acc
+
+    vae = _tiny_vae(ch_mult=[1, 1], downsample=2)
+    BagelFlowConnector = model_cls("bagel_flow_connector")
+    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
+    flow = BagelFlowConnector(
+        BagelFlowConnectorConfig(
+            hidden_size=4,
+            z_channels=2,
+            latent_patch_size=1,
+            patch_latent_dim=2,
+            max_latent_size=8,
+            timestep_frequency_embedding_size=4,
+            timestep_shift=3.0,
+        )
+    )
+
+    torch.manual_seed(99)
+    small_img = torch.randn(3, 4, 4)
+    large_img = torch.randn(3, 8, 8)
+
+    def _make_batch() -> list[list[ConversationItem]]:
+        return [
+            [
+                ConversationItem(
+                    type="image",
+                    value=small_img.clone(),
+                    role="assistant",
+                    meta={
+                        BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
+                        _IMG_TAG_KEY: "gen",
+                        BAGEL_VAE_PIXEL_SHAPE: torch.tensor([4, 4], dtype=torch.long),
+                    },
+                ),
+                ConversationItem(
+                    type="image",
+                    value=large_img.clone(),
+                    role="assistant",
+                    meta={
+                        BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
+                        _IMG_TAG_KEY: "gen",
+                        BAGEL_VAE_PIXEL_SHAPE: torch.tensor([8, 8], dtype=torch.long),
+                    },
+                ),
+            ]
+        ]
+
+    # 1. Baseline sp_size=1 run
+    monkeypatch.setattr(
+        vae_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=1, sp_rank=0, cp_size=1, sp_group=None, fsdp_group=None),
+    )
+    monkeypatch.setattr(
+        flow_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=1, sp_rank=0, cp_size=1, sp_group=None, fsdp_group=None),
+    )
+    ref_batch = _make_batch()
+    torch.manual_seed(2026)
+    ref_pre = vae.pre_forward("encode", conversation_list=ref_batch)
+    ref_enc = vae.encode(**ref_pre)
+    vae.post_forward("encode", **ref_enc)
+    ref_rng_after_vae = torch.get_rng_state()
+    ref_flow_inputs = flow.pre_forward("embed_latent", conversation_list=ref_batch)
+
+    # 2. Simulate 2-rank SP where rank 0 encodes small_img (4x4) and rank 1 encodes large_img (8x8)
+    rank_caches: dict[int, list[torch.Tensor]] = {}
+    for sp_rank in (0, 1):
+        monkeypatch.setattr(
+            vae_acc,
+            "get_parallel_state",
+            lambda r=sp_rank: SimpleNamespace(sp_size=2, sp_rank=r, cp_size=1, sp_group=object(), fsdp_group=None),
+        )
+        batch_r = _make_batch()
+        torch.manual_seed(2026)
+        pre_r = vae.pre_forward("encode", conversation_list=batch_r)
+        enc_r = vae.encode(**pre_r)
+        # No RNG must be consumed during the SP-sharded encode step before gather
+        assert torch.equal(torch.get_rng_state(), torch.manual_seed(2026).get_state())
+        rank_caches[sp_rank] = enc_r["latents"]
+
+    def _fake_gather_outputs(x: torch.Tensor, gather_dim: int = 0, group=None) -> torch.Tensor:
+        del group
+        assert gather_dim == 0
+        # Pad rank 0's flat posterior tensor to match max_rank_numel (rank 1's 2*2*4*4 = 64 elements)
+        flat_0 = rank_caches[0][0].reshape(-1)
+        flat_1 = rank_caches[1][0].reshape(-1)
+        max_numel = max(int(flat_0.numel()), int(flat_1.numel()))
+        pad_0 = torch.nn.functional.pad(flat_0, (0, max_numel - int(flat_0.numel()))).unsqueeze(0)
+        pad_1 = torch.nn.functional.pad(flat_1, (0, max_numel - int(flat_1.numel()))).unsqueeze(0)
+        return torch.cat([pad_0, pad_1], dim=0)
+
+    monkeypatch.setattr(vae_acc, "gather_outputs", _fake_gather_outputs)
+    monkeypatch.setattr(
+        flow_acc,
+        "slice_sp_token_inputs",
+        lambda method, **inputs: (int(inputs["latents"].shape[0]), inputs),
+    )
+
+    rank_batches: dict[int, list[list[ConversationItem]]] = {}
+    rank_flow_inputs: dict[int, dict[str, torch.Tensor]] = {}
+    for sp_rank in (0, 1):
+        monkeypatch.setattr(
+            vae_acc,
+            "get_parallel_state",
+            lambda r=sp_rank: SimpleNamespace(sp_size=2, sp_rank=r, cp_size=1, sp_group=object(), fsdp_group=None),
+        )
+        monkeypatch.setattr(
+            flow_acc,
+            "get_parallel_state",
+            lambda r=sp_rank: SimpleNamespace(sp_size=2, sp_rank=r, cp_size=1, sp_group=object(), fsdp_group=None),
+        )
+        batch_r = _make_batch()
+        torch.manual_seed(2026)
+        pre_r = vae.pre_forward("encode", conversation_list=batch_r)
+        enc_r = vae.encode(**pre_r)
+        vae.post_forward("encode", **enc_r)
+        assert torch.equal(torch.get_rng_state(), ref_rng_after_vae)
+        flow_in_r = flow.pre_forward("embed_latent", conversation_list=batch_r)
+        rank_batches[sp_rank] = batch_r
+        rank_flow_inputs[sp_rank] = flow_in_r
+
+    for idx in (0, 1):
+        torch.testing.assert_close(rank_batches[0][0][idx].value, ref_batch[0][idx].value)
+        torch.testing.assert_close(rank_batches[1][0][idx].value, ref_batch[0][idx].value)
+        torch.testing.assert_close(
+            rank_batches[0][0][idx].meta["flow_velocity_target"],
+            rank_batches[1][0][idx].meta["flow_velocity_target"],
+        )
+        torch.testing.assert_close(
+            rank_batches[0][0][idx].meta["flow_velocity_target"],
+            ref_batch[0][idx].meta["flow_velocity_target"],
+        )
+        torch.testing.assert_close(
+            rank_batches[0][0][idx].meta["timestep"],
+            rank_batches[1][0][idx].meta["timestep"],
+        )
+    for key in ("latents", "position_ids", "timesteps"):
+        torch.testing.assert_close(rank_flow_inputs[0][key], rank_flow_inputs[1][key])
+        torch.testing.assert_close(rank_flow_inputs[0][key], ref_flow_inputs[key])
