@@ -29,6 +29,15 @@
     ]
   },
   {
+    "name": "qwen38-sft-resume-modes-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_sft_resume_modes.py"
+    ]
+  },
+  {
     "name": "npu-unit-03",
     "suite": "unit",
     "args": [
