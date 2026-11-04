@@ -286,12 +286,10 @@ full-model pretrained numerical parity and optimizer resume remain unverified.
 
 The deterministic 100-step comparison fixes input order, seed, VAE posterior
 noise, diffusion noise and timestep, with cuDNN SDPA disabled in the external
-GPU comparison harness. Loss mean/max relative errors are 0.334%/1.685%
-(Pearson 0.999976); gradient-norm mean/max relative errors are 12.55%/72.96%
-(Pearson 0.986825), using NPU values as the denominator. These are the historical
-pre-review measurements in [PR #1319](https://github.com/ByteDance-Seed/VeOmni/pull/1319),
-not a rerun of the optimized mask. They show close loss trajectories and a
-remaining gradient-norm difference; they do not establish gradient equivalence
-or long-run convergence.
-
-![Historical GPU and NPU precision comparison](../assets/hunyuanvideo15_gpu_npu_precision.png)
+GPU comparison harness. The loss and gradient-norm summary and the precision
+plot are kept in the
+[PR #1319](https://github.com/ByteDance-Seed/VeOmni/pull/1319) description rather
+than duplicated here; they are the historical pre-review measurements, not a
+rerun of the optimized mask. They show close loss trajectories and a remaining
+gradient-norm difference; they do not establish gradient equivalence or long-run
+convergence.
