@@ -49,6 +49,23 @@ if TYPE_CHECKING:
     from ..trainer.callbacks import TrainerState
     from .checkpoint import ModelCheckpointManager
 
+
+def _configure_extra_parallel_checkpoint_layout(model, checkpoint, *, require_plan=True):
+    """Apply canonical ExtraParallel checkpoint layout after model wrapping."""
+    if not getattr(checkpoint, "extra_parallel_canonical_layout", False):
+        return
+    from torch.distributed.tensor import Shard
+
+    specs = getattr(model, "_fqn2spec_info", None)
+    if specs is None:
+        if require_plan:
+            raise RuntimeError("Canonical ExtraParallel checkpointing requires an ExtraParallel model plan")
+        return
+    for spec in specs.values():
+        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
+            spec.checkpoint_layout_v2 = True
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -143,9 +160,58 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
-            self._build_optimizer()
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            canonical = getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False)
+            layout_error = None
+            try:
+                if canonical:
+                    _configure_extra_parallel_checkpoint_layout(self.model, self.train_args.checkpoint)
+            except BaseException as exc:
+                layout_error = exc
+            raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")
+            checkpoint_path = self.train_args.checkpoint.load_path
+            recover_ownership = bool(
+                checkpoint_path
+                and self.model_name in ("base", "policy")
+                and (getattr(self.model, "_fqn2spec_info", None) is not None or self.args.optimizer.type in ("muon",))
+            )
+            self._build_optimizer_checked(checkpoint_path if recover_ownership else None)
         self._build_model_assets()
         self.build_checkpoint()
+
+    def _build_optimizer_checked(self, checkpoint_path: Optional[str] = None) -> None:
+        """Coordinate local build failures before entering checkpoint preflight."""
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if checkpoint_path is not None:
+                from ..checkpoint.rank_local_optimizer import recover_frozen_optimizer_ownership
+
+                with recover_frozen_optimizer_ownership(self.model, checkpoint_path):
+                    self._build_optimizer()
+            else:
+                self._build_optimizer()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "building model optimizer")
+        self._validate_optimizer_checkpoint_mode()
+
+    def _validate_optimizer_checkpoint_mode(self) -> None:
+        """Reject unsupported checkpoint modes on all ranks before training."""
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        checkpoint = getattr(self.train_args, "checkpoint", None)
+        manager = getattr(checkpoint, "manager", "dcp")
+        asynchronous = bool(getattr(checkpoint, "save_async", False))
+        if manager == "dcp" and asynchronous:
+            error = (
+                RuntimeError("MultiOptimizer checkpoints currently require synchronous DCP save")
+                if getattr(self.optimizer, "_is_multi_optimizer", False) is True
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint mode")
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""

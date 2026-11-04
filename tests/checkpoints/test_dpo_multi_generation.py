@@ -1,5 +1,6 @@
 """DPO epoch-boundary sidecars retain the loaded optimizer generation."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -56,8 +57,6 @@ def test_dpo_pending_epoch_refresh_preserves_loaded_generation_and_cursor(tmp_pa
     state = TrainerState(global_step=3, epoch=0)
     first = GlobalStateCallback(trainer)
     first.save_global_state(state, require_optimizer_checkpoint=True)
-    manager._last_saved_step = -1
-    manager._last_saved_optimizer_generation = None
     trainer._dpo_pending_epoch_end = (0, 3)
     trainer._dpo_pending_loader_state = {"buffer": [1, 2]}
     trainer._dpo_epoch_complete = True
@@ -70,6 +69,16 @@ def test_dpo_pending_epoch_refresh_preserves_loaded_generation_and_cursor(tmp_pa
     assert extra["_veomni_optimizer_generations"] == {"model": "source"}
     assert extra["dpo_position"]["epoch_complete"] is True
     assert cursor["train_dataloader"] == {"buffer": [1, 2]}
+
+    # A previously loaded generation alone is not proof that the current
+    # optimizer still owns this transaction. Reject before rewriting a cursor.
+    extra_path = Path(layout.extra_state_path(root, 0))
+    before = extra_path.read_bytes()
+    manager._last_saved_step = -1
+    manager._last_saved_optimizer_generation = None
+    with pytest.raises(RuntimeError, match="same-step MultiOptimizer checkpoint generation"):
+        resumed.on_epoch_end(state)
+    assert extra_path.read_bytes() == before
 
 
 def test_dpo_verified_loaded_receipt_prevents_rewriting_same_epoch_step(tmp_path):
