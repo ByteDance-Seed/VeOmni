@@ -69,10 +69,10 @@ def _update(model, optimizer, value):
     optimizer.zero_grad()
 
 
-def _rope_update(model, optimizer):
-    inputs = torch.arange(64, dtype=torch.float32).reshape(1, 8, 8) / 64
+def _rope_update(model, optimizer, length=8):
+    inputs = torch.arange(length * 8, dtype=torch.float32).reshape(1, length, 8) / (length * 8)
     projected = model.projection(inputs)
-    cos, sin = model.rope(projected, torch.arange(8).reshape(1, -1))
+    cos, sin = model.rope(projected, torch.arange(length).reshape(1, -1))
     loss = (projected * cos + sin).square().mean()
     loss.backward()
     trace = {"cos": cos.detach().clone(), "sin": sin.detach().clone(), "loss": loss.detach().clone()}
@@ -82,6 +82,17 @@ def _rope_update(model, optimizer):
     return trace
 
 
+def _rope_transitions(model, optimizer):
+    result = {}
+    for length in (8, 32, 24, 4):
+        trace = _rope_update(model, optimizer, length)
+        result.update({f"{length}.{key}": value for key, value in trace.items()})
+        result[f"{length}.inv_freq"] = model.rope.inv_freq.detach().clone()
+        result[f"{length}.cached_length"] = torch.tensor(int(model.rope.max_seq_len_cached))
+        result.update({f"{length}.param.{name}": value.detach().clone() for name, value in model.named_parameters()})
+    return result
+
+
 def _fresh_resume(_rank, checkpoint, expected_path):
     model, optimizer = _build()
     DistributedCheckpointer.load(
@@ -89,7 +100,7 @@ def _fresh_resume(_rank, checkpoint, expected_path):
         {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
         parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
-    trace = _rope_update(model, optimizer)
+    trace = _rope_transitions(model, optimizer)
     expected = torch.load(expected_path, map_location="cpu", weights_only=True)
     actual = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}
     for group in ("model", "optimizer", "trace"):
@@ -209,21 +220,90 @@ def test_rank_local_expanded_rope_error_is_coordinated(tmp_path):
     assert not (tmp_path / "checkpoint").exists()
 
 
-def test_real_qwen3_dynamic_rope_reset_is_rejected_before_save(tmp_path):
+def test_real_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_path):
     model, optimizer = _build()
     _update(model, optimizer, 1.0)
     model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
     model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
     assert model.rope.inv_freq is model.rope.original_inv_freq
     assert not any("inv_freq" in key for key in model.state_dict())
+    checkpoint = str(tmp_path / "checkpoint")
+    DistributedCheckpointer.save(
+        checkpoint,
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=SimpleNamespace(dp_mode="ddp"),
+    )
+    trace = _rope_transitions(model, optimizer)
+    expected = tmp_path / "expected.pt"
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
+    mp.spawn(_fresh_resume, args=(checkpoint, str(expected)), nprocs=1, join=True)
+
+
+def _rank_local_rope_reset(rank, checkpoint, directory, phase, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        torch.manual_seed(13)
+        expected = str(directory / f"expected-{rank}.pt")
+        if phase == "load":
+            _fresh_resume(rank, checkpoint, expected)
+            return
+        model, optimizer = _build()
+        _update(model, optimizer, 1.0)
+        if rank == 0:
+            model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+            model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
+        assert (model.rope.inv_freq is model.rope.original_inv_freq) == (rank == 0)
+        DistributedCheckpointer.save(
+            checkpoint,
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=SimpleNamespace(dp_mode="ddp"),
+        )
+        trace = _rope_transitions(model, optimizer)
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_rank_local_qwen3_rope_reset_fresh_resume(tmp_path):
+    checkpoint = str(tmp_path / "checkpoint")
+    spawn_with_rendezvous(_rank_local_rope_reset, args=(checkpoint, tmp_path, "save"), nprocs=2)
+    spawn_with_rendezvous(_rank_local_rope_reset, args=(checkpoint, tmp_path, "load"), nprocs=2)
+
+
+def test_qwen3_reset_alias_still_rejects_wrong_frequency_values(tmp_path):
+    model, optimizer = _build()
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
+    model.rope.inv_freq.add_(1)
     checkpoint = tmp_path / "checkpoint"
-    with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache"):
+    with pytest.raises(RuntimeError, match="Dynamic RoPE cache.*depends on prior sequence lengths"):
         DistributedCheckpointer.save(
             str(checkpoint),
             {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
             parallel_state=SimpleNamespace(dp_mode="ddp"),
         )
     assert not checkpoint.exists()
+
+
+def test_qwen3_reset_alias_with_third_buffer_keeps_identity_check(tmp_path):
+    model, optimizer = _build()
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
+    model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
+    model.rope.register_buffer("other_cache", model.rope.inv_freq, persistent=False)
+    checkpoint = str(tmp_path / "checkpoint")
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
+    )
+    target, restored = _build()
+    target.rope.register_buffer("other_cache", target.rope.inv_freq.clone(), persistent=False)
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            checkpoint,
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
 
 
 def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path):
@@ -235,7 +315,7 @@ def test_unexpanded_dynamic_rope_fresh_process_matches_training_update(tmp_path)
         {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
         parallel_state=SimpleNamespace(dp_mode="ddp"),
     )
-    trace = _rope_update(model, optimizer)
+    trace = _rope_transitions(model, optimizer)
     expected = tmp_path / "expected.pt"
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
     mp.spawn(_fresh_resume, args=(checkpoint, str(expected)), nprocs=1, join=True)
