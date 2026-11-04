@@ -47,14 +47,14 @@ def _resolve_attn_implementation(config: PreTrainedConfig, attn_implementation: 
     """Resolve the active attention implementation from ``config``."""
     if isinstance(attn_implementation, str) and attn_implementation:
         return attn_implementation
+    impl = getattr(config, "_attn_implementation", None)
+    if isinstance(impl, str) and impl:
+        return impl
     ops_config = getattr(config, "ops_config", None)
     if ops_config is not None:
         impl = getattr(ops_config, "attn_implementation", None)
         if isinstance(impl, str) and impl:
             return impl
-    impl = getattr(config, "_attn_implementation", None)
-    if isinstance(impl, str) and impl:
-        return impl
     return "eager"
 
 
@@ -232,11 +232,12 @@ def create_causal_mask(
     cu_seqlens, cu_seqlens_k = _extract_cu_seqlens(kwargs)
     if _should_use_packed_mask(cu_seqlens, attn_impl):
         assert cu_seqlens is not None
-        if past_key_values is not None:
-            raise ValueError("Packed causal attention mask does not support past_key_values.")
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if past_seen > 0:
+            raise ValueError("Packed causal attention mask does not support cached sequences.")
         existing_4d = attention_mask if isinstance(attention_mask, Tensor) and attention_mask.ndim >= 3 else None
         q_len = inputs_embeds.shape[1]
-        kv_len = q_len
+        kv_len = q_len + past_seen
         if existing_4d is not None:
             from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
 
@@ -324,14 +325,15 @@ def create_sliding_window_causal_mask(
     cu_seqlens, cu_seqlens_k = _extract_cu_seqlens(kwargs)
     if _should_use_packed_mask(cu_seqlens, attn_impl):
         assert cu_seqlens is not None
-        if past_key_values is not None:
-            raise ValueError("Packed sliding-window attention mask does not support past_key_values.")
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if past_seen > 0:
+            raise ValueError("Packed sliding-window attention mask does not support cached sequences.")
         sliding_window = getattr(config, "sliding_window", None)
         if sliding_window is None:
             raise ValueError("Could not find a `sliding_window` argument in the config, or it is not set")
         existing_4d = attention_mask if isinstance(attention_mask, Tensor) and attention_mask.ndim >= 3 else None
         q_len = inputs_embeds.shape[1]
-        kv_len = q_len
+        kv_len = q_len + past_seen
         if existing_4d is not None:
             from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
 

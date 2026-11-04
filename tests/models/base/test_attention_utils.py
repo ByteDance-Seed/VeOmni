@@ -12,63 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for packed SDPA/eager attention helpers."""
+"""CPU tests for ``veomni.models.utils.mask_utils``."""
 
 from __future__ import annotations
 
 import pytest
 import torch
+from transformers import PreTrainedConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-
-@pytest.mark.parametrize("impl", ["eager", "sdpa"])
-def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):
-    from veomni.models.utils.attention_utils import drop_packed_attention_metadata
-
-    kwargs = {
-        "cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32),
-        "max_length_q": 32,
-        "keep": 1,
-    }
-    filtered = drop_packed_attention_metadata(kwargs, impl=impl)
-    assert "cu_seq_lens_q" not in filtered
-    assert "max_length_q" not in filtered
-    assert filtered["keep"] == 1
-    assert "cu_seq_lens_q" in kwargs
-
-
-def test_dense_attention_helpers_treat_veomni_sdpa_as_sdpa():
-    from veomni.models.utils.attention_utils import drop_packed_attention_metadata
-
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32), "keep": 1}
-    stock = drop_packed_attention_metadata(kwargs, impl="sdpa")
-    aliased = drop_packed_attention_metadata(kwargs, impl="veomni_sdpa")
-    assert stock.keys() == aliased.keys() == {"keep"}
-
-
-def test_prepare_dense_attention_inputs_builds_packed_mask_for_multi_segment():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
-    hidden = torch.randn(1, 8, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32), "keep": 1}
-    attention_mask = torch.ones(1, 8, dtype=torch.long)
-    filtered, packed_mask = prepare_dense_attention_inputs(
-        kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden
-    )
-    assert "cu_seq_lens_q" not in filtered
-    assert filtered["keep"] == 1
-    assert packed_mask is not None
-    assert packed_mask.shape[-2:] == (8, 8)
-    # Token 4 (start of sample 1) must not see token 0 (sample 0).
-    q4_k0 = packed_mask[0, 0, 4, 0] if packed_mask.dtype == torch.bool else packed_mask[0, 0, 4, 0]
-    if packed_mask.dtype == torch.bool:
-        assert not bool(q4_k0)
-    else:
-        assert q4_k0 < 0
 
 
 def _mask_kept(mask: torch.Tensor, query: int, key: int) -> bool:
@@ -78,47 +34,76 @@ def _mask_kept(mask: torch.Tensor, query: int, key: int) -> bool:
     return float(value) >= 0
 
 
-def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_mask():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+def test_create_causal_mask_builds_packed_mask_for_multi_segment():
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
     hidden = torch.randn(1, 8, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 8], dtype=torch.int32)}
     attention_mask = torch.ones(1, 8, dtype=torch.long)
-    filtered, mask = prepare_dense_attention_inputs(
-        kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden
+    packed_mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
     )
-    assert "cu_seq_lens_q" not in filtered
-    assert mask is attention_mask
+    assert isinstance(packed_mask, torch.Tensor)
+    assert packed_mask.shape[-2:] == (8, 8)
+    # Token 4 (start of sample 1) must not see token 0 (sample 0).
+    assert not _mask_kept(packed_mask, 4, 0)
+    assert _mask_kept(packed_mask, 5, 4)
 
 
-def test_prepare_dense_attention_inputs_keeps_2d_padding_inside_packed_sample():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+def test_create_causal_mask_delegates_single_segment_to_hf():
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
     hidden = torch.randn(1, 8, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 8], dtype=torch.int32),
+    )
+    assert mask is None
+
+
+def test_create_causal_mask_keeps_2d_padding_inside_packed_sample():
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
+    hidden = torch.randn(1, 8, 4)
     attention_mask = torch.ones(1, 8, dtype=torch.long)
     attention_mask[0, 1] = 0
-    _, packed_mask = prepare_dense_attention_inputs(
-        kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden
+    packed_mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
     )
-    assert packed_mask is not None
+    assert isinstance(packed_mask, torch.Tensor)
     assert not _mask_kept(packed_mask, 2, 1)
     assert not _mask_kept(packed_mask, 4, 0)
     assert _mask_kept(packed_mask, 2, 0)
 
 
 @pytest.mark.parametrize("impl", ["sdpa", "eager"])
-def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(impl):
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+def test_create_causal_mask_merges_4d_padding_with_packed_isolation(impl):
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
     hidden = torch.randn(1, 8, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
     query = torch.arange(8)[:, None]
     key = torch.arange(8)[None, :]
     existing = (key <= query).view(1, 1, 8, 8).clone()
     existing[..., :, 1] = False
-    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl=impl, attention_mask=existing, hidden_states=hidden)
-    assert packed_mask is not None
+    packed_mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=existing,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    assert isinstance(packed_mask, torch.Tensor)
     if impl == "eager":
         assert packed_mask.dtype.is_floating_point
         assert torch.isneginf(packed_mask[0, 0, 4, 0])
@@ -131,19 +116,24 @@ def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(
 
 
 @pytest.mark.parametrize("impl", ["sdpa", "eager"])
-def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+def test_create_causal_mask_keeps_positive_additive_bias(impl):
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
     hidden = torch.randn(1, 4, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
     query = torch.arange(4, dtype=torch.long)[:, None]
     key = torch.arange(4, dtype=torch.long)[None, :]
     allowed = key <= query
     existing = torch.where(allowed, torch.zeros((), dtype=torch.float32), torch.finfo(torch.float32).min)
     existing = existing.view(1, 1, 4, 4).clone()
     existing[0, 0, 1, 0] = 2.0
-    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl=impl, attention_mask=existing, hidden_states=hidden)
-    assert packed_mask is not None
+    packed_mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=existing,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    assert isinstance(packed_mask, torch.Tensor)
     assert packed_mask.dtype.is_floating_point
     torch.testing.assert_close(packed_mask[0, 0, 1, 0], existing.new_tensor(2.0))
     assert not _mask_kept(packed_mask, 2, 0)
@@ -157,8 +147,8 @@ def _eager_attn(query: torch.Tensor, values: torch.Tensor, mask: torch.Tensor) -
 
 @pytest.mark.parametrize("mask_kind", ["bool", "additive"])
 def test_packed_eager_fully_masked_row_isolates_other_sample(mask_kind):
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+    config = PreTrainedConfig()
+    config._attn_implementation = "eager"
     sample_start = 2
     query = torch.zeros(1, 1, 4, 1)
     values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
@@ -169,12 +159,14 @@ def test_packed_eager_fully_masked_row_isolates_other_sample(mask_kind):
     else:
         existing = torch.zeros(1, 1, 4, 4).masked_fill(~allowed, torch.finfo(torch.float32).min)
         existing[:, :, sample_start, sample_start : sample_start + 2] = torch.finfo(torch.float32).min
-    _, mask = prepare_dense_attention_inputs(
-        {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)},
-        impl="eager",
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=torch.zeros(1, 4, 1),
         attention_mask=existing,
-        hidden_states=torch.zeros(1, 4, 1),
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
     )
+    assert isinstance(mask, torch.Tensor)
     other_start = 0
     assert torch.isneginf(mask[0, 0, sample_start, other_start : other_start + 2]).all()
     actual = _eager_attn(query, values, mask)
@@ -191,22 +183,28 @@ def test_packed_eager_fully_masked_row_isolates_other_sample(mask_kind):
 
 
 def test_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+    config = PreTrainedConfig()
+    config._attn_implementation = "eager"
     hidden = torch.zeros(1, 4, 1)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
     attention_mask = torch.ones(1, 4, dtype=torch.long)
     attention_mask[0, :2] = 0
-    _, mask = prepare_dense_attention_inputs(kwargs, impl="eager", attention_mask=attention_mask, hidden_states=hidden)
-    assert mask is not None
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=hidden,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    assert isinstance(mask, torch.Tensor)
     assert torch.isneginf(mask[0, 0, 0, 2:4]).all()
+    assert torch.isneginf(mask[0, 0, 2, 0:2]).all()
     assert not _mask_kept(mask, 0, 0)
     assert _mask_kept(mask, 3, 2)
 
 
 def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
     sample_start = 2
     query = torch.zeros(1, 1, 4, 1)
     values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
@@ -215,12 +213,14 @@ def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads():
     # Mask this query's own sample; earlier samples remain visible in the
     # incoming triangle and must be blocked by packed isolation itself.
     existing[:, :, sample_start, sample_start : sample_start + 2] = float("-inf")
-    _, mask = prepare_dense_attention_inputs(
-        {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)},
-        impl="sdpa",
+    mask = create_causal_mask(
+        config=config,
+        inputs_embeds=torch.zeros(1, 4, 1),
         attention_mask=existing,
-        hidden_states=torch.zeros(1, 4, 1),
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
     )
+    assert isinstance(mask, torch.Tensor)
     actual = torch.nn.functional.scaled_dot_product_attention(query, query, values, attn_mask=mask)
     expected = torch.cat(
         [
@@ -245,72 +245,74 @@ def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads():
     torch.testing.assert_close(other_grad, torch.zeros_like(other_grad))
 
 
-def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-
+def test_create_causal_mask_rejects_cached_packed_sequences():
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
     hidden = torch.randn(1, 8, 4)
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
     attention_mask = torch.ones(1, 1, 8, 16)
     with pytest.raises(ValueError, match="does not support cached sequences"):
-        prepare_dense_attention_inputs(kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden)
+        create_causal_mask(
+            config=config,
+            inputs_embeds=hidden,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        )
 
 
-def test_drop_packed_attention_metadata_keeps_keys_for_flash():
-    from veomni.models.utils.attention_utils import drop_packed_attention_metadata
-
-    kwargs = {"cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32)}
-    assert drop_packed_attention_metadata(kwargs, impl="flash_attention_2") is kwargs
-
-
-def test_prepare_dense_attention_inputs_with_ulysses_uses_post_ulysses_lengths_without_double_expansion(monkeypatch):
-    """Under Ulysses SP, rank-local hidden_states (4 tokens) with a global 8x8 mask or 2D mask
+def test_create_causal_mask_with_ulysses_uses_post_ulysses_lengths_without_double_expansion(monkeypatch):
+    """Under Ulysses SP, rank-local inputs_embeds (4 tokens) with a global 8x8 mask or 2D mask
     must resolve to the post-Ulysses 8x8 mask without raising or double-expanding to 16x16."""
     from types import SimpleNamespace
 
-    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
     from veomni.ops.kernels.attention import ulysses as ulysses_mod
 
     monkeypatch.setattr(ulysses_mod, "get_parallel_state", lambda: SimpleNamespace(ulysses_size=2))
+    config = PreTrainedConfig()
+    config._attn_implementation = "veomni_sdpa"
     local_hidden = torch.randn(1, 4, 8)
     cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
 
-    # Case 1: existing 4D global mask (1, 1, 8, 8) built from create_causal_mask / packed_causal_mask
+    # Case 1: existing 4D global mask (1, 1, 8, 8)
     query = torch.arange(8)[:, None]
     key = torch.arange(8)[None, :]
     existing_4d = (key <= query).view(1, 1, 8, 8).clone()
     existing_4d[..., :, 7] = False  # last token padded
-    filtered_4d, mask_4d = prepare_dense_attention_inputs(
-        {"cu_seq_lens_q": cu_seqlens},
-        impl="veomni_sdpa",
+    mask_4d = create_causal_mask(
+        config=config,
+        inputs_embeds=local_hidden,
         attention_mask=existing_4d,
-        hidden_states=local_hidden,
+        past_key_values=None,
+        cu_seq_lens_q=cu_seqlens,
     )
-    assert "cu_seq_lens_q" not in filtered_4d
-    assert mask_4d is not None and mask_4d.shape == (1, 1, 8, 8)
+    assert isinstance(mask_4d, torch.Tensor) and mask_4d.shape == (1, 1, 8, 8)
     assert not _mask_kept(mask_4d, 3, 0)  # sample 1 isolated from sample 0
     assert _mask_kept(mask_4d, 4, 3)  # within sample 1 allowed
     assert not _mask_kept(mask_4d, 7, 7)  # padding preserved
 
     # Case 2: 2D full-sequence padding mask (1, 8)
     padding_2d = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long)
-    _, mask_2d = prepare_dense_attention_inputs(
-        {"cu_seq_lens_q": cu_seqlens},
-        impl="veomni_sdpa",
+    mask_2d = create_causal_mask(
+        config=config,
+        inputs_embeds=local_hidden,
         attention_mask=padding_2d,
-        hidden_states=local_hidden,
+        past_key_values=None,
+        cu_seq_lens_q=cu_seqlens,
     )
-    assert mask_2d is not None and mask_2d.shape == (1, 1, 8, 8)
+    assert isinstance(mask_2d, torch.Tensor) and mask_2d.shape == (1, 1, 8, 8)
     torch.testing.assert_close(mask_2d, mask_4d)
 
     # Case 3: skip_ulysses=True keeps local 4x4 dimensions
     local_cu = torch.tensor([0, 2, 4], dtype=torch.int32)
-    _, mask_skip = prepare_dense_attention_inputs(
-        {"cu_seq_lens_q": local_cu, "skip_ulysses": True},
-        impl="veomni_sdpa",
+    mask_skip = create_causal_mask(
+        config=config,
+        inputs_embeds=local_hidden,
         attention_mask=None,
-        hidden_states=local_hidden,
+        past_key_values=None,
+        cu_seq_lens_q=local_cu,
+        skip_ulysses=True,
     )
-    assert mask_skip is not None and mask_skip.shape == (1, 1, 4, 4)
+    assert isinstance(mask_skip, torch.Tensor) and mask_skip.shape == (1, 1, 4, 4)
     assert not _mask_kept(mask_skip, 2, 0)
 
 
@@ -319,9 +321,7 @@ def test_mask_utils_create_causal_mask_isolates_packed_samples_with_2d_all_ones_
     """mask_utils.create_causal_mask routes packed cu_seq_lens_q through veomni.ops.mask even when
     attention_mask is a 2D all-ones tensor."""
     from torch.nn.attention.flex_attention import BlockMask
-    from transformers import PreTrainedConfig
 
-    from veomni.models.utils.mask_utils import create_causal_mask
     from veomni.ops.mask import MagiAttentionMask
 
     config = PreTrainedConfig()
@@ -360,9 +360,6 @@ def test_mask_utils_create_causal_mask_isolates_packed_samples_with_2d_all_ones_
 
 def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
     from torch.nn.attention.flex_attention import BlockMask
-    from transformers import PreTrainedConfig
-
-    from veomni.models.utils.mask_utils import create_sliding_window_causal_mask
 
     config = PreTrainedConfig()
     config._attn_implementation = "veomni_flex_attention"
@@ -385,27 +382,3 @@ def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
     assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
     assert not mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
     assert mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
-
-
-def test_mask_utils_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
-    from transformers import PreTrainedConfig
-
-    from veomni.models.utils.mask_utils import create_causal_mask
-
-    config = PreTrainedConfig()
-    config._attn_implementation = "eager"
-    hidden = torch.zeros(1, 4, 1)
-    attention_mask = torch.ones(1, 4, dtype=torch.long)
-    attention_mask[0, :2] = 0
-    mask = create_causal_mask(
-        config=config,
-        inputs_embeds=hidden,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
-    )
-    assert isinstance(mask, torch.Tensor)
-    assert torch.isneginf(mask[0, 0, 0, 2:4]).all()
-    assert torch.isneginf(mask[0, 0, 2, 0:2]).all()
-    assert not _mask_kept(mask, 0, 0)
-    assert _mask_kept(mask, 3, 2)

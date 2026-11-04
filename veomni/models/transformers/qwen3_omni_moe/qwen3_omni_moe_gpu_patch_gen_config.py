@@ -44,7 +44,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
@@ -77,7 +76,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -97,7 +96,7 @@ config = PatchConfig(
     description="Qwen3-Omni-MoE thinker with VeOmni v5 compatibility (SP + FSDP + fused MoE + fused loss)",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 
@@ -124,8 +123,8 @@ config.add_import(
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
@@ -1117,11 +1116,14 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
     # ("Deprecated and unused" — see masking_utils.py:917).
     attention_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
+        **{
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
     )
 
     hidden_states = inputs_embeds
@@ -2017,13 +2019,6 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -2033,7 +2028,7 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
