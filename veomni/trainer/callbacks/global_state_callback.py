@@ -281,14 +281,7 @@ class GlobalStateCallback(Callback):
             if getattr(checkpoint, "_last_saved_step", None) == state.global_step
             and isinstance(getattr(checkpoint, "_last_saved_optimizer_generation", None), str)
         }
-        changed = current != self._last_saved_optimizer_generations
-        if dist.is_initialized():
-            group = dist.group.WORLD
-            device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
-            flag = torch.tensor([int(changed)], dtype=torch.int32, device=device)
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-            changed = bool(flag.item())
-        return changed
+        return current != self._last_saved_optimizer_generations
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
         pending = getattr(self, "_unadvanced_boundary_state", None)
