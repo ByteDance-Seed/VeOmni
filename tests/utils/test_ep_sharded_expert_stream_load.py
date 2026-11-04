@@ -34,6 +34,7 @@ from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
 import veomni.models.checkpoint.weights as checkpoint_weights
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
@@ -42,6 +43,9 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwe
 from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
     Qwen3OmniMoeCheckpointTensorConverter,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 NUM_EXPERTS, HIDDEN, INTERMEDIATE, EP_SIZE = 4, 3, 2, 2

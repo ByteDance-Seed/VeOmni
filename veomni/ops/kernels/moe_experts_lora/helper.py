@@ -47,6 +47,7 @@ def npu_non_ep_forward(
 
     from ..moe_experts.standard.npu import npu_group_gemm
 
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     selected_experts = selected_experts.to(torch.int32)
     permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts)
@@ -83,6 +84,7 @@ def npu_ep_forward(
         npu_group_gemm,
     )
 
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     selected_experts = selected_experts.to(torch.int32)
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (

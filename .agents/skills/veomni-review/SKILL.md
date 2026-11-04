@@ -65,6 +65,31 @@ branch you took, so the reader knows a review happened or why it didn't.
 5. Run `make quality` before pushing. (It gates every commit anyway, but this
    is the last chance before the diff is public.)
 
+## Anti-Pattern: "AI Self-Inflicted Corner-Case & Defensive Bloat"
+
+A recurring failure mode in AI-authored PRs is the **"self-inflicted defense
+loop"**: during self-review, an agent invents hypothetical edge cases ("What if
+an `asyncio` task or background thread calls this hook across steps?", "What if
+a user's dataset has a key matching our internal private key?", "What if
+`metadata_collate_func` secretly flips `input_ids`?", "What if a sample has 0
+tokens?", "What if rank 0 has a `torch._neg_view` bit flag and rank 1 does
+not?") and then adds a unit test plus hundreds of lines of locks, SHA-256
+hashing, preflight collectives, and tensor-cloning guards for each imagined
+scenario — ballooning a 40-line change into 3,000+ lines.
+
+Both the outer agent and the review subagent must enforce two rules:
+
+1. **Do NOT invent hypothetical corner cases that violate VeOmni's runtime contract**:
+   - Training is **synchronous and single-threaded per rank** (`forward -> backward -> step`). Do not ask for thread locks, `asyncio` task ownership checks, or epoch tokens on trainer/model/callback state.
+   - Ranks in the same SP/DP/EP group run the **same config, same model code, and (within an SP group) slice the same deterministic micro-batch**. Do not ask for cross-rank SHA-256/pickle preflight collectives to verify that ranks agree on config flags or batch metadata.
+   - Internal hooks (`metadata_collate_func`, model/callback hooks) and collators are **trusted in-process code**, not adversarial inputs. Do not clone tensors before/after hooks to check for mutation or guard against user keys colliding with private `_veomni_*` keys.
+   - Dataset preprocessing already filters empty samples and builds monotonic `position_ids` (`0..L-1`) per sample. Do not demand provenance state machines or dynamic-programming solvers for 0-token samples or mid-sample `position_ids == 0` resets.
+   - Activations and gradients in LLM/VLM/DiT training are real floating-point tensors. Do not demand handling for `complex64`, conjugate views, rank-asymmetric C++ `_neg_view` flags, deliberate FP16 pre-sum overflow to `NaN`, or manual `untyped_storage().resize_()` aliasing.
+   - Do not demand defenses for hostile OS/Python environments (custom `sys.meta_path` finders, broken consecutive namespace packages, source files mutated mid-CI run, all-zeros `/proc/sys/kernel/random/boot_id` UUIDs) or wrong Python types (`bool` passed as `int`, generators passed as lists) on internal helpers already behind typed config dataclasses.
+2. **Flag speculative defensive bloat and synthetic tests as `needs-attention` (for deletion)**:
+   - When a diff contains defensive scaffolding, state machines, extra collectives, or synthetic unit tests for any of the hypothetical scenarios above (or meta-tests that parse AST/source text or test another test's `pytest.skip`), flag them as `needs-attention` and require their **removal**.
+   - Never promote a test-invented corner case into `.agents/knowledge/constraints.md` or `.agents/knowledge/testing.md`.
+
 ## Subagent Launch
 
 Launch a subagent with this prompt. Use whatever the running agent calls it —
@@ -85,10 +110,20 @@ You are a code reviewer for VeOmni, a distributed multi-modality training framew
 For each changed file, check:
 
 ### Implementation Quality
-- Hidden risks or edge cases not handled?
-- Simpler alternative that achieves the same result?
+- Hidden risks or edge cases in *real* training workflows not handled? (Do NOT invent hypothetical corner cases outside VeOmni's runtime invariants — see "Anti-Bloat & Proportionality" below.)
+- Simpler alternative that achieves the same result with substantially less code?
 - Boundary conditions (tensor shapes, distributed rank handling, gradient accumulation steps)?
 - Does the fix depend on downstream code to "clean up"?
+
+### Anti-Bloat & Proportionality (CRITICAL)
+- Does the diff add speculative defensive machinery or synthetic unit tests for scenarios that cannot happen in VeOmni's synchronous distributed training runtime? Flag any of the following as `needs-attention` and recommend **deleting** them:
+  - Thread locks, `asyncio` task/thread-ID ownership checks, or epoch tokens on synchronous trainer/callback/op state.
+  - Cross-rank SHA-256 digests, `pickle` serialization, or extra preflight `all_gather` / `all_reduce` collectives defending against SP/DP ranks having mismatched configs or corrupted batch metadata.
+  - Tensor-cloning guards checking whether internal hooks (`metadata_collate_func`, etc.) mutated inputs, or custom subclasses defending against user dataset keys colliding with private internal keys.
+  - Elaborate solvers or provenance tracking for 0-token samples, mid-sample `position_ids` resets, or multi-row packed batches (PackingCollator always packs into 1 row).
+  - Handling or testing `complex64`, `.conj()`, rank-asymmetric `torch._neg_view`, deliberate FP16 overflow to `NaN`, custom `sys.meta_path` finders, or `isinstance(x, bool)` on internal `int` helpers.
+  - Meta-tests that unit-test a test helper's own AST visitor, use `inspect.getsource` to match substrings in trainer methods, or test another test function's `pytest.skip`.
+- Is the diff size proportional to the problem solved? If a 40-line fix is accompanied by 500+ lines of defensive scaffolding and synthetic tests, require stripping it down to the essential change.
 
 ### Multi-file Consistency
 - If a Trainer method changed, do all subclasses need matching changes?

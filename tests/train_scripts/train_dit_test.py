@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 import torch
 
+from tests.tools.training_utils import dp_mean
 from veomni.arguments import parse_args
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.callbacks import Callback, TrainerState
@@ -31,9 +32,9 @@ class LogDictSaveCallback(Callback):
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        self.log_dict["loss"].append(loss)
+        self.log_dict["loss"].append(dp_mean(loss, self.trainer))
         for key, value in loss_dict.items():
-            self.log_dict[key].append(value)
+            self.log_dict[key].append(dp_mean(value, self.trainer))
         self.log_dict["grad_norm"].append(float(grad_norm))
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
@@ -52,6 +53,26 @@ class TestDiTModelRuntime(DiTModelRuntime):
 
     def _freeze_model_module(self) -> None:
         pass
+
+    def reset_for_dataset_branch(self) -> None:
+        """Reload initial weights and optimizer under this model's parallel state."""
+        from torch.distributed.tensor import distribute_tensor
+
+        from veomni.models.checkpoint.weights import load_model_weights
+        from veomni.utils import helper
+        from veomni.utils.device import get_device_type
+
+        helper.set_seed(self.train_args.seed, self.train_args.enable_full_determinism)
+        dtensor_to_cpu = self.args.accelerator.fsdp_config.offload
+        with use_parallel_state(self.parallel_state):
+            load_model_weights(
+                self.model,
+                self.args.model_path,
+                init_device="cpu" if dtensor_to_cpu else get_device_type(),
+                dtensor_factory=distribute_tensor,
+                dtensor_to_cpu=dtensor_to_cpu,
+            )
+            self._build_optimizer()
 
 
 class TestDiTTrainer(DiTTrainer):
@@ -72,6 +93,23 @@ class TestDiTTrainer(DiTTrainer):
 
     def _build_data_transform(self) -> None:
         self.base.data_transform = process_dummy_example
+
+    def _run_extra_train_path(self, extra_train_path: str) -> None:
+        """Reuse the initialized process group and model to run a second dataset branch."""
+        args = self.base.args
+        args.data.train_path = extra_train_path
+        args.train.checkpoint.output_dir = f"{args.train.checkpoint.output_dir}_padding"
+        self.base._log_callback.log_dict.clear()
+        self.base.state = TrainerState()
+        self.base.start_epoch = 0
+        self.base.start_step = 0
+
+        self.base.model.reset_for_dataset_branch()
+        with use_parallel_state(self.base.model.parallel_state):
+            self._build_dataset()
+            self._build_dataloader()
+        self.base._build_lr_scheduler()
+        self.train()
 
     # ------------------------------------------------------------------
     # Skip condition model processing – batch is already model-ready.
@@ -104,6 +142,24 @@ class TestDiTTrainer(DiTTrainer):
 
 
 if __name__ == "__main__":
+    import argparse
+    import sys
+
+    _extra_parser = argparse.ArgumentParser()
+    _extra_parser.add_argument("--extra_train_path", default=None)
+    _extra_args, _remaining = _extra_parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + _remaining
+
     args: VeOmniDiTArguments = parse_args(VeOmniDiTArguments)
     trainer = TestDiTTrainer(args)
-    trainer.train()
+    if _extra_args.extra_train_path is not None:
+        orig_destroy = trainer.base.destroy_distributed
+        trainer.base.destroy_distributed = lambda: None
+        try:
+            trainer.train()
+            trainer._run_extra_train_path(_extra_args.extra_train_path)
+        finally:
+            trainer.base.destroy_distributed = orig_destroy
+            trainer.base.destroy_distributed()
+    else:
+        trainer.train()

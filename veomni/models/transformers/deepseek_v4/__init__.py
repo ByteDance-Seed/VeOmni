@@ -14,8 +14,6 @@
 
 """DeepSeek-V4 modeling that calls local VeomniOp handles."""
 
-from functools import partial
-
 from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -30,7 +28,6 @@ def register_deepseek_v4_config():
 @MODELING_REGISTRY.register("deepseek_v4")
 def register_deepseek_v4_modeling(architecture: str):
     from .checkpoint_tensor_converter import (
-        convert_deepseek_v4_fqn_to_index_mapping,
         create_deepseek_v4_checkpoint_tensor_converter,
     )
 
@@ -45,14 +42,7 @@ def register_deepseek_v4_modeling(architecture: str):
     DeepseekV4ForCausalLM._create_checkpoint_tensor_converter = staticmethod(
         create_deepseek_v4_checkpoint_tensor_converter
     )
-    DeepseekV4ForCausalLM._convert_fqn_to_index_mapping = staticmethod(
-        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="model.")
-    )
-
     DeepseekV4Model._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v4_checkpoint_tensor_converter)
-    DeepseekV4Model._convert_fqn_to_index_mapping = staticmethod(
-        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="")
-    )
 
     if "ForCausalLM" in architecture:
         return DeepseekV4ForCausalLM

@@ -263,3 +263,105 @@ def test_collator_aligns_missing_keys_with_none():
     assert dict(single) == {"a": [1], "b": [2]}
     mixed = DiTDataCollator()([{"a": 1, "x": "fl2va"}, {"a": 2, "y": "ref2va"}, {"a": 3}])
     assert dict(mixed) == {"a": [1, 2, 3], "x": ["fl2va", None, None], "y": [None, "ref2va", None]}
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_fused_dit_branch_reloads_weights_and_optimizer_under_its_model_state(monkeypatch, offload):
+    from contextlib import contextmanager
+
+    import veomni.models.checkpoint.weights as weights_module
+    from tests.train_scripts import train_dit_test
+
+    runtime = train_dit_test.TestDiTModelRuntime.__new__(train_dit_test.TestDiTModelRuntime)
+    runtime.args = SimpleNamespace(
+        accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(offload=offload)), model_path="initial"
+    )
+    runtime.train_args = SimpleNamespace(seed=42, enable_full_determinism=False)
+    runtime.model_name = "second-model"
+    runtime.model = nn.Linear(2, 2)
+    state = object()
+    active_state = []
+    monkeypatch.setattr(
+        runtime_module, "get_parallel_state_by_name", lambda name: state if name == runtime.model_name else None
+    )
+
+    @contextmanager
+    def model_scope(current):
+        assert current is state
+        active_state.append(current)
+        try:
+            yield
+        finally:
+            active_state.pop()
+
+    loaded = []
+
+    def load(model, path, **kwargs):
+        assert active_state == [state]
+        assert model is runtime.model and path == "initial"
+        loaded.append(kwargs)
+
+    def optimizer():
+        assert active_state == [state]
+        assert len(loaded) == 1
+
+    monkeypatch.setattr(train_dit_test, "use_parallel_state", model_scope)
+    monkeypatch.setattr(weights_module, "load_model_weights", load)
+    monkeypatch.setattr(runtime, "_build_optimizer", optimizer)
+    monkeypatch.setattr("veomni.utils.helper.set_seed", lambda *args: None)
+    model_device = "test_accelerator"
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: model_device)
+    runtime.reset_for_dataset_branch()
+    assert not active_state
+    assert loaded[0]["init_device"] == ("cpu" if offload else model_device)
+    assert loaded[0]["dtensor_to_cpu"] is offload
+
+
+def test_fused_dit_branch_resizes_schedule_and_runs_full_training_lifecycle(monkeypatch):
+    from tests.train_scripts import train_dit_test
+    from veomni.trainer.callbacks import TrainerState
+
+    trainer = train_dit_test.TestDiTTrainer.__new__(train_dit_test.TestDiTTrainer)
+    train_args = SimpleNamespace(
+        checkpoint=SimpleNamespace(output_dir="first"),
+        num_train_epochs=1,
+        local_rank=0,
+    )
+    data_args = SimpleNamespace(train_path="first", dataloader=SimpleNamespace(use_background_prefetcher=False))
+    args = SimpleNamespace(train=train_args, data=data_args, train_steps=1)
+    model = SimpleNamespace(parallel_state=object(), reset_for_dataset_branch=Mock())
+    events = []
+    trainer.base = SimpleNamespace(
+        args=args,
+        model=model,
+        state=TrainerState(global_step=9),
+        start_epoch=1,
+        start_step=1,
+        _log_callback=SimpleNamespace(log_dict={"loss": [1.0]}),
+        train_dataloader=None,
+        destroy_distributed=lambda: events.append("destroy"),
+    )
+    trainer.training_task = "offline_training"
+    monkeypatch.setattr(train_dit_test, "use_parallel_state", lambda state: nullcontext())
+
+    def dataset():
+        assert args.data.train_path == "second"
+        args.train_steps = 3
+
+    schedule = []
+    trainer._build_dataset = dataset
+    trainer._build_dataloader = lambda: None
+    trainer.base._build_lr_scheduler = lambda: schedule.append(args.train_steps)
+    trainer.on_train_begin = lambda: events.append("begin")
+    trainer.on_epoch_begin = lambda: None
+    trainer.train_step = lambda batch: events.append("step")
+    trainer.on_epoch_end = lambda: None
+    trainer.on_train_end = lambda: events.append("end")
+    monkeypatch.setattr(dit_module, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(dit_module.helper, "print_device_mem_info", lambda *args: None)
+    trainer._run_extra_train_path("second")
+    assert schedule == [3]
+    assert events == ["begin", "step", "step", "step", "end", "sync", "destroy"]
+    assert trainer.base.state.global_step == 0
+    assert trainer.base._log_callback.log_dict == {}
+    assert args.train.checkpoint.output_dir == "first_padding"

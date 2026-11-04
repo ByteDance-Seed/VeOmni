@@ -33,6 +33,11 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TRANSFORMERS_ROOT = REPO_ROOT / "veomni" / "models" / "transformers"
