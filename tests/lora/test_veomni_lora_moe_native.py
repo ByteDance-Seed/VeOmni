@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU single-process tests for native MoE-LoRA via ``VeOmniLoraModel`` (Phase 2).
+"""CPU tests for native MoE-LoRA via ``VeOmniLoraModel`` (Phase 2).
 
 Exercises the injection + save/load contract *without* running the experts
 forward (which needs the fused kernel / distributed state), so the suite is
@@ -27,22 +27,36 @@ CPU-only and dependency-light:
   native weight load round-trips the adapter tensors bit-exact.
 * MoE mode is inferred from tensor shapes when the config lacks a
   ``veomni_lora`` block (stock-PEFT-style adapter).
+* A two-rank Gloo probe checks shared-LoRA FSDP2/EP gradient accumulation,
+  activation recomputation, and parameter updates without the fused GPU kernel.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
-from veomni.lora.moe_layers import is_lora_independent_experts, is_lora_moe_experts, is_lora_shared_experts
+from veomni.lora.moe_layers import (
+    LoraSharedExperts,
+    is_lora_independent_experts,
+    is_lora_moe_experts,
+    is_lora_shared_experts,
+)
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import init_lora_parameter, load_lora_weights
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 torch.manual_seed(0)
@@ -113,6 +127,110 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
         for name, p in model.named_parameters():
             if ".lora_B." in name:
                 p.normal_(0.0, 0.02)
+
+
+_SHARED_LORA_PROBE_MODULES = tuple(
+    f"{projection}.lora_{factor}.default"
+    for projection in ("gate_proj", "up_proj", "down_proj")
+    for factor in ("A", "B")
+)
+
+
+class _SharedLoraAccumulationProbe(LoraSharedExperts):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        self._forward_calls = getattr(self, "_forward_calls", 0) + 1
+        self._ensure_ep_grad_sync_hooks()
+        # Use each A/B independently: zero-initialized B must not mask A's
+        # gradient, and every parameter gets a distinct, linear oracle.
+        outputs = []
+        for coefficient, name in enumerate(_SHARED_LORA_PROBE_MODULES, start=1):
+            linear = self.get_submodule(name)
+            outputs.append(coefficient * linear(x[:, : linear.in_features]))
+        return tuple(outputs)
+
+
+def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_reshard: bool, endpoint) -> None:
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard
+    from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+
+    previous_device_type = DefaultDeviceType.get_device_type()
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=_CI_CPU_2.nproc)
+    try:
+        # Spawned workers do not inherit the pytest parent's CPU device policy.
+        DefaultDeviceType.set_device_type("cpu")
+        mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "ep_fsdp"))
+        experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8)
+        fully_shard(experts, mesh=mesh["ep_fsdp"], shard_placement_fn=lambda param: Shard(1))
+        experts.set_gradient_divide_factor(2)
+        weights = {name: experts.get_submodule(name).weight for name in _SHARED_LORA_PROBE_MODULES}
+        assert {f"{name}.weight" for name in weights} == {
+            name for name, param in experts.named_parameters() if param.requires_grad
+        }
+        initial = {name: weight.to_local().detach().clone() for name, weight in weights.items()}
+        optimizer = torch.optim.SGD(weights.values(), lr=0.1, foreach=False)
+        state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
+        forward_checks = []
+        with mock.patch("veomni.lora.moe_layers.get_parallel_state", return_value=state):
+            # d(sum(c * linear(x)))/dW[i,j] = c * x[j]. The rank and
+            # microbatch factors sum to (1 + 2) * (1 + 2) = 9; FSDP's
+            # divide factor gives 4.5 * c * (j + 1) for every output row.
+            for micro in (1, 2):
+                if defer_reshard:
+                    experts.set_reshard_after_backward(micro == 2)
+                x = torch.arange(1, INTER + 1, dtype=torch.float32, device="cpu").unsqueeze(0)
+                x = x * micro * (rank + 1)
+                outputs = checkpoint(experts, x, use_reentrant=False) if checkpointed else experts(x)
+                for coefficient, (name, output) in enumerate(zip(weights, outputs), start=1):
+                    expected = coefficient * (x[:, : initial[name].shape[1]] @ initial[name].T)
+                    forward_checks.append((name, output.detach().clone(), expected))
+                sum(output.sum() for output in outputs).backward()
+
+        actual_grads = {name: weight.grad.to_local().detach().clone() for name, weight in weights.items()}
+        optimizer.step()
+        replicas = {}
+        for name, weight in weights.items():
+            grad_replicas = [torch.empty_like(initial[name]) for _ in range(2)]
+            weight_replicas = [torch.empty_like(initial[name]) for _ in range(2)]
+            dist.all_gather(grad_replicas, actual_grads[name], group=state.ep_group)
+            dist.all_gather(weight_replicas, weight.to_local(), group=state.ep_group)
+            replicas[name] = (grad_replicas, weight_replicas)
+
+        # Complete every collective before asserting, including fault-injected
+        # runs where one parameter has missed its synchronization hook.
+        for name, actual, expected in forward_checks:
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6, msg=name)
+        assert experts._forward_calls == (4 if checkpointed else 2)
+        for coefficient, (name, weight) in enumerate(weights.items(), start=1):
+            columns = torch.arange(1, initial[name].shape[1] + 1, dtype=torch.float32, device="cpu")
+            expected_grad = (4.5 * coefficient * columns).expand_as(initial[name])
+            torch.testing.assert_close(actual_grads[name], expected_grad, rtol=0, atol=0, msg=f"{name} gradient")
+            torch.testing.assert_close(
+                weight.to_local(), initial[name] - 0.1 * expected_grad, rtol=1e-6, atol=1e-7, msg=f"{name} update"
+            )
+            grad_replicas, weight_replicas = replicas[name]
+            torch.testing.assert_close(
+                grad_replicas[0], grad_replicas[1], rtol=0, atol=0, msg=f"{name} gradient replicas"
+            )
+            torch.testing.assert_close(
+                weight_replicas[0], weight_replicas[1], rtol=0, atol=0, msg=f"{name} weight replicas"
+            )
+    finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("defer_reshard", [False, True])
+def test_shared_lora_ep_gradient_accumulation(checkpointed, defer_reshard):
+    spawn_with_rendezvous(
+        _shared_lora_ep_accumulation_worker,
+        args=(checkpointed, defer_reshard),
+        nprocs=_CI_CPU_2.nproc,
+    )
 
 
 @pytest.mark.parametrize("mode", ["independent", "shared"])

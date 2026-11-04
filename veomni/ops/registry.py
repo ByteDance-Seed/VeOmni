@@ -201,6 +201,9 @@ class OpRegistry:
             if device == "mlu" and package == "apex":
                 if not import_utils.is_apex_mlu_available():
                     return False
+            elif device == "mlu" and package == "liger_kernel":
+                if not import_utils.is_liger_kernel_mlu_available():
+                    return False
             elif not is_package_available(package):
                 return False
         return True

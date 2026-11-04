@@ -86,6 +86,21 @@ Known limitations:
   semantics are validated without materializing the 95 GiB table. A real
   multi-node load-and-train smoke run remains the final deployment gate.
 
+## Compact QSA indexing on Ascend
+
+The indexer uses INT8 for NPU visibility gathers (the resulting mask is still
+boolean) and bounded INT32 position arithmetic. Top-k scores and floating
+attention arithmetic are unchanged. Positions including compression padding
+must fit INT32, matching the output-index contract.
+
+A two-entry host-only LRU caches immutable block metadata keyed by the complete
+packed boundaries, compression ratio, local shard length and SP rank/group size.
+Blocks are bucketed by owner in one pass, and counts stay on the host. One model
+forward prepares the device metadata before the decoder loop and reuses it across
+QSA layers and checkpoint recomputation. Only rank-local query segment maps are
+materialized. Device tensors are not cached across forwards; direct indexer
+calls prepare their own metadata through the same validated path.
+
 ## Two-device pipeline regression
 
 Run the daily toy regression with:

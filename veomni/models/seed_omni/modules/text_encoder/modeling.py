@@ -97,7 +97,7 @@ class InferenceMixin:
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """One FSM inference step — implemented per module (see class docstring)."""
@@ -184,6 +184,10 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
     # vocab-split and a parent unit would mix different ranks' vocab slices.
     _no_split_modules: list = ["ShardedEmbedding"]
     main_input_name = "input_ids"
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This module embeds and projects tokens; it does not execute attention.
+        return attn_implementation
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)

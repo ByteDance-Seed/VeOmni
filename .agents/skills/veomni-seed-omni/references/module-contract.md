@@ -8,7 +8,7 @@ also `docs/seed_omni/usage/adding_a_model.md` and
 
 ```text
 modules/<family>/<submodule>/
-├── configuration.py     # PretrainedConfig with unique model_type
+├── configuration.py     # OmniModuleConfig with unique model_type
 ├── modeling.py          # pure HF-native class + optional in-file InferenceMixin
 ├── accelerated/
 │   ├── __init__.py      # re-exports the accelerated class for the registry
@@ -50,6 +50,13 @@ modules/<family>/<submodule>/
 - For shared stateless carrier helpers called by both `modeling.py` and
   `accelerated/accelerated.py`, define plain module-level functions in
   `modeling.py`.
+
+Attention-free modules such as `TextEncoder` override HF's
+`_check_and_adjust_attn_implementation` to return the canonical selection.
+Keep this override local to those modules: attention-owning modules must still
+validate their selected backend. Do not set a false `_supports_sdpa` capability
+or introduce a second HF-only attention state. See
+`docs/design/module_config.md` for the configuration boundary.
 
 ## 3. IDE Type Stubs on `TrainingMixin`
 
@@ -101,3 +108,18 @@ Workflow:
    and optional `processing.py`, then register in `modules/__init__.py`.
 3. Wire `modules_train.yaml`, `graph_train.yaml`, and `infer/` YAML configs.
 4. Validate with `pytest tests/seed_omni/ -q` and `make quality`.
+
+## Ops configuration base
+
+`OmniConfig` and `OmniModuleConfig` both inherit `VeOmniPretrainedConfig`.
+Forward `ops_implementation` to `super().__init__` in custom constructors;
+assigning it before a superclass call can lose selections during initialization.
+The sparse dictionary owns attention state, including HF attention accessors.
+An HF schema extension may inherit `(OmniModuleConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively, including on handwritten subclasses.
+Use `get_veomni_config_class` to construct an adapted native schema directly;
+importing VeOmni does not add lifecycle methods to native HF configs. The shared lifecycle
+and override contract is in `docs/design/module_config.md`.
+The composed `OmniModel` treats its root ops as inheritance defaults and validates
+effective selections on its independently built modules. An overridden root
+default must not reject a module whose final ops are valid for its device.

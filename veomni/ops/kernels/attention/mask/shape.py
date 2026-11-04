@@ -44,6 +44,7 @@ _FLASH = frozenset(
         "flash_attention_3",
         "flash_attention_3_hub",
         "flash_attention_4",
+        "flash_attention_aiter",
     }
 )
 _SAGE = frozenset({"sage_attention"})

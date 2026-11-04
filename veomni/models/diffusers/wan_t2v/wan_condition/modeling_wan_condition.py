@@ -8,7 +8,9 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.pipelines.wan.pipeline_wan import WanPipeline
 from diffusers.video_processor import VideoProcessor
 from torchvision.transforms import InterpolationMode, functional
-from transformers import AutoTokenizer, PreTrainedModel, UMT5EncoderModel
+from transformers import AutoTokenizer, UMT5EncoderModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
@@ -22,6 +24,10 @@ logger = logging.get_logger(__name__)
 class WanTransformer3DConditionModel(PreTrainedModel):
     config_class = WanTransformer3DConditionModelConfig
     supports_gradient_checkpointing = False
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
 
     def __init__(self, config: WanTransformer3DConditionModelConfig, meta_init=False, **kwargs):
         super().__init__(config, **kwargs)
