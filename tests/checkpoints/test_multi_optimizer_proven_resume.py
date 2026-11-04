@@ -1752,13 +1752,14 @@ def test_shared_tensor_lr_across_groups_is_rejected_before_save(tmp_path):
 
 
 def test_model_checkpoint_extra_state_records_optimizer_global_step():
-    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.models.checkpoint.manager import ModelCheckpointManager, _scheduler_recipe
 
     _, optimizer = _model_and_optimizer()
     manager = object.__new__(ModelCheckpointManager)
     manager.runtime = SimpleNamespace(optimizer=optimizer, lr_scheduler=None, extra_state=lambda: {})
     saved = manager._extra_state(SimpleNamespace(global_step=3))
     assert saved["_veomni_optimizer_global_step"] == 3
+    assert saved["_veomni_scheduler_recipe"] == {"status": "supported", "value": _scheduler_recipe(None, optimizer)}
 
 
 def test_proven_optimizer_load_sets_identity_receipt(tmp_path):
