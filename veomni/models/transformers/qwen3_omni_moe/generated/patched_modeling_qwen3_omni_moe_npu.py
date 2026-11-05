@@ -106,7 +106,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
@@ -144,7 +143,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -1766,13 +1765,6 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -1782,7 +1774,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -2030,11 +2022,14 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
         # ("Deprecated and unused" — see masking_utils.py:917).
         attention_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": text_position_ids,
+            }
         )
 
         hidden_states = inputs_embeds

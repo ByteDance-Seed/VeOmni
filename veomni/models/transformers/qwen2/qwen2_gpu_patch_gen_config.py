@@ -26,7 +26,6 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -37,7 +36,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
@@ -54,7 +53,7 @@ config = PatchConfig(
     description="Qwen2 with VeomniOp-based GPU kernel replacements",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask", "create_sliding_window_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 
@@ -68,8 +67,8 @@ config.add_import(
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
@@ -200,6 +199,7 @@ def qwen2_model_forward_patched(
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
         mask_kwargs = {
+            **kwargs,
             "config": self.config,
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -435,13 +435,6 @@ def qwen2_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -451,7 +444,7 @@ def qwen2_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
