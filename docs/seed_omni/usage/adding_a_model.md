@@ -104,11 +104,50 @@ Create `configs/seed_omni/<model>/<task>/` following
 [the config layout](training_and_inference.md#1-config-layout): `base.yaml`,
 `modules_train.yaml`, `graph_train.yaml`, plus shared `infer/` graphs and
 `data.yaml`. Edges only declare order; conversation graphs move data through the
-conversation list. Packed graphs (such as Janus `packed/graph_train.yaml`) call
-`pack_*` methods and move packed tensors on the batch dict instead.
+conversation list.
 
 If the model needs a new data source, add a preprocessor as described in
 [Data Format](data_format.md#custom-datasets).
+
+### 4.1 Packing is optional
+
+A second graph shape exists: packed graphs (Qwen3-VL's
+`packed/graph_train.yaml` is the in-tree example) call `pack_*` methods and move
+packed tensors on the batch dict instead of a conversation carrier. The
+text-encoder preprocessor builds one flat token sequence per sample on the CPU —
+tokens, M-RoPE positions, visual masks — and every later node only mask-selects
+its own embeddings and `masked_scatter`s them back.
+
+**Adding a model does not require it.** Ship the conversation graph first: it is
+the reference path, it is what inference uses, and it is what the packed graph is
+checked against. Packing is a throughput optimization, not a capability: it buys
+the padding removed from the prefill, and nothing else.
+
+How much it buys is measured, not assumed. On Qwen3-Omni-30B-A3B
+(`scripts/seed_omni/bench_module_split/`, four arms on the same replay batch):
+
+| Round | `packed` vs `split` | `packed` vs `mfsdp` |
+|-------|--------------------|---------------------|
+| thinker, mbs=12 (VRAM-saturating) | −1.01% | −0.54% |
+| thinker, mbs=2 | −0.44% | −0.23% |
+| speech (6 modules, text+speech loss), mbs=32 | −3.45% | −0.18% |
+
+Two readings matter here:
+
+- **The data path is the smallest of the levers.** `split` → `mfsdp`
+  (`fsdp_scope: model`) already recovers most of it (0.47% / 0.21% / 3.28%);
+  the packed path adds 0.18–0.54% on top, which at the saturated batch is inside
+  its own 27 ms run-to-run jitter.
+- **Its ceiling is padding.** Where the sequence is already near-full, or where a
+  module runs one utterance at a time regardless (the talker), packing has nothing
+  left to remove — hence the 0.18% in the speech round against a 3.45% total, all
+  of which `mfsdp` alone already delivered.
+
+So add a packed graph when profiling shows prefill padding is actually costing
+you. It is extra surface: a second train graph, `pack_*` hooks on every module in
+it, its own collation contract in `SeedOmniCollator`, and a parity test against
+the conversation path (`tests/seed_omni/modules/<family>/test_*_packing.py`).
+None of that is on the critical path for "support model X".
 
 ## 5. Honour the contracts
 

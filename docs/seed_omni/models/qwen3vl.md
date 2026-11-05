@@ -47,7 +47,7 @@ Layout follows [the shared config layout](../usage/training_and_inference.md#1-c
 | `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). Shared by both tasks. |
 | `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). Shared by both tasks. |
-| `packed/base.yaml` | Launcher for the packed training graph. |
+| `packed/base.yaml` | Launcher for the packed training graph (optional, see [§3.2](#32-packed-graph-optional)). |
 | `packed/modules_train.yaml` | Same module overrides plus `processor_config: {packed_preprocess: true}` on the text encoder. |
 | `packed/graph_train.yaml` | Packed DAG (`pack_encode → pack_encode → pack_forward → pack_decode`). |
 
@@ -163,6 +163,31 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
 - If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
   `_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
   `full_tensor()` needs, which crashes any FSDP2 run (SP or not).
+
+### 3.2 Packed graph (optional)
+
+`packed/base.yaml` is a second training entry point, not a replacement for
+`train/base.yaml`. It builds one flat token sequence per sample on the CPU — tokens,
+M-RoPE positions and the visual mask — so each node only mask-selects its own
+embeddings and `masked_scatter`s them back, instead of walking the conversation
+carrier item by item.
+
+```bash
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/base.yaml
+```
+
+The conversation graph stays the reference path: it is what inference uses, what
+the packed graph is checked against (`test_qwen3vl_packing.py`), and it is what you
+should ship first. Packing only removes prefill padding, so treat it as a
+throughput knob to reach for when profiling shows that padding is costing you. On
+Qwen3-Omni-30B-A3B it measured −1.01% step time at a VRAM-saturating batch and
+−0.44% at mbs=2, against `fsdp_scope: model` alone recovering 0.47% / 0.21% of
+that same gap; the speech round showed 0.18%, inside its own jitter. See
+[Adding a model §4.1](../usage/adding_a_model.md#41-packing-is-optional) for the
+full numbers and why the ceiling is padding.
+
+Note the packed launcher currently reports no per-sample sequence lengths to the
+metric meter, so multi-source token accounting is zero on this path.
 
 ---
 
