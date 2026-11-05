@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
+from veomni.models.seed_omni.modules.base.packing import PACKED_ATTENTION_MASK
 from veomni.models.seed_omni.modules.qwen3vl.packing import (
     IMAGE_GRID_THW,
     PACKED_CU_SEQLENS,
@@ -239,3 +240,68 @@ def test_qwen3vl_packed_preprocessor_keeps_conversation_list_on_inference():
     preprocessor(batch, inference=True)
     assert batch["conversation_list"] is conversation
     assert PACKED_INPUT_IDS not in batch
+
+
+def test_packed_samples_survive_omni_preprocess_and_collation():
+    """The packed training path, end to end: ``OmniProcessor.preprocess`` keeps the
+    keys the packed preprocessor wrote, and ``SeedOmniCollator`` batches them into
+    one varlen packed sequence instead of list-grouping them."""
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+    from veomni.models.seed_omni.processing_omni import OmniProcessor
+
+    preprocessor = Qwen3VLTextEncoderPreprocessor(
+        Qwen3VLChatTemplate(_FakeTokenizer()), packed_preprocess=True, spatial_merge_size=2
+    )
+    processor = OmniProcessor({"qwen3vl_text_encoder": preprocessor})
+
+    def _sample() -> list[ConversationItem]:
+        return [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(type="image", value=torch.ones(16, 8), role="user", meta={_OMNI_GRID: [1, 4, 4]}),
+            ConversationItem(type="text", value="ok", role="assistant"),
+        ]
+
+    first = processor.preprocess(_sample())
+    second = processor.preprocess(_sample())
+    # The carrier is consumed, and everything the packed preprocessor wrote is kept.
+    assert "conversation_list" not in first
+    assert PACKED_INPUT_IDS in first and VISUAL_POS_MASK in first
+
+    batch = SeedOmniCollator()([first, second])
+
+    per_sample = int(first[PACKED_INPUT_IDS].shape[-1])
+    assert tuple(batch[PACKED_INPUT_IDS].shape) == (1, 2 * per_sample)
+    assert tuple(batch[PACKED_LABELS].shape) == (1, 2 * per_sample)
+    assert tuple(batch[PACKED_POSITION_IDS].shape) == (3, 1, 2 * per_sample)
+    assert tuple(batch[VISUAL_POS_MASK].shape) == (1, 2 * per_sample)
+    # One varlen segment per sample, rebuilt by the collator.
+    assert batch[PACKED_CU_SEQLENS].tolist() == [0, per_sample, 2 * per_sample]
+    assert batch["packed_max_length"] == per_sample
+    # Per-visual rows and the scalar both accumulate.
+    assert batch[VISUAL_NUM_REAL] == 2
+    assert tuple(batch[IMAGE_GRID_THW].shape) == (2, 3)
+    assert tuple(batch[PIXEL_VALUES].shape) == (32, 8)
+
+
+def test_packed_collation_rejects_an_unknown_preprocessor_key():
+    """A packed preprocessor that starts emitting a new key must teach the collator
+    about it rather than have it silently list-grouped."""
+    import pytest
+
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+
+    sample = {
+        PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
+        PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
+        PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
+        PACKED_POSITION_IDS: torch.zeros(3, 1, 4, dtype=torch.long),
+        PACKED_CU_SEQLENS: torch.tensor([0, 4], dtype=torch.int32),
+        "packed_max_length": 4,
+        "visual_num_real": 0,
+        "pixel_values": torch.zeros(4, 8),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "visual_pos_mask": torch.zeros(1, 4, dtype=torch.bool),
+        "brand_new_key": torch.zeros(1),
+    }
+    with pytest.raises(KeyError, match="brand_new_key"):
+        SeedOmniCollator()([sample])

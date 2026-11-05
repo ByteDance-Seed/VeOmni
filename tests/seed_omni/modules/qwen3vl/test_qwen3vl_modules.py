@@ -185,6 +185,35 @@ def test_video_position_ids_restart_per_frame_like_hf():
     )
 
 
+def test_pack_leaves_deepstack_out_when_the_vision_config_disables_it():
+    """``disable_deepstack`` empties every item's ``deepstack`` list. The packer must
+    then pass neither a mask nor layer features, so the backbone does not try to
+    ``torch.stack`` an empty list."""
+    from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import (
+        pack_qwen3vl_conversations_for_forward as pack,
+    )
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+    text = ConversationItem(type="text", value=torch.zeros(2, 64), role="user")
+    image = ConversationItem(
+        type="image", value=torch.zeros(4, 64), role="user", meta={"grid_thw": [1, 2, 2], "deepstack": []}
+    )
+    out = pack([[text, image]], torch.device("cpu"), 2)
+    assert out["visual_pos_masks"] is None
+    assert out["deepstack_visual_embeds"] is None
+
+    # With layer features present, both come through.
+    with_ds = ConversationItem(
+        type="image",
+        value=torch.zeros(4, 64),
+        role="user",
+        meta={"grid_thw": [1, 2, 2], "deepstack": [torch.zeros(4, 64), torch.zeros(4, 64)]},
+    )
+    out = pack([[text, with_ds]], torch.device("cpu"), 2)
+    assert out["visual_pos_masks"] is not None
+    assert len(out["deepstack_visual_embeds"]) == 2
+
+
 def test_vision_preprocessor_injects_one_dummy_per_sample_and_tags_token_len():
     """A sample with no media gets its own ``is_dummy`` placeholder, tagged with
     the merged-token count ``dyn_bsz`` counts (one per sample, not one per batch)."""

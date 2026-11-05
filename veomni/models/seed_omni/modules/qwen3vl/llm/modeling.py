@@ -125,6 +125,12 @@ def pack_qwen3vl_conversations_for_forward(
     else:
         deepstack_visual_embeds = collect_qwen3vl_dummy_deepstack(conversations, device)
         visual_pos_masks = None
+    if not deepstack_visual_embeds:
+        # ``deepstack_visual_indexes: []`` (``disable_deepstack``) leaves every
+        # item's ``deepstack`` list empty, so there is nothing to inject and the
+        # backbone must not receive a mask that promises layer features.
+        deepstack_visual_embeds = None
+        visual_pos_masks = None
 
     cu_seq_lens = torch.tensor([0, *_cumsum(sample_lengths)], dtype=torch.int32, device=device)
     max_length = max(sample_lengths) if sample_lengths else 0

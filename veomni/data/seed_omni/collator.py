@@ -18,6 +18,18 @@ from typing import Any, Dict, Sequence
 from ..data_collator import DataCollator
 
 
+# Keys a packed preprocessor writes instead of a conversation carrier. A packed
+# sample carries exactly one packed sequence already (its preprocessor packed the
+# sample's turns together), so collation concatenates them along the packed
+# sequence axis instead of list-grouping them.
+_PACKED_SEQUENCE_KEYS = ("packed_input_ids", "packed_labels", "packed_attention_mask")
+_PACKED_CONCAT_DIM = {"packed_input_ids": 1, "packed_labels": 1, "packed_attention_mask": 1}
+# Per-visual metadata: concatenated along the first axis (one row per visual).
+_PACKED_VISUAL_ROW_KEYS = ("pixel_values", "image_grid_thw")
+# Scalars describing the whole packed batch, summed or re-derived.
+_PACKED_SCALAR_KEYS = ("visual_num_real",)
+
+
 @dataclass
 class SeedOmniCollator(DataCollator):
     """List-only collator for the SeedOmni ``conversation_list`` schema.
@@ -75,10 +87,66 @@ class SeedOmniCollator(DataCollator):
                     f"all samples in a batch must carry the same key set."
                 )
         if "conversation_list" not in first_keys:
+            if "packed_input_ids" in first_keys:
+                return _collate_packed(features, first_keys)
             raise KeyError(
                 "SeedOmniCollator: every sample must have a 'conversation_list' key "
-                "(produced by the seedomni data_transform); "
-                f"got {first_keys}"
+                "(produced by the seedomni data_transform) or the packed keys written by a "
+                f"packed preprocessor; got {first_keys}"
             )
 
         return {key: [f[key] for f in features] for key in first_keys}
+
+
+def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[str, Any]:
+    """Batch already-packed per-sample dicts into one packed batch.
+
+    A packed preprocessor consumes ``conversation_list`` and emits one packed
+    sequence per sample, so unlike the conversation path nothing here may stay a
+    per-sample list: every packed node indexes into the batch directly.
+
+    - Sequence tensors (``packed_input_ids`` / ``_labels`` / ``_attention_mask``)
+      concatenate along the packed sequence axis and ``packed_cu_seqlens`` is
+      rebuilt from the per-sample lengths, so the batch is one varlen sequence.
+    - ``packed_position_ids`` concatenates on its sequence axis too.
+    - Per-visual rows (``pixel_values`` / ``image_grid_thw``) concatenate on the
+      first axis; DeepStack features concatenate on their token axis.
+    - Scalars (``visual_num_real``) sum.
+    """
+    import torch
+
+    batch: Dict[str, Any] = {}
+    lengths = [int(f["packed_input_ids"].shape[-1]) for f in features]
+    for key in keys:
+        values = [f[key] for f in features]
+        if key in _PACKED_CONCAT_DIM:
+            batch[key] = torch.cat(
+                [v if v.dim() == 2 else v.unsqueeze(0) for v in values], dim=_PACKED_CONCAT_DIM[key]
+            )
+        elif key == "packed_position_ids":
+            # [3, 1, T] per sample -> [3, 1, sum(T)]
+            parts = [v if v.dim() == 3 else v.unsqueeze(1) for v in values]
+            batch[key] = torch.cat(parts, dim=2)
+        elif key in _PACKED_VISUAL_ROW_KEYS or key == "deepstack_visual_embeds":
+            batch[key] = torch.cat(values, dim=0)
+        elif key in _PACKED_SCALAR_KEYS:
+            batch[key] = sum(int(v) for v in values)
+        elif key == "packed_cu_seqlens":
+            continue  # rebuilt below from the per-sample lengths
+        elif key == "packed_max_length":
+            continue  # rebuilt below
+        elif key == "visual_pos_mask":
+            # [1, T] per sample -> [1, sum(T)]
+            batch[key] = torch.cat([v if v.dim() == 2 else v.unsqueeze(0) for v in values], dim=1)
+        else:
+            raise KeyError(
+                f"SeedOmniCollator: packed sample produced unknown key {key!r}; add it to the packed "
+                "collation contract in veomni/data/seed_omni/collator.py."
+            )
+
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    batch["packed_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32)
+    batch["packed_max_length"] = max(lengths)
+    return batch
