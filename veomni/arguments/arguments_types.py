@@ -848,6 +848,8 @@ class OffloadConfig:
     def __post_init__(self):
         if self.activation_offload_backend not in ("direct", "bounded"):
             raise ValueError("activation_offload_backend must be direct or bounded")
+        if not isinstance(self.activation_offload_pipeline_transfers, bool):
+            raise ValueError("activation_offload_pipeline_transfers must be a boolean")
         if self.activation_offload_pipeline_transfers and self.activation_offload_backend != "bounded":
             raise ValueError("Pipelined staging requires the bounded activation backend")
         if self.activation_offload_backend == "bounded":

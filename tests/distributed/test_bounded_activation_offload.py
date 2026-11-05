@@ -132,6 +132,36 @@ def test_bounded_config_requires_explicit_capacity_and_checkpoint_targets():
             OffloadConfig(**dict(valid, **{field: value}))
 
 
+@pytest.mark.parametrize("backend", ["direct", "bounded"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_pipeline_transfers_requires_boolean(backend, value):
+    from veomni.arguments.arguments_types import OffloadConfig
+
+    with pytest.raises(ValueError, match="activation_offload_pipeline_transfers must be a boolean"):
+        OffloadConfig(
+            enable_async_activation=True,
+            activation_offload_backend=backend,
+            activation_offload_modules=["layers.{*}"],
+            activation_offload_pipeline_transfers=value,
+        )
+
+
+def test_pipeline_transfer_booleans_keep_existing_backend_policy():
+    from veomni.arguments.arguments_types import OffloadConfig
+
+    assert OffloadConfig(activation_offload_pipeline_transfers=False).activation_offload_pipeline_transfers is False
+    options = dict(
+        enable_async_activation=True, activation_offload_backend="bounded", activation_offload_modules=["x"]
+    )
+    for value in (False, True):
+        assert (
+            OffloadConfig(**options, activation_offload_pipeline_transfers=value).activation_offload_pipeline_transfers
+            is value
+        )
+    with pytest.raises(ValueError, match="requires the bounded"):
+        OffloadConfig(activation_offload_pipeline_transfers=True)
+
+
 class CPUTransfers:
     """Actual CPU tensors, explicit test events, no accelerator initialization."""
 
