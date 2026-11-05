@@ -31,7 +31,6 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -41,11 +40,13 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -57,7 +58,8 @@ from .layout import (
     step_dir,
     weights_dir,
 )
-from .ple_planner import PleLoadPlanner, PleSavePlanner
+from .ple_planner import _EXPERT_LAYOUTS_KEY as _EXPERT_LAYOUTS_KEY
+from .ple_planner import PleLoadPlanner, PleSavePlanner, _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
 
 
 logger = logging.get_logger(__name__)
@@ -67,33 +69,10 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
-class _ModelStrictLoadPlanner(PleLoadPlanner):
-    """Allow partial optimizer state while requiring a complete full-model DCP."""
-
-    def __init__(self, strict_model: bool, ple_rows_by_name=None):
-        super().__init__(allow_partial_load=True, ple_rows_by_name=ple_rows_by_name)
-        self.strict_model = strict_model
-
-    def create_local_plan(self):
-        plan = super().create_local_plan()
-        if not self.strict_model:
-            return plan
-
-        assert self.metadata is not None
-        missing_model_keys = sorted(
-            key
-            for key, path in self.mappings.items()
-            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
-        )
-        if missing_model_keys:
-            preview = ", ".join(missing_model_keys[:10])
-            suffix = " ..." if len(missing_model_keys) > 10 else ""
-            raise RuntimeError(
-                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
-                f"{preview}{suffix}"
-            )
-
-        return plan
+def _model_load_planner(*, strict_model: bool, ple_rows_by_name):
+    if ple_rows_by_name:
+        return PleLoadPlanner(strict_model=strict_model, ple_rows_by_name=ple_rows_by_name)
+    return _ModelStrictLoadPlanner(strict_model=strict_model)
 
 
 def _validate_extra_parallel_meshes(parallel_state) -> None:
@@ -301,7 +280,16 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the
@@ -421,12 +409,16 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+        tensor_to_put = rewrap_dtensor_local(
+            loaded_tensor._local_tensor,
+            mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+        tensor_to_put = rewrap_dtensor_local(
+            loaded_tensor._local_tensor,
+            mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
         )
     else:
         raise RuntimeError(
@@ -448,7 +440,7 @@ def restore_extra_parallel_dim(
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
 
     The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
-    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
+    their configured axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
     experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
     layout). They must be mapped to the matching mesh dims explicitly.
 
@@ -463,15 +455,11 @@ def restore_extra_parallel_dim(
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
 
     Note:
-        When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
-        shards experts on dim 0 just like EP), both mesh dims split the SAME
-        tensor dim. The mesh order ``(ep_fsdp, ep)`` then composes ``ep_fsdp``
-        OUTER of ``ep``, whereas the physical layout is EP-outer / FSDP-inner,
-        so the reconstructed GLOBAL tensor is block-transposed along that dim.
-        Save->load into the SAME parallel config still round-trips correctly
-        (drop is the exact inverse); only resharding / external reads of such a
-        checkpoint see the permuted layout. Fixing this needs the EP mesh dims
-        reordered so ``ep`` precedes ``ep_fsdp`` (a parallel_state change).
+        When both splits use the same tensor dimension, physical sharding is
+        EP-first/FSDP-second despite the mesh order ``(ep_fsdp, ep)``. Describe
+        that with ``_StridedShard`` on the FSDP mesh axis, just as native FSDP2
+        does for same-dimension TP. This preserves global expert identities in
+        DCP metadata without communication or copying the local tensor.
     """
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
@@ -479,14 +467,30 @@ def restore_extra_parallel_dim(
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
         # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
+        fsdp_placement = (
+            _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1))
+            if ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
+            else Shard(fsdp_shard_dim)
+        )
         if fsdp_mesh.ndim == 3:
-            placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+            placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
-            placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+            placements = [fsdp_placement, Shard(ep_shard_dim)]
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor._local_tensor,
+            mesh=fsdp_mesh,
+            placements=placements,
+        )
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        # If there is no FSDP but only ExtraParallel. Use the helper here too:
+        # ``DTensor.from_local`` copies a host-resident local onto the mesh
+        # device, which would materialize the swap optimizer's host state on the
+        # accelerator during a save.
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor,
+            mesh=extra_parallel_fsdp_mesh,
+            placements=[Shard(0)],
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -1055,7 +1059,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
+                planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
@@ -1067,7 +1071,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_path),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
+            planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
         )
         if wants_optimizer:
             dcp.load(
@@ -1223,7 +1227,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
             )
             if counts
-            else DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+            else _ExtraParallelSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         )
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
@@ -1458,6 +1462,7 @@ def _process_shard(
         state_dict,
         checkpoint_id=checkpoint_path,
         storage_reader=FileSystemReader(checkpoint_path),
+        planner=_ModelStrictLoadPlanner(strict_model=True),
         no_dist=True,
     )
 

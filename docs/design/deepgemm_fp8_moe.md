@@ -63,9 +63,148 @@ This is operator integration, not full-model convergence validation.
 - First-order autograd and non-reentrant activation checkpointing are supported.
   Full-graph `torch.compile` and CUDA graph capture are unsupported because
   Hopper's K-grouped launch requires token counts on the host.
-- FSDP2 parameter communication and EP token all-to-all retain their configured
-  precision. This change does not add FP8 all-gather, quantized optimizer state,
-  or a persistent FP8 parameter cache.
+- Parameter all-gather uses its configured precision by default. The optional
+  FP8 transport below applies only to routed expert weights. EP token all-to-all,
+  gradients and optimizer state keep their configured precision.
+
+## Optional FP8 parameter all-gather
+
+```yaml
+model:
+  ops_implementation:
+    moe_implementation: deepgemm_fp8
+    qat_implementation: none
+  accelerator:
+    fsdp_config:
+      expert_weight_fp8_all_gather: true
+      expert_fsdp_shard_dim: 0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+```
+
+This opt-in path uses native Torch 2.11 FSDP2 extensions. It quantizes each
+local expert weight shard before communication, gathers E4M3 payloads and
+FP32 block scales, and passes them directly to DeepGEMM. Payload copies and
+transposes use byte views to avoid unnecessary float8 conversion kernels;
+the bits and quantization recipe are unchanged. Dense layers,
+routers, shared experts, EP token communication and gradient reduction are
+unaffected. Master parameter shards and optimizer/checkpoint state remain in
+their original precision. The quantizer rounds FP32 masters to BF16 inside
+the kernel, matching the default BF16 parameter all-gather's numerical recipe.
+
+For each 128x128 block, transport contains 16384 FP8 bytes plus a four-byte
+scale, compared with 32768 BF16 bytes: about half the parameter payload.
+Scales use separate small collectives because Torch 2.11's nonzero-dimension
+shard copy-out assumes every extension output has the parameter's shape.
+Extra collective launches and local quantization affect latency; this byte
+reduction is not a promise of a 2x training speedup.
+
+Forward consumes the gathered FP8 weight directly. Dgrad transposes its
+payload and its scale grid: square 128x128 blocks preserve their exact values
+under transpose. FSDP frees and repopulates payload/scale storage on reshard
+and unshard, including backward and activation recomputation. Local shards
+are requantized on every unshard, so optimizer updates cannot leave an
+across-step FP8 cache stale.
+
+Synchronous activation offload remains supported: it skips the gathered FP8
+weight container and offloads ordinary saved activations as usual. FSDP owns
+the weight payload/scale storage and restores it before backward; activation
+offload must not copy that container to CPU or count it against its GPU budget.
+
+`expert_weight_fp8_all_gather: true` applies only to modules whose actual `veomni_moe.impl`
+is `deepgemm_fp8`. If none match, the flag is silently ignored, for standalone
+models, composed models and individual children alike. FP8-specific policy
+checks run only after this selection, so a dense child can inherit the flag
+while using DDP, FP16, CPU offload or compilation under its usual backend
+rules. The flag itself must always be a boolean.
+
+This option controls routed-expert **parameter** all-gather during FSDP2
+unshard, including forward/backward prefetch and backward re-gather after
+resharding. EP token all-to-all, gradient reduce-scatter, and other parameters'
+all-gather retain their configured behavior. Expert FSDP shard size one has
+no cross-rank expert parameter all-gather to compress.
+
+Constraints for selected experts:
+
+- Two merged expert weights `[E,2*I,H]` and `[E,H,I]`, selected by the actual
+  module's `veomni_moe.impl == "deepgemm_fp8"` handle.
+- BF16 FSDP mixed precision, CUDA, contiguous BF16/FP32 master shards.
+- Even sharding, with complete 128x128 blocks inside every shard. The default
+  EP FSDP `Shard(1)` layout must divide both `2*I` and `H` into multiples of
+  128. Unsupported shapes fail before the first training parameter all-gather.
+- No FSDP parameter CPU offload, integer partial resharding, `torch.compile`, or CUDA graphs.
+  Register the hooks after wrapping and initial weight materialization, before
+  the first forward. In-place checkpoint loading is supported; replacing
+  parameters or moving the wrapped model after registration is unsupported.
+
+On eight GPUs, EP8 has expert FSDP size one and no expert all-gather to reduce.
+Use EP4 with FSDP size two to measure this path locally, or sixteen GPUs for
+EP8 with FSDP size two. Compare identical parallel layouts and include the
+all-gather and gradient reduction in the measured forward/backward step.
+
+### Whole-expert FSDP sharding and EP combine
+
+`model.accelerator.fsdp_config.expert_fsdp_shard_dim` optionally overrides
+EP expert FSDP placement. `null` (the default) preserves the existing hidden
+split/Muon selection, `1` splits expert matrix rows, and `0` shards whole
+experts. An explicit value overrides `muon_expert_zero_comm` for EP. The setting
+applies to declared EP groups in FSDP2; other parameter groups are unchanged.
+Dim 0 requires a dim-0 EP plan with at least one 3D expert stack, and each
+matched parameter's local first dimension must divide the expert FSDP size.
+Unsupported dim-0 layouts fail during wrapping.
+
+This option works with BF16 GEMMs and DeepGEMM FP8. Whole-expert shards avoid
+FSDP's hidden-dimension all-gather copy-out reorder and backward gradient
+concatenation. Same-dimension EP/FSDP splits use strided placement metadata to
+preserve EP-first expert order. DCP planner metadata records each expert
+tensor's source EP/FSDP shard dimensions, group sizes, and global expert order
+under `__veomni_expert_layouts__` (format version 1). Entries use flattened
+state-dict keys, covering both model weights and optimizer tensors without
+adding model state keys or tensor collectives. Canonical checkpoints can
+reshard between dim 0 and dim 1; the load target need not match the saved layout.
+
+Older Muon dim-0 checkpoints used two ordinary shard placements and encoded a
+permuted global expert order. The load planner now checks the **source**
+ordering, including when loading into dim 1 or plain tensors. A source marked
+as noncanonical is rejected before tensor reads. For unmarked legacy EP
+checkpoints, saved chunks that split a matrix dimension identify safe
+different-axis sharding and can load into either target layout. Chunks spanning
+all experts are also unambiguous. Expert-only chunks cannot distinguish a
+valid EP-only save from the faulty same-axis layout: EP resumes reject these
+for both target dimensions and require migration using the original training
+layout, for model and optimizer together. Changing the target dimension or
+merely adding a canonical tag cannot repair a permuted checkpoint.
+
+Earlier checkpoints carrying the `__veomni_ep_first_layout__=1` marker remain
+readable. Low-level DCP callers must use the VeOmni planners to run these
+checks. Unmarked legacy exports to plain tensors still require external source
+layout information: neither tensor names nor shapes alone identify EP weights.
+
+MoE-LoRA adapter export with a supported BF16 backend also preserves the
+actual EP and FSDP shard dimensions when consolidating the adapter into
+safetensors. Whole-expert shards therefore export the same global adapter
+shapes and expert order as hidden-dimension shards.
+Master weights, optimizer state, and gradient reduction dtypes are unchanged.
+FP32 reduce-scatter buffers can still dominate
+peak memory, so FP8 parameter transport alone need not lower the step peak.
+
+The common EP combine path selects `moe_unpermute/standard/triton` on NVIDIA
+GPUs and `eager` on other devices or when deterministic algorithms are enabled. It fuses route weighting into FP32 scatter
+accumulation and gathers gradients directly, avoiding expanded weighted-token
+and FP32 token copies in forward and backward. Both BF16 and FP8 expert
+backends use it. Multiplication retains the promoted input/weight dtype's
+rounding before FP32 accumulation; the EP dispatcher restores the original
+token dtype after the combine. The router
+weight gradient similarly rounds each product before its channel reduction.
+Floating-point atomic summation order may differ from the eager scatter.
+The operator supports first-order autograd and requires valid token indices.
+
+The implementation is in
+[fp8_all_gather.py](../../veomni/distributed/fsdp2/fp8_all_gather.py), with a
+[weight container](../../veomni/ops/kernels/moe_experts/shared/fp8_weight.py)
+consumed by the existing grouped-linear autograd implementation.
 
 ## Installation
 
