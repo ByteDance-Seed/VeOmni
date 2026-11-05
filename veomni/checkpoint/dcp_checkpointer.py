@@ -38,7 +38,12 @@ from torch.distributed.checkpoint import (
     load,
 )
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
+from torch.distributed.checkpoint.metadata import (
+    STATE_DICT_TYPE,
+    BytesStorageMetadata,
+    Metadata,
+    TensorStorageMetadata,
+)
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -2106,17 +2111,65 @@ def _single_swap_frozen_resume(model, optimizer, reader, *, group=None, trainabl
     if type(optimizer) is not SwapAdamW:
         yield ()
         return
-    has_frozen = any(not p.requires_grad for g in optimizer.param_groups for p in g["params"])
-    if not any_rank_failed(has_frozen, group=group):
-        yield ()
+    names, owned, error = None, None, None
+    try:
+        names = _dcp_parameter_name_map(model)
+        owned = {id(p): p for g in optimizer.param_groups for p in g["params"]}
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "inspecting SwapAdamW parameter ownership", group=group)
+    needs_inspection = any(not p.requires_grad or id(p) not in owned for p in names.values())
+    needs_inspection = any_rank_failed(needs_inspection, group=group)
+    metadata, group_indices, error = None, None, None
+    try:
+        if needs_inspection:
+            _validate_fresh_swap_optimizer(optimizer)
+        metadata = reader.read_metadata().state_dict_metadata
+        group_indices = sorted(
+            int(match.group(1))
+            for key in metadata
+            if (match := re.fullmatch(r"optimizer\.param_groups\.(\d+)\.params", key))
+        )
+        if not group_indices or group_indices != list(range(len(group_indices))):
+            raise RuntimeError("SwapAdamW checkpoint parameter groups cannot be proven")
+        if any(
+            not isinstance(metadata[f"optimizer.param_groups.{index}.params"], BytesStorageMetadata)
+            for index in group_indices
+        ):
+            raise RuntimeError("SwapAdamW checkpoint parameter groups have an unsupported format")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "inspecting SwapAdamW checkpoint groups", group=group)
+    if dist.is_initialized():
+        layouts = [None] * dist.get_world_size(group)
+        dist.all_gather_object(layouts, group_indices, group=group)
+        if any(layout != layouts[0] for layout in layouts[1:]):
+            raise RuntimeError("SwapAdamW checkpoint group metadata differs across ranks")
+    saved_groups = {"optimizer": {"param_groups": [{"params": None} for _ in group_indices]}}
+    dcp.load(state_dict=saved_groups, storage_reader=reader, process_group=group)
+    error = None
+    try:
+        names_by_id = {id(param): name for name, param in names.items()}
+        current_groups = [[names_by_id[id(param)] for param in entry["params"]] for entry in optimizer.param_groups]
+        source_groups = [entry["params"] for entry in saved_groups["optimizer"]["param_groups"]]
+        if source_groups != current_groups:
+            raise RuntimeError(
+                "SwapAdamW checkpoint parameter groups differ; restore the original groups or use a verified migration"
+            )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating SwapAdamW checkpoint groups", group=group)
+    if not needs_inspection:
+        try:
+            yield ()
+        except BaseException:
+            optimizer._veomni_dcp_restore_failed = True
+            raise
         return
     changed, allocated, error = [], [], None
     try:
-        _validate_fresh_swap_optimizer(optimizer)
-        metadata = reader.read_metadata().state_dict_metadata
-        owned = {id(p): p for g in optimizer.param_groups for p in g["params"]}
-        for name, param in _dcp_parameter_name_map(model).items():
-            if id(param) not in owned or param.requires_grad:
+        for name, param in names.items():
+            if id(param) in owned and param.requires_grad:
                 continue
             fields = {
                 field: metadata.get(f"optimizer.state.{name}.{field}") for field in ("step", *optimizer._state_keys)
@@ -2126,6 +2179,11 @@ def _single_swap_frozen_resume(model, optimizer, reader, *, group=None, trainabl
                 continue
             if present != set(fields):
                 raise RuntimeError(f"SwapAdamW frozen state for {name} is incomplete")
+            if id(param) not in owned:
+                raise RuntimeError(
+                    f"SwapAdamW checkpoint has state for unowned parameter {name}; "
+                    "restore the original optimizer groups or use a verified migration"
+                )
             if trainable_only:
                 raise RuntimeError("Frozen SwapAdamW history requires a full-model checkpoint")
             if optimizer._optimizer_load_state_dict_pre_hooks or optimizer._optimizer_load_state_dict_post_hooks:
@@ -2291,6 +2349,20 @@ class DistributedCheckpointer(CheckpointerBase):
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi, saving=True
         )
+        from ..optim.swap_adamw import SwapAdamW
+
+        single_swap_snapshot = None
+        if type(optimizer) is SwapAdamW:
+            if save_async:
+                cls._drain_slot(OPTIMIZER_DIRNAME)
+            error = None
+            try:
+                single_swap_snapshot = OptimizerState(
+                    model=state["model"], optimizer=optimizer, parallel_state=parallel_state
+                ).state_dict()
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "preparing SwapAdamW checkpoint state")
         scheduler_object = state.get("_veomni_scheduler_object") if multi else None
         source_model = state.get("model")
         extra = state.get("extra_state") if multi else None
@@ -2380,10 +2452,7 @@ class DistributedCheckpointer(CheckpointerBase):
             cls._save_extra_state(checkpoint_dir=write_root, state=state)
         except BaseException as exc:
             error = exc
-        if multi:
-            raise_if_any_rank_failed(error, "preparing MultiOptimizer checkpoint")
-        elif error is not None:
-            raise error
+        raise_if_any_rank_failed(error, "preparing checkpoint files")
         extra_digest = None
         if multi:
             error = None
@@ -2456,6 +2525,8 @@ class DistributedCheckpointer(CheckpointerBase):
                             group=None,
                         )
                         if multi
+                        else single_swap_snapshot
+                        if single_swap_snapshot is not None
                         else OptimizerState(model=state["model"], optimizer=optimizer, parallel_state=parallel_state),
                         cls._create_storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
                     ),
@@ -2766,6 +2837,15 @@ class DistributedCheckpointer(CheckpointerBase):
             return _PreparedLoadState(owner, snapshot, process_group)
 
         reader = model_reader if fused_dir is not None else optimizer_reader
+
+        def load_extra_coordinated(checkpoint_dir):
+            error = None
+            try:
+                cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "loading checkpoint extra state", group=process_group)
+
         with _single_swap_frozen_resume(
             state["model"], optimizer, reader, group=process_group, trainable_only=trainable_only
         ) as frozen_swap_owners:
@@ -2790,7 +2870,7 @@ class DistributedCheckpointer(CheckpointerBase):
                         strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
                     ),
                 )
-                cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
+                load_extra_coordinated(fused_dir)
                 logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
                 return state
 
@@ -2818,7 +2898,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     process_group=process_group,
                     planner=_ModelStrictLoadPlanner(strict_model=False),
                 )
-            cls._load_extra_state(checkpoint_dir=fused_dir if split_fused else model_root, state=state)
+            load_extra_coordinated(fused_dir if split_fused else model_root)
             logger.info_rank0(f"Loaded checkpoint from {model_root}")
             return state
 

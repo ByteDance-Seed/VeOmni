@@ -553,8 +553,10 @@ dtype and does not provide FP32 master weights; it is not equivalent to an
 FP32-master optimizer. Its float32 checkpoint step is accepted only while the
 integer step is exactly representable (at most 2**24).
 For a standalone SwapAdamW, use `DistributedCheckpointer` when parameters may
-be frozen during recovery: it restores their saved optimizer history before
-they are unfrozen. If a frozen parameter has saved history, custom optimizer
+be frozen during recovery: it restores saved optimizer history for frozen
+parameters still owned by the optimizer before they are unfrozen. Source and
+target parameter groups must match even for an owner with no saved moments; a mismatch
+requires the original groups or a verified migration. If a frozen parameter has saved history, custom optimizer
 load-state hooks and trainable-only model checkpoints are rejected; model hooks
 see the original frozen flags. Raw DCP `OptimizerState` does not inspect checkpoint owner
 metadata and can silently omit that history; it retains its original behavior.
