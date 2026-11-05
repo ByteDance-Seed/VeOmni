@@ -17,12 +17,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch import Tensor
 
 from .....registry import SavedState
 from ...optional import optional_tensor, unused_like
+
+
+@lru_cache(maxsize=8)
+def _cached_boundary_tensor(boundaries: tuple[int, ...], dtype, device_name: str, stream_token: int) -> Tensor:
+    """Retain only eight immutable integer uploads, separately for each NPU stream."""
+    del stream_token
+    # Validation/inference warmup must not poison a later training SavedState.
+    with torch.inference_mode(False):
+        return torch.tensor(boundaries, dtype=dtype, device=device_name)
+
+
+def _stage_boundaries(boundaries: Tensor, device: torch.device) -> Tensor:
+    """Reuse CPU boundary uploads by value; mutable inputs cannot produce stale keys."""
+    if boundaries.device.type != "cpu" or device.type != "npu" or torch.compiler.is_compiling():
+        return boundaries.to(device=device, non_blocking=True)
+    stream = int(torch.npu.current_stream(device).npu_stream)
+    return _cached_boundary_tensor(tuple(boundaries.tolist()), boundaries.dtype, str(device), stream)
 
 
 @dataclass(frozen=True)
@@ -56,7 +74,7 @@ def forward(
     elif cu_seqlens.device != x.device:
         # ``veomni.models.auto`` leaves ``cu_seq_lens_q`` on CPU for NPU fusion
         # attention. This kernel indexes ``cu_seqlens`` on ``x.device``.
-        cu_seqlens = cu_seqlens.to(device=x.device, non_blocking=True)
+        cu_seqlens = _stage_boundaries(cu_seqlens, x.device)
 
     if is_arch35():
         raise NotImplementedError("causal_conv1d is not supported on arch35")
