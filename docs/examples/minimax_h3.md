@@ -191,8 +191,7 @@ train:
 ## Packed Offline Training
 
 With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
-Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
-audio) use `process_condition(**batch) → model(**batch)` and return sample-mean
+Both **FL2VA** and **Ref2VA** (image, video, audio and video-with-audio references) use `process_condition(**batch) → model(**batch)` and return sample-mean
 scalar losses. There is no Trainer packing switch or alternate output protocol.
 The recipe defaults to one sample. This does not batch inference requests,
 enable dynamic batching, load new encoders, or implement an RL objective.
@@ -209,14 +208,15 @@ Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
 `mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
 stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
 changing their precision. Samples in one microbatch may differ in task
-(FL2VA/visual Ref2VA, with or without keyframes), target video/audio geometry,
+(FL2VA/Ref2VA, with or without keyframes), target video/audio geometry,
 prompt length, reference count and reference geometry; `DiTDataCollator` fills
 keys a sample lacks with `None`, and multi-sample outputs return per-sample
 prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint
 offload inside modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
 LoRA, compilation and additional parallel/offload combinations are not validated.
 
-FL2VA and Ref2VA layouts now contain exactly `[text | cond | audio | video]`, with
+FL2VA and Ref2VA layouts contain exactly `[text | cond | audio | video]`, with
+Ref2VA condition blocks preserving the ordered visual/audio references and
 `seq_len=used` and `cu_seqlens=[0, used]`. There is no 64-row tail to crop during
 batch packing. Regenerate old cached `packed` metadata with the current builders
 before multi-sample training; latent tensors and embeddings need not be re-encoded.
@@ -233,7 +233,7 @@ every sample keeps weight `1/G`, as with `micro_batch_size=1`. Normalizing by th
 global audio-sample count is not implemented. Caches written without `has_audio`
 keep supervising audio as before.
 
-### Visual Ref2VA prepared data
+### Ref2VA prepared data
 
 Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition
 embeddings. The existing FL2VA embedding recipe does not become a Ref2VA encoder.
@@ -246,7 +246,8 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import b
 # Illustrative geometry; match it to the actual encoded tensors.
 ref_blocks = [
     {"kind": "image", "latent_t": 1, "latent_h": 16, "latent_w": 24},
-    {"kind": "video", "latent_t": 6, "latent_h": 16, "latent_w": 24},
+    {"kind": "video_audio", "latent_t": 6, "latent_h": 16, "latent_w": 24, "ref_audio_t": 40},
+    {"kind": "audio", "ref_audio_t": 80},
 ]
 packed = build_packed_ref2va(
     text_len=prompt_embeds.shape[0],
@@ -266,7 +267,31 @@ be concatenated in reference-block order and already use the same conditioning
 noise augmentation as `model.condition_model_cfg.imgvid_cond_noise_aug`, matching
 the native inference reference encoder. Preserve the Ref2VA presentation's text
 versus vision token tags. Do not substitute target-video keyframes or FL2VA prompt
-embeddings for Ref2VA references. Reference audio is rejected explicitly.
+embeddings for Ref2VA references.
+
+For audio references, also store `ref_audio_anchor` as
+`[packed["audio_cond_rows"], 32]`, concatenated by reference block, with channel-major
+rows inside each block (`pack_audio` order). `video_audio` places its audio rows
+before its video rows. Its audio positions use the reference video spatial grid;
+standalone audio uses the target grid. The target starts after the full reference
+temporal span. Old visual-only caches omit `audio_cond_rows` and remain supported.
+
+Anchors must already include the preparation-time noise augmentation. Store
+`audio_cond_noise_aug` with each cache (default `1.0`, clean); when absent, the
+condition model uses its configured value. Training reuses those rows with their
+near-clean timestep, slices both reference modalities from the predictions, and
+computes loss only on target video/audio. `has_audio=False` masks target audio
+loss without removing reference audio.
+
+The existing native reference encoder supports raw audio and video soundtracks.
+A cache producer can reuse its [`MiniMaxH3Unit_ReferenceEncoder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L844) with a
+loaded H3 pipeline, then [`MiniMaxH3Unit_PromptEmbedder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L605) with the returned
+`ref_blocks`, and build the metadata above. An audio input is
+`{"type": "audio", "audio": waveform, "sample_rate": sample_rate}`; a
+`video_audio` input additionally has `"video": frames`. The native encoder
+resamples audio to the VAE rate, converts it to stereo, and returns the prepared
+anchors. Keep those blocks for positive and negative prompt encoding. This
+preview extends prepared-cache training; the FL2VA CSV embedding recipe is unchanged.
 
 Each sample samples its own timestep/noise through the existing condition path
 before packing. The transformer then executes once over compact rows with
@@ -312,8 +337,8 @@ SDPA, and every other call uses the configured kernel.
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
 geometry and checkpoint recomputation), sample isolation, Ref2VA variable
-references, forward-local SP padding and fail-closed inputs. SP collectives are
-mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
+references, forward-local SP padding and fail-closed inputs. A separate two-process Gloo case compares single-sample SP1/SP2 losses and
+SP-averaged parameter gradients; this does not establish accelerator parity. The FA2/FA3 call
 site is checked for all four backends with a kernel stub that asserts the
 varlen layout; kernel correctness itself is covered by
 `tests/ops/attention/flash/test_flash_attention.py`.
@@ -393,11 +418,21 @@ video, audio = pipe(
 ## Prepared Ref2VA with CFG-aware LoRA
 
 Use [minimax_h3_ref2va_cfg_offline.yaml](../../configs/dit/minimax_h3_ref2va_cfg_offline.yaml)
-with a compatible Ref2VA checkpoint and prepared visual-reference caches.
+with a compatible Ref2VA checkpoint and prepared reference caches.
 It uses the existing `DiTTrainer`, native LoRA, FSDP2 and model-owned packing.
-It does **not** add raw-reference encoding, audio-reference support or a
-Training Adapter downloader. A training/de-distillation adapter is separate from
+The recipe consumes prepared caches; it does not add a raw-reference CSV loader
+or a Training Adapter downloader. A training/de-distillation adapter is separate from
 the trainable LoRA; this recipe does not load one implicitly.
+
+For NVIDIA CUDA BF16 training with SP, prefer cuBLASLt to reduce rounding
+differences when sequence partitioning changes GEMM shapes. Keep the recipe's
+FP32 gradient reduction and `cast_forward_inputs=false`:
+
+```shell
+TORCH_BLAS_PREFER_CUBLASLT=1 NPROC_PER_NODE=2 \
+  bash train.sh tasks/train_dit.py configs/dit/minimax_h3_ref2va_cfg_offline.yaml \
+  --model.accelerator.ulysses_size 2
+```
 
 ```text
 Prepared video/audio latents + paired conditions
@@ -405,7 +440,7 @@ Prepared video/audio latents + paired conditions
             Shared timestep and noise
                 /                 \
 Negative layout                   Positive layout
-(same targets and visual anchors)       |
+(same targets and reference anchors)       |
         |                               |
 Current DiT (no gradient)       Current DiT (gradient enabled)
                 \                 /
@@ -426,7 +461,9 @@ objects, not a new byte-storage schema or a direct Magnus-table reader.
 | `audio_input_latents` | Float tensor `[C,32,Ta]` | Clean audio target |
 | `prompt_embeds` | Float tensor `[L,D]` | Conditional Qwen representation |
 | `packed` | Dictionary from `build_packed_ref2va` | Conditional positions and segment bounds |
-| `ref_visual_anchor` | Float tensor `[cond_rows,96]` | Prepared reference image/video rows |
+| `ref_visual_anchor` | Float tensor `[cond_rows,96]` or absent | Prepared reference image/video rows |
+| `ref_audio_anchor` | Float tensor `[audio_cond_rows,32]` or absent | Prepared reference audio rows |
+| `audio_cond_noise_aug` | Float in `[0,1]` | Matches audio anchor preparation; defaults to condition config |
 | `has_audio` | Boolean | Set false for placeholder audio; its loss is zero |
 | `unconditional_prompt_embeds` | Float tensor `[Lu,D]` | Required per sample when CFG calibration is enabled |
 | `unconditional_packed` | Dictionary from the same layout builder | Required with the negative embedding; uses `Lu` and its own text token tags |
@@ -535,8 +572,9 @@ text_only_negative = condition_model.add_unconditional_cache(
 `unconditional_packed`. It rebuilds the Qwen prefix length/tags and shifts the
 target/reference positions consistently. It cannot recover original references
 from a conditional embedding; keep the prepared source images/frames available
-during dataset creation for the default policy. Reference audio is not supported
-by this recipe. Neither policy infers negatives by truncating positive embeddings.
+during dataset creation for the default policy. Audio reference labels and DiT
+audio anchors are preserved with the same block order. Neither policy infers
+negatives by truncating positive embeddings.
 
 The text-only experiment has precedent in AI Toolkit's
 [cached unconditional prompt construction](https://github.com/ostris/ai-toolkit/blob/2fde764876d096f7bee8b5f5bd137b43aeee773a/extensions_built_in/sd_trainer/SDTrainer.py).
