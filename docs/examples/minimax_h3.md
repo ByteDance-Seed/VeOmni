@@ -288,6 +288,37 @@ variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
 packing; ordinary single-sample attention dispatch is preserved.
 
+### Mixed precision
+
+H3 keeps the official checkpoint's video/audio patch projections, both time
+embedding projections and video/audio output heads in FP32; block, refiner and
+conditioning weights keep the configured BF16/FP16 precision. Projection inputs
+are cast to the projection's own dtype, the time MLP stays FP32, and AdaLN
+applies SiLU before casting to its ordinary projection dtype. Parameter names
+and shapes are unchanged, but the previous BF16 forward numerics intentionally
+change.
+
+Under FSDP2 the six projections are sharded without parameter casting. To reach
+them, `MiniMaxH3DiT` is listed in `_no_split_modules`, which has side effects:
+
+- `MiniMaxH3DiT` is its own FSDP unit: with the default reshard and prefetch
+  settings, its remaining parameters (condition projection, token refiner and
+  final-layer AdaLN) are resharded after forward and gathered again in backward,
+  and manual forward/backward prefetch is enabled. The six FP32 projections stay
+  unsharded between forward and backward.
+- A configured `mixed_precision.output_dtype` also applies to `dit` outputs.
+- Do not add modules containing the FP32 projections to `basic_modules`; they
+  would be wrapped twice.
+- Async activation offload auto-discovery selects only `MiniMaxH3DiTBlock`
+  instances. It does not offload the parent `MiniMaxH3DiT` FSDP unit. Each
+  block owns its checkpoint boundary, so offload leaves backward recomputation
+  active.
+
+Set `mixed_precision.cast_forward_inputs=false`; H3 rejects timesteps or
+positions already cast below FP32. FSDP2 parallelization rejects LoRA on the six
+FP32 projections; other paths do not check. `save_hf_safetensor` exports still
+convert FP32 tensors, including these projections, to BF16.
+
 ### Attention and validation
 
 The DiT and VAE attention backend comes from

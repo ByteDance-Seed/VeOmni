@@ -134,11 +134,15 @@ integration around the outer checkpoint call is needed before combining them.
 
 ### Automatic Module Discovery
 
-Offload targets are automatically derived from `model._no_split_modules` — the same
-class names used for FSDP sharding boundaries. This mirrors the FSDP enablement pattern
-where `_no_split_modules` determines sharding units automatically.
+Offload targets are automatically derived from `model._no_split_modules` by default.
+Models with additional FSDP wrapping boundaries can set
+`_activation_offload_target_classes` to a separate list of class names, so
+offload does not also wrap parent modules. Explicit
+`activation_offload_modules` patterns take precedence over auto-discovery.
 For example, with Qwen3-MoE where `_no_split_modules = ["Qwen3MoeDecoderLayer"]`,
 all `Qwen3MoeDecoderLayer` instances are automatically identified as offload targets.
+See the [model target contract](async_activation_offload_targets.md) for the
+optional override and its interaction with FSDP wrapping.
 
 ## Configuration Reference
 
@@ -171,7 +175,8 @@ apply_async_activation_offload(model, activation_offload_modules=[])
 Args:
 - `model`: The model to apply offloading to.
 - `activation_offload_modules`: Explicit module-name patterns, or `[]` to discover
-  targets from `model._no_split_modules`. Missing or unmatched targets raise an error.
+  targets from `model._activation_offload_target_classes` when defined, otherwise
+  from `model._no_split_modules`. Missing or unmatched targets raise an error.
 - `host_cache_limit_bytes`: Optional idle pinned-buffer cache budget for this call.
 - `host_buffer_pool`: Optional shared `PinnedBufferPool` for multiple model roots;
   mutually exclusive with `host_cache_limit_bytes`.
