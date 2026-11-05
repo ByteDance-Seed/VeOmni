@@ -540,17 +540,26 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 `train.profile.*` — Torch profiler settings.
 
+After resume, the profiler anchors its completed-step count to the saved
+`global_step`. Checkpoints do not record prior exhausted-fetch events, so
+the absolute profiling window may differ from an uninterrupted run after such
+an event; this does not change training or checkpoint steps.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable profiling. |
-| start_step | `int` | `1` | Start step for profiling. |
-| end_step | `int` | `2` | End step for profiling. |
+| start_step | `int` | `1` | Start profiler step, counted from the restored training step using completed step callbacks. |
+| end_step | `int` | `2` | End profiler step; an exhausted data fetch does not advance the profiler. |
 | trace_dir | `str` | `"./trace"` | Directory to save profiling traces. |
 | record_shapes | `bool` | `True` | Record input tensor shapes. |
-| profile_memory | `bool` | `True` | Record memory usage. |
+| profile_memory | `bool` | `True` | Record memory events; on NPU they are kept in the torch_npu trace rather than a CUDA `.pkl` allocator snapshot. |
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
+| npu_analysis_mode | `Literal["offline", "async"]` | `"offline"` | Ascend only. `offline` finalizes raw data and auto-uploads a postprocessed profiling asset in Merlin through a platform file uploader or `merlin-cli`; if neither uploader is available, it preserves raw data. JSON/base64 SDK upload is intentionally avoided for large traces. `async` uses torch_npu's online process pool (`analyse_flag=True, async_mode=True`). Use a pod-local directory for `async`. Distributed barriers cover raw finalization and handler submission, not background analysis. |
+| npu_postprocess | `bool` | `True` | Run offline NPU trace analysis and durable copy in a detached sidecar after raw finalization. |
+| npu_upload | `bool` | `True` | Allow upload through an explicit or platform file uploader, even outside a JobRun. The `merlin-cli` fallback and automatic Trial association require a JobRun context. |
+| npu_sidecar_wait_timeout | `float` | `300.0` | Maximum seconds to wait for detached NPU postprocessing after training. |
 
 ### ChannelLossConfig
 

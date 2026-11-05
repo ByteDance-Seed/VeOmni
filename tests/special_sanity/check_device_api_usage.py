@@ -59,6 +59,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # CPU-only scheduler tests use literal CUDA/NPU backend names as fixtures
     # to validate device leases and launch plans without accessing hardware.
     "tests/ci/test_accelerator.py",
+    # CPU profiler fixtures mock CUDA/NPU backend names to verify memory-history
+    # options; they do not select devices or execute vendor APIs.
+    "tests/utils/test_profiler_config.py",
     # CPU-only argument tests pass an accelerator name to mocked builders to
     # exercise inherited FP8 policies without allocating accelerator tensors.
     "tests/arguments/test_model_arguments.py",
