@@ -474,6 +474,7 @@ weight stay on the model side.
 | `rms_norm_implementation` | `{Model}RMSNorm` | `VeomniOp("rms_norm", variant, impl)` |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `VeomniOp("rope", variant, impl)` |
 | `swiglu_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("swiglu_mlp", "standard", impl)` |
+| `linear_implementation` | `{Model}Attention.q/k/v/o_proj` | `VeomniOp("linear", "standard", impl)` |
 
 The selected registry row determines the callable and validates its hardware
 and optional-package requirements when the handle is constructed.
@@ -491,7 +492,7 @@ supported values are `triton` and `eager`.
 
 - Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
-- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
+- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp,linear}/__init__.py`
 - Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
 
 ---

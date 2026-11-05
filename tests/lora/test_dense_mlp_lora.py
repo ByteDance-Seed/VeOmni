@@ -161,3 +161,39 @@ def test_lora_projections_at_init_match_eager_row_bitwise(family: str):
         base_out = mlp(x)
         lora_out = _wrap(mlp)(x)
     assert torch.equal(lora_out, base_out)
+
+
+@pytest.mark.parametrize("family", list(_FAMILIES))
+@pytest.mark.parametrize("impl", ["eager", "liger_kernel"])
+def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
+    """An adapter on the projections must not be blocked just because the row reads weights.
+
+    Only a fake-quantizing row needs the projection's own ``weight``; the fused
+    arithmetic rows keep the projection-module fallback that ``main`` has always
+    used for a wrapped projection. This is the case a "reject every non-eager
+    impl" guard breaks, and ``liger_kernel`` is the GPU/MLU default.
+    """
+    build, variant = _FAMILIES[family]
+    if impl not in OP_REGISTRY.list_available("swiglu_mlp", variant):
+        pytest.skip(f"swiglu_mlp/{variant}/{impl} is unavailable on this device")
+    mlp = _build_mlp(family, impl, torch.float32, get_device_type())
+    model = _wrap(mlp)
+
+    x = torch.randn(2, 5, 16, device=get_device_type())
+    out = model(x)
+    assert out.shape[0] == 2
+    out.sum().backward()
+
+
+@pytest.mark.skipif(
+    "torchao_mxfp4" not in OP_REGISTRY.list_available("swiglu_mlp", "standard"),
+    reason="the torchao_mxfp4 row needs the optional 'torchao' package",
+)
+def test_mlp_lora_refuses_the_quantizing_row():
+    """Silently running the base layer at full precision would leave the config claiming QAT."""
+    mlp = _build_mlp("qwen3", "torchao_mxfp4", torch.float32, get_device_type())
+    model = _wrap(mlp)
+
+    x = torch.randn(2, 5, 16, device=get_device_type())
+    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
+        model(x)
