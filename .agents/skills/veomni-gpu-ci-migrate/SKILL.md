@@ -61,7 +61,7 @@ rg -n 'pytest|torchrun|working-directory|matrix|uses:|run:' .github/workflows
 rg --files tests
 ```
 
-These searches find candidates; read the full relevant YAML and invoked scripts.
+The accelerator workflows invoke `python -m scripts.ci.accelerator`. For each selected job, trace its backend, suite and conditional flags into `scripts/ci/accelerator/suites/gpu.json`; compare the corresponding entries in `scripts/ci/accelerator/suites/npu.json`. Record manifest selectors and filters, not just the workflow command.
 The absence of a direct pytest line does not prove a job has no tests.
 
 ### 1.2 Resolve each command in its execution context
@@ -220,7 +220,7 @@ unresolved cause instead of continuing speculative edits. Continue independent r
 1. Read the current NPU workflow and ownership rules in testing knowledge.
 2. Check exact-file and directory-level selections, including filters.
 3. If already selected, record existing coverage; do not add duplicate commands.
-4. Otherwise add a minimal explicit selector under the correct unit/e2e job.
+4. For an uncovered accelerator case, add the minimal selector to `scripts/ci/accelerator/suites/npu.json` with the correct `suite` (`unit` or `e2e`). Keep runner setup and triggers in the workflow YAML.
 5. Preserve runner/image/dependency conventions and separate CPU-only contract
    overrides from real-NPU/compiler claims.
 6. Add a hardware preflight matching each launch's worker count, bounded execution

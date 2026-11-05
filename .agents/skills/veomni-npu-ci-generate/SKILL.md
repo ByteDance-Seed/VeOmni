@@ -179,7 +179,7 @@ One pytest case that checks six collective paths is still one collected case.
 
 Inspect the actual unit/e2e owner, runner, image, dependencies and job conditions.
 If an existing directory or command selects the case, no new CI line is needed.
-Otherwise add the smallest explicit file/selector entry in its owning workflow.
+For an uncovered accelerator case, add the smallest selector to `scripts/ci/accelerator/suites/npu.json` under the appropriate `suite` (`unit` or `e2e`). The workflow calls the shared accelerator runner; keep machine setup and triggers in YAML. Declare card requirements via the case launch plan, using the same configuration that launches its workers.
 
 Preserve repository launch conventions. Include a hardware preflight for real-device
 coverage, matching the largest launch in that step, bounded execution and JUnit
