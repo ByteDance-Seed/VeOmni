@@ -178,9 +178,13 @@ def _asymmetric_optimizer_preflight(rank, root, case):
             return SimpleNamespace(size=lambda: 2)
 
     class FakeOptimizer:
-        _is_multi_optimizer = not (case == "wrong_type" and rank == 0)
+        _is_multi_optimizer = not (case.startswith("wrong_type") and rank == 0)
+        called = False
 
         def state_dict(self):
+            self.called = True
+            if case == "wrong_type_collective":
+                dist.barrier()
             return {"state.experts.weight.exp_avg": torch.ones(2, 3)} if rank == 0 else {}
 
     dist.init_process_group(
@@ -191,15 +195,19 @@ def _asymmetric_optimizer_preflight(rank, root, case):
         spec = SimpleNamespace(placement=Shard(0), para_fsdp_mesh=FakeMesh())
         model = SimpleNamespace(_fqn2spec_info={"experts.weight": spec})
         parallel = SimpleNamespace(dp_mode="fsdp2")
-        optimizer = dcp_checkpointer.OptimizerState(model, FakeOptimizer(), parallel_state=parallel)
+        leaf = FakeOptimizer()
+        optimizer = dcp_checkpointer.OptimizerState(model, leaf, parallel_state=parallel)
         checkpoint = Path(root) / "rejected"
-        if rank == 0 and case == "wrong_type":
-            exception, message = AssertionError, "not a MultiOptimizer"
+        if rank == 0 and case.startswith("wrong_type"):
+            message = "not a MultiOptimizer"
+        elif case.startswith("wrong_type"):
+            message = "validating ExtraParallel optimizer type"
         else:
-            exception = RuntimeError
             message = "no proven replica layout" if rank == 0 else "preparing ExtraParallel optimizer checkpoint state"
-        with pytest.raises(exception, match=message):
+        with pytest.raises(RuntimeError, match=message):
             dcp.save({"optimizer": optimizer}, checkpoint_id=checkpoint)
+        if case.startswith("wrong_type"):
+            assert not leaf.called
         assert not (checkpoint / ".metadata").exists()
         value = torch.ones(())
         dist.all_reduce(value)
@@ -209,6 +217,6 @@ def _asymmetric_optimizer_preflight(rank, root, case):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("case", ["plain_state", "wrong_type"])
+@pytest.mark.parametrize("case", ["plain_state", "wrong_type", "wrong_type_collective"])
 def test_asymmetric_optimizer_preflight_rejects_every_rank(tmp_path, case):
     torch.multiprocessing.spawn(_asymmetric_optimizer_preflight, args=(str(tmp_path), case), nprocs=2, join=True)

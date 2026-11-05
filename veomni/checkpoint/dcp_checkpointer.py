@@ -434,11 +434,16 @@ class OptimizerState(Stateful):
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
+            # Validate locally before any rank enters state_dict(), which can
+            # contain collectives. A single rank's type error must not race
+            # another rank's optimizer collective against our error reduction.
+            error = None
+            if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                error = RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+            raise_if_any_rank_failed(error, "validating ExtraParallel optimizer type", group=self.process_group)
+
             optim_sd_with_extra_parallel_dim, error = None, None
             try:
-                assert self.optimizer._is_multi_optimizer, (
-                    "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-                )
                 vanilla_optim_sd = self.optimizer.state_dict()
                 optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                     vanilla_optim_sd, "restore"
