@@ -50,6 +50,7 @@ from ..distributed.parallel_state import ParallelState, get_parallel_state, is_p
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -872,32 +873,21 @@ def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
 
 
 def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
-    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
-
-    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
-    A metadata-only construction computes the same global shape/stride/spec;
-    attaching the actual local shard then preserves CPU storage and the original
-    mesh identity. DTensor's spec constructor is intentionally isolated here.
-    No collectives or accelerator allocations are needed (run_check=False).
-    """
-    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
-        metadata = DTensor.from_local(
-            local_tensor.to("meta"),
-            device_mesh=device_mesh,
-            placements=placements,
-            run_check=False,
-            shape=shape,
-            stride=stride,
+    """Wrap CPU optimizer shards without moving or changing their strides."""
+    if local_tensor.device.type != "cpu" or device_mesh.device_type == "cpu":
+        return DTensor.from_local(
+            local_tensor, device_mesh=device_mesh, placements=placements, run_check=False, shape=shape, stride=stride
         )
-        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
-    return DTensor.from_local(
+    wrapped = rewrap_dtensor_local(
         local_tensor,
-        device_mesh=device_mesh,
+        mesh=device_mesh,
         placements=placements,
-        run_check=False,
         shape=shape,
         stride=stride,
     )
+    if wrapped.requires_grad != local_tensor.requires_grad:
+        wrapped = DTensor(local_tensor, wrapped._spec, requires_grad=local_tensor.requires_grad)
+    return wrapped
 
 
 def _chunk_extent(extent: int, num_chunks: int, index: int) -> int:
@@ -1162,7 +1152,16 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the
@@ -1315,15 +1314,24 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
+    if num_placements in (2, 3) and any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
+        ndim = loaded_tensor.ndim
+        if not -ndim <= fsdp_shard_dim < ndim:
+            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+        fsdp_shard_dim %= ndim
     if num_placements == 1 or all(isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
         )
     else:
         raise RuntimeError(
@@ -1388,7 +1396,11 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
             placements = [fsdp_placement, Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(
+            orgin_tensor._local_tensor,
+            device_mesh=fsdp_mesh,
+            placements=placements,
+        )
     elif torch.is_tensor(orgin_tensor):
         # A plain model tensor has no FSDP shard. The caller must ensure every
         # FSDP/HSDP replica for the same ExtraParallel coordinate has identical
@@ -1400,7 +1412,7 @@ def restore_extra_parallel_dim(
         if fsdp_mesh.mesh_dim_names is None:
             raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
         placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
