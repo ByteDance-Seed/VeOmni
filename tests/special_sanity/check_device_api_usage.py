@@ -69,6 +69,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/transformers/test_model_forward_no_implicit_sync.py",
+    # H3 cuDNN tests use explicit CUDA metadata (including ROCm rejection) and
+    # torch.backends.cuda SDPA flags, which have no device-agnostic equivalent.
+    # Only the real-kernel case requires an NVIDIA GPU; other cases run on CPU.
+    "tests/models/test_minimax_h3_packing.py",
     # Precision and async-offload tests explicitly select CUDA/NPU devices by
     # name to exercise accelerator-specific code paths; the literal "cuda" is
     # a test fixture, not a production device-API call.
