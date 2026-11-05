@@ -178,13 +178,45 @@ bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/bas
 
 The conversation graph stays the reference path: it is what inference uses, what
 the packed graph is checked against (`test_qwen3vl_packing.py`), and it is what you
-should ship first. Packing only removes prefill padding, so treat it as a
-throughput knob to reach for when profiling shows that padding is costing you. On
-Qwen3-Omni-30B-A3B it measured −1.01% step time at a VRAM-saturating batch and
-−0.44% at mbs=2, against `fsdp_scope: model` alone recovering 0.47% / 0.21% of
-that same gap; the speech round showed 0.18%, inside its own jitter. See
-[Adding a model §4.1](../usage/adding_a_model.md#41-packing-is-optional) for the
-full numbers and why the ceiling is padding.
+should ship first.
+
+What packing buys here is **not** padding removal — the conversation path does not
+pad either; `pack_llm_conversations_for_forward` already concatenates every
+sample's embed segments into one varlen sequence. The difference is *where the
+per-item work happens*:
+
+- **Packed.** The CPU preprocessor does template / tokenize / patchify in the
+  dataloader worker and emits one `packed_input_ids` / `packed_position_ids` /
+  `packed_attention_mask` triple. `batch_to_device` moves those top-level tensors
+  in one transfer; `pre_forward` then only builds the varlen args.
+- **Conversation.** The carrier's tensors are built per item in the worker, and
+  `batch_to_device` deliberately leaves them there — "tensors a module keeps
+  inside its conversation items stay where the preprocessor built them; placing
+  those is the module's own `pre_forward` job". So the step pays one
+  `to(device)` per `ConversationItem` (18–48 of them per micro-batch) plus a
+  `torch.cat` over all of them, on the critical path.
+
+Measured on one A100-SXM4-80GB against the real
+`/mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct` (28 layers, hidden 2048), each
+sample 4 images of 144 merged rows plus two ~400-token text turns:
+
+| Samples / micro-batch | items | rows | per-item placement (conversation) | one-shot (packed) | backbone forward | saved |
+|---|---|---|---|---|---|---|
+| 3 | 18 | 4 128 | 1.26 ms | 0.05 ms | 223 ms | **0.54%** |
+| 8 | 48 | 11 008 | 4.55 ms | 0.08 ms | 511 ms | **0.88%** |
+
+So packing is worth **under 1% of a step** at this size, and it is the only thing
+it removes. The saving scales with **item count, not token count**: a micro-batch
+of many short samples (more items per row) gains proportionally more than a few
+long ones.
+
+On Qwen3-Omni-30B-A3B the same fixed cost was −1.01% step time at a
+VRAM-saturating batch and −0.44% at mbs=2, against `fsdp_scope: model` alone
+recovering 0.47% / 0.21% of that gap, and 0.18% (inside its own jitter) in the
+speech round. See [Adding a model §4.1](../usage/adding_a_model.md#41-packing-is-optional)
+for those numbers.
+
+Reproduce: `python scripts/seed_omni/bench_packed_qwen3vl.py`.
 
 Note the packed launcher currently reports no per-sample sequence lengths to the
 metric meter, so multi-source token accounting is zero on this path.

@@ -120,34 +120,54 @@ its own embeddings and `masked_scatter`s them back.
 
 **Adding a model does not require it.** Ship the conversation graph first: it is
 the reference path, it is what inference uses, and it is what the packed graph is
-checked against. Packing is a throughput optimization, not a capability: it buys
-the padding removed from the prefill, and nothing else.
+checked against. Packing is a throughput optimization, not a capability.
 
-How much it buys is measured, not assumed. On Qwen3-Omni-30B-A3B
-(`scripts/seed_omni/bench_module_split/`, four arms on the same replay batch):
+It is also not a padding win, despite how it reads: the conversation path does not
+pad either — it concatenates every sample's embed segments into one varlen
+sequence too. What packing changes is *where* the per-item work runs. The packed
+path has the dataloader worker emit one ready-made tensor triple, so
+`batch_to_device` moves it in a single transfer. The conversation path's carrier
+tensors are built per item and `batch_to_device` deliberately leaves them on the
+host ("placing those is the module's own `pre_forward` job"), so the step pays one
+`to(device)` per `ConversationItem` plus a `torch.cat` over all of them.
+
+So the gain is bounded by the step's Python and H2D bookkeeping, not by the
+model's FLOPs, and it scales with **item count** rather than token count. Measured
+against the real Qwen3-VL-2B checkpoint on one A100 (4 images + two ~400-token
+turns per sample):
+
+| Samples / micro-batch | items | per-item placement | one-shot | backbone forward | saved |
+|---|---|---|---|---|---|
+| 3 | 18 | 1.26 ms | 0.05 ms | 223 ms | 0.54% |
+| 8 | 48 | 4.55 ms | 0.08 ms | 511 ms | 0.88% |
+
+On Qwen3-Omni-30B-A3B the same fixed cost measured −1.01% step time at a
+VRAM-saturating batch and −0.44% at mbs=2, against `fsdp_scope: model` alone
+recovering 0.47% / 0.21% of that same gap.
 
 | Round | `packed` vs `split` | `packed` vs `mfsdp` |
 |-------|--------------------|---------------------|
-| thinker, mbs=12 (VRAM-saturating) | −1.01% | −0.54% |
-| thinker, mbs=2 | −0.44% | −0.23% |
-| speech (6 modules, text+speech loss), mbs=32 | −3.45% | −0.18% |
+| Qwen3-VL-2B, 3 samples, 4.1k rows | n/a | −0.54% |
+| Qwen3-VL-2B, 8 samples, 11k rows | n/a | −0.88% |
+| Qwen3-Omni-30B, thinker mbs=12 (VRAM-saturating) | −1.01% | −0.54% |
+| Qwen3-Omni-30B, thinker mbs=2 | −0.44% | −0.23% |
+| Qwen3-Omni-30B, speech (6 modules), mbs=32 | −3.45% | −0.18% |
 
 Two readings matter here:
 
-- **The data path is the smallest of the levers.** `split` → `mfsdp`
-  (`fsdp_scope: model`) already recovers most of it (0.47% / 0.21% / 3.28%);
-  the packed path adds 0.18–0.54% on top, which at the saturated batch is inside
-  its own 27 ms run-to-run jitter.
-- **Its ceiling is padding.** Where the sequence is already near-full, or where a
-  module runs one utterance at a time regardless (the talker), packing has nothing
-  left to remove — hence the 0.18% in the speech round against a 3.45% total, all
-  of which `mfsdp` alone already delivered.
+- **The wrap scope is the bigger lever.** `split` → `mfsdp` (`fsdp_scope: model`)
+  recovers 0.47% / 0.21% / 3.28% on the Omni rounds, leaving the data path
+  0.18–0.54% on top — inside packed's own 27 ms jitter at the saturated batch.
+- **It buys step-side overhead, nothing else.** Where a module runs one utterance
+  at a time regardless (the talker), or the micro-batch holds few samples, there
+  is little left to win.
 
-So add a packed graph when profiling shows prefill padding is actually costing
-you. It is extra surface: a second train graph, `pack_*` hooks on every module in
-it, its own collation contract in `SeedOmniCollator`, and a parity test against
-the conversation path (`tests/seed_omni/modules/<family>/test_*_packing.py`).
-None of that is on the critical path for "support model X".
+So add a packed graph when profiling shows `pre_forward` bookkeeping is a
+measurable slice of the step. It is extra surface: a second train graph, `pack_*`
+hooks on every module in it, its own collation contract in `SeedOmniCollator`, and
+a parity test against the conversation path
+(`tests/seed_omni/modules/<family>/test_*_packing.py`). None of that is on the
+critical path for "support model X".
 
 ## 5. Honour the contracts
 
