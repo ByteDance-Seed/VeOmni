@@ -521,6 +521,9 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
+| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
+| state_offload_device_memory_fraction | `float` | `0.8` | With `state_offload="cpu"`, fraction of currently free device memory used to size one streamed batch of optimizer states. It is recomputed every step; a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
+| state_offload_pin_memory | `bool` | `True` | With `state_offload="cpu"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
 ### WandbConfig
 
@@ -718,7 +721,7 @@ configured and never round-trip through a saved config.
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
-| offload | `bool` | `False` | Enable CPU offload. |
+| offload | `bool` | `False` | Enable CPU offload. Cannot be combined with `model.optimizer.state_offload="cpu"`: both move training state to host, and the combination is rejected at config parse time. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | expert_fsdp_shard_dim | `Optional[int]` | `None` | Override EP expert FSDP2 placement: `0` shards whole experts, `1` splits matrix rows. `None` preserves the existing placement/Muon policy; explicit values override it. Dim 0 requires evenly divisible local expert stacks. Applies to BF16 and FP8; see [FP8 MoE](../design/deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine). |
 | expert_weight_fp8_all_gather | `bool` | `False` | Gather DeepGEMM routed expert weights as E4M3 payloads and 128x128 block scales. Ignored when no experts use `deepgemm_fp8`. Selected experts require native FSDP2, BF16 mixed precision, block-aligned shards and no CPU offload. See [FP8 MoE](../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather). |
