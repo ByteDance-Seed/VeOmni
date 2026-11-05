@@ -134,6 +134,10 @@ config.add_import(
     names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
+)
+config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )

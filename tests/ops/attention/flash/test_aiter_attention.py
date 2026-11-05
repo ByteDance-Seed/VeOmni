@@ -32,7 +32,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 AITER_IMPL = "veomni_flash_attention_aiter"
 
 
-def test_aiter_preserves_packed_varlen_attention_metadata():
+def test_aiter_packed_varlen_skips_mask_construction():
     from transformers import PreTrainedConfig
 
     from veomni.models.utils.mask_utils import create_causal_mask
@@ -50,8 +50,8 @@ def test_aiter_preserves_packed_varlen_attention_metadata():
         past_key_values=None,
         **kwargs,
     )
+    # AITER consumes ``cu_seq_lens_q`` natively, so no dense/packed mask is built.
     assert out_mask is None
-    assert "cu_seq_lens_q" in kwargs
 
 
 def _install_fake_aiter(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict]:

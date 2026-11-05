@@ -36,6 +36,7 @@ from transformers.masking_utils import (
     create_sliding_window_causal_mask as _hf_create_sliding_window_causal_mask,
 )
 
+from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
 from veomni.ops.mask import (
     MagiAttentionMask,
     packed_causal_mask,
@@ -83,6 +84,8 @@ def _should_use_packed_mask(cu_seqlens: Tensor | None, attn_impl: str) -> bool:
     if cu_seqlens is None:
         return False
     canonical = attn_impl.removeprefix("veomni_")
+    if canonical == "sage_attention":
+        return False
     if canonical in ("flex_attention", "magi_attention"):
         return True
     return cu_seqlens.numel() >= 3
@@ -93,6 +96,31 @@ def _is_prebuilt_mask(attention_mask: Tensor | BlockMask | MagiAttentionMask | N
     if isinstance(attention_mask, (BlockMask, MagiAttentionMask)):
         return True
     return isinstance(attention_mask, Tensor) and attention_mask.ndim == 4
+
+
+def _resolve_skip_ulysses(attn_impl: str, extra_kwargs: dict[str, Any]) -> bool:
+    """Return whether mask construction should keep rank-local sequence lengths."""
+    canonical = attn_impl.removeprefix("veomni_")
+    return bool(extra_kwargs.get("skip_ulysses", False)) or canonical == "eager"
+
+
+def _validate_existing_4d_mask(existing_4d: Tensor, q_len: int, attn_impl: str, extra_kwargs: dict[str, Any]) -> None:
+    """Validate that a pre-built 3D/4D mask matches the post-Ulysses sequence length."""
+    eff_q_len, _ = effective_sequence_lengths(
+        q_len,
+        q_len,
+        skip_ulysses=_resolve_skip_ulysses(attn_impl, extra_kwargs),
+    )
+    if existing_4d.shape[-2] != eff_q_len:
+        raise ValueError(
+            "packed SDPA/eager attention requires the existing mask query length "
+            f"to match hidden_states, got {existing_4d.shape[-2]} and {eff_q_len}"
+        )
+    if existing_4d.shape[-1] != eff_q_len:
+        raise ValueError(
+            "packed SDPA/eager attention does not support cached sequences "
+            f"(q_len={eff_q_len}, kv_len={existing_4d.shape[-1]}); use a packed-capable impl or disable cache"
+        )
 
 
 def _merge_dense_attention_masks(existing: Tensor, packed: Tensor) -> Tensor:
@@ -184,14 +212,12 @@ def _build_packed_mask_kwargs(
     extra_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble keyword arguments for ``packed_causal_mask`` / ``sliding_window_mask``."""
-    canonical = attn_impl.removeprefix("veomni_")
-    skip_ulysses = bool(extra_kwargs.get("skip_ulysses", False)) or canonical == "eager"
     packed_kwargs: dict[str, Any] = {
         "impl": attn_impl,
         "device": inputs_embeds.device,
         "batch_size": inputs_embeds.shape[0],
         "dtype": inputs_embeds.dtype,
-        "skip_ulysses": skip_ulysses,
+        "skip_ulysses": _resolve_skip_ulysses(attn_impl, extra_kwargs),
     }
     if attention_mask is not None and attention_mask.ndim == 2:
         packed_kwargs["attention_mask"] = attention_mask
@@ -239,21 +265,7 @@ def create_causal_mask(
         q_len = inputs_embeds.shape[1]
         kv_len = q_len + past_seen
         if existing_4d is not None:
-            from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
-
-            canonical = attn_impl.removeprefix("veomni_")
-            skip_ulysses = bool(kwargs.get("skip_ulysses", False)) or canonical == "eager"
-            eff_q_len, _ = effective_sequence_lengths(q_len, q_len, skip_ulysses=skip_ulysses)
-            if existing_4d.shape[-2] != eff_q_len:
-                raise ValueError(
-                    "packed SDPA/eager attention requires the existing mask query length "
-                    f"to match hidden_states, got {existing_4d.shape[-2]} and {eff_q_len}"
-                )
-            if existing_4d.shape[-1] != eff_q_len:
-                raise ValueError(
-                    "packed SDPA/eager attention does not support cached sequences "
-                    f"(q_len={eff_q_len}, kv_len={existing_4d.shape[-1]}); use a packed-capable impl or disable cache"
-                )
+            _validate_existing_4d_mask(existing_4d, q_len, attn_impl, kwargs)
         packed_kwargs = _build_packed_mask_kwargs(
             config=config,
             inputs_embeds=inputs_embeds,
@@ -282,10 +294,11 @@ def create_causal_mask(
     if _is_prebuilt_mask(attention_mask):
         return attention_mask
 
+    hf_impl = "veomni_sage_attention" if attn_impl == "sage_attention" else attn_impl
     previous_impl = getattr(config, "_attn_implementation", None)
-    changed_impl = previous_impl != attn_impl
+    changed_impl = previous_impl != hf_impl
     if changed_impl:
-        config._attn_implementation = attn_impl
+        config._attn_implementation = hf_impl
     try:
         return _hf_create_causal_mask(
             config=config,
@@ -335,21 +348,7 @@ def create_sliding_window_causal_mask(
         q_len = inputs_embeds.shape[1]
         kv_len = q_len + past_seen
         if existing_4d is not None:
-            from veomni.ops.kernels.attention.ulysses import effective_sequence_lengths
-
-            canonical = attn_impl.removeprefix("veomni_")
-            skip_ulysses = bool(kwargs.get("skip_ulysses", False)) or canonical == "eager"
-            eff_q_len, _ = effective_sequence_lengths(q_len, q_len, skip_ulysses=skip_ulysses)
-            if existing_4d.shape[-2] != eff_q_len:
-                raise ValueError(
-                    "packed SDPA/eager attention requires the existing mask query length "
-                    f"to match hidden_states, got {existing_4d.shape[-2]} and {eff_q_len}"
-                )
-            if existing_4d.shape[-1] != eff_q_len:
-                raise ValueError(
-                    "packed SDPA/eager attention does not support cached sequences "
-                    f"(q_len={eff_q_len}, kv_len={existing_4d.shape[-1]}); use a packed-capable impl or disable cache"
-                )
+            _validate_existing_4d_mask(existing_4d, q_len, attn_impl, kwargs)
         packed_kwargs = _build_packed_mask_kwargs(
             config=config,
             inputs_embeds=inputs_embeds,
@@ -385,10 +384,11 @@ def create_sliding_window_causal_mask(
     if _is_prebuilt_mask(attention_mask):
         return attention_mask
 
+    hf_impl = "veomni_sage_attention" if attn_impl == "sage_attention" else attn_impl
     previous_impl = getattr(config, "_attn_implementation", None)
-    changed_impl = previous_impl != attn_impl
+    changed_impl = previous_impl != hf_impl
     if changed_impl:
-        config._attn_implementation = attn_impl
+        config._attn_implementation = hf_impl
     try:
         return _hf_create_sliding_window_causal_mask(
             config=config,

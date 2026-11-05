@@ -382,3 +382,31 @@ def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
     assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
     assert not mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
     assert mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
+
+
+@pytest.mark.parametrize("impl", ["sage_attention", "veomni_sage_attention"])
+def test_mask_utils_keeps_sage_attention_on_flash_mask_path(impl):
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    inputs_embeds = torch.randn(1, 8, 16)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    all_ones = torch.ones(1, 8, dtype=torch.long)
+    mask_valid = create_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=all_ones,
+        past_key_values=None,
+        cu_seq_lens_q=cu_seqlens,
+    )
+    assert mask_valid is None
+
+    padded = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long)
+    mask_padded = create_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=padded,
+        past_key_values=None,
+        cu_seq_lens_q=cu_seqlens,
+    )
+    assert isinstance(mask_padded, torch.Tensor) and mask_padded.shape == (1, 8)

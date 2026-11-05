@@ -551,3 +551,65 @@ def test_qwen3_packed_flex_matches_independent_samples_on_cuda():
         torch.zeros_like(packed_inputs.grad[:, :3]),
     )
     assert packed_inputs.grad[:, 3:].abs().max() > 0
+
+
+def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, available_nvidia_ops):
+    """Packed Qwen3 inference with ``veomni_sage_attention`` routes through the segment-splitting adapter."""
+    from veomni.ops.kernels.attention.standard import sage as sage_backend
+
+    def fake_sage(query, key, value, tensor_layout="HND", is_causal=False, sm_scale=None):
+        del tensor_layout
+        num_kv_groups = query.shape[1] // key.shape[1]
+        if num_kv_groups > 1:
+            key = key.repeat_interleave(num_kv_groups, dim=1)
+            value = value.repeat_interleave(num_kv_groups, dim=1)
+        scale = (query.shape[-1] ** -0.5) if sm_scale is None else sm_scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        if is_causal and query.shape[-2] > 1:
+            causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device).tril()
+            scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        return torch.matmul(weights, value)
+
+    monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+
+    torch.manual_seed(129)
+    config = _tiny_config()
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_sage_attention"
+    model = _build_qwen3(config, ops).eval()
+
+    first_input_ids = torch.tensor([[5, 6, 7]])
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    with torch.no_grad():
+        packed_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=torch.ones_like(packed_input_ids),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            use_cache=False,
+        ).logits
+        first_logits = model(
+            input_ids=first_input_ids,
+            attention_mask=torch.ones_like(first_input_ids),
+            position_ids=torch.arange(3).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 3], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            input_ids=second_input_ids,
+            attention_mask=torch.ones_like(second_input_ids),
+            position_ids=torch.arange(5).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 5], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
