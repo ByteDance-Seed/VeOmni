@@ -495,8 +495,7 @@ def test_qwen3_mxfp4_qat_refuses_a_wrapped_projection():
         model(input_ids=input_ids, use_cache=False)
 
 
-@pytest.mark.parametrize("linear_impl", ["eager"])
-def test_qwen3_lora_runs_with_the_eager_linear_row(linear_impl: str):
+def test_qwen3_lora_runs_with_the_eager_linear_row():
     """The shipped qwen3_lora.yaml targets the attention projections; the fallback must still forward."""
     import copy
 
@@ -506,7 +505,7 @@ def test_qwen3_lora_runs_with_the_eager_linear_row(linear_impl: str):
     config = _tiny_config()
     model = _build_qwen3(
         copy.deepcopy(config),
-        SimpleNamespace(**{**vars(eager_ops_config()), "linear_implementation": linear_impl}),
+        SimpleNamespace(**{**vars(eager_ops_config()), "linear_implementation": "eager"}),
     )
     model.eval()
     input_ids = torch.randint(3, config.vocab_size, (1, 4))
@@ -523,3 +522,40 @@ def test_qwen3_lora_runs_with_the_eager_linear_row(linear_impl: str):
 
     # Zero-initialized lora_B keeps an injected adapter a no-op at construction.
     torch.testing.assert_close(after, before, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(
+    not is_package_available("torchao"),
+    reason="the torchao_mxfp4 swiglu_mlp row needs the optional 'torchao' package",
+)
+def test_qwen3_mxfp4_qat_refuses_a_wrapped_mlp_projection():
+    """The fused MLP row quantizes the weights it is handed; a wrapped projection has none.
+
+    Forwarding the unquantized base layer instead would leave the config claiming
+    MXFP4 while the step runs at full precision.
+    """
+    import copy
+
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    config = _tiny_config()
+    model = _build_qwen3(
+        copy.deepcopy(config),
+        SimpleNamespace(
+            **{
+                **vars(eager_ops_config()),
+                "linear_implementation": "eager",
+                "swiglu_mlp_implementation": "torchao_mxfp4",
+            }
+        ),
+    )
+    inject_dense_lora(
+        model.model,
+        VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=["gate_proj", "up_proj", "down_proj"]),
+        "default",
+    )
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
+        model(input_ids=input_ids, use_cache=False)

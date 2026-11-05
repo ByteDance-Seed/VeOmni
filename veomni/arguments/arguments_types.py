@@ -1456,7 +1456,7 @@ class OpsImplementationConfig:
 
     - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
       ``rms_norm``, ``rotary_pos_emb``,
-      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``linear``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
     - **Model-build time** (instance-local ``VeomniOp`` resolution) for

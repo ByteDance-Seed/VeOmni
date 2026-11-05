@@ -39,8 +39,27 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
 
     A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
     its own forward, so the MLP has to call the projection modules instead.
+
+    Raises:
+        ValueError: when the projections are wrapped while ``mlp``'s own
+            ``swiglu_mlp`` selection quantizes. Falling back would run the base
+            layers at full precision while the config still claims
+            quantization-aware training, which is a silent correctness bug
+            rather than a graceful degradation.
     """
-    return all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    if plain:
+        return True
+
+    handle = getattr(mlp, "veomni_swiglu_mlp", None)
+    impl = getattr(handle, "impl", None)
+    if impl is not None and impl != "eager":
+        raise ValueError(
+            f"swiglu_mlp_implementation={impl!r} cannot run on a wrapped projection: the row fake-quantizes "
+            "the projection weights it is handed, and a layer substituted after construction (LoRA) keeps "
+            "them at `base_layer`. Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down."
+        )
+    return False
 
 
 register_op(
