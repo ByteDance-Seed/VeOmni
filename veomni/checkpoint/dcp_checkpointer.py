@@ -185,6 +185,25 @@ def _ordinary_expert_fqns(model, parallel_state):
     return result - ambiguous
 
 
+def _logical_extra_parallel_key(key, state_dict):
+    # The save planner's metadata keeps the serialized key, but ownership is
+    # expressed in logical FQNs. Canonical v2 checkpoints namespace both model
+    # and optimizer keys, so strip only the verified layout marker for lookup.
+    root, sep, rest = key.partition(".")
+    if not sep or root not in ("model", "optimizer"):
+        return key
+    marker = _extra_parallel_layout_key({})
+    marker_value = state_dict.get(f"{root}.{marker}")
+    if isinstance(marker_value, str) and marker_value == "ep-outer-v1":
+        if rest == marker:
+            return None
+        prefix = marker + "__"
+        if not rest.startswith(prefix):
+            raise RuntimeError("ExtraParallel checkpoint mixes versioned and legacy tensor keys")
+        return f"{root}.{rest[len(prefix) :]}"
+    return key
+
+
 def _key_belongs_to_fqns(key, fqns):
     if key.startswith("model.") and (key in fqns or key.removeprefix("model.") in fqns):
         return True
@@ -467,12 +486,17 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
         plan = super().create_local_plan()
         layouts = {}
         for key, value in self.state_dict.items():
+            logical_key = _logical_extra_parallel_key(key, self.state_dict)
+            if logical_key is None:
+                continue
             extra_names = getattr(self.parallel_state, "extra_parallel_names", ())
             layout = (
                 _expert_layout(value, extra_names)
-                or _no_ep_expert_layout(key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns)
+                or _no_ep_expert_layout(
+                    logical_key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns
+                )
                 or _tp_only_source_layout(
-                    key,
+                    logical_key,
                     value,
                     self.tp_only_parameters,
                     self.tp_only_mesh,
@@ -482,7 +506,7 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
             if layout is not None:
                 layouts[key] = layout
             elif _unidentified_same_axis_shards(value) or (
-                "experts" in key.split(".") and torch.is_tensor(value) and value.ndim > 0
+                "experts" in logical_key.split(".") and torch.is_tensor(value) and value.ndim > 0
             ):
                 layouts[key] = {"expert_order": "unproven"}
         return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
@@ -578,16 +602,14 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                         "Migrate model and optimizer state using the original training layout before loading."
                     )
 
-        # Checkpoints produced by the earlier version of this feature already
-        # used canonical coordinates, but did not record individual layouts.
-        if planner_data.get("__veomni_ep_first_layout__") == 1:
-            return
-
-        # Earlier namespaced v2 checkpoints used an EP-first mesh but predate
-        # the per-tensor planner metadata. The marker and namespace were
-        # already checked against the target above.
+        # The v2 namespace proves how sharded EP tensors were serialized, but
+        # not whether an ordinary/shared expert was a synchronized replica.
+        # Each saved expert needs its own layout proof even in a v2 checkpoint.
         marker = _extra_parallel_layout_key({})
-        if any(key.split(".")[-1] == marker for key in self.metadata.state_dict_metadata):
+        has_v2_marker = any(key.split(".")[-1] == marker for key in self.metadata.state_dict_metadata)
+        # Preserve the earlier unversioned EP-first contract. A v2 marker must
+        # not bypass the per-tensor proof even if both markers are present.
+        if not has_v2_marker and planner_data.get("__veomni_ep_first_layout__") == 1:
             return
 
         for key, value in self.state_dict.items():
@@ -597,11 +619,18 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             saved = self.metadata.state_dict_metadata.get(key)
             if saved is None:
                 continue
-            if source is not None and "experts" in key.split(".") and bool(getattr(saved, "size", ())):
+            root = key.partition(".")[0]
+            root_marker = f"{root}.{marker}"
+            source_marker = {root_marker: "ep-outer-v1"} if root_marker in self.metadata.state_dict_metadata else {}
+            logical_key = _logical_extra_parallel_key(key, source_marker)
+            is_expert = logical_key is not None and "experts" in logical_key.split(".")
+            if (source is not None or has_v2_marker) and is_expert and bool(getattr(saved, "size", ())):
                 raise RuntimeError(
-                    f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                    f"Cannot determine source expert order for {key!r}: checkpoint metadata omits its layout. "
                     "Verify and migrate the original training layout before loading."
                 )
+            if has_v2_marker:
+                continue
             # For legacy VeOmni EP weights, the faulty same-axis layout only
             # split the expert dimension. A source chunk that splits matrix
             # rows (old dim-1 FSDP), or spans all experts, cannot have that
@@ -611,7 +640,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                 # letting it re-save would incorrectly mark that data as
                 # canonical. The stacked VeOmni expert axis is dimension 0.
                 shape = getattr(saved, "size", ())
-                if "experts" not in key.split(".") or not shape:
+                if not is_expert or not shape:
                     continue
                 ep_dim = 0
             else:
@@ -2471,8 +2500,10 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys) -> None:
                     f"Checkpoint tensor {key!r} has noncanonical expert order; migrate it before export"
                 )
 
-    marker_key = "model." + _extra_parallel_layout_key({})
-    if marker_key in metadata.state_dict_metadata or planner_data.get("__veomni_ep_first_layout__") == 1:
+    marker = _extra_parallel_layout_key({})
+    marker_key = "model." + marker
+    has_v2_marker = marker_key in metadata.state_dict_metadata
+    if not has_v2_marker and planner_data.get("__veomni_ep_first_layout__") == 1:
         return
 
     # An old expert-only chunk may use either EP-first or FSDP-first order.
@@ -2480,11 +2511,15 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys) -> None:
     for key in model_keys:
         tensor_metadata = metadata.state_dict_metadata[key]
         shape = getattr(tensor_metadata, "size", ())
-        if "experts" not in key.split(".") or not shape or key in layouts:
+        logical_key = key
+        if has_v2_marker:
+            fqn = _export_extra_parallel_layout_key(key.removeprefix("model."))
+            logical_key = f"model.{fqn}" if fqn is not None else ""
+        if "experts" not in logical_key.split(".") or not shape or key in layouts:
             continue
-        if recorded is not None:
+        if recorded is not None or has_v2_marker:
             raise RuntimeError(
-                f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                f"Cannot determine source expert order for {key!r}: checkpoint metadata omits its layout. "
                 "Verify and migrate the original training layout before exporting."
             )
         if any(
