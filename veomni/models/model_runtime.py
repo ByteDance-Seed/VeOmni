@@ -143,6 +143,7 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
+            self._apply_frozen_ple()
             self._build_optimizer()
         self._build_model_assets()
         self.build_checkpoint()
@@ -488,6 +489,26 @@ class VeOmniModelRuntime:
             **kwargs,
         )
         self.model.train()
+
+    def _apply_frozen_ple(self) -> None:
+        """Freeze PLE tables after parallelization and before the optimizer.
+
+        Parallelization can upcast parameters. Restore the requested table dtype
+        first, then drop ``requires_grad`` so ``build_optimizer`` leaves the
+        tables out of Adam.
+        """
+        if not getattr(self.train_args, "freeze_ple_embeddings", False):
+            return
+
+        from ..utils.device import get_device_type
+        from ..utils.model_utils import pretty_print_trainable_parameters
+        from .frozen_ple import freeze_ple_embeddings
+
+        count, local_bytes = freeze_ple_embeddings(
+            self.model, getattr(self.train_args, "frozen_ple_dtype", None), expected_device=get_device_type()
+        )
+        logger.info_rank0("Frozen PLE: %d tables, %.3f GiB local", count, local_bytes / 2**30)
+        pretty_print_trainable_parameters(self.model)
 
     def _setup_lora(self) -> None:
         """Wrap :attr:`model` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.

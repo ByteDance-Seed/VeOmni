@@ -66,6 +66,7 @@ hardware_support/mlu/README.md
 
 examples/qwen3.md
 examples/qwen3_5.md
+examples/qwen4_exp_frozen_ple.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen_image_edit.md
