@@ -74,18 +74,18 @@ forwards, instead of quietly training the unquantized base layer while the confi
 still claims MXFP4.
 
 Set `linear_implementation: eager` for adapter training. The shipped
-[Qwen3 LoRA config](../../configs/text/qwen3_lora.yaml) already pins
-`swiglu_mlp_implementation: eager` for the same reason, and every other
-`*_lora.yaml` in `configs/` does the same.
+[Qwen3 LoRA config](../../configs/text/qwen3_lora.yaml) also pins
+`swiglu_mlp_implementation: eager`, as do the other text LoRA configs that
+target MLP projections.
 
 The fused MLP row follows the same rule, and only for the quantizing value:
 with `swiglu_mlp_implementation: torchao_mxfp4` and an adapter on
 `gate_proj`/`up_proj`/`down_proj`, the forward raises
 `swiglu_mlp_implementation=... cannot run on a wrapped projection`.
-`liger_kernel` and `torch_npu` are **not** affected — they are arithmetic
-rewrites that keep the projection-module fallback, so leaving
-`swiglu_mlp_implementation` unset under LoRA still resolves to `liger_kernel` and
-still works. Only the fake-quant rows need the projection's own `weight`.
+`liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
+projection-module fallback, so leaving `swiglu_mlp_implementation` unset under
+LoRA still resolves to `liger_kernel` and still works. Only a fake-quant row
+needs the projection's own `weight`.
 
 Start from [the Qwen3 example](../../configs/text/qwen3_mxfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:
