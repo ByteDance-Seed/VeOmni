@@ -1027,7 +1027,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1199,17 @@
+@@ -1019,14 +1199,34 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -1038,21 +1038,39 @@
 -        dtype: torch.dtype,
 -        kwargs: dict | None = None,
 -    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
 +    # ================================================================
 +    # Patch: MiniMaxM3VL3DRotaryEmbedding.forward
-+    # 1. accept CPU-precomputed grid_thw_list from the collator and hand a CPU grid
-+    #    to `get_vision_position_ids`, so its `.tolist()` never syncs a CUDA tensor
-+    #    in the hot path; external callers without the list keep the upstream path
++    # 1. use the collator's host grid list to build T/H/W coordinates directly on
++    #    the target device, avoiding both GPU metadata reads and CPU coordinate uploads
++    # 2. preserve upstream precomputed position_ids and the no-metadata fallback
 +    # ================================================================
 +    def forward(self, grid_thw, device, dtype, kwargs=None, grid_thw_list=None):
 +        # --- Patch.1 ---
-+        if grid_thw_list is not None:
-+            grid_thw = torch.tensor(grid_thw_list, dtype=torch.long)
++        coords = kwargs.pop("position_ids", None) if kwargs is not None else None
++        if coords is None:
++            if grid_thw_list is None:
++                coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True)
++            else:
++                coords_list = []
++                merge_size = self.spatial_merge_size
++                for t, h, w in grid_thw_list:
++                    hpos_ids, wpos_ids = torch.meshgrid(
++                        torch.arange(h, device=device),
++                        torch.arange(w, device=device),
++                        indexing="ij",
++                    )
++                    block_shape = (h // merge_size, merge_size, w // merge_size, merge_size)
++                    hpos_ids = hpos_ids.reshape(block_shape).transpose(1, 2).flatten()
++                    wpos_ids = wpos_ids.reshape(block_shape).transpose(1, 2).flatten()
++                    tpos_ids = torch.arange(t, device=device).repeat_interleave(h * w)
++                    coords_list.append(torch.stack([tpos_ids, hpos_ids.repeat(t), wpos_ids.repeat(t)], dim=-1))
++                coords = torch.cat(coords_list, dim=0)
 +        # --- Patch.1 ---
-         coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1049,11 +1233,18 @@
+             self.theta ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32, device=device) / self.axis_dim)
+@@ -1049,11 +1249,18 @@
      return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
@@ -1071,7 +1089,7 @@
      def __init__(self, config: MiniMaxM3VLVisionConfig):
          super().__init__()
          self.config = config
-@@ -1071,15 +1262,10 @@
+@@ -1071,15 +1278,10 @@
          # The vision tower has no grouped-query attention; the shared eager kernel
          # still expects this attribute to drive its (no-op) `repeat_kv`.
          self.num_key_value_groups = 1
@@ -1091,7 +1109,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -1091,10 +1277,7 @@
+@@ -1091,10 +1293,7 @@
          queries, keys = apply_rotary_pos_emb_vision(queries, keys, cos, sin)
          queries, keys = queries.transpose(1, 2), keys.transpose(1, 2)
 
@@ -1103,7 +1121,7 @@
              self,
              queries,
              keys,
-@@ -1156,6 +1339,12 @@
+@@ -1156,6 +1355,12 @@
          return hidden_states
 
 
@@ -1116,7 +1134,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1367,134 @@
+@@ -1178,23 +1383,134 @@
          )
          self.post_init()
 
@@ -1257,7 +1275,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1578,26 @@
+@@ -1278,6 +1594,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1284,7 +1302,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1670,141 @@
+@@ -1350,46 +1686,141 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1443,7 +1461,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,15 +1841,25 @@
+@@ -1426,15 +1857,25 @@
          return vision_outputs
 
 
@@ -1470,7 +1488,7 @@
          self.post_init()
 
      def get_output_embeddings(self) -> nn.Module:
-@@ -1448,48 +1873,25 @@
+@@ -1448,48 +1889,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1537,7 +1555,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1906,29 @@
+@@ -1504,15 +1922,29 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1572,7 +1590,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1940,19 @@
+@@ -1524,9 +1956,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

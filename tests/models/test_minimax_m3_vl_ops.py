@@ -353,6 +353,42 @@ def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_s
     assert metadata["vit_video_max_seqlen"] == 8
 
 
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize("merge_size", [1, 2, 3])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_minimax_m3_vl_vision_rope_grid_list_matches_upstream(module_name, merge_size, dtype):
+    """Preserve temporal order and spatial merge blocks across mixed image/video grids."""
+    modeling = importlib.import_module(module_name)
+    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    grid_list = [[1, 2 * merge_size, 3 * merge_size], [3, 3 * merge_size, 2 * merge_size]]
+    grid = torch.tensor(grid_list, dtype=torch.long)
+    reference = upstream.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=merge_size)
+    rope = modeling.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=merge_size)
+    expected = reference(grid, device="cpu", dtype=dtype)
+    actual = rope(grid, device="cpu", dtype=dtype, grid_thw_list=grid_list)
+    fallback = rope(grid, device="cpu", dtype=dtype)
+    for fast, slow, ref in zip(actual, fallback, expected):
+        torch.testing.assert_close(fast, ref, rtol=0, atol=0)
+        torch.testing.assert_close(slow, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_vision_rope_preserves_precomputed_positions(module_name):
+    modeling = importlib.import_module(module_name)
+    upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    grid_list = [[2, 4, 6]]
+    grid = torch.tensor(grid_list, dtype=torch.long)
+    positions = upstream.get_vision_position_ids(grid, 2, include_temporal=True).flip(0)
+    reference = upstream.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=2)
+    rope = modeling.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=2)
+    kwargs = {"position_ids": positions}
+    expected = reference(grid, "cpu", torch.float32, kwargs={"position_ids": positions})
+    actual = rope(grid, "cpu", torch.float32, kwargs=kwargs, grid_thw_list=grid_list)
+    assert "position_ids" not in kwargs
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result, ref, rtol=0, atol=0)
+
+
 def _tiny_vision_model(modeling, attn_implementation):
     config = modeling.MiniMaxM3VLVisionConfig(
         hidden_size=12,

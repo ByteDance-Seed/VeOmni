@@ -1201,16 +1201,32 @@ class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
 
     # ================================================================
     # Patch: MiniMaxM3VL3DRotaryEmbedding.forward
-    # 1. accept CPU-precomputed grid_thw_list from the collator and hand a CPU grid
-    #    to `get_vision_position_ids`, so its `.tolist()` never syncs a CUDA tensor
-    #    in the hot path; external callers without the list keep the upstream path
+    # 1. use the collator's host grid list to build T/H/W coordinates directly on
+    #    the target device, avoiding both GPU metadata reads and CPU coordinate uploads
+    # 2. preserve upstream precomputed position_ids and the no-metadata fallback
     # ================================================================
     def forward(self, grid_thw, device, dtype, kwargs=None, grid_thw_list=None):
         # --- Patch.1 ---
-        if grid_thw_list is not None:
-            grid_thw = torch.tensor(grid_thw_list, dtype=torch.long)
+        coords = kwargs.pop("position_ids", None) if kwargs is not None else None
+        if coords is None:
+            if grid_thw_list is None:
+                coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True)
+            else:
+                coords_list = []
+                merge_size = self.spatial_merge_size
+                for t, h, w in grid_thw_list:
+                    hpos_ids, wpos_ids = torch.meshgrid(
+                        torch.arange(h, device=device),
+                        torch.arange(w, device=device),
+                        indexing="ij",
+                    )
+                    block_shape = (h // merge_size, merge_size, w // merge_size, merge_size)
+                    hpos_ids = hpos_ids.reshape(block_shape).transpose(1, 2).flatten()
+                    wpos_ids = wpos_ids.reshape(block_shape).transpose(1, 2).flatten()
+                    tpos_ids = torch.arange(t, device=device).repeat_interleave(h * w)
+                    coords_list.append(torch.stack([tpos_ids, hpos_ids.repeat(t), wpos_ids.repeat(t)], dim=-1))
+                coords = torch.cat(coords_list, dim=0)
         # --- Patch.1 ---
-        coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
         coords = coords.to(device=device, dtype=torch.float32)
         inv_freq = 1.0 / (
             self.theta ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32, device=device) / self.axis_dim)
