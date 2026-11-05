@@ -119,8 +119,8 @@ tokens, M-RoPE positions, visual masks — and every later node only mask-select
 its own embeddings and `masked_scatter`s them back.
 
 **Adding a model does not require it.** Ship the conversation graph first: it is
-the reference path, it is what inference uses, and it is what the packed graph is
-checked against. Packing is a throughput optimization, not a capability.
+the reference path, it is what inference uses, and it is what a packed graph must
+keep matching. Packing is a throughput optimization, not a capability.
 
 It is also not a padding win, despite how it reads: the conversation path does not
 pad either — it concatenates every sample's embed segments into one varlen

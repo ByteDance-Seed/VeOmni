@@ -143,6 +143,9 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
         if key in _PACKED_REBUILT_KEYS:
             continue
         values = [f[key] for f in features]
+        if key in ("pixel_values", "image_grid_thw"):
+            # Reordered below, so the batch-wide real/dummy split stays contiguous.
+            continue
         if key in _PACKED_CONCAT_DIM:
             batch[key] = torch.cat(values, dim=_PACKED_CONCAT_DIM[key])
         elif key in _PACKED_SUM_KEYS:
@@ -153,9 +156,39 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
             # is batched.
             batch[key] = default_collate(values)
 
+    _collate_visual_rows(features, batch)
+
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
     batch["packed_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32)
     batch["packed_max_length"] = max(lengths)
     return batch
+
+
+def _collate_visual_rows(features: Sequence[Dict[str, Any]], batch: Dict[str, Any]) -> None:
+    """Join ``pixel_values`` / ``image_grid_thw`` with all real visuals first.
+
+    Each sample packs its own visuals as ``[real..., dummy...]`` and reports how
+    many of them are real in ``visual_num_real``. A plain concatenation would then
+    order the batch as ``[s0 real, s0 dummy, s1 real, s1 dummy]`` while the summed
+    ``visual_num_real`` stays ``Σ real`` — and the vision hook reads the first
+    ``visual_num_real`` **rows** as the real ones, which would count ``s0``'s
+    dummies and then either scatter them into the real mask or crash on a shape
+    mismatch. Reorder so every real row precedes every dummy row.
+    """
+    if "pixel_values" not in features[0] or "image_grid_thw" not in features[0]:
+        return
+    real_grids, dummy_grids, real_pixels, dummy_pixels = [], [], [], []
+    for feature in features:
+        grids = feature["image_grid_thw"]
+        pixels = feature["pixel_values"]
+        n_real = int(feature.get("visual_num_real", 0))
+        # One patch block per visual row, so pixels and grids reorder together.
+        blocks = torch.split(pixels, grids.prod(dim=1).tolist(), dim=0)
+        real_grids.append(grids[:n_real])
+        dummy_grids.append(grids[n_real:])
+        real_pixels.append(torch.cat(blocks[:n_real], dim=0) if n_real else pixels[:0])
+        dummy_pixels.append(torch.cat(blocks[n_real:], dim=0) if n_real < len(blocks) else pixels[:0])
+    batch["pixel_values"] = torch.cat(real_pixels + dummy_pixels, dim=0)
+    batch["image_grid_thw"] = torch.cat(real_grids + dummy_grids, dim=0)

@@ -61,8 +61,8 @@ checkpoint, and `model.model_path` alone picks which one.
 Qwen3-VL registers an HF layout (`modules/qwen3vl/hf_layout.py`), so
 `model.model_path` can be the **upstream checkpoint itself** — `base.yaml` already
 points at one, and no offline split is needed. The layout routes
-`model.visual.*` to `qwen3vl_vision`, `model.language_model.embed_tokens.*` (and
-`lm_head.*`) plus the tokenizer and both image/video processors to
+`model.visual.*` to `qwen3vl_vision` (with both its image and video processors),
+`model.language_model.embed_tokens.*` (and `lm_head.*`) plus the tokenizer to
 `qwen3vl_text_encoder`, and the rest of `model.language_model.*` to
 `qwen3vl_llm`. HF exports are then written in the upstream layout (see
 [Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
@@ -176,9 +176,10 @@ carrier item by item.
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/base.yaml
 ```
 
-The conversation graph stays the reference path: it is what inference uses, what
-the packed graph is checked against (`test_qwen3vl_packing.py`), and it is what you
-should ship first.
+The conversation graph stays the reference path: it is what inference uses, it is
+what the packed graph is meant to reproduce, and it is what you should ship first.
+(`test_qwen3vl_packing.py` pins the packer's outputs — masks, cu_seqlens, visual
+placement — not a full loss parity against the conversation graph.)
 
 What packing buys here is **not** padding removal — the conversation path does not
 pad either; `pack_llm_conversations_for_forward` already concatenates every
@@ -218,8 +219,11 @@ for those numbers.
 
 Reproduce: `python scripts/seed_omni/bench_packed_qwen3vl.py`.
 
-Note the packed launcher currently reports no per-sample sequence lengths to the
-metric meter, so multi-source token accounting is zero on this path.
+Note the packed launcher reports no per-sample sequence lengths to the metric
+meter, so per-module token accounting and multi-source token counts read zero on
+this path. The sample count is correct (`OmniEnvironMeter.add` reads the collated
+`ds_idx`), and the collator now teaches `get_length_fn` the packed keys, so
+`dyn_bsz` can size packed samples too.
 
 ---
 

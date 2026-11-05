@@ -344,3 +344,35 @@ def test_packed_collation_carries_cur_token_num():
 
     batch = SeedOmniCollator()([_packed(4), _packed(6)])
     assert torch.equal(batch["cur_token_num"], torch.tensor([4, 6]))
+
+
+def test_packed_collation_puts_every_real_visual_before_every_dummy():
+    """Each sample packs its visuals as ``[real..., dummy...]`` and reports how many
+    are real. A plain concatenation would order the batch per sample while the
+    summed ``visual_num_real`` counts all real rows, so the vision hook would read
+    a dummy grid as real — scattering zeros into a real image's mask positions, or
+    crashing when the grids differ in size."""
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+    from veomni.models.seed_omni.modules.qwen3vl.packing import visual_token_count
+
+    def _packed(real_grid: list[int], dummy_grid: list[int], n_real: int) -> dict:
+        grids = torch.tensor([real_grid, dummy_grid])
+        return {
+            PACKED_INPUT_IDS: torch.zeros(1, 8, dtype=torch.long),
+            PACKED_LABELS: torch.zeros(1, 8, dtype=torch.long),
+            PACKED_ATTENTION_MASK: torch.ones(1, 8, dtype=torch.long),
+            PIXEL_VALUES: torch.arange(int(grids.prod(dim=1).sum()), dtype=torch.float).unsqueeze(1),
+            IMAGE_GRID_THW: grids,
+            VISUAL_NUM_REAL: n_real,
+        }
+
+    # Asymmetric on purpose: a plain per-sample concat would interleave them as
+    # [[1,4,4], [1,8,8], [1,4,4], [1,8,8]] and count sample 0's dummy as real.
+    batch = SeedOmniCollator()([_packed([1, 4, 4], [1, 8, 8], 1), _packed([1, 4, 4], [1, 8, 8], 1)])
+    assert batch[IMAGE_GRID_THW].tolist() == [[1, 4, 4], [1, 4, 4], [1, 8, 8], [1, 8, 8]]
+    assert batch[VISUAL_NUM_REAL] == 2
+    # The first `visual_num_real` rows are the real ones, so their merged-token
+    # count is what the vision hook consumes.
+    assert visual_token_count(batch[IMAGE_GRID_THW], 2, batch[VISUAL_NUM_REAL]) == (16 + 16) // 4
+    # Pixels follow their grids: 16 + 16 + 64 + 64 patch rows.
+    assert tuple(batch[PIXEL_VALUES].shape) == (160, 1)

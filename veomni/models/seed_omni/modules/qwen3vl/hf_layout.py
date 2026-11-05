@@ -35,18 +35,27 @@ def _vision_config(hf_config: Any) -> Qwen3VLVisionEncoderConfig:
     return Qwen3VLVisionEncoderConfig(vision_config=hf_config.vision_config.to_dict())
 
 
+def _tie_word_embeddings(hf_config: Any) -> bool:
+    """Whether the checkpoint ties its embedding to the LM head.
+
+    Official Qwen3-VL states this on the *top-level* config (2B ties, 8B does
+    not); a nested ``text_config`` may carry the field too, and a hand-written
+    config may set only that one. Read the outer first and fall back to the
+    nested value, treating an absent field as absent rather than as ``False``.
+    """
+    outer = getattr(hf_config, "tie_word_embeddings", None)
+    if outer is not None:
+        return bool(outer)
+    nested = getattr(hf_config.text_config, "tie_word_embeddings", None)
+    return True if nested is None else bool(nested)
+
+
 def _text_encoder_config(hf_config: Any) -> Qwen3VLTextEncoderConfig:
-    # Official Qwen3-VL puts `tie_word_embeddings` on the top-level config
-    # (2B=True, 8B=False) and the nested `text_config` often omits the field, so
-    # read the outer one first — the same order the family converter uses.
     text_config = hf_config.text_config
-    tie_word_embeddings = bool(
-        getattr(hf_config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", True))
-    )
     return Qwen3VLTextEncoderConfig(
         vocab_size=text_config.vocab_size,
         hidden_size=text_config.hidden_size,
-        tie_word_embeddings=tie_word_embeddings,
+        tie_word_embeddings=_tie_word_embeddings(hf_config),
         lm_head_bias=False,
     )
 

@@ -232,12 +232,27 @@ def test_the_backbone_drops_the_embedding_it_shares_with_the_text_encoder(hf_roo
     )
 
 
-def test_an_untied_head_loads(hf_root):
+def test_an_untied_head_loads(tmp_path):
+    """An untied checkpoint must give the text encoder a real `lm_head` weight."""
+    root = tmp_path / "Qwen3-VL-untied"
+    tensors = _write_hf_checkpoint(root, tied=False)
+    assert "lm_head.weight" in tensors
+
+    model = OmniModel.from_pretrained(
+        str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
+    )
+    encoder = model.modules_dict[TEXT_ENCODER]
+    assert encoder.lm_head is not None, "an untied checkpoint must not fall back to the tied path"
+    assert torch.equal(encoder.lm_head.weight, tensors["lm_head.weight"])
+
+
+def test_a_tied_head_stores_no_separate_projection(hf_root):
+    """The 2B-style tied checkpoint reuses `embed_tokens` for the decode head."""
     root, tensors = hf_root
     model = OmniModel.from_pretrained(
         str(root), torch_dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager"
     )
-    assert model.modules_dict[TEXT_ENCODER].lm_head is None  # 2B-style tie
+    assert model.modules_dict[TEXT_ENCODER].lm_head is None
     assert torch.equal(
         model.modules_dict[TEXT_ENCODER].embed_tokens.weight,
         tensors["model.language_model.embed_tokens.weight"],

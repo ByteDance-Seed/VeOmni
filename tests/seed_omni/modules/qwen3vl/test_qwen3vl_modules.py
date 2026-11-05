@@ -179,10 +179,15 @@ def test_video_position_ids_restart_per_frame_like_hf():
     # An image (t == 1) is unaffected by the per-frame split.
     image = torch.tensor([1, 16, 16])
     assert qwen3vl_vision_position_advance(image, 2) == 8
-    torch.testing.assert_close(
-        qwen3vl_vision_position_ids(2, image, merge=2),
-        qwen3vl_vision_position_ids(2, image, merge=2),
-    )
+    # One frame of a t=1 image: the temporal row is the caller's start and the
+    # spatial rows run over the *merged* grid (16x16 patches, merge 2 -> 8x8 = 64
+    # tokens). Pinned as literals because comparing the function to itself would
+    # pass for any implementation.
+    pos = qwen3vl_vision_position_ids(2, image, merge=2)
+    assert tuple(pos.shape) == (3, 64)
+    assert set(pos[0].tolist()) == {2}, "temporal row is the start position for every token"
+    assert pos[1].tolist() == [2 + i // 8 for i in range(64)], "h row runs 2..2+gh-1"
+    assert pos[2].tolist() == [2 + i % 8 for _ in range(8) for i in range(8)], "w row cycles 2..2+gw-1"
 
 
 def test_pack_leaves_deepstack_out_when_the_vision_config_disables_it():
