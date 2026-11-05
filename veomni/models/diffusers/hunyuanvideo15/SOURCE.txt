@@ -7,12 +7,12 @@ Original license headers are retained in source-derived files.
 Each mapped file carries a notice identifying the VeOmni modifications.
 
 Source path -> local path:
-hyvideo/models/transformers/hunyuanvideo_1_5_transformer.py -> native/transformer.py
-hyvideo/models/transformers/modules/{activation,norm,embed,posemb,mlp,modulate}_layers.py -> native/modules/
-hyvideo/models/transformers/modules/token_refiner.py -> native/modules/token_refiner.py
-hyvideo/models/text_encoders/__init__.py -> native/text_encoder.py
-hyvideo/models/text_encoders/byT5/__init__.py -> native/{byt5,glyph_encoder}.py
-hyvideo/models/autoencoders/hunyuanvideo_15_vae.py -> native/vae.py
+hyvideo/models/transformers/hunyuanvideo_1_5_transformer.py -> hunyuanvideo15_transformer/native/transformer.py
+hyvideo/models/transformers/modules/{activation,norm,embed,posemb,mlp,modulate}_layers.py -> hunyuanvideo15_transformer/native/modules/
+hyvideo/models/transformers/modules/token_refiner.py -> hunyuanvideo15_transformer/native/modules/token_refiner.py
+hyvideo/models/text_encoders/__init__.py -> hunyuanvideo15_condition/native/text_encoder.py
+hyvideo/models/text_encoders/byT5/__init__.py -> hunyuanvideo15_transformer/native/byt5.py and hunyuanvideo15_condition/native/glyph_encoder.py
+hyvideo/models/autoencoders/hunyuanvideo_15_vae.py -> hunyuanvideo15_condition/native/vae.py
 
 Changes:
 - Core native transformer uses nn.Module; VeOmni's outer PreTrainedModel owns HF metadata.

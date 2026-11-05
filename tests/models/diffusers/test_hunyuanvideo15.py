@@ -7,10 +7,15 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
-from veomni.models.diffusers.hunyuanvideo15.conditioning import FlowMatchingConditioner
-from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
-from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
-from veomni.utils.device import get_device_type
+from tests.tools.common_utils import ieee_fp32_matmul
+from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.conditioning import FlowMatchingConditioner
+from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.configuration_hunyuanvideo15_transformer import (
+    HunyuanVideo15Config,
+)
+from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.modeling_hunyuanvideo15_transformer import (
+    HunyuanVideo15Model,
+)
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +24,16 @@ def cpu_threads():
     torch.set_num_threads(2)
     yield
     torch.set_num_threads(previous)
+
+
+@pytest.fixture
+def accelerator_precision(dtype, monkeypatch):
+    if IS_CUDA_AVAILABLE and dtype == torch.float32:
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+        with ieee_fp32_matmul():
+            yield
+    else:
+        yield
 
 
 def initialize_nonzero_linears(model):
@@ -121,8 +136,12 @@ def test_dense_attention_ops_config_roundtrip(monkeypatch, tmp_path, attention):
 def test_condition_construction_preserves_component_dtypes(
     monkeypatch, tmp_path, dtype_key, dtype_value, config_source
 ):
-    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
-    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15_condition import HunyuanVideo15ConditionModel
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.configuration_hunyuanvideo15_condition import (
+        HunyuanVideo15ConditionConfig,
+    )
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.modeling_hunyuanvideo15_condition import (
+        HunyuanVideo15ConditionModel,
+    )
 
     construction_dtypes = []
 
@@ -178,7 +197,7 @@ def test_condition_construction_preserves_component_dtypes(
 def test_rotary_cache_survives_meta_context_and_releases_positions():
     import weakref
 
-    from veomni.models.diffusers.hunyuanvideo15.native.modules.posemb_layers import (
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules.posemb_layers import (
         get_1d_rotary_pos_embed,
         get_nd_rotary_pos_embed,
     )
@@ -201,7 +220,9 @@ def test_rotary_cache_survives_meta_context_and_releases_positions():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_token_refiner_masked_mean_preserves_long_counts_and_empty_samples():
-    from veomni.models.diffusers.hunyuanvideo15.native.modules.token_refiner import SingleTokenRefiner
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules.token_refiner import (
+        SingleTokenRefiner,
+    )
 
     torch.manual_seed(42)
     model = SingleTokenRefiner(8, 16, 2, depth=1, dtype=torch.bfloat16)
@@ -223,7 +244,9 @@ def test_token_refiner_masked_mean_preserves_long_counts_and_empty_samples():
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("frames,spatial", [(1, 1), (2, 3), (3, 2)])
 def test_vae_causal_mask_matches_framewise_reference(frames, spatial):
-    from veomni.models.diffusers.hunyuanvideo15.native.vae import prepare_causal_attention_mask
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.native.vae import (
+        prepare_causal_attention_mask,
+    )
 
     for dtype in (torch.float32, torch.bfloat16):
         length = frames * spatial
@@ -278,11 +301,11 @@ def test_t2v_ddp_two_updates_preserve_checkpoint_schema():
 
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_accelerator_rotary_tables_reuse_device_storage(checkpointing, monkeypatch):
-    from veomni.models.diffusers.hunyuanvideo15.native import transformer
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native import transformer
     from veomni.utils.device import get_torch_device
 
     device = get_device_type()
-    if device not in ("cuda", "npu") or not get_torch_device().is_available():
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or not get_torch_device().is_available():
         pytest.skip("An accessible CUDA GPU or NPU is required")
     get_torch_device().set_device(0)
     config = tiny_config(glyph=True)
@@ -316,7 +339,7 @@ def test_meta_materialization_preserves_native_initialization(text_projection, m
     """Run the trainer's random-init path after discarding every constructor value."""
     from veomni.distributed import torch_parallelize
     from veomni.models import init_empty_weights
-    from veomni.models.diffusers.hunyuanvideo15.native.modules.norm_layers import RMSNorm
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules.norm_layers import RMSNorm
 
     config = tiny_config(glyph=True)
     config.text_projection = text_projection
@@ -437,7 +460,9 @@ def test_rotary_checkpoint_accepts_table_dtype_changes(table_dtypes):
     """Recompute may receive the original tables instead of FSDP's cast views."""
     from torch.utils.checkpoint import checkpoint
 
-    from veomni.models.diffusers.hunyuanvideo15.native.modules.posemb_layers import apply_rotary_emb
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules.posemb_layers import (
+        apply_rotary_emb,
+    )
 
     inputs = [torch.randn(1, 4, 2, 12, dtype=torch.bfloat16, requires_grad=True) for _ in range(2)]
     references = [value.detach().clone().requires_grad_() for value in inputs]
@@ -524,16 +549,16 @@ def _hunyuanvideo15_fsdp_checkpoint_worker():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 @pytest.mark.skipif(
-    get_device_type() not in ("cuda", "npu") or runner_device_count() < 2,
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or runner_device_count() < 2,
     reason="Two accessible CUDA GPUs or NPUs are required",
 )
 def test_hunyuanvideo15_fsdp_bf16_checkpoint():
     """The documented FSDP2/BF16 path must survive checkpoint recomputation."""
     from tests.tools.launch_utils import torchrun
-    from veomni.utils.device import get_device_type, get_torch_device
+    from veomni.utils.device import get_torch_device
 
     accelerator = get_torch_device()
-    if get_device_type() not in ("cuda", "npu") or not accelerator.is_available() or accelerator.device_count() < 2:
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or not accelerator.is_available() or accelerator.device_count() < 2:
         pytest.skip("Two accessible CUDA GPUs or NPUs are required")
     torchrun(_hunyuanvideo15_fsdp_checkpoint_worker, world_size=2)
 
@@ -555,7 +580,9 @@ def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeyp
     """Keep masked-query semantics and gradients without allocating a quadratic mask."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    from veomni.models.diffusers.hunyuanvideo15.native.modules import attention as attention_module
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules import (
+        attention as attention_module,
+    )
 
     torch.manual_seed(42)
     valid = torch.tensor([[True, False, True, False], [False] * 4, [True] * 4])
@@ -590,18 +617,20 @@ def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeyp
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_npu_attention_mask_view_preserves_storage_and_cpu_parity(dtype, monkeypatch):
     """Exercise CANN's required mask shape without quadratic caller-side storage."""
-    from veomni.models.diffusers.hunyuanvideo15.native.modules import attention as attention_module
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.native.modules import (
+        attention as attention_module,
+    )
     from veomni.utils.device import get_device_type, get_torch_device
 
-    if get_device_type() != "npu" or not get_torch_device().is_available():
+    if not IS_NPU_AVAILABLE or not get_torch_device().is_available():
         pytest.skip("An accessible NPU is required")
     get_torch_device().set_device(0)
     torch.manual_seed(42)
     valid_cpu = torch.tensor([[True, False, True, False], [False] * 4, [True] * 4])
     inputs_cpu = [torch.randn(3, 4, 2, 128, dtype=dtype, requires_grad=True) for _ in range(3)]
     expected = attention_module.attention(*inputs_cpu, attn_mask=valid_cpu)
-    inputs = [value.detach().to("npu").requires_grad_() for value in inputs_cpu]
-    valid = valid_cpu.to("npu")
+    inputs = [value.detach().to(get_device_type()).requires_grad_() for value in inputs_cpu]
+    valid = valid_cpu.to(get_device_type())
     sdpa = attention_module.F.scaled_dot_product_attention
     mask_storage = []
 
@@ -648,7 +677,7 @@ def test_vae_memory_efficient_context_restores_settings(initial_slicing, initial
 
 def tiny_vae(out_channels=3):
     """Build a small real VAE for decode and setting-restoration regressions."""
-    from veomni.models.diffusers.hunyuanvideo15.native.vae import AutoencoderKLConv3D
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.native.vae import AutoencoderKLConv3D
 
     return AutoencoderKLConv3D(
         in_channels=3,
@@ -742,7 +771,7 @@ def test_reject_misaligned_batches_and_unsupported_scope():
 @pytest.mark.skipif(not os.environ.get("HUNYUANVIDEO15_SOURCE"), reason="Pinned upstream source not supplied")
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_upstream_output_gradient_and_full_parameter_schema():
-    from tests.models.hunyuanvideo15_reference import load_reference
+    from tests.models.diffusers.hunyuanvideo15_reference import load_reference
 
     torch.manual_seed(123)
     reference_cls = load_reference(os.environ["HUNYUANVIDEO15_SOURCE"])
@@ -803,8 +832,12 @@ def test_upstream_output_gradient_and_full_parameter_schema():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_runtime_rng_roundtrip(monkeypatch):
-    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
-    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15_condition import HunyuanVideo15ConditionModel
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.configuration_hunyuanvideo15_condition import (
+        HunyuanVideo15ConditionConfig,
+    )
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.modeling_hunyuanvideo15_condition import (
+        HunyuanVideo15ConditionModel,
+    )
     from veomni.trainer.dit_trainer import DiTModelRuntime
 
     # This tests real process_condition/RNG hooks without claiming encoder execution.
@@ -833,7 +866,7 @@ def test_runtime_rng_roundtrip(monkeypatch):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_native_vae_encode_strict_reload(tmp_path):
-    from veomni.models.diffusers.hunyuanvideo15.native.vae import AutoencoderKLConv3D
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.native.vae import AutoencoderKLConv3D
 
     model = AutoencoderKLConv3D(
         in_channels=3,
@@ -887,7 +920,7 @@ def test_foundation_loader_preserves_native_weights(tmp_path):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_glyph_checkpoint_extraction_is_strict(tmp_path, monkeypatch):
-    from veomni.models.diffusers.hunyuanvideo15.native import glyph_encoder
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.native import glyph_encoder
 
     encoder = torch.nn.Linear(3, 2)
     reference = {key: value.clone() for key, value in encoder.state_dict().items()}
@@ -928,19 +961,15 @@ def test_glyph_checkpoint_extraction_is_strict(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_accelerator_forward_backward_update_and_rng(dtype, checkpointing, monkeypatch):
+def test_accelerator_forward_backward_update_and_rng(dtype, checkpointing, accelerator_precision):
     """Check CPU parity, finite gradients, optimizer updates, and RNG on CUDA or NPU."""
     import copy
 
     from veomni.utils.device import get_device_type, get_torch_device
 
     device = get_device_type()
-    if device not in ("cuda", "npu") or not get_torch_device().is_available():
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or not get_torch_device().is_available():
         pytest.skip("An accessible CUDA GPU or NPU is required")
-    if device == "cuda" and dtype == torch.float32:
-        # Compare FP32 arithmetic against CPU instead of CUDA's optional TF32 path.
-        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     accelerator = get_torch_device()
     accelerator.set_device(0)
     torch.manual_seed(42)
@@ -1011,14 +1040,14 @@ def test_full_backbone_npu():
     """Needs at least 40 GiB free; reduced latent input, random weights, SGD."""
     from veomni.utils.device import get_device_type, get_torch_device
 
-    if get_device_type() != "npu" or not get_torch_device().is_available():
+    if not IS_NPU_AVAILABLE or not get_torch_device().is_available():
         pytest.skip("An accessible NPU is required")
     accelerator = get_torch_device()
     accelerator.set_device(0)
     accelerator.empty_cache()
     accelerator.reset_peak_memory_stats()
     torch.manual_seed(42)
-    with torch.device("npu:0"):
+    with torch.device(get_device_type(), 0):
         model = HunyuanVideo15Model._from_config(
             HunyuanVideo15Config(), dtype=torch.bfloat16, attn_implementation="eager"
         )
@@ -1026,13 +1055,13 @@ def test_full_backbone_npu():
     assert sum(p.numel() for p in model.parameters()) == 8326608160
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
-    flow = FlowMatchingConditioner(314, "npu")
-    data = flow(torch.randn(1, 32, 2, 4, 4, device="npu", dtype=torch.bfloat16))
+    flow = FlowMatchingConditioner(314, get_device_type())
+    data = flow(torch.randn(1, 32, 2, 4, 4, device=get_device_type(), dtype=torch.bfloat16))
     data.update(
-        text_states=torch.randn(1, 8, 3584, device="npu", dtype=torch.bfloat16),
-        encoder_attention_mask=torch.tensor([[True] * 4 + [False] * 4], device="npu"),
-        byt5_text_states=torch.randn(1, 4, 1472, device="npu", dtype=torch.bfloat16),
-        byt5_text_mask=torch.tensor([[True, True, False, False]], device="npu"),
+        text_states=torch.randn(1, 8, 3584, device=get_device_type(), dtype=torch.bfloat16),
+        encoder_attention_mask=torch.tensor([[True] * 4 + [False] * 4], device=get_device_type()),
+        byt5_text_states=torch.randn(1, 4, 1472, device=get_device_type(), dtype=torch.bfloat16),
+        byt5_text_mask=torch.tensor([[True, True, False, False]], device=get_device_type()),
     )
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, foreach=False)
     before = model.img_in.proj.weight.detach().clone()

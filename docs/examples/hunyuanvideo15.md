@@ -53,6 +53,20 @@ unverified**. Real-data training requires the complete pretrained components.
 The native code retains Tencent's license and provenance under
 `veomni/models/diffusers/hunyuanvideo15/`.
 
+The model family follows the two-model DiT layout:
+
+```text
+hunyuanvideo15/
+  hunyuanvideo15_transformer/   # config, model, and native transformer modules
+    native/byt5.py             # trainable ByT5Mapper projection
+  hunyuanvideo15_condition/     # config, frozen model, and conditioning helpers
+    native/                   # VAE, text encoder, and Glyph ByT5 loader
+```
+
+Each subpackage registers its own config and model at import time. The registry
+keys remain `HunyuanVideo15Model` and `HunyuanVideo15ConditionModel`; module
+relocation does not add a parameter prefix or change checkpoint tensor layouts.
+
 ## Required local assets
 
 Use the native repository's checkpoint layout, not a Diffusers-converted model:
@@ -147,7 +161,7 @@ TF32 in the test only to compare the same arithmetic precision:
 
 ```bash
 PYTHONPATH=. python -m pytest -q \
-  tests/models/test_hunyuanvideo15.py \
+  tests/models/diffusers/test_hunyuanvideo15.py \
   tests/data/test_hunyuanvideo15_data.py \
   tests/models/base/test_auto_registry.py -k hunyuanvideo15
 make quality
@@ -247,7 +261,7 @@ The opt-in test needs at least 40 GiB free on the selected device:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 HUNYUANVIDEO15_FULL_NPU=1 PYTHONPATH=. \
-  python -m pytest tests/models/test_hunyuanvideo15.py -k full_backbone_npu -q -s
+  python -m pytest tests/models/diffusers/test_hunyuanvideo15.py -k full_backbone_npu -q -s
 ```
 
 The validation environment used torch/torch-npu 2.10.0 and CANN 9.2.0 B020.

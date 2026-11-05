@@ -6,7 +6,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from scripts.dataset.prepare_tom_and_jerry import prepare_dataset
-from veomni.models.diffusers.hunyuanvideo15.conditioning import prepare_video
+from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.conditioning import prepare_video
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

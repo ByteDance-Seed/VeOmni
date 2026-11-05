@@ -34,7 +34,7 @@ from torch import Tensor, nn
 from torch import distributed as dist
 from torch.nn import Conv3d
 
-from .....distributed.parallel_state import get_parallel_state
+from ......distributed.parallel_state import get_parallel_state
 
 
 @dataclass

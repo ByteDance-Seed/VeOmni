@@ -5,12 +5,12 @@ from pathlib import Path
 
 import torch
 
-from ....distributed.parallel_state import get_parallel_state
-from ....utils import logging
-from ....utils.device import get_device_type
-from ...modeling_base import VeOmniPreTrainedModel
+from .....distributed.parallel_state import get_parallel_state
+from .....utils import logging
+from .....utils.device import get_device_type
+from ....modeling_base import VeOmniPreTrainedModel
 from .conditioning import FlowMatchingConditioner, prepare_video
-from .configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
+from .configuration_hunyuanvideo15_condition import HunyuanVideo15ConditionConfig
 
 
 logger = logging.get_logger(__name__)

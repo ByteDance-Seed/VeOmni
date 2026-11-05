@@ -211,7 +211,9 @@ def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
 
 
 def _tiny_hunyuanvideo15_config(architecture):
-    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.configuration_hunyuanvideo15_transformer import (
+        HunyuanVideo15Config,
+    )
 
     config = HunyuanVideo15Config(
         hidden_size=24,
@@ -911,8 +913,12 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
-    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
-    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.configuration_hunyuanvideo15_transformer import (
+        HunyuanVideo15Config,
+    )
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.modeling_hunyuanvideo15_transformer import (
+        HunyuanVideo15Model,
+    )
 
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     HunyuanVideo15Config().save_pretrained(tmp_path)
@@ -1023,7 +1029,7 @@ def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkey
         def construct():
             return cls(config)
     elif family == "hunyuanvideo15":
-        from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15_condition import (
+        from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.modeling_hunyuanvideo15_condition import (
             HunyuanVideo15ConditionModel,
         )
 

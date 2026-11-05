@@ -6,9 +6,9 @@ import torch
 import torch.nn.functional as F
 from transformers.utils import ModelOutput
 
-from ....distributed.parallel_state import get_parallel_state
-from ...modeling_base import VeOmniPreTrainedModel
-from .configuration_hunyuanvideo15 import HunyuanVideo15Config
+from .....distributed.parallel_state import get_parallel_state
+from ....modeling_base import VeOmniPreTrainedModel
+from .configuration_hunyuanvideo15_transformer import HunyuanVideo15Config
 from .native.modules.embed_layers import PatchEmbed, TimestepEmbedder
 from .native.modules.mlp_layers import FinalLayer
 from .native.modules.modulate_layers import ModulateDiT
