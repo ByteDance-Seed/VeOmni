@@ -23,6 +23,7 @@ import uuid
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Dict, Optional, Set, Union
@@ -37,7 +38,7 @@ from torch.distributed.checkpoint import (
     load,
 )
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -52,6 +53,7 @@ from ..distributed.parallel_state import ParallelState, get_parallel_state, is_p
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -67,12 +69,14 @@ from .layout import (
 from .multi_optimizer_checkpoint import (
     _MULTI_GENERATION_MARKER,
     _MULTI_INVENTORY_MARKER,
+    _clear_swap_checkpoint_staging,
     _dcp_parameter_name_map,
     _inventory_digests,
     _iter_optimizer_leaves,
     _multi_extra_snapshot,
     _preflight_multi_optimizer_layout,
     _prepare_multi_optimizer_saved_states,
+    _validate_fresh_swap_optimizer,
     _validate_source_optimizer_states,
 )
 from .optimizer_resume_layout import (
@@ -967,32 +971,21 @@ def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
 
 
 def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
-    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
-
-    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
-    A metadata-only construction computes the same global shape/stride/spec;
-    attaching the actual local shard then preserves CPU storage and the original
-    mesh identity. DTensor's spec constructor is intentionally isolated here.
-    No collectives or accelerator allocations are needed (run_check=False).
-    """
-    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
-        metadata = DTensor.from_local(
-            local_tensor.to("meta"),
-            device_mesh=device_mesh,
-            placements=placements,
-            run_check=False,
-            shape=shape,
-            stride=stride,
+    """Wrap CPU optimizer shards without moving or changing their strides."""
+    if local_tensor.device.type != "cpu" or device_mesh.device_type == "cpu":
+        return DTensor.from_local(
+            local_tensor, device_mesh=device_mesh, placements=placements, run_check=False, shape=shape, stride=stride
         )
-        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
-    return DTensor.from_local(
+    wrapped = rewrap_dtensor_local(
         local_tensor,
-        device_mesh=device_mesh,
+        mesh=device_mesh,
         placements=placements,
-        run_check=False,
         shape=shape,
         stride=stride,
     )
+    if wrapped.requires_grad != local_tensor.requires_grad:
+        wrapped = DTensor(local_tensor, wrapped._spec, requires_grad=local_tensor.requires_grad)
+    return wrapped
 
 
 def _chunk_extent(extent: int, num_chunks: int, index: int) -> int:
@@ -1259,7 +1252,16 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the
@@ -1549,14 +1551,20 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements == 1 or all(isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
+    has_fsdp_shard = any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1])
+    if num_placements in (2, 3) and has_fsdp_shard:
+        ndim = loaded_tensor.ndim
+        if not -ndim <= fsdp_shard_dim < ndim:
+            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+        fsdp_shard_dim %= ndim
+    if num_placements == 1 or (num_placements in (2, 3) and not has_fsdp_shard):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
@@ -1604,10 +1612,8 @@ def restore_extra_parallel_dim(
 
     if isinstance(orgin_tensor, DTensor):
         ndim = orgin_tensor.ndim
-        if not -ndim <= ep_shard_dim < ndim:
+        if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-        if not -ndim <= fsdp_shard_dim < ndim:
-            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
         ep_shard_dim %= ndim
         fsdp_shard_dim %= ndim
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
@@ -1622,19 +1628,18 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
             placements = [fsdp_placement, Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # A plain model tensor has no FSDP shard. The caller must ensure every
-        # FSDP/HSDP replica for the same ExtraParallel coordinate has identical
-        # values; from_local does not check or synchronize them. Optimizer
-        # states without this guarantee are rejected by the caller.
+        # Plain model tensors must be replicated across FSDP coordinates for
+        # the same ExtraParallel rank. Optimizer shards without that proof are
+        # rejected by the caller.
         ndim = orgin_tensor.ndim
         if not -ndim <= ep_shard_dim < ndim:
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
         if fsdp_mesh.mesh_dim_names is None:
             raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
         placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -2093,6 +2098,87 @@ def _promote_staged_checkpoint(
         raise RuntimeError("checkpoint promotion failed on another rank; no completion marker was written")
 
 
+@contextmanager
+def _single_swap_frozen_resume(model, optimizer, reader, *, group=None, trainable_only=False):
+    """Include saved frozen SwapAdamW owners in the legacy DCP template."""
+    from ..optim.swap_adamw import SwapAdamW
+
+    if type(optimizer) is not SwapAdamW:
+        yield ()
+        return
+    has_frozen = any(not p.requires_grad for g in optimizer.param_groups for p in g["params"])
+    if not any_rank_failed(has_frozen, group=group):
+        yield ()
+        return
+    changed, allocated, error = [], [], None
+    try:
+        _validate_fresh_swap_optimizer(optimizer)
+        metadata = reader.read_metadata().state_dict_metadata
+        owned = {id(p): p for g in optimizer.param_groups for p in g["params"]}
+        for name, param in _dcp_parameter_name_map(model).items():
+            if id(param) not in owned or param.requires_grad:
+                continue
+            fields = {
+                field: metadata.get(f"optimizer.state.{name}.{field}") for field in ("step", *optimizer._state_keys)
+            }
+            present = {key for key, value in fields.items() if value is not None}
+            if not present:
+                continue
+            if present != set(fields):
+                raise RuntimeError(f"SwapAdamW frozen state for {name} is incomplete")
+            if trainable_only:
+                raise RuntimeError("Frozen SwapAdamW history requires a full-model checkpoint")
+            if optimizer._optimizer_load_state_dict_pre_hooks or optimizer._optimizer_load_state_dict_post_hooks:
+                raise RuntimeError("Frozen SwapAdamW history does not support optimizer load-state hooks")
+            for field, value in fields.items():
+                expected_shape = torch.Size([]) if field == "step" else param.shape
+                expected_dtype = torch.float32 if field == "step" else param.dtype
+                if (
+                    not isinstance(value, TensorStorageMetadata)
+                    or value.size != expected_shape
+                    or value.properties.dtype != expected_dtype
+                ):
+                    raise RuntimeError(f"SwapAdamW frozen state {name}.{field} has incompatible shape or dtype")
+            if param not in optimizer._host_states:
+                allocated.append(param)
+                optimizer._ensure_param_state(param, bool(optimizer._group_by_param[param]["amsgrad"]))
+            param.requires_grad_(True)
+            changed.append(param)
+    except BaseException as exc:
+        error = exc
+    try:
+        raise_if_any_rank_failed(error, "preparing frozen SwapAdamW checkpoint state", group=group)
+    except BaseException:
+        for param in changed:
+            param.requires_grad_(False)
+        for param in allocated:
+            optimizer._host_states.pop(param, None)
+            optimizer._device_states.pop(param, None)
+            optimizer.state.pop(param, None)
+        raise
+    try:
+        yield changed
+    except BaseException:
+        optimizer._veomni_dcp_restore_failed = True
+        raise
+    finally:
+        for param in changed:
+            param.requires_grad_(False)
+
+
+@contextmanager
+def _single_swap_frozen_model_view(changed):
+    for param in changed:
+        param.requires_grad_(False)
+    try:
+        yield
+        if any(param.requires_grad for param in changed):
+            raise RuntimeError("Model load-state hooks changed frozen SwapAdamW parameter trainability")
+    finally:
+        for param in changed:
+            param.requires_grad_(True)
+
+
 class DistributedCheckpointer(CheckpointerBase):
     """
     Distributed checkpointer for torch.distributed.checkpoint
@@ -2528,12 +2614,11 @@ class DistributedCheckpointer(CheckpointerBase):
             if any(decision != local for decision in decisions):
                 raise RuntimeError("Checkpoint load format differs across ranks")
 
-        fused_dir, error = None, None
+        error = None
         try:
             _validate_legacy_expert_source_layout(legacy_expert_source_layout)
             if legacy_expert_source_layout is not None and optimizer is not None:
                 raise ValueError("Legacy expert source declarations are only supported for model-only loads")
-            fused_dir = cls._legacy_fused_dir(path, module)
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "inspecting checkpoint layout", group=process_group)
@@ -2619,41 +2704,52 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
                 planner=planner,
             )
-            _prepare_multi_optimizer_saved_states(
-                state["model"],
-                optimizer,
-                cls._create_storage_reader,
-                optimizer_path,
-                optimizer_id,
-                group=process_group,
-                parallel_state=parallel_state,
-            )
-            optimizer_state, reader, planner, error = None, None, None, None
             try:
-                optimizer_state = _ProvenMultiOptimizerState(
-                    model=state["model"],
-                    optimizer=optimizer,
-                    parallel_state=parallel_state,
-                    load=True,
-                    generation=generation,
-                    expected_layout=expected_layout,
+                _prepare_multi_optimizer_saved_states(
+                    state["model"],
+                    optimizer,
+                    cls._create_storage_reader,
+                    optimizer_path,
+                    optimizer_id,
                     group=process_group,
+                    parallel_state=parallel_state,
                 )
-                reader = cls._create_storage_reader(optimizer_path)
-                planner = _ModelStrictLoadPlanner(
-                    strict_model=False,
-                    expected_save_id=optimizer_id,
-                    rank_local_adapter=optimizer_state if optimizer_state.should_extra_parallel_aware else None,
+                optimizer_state, reader, planner, error = None, None, None, None
+                try:
+                    optimizer_state = _ProvenMultiOptimizerState(
+                        model=state["model"],
+                        optimizer=optimizer,
+                        parallel_state=parallel_state,
+                        load=True,
+                        generation=generation,
+                        expected_layout=expected_layout,
+                        group=process_group,
+                    )
+                    reader = cls._create_storage_reader(optimizer_path)
+                    planner = _ModelStrictLoadPlanner(
+                        strict_model=False,
+                        expected_save_id=optimizer_id,
+                        rank_local_adapter=optimizer_state if optimizer_state.should_extra_parallel_aware else None,
+                    )
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "preparing proven optimizer checkpoint state", group=process_group)
+                dcp.load(
+                    state_dict={"optimizer": optimizer_state},
+                    storage_reader=reader,
+                    process_group=process_group,
+                    planner=planner,
                 )
-            except BaseException as exc:
-                error = exc
-            raise_if_any_rank_failed(error, "preparing proven optimizer checkpoint state", group=process_group)
-            dcp.load(
-                state_dict={"optimizer": optimizer_state},
-                storage_reader=reader,
-                process_group=process_group,
-                planner=planner,
-            )
+            except BaseException:
+                from ..optim.swap_adamw import SwapAdamW
+
+                optimizer._veomni_dcp_restore_failed = True
+                for leaf in _iter_optimizer_leaves(optimizer):
+                    if type(leaf) is SwapAdamW:
+                        leaf._veomni_dcp_restore_failed = True
+                raise
+            finally:
+                _clear_swap_checkpoint_staging(optimizer)
             if extra is not None:
                 state["extra_state"].update(extra)
             state["_veomni_optimizer_identity_verified"] = True
@@ -2669,53 +2765,62 @@ class DistributedCheckpointer(CheckpointerBase):
             raise_if_any_rank_failed(error, description, group=process_group)
             return _PreparedLoadState(owner, snapshot, process_group)
 
-        model_state = prepared(model_state, "preparing model checkpoint state")
-        if fused_dir is not None:
-            load_state: Dict[str, Any] = {"model": model_state}
+        reader = model_reader if fused_dir is not None else optimizer_reader
+        with _single_swap_frozen_resume(
+            state["model"], optimizer, reader, group=process_group, trainable_only=trainable_only
+        ) as frozen_swap_owners:
+            has_frozen = any_rank_failed(bool(frozen_swap_owners), group=process_group)
+            error = None
+            if has_frozen and (
+                optimizer._optimizer_load_state_dict_pre_hooks or optimizer._optimizer_load_state_dict_post_hooks
+            ):
+                error = RuntimeError("Frozen SwapAdamW history does not support optimizer load-state hooks")
+            raise_if_any_rank_failed(error, "checking frozen optimizer recovery hooks", group=process_group)
+            split_fused = fused_dir is not None and has_frozen
+            if fused_dir is not None and not split_fused:
+                model_state = prepared(model_state, "preparing model checkpoint state")
+                load_state = {"model": model_state}
+                if wants_optimizer:
+                    load_state["optimizer"] = prepared(optimizer_state, "preparing optimizer checkpoint state")
+                dcp.load(
+                    state_dict=load_state,
+                    storage_reader=model_reader,
+                    process_group=process_group,
+                    planner=_ModelStrictLoadPlanner(
+                        strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
+                    ),
+                )
+                cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
+                logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
+                return state
+
+            model_root = model_dir(path, module)
+            error = None
+            try:
+                with _single_swap_frozen_model_view(frozen_swap_owners):
+                    model_state = prepared(model_state, "preparing model checkpoint state")
+                    dcp.load(
+                        state_dict={"model": model_state},
+                        storage_reader=model_reader,
+                        process_group=process_group,
+                        planner=_ModelStrictLoadPlanner(
+                            strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
+                        ),
+                    )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "loading model before optimizer recovery", group=process_group)
             if wants_optimizer:
-                load_state["optimizer"] = prepared(optimizer_state, "preparing optimizer checkpoint state")
-            dcp.load(
-                state_dict=load_state,
-                storage_reader=model_reader,
-                process_group=process_group,
-                planner=_ModelStrictLoadPlanner(
-                    strict_model=not trainable_only,
-                    legacy_expert_source_layout=legacy_expert_source_layout,
-                ),
-            )
-            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
-            logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
+                optimizer_state = prepared(optimizer_state, "preparing optimizer checkpoint state")
+                dcp.load(
+                    state_dict={"optimizer": optimizer_state},
+                    storage_reader=reader,
+                    process_group=process_group,
+                    planner=_ModelStrictLoadPlanner(strict_model=False),
+                )
+            cls._load_extra_state(checkpoint_dir=fused_dir if split_fused else model_root, state=state)
+            logger.info_rank0(f"Loaded checkpoint from {model_root}")
             return state
-
-        model_root = model_dir(path, module)
-        dcp.load(
-            state_dict={"model": model_state},
-            storage_reader=model_reader,
-            process_group=process_group,
-            planner=_ModelStrictLoadPlanner(
-                strict_model=not trainable_only,
-                legacy_expert_source_layout=legacy_expert_source_layout,
-            ),
-        )
-        if wants_optimizer:
-            # Preserve the split-checkpoint ordering: some optimizers lazily
-            # initialize during state_dict(), so model weights must already be
-            # restored before the optimizer snapshot is constructed.
-            optimizer_state = prepared(optimizer_state, "preparing optimizer checkpoint state")
-            dcp.load(
-                state_dict={"optimizer": optimizer_state},
-                storage_reader=optimizer_reader,
-                process_group=process_group,
-                # The strict check looks for missing ``model`` keys; there are none
-                # in an optimizer-only load, so strictness has nothing to say here.
-                planner=_ModelStrictLoadPlanner(strict_model=False),
-            )
-
-        cls._load_extra_state(checkpoint_dir=model_root, state=state)
-
-        logger.info_rank0(f"Loaded checkpoint from {model_root}")
-
-        return state
 
     @classmethod
     def _legacy_fused_dir(cls, path: str, module: str) -> Optional[str]:

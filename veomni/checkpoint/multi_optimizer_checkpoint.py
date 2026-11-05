@@ -64,16 +64,48 @@ def _iter_optimizer_leaves(optimizer):
     yield from optimizer.optimizers_dict.values()
 
 
+def _validate_fresh_swap_optimizer(leaf):
+    """Verify SwapAdamW's eagerly allocated buffers still have fresh state."""
+    if "_veomni_dcp_staged_state" in vars(leaf) or getattr(leaf, "_veomni_dcp_restore_failed", False):
+        raise RuntimeError("SwapAdamW checkpoint resume requires a fresh optimizer without state")
+    params = {param for group in leaf.param_groups for param in group["params"]}
+    if set(leaf.state) != set(leaf._host_states) or set(leaf.state) != set(leaf._device_states):
+        raise RuntimeError("SwapAdamW checkpoint resume requires a fresh optimizer without state")
+    if not set(leaf.state).issubset(params):
+        raise RuntimeError("SwapAdamW checkpoint resume found unowned state")
+    for param, state in leaf.state.items():
+        host = leaf._host_states[param]
+        if (
+            type(state.get("step")) is not int
+            or state["step"] != 0
+            or set(state) != {"step", *leaf._state_keys}
+            or set(host) != set(leaf._state_keys)
+        ):
+            raise RuntimeError("SwapAdamW checkpoint resume requires a fresh optimizer without state")
+        for value in host.values():
+            if value.device.type != "cpu" or bool(torch.count_nonzero(value).item()):
+                raise RuntimeError("SwapAdamW checkpoint resume requires pristine host state")
+
+
+def _clear_swap_checkpoint_staging(optimizer):
+    from ..optim.swap_adamw import SwapAdamW
+
+    for leaf in _iter_optimizer_leaves(optimizer):
+        if type(leaf) is SwapAdamW:
+            leaf.__dict__.pop("_veomni_dcp_staged_state", None)
+
+
 def _expected_optimizer_fields(leaf, param_group):
     from ..optim.checkpoint_adapter import rank_local_adamw_adapter
     from ..optim.muon import DistributedMuon
     from ..optim.optimizer import AnyPrecisionAdamW
+    from ..optim.swap_adamw import SwapAdamW
 
     if isinstance(leaf, DistributedMuon):
         return {"momentum_buffer"}
     if rank_local_adamw_adapter(leaf) is not None:
         return {"step", "master_weight", "exp_avg", "exp_avg_sq"}
-    if type(leaf) is torch.optim.AdamW:
+    if type(leaf) in (torch.optim.AdamW, SwapAdamW):
         fields = {"step", "exp_avg", "exp_avg_sq"}
         if param_group.get("amsgrad"):
             fields.add("max_exp_avg_sq")
@@ -89,8 +121,14 @@ def _expected_optimizer_fields(leaf, param_group):
 def _validate_source_optimizer_states(optimizer, model):
     from ..optim.checkpoint_adapter import rank_local_adamw_adapter
     from ..optim.optimizer import AnyPrecisionAdamW
+    from ..optim.swap_adamw import SwapAdamW
 
     for leaf in _iter_optimizer_leaves(optimizer):
+        if type(leaf) is SwapAdamW:
+            if getattr(leaf, "_veomni_dcp_restore_failed", False) or "_veomni_dcp_staged_state" in vars(leaf):
+                raise RuntimeError("SwapAdamW cannot save an incomplete checkpoint restore")
+            if set(leaf.state) != set(leaf._host_states) or set(leaf.state) != set(leaf._device_states):
+                raise RuntimeError("SwapAdamW checkpoint state ownership is inconsistent")
         for group in leaf.param_groups:
             expected = _expected_optimizer_fields(leaf, group)
             for param in group["params"]:
@@ -99,7 +137,21 @@ def _validate_source_optimizer_states(optimizer, model):
                     continue
                 if set(state) != expected:
                     raise RuntimeError("MultiOptimizer has incomplete or unsupported parameter state")
+                if type(leaf) is SwapAdamW:
+                    local_param = param.to_local() if isinstance(param, DTensor) else param
+                    host = leaf._host_states[param]
+                    if set(host) != set(leaf._state_keys) or any(
+                        value.device.type != "cpu" or value.shape != local_param.shape or value.dtype != param.dtype
+                        for value in host.values()
+                    ):
+                        raise RuntimeError("SwapAdamW checkpoint host buffers have an incompatible layout")
                 for field, value in state.items():
+                    if field == "step" and type(leaf) is SwapAdamW:
+                        # SwapAdamW serializes this integer as float32 for AdamW
+                        # compatibility; larger values would silently round.
+                        if type(value) is not int or not 0 <= value <= 2**24:
+                            raise RuntimeError("SwapAdamW step cannot be represented exactly in its checkpoint")
+                        continue
                     if not torch.is_tensor(value):
                         raise RuntimeError(f"MultiOptimizer state {field} must be a tensor")
                     if field == "step":
@@ -204,6 +256,8 @@ def _preflight_multi_optimizer_layout(
         return None, None, None, None, None, None, None
     snapshot, extra, extra_digest, source_metadata, error = None, None, None, None, None
     try:
+        if getattr(optimizer, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("MultiOptimizer checkpoint resume requires a newly constructed optimizer")
         source_metadata = reader_factory(checkpoint_path).read_metadata()
         parameter_names = _dcp_parameter_name_map(model)
         from .rank_local_optimizer import current_rank, load_rank_scalars, rank_prefix
@@ -225,7 +279,11 @@ def _preflight_multi_optimizer_layout(
                         "use a full-model checkpoint or a verified migration"
                     )
         for leaf in _iter_optimizer_leaves(optimizer):
-            if leaf.state:
+            from ..optim.swap_adamw import SwapAdamW
+
+            if type(leaf) is SwapAdamW:
+                _validate_fresh_swap_optimizer(leaf)
+            elif leaf.state:
                 raise RuntimeError("MultiOptimizer checkpoint resume requires a fresh optimizer without state")
             if any(param.grad is not None for param_group in leaf.param_groups for param in param_group["params"]):
                 raise RuntimeError("MultiOptimizer checkpoint resume requires cleared gradients")
@@ -424,6 +482,7 @@ def _prepare_multi_optimizer_saved_states(
     try:
         from ..optim.checkpoint_adapter import rank_local_adamw_adapter
         from ..optim.optimizer import AnyPrecisionAdamW
+        from ..optim.swap_adamw import SwapAdamW
 
         metadata = reader_factory(checkpoint_path).read_metadata()
         save_id = getattr(getattr(metadata, "storage_meta", None), "save_id", None)
@@ -490,6 +549,7 @@ def _prepare_multi_optimizer_saved_states(
                 raise RuntimeError("MultiOptimizer checkpoint parameter group inventory differs")
 
         for leaf in _iter_optimizer_leaves(optimizer):
+            staged = {} if type(leaf) is SwapAdamW and not validate_only else None
             if any(not param.requires_grad for group in leaf.param_groups for param in group["params"]):
                 if getattr(leaf, "_optimizer_load_state_dict_pre_hooks", None) or getattr(
                     leaf, "_optimizer_load_state_dict_post_hooks", None
@@ -521,13 +581,18 @@ def _prepare_multi_optimizer_saved_states(
                                 step_shape, step_dtype = tuple(entry.size), entry.properties.dtype
                             if step_shape != ():
                                 raise RuntimeError("Non-scalar optimizer steps require an explicit owner-layout codec")
+                            if type(leaf) is SwapAdamW and step_dtype != torch.float32:
+                                raise RuntimeError("SwapAdamW checkpoint step must be a float32 scalar")
                             adapter = rank_local_adamw_adapter(leaf)
                             if adapter is not None and step_dtype != adapter.state_dtype(leaf, param, field):
                                 raise RuntimeError(
                                     "MultiOptimizer checkpoint step dtype differs from its registered policy"
                                 )
                             device = (
-                                param.device if param_group.get("capturable") or param_group.get("fused") else "cpu"
+                                param.device
+                                if type(leaf) is not SwapAdamW
+                                and (param_group.get("capturable") or param_group.get("fused"))
+                                else "cpu"
                             )
                             if not validate_only:
                                 state[field] = torch.zeros((), dtype=step_dtype, device=device)
@@ -553,14 +618,23 @@ def _prepare_multi_optimizer_saved_states(
                         if tuple(entry.size) != tuple(local_param.shape):
                             raise RuntimeError(f"MultiOptimizer checkpoint shape mismatch for {candidates[0]}.{field}")
                         if not validate_only:
-                            if adapter is not None and adapter.state_is_offloaded(leaf, param):
+                            if type(leaf) is SwapAdamW or (
+                                adapter is not None and adapter.state_is_offloaded(leaf, param)
+                            ):
                                 from .rank_local_optimizer import zeros_like_parameter_on_cpu
 
                                 state[field] = zeros_like_parameter_on_cpu(param, dtype=dtype)
                             else:
                                 state[field] = torch.zeros_like(param, dtype=dtype, device=param.device)
                     if not validate_only:
-                        leaf.state[param] = state
+                        if staged is not None:
+                            staged[param] = state
+                        else:
+                            leaf.state[param] = state
+            if staged is not None:
+                if "_veomni_dcp_staged_state" in vars(leaf):
+                    raise RuntimeError("SwapAdamW checkpoint staging is already active")
+                leaf._veomni_dcp_staged_state = staged
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "preparing MultiOptimizer checkpoint state", group=group)
