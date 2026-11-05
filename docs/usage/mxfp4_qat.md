@@ -75,9 +75,11 @@ still claims MXFP4.
 
 Set `linear_implementation: eager` for adapter training — the shipped
 [Qwen3 LoRA config](../../configs/text/qwen3_lora.yaml) already does, because it
-does not select the field. `swiglu_mlp_implementation: torchao_mxfp4` is
-unaffected: the fused MLP row reads the projection weights itself and falls back
-to the projection modules when they are wrapped.
+does not select the field. The fused MLP row has the same rule: with
+`swiglu_mlp_implementation: torchao_mxfp4` and an adapter on
+`gate_proj`/`up_proj`/`down_proj`, the forward raises
+`swiglu_mlp_implementation=... cannot run on a wrapped projection` instead of
+running the quantized row's unquantized fallback path.
 
 Start from [the Qwen3 example](../../configs/text/qwen3_mxfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:
@@ -121,6 +123,7 @@ model keeps training with the same rounding.
 ## Tests
 
 ```bash
+uv pip install torchao==0.18.0   # not in any extra; the rows are optional
 pytest tests/ops/linear/ tests/ops/swiglu_mlp/ -q
 ```
 
@@ -128,5 +131,11 @@ These are CPU tests: they cover the registry rows, forward parity against a
 hand-quantized reference, the straight-through gradient contract, the
 empty-input and non-contiguous-input paths, the divisibility and dtype errors,
 and the missing-package failure. `tests/models/transformers/qwen/test_qwen3.py`
-additionally checks that a built Qwen3 model runs the selected row and produces
-finite gradients.
+additionally checks that a built Qwen3 model runs the selected row, produces
+finite gradients, and refuses a LoRA-wrapped projection.
+
+**They skip when `torchao` is absent**, and `torchao` is deliberately in no
+VeOmni extra — the `gpu` extra is the accelerator stack, and a fake-quant
+backend should not add a wheel to every GPU job. CI therefore reports them as
+skipped, not passed: install `torchao` to run them, and treat a change that
+removes `torchao` from a test environment as reducing what is verified.

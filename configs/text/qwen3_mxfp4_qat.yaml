@@ -40,7 +40,10 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
-  global_batch_size: null
+  # Matches configs/text/qwen3.yaml. `null` would derive the batch from
+  # micro_batch_size x dp_size, which is 1 on a single device and makes the
+  # example a smoke run rather than a recipe.
+  global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 1
   checkpoint:

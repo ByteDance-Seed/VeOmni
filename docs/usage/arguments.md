@@ -203,6 +203,7 @@ apart from the compatibility aliases documented below.
 | `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `liger_kernel` |
 | `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `liger_kernel` |
 | `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `liger_kernel` |
+| `linear_implementation` | `eager` | `eager` | `eager` |
 | `rotary_pos_emb_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
 | `rotary_pos_emb_vision_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
 | `load_balancing_loss_implementation` | `triton` | `eager` | `eager` |

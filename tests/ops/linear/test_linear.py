@@ -161,6 +161,34 @@ def test_linear_torchao_mxfp4_handles_empty_input():
 
 
 @_requires_torchao
+def test_linear_torchao_mxfp4_quantizes_even_with_no_tokens():
+    """The zero-token path must not be the branch that skips the quantizer.
+
+    Comparing a ``float32`` activation against the eager row does not tell the
+    two apart, because an empty tensor has no values to round; instead assert the
+    call reaches ``mxfp4_fake_quant`` for both operands.
+    """
+    from veomni.ops.kernels.linear.standard import torchao_mxfp4 as impl
+
+    seen: list[tuple[tuple[int, ...], int]] = []
+
+    def _record(tensor, block_size=32):
+        seen.append((tuple(tensor.shape), block_size))
+        return tensor
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(impl, "mxfp4_fake_quant", _record)
+    try:
+        x = torch.randn(0, 64, dtype=torch.bfloat16)
+        w = torch.randn(32, 64, dtype=torch.bfloat16)
+        impl.wrapper(x, w, _empty_bias(w))
+    finally:
+        monkeypatch.undo()
+
+    assert seen == [((0, 64), 32), ((32, 64), 32)]
+
+
+@_requires_torchao
 def test_linear_torchao_mxfp4_accepts_non_contiguous_input():
     """A sliced activation arrives non-contiguous and torchao's to_mx asserts contiguity."""
     op = VeomniOp("linear", "standard", "torchao_mxfp4")

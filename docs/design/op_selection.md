@@ -447,7 +447,20 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
+| `torchao_mxfp4` | Registered MXFP4 fake-quant row | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
+
+#### `linear_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `eager` | Registered `F.linear` row | — |
+| `torchao_mxfp4` | Registered MXFP4 fake-quant row | `torchao` package |
+
+Both quantizing rows refuse to run on a projection substituted after
+construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):
+they raise instead of forwarding the unquantized base, because a graceful
+fallback would leave the config claiming quantization-aware training.
 
 ### What gets patched
 
