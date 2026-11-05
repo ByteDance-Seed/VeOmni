@@ -136,7 +136,8 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" \
   --train.checkpoint.output_dir "$RUN_DIR"
 ```
 
-The example runs four steps and checkpoints every two steps. To check resume,
+The example keeps sample order with `data.dataloader.shuffle: false`, runs four
+steps and checkpoints every two steps. To check resume,
 repeat the same command in a **new process**, adding:
 
 ```bash

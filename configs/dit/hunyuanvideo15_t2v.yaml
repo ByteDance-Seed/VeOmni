@@ -51,7 +51,7 @@ data:
     num_workers: 0
     drop_last: true
     pin_memory: false
-  shuffle: false
+    shuffle: false
 
 train:
   training_task: online_training

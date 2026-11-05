@@ -21,18 +21,22 @@ def test_video_layout_range_and_frame_requirement():
         prepare_video(raw, 16, 16, 4)
 
 
-def test_training_config_resizes_video_only_at_conditioning():
-    import yaml
+def test_training_config_resizes_video_only_at_conditioning(monkeypatch):
+    import sys
 
+    from veomni.arguments import parse_args
     from veomni.data.multimodal.video_utils import smart_resize
+    from veomni.trainer.dit_trainer import VeOmniDiTArguments
 
     config_path = Path(__file__).resolve().parents[2] / "configs/dit/hunyuanvideo15_t2v.yaml"
-    config = yaml.safe_load(config_path.read_text())
+    monkeypatch.setattr(sys, "argv", ["train_dit.py", str(config_path)])
+    config = parse_args(VeOmniDiTArguments)
+    assert config.data.dataloader.shuffle is False
     raw = torch.rand(1, 3, 720, 1280) * 255
-    decoded = smart_resize(raw, **config["data"]["mm_configs"])
+    decoded = smart_resize(raw, **config.data.mm_configs)
     assert decoded.shape == raw.shape
     torch.testing.assert_close(decoded, raw, rtol=0, atol=0)
-    condition = config["model"]["condition_model_cfg"]
+    condition = config.model.condition_model_cfg
     actual = prepare_video(decoded, condition["height"], condition["width"], 1)
     assert actual.shape == (1, 3, 1, 480, 832)
     expected = prepare_video(raw, condition["height"], condition["width"], 1)
