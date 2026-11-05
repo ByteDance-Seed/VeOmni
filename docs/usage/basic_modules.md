@@ -397,6 +397,11 @@ compute parameters and gradients stay on their original device. Checkpoint
 resume for these optimizers requires the same proven parameter groups and
 parallel layout; see [checkpoint recovery](checkpoint.md).
 
+`model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
+states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
+is `false` or a pinned allocation fails — and streams them to the device in
+batches, lowering peak device memory.
+
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
 Muon-specific knobs (only consulted when `optimizer.type == "muon"`):

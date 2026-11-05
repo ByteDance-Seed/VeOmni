@@ -494,6 +494,28 @@ def _dcp_avoid_synthetic_optimizer_step(optimizer):
             optimizer.state.pop(param)
 
 
+@contextmanager
+def _dcp_swap_load_template(optimizer):
+    from .swap_adamw import SwapAdamW
+
+    staged = getattr(optimizer, "_veomni_dcp_staged_state", None)
+    if type(optimizer) is not SwapAdamW or staged is None:
+        yield
+        return
+    if "_veomni_dcp_live_state" in vars(optimizer):
+        raise RuntimeError("SwapAdamW checkpoint load is already active")
+    live = optimizer.state
+    optimizer._veomni_dcp_live_state = live
+    # PyTorch probes absent parameters through ``state[param]``. Keep those
+    # empty probe entries out of the proven source-owner inventory.
+    optimizer.state = defaultdict(dict, staged)
+    try:
+        yield
+    finally:
+        optimizer.state = live
+        del optimizer._veomni_dcp_live_state
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -524,6 +546,8 @@ class MultiOptimizer(Optimizer, Stateful):
         )
 
     def step(self, closure=None):
+        if getattr(self, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
         children = tuple(self.optimizers_dict.values())
         qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
         if self._qwen38_ple_world_profile:
@@ -585,9 +609,10 @@ class MultiOptimizer(Optimizer, Stateful):
 
         from .checkpoint_adapter import rank_local_adamw_adapter
         from .muon import DistributedMuon
+        from .swap_adamw import SwapAdamW
 
         for optimizer in self.optimizers_dict.values():
-            if type(optimizer) not in (torch.optim.AdamW, AnyPrecisionAdamW, DistributedMuon) and (
+            if type(optimizer) not in (torch.optim.AdamW, AnyPrecisionAdamW, DistributedMuon, SwapAdamW) and (
                 rank_local_adamw_adapter(optimizer) is None
             ):
                 raise RuntimeError("Cannot construct a MultiOptimizer snapshot for an unsupported optimizer leaf")
@@ -610,14 +635,18 @@ class MultiOptimizer(Optimizer, Stateful):
         by a scheduler even when no parameter has received a gradient.
         """
         merged: Dict[str, Any] = {}
+        if coordinate:
+            from ..checkpoint.optimizer_resume_layout import _validate_multi_leaf_order
+
+            _validate_multi_leaf_order(self, group=group)
         for name in self.key_names:
             error, sd = None, None
             try:
                 opt = self.optimizers_dict.get(name)
                 from .checkpoint_adapter import rank_local_adamw_context
 
-                with rank_local_adamw_context(opt):
-                    if not opt.state:
+                with rank_local_adamw_context(opt), _dcp_swap_load_template(opt):
+                    if not opt.state and not getattr(opt, "_veomni_dcp_staged_state", None):
                         sd = _empty_optimizer_state_dict(self.model, opt)
                     else:
                         sd = get_optimizer_state_dict(
@@ -647,6 +676,9 @@ class MultiOptimizer(Optimizer, Stateful):
         )
 
     def _dcp_load_state_dict(self, state_dict: Dict[str, Any], *, group=None) -> None:
+        from ..checkpoint.optimizer_resume_layout import _validate_multi_leaf_order
+
+        _validate_multi_leaf_order(self, group=group)
         for name in self.key_names:
             error = None
             try:
@@ -656,6 +688,7 @@ class MultiOptimizer(Optimizer, Stateful):
                 with (
                     rank_local_adamw_context(optimizer),
                     _dcp_restore_frozen_ownership(optimizer),
+                    _dcp_swap_load_template(optimizer),
                     _dcp_reuse_owned_anyprecision_state(optimizer),
                     _dcp_avoid_synthetic_optimizer_step(optimizer),
                 ):
@@ -973,6 +1006,43 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _build_state_offload_optimizer(
+    optimizer_type: str,
+    param_groups: Sequence[Dict[str, Any]],
+    *,
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    optimizer_config: Optional["OptimizerConfig"],
+) -> "Optimizer":
+    """Build the optimizer whose moment states live in host buffers.
+
+    ``model.optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
+    algorithm dispatch lives here, so a new offloadable algorithm is one branch
+    rather than one helper per algorithm. Muon will add its own ``elif`` (its
+    AdamW leaf is what carries host state today).
+    """
+    if optimizer_type == "adamw":
+        from .swap_adamw import SwapAdamW
+
+        return SwapAdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            device_memory_fraction=(
+                0.8 if optimizer_config is None else optimizer_config.state_offload_device_memory_fraction
+            ),
+            pin_memory=True if optimizer_config is None else optimizer_config.state_offload_pin_memory,
+        )
+    else:
+        raise ValueError(
+            f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+        )
+
+
 @_coordinate_qwen_builder
 def build_optimizer(
     model: "nn.Module",
@@ -995,12 +1065,17 @@ def build_optimizer(
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
-    here rather than unpacked by every trainer. It does *not* supply ``lr``,
-    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
-    because callers such as the VLM trainer drive the AdamW side from their own
-    param groups. ``muon_kwargs`` overrides the config key by key, for callers
-    that build Muon without an ``OptimizerConfig`` at all.
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
+    ``state_offload='cpu'``'s ``state_offload_device_memory_fraction``/``state_offload_pin_memory``)
+    are read here rather than unpacked by every trainer. It does *not* supply
+    ``lr``, ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit
+    arguments, because callers such as the VLM trainer drive the AdamW side from
+    their own param groups. ``muon_kwargs`` overrides the config key by key, for
+    callers that build Muon without an ``OptimizerConfig`` at all.
+
+    ``fused`` drives the stock ``AdamW`` path only: the state-offload optimizer
+    selects the fused kernel from the backend (``FUSED_ADAMW_DEVICE_TYPES``) and
+    takes the elementwise path elsewhere.
     """
     if isinstance(betas, list):
         betas = tuple(betas)
@@ -1093,6 +1168,7 @@ def build_optimizer(
             no_decay_modules,
             no_decay_params,
             cpu_offload_kwargs=cpu_offload_kwargs,
+            optimizer_config=optimizer_config,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -1118,6 +1194,19 @@ def build_optimizer(
     param_groups = filter_empty_param_groups(param_groups)
     if not param_groups:
         raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
+
+    if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+        # State offload is a placement choice, not a new algorithm: dispatch on it
+        # first; the algorithm branch lives in the helper.
+        return _build_state_offload_optimizer(
+            optimizer_type,
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            optimizer_config=optimizer_config,
+        )
 
     if optimizer_type == "adamw":
         foreach = not fused
@@ -1393,6 +1482,7 @@ def build_extra_parallel_fsdp2_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     cpu_offload_kwargs: Optional[Dict[str, Any]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -1510,7 +1600,23 @@ def build_extra_parallel_fsdp2_optimizer(
             model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
         )
 
+    # Each SwapAdamW leaf owns its own swap stream: the MultiOptimizer steps its
+    # leaves serially and every leaf drains its stream at the end of its own
+    # ``step``, so there is no cross-leaf copy to serialize.
+
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
+        if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+            # Same outer dispatch as the dense path: offload decides placement,
+            # the helper decides the algorithm.
+            return _build_state_offload_optimizer(
+                optimizer_type,
+                groups,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                optimizer_config=optimizer_config,
+            )
         if optimizer_type == "adamw":
             nonlocal fused
             foreach = not fused

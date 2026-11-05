@@ -3,9 +3,12 @@
 
 """Identity of a MultiOptimizer's rank-local parameter and scheduler layout."""
 
+import builtins
+import dis
 import hashlib
 import json
 import marshal
+import math
 import types
 
 import torch
@@ -17,11 +20,21 @@ from ..utils.dist_utils import raise_if_any_rank_failed
 
 MULTI_LAYOUT_MARKER = "__veomni_multi_optimizer_layout_v1__"
 
+_SCHEDULER_SAFE_BUILTINS = {
+    name: getattr(builtins, name)
+    for name in ("abs", "bool", "float", "int", "len", "max", "min", "pow", "range", "round", "sum")
+}
+_SCHEDULER_MATH_MEMBERS = {
+    name: value
+    for name, value in vars(math).items()
+    if not name.startswith("_") and type(value) in (float, int, types.BuiltinFunctionType)
+}
+
 
 def _immutable_value(value):
     if value is None or type(value) in (bool, int, float, str):
         return value
-    if isinstance(value, tuple):
+    if type(value) is tuple:
         return [_immutable_value(item) for item in value]
     raise RuntimeError("MultiOptimizer scheduler captures unsupported mutable state")
 
@@ -65,9 +78,80 @@ def _lr_layout(group, key, aliases):
     return {"type": type(value).__name__}
 
 
-def _scheduler_layout(leaf):
-    import math
+def _scheduler_functions(scheduler):
+    """Describe LambdaLR callables using the existing checkpoint identity format."""
 
+    def normalize(code, globals_dict, builtins_dict):
+        # Nested code objects share this function's global namespace. A
+        # referenced global can change the next LR without changing code.
+        # LOAD_ATTR names are not globals; inspect actual global lookups instead.
+        instructions = list(dis.get_instructions(code))
+        for index, instruction in enumerate(instructions):
+            opcode = instruction.opname
+            if opcode in ("STORE_DEREF", "DELETE_DEREF") and instruction.argval in code.co_freevars:
+                raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
+            if opcode in (
+                "LOAD_NAME",
+                "STORE_NAME",
+                "DELETE_NAME",
+                "STORE_GLOBAL",
+                "DELETE_GLOBAL",
+                "STORE_ATTR",
+                "DELETE_ATTR",
+                "STORE_SUBSCR",
+                "DELETE_SUBSCR",
+                "IMPORT_NAME",
+                "IMPORT_FROM",
+                "IMPORT_STAR",
+                "LOAD_BUILD_CLASS",
+            ):
+                raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
+            if opcode in ("LOAD_ATTR", "LOAD_METHOD"):
+                previous = instructions[index - 1] if index else None
+                if previous is None or previous.opname != "LOAD_GLOBAL" or previous.argval != "math":
+                    raise RuntimeError("MultiOptimizer scheduler uses unsupported attribute access")
+                expected = _SCHEDULER_MATH_MEMBERS.get(instruction.argval)
+                actual = vars(math).get(instruction.argval)
+                if (
+                    expected is None
+                    or type(expected) is not type(actual)
+                    or (actual is not expected and (type(expected) not in (int, float) or actual != expected))
+                ):
+                    raise RuntimeError("MultiOptimizer scheduler uses unsupported math state")
+                continue
+            if opcode != "LOAD_GLOBAL":
+                continue
+            name = instruction.argval
+            if name in globals_dict:
+                if name != "math" or globals_dict[name] is not math:
+                    raise RuntimeError("MultiOptimizer scheduler refers to unsupported global state")
+            elif name not in _SCHEDULER_SAFE_BUILTINS or builtins_dict.get(name) is not _SCHEDULER_SAFE_BUILTINS[name]:
+                raise RuntimeError("MultiOptimizer scheduler uses an unsupported builtin")
+        constants = tuple(
+            normalize(item, globals_dict, builtins_dict) if isinstance(item, types.CodeType) else item
+            for item in code.co_consts
+        )
+        return code.replace(co_filename="", co_firstlineno=0, co_consts=constants)
+
+    functions = []
+    for function in scheduler.lr_lambdas:
+        if not isinstance(function, types.FunctionType):
+            raise RuntimeError("MultiOptimizer scheduler uses an unsupported callable")
+
+        functions.append(
+            {
+                "code": hashlib.sha256(
+                    marshal.dumps(normalize(function.__code__, function.__globals__, function.__builtins__))
+                ).hexdigest(),
+                "defaults": _immutable_value(function.__defaults__),
+                "kwdefaults": _immutable_value(function.__kwdefaults__),
+                "closure": [_immutable_value(cell.cell_contents) for cell in function.__closure__ or ()],
+            }
+        )
+    return functions
+
+
+def _scheduler_layout(leaf):
     from ..optim.lr_scheduler import checkpoint_scheduler_binding
 
     scheduler = checkpoint_scheduler_binding(leaf)
@@ -77,29 +161,10 @@ def _scheduler_layout(leaf):
         raise RuntimeError("MultiOptimizer requires a supported scheduler")
     if scheduler.optimizer is not leaf:
         raise RuntimeError("MultiOptimizer scheduler binding changed")
-    functions = []
-    for function in scheduler.lr_lambdas:
-        if not isinstance(function, types.FunctionType):
-            raise RuntimeError("MultiOptimizer scheduler uses an unsupported callable")
-        if any(
-            name in function.__globals__ and (name != "math" or function.__globals__[name] is not math)
-            for name in function.__code__.co_names
-        ):
-            raise RuntimeError("MultiOptimizer scheduler refers to unsupported global state")
-
-        def normalize(code):
-            constants = tuple(normalize(item) if isinstance(item, types.CodeType) else item for item in code.co_consts)
-            return code.replace(co_filename="", co_firstlineno=0, co_consts=constants)
-
-        functions.append(
-            {
-                "code": hashlib.sha256(marshal.dumps(normalize(function.__code__))).hexdigest(),
-                "defaults": _immutable_value(function.__defaults__),
-                "kwdefaults": _immutable_value(function.__kwdefaults__),
-                "closure": [_immutable_value(cell.cell_contents) for cell in function.__closure__ or ()],
-            }
-        )
-    return {"type": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}", "functions": functions}
+    return {
+        "type": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}",
+        "functions": _scheduler_functions(scheduler),
+    }
 
 
 def _local_layout(
@@ -108,6 +173,7 @@ def _local_layout(
     from ..optim.checkpoint_adapter import rank_local_adamw_adapter
     from ..optim.muon import DistributedMuon
     from ..optim.optimizer import AnyPrecisionAdamW, MultiOptimizer
+    from ..optim.swap_adamw import SwapAdamW
 
     if type(optimizer) is not MultiOptimizer:
         raise RuntimeError("MultiOptimizer checkpoint requires the standard serialization implementation")
@@ -228,6 +294,7 @@ def _local_layout(
             torch.optim.AdamW,
             AnyPrecisionAdamW,
             DistributedMuon,
+            SwapAdamW,
         ):
             raise RuntimeError("MultiOptimizer checkpoint requires an explicitly supported optimizer leaf")
         groups = []
@@ -365,6 +432,16 @@ def frozen_parameter_digest(model, *, enabled, group=None, chunk_bytes=4 << 20):
     return digest.hexdigest()
 
 
+def _validate_multi_leaf_order(optimizer, *, group=None):
+    """All ranks must enter per-leaf checkpoint collectives in the same order."""
+    if not dist.is_initialized():
+        return
+    orders = [None] * dist.get_world_size(group)
+    dist.all_gather_object(orders, tuple(optimizer.key_names), group=group)
+    if any(order != orders[0] for order in orders[1:]):
+        raise RuntimeError(f"MultiOptimizer leaf order differs across checkpoint ranks: {orders}")
+
+
 def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object, *, group=None, frozen_digest=None):
     """Validate the live save layout once, before creating checkpoint files."""
     encoded, error = None, None
@@ -383,6 +460,7 @@ def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object,
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "capturing MultiOptimizer checkpoint layout", group=group)
+    _validate_multi_leaf_order(optimizer, group=group)
     return encoded
 
 
@@ -432,6 +510,7 @@ def coordinated_multi_layout(
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "inspecting MultiOptimizer layout", group=group)
+    _validate_multi_leaf_order(optimizer, group=group)
     if dist.is_initialized():
         world = dist.get_world_size(group)
         digests = [None] * world

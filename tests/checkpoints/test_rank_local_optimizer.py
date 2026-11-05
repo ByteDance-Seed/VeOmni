@@ -166,7 +166,7 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
         )
         model = torch.nn.Module()
         values = torch.arange(16, dtype=torch.float32).reshape(4, 4) + 100 * owner
-        if kind == "offload":
+        if kind in ("offload", "swap_bf16"):
             values = values.to(torch.bfloat16)
         fsdp_axis = 0 if same_axis else 1
         model.register_parameter("weight", torch.nn.Parameter(distribute_tensor(values, fsdp, [Shard(fsdp_axis)])))
@@ -179,6 +179,14 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
             from veomni.optim.optimizer import AnyPrecisionAdamW
 
             leaf = AnyPrecisionAdamW([model.weight], lr=0.01)
+        elif kind in ("swap", "swap_bf16"):
+            from veomni.optim.swap_adamw import SwapAdamW
+
+            if inactive_owner and owner == 1:
+                model.weight.requires_grad_(False)
+            leaf = SwapAdamW([model.weight], lr=0.01, pin_memory=False)
+            if inactive_owner and owner == 1:
+                model.weight.requires_grad_(True)
         else:
             leaf = torch.optim.AdamW([model.weight], lr=0.01)
         leaves = {"expert": leaf}
@@ -190,6 +198,8 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
 
         def snapshot():
             state = optimizer.optimizers_dict["expert"].state.get(model.weight, {})
+            if kind in ("swap", "swap_bf16") and state:
+                state = {"step": torch.tensor(state["step"]), **leaf._host_states[model.weight]}
             if kind == "anyprecision" and state:
                 assert set(state) == {"step", "exp_avg", "exp_avg_sq", "compensation"}
                 assert state["step"].dtype == torch.float32
@@ -245,7 +255,7 @@ def _cold_optimizer_worker(rank, root, inactive_owner, phase, kind, canonical, s
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 @pytest.mark.parametrize("inactive_owner", [False, True])
-@pytest.mark.parametrize("kind", ["adam", "offload", "muon"])
+@pytest.mark.parametrize("kind", ["adam", "offload", "muon", "swap"])
 @pytest.mark.parametrize("canonical", [False, True])
 def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kind, canonical):
     mp.spawn(
@@ -260,6 +270,19 @@ def test_rank_owned_optimizer_fresh_process_resume(tmp_path, inactive_owner, kin
         nprocs=4,
         join=True,
     )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+@pytest.mark.parametrize("kind", ["swap", "swap_bf16"])
+@pytest.mark.parametrize("same_axis", [False, True])
+def test_swap_rank_owned_optimizer_fresh_process_resume(tmp_path, kind, same_axis):
+    for phase in ("save", "load"):
+        mp.spawn(
+            _cold_optimizer_worker,
+            args=(str(tmp_path), True, phase, kind, True, same_axis),
+            nprocs=4,
+            join=True,
+        )
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))

@@ -118,3 +118,20 @@ for the complete recovery constraints. Test an extension with initialized and
 unused parameters, save, fresh-process restore, and the next update at its
 actual dtype and placement; an adapter registration or a single forward pass
 is not an acceptance test.
+
+## Optional file-backed state abort hook
+
+An optimizer that owns file-backed state may provide the zero-argument
+`checkpoint_abort_file_backed_state()` hook. If the final distributed barrier
+in `ModelCheckpointManager.load()` fails after loading state, the manager
+calls this hook on the optimizer and on each `MultiOptimizer` leaf that defines
+it. The hook owns its optimizer's cleanup or invalidation: it should make any
+partially restored file-backed state unusable until the optimizer is rebuilt
+or explicitly recovered. It must not perform collectives and should be safe
+to call more than once. The manager ignores ordinary cleanup exceptions so the
+original barrier failure is propagated; it does not report the checkpoint as
+successfully loaded. Optimizers without file-backed state need no hook.
+
+The manager calls this hook only on its final-barrier failure path; it is not a
+general notification for every earlier load error. File-backed optimizers and
+checkpointers remain responsible for cleanup at their own failure sites.
