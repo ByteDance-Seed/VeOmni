@@ -22,6 +22,8 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    _flatten_optim_state_dict,
+    _get_fqns,
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
@@ -255,6 +257,53 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def _empty_optimizer_state_dict(model, opt):
+    if getattr(opt.state_dict, "__func__", None) is not Optimizer.state_dict:
+        raise RuntimeError("Cannot safely serialize an empty optimizer with a custom state_dict")
+    packed_groups = []
+    id_to_name = {}
+    captured = False
+
+    def capture_params(leaf):
+        nonlocal captured
+        if captured:
+            raise RuntimeError("Cannot reenter optimizer state_dict while saving an empty optimizer")
+        captured = True
+        packed_groups.extend([list(group["params"]) for group in leaf.param_groups])
+
+    def capture_ids(_leaf, packed):
+        names = {}
+        for runtime_name, param in model.named_parameters():
+            fqns = _get_fqns(model, runtime_name)
+            if len(fqns) != 1:
+                raise ValueError(f"Expected one checkpoint name for parameter {runtime_name}")
+            names[id(param)] = next(iter(fqns))
+        for params, group in zip(packed_groups, packed["param_groups"], strict=True):
+            for param, saved_id in zip(params, group["params"], strict=True):
+                param_name = names[id(param)]
+                if saved_id in id_to_name and id_to_name[saved_id] != param_name:
+                    raise RuntimeError("Ambiguous parameter mapping in optimizer state_dict")
+                id_to_name[saved_id] = param_name
+
+    # Capture after user pre-hooks and before user post-hooks can change either
+    # the serialized or live groups. Concurrent serialization must be excluded.
+    pre_hook = opt.register_state_dict_pre_hook(capture_params)
+    try:
+        post_hook = opt.register_state_dict_post_hook(capture_ids, prepend=True)
+        try:
+            raw = opt.state_dict()
+        finally:
+            post_hook.remove()
+    finally:
+        pre_hook.remove()
+    state = {id_to_name[key]: value for key, value in raw["state"].items()}
+    groups = [
+        {**saved_group, "params": [id_to_name[key] for key in saved_group["params"]]}
+        for saved_group in raw["param_groups"]
+    ]
+    return _flatten_optim_state_dict({"state": state, "param_groups": groups})
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -309,18 +358,20 @@ class MultiOptimizer(Optimizer, Stateful):
     ) -> Dict[str, Any]:
         """Return a flattened optimizer state dict without materializing state.
 
-        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
-        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
-        call ``_init_optim_state`` and synthesize default state for every
-        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
-        this rank), bloating the checkpoint.
+        Unlike ``state_dict()``, this serializes an empty leaf's parameter
+        groups without calling PyTorch's synthetic optimizer initialization.
+        The groups must still be saved because their LR may have been updated
+        by a scheduler even when no parameter has received a gradient.
         """
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
             if not opt.state:
-                continue
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+                sd = _empty_optimizer_state_dict(self.model, opt)
+            else:
+                sd = get_optimizer_state_dict(
+                    self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
+                )
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(
