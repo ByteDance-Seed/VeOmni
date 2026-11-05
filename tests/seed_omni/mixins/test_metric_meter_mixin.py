@@ -167,6 +167,26 @@ def test_consumed_tokens_accumulate_per_module_across_steps(single_process_meter
     assert meter.consume_chunks == 2
 
 
+def test_add_counts_a_packed_batch_by_its_per_sample_metadata(single_process_meter):
+    """A packed batch carries no conversation carrier, so counting `conversation_list`
+    alone reports zero samples for a whole packed run. The collator concatenates
+    `ds_idx`, so the count comes from that tensor's length."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "ds_idx": torch.tensor([0, 2])})
+    assert meter.batch_count == 2
+
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "ds_idx": torch.tensor([1])})
+    assert meter.batch_count == 3
+
+
+def test_add_counts_a_packed_batch_without_multisource_metadata_as_one_sample(single_process_meter):
+    """Multi-source off means no `ds_idx` was ever attached; the batch is still
+    one packed micro-batch worth of samples, not zero."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long)})
+    assert meter.batch_count == 1
+
+
 def test_step_resets_the_per_step_sample_accumulator(single_process_meter):
     meter = single_process_meter
     meter.add({"conversation_list": [object(), object()]})

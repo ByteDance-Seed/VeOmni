@@ -15,19 +15,42 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence
 
+import torch
+from torch.utils.data._utils.collate import default_collate
+
 from ..data_collator import DataCollator
 
 
-# Keys a packed preprocessor writes instead of a conversation carrier. A packed
-# sample carries exactly one packed sequence already (its preprocessor packed the
-# sample's turns together), so collation concatenates them along the packed
-# sequence axis instead of list-grouping them.
-_PACKED_SEQUENCE_KEYS = ("packed_input_ids", "packed_labels", "packed_attention_mask")
-_PACKED_CONCAT_DIM = {"packed_input_ids": 1, "packed_labels": 1, "packed_attention_mask": 1}
-# Per-visual metadata: concatenated along the first axis (one row per visual).
-_PACKED_VISUAL_ROW_KEYS = ("pixel_values", "image_grid_thw")
-# Scalars describing the whole packed batch, summed or re-derived.
-_PACKED_SCALAR_KEYS = ("visual_num_real",)
+# Which axis of a per-sample packed tensor continues the packed sequence. Same
+# idea as ``DEFAULT_DATA_COLLATE_INFO`` in ``data_collator`` — a declarative table
+# keyed by literal field name, not a per-key branch — only these sample tensors
+# already carry the batch axis the base collator appends at the end:
+#
+#   packed_input_ids      (1, T)      -> (1, sum T)
+#   packed_position_ids   (3, 1, T)   -> (3, 1, sum T)
+#   pixel_values          (N, D)      -> (sum N, D)      (one row per visual)
+#   image_grid_thw        (N, 3)      -> (sum N, 3)
+#
+# A key that is not listed is not part of the packed sequence: it is batched by
+# ``default_collate``, exactly as the base ``PackingCollator`` treats a field the
+# model did not declare. That is also how the framework's own metadata
+# (``ds_idx`` / ``source_name`` / ``cur_token_num``, appended to a sample by the
+# dataset *after* the transform) reaches the trainer.
+_PACKED_CONCAT_DIM: Dict[str, int] = {
+    "packed_input_ids": 1,
+    "packed_labels": 1,
+    "packed_attention_mask": 1,
+    "packed_position_ids": 2,
+    "visual_pos_mask": 1,
+    "pixel_values": 0,
+    "image_grid_thw": 0,
+}
+
+# Summed across the batch rather than joined: a count of visuals, not a tensor.
+_PACKED_SUM_KEYS = ("visual_num_real",)
+
+# Re-derived from the joined sequence, so the per-sample copies are ignored.
+_PACKED_REBUILT_KEYS = ("packed_cu_seqlens", "packed_max_length")
 
 
 @dataclass
@@ -102,47 +125,33 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
     """Batch already-packed per-sample dicts into one packed batch.
 
     A packed preprocessor consumes ``conversation_list`` and emits one packed
-    sequence per sample, so unlike the conversation path nothing here may stay a
-    per-sample list: every packed node indexes into the batch directly.
+    sequence per sample, so the tensors describing that sequence join into one
+    longer sequence instead of staying a per-sample list: every packed node
+    indexes into the batch directly.
 
-    - Sequence tensors (``packed_input_ids`` / ``_labels`` / ``_attention_mask``)
-      concatenate along the packed sequence axis and ``packed_cu_seqlens`` is
-      rebuilt from the per-sample lengths, so the batch is one varlen sequence.
-    - ``packed_position_ids`` concatenates on its sequence axis too.
-    - Per-visual rows (``pixel_values`` / ``image_grid_thw``) concatenate on the
-      first axis; DeepStack features concatenate on their token axis.
-    - Scalars (``visual_num_real``) sum.
+    Only the axes in :data:`_PACKED_CONCAT_DIM` are known here; everything else
+    goes through ``default_collate``, the same rule the base ``PackingCollator``
+    applies to a key the model did not declare. That is what carries the
+    framework's own metadata — ``ds_idx`` / ``source_name`` / ``cur_token_num``
+    are appended to a sample by the dataset *after* the transform, and
+    ``default_collate`` joins them the way the meter expects (a tensor of
+    per-sample indices, or a list when they are strings).
     """
-    import torch
-
-    batch: Dict[str, Any] = {}
     lengths = [int(f["packed_input_ids"].shape[-1]) for f in features]
+    batch: Dict[str, Any] = {}
     for key in keys:
+        if key in _PACKED_REBUILT_KEYS:
+            continue
         values = [f[key] for f in features]
         if key in _PACKED_CONCAT_DIM:
-            batch[key] = torch.cat(
-                [v if v.dim() == 2 else v.unsqueeze(0) for v in values], dim=_PACKED_CONCAT_DIM[key]
-            )
-        elif key == "packed_position_ids":
-            # [3, 1, T] per sample -> [3, 1, sum(T)]
-            parts = [v if v.dim() == 3 else v.unsqueeze(1) for v in values]
-            batch[key] = torch.cat(parts, dim=2)
-        elif key in _PACKED_VISUAL_ROW_KEYS or key == "deepstack_visual_embeds":
-            batch[key] = torch.cat(values, dim=0)
-        elif key in _PACKED_SCALAR_KEYS:
+            batch[key] = torch.cat(values, dim=_PACKED_CONCAT_DIM[key])
+        elif key in _PACKED_SUM_KEYS:
             batch[key] = sum(int(v) for v in values)
-        elif key == "packed_cu_seqlens":
-            continue  # rebuilt below from the per-sample lengths
-        elif key == "packed_max_length":
-            continue  # rebuilt below
-        elif key == "visual_pos_mask":
-            # [1, T] per sample -> [1, sum(T)]
-            batch[key] = torch.cat([v if v.dim() == 2 else v.unsqueeze(0) for v in values], dim=1)
         else:
-            raise KeyError(
-                f"SeedOmniCollator: packed sample produced unknown key {key!r}; add it to the packed "
-                "collation contract in veomni/data/seed_omni/collator.py."
-            )
+            # Not part of the packed sequence — framework metadata, and whatever a
+            # later preprocessor adds. Batch it the way every other trainer field
+            # is batched.
+            batch[key] = default_collate(values)
 
     cu = [0]
     for length in lengths:

@@ -283,25 +283,64 @@ def test_packed_samples_survive_omni_preprocess_and_collation():
     assert tuple(batch[PIXEL_VALUES].shape) == (32, 8)
 
 
-def test_packed_collation_rejects_an_unknown_preprocessor_key():
-    """A packed preprocessor that starts emitting a new key must teach the collator
-    about it rather than have it silently list-grouped."""
-    import pytest
-
+def test_packed_collation_batches_an_undeclared_key_like_the_base_collator():
+    """An unknown key is not an error and not a per-sample list: the base
+    ``PackingCollator`` runs it through ``default_collate``, and so does this one.
+    Framework metadata (`ds_idx` appended after the transform) relies on that."""
     from veomni.data.seed_omni.collator import SeedOmniCollator
 
-    sample = {
-        PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
-        PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
-        PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
-        PACKED_POSITION_IDS: torch.zeros(3, 1, 4, dtype=torch.long),
-        PACKED_CU_SEQLENS: torch.tensor([0, 4], dtype=torch.int32),
-        "packed_max_length": 4,
-        "visual_num_real": 0,
-        "pixel_values": torch.zeros(4, 8),
-        "image_grid_thw": torch.tensor([[1, 2, 2]]),
-        "visual_pos_mask": torch.zeros(1, 4, dtype=torch.bool),
-        "brand_new_key": torch.zeros(1),
-    }
-    with pytest.raises(KeyError, match="brand_new_key"):
-        SeedOmniCollator()([sample])
+    def _packed(extra: dict) -> dict:
+        return {
+            PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
+            **extra,
+        }
+
+    batch = SeedOmniCollator()([_packed({"brand_new_key": 1}), _packed({"brand_new_key": 2})])
+    # default_collate turns a list of ints into a tensor of ints.
+    assert torch.equal(batch["brand_new_key"], torch.tensor([1, 2]))
+
+
+def test_packed_collation_carries_the_multisource_metadata_the_meter_reads():
+    """``WeightedMultiSourceDataset`` appends ``ds_idx`` / ``source_name`` to a sample
+    *after* the transform, so a packed sample arrives carrying them. They must
+    survive collation in the shape the trainer's multi-source meter pops them:
+    a tensor of indices, a list of names."""
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+    from veomni.utils.helper import _get_multisource_ds_idx
+
+    def _packed(ds_idx: int, source_name: str) -> dict:
+        return {
+            PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
+            "ds_idx": ds_idx,
+            "source_name": source_name,
+        }
+
+    batch = SeedOmniCollator()([_packed(0, "sharegpt4v"), _packed(2, "llava_video")])
+    assert torch.equal(batch["ds_idx"], torch.tensor([0, 2]))
+    assert batch["source_name"] == ["sharegpt4v", "llava_video"]
+
+    # The meter reads them and pops them off, leaving only the packed tensors.
+    assert _get_multisource_ds_idx(batch) == [0, 2]
+    assert "ds_idx" not in batch and "source_name" not in batch
+    assert PACKED_INPUT_IDS in batch
+
+
+def test_packed_collation_carries_cur_token_num():
+    """Dynamic batching writes ``cur_token_num`` per sample; it must survive collation
+    so the meter's own pop finds it instead of leaking it into the graph."""
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+
+    def _packed(cur_token_num: int) -> dict:
+        return {
+            PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
+            "cur_token_num": cur_token_num,
+        }
+
+    batch = SeedOmniCollator()([_packed(4), _packed(6)])
+    assert torch.equal(batch["cur_token_num"], torch.tensor([4, 6]))

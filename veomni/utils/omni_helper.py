@@ -33,6 +33,7 @@ from .count_flops import get_device_flops
 from .dist_utils import all_reduce
 from .helper import (
     MultiSourceInfoTracker,
+    _as_index_list,
     _get_multisource_ds_idx,
     compute_device_memory_metrics,
     empty_cache,
@@ -125,13 +126,22 @@ class OmniEnvironMeter:
 
         Called once per micro-batch.  **Token lengths are NOT computed here** —
         they come from the modules' metric meters at :meth:`step`.  Here we only count
-        the training samples (one per conversation) and, for multi-source, gather
-        the per-sample dataset indices.
+        the training samples (one per conversation, or one per packed sequence) and,
+        for multi-source, gather the per-sample dataset indices.
         """
         conversation_list = micro_batch.get("conversation_list")
         if conversation_list is not None:
             self.batch_count += len(conversation_list)
+        elif "packed_input_ids" in micro_batch:
+            # A packed batch carries no carrier, so the count above does not apply.
+            # Its samples are the packed sequences the collator joined; `ds_idx`
+            # holds one entry per sample, which is the only count available before
+            # `_get_multisource_ds_idx` pops it below.
+            ds_idx = micro_batch.get("ds_idx")
+            self.batch_count += len(_as_index_list(ds_idx)) if ds_idx is not None else 1
         if self.enable_multisource:
+            # Pops `ds_idx` / `source_name` / `cur_token_num` off the batch, so it
+            # must run after the count above reads them.
             self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
     def step(
