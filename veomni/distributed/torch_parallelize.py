@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import os
 import types
 from collections.abc import Collection, Mapping
+from dataclasses import replace
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -47,6 +49,13 @@ from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
+
+
+def _validate_dense_mlp_prefetch_next() -> str:
+    value = os.environ.get("VEOMNI_DENSE_MLP_PREFETCH_NEXT", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VEOMNI_DENSE_MLP_PREFETCH_NEXT must be 0 or 1")
+    return value
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -462,6 +471,8 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    dense_mlp_path = os.environ.get("VEOMNI_DENSE_MLP_LAYERS", "")
+    prefetch_next = _validate_dense_mlp_prefetch_next() if dense_mlp_path else "0"
 
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -789,6 +800,49 @@ def parallelize_model_fsdp2(
     else:
         transport_reduction_scales = None
 
+    # Experimental dense-only partitioning. Example:
+    # VEOMNI_DENSE_MLP_LAYERS=model.language_model.layers
+    # VEOMNI_DENSE_MLP_PREFETCH=0 keeps the split but disables explicit prefetch.
+    # Not approved for checkpointed training on unpatched older FSDP runtimes:
+    # nested recomputation needs the lifecycle fix discussed in pytorch#164009
+    # (or equivalent integration). This patch does NOT backport that fix.
+    dense_mlp_pairs = {}
+    dense_mlp_prefetch_enabled = False
+    if dense_mlp_path:
+        prefetch_mlp = os.environ.get("VEOMNI_DENSE_MLP_PREFETCH", "1")
+        if prefetch_mlp not in {"0", "1"}:
+            raise ValueError("VEOMNI_DENSE_MLP_PREFETCH must be 0 or 1")
+        dense_mlp_prefetch_enabled = prefetch_mlp == "1" and kwargs.get("enable_forward_prefetch", True)
+        if parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None:
+            raise ValueError("Dense MLP experiment requires no extra parallelism or MP exclusions")
+        if parallel_state.tp_enabled:
+            raise ValueError("Dense MLP experiment does not support tensor parallelism")
+        if compile_config.enable:
+            raise ValueError("Dense MLP experiment currently requires torch_compile disabled")
+        decoder_blocks = model.get_submodule(dense_mlp_path)
+        if not isinstance(decoder_blocks, nn.ModuleList) or not len(decoder_blocks):
+            raise ValueError("VEOMNI_DENSE_MLP_LAYERS must identify a nonempty decoder ModuleList")
+        target_ids = {id(mod) for _, (mod, _) in layer_pairs_list}
+        for index, block in enumerate(decoder_blocks):
+            mlp = getattr(block, "mlp", None)
+            if id(block) not in target_ids or not isinstance(mlp, nn.Module):
+                raise ValueError(f"Decoder {index} must be an existing FSDP target with a .mlp module")
+            if isinstance(block, FSDPModule) or any(
+                isinstance(child, FSDPModule) or id(child) in target_ids for child in mlp.modules()
+            ):
+                raise ValueError("Apply the MLP split before wrapping; nested MLP targets are unsupported")
+            if hasattr(mlp, "experts") or not list(mlp.parameters()):
+                raise ValueError("This experiment supports parameterized dense MLPs only")
+            # Shared parameters need a separate ownership plan; reject them here.
+            mlp_ids = {id(param) for param in mlp.parameters()}
+            prefix = f"{dense_mlp_path}.{index}.mlp."
+            if any(
+                id(param) in mlp_ids and not name.startswith(prefix)
+                for name, param in model.named_parameters(remove_duplicate=False)
+            ):
+                raise ValueError(f"Decoder {index} MLP shares parameters outside its FSDP group")
+            dense_mlp_pairs[id(block)] = (block, mlp)
+
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -837,6 +891,18 @@ def parallelize_model_fsdp2(
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
+
+        # Child first: the parent group excludes MLP parameters automatically.
+        if id(layer_mod) in dense_mlp_pairs:
+            _, dense_mlp = dense_mlp_pairs[id(layer_mod)]
+            dense_mlp_fsdp_kwargs = dict(fsdp_kwargs)
+            if mixed_precision.enable:
+                # Keep the output cast at the parent block, after the residual addition.
+                dense_mlp_fsdp_kwargs["mp_policy"] = replace(fsdp_kwargs["mp_policy"], output_dtype=None)
+            fully_shard(dense_mlp, **dense_mlp_fsdp_kwargs)
+            if transport_reduction_scales is not None and fsdp_transport_enabled:
+                transport_reduction_scales[dense_mlp] = fsdp_reduction_scale
+            layer_mod._fsdp_modules.append(dense_mlp)
 
         # Shard everything else in the module:
         #   Note:
@@ -902,6 +968,28 @@ def parallelize_model_fsdp2(
             if prev_block is not None:
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+
+    if dense_mlp_pairs:
+        # The original manual-prefetch gate above stays false for this dense path.
+        # Gather MLP asynchronously from the parent's pre-forward hook, after
+        # parent unshard and before attention computation. No explicit backward
+        # targets: native backward tracks the new group order.
+        for block, dense_mlp in dense_mlp_pairs.values():
+            if dense_mlp_prefetch_enabled:
+                block.set_modules_to_forward_prefetch([dense_mlp])
+        # Optionally gather the next parent's non-MLP parameters at the MLP boundary.
+        next_block_prefetch_enabled = prefetch_next == "1" and dense_mlp_prefetch_enabled
+        if next_block_prefetch_enabled:
+            ordered_blocks = [b for b, _ in dense_mlp_pairs.values()]
+            for current_block, following_block in zip(ordered_blocks, ordered_blocks[1:]):
+                current_mlp = dense_mlp_pairs[id(current_block)][1]
+                current_mlp.set_modules_to_forward_prefetch([following_block])
+
+        logger.info_rank0(
+            f"Dense MLP split: {len(dense_mlp_pairs)} blocks, "
+            f"forward prefetch={dense_mlp_prefetch_enabled}, "
+            f"mlp->next-block prefetch={next_block_prefetch_enabled}"
+        )
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -1059,6 +1147,21 @@ def build_parallelize_model(
             Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
+    if parallel_state.fsdp_enabled and parallel_state.dp_mode == "fsdp2" and os.environ.get("VEOMNI_DENSE_MLP_LAYERS"):
+        _validate_dense_mlp_prefetch_next()
+        if (
+            os.environ.get("VEOMNI_DENSE_MLP_PREFETCH", "1") == "1"
+            and kwargs.get("enable_forward_prefetch", True)
+            and recompute_policy is not None
+            and recompute_policy.enabled
+            and recompute_policy.context_fn is not None
+        ):
+            raise ValueError(
+                "Dense MLP prefetch is not approved with selective activation checkpointing: "
+                "nesting an FSDP2 group inside a selectively checkpointed block can fail during "
+                "recomputation. Set selective_recompute_layers=0, or disable "
+                "VEOMNI_DENSE_MLP_PREFETCH."
+            )
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
