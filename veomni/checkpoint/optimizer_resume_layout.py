@@ -3,7 +3,6 @@
 
 """Identity of a MultiOptimizer's rank-local parameter and scheduler layout."""
 
-import builtins
 import dis
 import hashlib
 import json
@@ -20,15 +19,14 @@ from ..utils.dist_utils import raise_if_any_rank_failed
 
 MULTI_LAYOUT_MARKER = "__veomni_multi_optimizer_layout_v1__"
 
-_SCHEDULER_SAFE_BUILTINS = {
-    name: getattr(builtins, name)
-    for name in ("abs", "bool", "float", "int", "len", "max", "min", "pow", "range", "round", "sum")
-}
-_SCHEDULER_MATH_MEMBERS = {
-    name: value
+_SCHEDULER_SAFE_BUILTINS = frozenset(
+    ("abs", "bool", "float", "int", "len", "max", "min", "pow", "range", "round", "sum")
+)
+_SCHEDULER_MATH_MEMBERS = frozenset(
+    name
     for name, value in vars(math).items()
     if not name.startswith("_") and type(value) in (float, int, types.BuiltinFunctionType)
-}
+)
 
 
 def _immutable_value(value):
@@ -81,7 +79,12 @@ def _lr_layout(group, key, aliases):
 def _scheduler_functions(scheduler):
     """Describe LambdaLR callables using the existing checkpoint identity format."""
 
-    def normalize(code, globals_dict, builtins_dict):
+    def has_unordered_constant(value):
+        if isinstance(value, frozenset):
+            return True
+        return isinstance(value, tuple) and any(has_unordered_constant(item) for item in value)
+
+    def normalize(code, globals_dict):
         # Nested code objects share this function's global namespace. A
         # referenced global can change the next LR without changing code.
         # LOAD_ATTR names are not globals; inspect actual global lookups instead.
@@ -104,19 +107,24 @@ def _scheduler_functions(scheduler):
                 "IMPORT_FROM",
                 "IMPORT_STAR",
                 "LOAD_BUILD_CLASS",
+                # Hash-randomized set iteration can change floating-point LR
+                # results across processes without changing the recipe hash.
+                "BUILD_SET",
+                "SET_ADD",
+                "SET_UPDATE",
+                # Formatting arbitrary objects can include process-local ids.
+                "FORMAT_VALUE",
+                "FORMAT_SIMPLE",
+                "FORMAT_WITH_SPEC",
+                "CONVERT_VALUE",
+                "BUILD_STRING",
             ):
                 raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
             if opcode in ("LOAD_ATTR", "LOAD_METHOD"):
                 previous = instructions[index - 1] if index else None
                 if previous is None or previous.opname != "LOAD_GLOBAL" or previous.argval != "math":
                     raise RuntimeError("MultiOptimizer scheduler uses unsupported attribute access")
-                expected = _SCHEDULER_MATH_MEMBERS.get(instruction.argval)
-                actual = vars(math).get(instruction.argval)
-                if (
-                    expected is None
-                    or type(expected) is not type(actual)
-                    or (actual is not expected and (type(expected) not in (int, float) or actual != expected))
-                ):
+                if instruction.argval not in _SCHEDULER_MATH_MEMBERS:
                     raise RuntimeError("MultiOptimizer scheduler uses unsupported math state")
                 continue
             if opcode != "LOAD_GLOBAL":
@@ -125,11 +133,12 @@ def _scheduler_functions(scheduler):
             if name in globals_dict:
                 if name != "math" or globals_dict[name] is not math:
                     raise RuntimeError("MultiOptimizer scheduler refers to unsupported global state")
-            elif name not in _SCHEDULER_SAFE_BUILTINS or builtins_dict.get(name) is not _SCHEDULER_SAFE_BUILTINS[name]:
+            elif name not in _SCHEDULER_SAFE_BUILTINS:
                 raise RuntimeError("MultiOptimizer scheduler uses an unsupported builtin")
+        if any(has_unordered_constant(item) for item in code.co_consts):
+            raise RuntimeError("MultiOptimizer scheduler uses unsupported unordered state")
         constants = tuple(
-            normalize(item, globals_dict, builtins_dict) if isinstance(item, types.CodeType) else item
-            for item in code.co_consts
+            normalize(item, globals_dict) if isinstance(item, types.CodeType) else item for item in code.co_consts
         )
         return code.replace(co_filename="", co_firstlineno=0, co_consts=constants)
 
@@ -140,9 +149,7 @@ def _scheduler_functions(scheduler):
 
         functions.append(
             {
-                "code": hashlib.sha256(
-                    marshal.dumps(normalize(function.__code__, function.__globals__, function.__builtins__))
-                ).hexdigest(),
+                "code": hashlib.sha256(marshal.dumps(normalize(function.__code__, function.__globals__))).hexdigest(),
                 "defaults": _immutable_value(function.__defaults__),
                 "kwdefaults": _immutable_value(function.__kwdefaults__),
                 "closure": [_immutable_value(cell.cell_contents) for cell in function.__closure__ or ()],

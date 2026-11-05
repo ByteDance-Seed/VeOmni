@@ -2068,19 +2068,21 @@ def test_scheduler_recipe_accepts_math_attribute_with_unrelated_global(monkeypat
     assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
 
 
-def test_scheduler_recipe_rejects_changed_math_member(monkeypatch):
-    import math as math_module
-
+@pytest.mark.parametrize("kind", ["set", "frozenset_constant", "object_format"])
+def test_scheduler_recipe_rejects_process_dependent_computation(kind):
     from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
 
-    monkeypatch.setitem(globals(), "math", math_module)
+    def unordered(step):
+        return sum(float(value) for value in {"0.125", "1e16", "-1e16"})
 
-    def schedule(step):
-        return math.cos(step)  # noqa: F821
+    def unordered_constant(step):
+        return step in {1, 2, 3}
 
-    _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-    monkeypatch.setattr(math_module, "cos", lambda value: 0.25)
-    with pytest.raises(RuntimeError, match="unsupported.*state|unsupported.*math"):
+    def object_format(step):
+        return int(f"{(lambda: 0)}"[-5], 16) / 20
+
+    schedule = {"set": unordered, "frozenset_constant": unordered_constant, "object_format": object_format}[kind]
+    with pytest.raises(RuntimeError, match="unsupported.*state"):
         _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
 
 
