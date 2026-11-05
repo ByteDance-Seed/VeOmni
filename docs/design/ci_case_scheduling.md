@@ -64,7 +64,7 @@ not exact resource reservations. For example,
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
-[training command resolution](../../tests/tools/training_utils.py#L242) provide
+[training command resolution](../../tests/tools/training_utils.py#L243) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests

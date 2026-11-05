@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
 
 import torch
 from einops import rearrange
-from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -26,8 +26,8 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .config_flux import FluxConfig
 from .utils_flux import (
@@ -123,7 +123,7 @@ class AdaLayerNorm(torch.nn.Module):
 class RMSNorm(torch.nn.Module):
     """``rms_norm`` / ``standard`` or ``unweighted``. Impl from ``rms_norm_implementation``, else eager."""
 
-    def __init__(self, dim, eps, elementwise_affine=True):
+    def __init__(self, dim, eps, elementwise_affine=True, config=None):
         super().__init__()
         self.eps = eps
         if elementwise_affine:
@@ -132,9 +132,8 @@ class RMSNorm(torch.nn.Module):
         else:
             self.weight = None
             variant = "unweighted"
-        self.veomni_rms_norm = VeomniOp(
-            "rms_norm", variant, resolve_op_impl("rms_norm_implementation", variant=variant)
-        )
+        rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", variant, rms_norm_impl)
 
     def forward(self, hidden_states):
         """Apply the interned ``rms_norm`` handle."""
@@ -180,7 +179,7 @@ class RoPEEmbedding(torch.nn.Module):
 
 
 class FluxJointAttention(torch.nn.Module):
-    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False, config=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -189,15 +188,15 @@ class FluxJointAttention(torch.nn.Module):
         self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
         self.b_to_qkv = torch.nn.Linear(dim_b, dim_b * 3)
 
-        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_q_b = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_q_b = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_b = RMSNorm(head_dim, eps=1e-6, config=config)
 
         self.a_to_out = torch.nn.Linear(dim_a, dim_a)
         if not only_out_a:
             self.b_to_out = torch.nn.Linear(dim_b, dim_b)
-        bind_flux_attention(self)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         # 打印输入大小，在一行
@@ -262,12 +261,12 @@ class FluxJointAttention(torch.nn.Module):
 
 
 class FluxJointTransformerBlock(torch.nn.Module):
-    def __init__(self, dim, num_attention_heads):
+    def __init__(self, dim, num_attention_heads, config=None):
         super().__init__()
         self.norm1_a = AdaLayerNorm(dim)
         self.norm1_b = AdaLayerNorm(dim)
 
-        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
+        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads, config=config)
 
         self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff_a = torch.nn.Sequential(
@@ -308,16 +307,16 @@ class FluxJointTransformerBlock(torch.nn.Module):
 
 
 class FluxSingleAttention(torch.nn.Module):
-    def __init__(self, dim_a, dim_b, num_heads, head_dim):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, config=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
 
         self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
 
-        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
-        bind_flux_attention(self)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -358,7 +357,7 @@ class AdaLayerNormSingle(torch.nn.Module):
 
 
 class FluxSingleTransformerBlock(torch.nn.Module):
-    def __init__(self, dim, num_attention_heads):
+    def __init__(self, dim, num_attention_heads, config=None):
         super().__init__()
         self.num_heads = num_attention_heads
         self.head_dim = dim // num_attention_heads
@@ -366,11 +365,11 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         self.norm = AdaLayerNormSingle(dim)
         self.to_qkv_mlp = torch.nn.Linear(dim, dim * (3 + 4))
-        self.norm_q_a = RMSNorm(self.head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(self.head_dim, eps=1e-6)
+        self.norm_q_a = RMSNorm(self.head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(self.head_dim, eps=1e-6, config=config)
 
         self.proj_out = torch.nn.Linear(dim * 5, dim)
-        bind_flux_attention(self)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -440,6 +439,7 @@ class FluxModel(PreTrainedModel):
     _no_split_modules = ["FluxJointTransformerBlock", "FluxSingleTransformerBlock"]
     _supports_flash_attn_2 = True
     _supports_flash_attn_3 = True
+    _supports_sdpa = True
 
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)
@@ -466,11 +466,14 @@ class FluxModel(PreTrainedModel):
         self.context_embedder = torch.nn.Linear(config.joint_attention_dim, hidden_size)
         self.x_embedder = torch.nn.Linear(config.input_dim, hidden_size)
         self.blocks = torch.nn.ModuleList(
-            [FluxJointTransformerBlock(hidden_size, config.num_attention_heads) for _ in range(config.num_blocks)]
+            [
+                FluxJointTransformerBlock(hidden_size, config.num_attention_heads, config=config)
+                for _ in range(config.num_blocks)
+            ]
         )
         self.single_blocks = torch.nn.ModuleList(
             [
-                FluxSingleTransformerBlock(hidden_size, config.num_attention_heads)
+                FluxSingleTransformerBlock(hidden_size, config.num_attention_heads, config=config)
                 for _ in range(config.num_single_layers)
             ]
         )

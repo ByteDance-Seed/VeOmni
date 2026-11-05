@@ -27,7 +27,6 @@ trailing padding stay in ``veomni.models.loss_utils``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -110,7 +109,7 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         temperature: float,
         chunk_size: int,
         ignore_index: int,
-        token_logprobs_fn: Optional[Callable[..., Tensor]] = None,
+        token_logprobs_fn: Callable[..., Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Stream the lm_head projection chunk-by-chunk to compute log-probs and entropy."""
         ctx.set_materialize_grads(False)
@@ -169,7 +168,7 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         return log_probs.view(orig_shape), entropy.view(orig_shape)
 
     @staticmethod
-    def backward(ctx, dlog_probs: Optional[Tensor], dentropy: Optional[Tensor]):
+    def backward(ctx, dlog_probs: Tensor | None, dentropy: Tensor | None):
         """Recompute chunked logits and accumulate gradients into ``hidden_states`` and ``weight``."""
         if dlog_probs is None and dentropy is None:
             return None, None, None, None, None, None, None
@@ -285,8 +284,8 @@ class _ChunkedLinearTopkDistill(torch.autograd.Function):
         temperature: float,
         chunk_size: int,
         ignore_index: int,
-        log_prob_min_clamp: Optional[float],
-        token_logprobs_fn: Optional[Callable[..., Tensor]] = None,
+        log_prob_min_clamp: float | None,
+        token_logprobs_fn: Callable[..., Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Stream the lm_head projection chunk-by-chunk for top-k forward-KL distillation."""
         ctx.set_materialize_grads(False)
@@ -388,11 +387,11 @@ class _ChunkedLinearTopkDistill(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx,
-        dlog_probs: Optional[Tensor],
-        dentropy: Optional[Tensor],
-        ddistill: Optional[Tensor],
-        dstudent_mass: Optional[Tensor],  # noqa: ARG004 - student_mass is detached
-        dteacher_mass: Optional[Tensor],  # noqa: ARG004 - teacher_mass is detached
+        dlog_probs: Tensor | None,
+        dentropy: Tensor | None,
+        ddistill: Tensor | None,
+        dstudent_mass: Tensor | None,  # noqa: ARG004 - student_mass is detached
+        dteacher_mass: Tensor | None,  # noqa: ARG004 - teacher_mass is detached
     ):
         """Recompute chunked logits and accumulate gradients for log-probs, entropy, and top-k KL."""
         if dlog_probs is None and dentropy is None and ddistill is None:
@@ -490,7 +489,7 @@ def chunk_linear_logprobs(
     temperature: float = 1.0,
     chunk_size: int = 1024,
     ignore_index: int = -100,
-    token_logprobs_fn: Optional[Callable[..., Tensor]] = None,
+    token_logprobs_fn: Callable[..., Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Run the tensor-level chunked linear log-probs and entropy autograd Function.
 
@@ -518,8 +517,8 @@ def chunk_linear_topk_distill(
     temperature: float = 1.0,
     chunk_size: int = 1024,
     ignore_index: int = -100,
-    log_prob_min_clamp: Optional[float] = None,
-    token_logprobs_fn: Optional[Callable[..., Tensor]] = None,
+    log_prob_min_clamp: float | None = None,
+    token_logprobs_fn: Callable[..., Tensor] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run the tensor-level chunked linear top-k forward-KL distillation autograd Function.
 

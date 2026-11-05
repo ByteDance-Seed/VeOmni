@@ -254,6 +254,121 @@ class TestMultiOptimizerState:
         )
 
 
+class TestSwapOptimizerState:
+    """DCP save/load for ``SwapAdamW`` (host-resident state), plus stock<->swap
+    interop, both through the flattened FQN-keyed optimizer state dict."""
+
+    # CPU-only: plain modules and DCP round-trips on tmp_path, no accelerator.
+    pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+    @staticmethod
+    def _build_swap(seed: int):
+        from veomni.optim.swap_adamw import SwapAdamW
+
+        torch.manual_seed(seed)
+        model = nn.Linear(4, 4)
+        optimizer = SwapAdamW(
+            [{"params": list(model.parameters()), "weight_decay": 0.0}],
+            lr=1e-2,
+            pin_memory=False,
+        )
+        return model, optimizer
+
+    @staticmethod
+    def _step(model, optimizer, seed: int):
+        torch.manual_seed(seed)
+        for param in model.parameters():
+            param.grad = torch.randn_like(param)
+        optimizer.step()
+
+    def test_swap_optimizer_dcp_roundtrip(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        src_model, src_opt = self._build_swap(seed=0)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        dst_model, dst_opt = self._build_swap(seed=1)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        for src_p, dst_p in zip(src_model.parameters(), dst_model.parameters()):
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    dst_opt._host_states[dst_p][key], src_opt._host_states[src_p][key], atol=0.0, rtol=0.0
+                )
+            assert int(dst_opt.state[dst_p]["step"]) == int(src_opt.state[src_p]["step"])
+
+    def test_swap_loads_stock_adamw_checkpoint(self, tmp_path):
+        """A checkpoint written by stock ``torch.optim.AdamW`` loads into
+        ``SwapAdamW`` (same flattened FQN layout)."""
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        torch.manual_seed(0)
+        src_model = nn.Linear(4, 4)
+        src_opt = torch.optim.AdamW(src_model.parameters(), lr=1e-2)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        dst_model, dst_opt = self._build_swap(seed=1)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        src_params = dict(src_model.named_parameters())
+        for name, param in dst_model.named_parameters():
+            src_state = src_opt.state[src_params[name]]
+            dst_state = dst_opt._host_states[param]
+            torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
+            torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+
+    def test_stock_loads_swap_checkpoint(self, tmp_path):
+        """A checkpoint written by ``SwapAdamW`` loads into stock
+        ``torch.optim.AdamW`` (same flattened FQN layout and param-group keys)."""
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        src_model, src_opt = self._build_swap(seed=0)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        torch.manual_seed(1)
+        dst_model = nn.Linear(4, 4)
+        dst_opt = torch.optim.AdamW(dst_model.parameters(), lr=1e-2)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        src_params = dict(src_model.named_parameters())
+        for name, param in dst_model.named_parameters():
+            src_state = src_opt._host_states[src_params[name]]
+            dst_state = dst_opt.state[param]
+            torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
+            torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+            assert int(dst_state["step"].item()) == int(src_opt.state[src_params[name]]["step"])
+
+
 @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
 class TestCheckpointLayoutRoundTrip:
     """A step's model state lands where ``docs/usage/checkpoint.md`` says, and

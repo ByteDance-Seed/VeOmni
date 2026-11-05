@@ -238,7 +238,7 @@ NPU validation runs at two times:
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, AITER, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. AITER is an AMD ROCm-only row that requires the `aiter` package; both `aiter` and `veomni_flash_attention_aiter` are rejected on Ascend before HF preloading. Local FA2/FA3 remain the defaults. FlexAttention requires NVIDIA CUDA and a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. SM90+ selects FA4 when supported, with Triton fallback for unsupported inputs; the registered mask builder uses 256×128 blocks on SM100+ and 128×128 elsewhere. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It requires NVIDIA SM100+ and uses CUTE DSL/JIT. SageAttention is inference-only and does not take a dense mask. |
 | moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `deepgemm_fp8` runs native FP8 expert forward/dgrad/wgrad (Hopper SM90 / Blackwell SM100; see [requirements](../design/deepgemm_fp8_moe.md)); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
 | cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU/MLU default) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
-| rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default for weighted variants; `unweighted` has no Ascend kernel and uses `eager`, including an explicit `torch_npu` for compatibility), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default for weighted variants; `unweighted` supports only `eager` on NPU and rejects explicit `torch_npu`/`npu`), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU/MLU default), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
 | rotary_pos_emb_implementation | `Optional[str]` | host default | Rotary pos emb. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default), `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. Variants without a default row (such as `deepseek_v4`, `wan`, `interleave`, `mrope`) resolve to `eager` when unset. |
 | rotary_pos_emb_vision_implementation | `Optional[str]` | host default | Independent implementation choice for the rank-3 vision layout of `rope/full`. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default). |
@@ -277,9 +277,9 @@ it runs on, so no value is named for the `npu` device alone. An Ascend row is
 When `rms_norm_implementation` is left unset, each RMSNorm variant resolves its
 own host default from `OP_REGISTRY`: weighted variants select `torch_npu` on
 NPU while `unweighted` (Flux, LTX-2.3, DeepSeek-V4) selects `eager`.
-For compatibility, an explicit `torch_npu` (including the deprecated `npu`
-alias) also maps to `eager` for `unweighted`; it remains `torch_npu` for
-weighted variants. This mapping is logged once.
+An explicit `torch_npu` (including the deprecated `npu` alias) is rejected for
+`unweighted`. Set its owning module's `rms_norm_implementation` to `eager`, or
+leave the field unset to select the per-variant device default.
 
 `rms_norm_implementation: qwen3_5` is rejected at parse time. `qwen3_5` was the
 Qwen3.5 RMSNorm variant name, now `offset`, and never an implementation. Other
@@ -521,6 +521,9 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
+| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
+| state_offload_device_memory_fraction | `float` | `0.8` | With `state_offload="cpu"`, fraction of currently free device memory used to size one streamed batch of optimizer states. It is recomputed every step; a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
+| state_offload_pin_memory | `bool` | `True` | With `state_offload="cpu"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
 ### WandbConfig
 
@@ -580,6 +583,15 @@ distinct from the first emission.
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
+
+Sampled steps also report `samples/<source>`, `input_tokens/<source>`, and
+`label_tokens_per_sample/<source>`, using the same source-qualified suffix as
+channel loss. Counts accumulate over micro-batches,
+merge segments across SP (Ulysses/CP), and sum across DP; padding is excluded.
+`label_tokens_per_sample` divides the summed supervised tokens by samples,
+not by packed batches. The existing `source_repeat` divides repeated sample
+counts (for example, chosen/rejected segments represent one preference pair).
+These are detached data metrics; DPO objective and completion masking are separate.
 
 ### GradientCheckpointingConfig
 
@@ -700,8 +712,10 @@ configured and never round-trip through a saved config.
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
-| offload | `bool` | `False` | Enable CPU offload. |
+| offload | `bool` | `False` | Enable CPU offload. Cannot be combined with `model.optimizer.state_offload="cpu"`: both move training state to host, and the combination is rejected at config parse time. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
+| expert_fsdp_shard_dim | `Optional[int]` | `None` | Override EP expert FSDP2 placement: `0` shards whole experts, `1` splits matrix rows. `None` preserves the existing placement/Muon policy; explicit values override it. Dim 0 requires evenly divisible local expert stacks. Applies to BF16 and FP8; see [FP8 MoE](../design/deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine). |
+| expert_weight_fp8_all_gather | `bool` | `False` | Gather DeepGEMM routed expert weights as E4M3 payloads and 128x128 block scales. Ignored when no experts use `deepgemm_fp8`. Selected experts require native FSDP2, BF16 mixed precision, block-aligned shards and no CPU offload. See [FP8 MoE](../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather). |
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |

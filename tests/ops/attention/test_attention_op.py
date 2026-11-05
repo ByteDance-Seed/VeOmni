@@ -189,7 +189,8 @@ def test_lookup_eager_uses_module_local_forward():
     assert op_metadata == "eager-local"
 
 
-def test_lookup_dispatches_through_hf_dict(monkeypatch):
+@pytest.mark.parametrize("impl", ("veomni_sdpa", "eager"))
+def test_lookup_dispatches_through_hf_dict(monkeypatch, impl):
     captured = {}
 
     def replacement(module, query, key, value, attention_mask, **kwargs):
@@ -199,7 +200,7 @@ def test_lookup_dispatches_through_hf_dict(monkeypatch):
     monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_sdpa", replacement)
     module = SimpleNamespace(is_causal=True)
     query = torch.randn(2, 4, 3, 8)
-    output, metadata = lookup("veomni_sdpa")(module, query, query, query, None, dropout=0.0, scaling=0.5)
+    output, metadata = lookup(impl)(module, query, query, query, None, dropout=0.0, scaling=0.5)
 
     assert captured["module"] is module
     assert captured["query"] is query
