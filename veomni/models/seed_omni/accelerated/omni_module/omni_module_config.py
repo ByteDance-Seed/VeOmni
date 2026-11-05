@@ -75,13 +75,16 @@ class OmniModuleRuntimeArguments(ModelArguments):
         does for an entry without one) would silently resolve to the wrong path
         for that module.
 
-        Kernels are not projected: the runtime builds each module with its own
-        ``args.ops_implementation``, so an entry stating them too would be a
-        second source of truth.
+        Kernels are projected too, so a checkpoint remembers what each module
+        was trained with: ``build_omni_module_runtime_args`` layers the entry under
+        the launcher's per-module YAML, and a bare ``OmniModel.from_pretrained``
+        applies it to the module config.
         """
         entry: dict = {}
         if self.model_path:
             entry["model_path"] = self.model_path
+        if self.ops_implementation is not None:
+            entry["ops_implementation"] = self.ops_implementation.to_dict()
         if model_config := hf_module_model_config(self.model_config):
             entry["model_config"] = deepcopy(model_config)
         if self.processor_config:

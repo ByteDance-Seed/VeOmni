@@ -17,7 +17,8 @@ from collections import OrderedDict
 from typing import Any
 
 import torch
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....utils import logging
 from ..minimax_h3_core.cfg_conditioning import (
@@ -44,6 +45,10 @@ _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3ConditionModelConfig, **kwargs):
         super().__init__(config)
         self._video_vae = None
@@ -64,15 +69,16 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     def _init_encoders(self, config: MiniMaxH3ConditionModelConfig):
         base = config.base_model_path
 
-        from veomni.models.module_utils import init_empty_weights
-
         from ..minimax_h3_core.minimax_h3_audio_vae import MiniMaxH3AudioVAE
         from ..minimax_h3_core.minimax_h3_text_encoder import MiniMaxH3TextEncoder
         from ..minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
+        from ._module_utils import init_empty_weights
 
         with init_empty_weights():
-            self._text_encoder = MiniMaxH3TextEncoder(num_retained_layers=config.text_encoder_num_retained_layers)
-            self._video_vae = MiniMaxH3VideoVAE()
+            self._text_encoder = MiniMaxH3TextEncoder(
+                num_retained_layers=config.text_encoder_num_retained_layers, config=config
+            )
+            self._video_vae = MiniMaxH3VideoVAE(config=config)
             self._audio_vae = MiniMaxH3AudioVAE()
 
         # Processor / tokenizer
@@ -161,7 +167,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         """
         from collections import OrderedDict
 
-        from veomni.models.module_utils import StateDictIterator
+        from ._module_utils import StateDictIterator
 
         total = 0
         for fname in sorted(os.listdir(path)):
@@ -246,7 +252,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
           packed: list[dict]
           imgvid_cond_noise_aug: list[float]
           audio_cond_noise_aug: list[float]
-          use_gradient_checkpointing: list[bool]
           has_audio: list[bool]               — False when the silent placeholder latent is used
         """
         device = next(self._video_vae.parameters()).device
@@ -260,7 +265,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "packed": [],
             "imgvid_cond_noise_aug": [],
             "audio_cond_noise_aug": [],
-            "use_gradient_checkpointing": [],
             "has_audio": [],
         }
 
@@ -357,7 +361,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             results["packed"].append(packed)
             results["imgvid_cond_noise_aug"].append(cfg.imgvid_cond_noise_aug)
             results["audio_cond_noise_aug"].append(cfg.audio_cond_noise_aug)
-            results["use_gradient_checkpointing"].append(True)
             results["has_audio"].append(has_audio)
 
         return results
@@ -549,8 +552,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         keyframe_cond_anchor: list[torch.Tensor | None] | None = None,
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
-        use_gradient_checkpointing: bool = True,
-        use_gradient_checkpointing_offload: bool = False,
         ref_visual_anchor: list[torch.Tensor | None] | None = None,
         ref_audio_anchor: list[torch.Tensor | None] | None = None,
         has_audio: list[bool | None] | None = None,
@@ -576,10 +577,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             imgvid_cond_noise_aug = imgvid_cond_noise_aug[0]
         if isinstance(audio_cond_noise_aug, list):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
-        if isinstance(use_gradient_checkpointing, list):
-            use_gradient_checkpointing = use_gradient_checkpointing[0]
-        if isinstance(use_gradient_checkpointing_offload, list):
-            use_gradient_checkpointing_offload = use_gradient_checkpointing_offload[0]
         # Caches written before has_audio existed supervise audio as before.
         has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
 
@@ -682,8 +679,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             **_packed_seq_params(pk, device),
             "skip_mask_out_condition": True,
             "cond_rows": cond_rows,
-            "use_gradient_checkpointing": use_gradient_checkpointing,
-            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "video_latent_shape": video_latent_shape,
             "audio_latent_shape": audio_latent_shape,
             "training_target": training_target,

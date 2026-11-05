@@ -41,8 +41,12 @@ import PIL.Image
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.utils.constants import IGNORE_INDEX  # noqa: F401  (sanity import)
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ----------------------------------------------------------------------------
@@ -379,7 +383,7 @@ def test_omni_transform_uses_effective_fps(omni_processor, monkeypatch, duration
     from types import SimpleNamespace
 
     from veomni.data.data_transform import process_sample_qwen_omni
-    from veomni.models.loader import MODELING_REGISTRY
+    from veomni.models.registry import MODELING_REGISTRY
     from veomni.utils.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
     is_qwen2_5 = type(omni_processor).__name__ == "Qwen2_5OmniProcessor"

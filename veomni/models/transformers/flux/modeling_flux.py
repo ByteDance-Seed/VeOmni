@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+"""Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
+
 import torch
-import torch.nn.functional as F
 from einops import rearrange
-from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -25,30 +26,18 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
-from veomni.models.transformers.flux.config_flux import FluxConfig
-from veomni.models.transformers.flux.utils_flux import (
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.ops import VeomniOp
+
+from .config_flux import FluxConfig
+from .utils_flux import (
     FluxDiTStateDictConverter,
     TileWorker,
     TimestepEmbeddings,
+    bind_flux_attention,
+    flux_attention,
     init_weights_on_device,
 )
-from veomni.utils import logging
-from veomni.utils.import_utils import is_liger_kernel_available
-
-
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-try:
-    import flash_attn
-
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
 
 
 def print_rank_0(message):
@@ -60,12 +49,6 @@ def print_rank_0(message):
         print(message, flush=True)
 
 
-if is_liger_kernel_available():
-    from liger_kernel.transformers.rms_norm import LigerRMSNorm
-
-logger = logging.get_logger(__name__)
-
-
 def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_dim: int, head_dim: int):
     q = gather_seq_scatter_heads(q, seq_dim, head_dim)
     k = gather_seq_scatter_heads(k, seq_dim, head_dim)
@@ -73,50 +56,40 @@ def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     return q, k, v
 
 
-def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_type: str):
-    q = rearrange(q, rerange_type)
-    k = rearrange(k, rerange_type)
-    v = rearrange(v, rerange_type)
-    return q, k, v
+def _sp_padded_layout(segment_lens, sp_size, device):
+    """Positions of the real tokens once each segment is padded to a multiple of sp_size."""
+    index, offset = [], 0
+    for length in segment_lens:
+        index.append(torch.arange(offset, offset + length, device=device))
+        offset += length + (sp_size - length % sp_size) % sp_size
+    return torch.cat(index), offset
 
 
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, attn_mask=None):
-    # bs, head_cont, seq, head_dim = q.shape
+def _to_sp_padded_layout(rotary_emb, attention_mask, index, padded_len, dtype):
+    """Move RoPE (seq on dim 2) and the additive mask into the padded SP layout, masking pad keys.
 
-    if attn_mask is not None:
-        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask, so fall
-        # back to scaled_dot_product_attention, which supports an additive mask. Note that
-        # supplying a mask rules out SDPA's flash backend, so this uses the memory-efficient
-        # kernel (or the math fallback) instead. The flash-attn path below is for the
-        # mask-less case only.
-        if causal:
-            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`, so
-            # merge a lower-triangular causal bias into the additive mask to preserve the
-            # caller's causal intent. No in-tree caller passes a mask with causal=True; this
-            # is defensive for future callers.
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(~attn_mask, float("-inf"))
-            causal_bias = torch.triu(torch.full_like(attn_mask, float("-inf")), diagonal=1)
-            attn_mask = attn_mask + causal_bias
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    Returns the inputs unchanged when no padding is needed, so the mask-free flash path is kept.
+    """
+    if padded_len == index.numel():
+        return rotary_emb, attention_mask
 
-    if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
-        rerange_type_seq_head = "b n s d -> b s n d"
-        rerange_type_head_seq = "b s n d -> b n s d"
-        q, k, v = rearrange_qkv(q, k, v, rerange_type_seq_head)
+    shape = list(rotary_emb.shape)
+    shape[2] = padded_len
+    rotary_emb = rotary_emb.new_zeros(shape).index_copy(2, index, rotary_emb)
 
-    if FLASH_ATTN_3_AVAILABLE:
-        x = flash_attn_interface.flash_attn_func(q, k, v, causal=causal)
-        if isinstance(x, tuple):
-            x = x[0]
-    elif FLASH_ATTN_2_AVAILABLE:
-        x = flash_attn.flash_attn_func(q, k, v, causal=causal)
+    is_pad = torch.ones(padded_len, dtype=torch.bool, device=index.device)
+    is_pad[index] = False
+    if attention_mask is None:
+        mask = torch.zeros(1, 1, 1, padded_len, dtype=dtype, device=index.device)
+        mask[..., is_pad] = float("-inf")
     else:
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        return x
-
-    x = rearrange(x, rerange_type_head_seq)
-    return x
+        # Pad query rows keep every real key, so they never become all -inf.
+        mask = torch.zeros(
+            *attention_mask.shape[:2], padded_len, padded_len, dtype=attention_mask.dtype, device=index.device
+        )
+        mask[..., is_pad] = float("-inf")
+        mask[:, :, index[:, None], index[None, :]] = attention_mask
+    return rotary_emb, mask
 
 
 class AdaLayerNorm(torch.nn.Module):
@@ -148,27 +121,30 @@ class AdaLayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim, eps, elementwise_affine=True):
+    """``rms_norm`` / ``standard`` or ``unweighted``. Impl from ``rms_norm_implementation``, else eager."""
+
+    def __init__(self, dim, eps, elementwise_affine=True, config=None):
         super().__init__()
         self.eps = eps
         if elementwise_affine:
             self.weight = torch.nn.Parameter(torch.ones((dim,)))
+            variant = "standard"
         else:
             self.weight = None
+            variant = "unweighted"
+        rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", variant, rms_norm_impl)
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).square().mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states = hidden_states.to(input_dtype)
-        if self.weight is not None:
-            hidden_states = hidden_states * self.weight
-        return hidden_states
+        """Apply the interned ``rms_norm`` handle."""
+        if self.weight is None:
+            return self.veomni_rms_norm(hidden_states, eps=self.eps)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.eps)
 
 
-def interact_with_ipadapter(hidden_states, q, ip_k, ip_v, scale=1.0):
+def interact_with_ipadapter(module, hidden_states, q, ip_k, ip_v, scale=1.0):
     batch_size, num_tokens = hidden_states.shape[0:2]
-    ip_hidden_states = torch.nn.functional.scaled_dot_product_attention(q, ip_k, ip_v)
+    ip_hidden_states = flux_attention(module, q, ip_k, ip_v)
     ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, num_tokens, -1)
     hidden_states = hidden_states + scale * ip_hidden_states
     return hidden_states
@@ -203,7 +179,7 @@ class RoPEEmbedding(torch.nn.Module):
 
 
 class FluxJointAttention(torch.nn.Module):
-    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, only_out_a=False, config=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -212,14 +188,15 @@ class FluxJointAttention(torch.nn.Module):
         self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
         self.b_to_qkv = torch.nn.Linear(dim_b, dim_b * 3)
 
-        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_q_b = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_b = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_q_b = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_b = RMSNorm(head_dim, eps=1e-6, config=config)
 
         self.a_to_out = torch.nn.Linear(dim_a, dim_a)
         if not only_out_a:
             self.b_to_out = torch.nn.Linear(dim_b, dim_b)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         # 打印输入大小，在一行
@@ -252,7 +229,7 @@ class FluxJointAttention(torch.nn.Module):
         k = torch.concat([k_b, k_a], dim=2)
         v = torch.concat([v_b, v_a], dim=2)
         q, k = self.apply_rope(q, k, image_rotary_emb)
-        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
+        hidden_states = flux_attention(self, q, k, v, attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             # The output is [text_full, image_full]. Scatter each stream on its own so this
@@ -273,7 +250,7 @@ class FluxJointAttention(torch.nn.Module):
             hidden_states[:, hidden_states_b.shape[1] :],
         )
         if ipadapter_kwargs_list is not None:
-            hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
+            hidden_states_a = interact_with_ipadapter(self, hidden_states_a, q_a, **ipadapter_kwargs_list)
 
         hidden_states_a = self.a_to_out(hidden_states_a)
         if self.only_out_a:
@@ -284,12 +261,12 @@ class FluxJointAttention(torch.nn.Module):
 
 
 class FluxJointTransformerBlock(torch.nn.Module):
-    def __init__(self, dim, num_attention_heads):
+    def __init__(self, dim, num_attention_heads, config=None):
         super().__init__()
         self.norm1_a = AdaLayerNorm(dim)
         self.norm1_b = AdaLayerNorm(dim)
 
-        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads)
+        self.attn = FluxJointAttention(dim, dim, num_attention_heads, dim // num_attention_heads, config=config)
 
         self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff_a = torch.nn.Sequential(
@@ -330,15 +307,16 @@ class FluxJointTransformerBlock(torch.nn.Module):
 
 
 class FluxSingleAttention(torch.nn.Module):
-    def __init__(self, dim_a, dim_b, num_heads, head_dim):
+    def __init__(self, dim_a, dim_b, num_heads, head_dim, config=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
 
         self.a_to_qkv = torch.nn.Linear(dim_a, dim_a * 3)
 
-        self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
+        self.norm_q_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(head_dim, eps=1e-6, config=config)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -357,7 +335,7 @@ class FluxSingleAttention(torch.nn.Module):
 
         q, k = self.apply_rope(q_a, k_a, image_rotary_emb)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        hidden_states = flux_attention(self, q, k, v)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
@@ -379,7 +357,7 @@ class AdaLayerNormSingle(torch.nn.Module):
 
 
 class FluxSingleTransformerBlock(torch.nn.Module):
-    def __init__(self, dim, num_attention_heads):
+    def __init__(self, dim, num_attention_heads, config=None):
         super().__init__()
         self.num_heads = num_attention_heads
         self.head_dim = dim // num_attention_heads
@@ -387,10 +365,11 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         self.norm = AdaLayerNormSingle(dim)
         self.to_qkv_mlp = torch.nn.Linear(dim, dim * (3 + 4))
-        self.norm_q_a = RMSNorm(self.head_dim, eps=1e-6)
-        self.norm_k_a = RMSNorm(self.head_dim, eps=1e-6)
+        self.norm_q_a = RMSNorm(self.head_dim, eps=1e-6, config=config)
+        self.norm_k_a = RMSNorm(self.head_dim, eps=1e-6, config=config)
 
         self.proj_out = torch.nn.Linear(dim * 5, dim)
+        bind_flux_attention(self, config=config)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -411,7 +390,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         q, k = self.apply_rope(q, k, image_rotary_emb)
 
-        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
+        hidden_states = flux_attention(self, q, k, v, attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
@@ -419,7 +398,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         if ipadapter_kwargs_list is not None:
-            hidden_states = interact_with_ipadapter(hidden_states, q, **ipadapter_kwargs_list)
+            hidden_states = interact_with_ipadapter(self, hidden_states, q, **ipadapter_kwargs_list)
         return hidden_states
 
     def forward(
@@ -460,22 +439,46 @@ class FluxModel(PreTrainedModel):
     _no_split_modules = ["FluxJointTransformerBlock", "FluxSingleTransformerBlock"]
     _supports_flash_attn_2 = True
     _supports_flash_attn_3 = True
+    _supports_sdpa = True
 
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)
 
-        self.pos_embedder = RoPEEmbedding(3072, 10000, [16, 56, 56])
-        self.time_embedder = TimestepEmbeddings(256, 3072)
-        self.guidance_embedder = None if config.disable_guidance_embedder else TimestepEmbeddings(256, 3072)
-        self.pooled_text_embedder = torch.nn.Sequential(
-            torch.nn.Linear(768, 3072), torch.nn.SiLU(), torch.nn.Linear(3072, 3072)
+        hidden_size = config.num_attention_heads * config.attention_head_dim
+        if sum(config.axes_dims_rope) != config.attention_head_dim:
+            raise ValueError(
+                f"sum(axes_dims_rope) must equal attention_head_dim, got "
+                f"{sum(config.axes_dims_rope)} and {config.attention_head_dim}"
+            )
+
+        self.pos_embedder = RoPEEmbedding(hidden_size, config.rope_theta, config.axes_dims_rope)
+        self.time_embedder = TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
+        self.guidance_embedder = (
+            None
+            if config.disable_guidance_embedder
+            else TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
         )
-        self.context_embedder = torch.nn.Linear(4096, 3072)
-        self.x_embedder = torch.nn.Linear(config.input_dim, 3072)
-        self.blocks = torch.nn.ModuleList([FluxJointTransformerBlock(3072, 24) for _ in range(config.num_blocks)])
-        self.single_blocks = torch.nn.ModuleList([FluxSingleTransformerBlock(3072, 24) for _ in range(38)])
-        self.final_norm_out = AdaLayerNormContinuous(3072)
-        self.final_proj_out = torch.nn.Linear(3072, 64)
+        self.pooled_text_embedder = torch.nn.Sequential(
+            torch.nn.Linear(config.pooled_projection_dim, hidden_size),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_size, hidden_size),
+        )
+        self.context_embedder = torch.nn.Linear(config.joint_attention_dim, hidden_size)
+        self.x_embedder = torch.nn.Linear(config.input_dim, hidden_size)
+        self.blocks = torch.nn.ModuleList(
+            [
+                FluxJointTransformerBlock(hidden_size, config.num_attention_heads, config=config)
+                for _ in range(config.num_blocks)
+            ]
+        )
+        self.single_blocks = torch.nn.ModuleList(
+            [
+                FluxSingleTransformerBlock(hidden_size, config.num_attention_heads, config=config)
+                for _ in range(config.num_single_layers)
+            ]
+        )
+        self.final_norm_out = AdaLayerNormContinuous(hidden_size)
+        self.final_proj_out = torch.nn.Linear(hidden_size, config.output_dim)
         self.input_dim = config.input_dim
 
         self.gradient_checkpointing = False
@@ -655,10 +658,22 @@ class FluxModel(PreTrainedModel):
 
             return custom_forward
 
-        if get_parallel_state().ulysses_enabled:
+        use_sp = get_parallel_state().ulysses_enabled
+        txt_len, img_len = prompt_emb.shape[1], hidden_states.shape[1]
+        joint_rotary_emb, joint_attention_mask = image_rotary_emb, attention_mask
+        single_rotary_emb, single_attention_mask = image_rotary_emb, attention_mask
+
+        if use_sp:
+            # slice_input_tensor pads each stream up to a multiple of sp_size. Inside
+            # attention the gathered sequence is [text + text_pad, image + image_pad], so
+            # RoPE and the mask must follow that layout, and the pad keys must be masked.
+            sp_size = get_parallel_state().ulysses_size
+            joint_index, joint_len = _sp_padded_layout([txt_len, img_len], sp_size, image_rotary_emb.device)
+            joint_rotary_emb, joint_attention_mask = _to_sp_padded_layout(
+                image_rotary_emb, attention_mask, joint_index, joint_len, hidden_states.dtype
+            )
             hidden_states = slice_input_tensor(hidden_states, dim=1)
             prompt_emb = slice_input_tensor(prompt_emb, dim=1)
-            # image_rotary_emb = slice_input_tensor(image_rotary_emb, dim=2)
 
         for block in self.blocks:
             if self.training and self.gradient_checkpointing:
@@ -667,21 +682,25 @@ class FluxModel(PreTrainedModel):
                     hidden_states,
                     prompt_emb,
                     conditioning,
-                    image_rotary_emb,
-                    attention_mask,
+                    joint_rotary_emb,
+                    joint_attention_mask,
                 )
             else:
                 hidden_states, prompt_emb = block(
-                    hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask
+                    hidden_states, prompt_emb, conditioning, joint_rotary_emb, joint_attention_mask
                 )
 
-        if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)
-            prompt_emb = gather_outputs(prompt_emb, gather_dim=1)
+        if use_sp:
+            hidden_states = gather_outputs(hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=img_len)
+            prompt_emb = gather_outputs(prompt_emb, gather_dim=1, padding_dim=1, unpad_dim_size=txt_len)
 
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
 
-        if get_parallel_state().ulysses_enabled:
+        if use_sp:
+            single_index, single_len = _sp_padded_layout([txt_len + img_len], sp_size, image_rotary_emb.device)
+            single_rotary_emb, single_attention_mask = _to_sp_padded_layout(
+                image_rotary_emb, attention_mask, single_index, single_len, hidden_states.dtype
+            )
             hidden_states = slice_input_tensor(hidden_states, dim=1)
 
         for block in self.single_blocks:
@@ -691,16 +710,18 @@ class FluxModel(PreTrainedModel):
                     hidden_states,
                     prompt_emb,
                     conditioning,
-                    image_rotary_emb,
-                    attention_mask,
+                    single_rotary_emb,
+                    single_attention_mask,
                 )
             else:
                 hidden_states, prompt_emb = block(
-                    hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask
+                    hidden_states, prompt_emb, conditioning, single_rotary_emb, single_attention_mask
                 )
 
-        if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)
+        if use_sp:
+            hidden_states = gather_outputs(
+                hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=txt_len + img_len
+            )
 
         hidden_states = hidden_states[:, prompt_emb.shape[1] :]
         hidden_states = self.final_norm_out(hidden_states, conditioning)
@@ -788,8 +809,3 @@ class FluxModel(PreTrainedModel):
     @staticmethod
     def state_dict_converter():
         return FluxDiTStateDictConverter()
-
-
-if is_liger_kernel_available():
-    RMSNorm = LigerRMSNorm
-    logger.info_rank0("Apply liger kernel to Flux.")

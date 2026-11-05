@@ -30,11 +30,11 @@ at load time, eliminating the need for offline checkpoint merging.
 
 from typing import Dict
 
-from ..._moe_fused_weight_map import (
+from ..._moe_per_expert_converter import PerExpertFusedCheckpointTensorConverter
+from ...checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
-from ..._moe_per_expert_converter import PerExpertFusedCheckpointTensorConverter
 
 
 class Qwen3MoeCheckpointTensorConverter(PerExpertFusedCheckpointTensorConverter):

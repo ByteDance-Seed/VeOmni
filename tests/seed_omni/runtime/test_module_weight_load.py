@@ -13,8 +13,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed.torch_compile import CompileConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _RESUME_PATH = "/tmp/checkpoint/global_step_10"
@@ -61,7 +66,10 @@ def test_without_resume_path_hf_weights_are_always_loaded() -> None:
     assert _build_module_runtime(nn.Linear(2, 2), load_path=None).skip_hf_weight_load is False
 
 
-def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("expert_weight_fp8_all_gather", [False, True])
+def test_parallelize_forwards_module_skip_decision(
+    monkeypatch: pytest.MonkeyPatch, expert_weight_fp8_all_gather: bool
+) -> None:
     parallelize = MagicMock(side_effect=lambda model, **kwargs: model)
     # ``VeOmniModelRuntime._build_parallelized_model`` imports the builder inside
     # the call, so the patch has to land on the defining module.
@@ -84,7 +92,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
         accelerator=SimpleNamespace(
             init_device="meta",
             torch_compile=CompileConfig(),
-            gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
+            gradient_checkpointing=GradientCheckpointingConfig(enable=False),
             fsdp_config=SimpleNamespace(
                 fsdp_mode="fsdp2",
                 fsdp_scope="module",
@@ -94,12 +102,16 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 offload=False,
                 offload_pin_memory=False,
                 low_precision_reduce_scatter_comm=False,
+                expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
+                expert_fsdp_shard_dim=0,
                 max_load_broadcast_size=20.0,
             ),
-            offload_config=SimpleNamespace(enable_async_activation=False),
+            offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
         ),
     )
 
     runtime._build_parallelized_model()
 
     assert parallelize.call_args.kwargs["should_skip_hf_weight_load"] is False
+    assert parallelize.call_args.kwargs["expert_weight_fp8_all_gather"] is expert_weight_fp8_all_gather
+    assert parallelize.call_args.kwargs["expert_fsdp_shard_dim"] == 0

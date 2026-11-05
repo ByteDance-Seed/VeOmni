@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,10 +8,12 @@ import torch
 import yaml
 from transformers import AutoConfig
 
+from tests.models.compare import eager_ops_config
 from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 from veomni.distributed.utils import check_fqn_match
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
-from veomni.models.checkpoint_tensor_loading import maybe_convert_checkpoint_tensor
+from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
+from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen3_5_moe import (
     register_qwen3_5_moe_modeling,
     register_qwen3_5_moe_text_modeling,
@@ -32,6 +35,11 @@ TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "qwen3_5_moe_toy"
 NUM_EXPERTS = 4
 HIDDEN_DIM = 8
 INTERMEDIATE_DIM = 6
+
+
+def _eager_ops(config):
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return nullcontext()
 
 
 class _SumFusion(torch.nn.Module):
@@ -78,7 +86,8 @@ def _make_expert_tensor(proj: str, expert_id: int) -> torch.Tensor:
 
 def test_qwen3_5_moe_mtp_structure():
     text_config = AutoConfig.from_pretrained(TOY_CONFIG).text_config
-    mtp = modeling.Qwen3_5MoeMTP(text_config)
+    with _eager_ops(text_config):
+        mtp = modeling.Qwen3_5MoeMTP(text_config)
 
     assert len(mtp.layers) == text_config.mtp_num_hidden_layers
     assert isinstance(mtp.layers[0], modeling.Qwen3_5MoeDecoderLayer)
@@ -100,7 +109,7 @@ def test_qwen3_5_eval_text_model_returns_mtp_context_on_demand(
 ):
     config = deepcopy(AutoConfig.from_pretrained(config_path).text_config)
     config.num_hidden_layers = 0
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         text_model = text_model_cls(config)
     text_model.norm = torch.nn.Identity()
     text_model.rotary_emb = _EmptyRotary()
@@ -131,7 +140,7 @@ def test_qwen3_5_eval_text_model_returns_mtp_context_on_demand(
 def test_qwen3_5_mtp_layers_are_recurrent_prediction_depths(mtp_cls, config_path):
     config = deepcopy(AutoConfig.from_pretrained(config_path).text_config)
     config.mtp_num_hidden_layers = 2
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         mtp = mtp_cls(config)
 
     layer_0 = _AddLayer(10.0)
@@ -170,7 +179,7 @@ def test_qwen3_5_mtp_layers_are_recurrent_prediction_depths(mtp_cls, config_path
 def test_qwen3_5_moe_mtp_collects_router_logits_per_depth():
     config = deepcopy(AutoConfig.from_pretrained(TOY_CONFIG).text_config)
     config.mtp_num_hidden_layers = 2
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         mtp = modeling.Qwen3_5MoeMTP(config)
 
     mtp.pre_fc_norm_embedding = torch.nn.Identity()
@@ -435,18 +444,7 @@ def _build_conditional_generation(monkeypatch, mtp_loss_weight, model_cls=None):
     config = AutoConfig.from_pretrained(TOY_CONFIG)
     config.text_config.mtp_loss_weight = mtp_loss_weight
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
-    for slot_name in (
-        "veomni_rms_norm",
-        "veomni_moe_experts_forward",
-        "veomni_causal_lm_loss",
-        "veomni_load_balancing_loss",
-        "veomni_rms_norm_gated",
-        "veomni_causal_conv1d",
-        "veomni_chunk_gated_delta_rule",
-    ):
-        getattr(modeling, slot_name).bind("eager")
-
-    with torch.device("meta"):
+    with _eager_ops(config), torch.device("meta"):
         return (model_cls or modeling.Qwen3_5MoeForConditionalGeneration)(config)
 
 

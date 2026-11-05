@@ -126,7 +126,7 @@ the MTP cross-entropy contribution.
 ### The MTP label row
 
 `ForCausalLMLoss` shifts labels by one internally when SP is disabled
-(`veomni/ops/kernels/cross_entropy/__init__.py`), so position `i` of the main head
+(`veomni/models/loss_utils/cross_entropy_loss.py`), so position `i` of the main head
 predicts `labels[i+1]`. MTP depth `d` instead needs `labels[i+d+2]`. The data
 transform therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, and
 the model supplies it as an explicit `shift_labels=` argument that bypasses the

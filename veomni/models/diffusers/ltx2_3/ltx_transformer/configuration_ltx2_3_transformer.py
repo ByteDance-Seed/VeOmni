@@ -1,13 +1,14 @@
 import inspect
 
 import diffusers
-from transformers import PretrainedConfig
+
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
 diffusers_version = diffusers.__version__
 
 
-class LTXVideoTransformerModelConfig(PretrainedConfig):
+class LTXVideoTransformerModelConfig(VeOmniPretrainedConfig):
     model_type = "LTXVideoTransformerModel"
     condition_model_type = "LTXVideoConditionModel"
 

@@ -1,215 +1,198 @@
 # Testing a New Model
 
-When adding a new model under `veomni/models/transformers/<model>/`, two test
-suites need updating:
+This is the coverage policy for adding a model under
+`veomni/models/transformers/<model>/`. Keep family-specific tests beside the
+maintained implementation and reuse the shared model and E2E suites. Select
+coverage by model structure, operator implementation, and supported parallel
+modes; adding a model does not require repeating every backend combination.
 
-1. **`tests/models/test_models_patch.py`** — single-GPU forward/backward
-   correctness across attention and MoE backends.
-2. **`tests/e2e/test_e2e_parallel.py`** — multi-GPU e2e training with FSDP2,
-   sequence parallelism (SP), and expert parallelism (EP).
+## 1. Registry and model parity
 
-For VLM models, there is also a lightweight trainer-level smoke test for
-`freeze_vit`:
+Add one canonical tiny-config factory to `tests/models/tiny_configs.py`.
+Reuse that factory from both places below instead of copying the config:
 
-3. **`tests/models/test_vlm_trainer.py`** — builds a real toy VLM model on
-   CPU and checks that vision parameters stay trainable when `freeze_vit=False`
-   and are frozen when `freeze_vit=True`.
+- `tests/models/base/test_auto_registry.py` lists the registered model
+  type, supported architectures, aliases, and build prerequisites.
+- The corresponding test under `tests/models/transformers/` covers the
+  model's eager forward/backward parity and any family-specific behavior.
 
-For VLM / Omni models, an additional multi-GPU test covers the FSDP2
-asymmetric-forward path:
+For a Qwen family, place the test under
+`tests/models/transformers/qwen/`; otherwise use a family file or
+subdirectory under `tests/models/transformers/`.
 
-4. **`tests/distributed/test_dummy_forward.py`** — verifies rank-asymmetric
-   multimodal batches (rank 0 has images/video/audio, others text-only) do
-   not hang NCCL under FSDP2, exercising the model's `dummy_forward()` hook.
+Choose eager attention on the root tiny config before constructing the HF
+reference. In composite configs, an eager text child does not select the
+root or unset vision/audio branches. Candidate builders must also select eager
+implementations for every consumed op before construction; reuse
+`tests.tools.training_utils.make_eager_ops_config()` to include GDN and vision
+fields. Adapt configs for standalone patched MLP/expert/attention layers too,
+using `get_veomni_config_class` or `as_veomni_config`. The CPU model-test
+fixture rejects optional FlashAttention preloading even on hosts with the
+package installed; the registry constructor matrix covers native HF references.
+FP32 accelerator comparisons must explicitly select a portable backend in
+`config.ops_implementation`, as shown by the Flux, Wan T2V, and LTX Ulysses tests.
 
-## 1. `tests/models/test_models_patch.py`
+Keep implementation assertions capability-based. A test may prove that eager
+and an optimized implementation can be selected, but it should not require a
+particular YAML file to choose one fixed implementation.
 
-### What it tests
+If an on-disk HuggingFace checkpoint needs key or tensor-layout conversion,
+implement the converter in `veomni/models/` and cover it in
+`tests/models/base/test_checkpoint_tensor_converter.py`.
 
-Runs one forward + backward step on dummy data for every combination of:
+Run the focused model tests first:
 
-- HF attention backends (`eager`, `flash_attention_2`, `flash_attention_3`)
-- VeOmni attention backends (`veomni_flash_attention_2_with_sp`,
-  `veomni_flash_attention_3_with_sp`)
-- MoE backends (for MoE models: `eager`, `fused`)
-
-Then asserts that loss and grad norm match across all combinations within
-`(rtol, atol)`.
-
-### How to add a case
-
-Append a `pytest.param(...)` to the test-cases list:
-
-```python
-pytest.param(
-    "./tests/toy_config/<new_model>_toy/config.json",
-    False,  # is_moe — set True for MoE models
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    id="<new_model>",
-),
+```bash
+pytest tests/models/base/test_auto_registry.py -k <model>
+pytest tests/models/transformers -k <model>
 ```
 
-The `id=` string controls test node naming (`pytest -k <id>`). Patchgen model
-tests load matching in-memory state dicts directly. If an on-disk HuggingFace
-checkpoint needs key or tensor-layout conversion, implement a
-`CheckpointTensorConverter` and cover it in
-`tests/models/test_checkpoint_tensor_converter.py`.
+## 2. Accelerator model parity and optimized operators
 
-### Filtering unsupported modes
+For each supported accelerator, cover one supported training configuration
+against an independent reference, including loss and backward checks. Reuse
+`tests/models/test_models_patch.py` for its supported families, or extend
+`tests/models/base/test_low_precision_oracle.py` or a family test when the model
+needs a different reference or attention path. The shared model-patch suite
+still runs; eager family parity and low-precision training parity have
+different purposes.
 
-If the model doesn't support certain attention backends yet, add a filter
-block in `test_models_patch_fwd_bwd` keyed on `case_id`:
+Choose the configuration that represents the model's supported training path
+on that device. FA2 plus the device's fused MoE implementation is a common
+choice, but models with DSA, GatedDeltaNet, or GPT-OSS-specific attention and
+experts need their supported implementations. Do not force an unsupported
+backend to make the matrix look uniform.
 
-```python
-if case_id == "<new_model>":
-    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
-    veomni_model_modes = [
-        mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
-    ]
+Additional attention versions, eager fallback, and alternate fused backends
+use representative models chosen by the implementation they exercise. Cover
+a new layout, activation, bias, or backward implementation explicitly. For
+example, `moe_experts/standard/fused_quack` and
+`moe_experts/gpt_oss/fused_quack` share Quack GEMM but have different expert
+math and backward implementations; one does not qualify the other.
+
+Put operator-level numerical, backward, availability, and hardware-guard tests
+under `tests/ops/`. Cover each distinct EP/non-EP implementation and relevant
+split/merged layouts there. An EP-local GEMM test does not exercise token
+all-to-all or the complete distributed training path. Model tests own operator
+binding and model-level parity; E2E tests own the integrated training path.
+
+## 3. End-to-end parallel coverage
+
+Add the model to `tests/e2e/test_e2e_parallel.py`. Text models use
+`text_test_cases`; VLM and omni models use the matching family list and data
+fixture. Reuse an existing test function and its launch-plan provider.
+
+### Default matrix
+
+Each pair below is `(SP, EP)`. The baseline has both SP and EP disabled;
+FSDP2 remains enabled.
+
+| Model | Modes | Processes per run | Assertion |
+|---|---|---|---|
+| Dense, with SP support | `(1,1)`, `(2,1)` | 4 | Loss and grad norm align to `(1,1)` |
+| MoE, with SP and EP support | `(1,1)`, `(2,2)` | 4 | Loss and grad norm align to `(1,1)` |
+| MoE, without SP support | `(1,1)`, `(1,2)` | 4 | EP alignment; document the SP restriction |
+| MoE, without EP support | `(1,1)`, `(2,1)` | 4 | SP alignment; document the EP restriction |
+
+The two-mode MoE default checks the combined SP+EP configuration. It does not
+isolate SP and EP independently. Shared parallel primitives and the
+representatives below provide that additional coverage. A model with a
+distinct implementation may need extra modes, with a stated reason.
+
+### Representatives and capability exceptions
+
+| Case | Modes | Processes per run | Reason |
+|---|---|---|---|
+| `qwen3_moe` | `(1,1)`, `(1,2)`, `(2,1)`, `(2,2)` | 4 at SP1, 8 at SP2 | Shared full-matrix representative; preserves the larger topology |
+| `gpt_oss` | `(1,1)`, `(2,1)`, `(2,2)` | 4 | Dedicated GPT-OSS Quack variant; baseline plus SP and EP configurations |
+
+GPT-OSS compares all three runs against the `(1,1)` baseline. Both EP and
+non-EP experts use Quack; they have separate custom backward implementations.
+That split also exists in standard Quack and does not require every MoE model
+to run three modes. Additional model/backend representatives should be added
+only when existing coverage misses a distinct implementation or topology.
+
+Capability exceptions are separate from these representatives. For example,
+GLM-MoE-DSA sets `max_sp_size=1` because its attention/indexer path does not
+support SP. DeepSeek-V4 has a dedicated SP1 EP-alignment test plus SP2 smoke
+tests for other paths. Record the supported configuration, the missing
+capability or assertion, and any complementary test; do not describe a smoke
+test as numerical alignment.
+
+### Numerical and resource contract
+
+Alignment runs use the same initial weights, data, global batch size, and
+optimizer settings, with two optimizer steps. At fixed four-process world
+size, changing SP changes the DP size; the training callbacks reduce losses
+with `dp_mean` before comparison. Compare loss and grad norm with an explicit,
+justified tolerance. These aggregate metrics do not prove per-parameter
+gradient/update equivalence or convergence.
+
+Keep `compare_alignment=True` for alignment cases. A successful process exit
+and nonempty logs only establish smoke coverage. Use smoke only when it is
+the intended contract, explain why, and identify any remaining alignment gap.
+
+The mode list in `tests/e2e/utils.py::parallel_launches` drives both commands
+and resource plans. Modes execute sequentially within a case. Ordinary cases
+reserve four devices; adding a model must not introduce an eight-device
+reservation unless the tested topology needs it. A new launcher must declare
+the same process count in its `pytest.mark.launch_plan` and worker startup.
+
+## 4. Hardware eligibility and CI collection
+
+Declare support and prerequisites independently for GPU and NPU. Check
+hardware eligibility before importing an optional accelerator kernel, and
+skip with a concrete reason when its device or package is unavailable.
+GPT-OSS FA4/Quack E2E requires SM90+ CUDA, FA4, and Quack; it skips on SM89
+GPU runners and NPUs. A green job that skips a case is not execution evidence
+for that backend. Record hardware, executed modes, and skips in validation.
+
+Check the selections and filters in
+`scripts/ci/accelerator/suites/gpu.json` and `npu.json`. A case added under an
+already-selected file/directory normally needs no manifest edit, but a new
+file outside those selections does. See
+[Registering Tests in CI](../testing.md#registering-tests-in-ci) and
+[launch-plan authoring](../design/ci_case_scheduling.md).
+
+Collect the exact family/test IDs before running. E2E model names can differ
+from registry names, especially for VLMs:
+
+```bash
+pytest tests/models --collect-only -q -k <model>
+pytest tests/e2e/test_e2e_parallel.py --collect-only -q -k <model>
+pytest tests/e2e/test_e2e_parallel.py -k <model>
 ```
 
-### Toy config
+## 5. VLM and omni contracts
 
-Create a minimal config under `tests/toy_config/<new_model>_toy/config.json`
-with few layers. Add a `README.md` under the same folder to indicate:
+VLM models also need the trainer freeze test in
+`tests/trainer/test_vlm_trainer.py`. Add the canonical tiny config to the
+freeze-ViT case list and verify both `freeze_vit=False` and
+`freeze_vit=True`.
 
-1. Where the original config is from
-2. What changes are made from the original config
+Any model whose generated modeling overrides `dummy_forward` must add a case
+to `tests/distributed/test_dummy_forward.py`. This 2-GPU test sends a
+multimodal batch to one rank and text-only batches to the others, checking that
+all ranks still participate in FSDP collectives.
 
-## 2. `tests/e2e/test_e2e_parallel.py`
-
-### What it tests
-
-Launches full `torchrun` training runs (2 epochs, 2 steps) across parallel
-configurations (FSDP2 always enabled):
-
-| Parameter | Values |
-|-----------|--------|
-| `sp_size` | 1, 2 |
-| `ep_size` | 1 (base models), 1×2 (MoE models) |
-
-Each run produces a `log_dict.json`. The test asserts that loss and grad norm
-match across all SP/EP configurations within `(rtol, atol)`.
-
-### How to add a case
-
-Add an entry to `text_test_cases` (for text-only models):
-
-```python
-pytest.param(
-    "<new_model>",
-    "./tests/toy_config/<new_model>_toy/config.json",
-    False,  # is_moe
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    None,  # max_sp_size
-),
+```bash
+pytest tests/trainer/test_vlm_trainer.py -k <model>
+pytest tests/distributed/test_dummy_forward.py -k <model>
 ```
-
-### Parametrize fields
-
-The `text_test_cases` parametrize string is:
-
-```
-"model_name, config_path, is_moe, rtol, atol, max_sp_size"
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model_name` | `str` | Used for directory naming and log output |
-| `config_path` | `str` | Path to toy config directory or `config.json` |
-| `is_moe` | `bool` | If `True`, also iterates over `ep_size` values |
-| `rtol`, `atol` | `float` | Tolerances for cross-config comparison |
-| `max_sp_size` | `int \| None` | `None` = no limit (run sp=1,2). Set to `1` to skip sp=2 if SP is not yet supported |
-
-### Limiting sequence parallelism
-
-If the model does not support SP yet, set `max_sp_size=1` to only run with
-`sp_size=1`:
-
-```python
-pytest.param(
-    "qwen3_5",
-    "./tests/toy_config/qwen3_5_toy/config.json",
-    False,  # is_moe
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    1,  # max_sp_size — remove once SP is supported
-),
-```
-
-### VLM / multimodal models
-
-For vision-language or multimodal models, add to the appropriate test case
-list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) and pair with the
-matching fixture and test function. The same `max_sp_size` field is available.
-
-## 3. `tests/models/test_vlm_trainer.py`
-
-### What it tests
-
-Builds a real toy VLM model and calls `VLMModelRuntime._freeze_model_module()`
-directly. The test only checks one behavior:
-
-- `freeze_vit=False` -> the vision tower parameters remain trainable
-- `freeze_vit=True` -> the vision tower parameters are frozen
-
-This is intentionally simpler than an e2e training test. It is meant to
-catch model wrapper path changes such as `model.visual` vs `model.model.visual`.
-
-### How to add a case
-
-Add your toy config to the freeze-ViT VLM cases list:
-
-```python
-pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
-```
-
-## 4. `tests/distributed/test_dummy_forward.py` (VLM / Omni only)
-
-### What it tests
-
-Launches a 2-GPU `torchrun` job under FSDP2. Rank 0 receives a multimodal
-batch (images + video, and audio for Omni); other ranks receive text-only.
-Both ranks must complete forward + backward without an NCCL timeout, which
-proves that the model's `dummy_forward()` hook (or equivalent) fires on
-text-only ranks so every rank participates in FSDP collectives.
-
-Any model whose patchgen-generated modeling overrides
-`<M>VisionTransformerPretrainedModel.dummy_forward` (or similar) must add a
-case here — this suite is the only coverage for that override on multi-GPU.
-
-### How to add a case
-
-Append an entry to `_vlm_cases` (VLM) or `_omni_cases` (Omni):
-
-```python
-pytest.param(
-    "<new_vlm_model>",
-    "./tests/toy_config/<new_vlm_model>_toy",
-    partial(_vlm_batch, patch_size=<P>),
-    id="<new_vlm_model>",
-),
-```
-
-`patch_size` must match the model's vision patch size (e.g. 14 for
-Qwen2.5-VL, 16 for Qwen3-VL). Run with
-`pytest tests/distributed/test_dummy_forward.py -k <new_vlm_model>` on a
-2-GPU host.
 
 ## Checklist
 
-When adding a new model, verify:
-
-- [ ] Toy config created under `tests/toy_config/<model>_toy/`
-- [ ] Entry added to the test-cases list in `test_models_patch.py`
-- [ ] Unsupported attention/MoE modes filtered in `test_models_patch_fwd_bwd` if needed
-- [ ] Entry added to `text_test_cases` (or VLM equivalent) in `test_e2e_parallel.py`
-- [ ] For VLM models, toy config added to the freeze-ViT VLM cases list in `tests/models/test_vlm_trainer.py`
-- [ ] `max_sp_size` set appropriately (use `1` if SP not supported, `None` otherwise)
-- [ ] `pytest --collect-only -k <model>` shows expected test cases
-- [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/test_e2e_parallel.py -k <model>`
-- [ ] For VLM models, `pytest tests/models/test_vlm_trainer.py -k <model>` passes
-- [ ] For VLM / Omni models, an entry added to `_vlm_cases` / `_omni_cases` in `tests/distributed/test_dummy_forward.py` (required on any model that overrides `dummy_forward`)
-- [ ] `pytest tests/distributed/test_dummy_forward.py -k <model>` passes on 2 GPUs
+- [ ] One canonical tiny config added to `tests/models/tiny_configs.py`
+- [ ] Registry case added to `tests/models/base/test_auto_registry.py`
+- [ ] Family test covers eager forward/backward parity and model-specific contracts
+- [ ] One supported accelerator training configuration has loss/backward parity coverage
+- [ ] Distinct optimized variants/backends have focused forward/backward coverage under `tests/ops/`
+- [ ] E2E modes follow the default matrix or document a representative/capability exception
+- [ ] Alignment compares loss and grad norm; any smoke-only gap is explicit
+- [ ] Launch plan matches worker process counts and sequential execution
+- [ ] GPU/NPU selections, prerequisites, executed cases, and skips checked
+- [ ] VLM: freeze-ViT case added to `tests/trainer/test_vlm_trainer.py`
+- [ ] VLM/omni with `dummy_forward`: asymmetric 2-GPU case added
+- [ ] `pytest --collect-only -k <model>` collects the expected tests
+- [ ] Patch generation is current: `make check-patchgen`
+- [ ] Focused tests and `make quality` pass

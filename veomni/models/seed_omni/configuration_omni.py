@@ -30,11 +30,13 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
 import yaml
-from transformers import PretrainedConfig
+
+from ..configuration_base import VeOmniPretrainedConfig
 
 
 if TYPE_CHECKING:
     from .modules.module_configuration_base import OmniModuleConfig
+    from .utils.hf_layout import HFSource
 
 
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
@@ -129,6 +131,8 @@ def _split_omni_kwargs(
     caller meant for HF (``torch_dtype``, ``device_map``, …). A block states
     choices rather than replacing the layer it lands on.
     """
+    from ...arguments import OpsImplementationConfig
+
     ops_fields = _ops_field_names()
     root_ops: Dict[str, Any] = {}
     per_module: Dict[str, Dict[str, Any]] = {}
@@ -136,6 +140,10 @@ def _split_omni_kwargs(
 
     def ops_selection(key: str, field: str, value: Any) -> Dict[str, Any]:
         if field == "ops_implementation":
+            if value is None:
+                return {}
+            if isinstance(value, OpsImplementationConfig):
+                value = value.to_dict()
             if not isinstance(value, dict):
                 raise ValueError(
                     f"Load kwarg {key!r} must be a dict of kernel selections, got {type(value).__name__}."
@@ -180,7 +188,7 @@ def _split_omni_kwargs(
     return root_ops, per_module, remaining
 
 
-class OmniConfig(PretrainedConfig):
+class OmniConfig(VeOmniPretrainedConfig):
     """Checkpoint config for :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
     ``_module_entries`` is the dict of checkpoint entries. A loaded module config is
@@ -216,14 +224,19 @@ class OmniConfig(PretrainedConfig):
         # Model-level kernels: this composed model's defaults for every module
         # it holds. Sparse — only what was explicitly selected. A loaded module
         # config ranks its own file under this, then under the module entry.
-        self.ops_implementation: Dict[str, Any] = dict(ops_implementation or {})
+
         # Each module's own typed config, built by :meth:`from_pretrained`.
         # In-memory only: the modules are described by their own files, and a
         # copy here would be a second place to keep in sync. Dropped by
         # :meth:`to_dict`.
         self._module_configs: Dict[str, OmniModuleConfig] = {}
+        # The upstream HF checkpoint the module weights are read from, when this
+        # config was loaded off a weight-free view of one (see
+        # :mod:`~veomni.models.seed_omni.utils.hf_layout`). In-memory only, like
+        # :attr:`_module_configs`: a saved config describes its own files.
+        self._hf_source: Optional[HFSource] = None
 
-        super().__init__(**kwargs)
+        super().__init__(ops_implementation=ops_implementation, **kwargs)
 
     @property
     def train_types(self) -> List[str]:
@@ -352,14 +365,12 @@ class OmniConfig(PretrainedConfig):
             loaded = self._module_configs.get(name)
             if loaded is None:
                 continue
-            loaded.ops_implementation = {
-                **dict(loaded.ops_implementation or {}),
-                **self.ops_implementation,
-                **dict(self._module_entries[name].get("ops_implementation") or {}),
-            }
-            attn_implementation = loaded.ops_implementation.get("attn_implementation")
-            if attn_implementation is not None:
-                loaded._attn_implementation = attn_implementation
+            loaded._apply_composed_overwrites(
+                model_config=None,
+                processor_config=None,
+                ops_implementation=self._module_entries[name].get("ops_implementation"),
+                base_ops_implementation=self.ops_implementation,
+            )
         return remaining
 
     @property
@@ -379,6 +390,7 @@ class OmniConfig(PretrainedConfig):
             self._module_entries[name]["model_path"] = name
         output = super().to_dict()
         output.pop("_module_configs", None)
+        output.pop("_hf_source", None)
         return output
 
     @classmethod
@@ -394,11 +406,18 @@ class OmniConfig(PretrainedConfig):
         ``ops_implementation``, ``model_config``, ``processor_config``. The
         config that comes back is the resolved one, and handing it to
         ``OmniModel.from_pretrained(path, config=...)`` loads the same model.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        too, through a weight-free split view of it.
         """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
-        config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        config = super().from_pretrained(pretrained_model_name_or_path, *model_args, _validate_ops=False, **kwargs)
         root = config.checkpoint_root or str(pretrained_model_name_or_path)
         config.apply_omni_kwargs(omni_kwargs)
         config.load_checkpoint_sidecars(root)
@@ -418,8 +437,10 @@ class OmniConfig(PretrainedConfig):
         sidecar).
         """
         from .modules.module_configuration_base import OmniModuleConfig
+        from .utils.hf_layout import read_hf_source
 
         root = str(checkpoint_root)
+        self._hf_source = read_hf_source(root)
         self._load_graphs_from_pretrained(root)
         for name in self.module_names:
             entry = self._module_entries[name]

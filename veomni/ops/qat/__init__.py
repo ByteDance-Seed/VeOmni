@@ -14,18 +14,20 @@
 
 """Fake-quantization primitives for quantization-aware training.
 
-These are library ops: model code calls them directly instead of going through
-`KERNEL_REGISTRY` / `OpSlot`, because which tensor gets quantized at which
-granularity is a property of the model's quantization recipe rather than a
-kernel the user picks.
+These are functional helpers: model code calls them directly because which
+tensor gets quantized at which granularity is a property of the model's
+quantization recipe rather than a selectable op implementation.
 
 The recipes implemented so far are DeepSeek-V4's: block-wise FP8 everywhere
 except the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both
-reuse the V4 TileLang quantizers (`veomni.ops.kernels.deepseek_v4`), so training
-stays bit-aligned with inference by construction. They are SM90-only and loaded
-lazily, so importing this package on CPU or NPU stays free.
+reuse the V4 TileLang quantizers in :mod:`veomni.ops.qat.quant`, so training
+stays bit-aligned with inference by construction. Quantizing calls require an
+NVIDIA SM90 or later GPU and load the backend lazily, so importing this package
+on CPU or NPU stays free. ``qat_linear(..., enabled=False)`` bypasses
+quantization and its hardware and dependency checks.
 """
 
+from ._hardware import require_tilelang_sm90
 from .fp4_blockwise import (
     FP4_BLOCK_SIZE,
     fp4_fake_quant_weight,
@@ -40,13 +42,40 @@ from .fp8_blockwise import (
 )
 
 
+def act_quant(*args, **kwargs):
+    """Run the optional TileLang FP8 activation quantizer lazily."""
+    require_tilelang_sm90()
+    from .quant import act_quant as impl
+
+    return impl(*args, **kwargs)
+
+
+def fp4_act_quant(*args, **kwargs):
+    """Run the optional TileLang FP4 quantizer lazily."""
+    require_tilelang_sm90()
+    from .quant import fp4_act_quant as impl
+
+    return impl(*args, **kwargs)
+
+
+def fp8_weight_quant(*args, **kwargs):
+    """Run the optional TileLang FP8 weight quantizer lazily."""
+    require_tilelang_sm90()
+    from .quant import fp8_weight_quant as impl
+
+    return impl(*args, **kwargs)
+
+
 __all__ = [
     "DEFAULT_SCALE_FMT",
     "FP4_BLOCK_SIZE",
+    "act_quant",
+    "fp4_act_quant",
     "fp4_fake_quant_weight",
     "fp8_fake_quant_act",
     "fp8_fake_quant_act_prefix",
     "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
+    "fp8_weight_quant",
     "qat_linear",
 ]
