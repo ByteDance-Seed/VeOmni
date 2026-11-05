@@ -29,14 +29,10 @@ Two blobs, two owners:
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
 """
 
-import hashlib
-import marshal
-import math
-import types
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
-from torch.optim.lr_scheduler import LambdaLR, StepLR
+from torch.optim.lr_scheduler import LambdaLR
 
 from ...checkpoint import CheckpointerBase, build_checkpointer, layout
 from ...utils import helper
@@ -45,6 +41,7 @@ from ...utils.dist_utils import raise_if_any_rank_failed
 
 def _scheduler_recipe(scheduler, optimizer):
     """Stable schedule identity; LambdaLR state_dict omits its callable."""
+    from ...checkpoint.optimizer_resume_layout import _scheduler_functions
     from ...optim.lr_scheduler import MultiLRScheduler
 
     if scheduler is None:
@@ -57,42 +54,9 @@ def _scheduler_recipe(scheduler, optimizer):
         }
     if getattr(optimizer, "_is_multi_optimizer", False) is True:
         raise RuntimeError("MultiOptimizer requires a scheduler for each optimizer leaf")
-    if type(scheduler) not in (LambdaLR, StepLR) or scheduler.optimizer is not optimizer:
+    if type(scheduler) is not LambdaLR or scheduler.optimizer is not optimizer:
         raise RuntimeError("MultiOptimizer scheduler implementation or binding is unsupported")
-    if type(scheduler) is StepLR:
-        return {"type": "StepLR", "step_size": scheduler.step_size, "gamma": scheduler.gamma}
-
-    def immutable(value):
-        if value is None or type(value) in (bool, int, float, str):
-            return value
-        if isinstance(value, tuple):
-            return [immutable(item) for item in value]
-        if isinstance(value, dict) and all(isinstance(key, str) for key in value):
-            return {key: immutable(item) for key, item in sorted(value.items())}
-        raise RuntimeError("MultiOptimizer scheduler captures unsupported mutable state")
-
-    def normalize(code):
-        constants = tuple(normalize(item) if isinstance(item, types.CodeType) else item for item in code.co_consts)
-        return code.replace(co_filename="", co_firstlineno=0, co_consts=constants)
-
-    functions = []
-    for function in scheduler.lr_lambdas:
-        if not isinstance(function, types.FunctionType):
-            raise RuntimeError("MultiOptimizer scheduler callable is unsupported")
-        if any(
-            name in function.__globals__ and (name != "math" or function.__globals__[name] is not math)
-            for name in function.__code__.co_names
-        ):
-            raise RuntimeError("MultiOptimizer scheduler depends on unsupported global state")
-        functions.append(
-            {
-                "code": hashlib.sha256(marshal.dumps(normalize(function.__code__))).hexdigest(),
-                "defaults": immutable(function.__defaults__),
-                "kwdefaults": immutable(function.__kwdefaults__),
-                "closure": [immutable(cell.cell_contents) for cell in function.__closure__ or ()],
-            }
-        )
-    return {"type": "LambdaLR", "functions": functions}
+    return {"type": "LambdaLR", "functions": _scheduler_functions(scheduler)}
 
 
 def _validate_scheduler_checkpoint(saved, current, global_step):
