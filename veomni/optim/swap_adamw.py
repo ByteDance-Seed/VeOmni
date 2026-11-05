@@ -320,6 +320,8 @@ class SwapAdamW(Optimizer):
         stager deep-copies them before writing, so a save transiently needs about
         twice the host optimizer-state memory (on top of the host buffers).
         """
+        if getattr(self, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("SwapAdamW cannot save after a failed checkpoint restore; rebuild the optimizer")
         staged = getattr(self, "_veomni_dcp_staged_state", None)
         if staged is None:
             self._bind_host_states()
@@ -364,10 +366,22 @@ class SwapAdamW(Optimizer):
                         state_dict = result
             finally:
                 self.state = current
+
         # ``Optimizer.state_dict`` hands back the live inner state dicts; copy
         # them before swapping the int step for the tensor stock AdamW expects.
+        def serialize_step(step):
+            if torch.is_tensor(step):
+                if step.ndim != 0:
+                    raise RuntimeError("SwapAdamW checkpoint step must be a scalar")
+                step = step.item()
+            if isinstance(step, bool) or not isinstance(step, (int, float)) or not math.isfinite(step):
+                raise RuntimeError("SwapAdamW checkpoint step must be a finite integer")
+            if not 0 <= step <= 2**24 or int(step) != step:
+                raise RuntimeError("SwapAdamW checkpoint step cannot be represented exactly as float32")
+            return torch.tensor(float(step), dtype=torch.float32, device="cpu")
+
         state_dict["state"] = {
-            key: ({**value, "step": torch.tensor(float(value["step"]))} if "step" in value else value)
+            key: ({**value, "step": serialize_step(value["step"])} if "step" in value else value)
             for key, value in state_dict["state"].items()
         }
         return state_dict
