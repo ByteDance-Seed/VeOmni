@@ -48,6 +48,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -286,6 +287,16 @@ def _apply_extra_parallel_dim(
         # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
         # when sharding the module in ``torch_parallelize``.
         fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        if (
+            action == "restore"
+            and key_match == "substring"
+            and not isinstance(tensor, DTensor)
+            and fsdp_submesh.size() > 1
+        ):
+            raise RuntimeError(
+                "Plain optimizer state on multiple ExtraParallel FSDP ranks has no proven replica layout; "
+                "use a rank-local optimizer checkpoint codec."
+            )
         # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
         # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
         # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
@@ -371,7 +382,16 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the
@@ -398,9 +418,10 @@ class OptimizerState(Stateful):
             MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False, process_group=None):
         self.model = model
         self.optimizer = optimizer
+        self.process_group = process_group
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
@@ -413,12 +434,19 @@ class OptimizerState(Stateful):
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
-            assert self.optimizer._is_multi_optimizer, (
-                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-            )
-            vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                vanilla_optim_sd, "restore"
+            optim_sd_with_extra_parallel_dim, error = None, None
+            try:
+                assert self.optimizer._is_multi_optimizer, (
+                    "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
+                )
+                vanilla_optim_sd = self.optimizer.state_dict()
+                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                    vanilla_optim_sd, "restore"
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(
+                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
             )
             return optim_sd_with_extra_parallel_dim
 
@@ -471,32 +499,21 @@ class OptimizerState(Stateful):
 
 
 def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
-    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
-
-    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
-    A metadata-only construction computes the same global shape/stride/spec;
-    attaching the actual local shard then preserves CPU storage and the original
-    mesh identity. DTensor's spec constructor is intentionally isolated here.
-    No collectives or accelerator allocations are needed (run_check=False).
-    """
-    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
-        metadata = DTensor.from_local(
-            local_tensor.to("meta"),
-            device_mesh=device_mesh,
-            placements=placements,
-            run_check=False,
-            shape=shape,
-            stride=stride,
+    """Wrap CPU optimizer shards without moving or changing their strides."""
+    if local_tensor.device.type != "cpu" or device_mesh.device_type == "cpu":
+        return DTensor.from_local(
+            local_tensor, device_mesh=device_mesh, placements=placements, run_check=False, shape=shape, stride=stride
         )
-        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
-    return DTensor.from_local(
+    wrapped = rewrap_dtensor_local(
         local_tensor,
-        device_mesh=device_mesh,
+        mesh=device_mesh,
         placements=placements,
-        run_check=False,
         shape=shape,
         stride=stride,
     )
+    if wrapped.requires_grad != local_tensor.requires_grad:
+        wrapped = DTensor(local_tensor, wrapped._spec, requires_grad=local_tensor.requires_grad)
+    return wrapped
 
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
@@ -517,7 +534,13 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
+    has_fsdp_shard = any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1])
+    if num_placements in (2, 3) and has_fsdp_shard:
+        ndim = loaded_tensor.ndim
+        if not -ndim <= fsdp_shard_dim < ndim:
+            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+        fsdp_shard_dim %= ndim
+    if num_placements == 1 or (num_placements in (2, 3) and not has_fsdp_shard):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
         tensor_to_put = _from_local_preserve_device(
@@ -590,10 +613,16 @@ def restore_extra_parallel_dim(
             placements = [fsdp_placement, Shard(ep_shard_dim)]
         dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel
-        dtensor = _from_local_preserve_device(
-            orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)]
-        )
+        # Plain model tensors must be replicated across FSDP coordinates for
+        # the same ExtraParallel rank. Optimizer shards without that proof are
+        # rejected by the caller.
+        ndim = orgin_tensor.ndim
+        if not -ndim <= ep_shard_dim < ndim:
+            raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+        if fsdp_mesh.mesh_dim_names is None:
+            raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
+        placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
+        dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -1141,6 +1170,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
                 load=True,
+                process_group=process_group,
             )
 
         wants_optimizer = state.get("optimizer") is not None

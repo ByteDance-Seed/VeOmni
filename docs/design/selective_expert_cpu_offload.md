@@ -51,6 +51,8 @@ specialized CPU-capable optimizer recipes are independent of this feature.
 
 - FSDP2, EP enabled, and expert FSDP mesh size 1.
 - Global FSDP offload disabled; explicit `ep` selection only.
+- `model.optimizer.state_offload: cpu` cannot be combined with this selective
+  parameter offload; the configuration is rejected before training.
 - Eager execution; `torch.compile` is rejected for this placement.
 - `offload_pin_memory` applies to the selected CPU groups as well.
 
