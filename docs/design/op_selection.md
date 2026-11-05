@@ -24,7 +24,8 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `torchao_mxfp4` (MXFP4 QAT) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Dense projection | `linear_implementation` | `eager`, `torchao_mxfp4` (MXFP4 QAT) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` variant) |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -42,6 +43,13 @@ the expert GEMM operands. Conflicting selections raise at config-parse time.
 Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`
 from `config.ops_config.qat_implementation`; mutating `config.ops_implementation`
 later does not retarget an existing instance.
+
+`torchao_mxfp4` is not a recipe field: it is an ordinary implementation name on
+`linear` and `swiglu_mlp`, so it composes with any `qat_implementation` and
+inherits the usual "explicit selections never fall back" rule. Its row on
+`swiglu_mlp` reaches only models that run the fused SwiGLU; a model that owns its
+projections reads `linear_implementation` instead. Both rows require the optional
+`torchao` package and are unavailable without it.
 
 **The seven general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.

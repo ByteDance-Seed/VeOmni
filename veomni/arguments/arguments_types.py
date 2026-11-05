@@ -1537,8 +1537,17 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'torchao_mxfp4' (MXFP4 QAT) | 'eager'. "
+            "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+        },
+    )
+    linear_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Dense projection. 'torchao_mxfp4' (MXFP4 quantization-aware training; fake-quantizes "
+            "both GEMM operands, needs the 'torchao' package) | 'eager' (PyTorch F.linear). "
+            "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
+            "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(

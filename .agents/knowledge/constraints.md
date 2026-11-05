@@ -231,6 +231,11 @@ Core files:
    - Direct CUDA calls break NPU and MLU compatibility.
    - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
+23a. **Optional kernel packages gate a row; they never change its default**
+   - A registered row that needs a third-party package declares it in `requires=(...)` and imports it lazily inside the entry point. `veomni.ops.qat.torchao_mxfp4` is the worked example: importing `veomni.ops` on a host without `torchao` must stay free, and selecting the row without the package must raise `requires unavailable package(s)` rather than falling back to `eager`.
+   - Do not add such a package to `pyproject.toml`'s `gpu` extra to "make the row work". The extra is the accelerator stack; an optional backend stays optional so its wheel churn and lockfile delta do not land on every GPU job.
+   - A fake-quantization op quantizes the operands the caller hands it, including a `Replicate` DTensor's local tensor. Refuse any other DTensor placement: a quantized dimension split across shards pairs channels with another shard's scale and silently changes the numbers instead of raising.
+
 ## Trainer Extensions
 
 24. **Trainer callback lifecycle changes must cover composed trainers**

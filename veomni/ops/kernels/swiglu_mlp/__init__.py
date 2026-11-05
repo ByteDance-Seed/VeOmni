@@ -27,6 +27,7 @@ from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
+from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 
 
 _GPU = GpuKernelRequirement()
@@ -73,6 +74,15 @@ register_op(
     requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
+)
+
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "torchao_mxfp4",
+    description="MXFP4 (E2M1 with E8M0 block scales) fake-quantized SwiGLU MLP with optional activation clamping",
+    wrapper=standard_torchao_mxfp4.wrapper,
+    requires=("torchao",),
 )
 
 register_op(
