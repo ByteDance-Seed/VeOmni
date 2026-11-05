@@ -454,6 +454,52 @@ def test_swap_rejects_inexact_checkpoint_step_before_saving(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_single_swap_state_dict_rejects_inexact_checkpoint_step(tmp_path):
+    model = torch.nn.Linear(3, 2)
+    optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+    param = next(model.parameters())
+    optimizer.state[param]["step"] = 2**24
+    assert optimizer.state_dict()["state"][0]["step"].item() == 2**24
+    optimizer.state[param]["step"] = 2**24 + 1
+    with pytest.raises(RuntimeError, match="cannot be represented exactly"):
+        optimizer.state_dict()
+    with pytest.raises(Exception, match="cannot be represented exactly"):
+        DistributedCheckpointer.save(
+            str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=SimpleNamespace(dp_mode="ddp")
+        )
+
+
+def test_single_swap_failed_partial_restore_blocks_update(tmp_path, monkeypatch):
+    import veomni.checkpoint.dcp_checkpointer as implementation
+
+    model = torch.nn.Linear(3, 2)
+    optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+    _step(model, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target = torch.nn.Linear(3, 2)
+    resumed = SwapAdamW(target.parameters(), pin_memory=False)
+    original_load = implementation.dcp.load
+
+    def fail_after_partial_write(*args, **kwargs):
+        if "optimizer" in kwargs["state_dict"] and not isinstance(kwargs["state_dict"]["optimizer"], dict):
+            resumed._host_states[target.weight]["exp_avg"].fill_(0.25)
+            raise RuntimeError("injected partial optimizer read failure")
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(implementation.dcp, "load", fail_after_partial_write)
+    with pytest.raises(RuntimeError, match="partial optimizer read failure"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    with pytest.raises(RuntimeError, match="failed checkpoint restore"):
+        resumed.step()
+    with pytest.raises(RuntimeError, match="failed checkpoint restore"):
+        resumed.state_dict()
+    with pytest.raises(BaseException, match="failed checkpoint restore"):
+        DistributedCheckpointer.save(
+            str(tmp_path / "invalid"), {"model": target, "optimizer": resumed}, parallel_state=parallel
+        )
+
+
 def test_single_swap_preserves_frozen_history_on_resume(tmp_path):
     model = torch.nn.Linear(3, 2)
     source = SwapAdamW(model.parameters(), lr=0.01, pin_memory=False)
@@ -492,6 +538,71 @@ def test_single_swap_absent_frozen_history_stays_absent(tmp_path):
     assert not target.bias.requires_grad
     assert target.bias not in resumed.state
     assert target.bias not in resumed._host_states
+
+
+def test_single_swap_rejects_saved_history_missing_from_runtime_groups(tmp_path):
+    model = torch.nn.Linear(3, 2)
+    optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+    _step(model, optimizer)
+    model.bias.requires_grad_(False)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target = torch.nn.Linear(3, 2)
+    target.bias.requires_grad_(False)
+    resumed = SwapAdamW((p for p in target.parameters() if p.requires_grad), pin_memory=False)
+    before = {name: value.clone() for name, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match="checkpoint parameter groups differ"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert target.bias not in resumed.state
+
+
+def test_single_swap_rejects_omitted_owner_without_history(tmp_path):
+    model = torch.nn.Linear(3, 2)
+    model.bias.requires_grad_(False)
+    optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+    _step(model, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target = torch.nn.Linear(3, 2)
+    target.bias.requires_grad_(False)
+    resumed = SwapAdamW((p for p in target.parameters() if p.requires_grad), pin_memory=False)
+    before = {name: value.clone() for name, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match="checkpoint parameter groups differ"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_single_swap_rejects_reordered_trainable_groups(tmp_path):
+    model = torch.nn.Linear(3, 2)
+    optimizer = SwapAdamW([{"params": [model.weight]}, {"params": [model.bias]}], pin_memory=False)
+    _step(model, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target = torch.nn.Linear(3, 2)
+    resumed = SwapAdamW([{"params": [target.bias]}, {"params": [target.weight]}], pin_memory=False)
+    before = {name: value.clone() for name, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match="checkpoint parameter groups differ"):
+        DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_single_swap_accepts_unowned_frozen_parameter_without_history(tmp_path):
+    model = torch.nn.Linear(3, 2)
+    model.bias.requires_grad_(False)
+    optimizer = SwapAdamW((p for p in model.parameters() if p.requires_grad), pin_memory=False)
+    _step(model, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    target = torch.nn.Linear(3, 2)
+    target.bias.requires_grad_(False)
+    resumed = SwapAdamW((p for p in target.parameters() if p.requires_grad), pin_memory=False)
+    DistributedCheckpointer.load(str(tmp_path), {"model": target, "optimizer": resumed}, parallel_state=parallel)
+    assert target.bias not in resumed.state
+    torch.testing.assert_close(target.weight, model.weight, rtol=0, atol=0)
 
 
 def test_single_swap_frozen_history_preserves_model_load_hook_view(tmp_path):
@@ -570,3 +681,48 @@ def test_mismatched_swap_leaves_fail_before_checkpoint(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_mismatched_leaf_worker, nprocs=2, args=(str(tmp_path / "ckpt"),))
+
+
+def _single_swap_save_failure_worker(rank, checkpoint, failure, save_async, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = torch.nn.Linear(3, 2)
+        optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+        if rank == 0:
+            if failure == "step":
+                optimizer.state[model.weight]["step"] = 2**24 + 1
+            elif failure == "poison":
+                optimizer._veomni_dcp_restore_failed = True
+            else:
+
+                def fail(_optimizer):
+                    raise RuntimeError("injected optimizer state hook failure")
+
+                optimizer.register_state_dict_pre_hook(fail)
+        with pytest.raises(RuntimeError):
+            DistributedCheckpointer.save(
+                checkpoint,
+                {"model": model, "optimizer": optimizer},
+                save_async=save_async,
+                parallel_state=SimpleNamespace(dp_mode="ddp"),
+            )
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("failure", ["step", "poison", "hook"])
+@pytest.mark.parametrize("save_async", [False, True])
+def test_single_swap_save_failure_is_coordinated(tmp_path, failure, save_async):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
+        _single_swap_save_failure_worker, nprocs=2, args=(str(tmp_path / "ckpt"), failure, save_async)
+    )
