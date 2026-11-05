@@ -1374,6 +1374,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
+    "linear_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
@@ -1399,6 +1400,7 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
     "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "linear_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }

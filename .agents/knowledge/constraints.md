@@ -235,6 +235,7 @@ Core files:
    - A registered row that needs a third-party package declares it in `requires=(...)` and imports it lazily inside the entry point. `veomni.ops.qat.torchao_mxfp4` is the worked example: importing `veomni.ops` on a host without `torchao` must stay free, and selecting the row without the package must raise `requires unavailable package(s)` rather than falling back to `eager`.
    - Do not add such a package to `pyproject.toml`'s `gpu` extra to "make the row work". The extra is the accelerator stack; an optional backend stays optional so its wheel churn and lockfile delta do not land on every GPU job.
    - A fake-quantization op quantizes the operands the caller hands it, including a `Replicate` DTensor's local tensor. Refuse any other DTensor placement: a quantized dimension split across shards pairs channels with another shard's scale and silently changes the numbers instead of raising.
+   - A row that takes a projection's `weight` as a tensor cannot run on a wrapped projection. LoRA keeps the base `nn.Linear` at `LoraLinear.base_layer`, so `q_proj.weight` does not exist; guard with `veomni.models.utils.linear_utils.has_plain_projections` and, for a quantizing row, raise rather than forward the unquantized base layer. A silent fallback leaves the config claiming QAT while training full precision.
 
 ## Trainer Extensions
 

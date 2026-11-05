@@ -34,7 +34,7 @@ def _linear(x: Tensor, weight: Tensor, bias: Tensor, block_size: int) -> Tensor:
     return torch.nn.functional.linear(
         mxfp4_fake_quant(x, block_size),
         mxfp4_fake_quant(weight, block_size),
-        _eager.optional_bias(bias) if bias.numel() == 0 else replicated_local(bias, "bias"),
+        None if bias.numel() == 0 else replicated_local(bias, "bias"),
     )
 
 
@@ -53,10 +53,10 @@ def wrapper(
     """Run SwiGLU with MXFP4 fake-quantized projections and the optional DeepSeek-V4 clamp.
 
     Empty bias tensors denote unused biases. ``block_size`` is the MX group width.
+    A zero-token ``x`` needs no special case: every operand stays attached to the
+    graph, so the output is empty and backward yields zero gradients on the
+    frozen weights, which is what the ``eager`` and ``liger_kernel`` rows do.
     """
-    if x.numel() == 0:
-        return _eager.empty_output(x, down_w)
-
     gate = _linear(x, gate_w, gate_b, block_size)
     up = _linear(x, up_w, up_b, block_size)
     if swiglu_limit is not None:

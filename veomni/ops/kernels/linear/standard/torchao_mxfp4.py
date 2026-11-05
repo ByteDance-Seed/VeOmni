@@ -34,9 +34,11 @@ def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = MXFP4_
 
     An empty ``bias`` tensor denotes an unused bias. ``block_size`` is the MX
     group width and defaults to the OCP MXFP4 width of 32.
+
+    A zero-token ``x`` needs no special case: ``mxfp4_fake_quant`` returns empty
+    operands unchanged and ``F.linear`` keeps them attached, so both the value
+    and the gradient path stay identical to the non-empty call.
     """
-    if x.numel() == 0:
-        return F.linear(x, weight, None if bias.numel() == 0 else bias)
     return F.linear(
         mxfp4_fake_quant(x, block_size),
         mxfp4_fake_quant(weight, block_size),

@@ -460,3 +460,66 @@ def test_qwen3_mxfp4_qat_trains_and_rounds():
         assert torch.isfinite(param.grad).all(), name
     assert torch.count_nonzero(attention.q_proj.weight.grad) > 0
     assert torch.count_nonzero(quantized.model.layers[0].mlp.gate_proj.weight.grad) > 0
+
+
+@pytest.mark.skipif(
+    not is_package_available("torchao"),
+    reason="the torchao_mxfp4 linear row needs the optional 'torchao' package",
+)
+def test_qwen3_mxfp4_qat_refuses_a_wrapped_projection():
+    """LoRA replaces q_proj with a weightless LoraLinear; running unquantized would be a silent no-op."""
+    import copy
+
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    config = _tiny_config()
+    model = _build_qwen3(
+        copy.deepcopy(config),
+        SimpleNamespace(
+            **{
+                **vars(eager_ops_config()),
+                "linear_implementation": "torchao_mxfp4",
+                "swiglu_mlp_implementation": "eager",
+            }
+        ),
+    )
+    inject_dense_lora(
+        model.model,
+        VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "default",
+    )
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
+        model(input_ids=input_ids, use_cache=False)
+
+
+@pytest.mark.parametrize("linear_impl", ["eager"])
+def test_qwen3_lora_runs_with_the_eager_linear_row(linear_impl: str):
+    """The shipped qwen3_lora.yaml targets the attention projections; the fallback must still forward."""
+    import copy
+
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    config = _tiny_config()
+    model = _build_qwen3(
+        copy.deepcopy(config),
+        SimpleNamespace(**{**vars(eager_ops_config()), "linear_implementation": linear_impl}),
+    )
+    model.eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with torch.no_grad():
+        before = model(input_ids=input_ids, use_cache=False).logits
+
+    inject_dense_lora(
+        model.model,
+        VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "default",
+    )
+    with torch.no_grad():
+        after = model(input_ids=input_ids, use_cache=False).logits
+
+    # Zero-initialized lora_B keeps an injected adapter a no-op at construction.
+    torch.testing.assert_close(after, before, atol=1e-5, rtol=1e-5)

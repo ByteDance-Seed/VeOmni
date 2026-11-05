@@ -51,11 +51,11 @@ inherits the usual "explicit selections never fall back" rule. Its row on
 projections reads `linear_implementation` instead. Both rows require the optional
 `torchao` package and are unavailable without it.
 
-**The seven general-purpose op fields default per host.** They default to
+**The eight general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
 On Ascend NPU, unset fields resolve to `torch_npu` for RMSNorm, rotary embedding and
 its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
-for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
+for MoE; and to `eager` for SwiGLU, dense projection and load-balancing loss. Explicit
 values are never rewritten, so an explicit GPU value such as `liger_kernel` or
 `fused_triton` raises on NPU. Qwen3.5's three GatedDeltaNet fields are
 model-specific and are not in the host table. Their `fla` default also registers on Ascend NPU. Set
