@@ -10,10 +10,11 @@
 #
 # model_path is the upstream Qwen3 checkpoint, loaded through the qwen3 HF layout;
 # HF exports keep its layout. A split root from scripts/seed_omni/convert_model.py
-# works too.
+# works too. It is a placeholder: replace it with an absolute path this job can
+# read (`base.yaml`'s `data.train_path` and `data.yaml`'s `sources` likewise).
 
 model:
-  model_path: /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B
+  model_path: Qwen3-0.6B
   model_config:
     modules: configs/seed_omni/Qwen/qwen3/train/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3/train/graph_train.yaml

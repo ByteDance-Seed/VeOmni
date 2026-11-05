@@ -16,6 +16,9 @@
 #
 # Produces three module sub-folders (qwen3vl_vision / qwen3vl_text_encoder /
 # qwen3vl_llm) under model.model.model_path.
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# absolute paths this job can read before training.
 
 model:
   model_path: Qwen3-VL-2B-Instruct-split

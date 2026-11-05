@@ -28,10 +28,12 @@ Two Qwen3-VL specifics the backbone reconstructs from `conversation_list`:
   vision module emits them on `item.meta["deepstack"]`; the backbone threads them
   into `Qwen3VLTextModel` as `deepstack_visual_embeds` + `visual_pos_masks`.
 
-All paths below are bare checkpoint / dataset names resolved by the launcher
-and the dataset loader, so nothing in this recipe pins a machine-specific
-location. Pass your own storage root with `--model.model_path` (or
-`$HF_HOME`-relative ids) when it differs.
+`model.model_path` and the `sources` entries in `data.yaml` are **placeholders**:
+replace each with an absolute path (or an `hdfs://` URL) this job can read before
+launching. Both are resolved by plain filesystem checks — `model_path` by looking
+for `config.json`, a dataset source by `os.path.isdir` / `isfile` — so a bare
+name fails instead of being expanded against some storage root. Checkpoints are
+split first (step 1), datasets are your own copies.
 
 Config dir: `configs/seed_omni/Qwen/qwen3vl/`
 
@@ -99,8 +101,11 @@ stopping_strategy: all_exhausted
 upstream_sharded: true
 ```
 
-The shipped file points at the maintainers' own dataset locations; replace the
-`sources` entries with your own copies.
+The shipped `sources` are placeholders. `get_data_files` accepts a local
+directory, a local file, or an `hdfs://` URL — nothing else — so replace every
+entry with an absolute path your job can read; a bare name fails with
+`FileNotFoundError` before the first batch. `names` are preprocessor keys, not
+paths, so leave them alone.
 
 Video decoding is driven by `data.mm_configs` in `base.yaml`
 (`use_audio_in_video: false`, `fps`, `min_frames` / `max_frames`) — Qwen3-VL has
@@ -191,6 +196,24 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
 
+Video works the same way through `--infer.videos`; the same `data.mm_configs`
+decode knobs apply, and this launcher is the only one of the two entry points
+that accepts video (see §5.2):
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Qwen/qwen3vl/train/base.yaml \
+  --model.model_config.infer_type vision_understanding \
+  --infer.prompt "Describe this clip." \
+  --infer.videos /path/to/clip.mp4 \
+  --infer.mm_configs.fps 2.0 \
+  --infer.mm_configs.max_frames 8
+```
+
+Qwen3-VL has no audio tower — `vision/processing.py` decodes only a clip's frames
+and skips its waveform — so keep `--infer.mm_configs.use_audio_in_video false`
+(the default) and never also pass `--infer.audios`.
+
 To infer from a **trained** checkpoint, assemble a flat root from the per-module
 `hf_ckpt/` subfolders (same pattern as Janus):
 
@@ -216,8 +239,9 @@ Single-process load — preprocess the request, then ``model.generate``:
 from veomni.models.seed_omni import OmniModel, OmniProcessor
 
 model = OmniModel.from_pretrained(checkpoint_root, device_map="auto")
-processor = OmniProcessor.from_pretrained(checkpoint_root)  # or from_model(model)
+processor = OmniProcessor.from_pretrained(checkpoint_root)
 inputs = processor(text="Describe this image.", images=["/path/to/image.jpg"])
+model.reset()
 model.generate(inputs, generation_kwargs={"max_new_tokens": 128})
 ```
 
@@ -231,6 +255,9 @@ python tasks/omni/infer_omni_native.py \
   --image /path/to/image.jpg \
   --max_new_tokens 128
 ```
+
+This entry point exposes `--image` only, so a **video** request has to go through
+§5.1 (`--infer.videos`).
 
 ---
 

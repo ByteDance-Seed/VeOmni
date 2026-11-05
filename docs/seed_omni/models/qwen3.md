@@ -10,9 +10,11 @@ graph model. This is the minimal **text-only** omni model: the monolithic
 | `qwen3_text_encoder` | `embed_tokens` (+ `lm_head` if untied) + tokenizer | token ↔ embedding, CE loss head, ChatML template |
 | `qwen3_llm` | decoder backbone (no embed / no head) | `inputs_embeds → hidden_states` |
 
-All paths below assume the upstream HuggingFace checkpoint (the post-trained
-chat model) lives at `/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. Adjust to your own
-storage.
+`model.model_path` and the `sources` entry in `data.yaml` are **placeholders**:
+replace each with an absolute path (or an `hdfs://` URL) this job can read before
+launching. `data.train_path` in `base.yaml` also still resolves as a file path —
+the loader checks `os.path.isdir` / `isfile`, so a bare name fails rather than
+being expanded against a storage root.
 
 Config dir: `configs/seed_omni/Qwen/qwen3/`.
 
@@ -37,8 +39,8 @@ its own task folder beside `train/`.
 ## 1. Checkpoint
 
 Qwen3 registers an HF layout (`modules/qwen3/hf_layout.py`), so `model.model_path`
-can be the **upstream checkpoint itself** — `base.yaml` already points at
-`/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. The layout routes `model.embed_tokens.*`
+can be the **upstream checkpoint itself** — `base.yaml` already points at one. The
+layout routes `model.embed_tokens.*`
 (and `lm_head.*`) plus the tokenizer to `qwen3_text_encoder`, and the rest of
 `model.*` to `qwen3_llm`; the graphs default to the YAML in this config dir. HF
 exports are then written in the upstream layout (see
@@ -49,8 +51,8 @@ cross-family composed model needs:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  --model_path /abs/path/to/Qwen3-0.6B \
+  --output_dir /abs/path/to/seed_omni/Qwen3-0.6B
 ```
 
 Either root works as `model.model_path`.
@@ -71,7 +73,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 ```yaml
 # configs/seed_omni/Qwen/qwen3/data.yaml
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
+  - tulu-3-sft-mixture   # placeholder: replace with an absolute path
 names:
   - tulu-3-sft-mixture
 schedule:
@@ -107,7 +109,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -166,12 +168,28 @@ upstream Qwen3 root (what `base.yaml` points at) or a split root holding
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.model_config.infer_type infer_text \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
 # -> "<think> ... the sum of 2 plus 2, which is 4 ..." (coherent chat output)
 ```
+
+`tasks/omni/infer_omni_native.py` is the other entry point — a single-process
+`OmniModel.from_pretrained` + `generate` load with no VeOmni runtime. It takes
+`--model_path` / `--prompt` / `--max_new_tokens` and writes `reply.txt`:
+
+```bash
+python tasks/omni/infer_omni_native.py \
+  --model_path /abs/path/to/Qwen3-0.6B \
+  --prompt "What is 2+2?" \
+  --output_dir qwen3_out \
+  --max_new_tokens 1024
+```
+
+See [Training and Inference §5](../usage/training_and_inference.md#5-inference)
+for how the two entry points differ; `--infer_type` defaults to the checkpoint's
+own `infer_text`, so Qwen3 needs no flag for it.
 
 A run trained from the upstream root exports `hf_ckpt/` as one Qwen3 checkpoint,
 so infer from it directly with `--model.model_path <step_dir>/hf_ckpt` (it loads
@@ -198,8 +216,8 @@ the same model + data and compare the loss curve:
 
 ```bash
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --data.train_path /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
+  --data.train_path /abs/path/to/tulu-3-sft-mixture \
   --data.max_seq_len 2048 --train.global_batch_size 8 --train.micro_batch_size 1 \
   --train.max_steps 15 --train.wandb.enable false
 ```

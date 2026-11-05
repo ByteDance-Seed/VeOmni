@@ -1,5 +1,8 @@
+# `sources` are placeholders: replace each entry with an absolute path (or an
+# `hdfs://` URL) this job can read. `names` are preprocessor keys in
+# veomni/data/seed_omni/preprocess.py — not paths, leave them as they are.
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
+  - tulu-3-sft-mixture
 names:
   - tulu-3-sft-mixture
 schedule:

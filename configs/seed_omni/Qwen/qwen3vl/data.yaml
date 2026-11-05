@@ -1,3 +1,6 @@
+# `sources` are placeholders: replace each entry with an absolute path (or an
+# `hdfs://` URL) this job can read. `names` are preprocessor keys in
+# veomni/data/seed_omni/preprocess.py — not paths, leave them as they are.
 sources:
   - sharegpt4v_cap_100k
   - LLaVA-Video-178K_0_30_s_academic_v0_1
