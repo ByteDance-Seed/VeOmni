@@ -583,3 +583,72 @@ def test_packed_cache_rejection_precedes_mutation(target):
         call()
     assert not cache.touched
     assert not hasattr(cache, "position_ids")
+
+
+def lookup_local_rows_method():
+    """Return the production local-row lookup extracted from the patchgen config."""
+    return production_method(
+        "_lookup_local_rows",
+        "PatchedQwen4ExpTextNGramEmbedding",
+        extra_namespace={"nn": torch.nn},
+    )
+
+
+def local_rows_embedding(num_shards=4, rows=5, hidden=3, seed=2027):
+    """Build a stub n-gram embedding holding independent per-shard tables."""
+    from types import SimpleNamespace
+
+    torch.manual_seed(seed)
+    return SimpleNamespace(ngram_embedding={f"shard_{i}": torch.nn.Embedding(rows, hidden) for i in range(num_shards)})
+
+
+@pytest.mark.parametrize(
+    "shard_ids,row_ids",
+    [
+        ([2, 0, 3, 0, 2, 1, 0], [1, 4, 0, 2, 1, 3, 0]),
+        ([2, 2, 2], [1, 0, 1]),
+    ],
+)
+def test_production_lookup_local_rows_matches_per_row_gather(shard_ids, row_ids):
+    """Match a per-row gather reference, in request order, including its gradients."""
+    embeddings = local_rows_embedding()
+    expected_embeddings = copy.deepcopy(embeddings)
+    shard_ids = torch.tensor(shard_ids)
+    row_ids = torch.tensor(row_ids)
+
+    actual = lookup_local_rows_method()(embeddings, shard_ids, row_ids)
+    weights = torch.stack([module.weight for module in expected_embeddings.ngram_embedding.values()])
+    expected = weights[shard_ids, row_ids]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    upstream = torch.randn_like(actual)
+    (actual * upstream).sum().backward()
+    (expected * upstream).sum().backward()
+    for name, module in embeddings.ngram_embedding.items():
+        # Shards that served no request are never gathered, so they keep no gradient.
+        actual_grad = module.weight.grad if module.weight.grad is not None else torch.zeros_like(module.weight)
+        torch.testing.assert_close(actual_grad, expected_embeddings.ngram_embedding[name].weight.grad)
+
+
+def test_production_lookup_local_rows_handles_empty_input_and_output_dtype():
+    """Return an empty result for no requests and honour the requested output dtype."""
+    embeddings = local_rows_embedding()
+    method = lookup_local_rows_method()
+
+    empty = method(embeddings, torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
+    assert empty.shape == (0, 3)
+    assert empty.dtype == torch.float32
+    empty_half = method(
+        embeddings,
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        output_dtype=torch.float16,
+    )
+    assert empty_half.shape == (0, 3)
+    assert empty_half.dtype == torch.float16
+
+    half = method(embeddings, torch.tensor([3, 1]), torch.tensor([4, 0]), output_dtype=torch.float16)
+    expected = torch.stack(
+        [embeddings.ngram_embedding["shard_3"].weight[4], embeddings.ngram_embedding["shard_1"].weight[0]]
+    )
+    torch.testing.assert_close(half, expected.to(torch.float16), rtol=0, atol=0)
