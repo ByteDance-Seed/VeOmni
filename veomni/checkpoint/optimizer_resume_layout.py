@@ -65,18 +65,10 @@ def _lr_layout(group, key, aliases):
     return {"type": type(value).__name__}
 
 
-def _scheduler_layout(leaf):
+def _scheduler_functions(scheduler):
+    """Describe LambdaLR callables using the existing checkpoint identity format."""
     import math
 
-    from ..optim.lr_scheduler import checkpoint_scheduler_binding
-
-    scheduler = checkpoint_scheduler_binding(leaf)
-    if scheduler is None:
-        return None
-    if type(scheduler) is not torch.optim.lr_scheduler.LambdaLR:
-        raise RuntimeError("MultiOptimizer requires a supported scheduler")
-    if scheduler.optimizer is not leaf:
-        raise RuntimeError("MultiOptimizer scheduler binding changed")
     functions = []
     for function in scheduler.lr_lambdas:
         if not isinstance(function, types.FunctionType):
@@ -99,7 +91,23 @@ def _scheduler_layout(leaf):
                 "closure": [_immutable_value(cell.cell_contents) for cell in function.__closure__ or ()],
             }
         )
-    return {"type": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}", "functions": functions}
+    return functions
+
+
+def _scheduler_layout(leaf):
+    from ..optim.lr_scheduler import checkpoint_scheduler_binding
+
+    scheduler = checkpoint_scheduler_binding(leaf)
+    if scheduler is None:
+        return None
+    if type(scheduler) is not torch.optim.lr_scheduler.LambdaLR:
+        raise RuntimeError("MultiOptimizer requires a supported scheduler")
+    if scheduler.optimizer is not leaf:
+        raise RuntimeError("MultiOptimizer scheduler binding changed")
+    return {
+        "type": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}",
+        "functions": _scheduler_functions(scheduler),
+    }
 
 
 def _local_layout(

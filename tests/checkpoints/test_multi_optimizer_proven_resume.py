@@ -1999,6 +1999,20 @@ def test_multi_checkpoint_requires_explicit_scheduler_declaration(tmp_path):
     assert not (tmp_path / "model").exists()
 
 
+def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
+    from veomni.models.checkpoint.manager import _scheduler_recipe
+
+    _, optimizer = _model_and_optimizer()
+    leaf = optimizer.optimizers_dict["weight"]
+    step = torch.optim.lr_scheduler.StepLR(leaf, step_size=1)
+    with pytest.raises(RuntimeError, match="scheduler implementation or binding is unsupported"):
+        _scheduler_recipe(step, leaf)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(leaf, lambda value, *, factor=0.5: value * factor)
+    with pytest.raises(RuntimeError, match="scheduler captures unsupported mutable state"):
+        _scheduler_recipe(scheduler, leaf)
+
+
 def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
     model, optimizer = _model_and_optimizer()
     model.weight.grad = torch.ones_like(model.weight)
