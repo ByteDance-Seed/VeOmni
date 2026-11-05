@@ -28,9 +28,10 @@ Two Qwen3-VL specifics the backbone reconstructs from `conversation_list`:
   vision module emits them on `item.meta["deepstack"]`; the backbone threads them
   into `Qwen3VLTextModel` as `deepstack_visual_embeds` + `visual_pos_masks`.
 
-All paths below assume the upstream HuggingFace checkpoint lives at
-`/mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct`. Adjust to your
-own storage.
+All paths below are bare checkpoint / dataset names resolved by the launcher
+and the dataset loader, so nothing in this recipe pins a machine-specific
+location. Pass your own storage root with `--model.model_path` (or
+`$HF_HOME`-relative ids) when it differs.
 
 Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 
@@ -56,8 +57,8 @@ tokenizer) and `qwen3vl_llm/` (backbone).
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+  --model_path Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir Qwen3-VL-2B-Instruct-split
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
@@ -78,9 +79,9 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 ```yaml
 # configs/seed_omni/Qwen/qwen3vl_2b/data.yaml
 sources:
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
-  - /mnt/hdfs/veomni/datasets/llava_video
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - sharegpt4v_cap_100k
+  - LLaVA-Video-178K_0_30_s_academic_v0_1
+  - tulu-3-sft-mixture
 names:
   - sharegpt4v_cap_100k
   - llava_video
@@ -218,7 +219,7 @@ CLI equivalent:
 
 ```bash
 python tasks/omni/infer_omni_native.py \
-  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct \
+  --model_path Qwen3-VL-2B-Instruct-split \
   --infer_type vision_understanding \
   --prompt "Describe this image." \
   --image /path/to/image.jpg \
