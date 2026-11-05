@@ -1,9 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
-from veomni.models.frozen_ple import FrozenPLEGuard, is_ple_table, prepare_ple_storage
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.frozen_ple import freeze_ple_embeddings, is_ple_table, prepare_ple_storage
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _qwen4_model():
@@ -22,25 +27,6 @@ def test_is_ple_table_matches_shard_weights_only():
     assert not is_ple_table("other.weight")
 
 
-def test_guard_excludes_table_from_optimizer_and_rejects_mutation():
-    model = _qwen4_model()
-    guard = FrozenPLEGuard(model, expected_device="cpu")
-    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
-    assert not table.requires_grad
-    assert model.other.weight.requires_grad
-
-    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
-    guard.verify(model, optimizer)
-
-    table.requires_grad_(True)
-    try:
-        guard.verify(model, optimizer)
-    except RuntimeError as exc:
-        assert "Frozen PLE invariant violated" in str(exc)
-    else:
-        raise AssertionError("verify should reject a thawed PLE table")
-
-
 def test_prepare_ple_storage_changes_only_the_table():
     model = _qwen4_model()
     table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
@@ -52,35 +38,11 @@ def test_prepare_ple_storage_changes_only_the_table():
     assert model.other.weight.dtype == torch.float32
 
 
-def test_note_restored_accepts_checkpoint_copy_and_rejects_a_later_write():
-    model = _qwen4_model()
-    guard = FrozenPLEGuard(model, expected_device="cpu")
-    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
-    table.copy_(torch.ones_like(table))
-    try:
-        guard.verify(model)
-    except RuntimeError as exc:
-        assert "Frozen PLE invariant violated" in str(exc)
-    else:
-        raise AssertionError("checkpoint copy_ should fail the pre-restore check")
-
-    guard.note_restored(model)
-    guard.verify(model)
-
-    table.copy_(torch.zeros_like(table))
-    try:
-        guard.verify(model)
-    except RuntimeError as exc:
-        assert "Frozen PLE invariant violated" in str(exc)
-    else:
-        raise AssertionError("verify should reject a write after resume")
-
-
-def test_guard_rejects_other_model_types():
+def test_freeze_rejects_other_model_types():
     model = nn.Linear(2, 2)
     model.config = type("Config", (), {"model_type": "llama"})()
     try:
-        FrozenPLEGuard(model)
+        freeze_ple_embeddings(model)
     except ValueError as exc:
         assert "qwen4_exp" in str(exc)
     else:
@@ -111,60 +73,65 @@ def test_training_arguments_validate_frozen_ple_dtype():
         raise AssertionError("float16 is not a supported frozen PLE dtype")
 
 
-def test_runtime_freezes_ple_before_building_the_optimizer(monkeypatch):
-    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: "cpu")
-
-    def build_sgd(model, **kwargs):
-        params = [param for param in model.parameters() if param.requires_grad]
-        assert params, "the non-PLE weights should stay trainable"
-        return torch.optim.SGD(params, lr=0.1)
-
-    monkeypatch.setattr("veomni.optim.build_optimizer", build_sgd)
-
+def _build_runtime():
     from veomni.models.model_runtime import VeOmniModelRuntime
 
-    model = _qwen4_model()
-    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
-    table.data = table.data.to(torch.float32)
     runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
-    runtime.model = model
+    runtime.model = _qwen4_model()
     runtime.train_args = SimpleNamespace(freeze_ple_embeddings=True, frozen_ple_dtype="bfloat16")
-    runtime.args = SimpleNamespace(
-        optimizer=SimpleNamespace(
-            lr=1e-3,
-            betas=(0.9, 0.95),
-            weight_decay=0.0,
-            type="adamw",
-            no_decay_modules=[],
-            no_decay_params=[],
-        )
-    )
+    from veomni.arguments.arguments_types import OptimizerConfig
 
+    runtime.args = SimpleNamespace(optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0))
     runtime._apply_frozen_ple()
-    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
-    assert table.dtype == torch.bfloat16
-    assert not table.requires_grad
-
     runtime._build_optimizer()
-    optimized = {id(param) for group in runtime.optimizer.param_groups for param in group["params"]}
-    assert id(table) not in optimized
-    assert id(model.other.weight) in optimized
+    return runtime
+
+
+def _train_step(runtime):
+    model = runtime.model
+    embedding = model.ple.ple_embedding.ngram_embedding["shard_0"]
+    table = embedding.weight
+    before_table = table.detach().clone()
+    before_weight = model.other.weight.detach().clone()
+
+    runtime.optimizer.zero_grad()
+    model.other(embedding(torch.tensor([0, 1])).float()).square().mean().backward()
     runtime.optimizer.step()
 
-    table.copy_(torch.ones_like(table))
-    try:
-        runtime._resync_frozen_ple_after_load()
-        runtime.optimizer.step()
-    except RuntimeError as exc:
-        raise AssertionError("checkpoint restore should re-arm the frozen PLE check") from exc
+    assert table.dtype == torch.bfloat16
+    assert not table.requires_grad
+    assert table.grad is None
+    assert table not in runtime.optimizer.state
+    assert all(table is not param for group in runtime.optimizer.param_groups for param in group["params"])
+    torch.testing.assert_close(table, before_table, rtol=0, atol=0)
+    assert not torch.equal(model.other.weight, before_weight)
 
-    table.copy_(torch.zeros_like(table))
-    try:
-        runtime.optimizer.step()
-    except RuntimeError as exc:
-        assert "Frozen PLE invariant violated" in str(exc)
-    else:
-        raise AssertionError("optimizer.step should reject a write after the checkpoint restore")
+
+def test_runtime_trains_and_resumes_with_frozen_ple(monkeypatch, tmp_path):
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: "cpu")
+    monkeypatch.setattr("veomni.optim.optimizer.get_parallel_state", lambda: SimpleNamespace(dp_mode="ddp"))
+
+    runtime = _build_runtime()
+    _train_step(runtime)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"model": runtime.model.state_dict(), "optimizer": runtime.optimizer.state_dict()}, checkpoint_path)
+
+    resumed = _build_runtime()
+
+    def load_checkpoint():
+        state = torch.load(checkpoint_path, weights_only=True)
+        resumed.model.load_state_dict(state["model"])
+        resumed.optimizer.load_state_dict(state["optimizer"])
+
+    resumed.checkpoint = SimpleNamespace(load=load_checkpoint)
+    resumed.load()
+    for name, weight in resumed.model.state_dict().items():
+        torch.testing.assert_close(weight, runtime.model.state_dict()[name], rtol=0, atol=0)
+
+    _train_step(runtime)
+    _train_step(resumed)
+    for name, weight in resumed.model.state_dict().items():
+        torch.testing.assert_close(weight, runtime.model.state_dict()[name], rtol=0, atol=0)
 
 
 def test_runtime_leaves_ple_trainable_when_freeze_is_disabled():
@@ -177,4 +144,3 @@ def test_runtime_leaves_ple_trainable_when_freeze_is_disabled():
     runtime._apply_frozen_ple()
     table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
     assert table.requires_grad
-    assert runtime._frozen_ple_guard is None

@@ -34,9 +34,9 @@ keep the dtype they have after model parallelization.
 
 ## Resume from a checkpoint
 
-- **Checks after restore.** VeOmni reapplies `frozen_ple_dtype` if set, clears
-  any table gradients, and uses the restored table state as the baseline
-  for checking changes during later optimizer steps.
+- **Frozen tables.** VeOmni freezes the tables before restoring the checkpoint.
+  Loading weights into the tables preserves their configured training dtype and
+  frozen status.
 - **Optimizer state.** If the PLE tables were trainable when the checkpoint
   was saved, the saved optimizer parameter groups may include them.
   Resuming with `freeze_ple_embeddings: true` excludes them from the current
