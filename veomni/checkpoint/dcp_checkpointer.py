@@ -946,6 +946,179 @@ def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, e
     return tuple(shape), tuple(stride)
 
 
+def drop_extra_parallel_dim_v2(
+    loaded_tensor: torch.Tensor,
+    device_mesh: DeviceMesh,
+    fsdp_shard_dim: int = 1,
+    *,
+    extra_parallel_name: Optional[str] = None,
+):
+    """
+    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
+
+    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
+    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
+    ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
+    the Muon zero-comm layout). The number of placements on the loaded DTensor
+    reflects the full saved mesh:
+
+    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
+      the 1D sub-mesh.
+    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
+      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
+    """
+
+    if not -loaded_tensor.ndim <= fsdp_shard_dim < loaded_tensor.ndim:
+        raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+    fsdp_shard_dim %= loaded_tensor.ndim
+    num_placements = len(loaded_tensor.placements)
+    if num_placements == 1:
+        tensor_to_put = loaded_tensor.to_local()
+    elif num_placements == 2:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
+        )
+    elif num_placements == 3:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
+        )
+    else:
+        raise RuntimeError(
+            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
+            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
+        )
+
+    return tensor_to_put
+
+
+def _validate_extra_parallel_tensor_v2(tensor, mesh, fsdp_mesh, ep_dim, fsdp_dim, global_shape):
+    if not isinstance(tensor, DTensor):
+        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
+    ndim = tensor.ndim
+    if not (-ndim <= ep_dim < ndim and -ndim <= fsdp_dim < ndim):
+        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+    ep_dim, fsdp_dim = ep_dim % ndim, fsdp_dim % ndim
+    if tensor.device_mesh != fsdp_mesh:
+        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP mesh")
+    if tuple(tensor.placements) != (Replicate(),) * (fsdp_mesh.ndim - 1) + (Shard(fsdp_dim),):
+        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP placement")
+    if global_shape is None or len(global_shape) != ndim:
+        raise RuntimeError("FSDP-only ExtraParallel tensors require the original global_shape")
+
+    expected = list(global_shape)
+    ep_size, ep_rank = mesh.size(-1), mesh.get_local_rank(-1)
+    ep_chunk = (expected[ep_dim] + ep_size - 1) // ep_size
+    expected[ep_dim] = max(min(expected[ep_dim] - ep_rank * ep_chunk, ep_chunk), 0)
+    if tuple(tensor.shape) != tuple(expected):
+        raise RuntimeError("ExtraParallel source tensor shape does not match the declared global shape")
+    local_size, local_rank = fsdp_mesh.size(-1), fsdp_mesh.get_local_rank(-1)
+    local_chunk = (expected[fsdp_dim] + local_size - 1) // local_size
+    expected[fsdp_dim] = max(min(expected[fsdp_dim] - local_rank * local_chunk, local_chunk), 0)
+    if tuple(tensor.to_local().shape) != tuple(expected):
+        raise RuntimeError("ExtraParallel local tensor shape does not match its declared FSDP placement")
+
+
+def restore_extra_parallel_dim_v2(
+    orgin_tensor: torch.Tensor,
+    fsdp_mesh: DeviceMesh,
+    extra_parallel_fsdp_mesh: DeviceMesh,
+    ep_shard_dim: int = 0,
+    fsdp_shard_dim: int = 1,
+    global_shape: Optional[tuple[int, ...]] = None,
+):
+    """
+    Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
+
+    The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
+    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
+    experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
+    layout). They must be mapped to the matching mesh dims explicitly.
+
+    args:
+        orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
+        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
+            ``(ep_fsdp, ep)`` for plain FSDP or 3D
+            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
+            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
+        ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
+        fsdp_shard_dim (int): Tensor dim FSDP shards along.
+        global_shape (tuple[int, ...], optional): The model parameter's shape
+            before ExtraParallel and FSDP sharding. It is required for an
+            FSDP-only DTensor: a local slice alone cannot prove global shape.
+
+    Note:
+        When both dimensions shard the same tensor axis, the FSDP placement
+        uses ``_StridedShard`` on the FSDP-first runtime mesh. If the global
+        axis is uneven across EP, use an EP-first mesh view instead: current
+        Torch strided metadata can report incorrect offsets for that case.
+    """
+    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
+    ndim = orgin_tensor.ndim
+    if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
+        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+    ep_shard_dim %= ndim
+    fsdp_shard_dim %= ndim
+
+    if isinstance(orgin_tensor, DTensor):
+        _validate_extra_parallel_tensor_v2(
+            orgin_tensor, fsdp_mesh, extra_parallel_fsdp_mesh, ep_shard_dim, fsdp_shard_dim, global_shape
+        )
+        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
+        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
+        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
+        same_axis = ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
+        if same_axis and global_shape[ep_shard_dim] % fsdp_mesh.size(-1):
+            checkpoint_mesh = _extra_parallel_first_mesh(fsdp_mesh)
+            placements = [Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
+            if checkpoint_mesh.ndim == 3:
+                placements.insert(0, Replicate())
+        else:
+            checkpoint_mesh = fsdp_mesh
+            fsdp_placement = (
+                _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1)) if same_axis else Shard(fsdp_shard_dim)
+            )
+            placements = [fsdp_placement, Shard(ep_shard_dim)]
+            if checkpoint_mesh.ndim == 3:
+                placements.insert(0, Replicate())
+        shape = tuple(global_shape)
+        stride = [1] * len(shape)
+        for index in range(len(shape) - 2, -1, -1):
+            stride[index] = stride[index + 1] * shape[index + 1]
+        dtensor = _from_local_preserve_device(
+            orgin_tensor._local_tensor,
+            device_mesh=checkpoint_mesh,
+            placements=placements,
+            shape=shape,
+            stride=tuple(stride),
+        )
+    elif torch.is_tensor(orgin_tensor):
+        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
+    else:
+        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
+
+    return dtensor
+
+
 def _apply_extra_parallel_dim(
     state_dict: Dict[str, Any],
     extra_parallel_fqn2spec_info: Dict[str, Any],
@@ -1216,12 +1389,20 @@ class OptimizerState(Stateful):
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
-            assert self.optimizer._is_multi_optimizer, (
-                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-            )
-            vanilla_optim_sd = self.optimizer.state_dict()
+            # Validate locally before any rank enters state_dict(), which can
+            # contain collectives. A single rank's type error must not race
+            # another rank's optimizer collective against our error reduction.
+            error = None
+            try:
+                if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                    raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating ExtraParallel optimizer type", group=self.process_group)
+
             optim_sd_with_extra_parallel_dim, error = None, None
             try:
+                vanilla_optim_sd = self.optimizer.state_dict()
                 optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                     vanilla_optim_sd, "restore"
                 )
@@ -1314,24 +1495,21 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements in (2, 3) and any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
+    has_fsdp_shard = any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1])
+    if num_placements in (2, 3) and has_fsdp_shard:
         ndim = loaded_tensor.ndim
         if not -ndim <= fsdp_shard_dim < ndim:
             raise RuntimeError("FSDP shard dimension is outside the tensor rank")
         fsdp_shard_dim %= ndim
-    if num_placements == 1 or all(isinstance(p, Replicate) for p in loaded_tensor.placements[:-1]):
+    if num_placements == 1 or (num_placements in (2, 3) and not has_fsdp_shard):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
         tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Shard(fsdp_shard_dim)],
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
         tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Replicate(), Shard(fsdp_shard_dim)],
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
         raise RuntimeError(
@@ -1378,10 +1556,8 @@ def restore_extra_parallel_dim(
 
     if isinstance(orgin_tensor, DTensor):
         ndim = orgin_tensor.ndim
-        if not -ndim <= ep_shard_dim < ndim:
+        if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-        if not -ndim <= fsdp_shard_dim < ndim:
-            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
         ep_shard_dim %= ndim
         fsdp_shard_dim %= ndim
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
@@ -1396,16 +1572,11 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
             placements = [fsdp_placement, Shard(ep_shard_dim)]
-        dtensor = _from_local_preserve_device(
-            orgin_tensor._local_tensor,
-            device_mesh=fsdp_mesh,
-            placements=placements,
-        )
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # A plain model tensor has no FSDP shard. The caller must ensure every
-        # FSDP/HSDP replica for the same ExtraParallel coordinate has identical
-        # values; from_local does not check or synchronize them. Optimizer
-        # states without this guarantee are rejected by the caller.
+        # Plain model tensors must be replicated across FSDP coordinates for
+        # the same ExtraParallel rank. Optimizer shards without that proof are
+        # rejected by the caller.
         ndim = orgin_tensor.ndim
         if not -ndim <= ep_shard_dim < ndim:
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
@@ -1413,179 +1584,6 @@ def restore_extra_parallel_dim(
             raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
         placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
         dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
-    else:
-        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
-
-    return dtensor
-
-
-def drop_extra_parallel_dim_v2(
-    loaded_tensor: torch.Tensor,
-    device_mesh: DeviceMesh,
-    fsdp_shard_dim: int = 1,
-    *,
-    extra_parallel_name: Optional[str] = None,
-):
-    """
-    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
-
-    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
-    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
-    ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
-    the Muon zero-comm layout). The number of placements on the loaded DTensor
-    reflects the full saved mesh:
-
-    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
-    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
-      the 1D sub-mesh.
-    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
-      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
-    """
-
-    if not -loaded_tensor.ndim <= fsdp_shard_dim < loaded_tensor.ndim:
-        raise RuntimeError("FSDP shard dimension is outside the tensor rank")
-    fsdp_shard_dim %= loaded_tensor.ndim
-    num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
-        tensor_to_put = loaded_tensor.to_local()
-    elif num_placements == 2:
-        ep_placement = loaded_tensor.placements[-1]
-        if not isinstance(ep_placement, Shard):
-            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
-        ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
-        tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Shard(fsdp_shard_dim)],
-            shape=shape,
-            stride=stride,
-        )
-    elif num_placements == 3:
-        ep_placement = loaded_tensor.placements[-1]
-        if not isinstance(ep_placement, Shard):
-            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
-        ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
-        tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Replicate(), Shard(fsdp_shard_dim)],
-            shape=shape,
-            stride=stride,
-        )
-    else:
-        raise RuntimeError(
-            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
-            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
-        )
-
-    return tensor_to_put
-
-
-def _validate_extra_parallel_tensor_v2(tensor, mesh, fsdp_mesh, ep_dim, fsdp_dim, global_shape):
-    if not isinstance(tensor, DTensor):
-        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
-    ndim = tensor.ndim
-    if not (-ndim <= ep_dim < ndim and -ndim <= fsdp_dim < ndim):
-        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-    ep_dim, fsdp_dim = ep_dim % ndim, fsdp_dim % ndim
-    if tensor.device_mesh != fsdp_mesh:
-        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP mesh")
-    if tuple(tensor.placements) != (Replicate(),) * (fsdp_mesh.ndim - 1) + (Shard(fsdp_dim),):
-        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP placement")
-    if global_shape is None or len(global_shape) != ndim:
-        raise RuntimeError("FSDP-only ExtraParallel tensors require the original global_shape")
-
-    expected = list(global_shape)
-    ep_size, ep_rank = mesh.size(-1), mesh.get_local_rank(-1)
-    ep_chunk = (expected[ep_dim] + ep_size - 1) // ep_size
-    expected[ep_dim] = max(min(expected[ep_dim] - ep_rank * ep_chunk, ep_chunk), 0)
-    if tuple(tensor.shape) != tuple(expected):
-        raise RuntimeError("ExtraParallel source tensor shape does not match the declared global shape")
-    local_size, local_rank = fsdp_mesh.size(-1), fsdp_mesh.get_local_rank(-1)
-    local_chunk = (expected[fsdp_dim] + local_size - 1) // local_size
-    expected[fsdp_dim] = max(min(expected[fsdp_dim] - local_rank * local_chunk, local_chunk), 0)
-    if tuple(tensor.to_local().shape) != tuple(expected):
-        raise RuntimeError("ExtraParallel local tensor shape does not match its declared FSDP placement")
-
-
-def restore_extra_parallel_dim_v2(
-    orgin_tensor: torch.Tensor,
-    fsdp_mesh: DeviceMesh,
-    extra_parallel_fsdp_mesh: DeviceMesh,
-    ep_shard_dim: int = 0,
-    fsdp_shard_dim: int = 1,
-    global_shape: Optional[tuple[int, ...]] = None,
-):
-    """
-    Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
-
-    The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
-    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
-    experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
-    layout). They must be mapped to the matching mesh dims explicitly.
-
-    args:
-        orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
-        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
-            ``(ep_fsdp, ep)`` for plain FSDP or 3D
-            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
-        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
-            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
-        ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
-        fsdp_shard_dim (int): Tensor dim FSDP shards along.
-        global_shape (tuple[int, ...], optional): The model parameter's shape
-            before ExtraParallel and FSDP sharding. It is required for an
-            FSDP-only DTensor: a local slice alone cannot prove global shape.
-
-    Note:
-        When both dimensions shard the same tensor axis, the FSDP placement
-        uses ``_StridedShard`` on the FSDP-first runtime mesh. If the global
-        axis is uneven across EP, use an EP-first mesh view instead: current
-        Torch strided metadata can report incorrect offsets for that case.
-    """
-    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
-    ndim = orgin_tensor.ndim
-    if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
-        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-    ep_shard_dim %= ndim
-    fsdp_shard_dim %= ndim
-
-    if isinstance(orgin_tensor, DTensor):
-        _validate_extra_parallel_tensor_v2(
-            orgin_tensor, fsdp_mesh, extra_parallel_fsdp_mesh, ep_shard_dim, fsdp_shard_dim, global_shape
-        )
-        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
-        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
-        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
-        same_axis = ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
-        if same_axis and global_shape[ep_shard_dim] % fsdp_mesh.size(-1):
-            checkpoint_mesh = _extra_parallel_first_mesh(fsdp_mesh)
-            placements = [Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
-            if checkpoint_mesh.ndim == 3:
-                placements.insert(0, Replicate())
-        else:
-            checkpoint_mesh = fsdp_mesh
-            fsdp_placement = (
-                _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1)) if same_axis else Shard(fsdp_shard_dim)
-            )
-            placements = [fsdp_placement, Shard(ep_shard_dim)]
-            if checkpoint_mesh.ndim == 3:
-                placements.insert(0, Replicate())
-        shape = tuple(global_shape)
-        stride = [1] * len(shape)
-        for index in range(len(shape) - 2, -1, -1):
-            stride[index] = stride[index + 1] * shape[index + 1]
-        dtensor = _from_local_preserve_device(
-            orgin_tensor._local_tensor,
-            device_mesh=checkpoint_mesh,
-            placements=placements,
-            shape=shape,
-            stride=tuple(stride),
-        )
-    elif torch.is_tensor(orgin_tensor):
-        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
