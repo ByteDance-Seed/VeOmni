@@ -159,6 +159,7 @@ def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypa
         ("cross_entropy_loss_implementation", "liger_kernel"),
         ("rms_norm_implementation", "liger_kernel"),
         ("swiglu_mlp_implementation", "liger_kernel"),
+        ("linear_implementation", "torchao_mxfp4"),
         ("rotary_pos_emb_implementation", "liger_kernel"),
         ("load_balancing_loss_implementation", "triton"),
     ],

@@ -23,9 +23,10 @@ This is a fake quantizer, not a quantized GEMM. The round trip runs through
 torchao's own :meth:`MXTensor.to_mx` / :meth:`MXTensor.dequantize`, which is what
 makes training bit-aligned with torchao's ``MXFakeQuantizedLinear`` rather than
 a second, drifting reimplementation of the same numerics. It is also why this
-module never imports ``torchao.quantization``: the module-swapping QAT recipe
-would replace layers and hide them behind a CUDA-only autograd function, while
-an op-registry row only needs the tensor math.
+module never imports ``torchao.quantization.qat``: the module-swapping QAT
+recipe would replace layers and hide them behind a CUDA-only autograd function,
+while an op-registry row only needs the tensor math. (``KernelPreference`` lives
+under ``torchao.quantization.quantize_`` and is plain configuration, not QAT.)
 
 The backward pass is the usual straight-through approximation. A
 quantize-dequantize round trip is a step function whose true derivative is zero

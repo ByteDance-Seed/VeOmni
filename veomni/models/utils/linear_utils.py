@@ -22,10 +22,13 @@ keeps every row's signature free of ``Optional``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from torch import Tensor, nn
 
 
 __all__ = [
+    "has_plain_projections",
     "optional_bias",
 ]
 
@@ -33,3 +36,16 @@ __all__ = [
 def optional_bias(linear: nn.Module) -> Tensor:
     """Return ``linear``'s bias, or the empty sentinel tensor when it has none."""
     return linear.weight.new_empty(0) if linear.bias is None else linear.bias
+
+
+def has_plain_projections(module: nn.Module, names: Iterable[str]) -> bool:
+    """Whether every named projection on ``module`` is a plain ``nn.Linear``.
+
+    A row that takes a projection's weight as a tensor can only be used on a
+    module that still owns one. LoRA replaces a matched ``nn.Linear`` with a
+    ``LoraLinear`` holding the base layer at ``base_layer``, which has no
+    ``weight``, so such a model has to call the projection modules themselves.
+    This is the same rule ``veomni.ops.kernels.swiglu_mlp.has_plain_linear_projections``
+    applies to ``gate_proj``/``up_proj``/``down_proj``.
+    """
+    return all(isinstance(getattr(module, name, None), nn.Linear) for name in names)

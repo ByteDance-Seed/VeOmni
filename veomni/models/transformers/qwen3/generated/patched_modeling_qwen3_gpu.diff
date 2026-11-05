@@ -107,7 +107,7 @@
 +# Additional imports for patches
 +from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 +from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-+from veomni.models.utils.linear_utils import optional_bias
++from veomni.models.utils.linear_utils import has_plain_projections, optional_bias
 +from veomni.ops import VeomniOp
 +from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -257,24 +257,41 @@
 
      def forward(
          self,
-@@ -249,21 +272,32 @@
+@@ -249,21 +272,49 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
 -        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
 -        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
 -        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-+        query_states = self.q_norm(
-+            self.veomni_linear(hidden_states, self.q_proj.weight, optional_bias(self.q_proj)).view(hidden_shape)
-+        ).transpose(1, 2)
-+        key_states = self.k_norm(
-+            self.veomni_linear(hidden_states, self.k_proj.weight, optional_bias(self.k_proj)).view(hidden_shape)
-+        ).transpose(1, 2)
-+        value_states = (
-+            self.veomni_linear(hidden_states, self.v_proj.weight, optional_bias(self.v_proj))
-+            .view(hidden_shape)
-+            .transpose(1, 2)
-+        )
++        # A linear row reads the projection's weight as a tensor, which a wrapped
++        # projection such as LoraLinear does not own. Falling back would run the
++        # base layer unquantized while the config still claims MXFP4 QAT, so a
++        # quantizing selection is refused instead.
++        plain = has_plain_projections(self, ("q_proj", "k_proj", "v_proj", "o_proj"))
++        if not plain and self.veomni_linear.impl != "eager":
++            raise ValueError(
++                f"linear_implementation={self.veomni_linear.impl!r} cannot run on a wrapped projection: "
++                "the row fake-quantizes a projection's own weight, and a layer substituted after "
++                "construction (LoRA) keeps it at `base_layer`. Set linear_implementation='eager' for "
++                "adapter training, or drop the adapter on the attention projections."
++            )
++        if not plain:
++            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
++            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
++            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++        else:
++            query_states = self.q_norm(
++                self.veomni_linear(hidden_states, self.q_proj.weight, optional_bias(self.q_proj)).view(hidden_shape)
++            ).transpose(1, 2)
++            key_states = self.k_norm(
++                self.veomni_linear(hidden_states, self.k_proj.weight, optional_bias(self.k_proj)).view(hidden_shape)
++            ).transpose(1, 2)
++            value_states = (
++                self.veomni_linear(hidden_states, self.v_proj.weight, optional_bias(self.v_proj))
++                .view(hidden_shape)
++                .transpose(1, 2)
++            )
 
          cos, sin = position_embeddings
 -        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -299,7 +316,7 @@
              self,
              query_states,
              key_states,
-@@ -271,25 +305,29 @@
+@@ -271,25 +322,32 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -311,7 +328,10 @@
 
          attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 -        attn_output = self.o_proj(attn_output)
-+        attn_output = self.veomni_linear(attn_output, self.o_proj.weight, optional_bias(self.o_proj))
++        if has_plain_projections(self, ("o_proj",)):
++            attn_output = self.veomni_linear(attn_output, self.o_proj.weight, optional_bias(self.o_proj))
++        else:
++            attn_output = self.o_proj(attn_output)
          return attn_output, attn_weights
 
 
@@ -337,7 +357,7 @@
 
      def forward(
          self,
-@@ -342,9 +380,15 @@
+@@ -342,9 +400,15 @@
      }
 
 
@@ -354,7 +374,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -353,12 +397,11 @@
+@@ -353,12 +417,11 @@
          self.layers = nn.ModuleList(
              [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -368,7 +388,7 @@
          self.post_init()
 
      @merge_with_config_defaults
-@@ -427,6 +470,12 @@
+@@ -427,6 +490,12 @@
          )
 
 
@@ -381,7 +401,7 @@
  @auto_docstring
  class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -435,12 +484,13 @@
+@@ -435,12 +504,13 @@
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
      def __init__(self, config):
@@ -398,7 +418,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -454,61 +504,110 @@
+@@ -454,61 +524,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

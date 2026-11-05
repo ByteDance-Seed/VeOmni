@@ -21,6 +21,10 @@ from torch import Tensor
 
 
 def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = 128) -> Tensor:
-    """Run ``F.linear`` with an empty tensor denoting an unused bias."""
+    """Run ``F.linear`` with an empty tensor denoting an unused bias.
+
+    ``block_size`` keeps the family-wide keyword so one signature serves every
+    row; this reference does not quantize, so the value is unused.
+    """
     del block_size
     return F.linear(x, weight, None if bias.numel() == 0 else bias)

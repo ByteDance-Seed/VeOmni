@@ -63,6 +63,22 @@ unquantized MLP. Selecting `torchao_mxfp4` without `torchao` installed raises
 `Op 'linear' variant='standard' impl='torchao_mxfp4' requires unavailable
 package(s): 'torchao'` at model construction; it never falls back silently.
 
+### Not supported: LoRA on a quantized projection
+
+A `linear` row fake-quantizes the projection's own `weight`. LoRA replaces the
+matched `nn.Linear` with a `LoraLinear` that keeps the base layer at
+`base_layer`, so the weight is no longer reachable as `q_proj.weight`. A model
+built with `linear_implementation: torchao_mxfp4` therefore raises
+`cannot run on a wrapped projection` as soon as an adapter on those projections
+forwards, instead of quietly training the unquantized base layer while the config
+still claims MXFP4.
+
+Set `linear_implementation: eager` for adapter training — the shipped
+[Qwen3 LoRA config](../../configs/text/qwen3_lora.yaml) already does, because it
+does not select the field. `swiglu_mlp_implementation: torchao_mxfp4` is
+unaffected: the fused MLP row reads the projection weights itself and falls back
+to the projection modules when they are wrapped.
+
 Start from [the Qwen3 example](../../configs/text/qwen3_mxfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:
 
@@ -75,12 +91,17 @@ convergence recipe.
 
 ## Distributed behaviour
 
-The fake quantization runs inside the op, on whichever tensor the caller passes.
-Under FSDP2 the projection weight arrives as a `Replicate` DTensor after the
-all-gather, so the op quantizes the local tensor and gradients flow back to the
-FP32 master shard through the existing FSDP2 path. A non-replicated placement is
-rejected: MX groups run along the last dimension, so a shard boundary through
-that dimension would pair channels with another shard's scale.
+The fake quantization runs inside the op, on whichever tensor the caller passes,
+and the operand must be a full local tensor. FSDP2 shards the parameter and
+all-gathers it before the block forward, so the op sees a plain tensor and
+gradients flow back to the FP32 master shard through the existing FSDP2 path.
+
+A DTensor operand is accepted only with a `Replicate` placement, whose local
+shard is the whole tensor; any other placement raises. MX groups run along the
+last dimension, so a shard boundary through that dimension would pair channels
+with another shard's scale and silently change the numbers instead of failing.
+That guard is a contract for the placements FSDP2 can produce rather than a
+description of today's forward, which is already a plain tensor.
 
 BF16 parameters with FP32 gradient reduction is the validated precision, and the
 example config pins it. Nothing else about the parallel topology is changed by

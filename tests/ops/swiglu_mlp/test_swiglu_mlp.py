@@ -649,9 +649,16 @@ def test_torchao_mxfp4_backward_produces_finite_gradients():
 @pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_mxfp4 row needs torchao")
 def test_torchao_mxfp4_empty_input_falls_back_to_eager():
     impl = resolve_op("swiglu_mlp", "standard", "torchao_mxfp4").wrapper
-    mlp = _tiny_qwen3_mlp()
-    x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16)
+    mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
+    x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 
     out = impl(*_mlp_args(mlp, x))
 
     assert out.shape == (0, 8, mlp.down_proj.weight.shape[0])
+    # A zero-token micro-batch must still reach the weights with zero gradients,
+    # which is what the eager and liger rows do through their raw backward.
+    out.sum().backward()
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        grad = getattr(mlp, name).weight.grad
+        assert grad is not None, name
+        torch.testing.assert_close(grad, torch.zeros_like(grad))

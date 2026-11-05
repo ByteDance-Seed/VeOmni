@@ -150,9 +150,14 @@ def test_linear_torchao_mxfp4_rejects_partial_group():
 @_requires_torchao
 def test_linear_torchao_mxfp4_handles_empty_input():
     op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    x = torch.randn(0, 64, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
-    assert op(x, w, _empty_bias(w)).shape == (0, 32)
+    x = torch.randn(0, 64, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(32, 64, dtype=torch.bfloat16, requires_grad=True)
+    out = op(x, w, _empty_bias(w))
+    assert out.shape == (0, 32)
+
+    # A zero-token micro-batch must still reach the weights with zero gradients.
+    out.sum().backward()
+    torch.testing.assert_close(w.grad, torch.zeros_like(w.grad))
 
 
 @_requires_torchao
@@ -201,33 +206,36 @@ def test_linear_torchao_mxfp4_block_size_changes_the_rounding(block_size: int):
     assert not torch.equal(default, impl.wrapper(x, w, _empty_bias(w), block_size=block_size))
 
 
-def _single_process_gloo(monkeypatch) -> bool:
-    """Join a one-rank gloo group so DTensor APIs work; False when a group cannot be built."""
+@pytest.fixture
+def single_rank_dist(monkeypatch):
+    """Provide a one-rank gloo group and destroy it, so later tests see no leaked state."""
     import torch.distributed as dist
 
     from tests.tools.launch_utils import find_free_port
 
-    if dist.is_available() and dist.is_initialized():
-        return True
-    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
-    dist.init_process_group("gloo", rank=0, world_size=1)
-    return True
+    created = False
+    if not dist.is_initialized():
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
+        dist.init_process_group("gloo", rank=0, world_size=1)
+        created = True
+    try:
+        yield
+    finally:
+        if created and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @_requires_torchao
-def test_linear_torchao_mxfp4_accepts_replicated_dtensor_parameter(monkeypatch):
-    """FSDP2 hands the projection a Replicate DTensor; quantizing its local shard must work.
+def test_linear_torchao_mxfp4_accepts_replicated_dtensor_parameter(single_rank_dist):
+    """FSDP2 hands the projection a DTensor in some placements; quantizing the local shard must work.
 
     Returning a plain tensor for the weight while leaving the bias a DTensor makes
     ``addmm`` reject the call with "got mixed torch.Tensor and DTensor", so both
-    operands have to take the same path.
+    operands take the same path.
     """
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Replicate, distribute_tensor
-
-    if not _single_process_gloo(monkeypatch):
-        pytest.skip("needs a gloo process group")
 
     mesh = init_device_mesh("cpu", (1,))
     weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Replicate()])
@@ -241,13 +249,24 @@ def test_linear_torchao_mxfp4_accepts_replicated_dtensor_parameter(monkeypatch):
 
 
 @_requires_torchao
-def test_linear_torchao_mxfp4_rejects_sharded_dtensor_parameter(monkeypatch):
+def test_linear_torchao_mxfp4_accepts_replicated_dtensor_with_empty_input(single_rank_dist):
+    """The zero-token path must not be the one branch that skips the placement normalization."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, distribute_tensor
+
+    mesh = init_device_mesh("cpu", (1,))
+    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Replicate()])
+    bias = distribute_tensor(torch.randn(32, dtype=torch.bfloat16), mesh, [Replicate()])
+    x = torch.randn(0, 64, dtype=torch.bfloat16)
+
+    assert VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, bias).shape == (0, 32)
+
+
+@_requires_torchao
+def test_linear_torchao_mxfp4_rejects_sharded_dtensor_parameter(single_rank_dist):
     """A sharded placement would split a 32-wide group across shards."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Shard, distribute_tensor
-
-    if not _single_process_gloo(monkeypatch):
-        pytest.skip("needs a gloo process group")
 
     mesh = init_device_mesh("cpu", (1,))
     weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Shard(1)])

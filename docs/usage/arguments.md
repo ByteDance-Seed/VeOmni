@@ -187,7 +187,7 @@ Each `*_implementation` field selects the op implementation for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
-**Defaults depend on the host and variant.** The seven general-purpose fields
+**Defaults depend on the host and variant.** The eight general-purpose fields
 below default to `None` on `OpsImplementationConfig`, and `resolve_op` /
 `VeomniOp` selects the host default for each `(op, variant)` from
 `OP_REGISTRY.default_impl`:
@@ -221,8 +221,8 @@ table and must be set to their Ascend values (`torch_npu`, `triton`, or
 NPU validation runs at two times:
 
 - **Config-parse time** (`OpsImplementationConfig.__post_init__`) for the
-  seven general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
-  `swiglu_mlp`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
+  eight general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
+  `swiglu_mlp`, `linear`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
   `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
 - **Model-build time** (instance-local `VeomniOp` resolution via the

@@ -37,7 +37,7 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
-from veomni.models.utils.linear_utils import optional_bias
+from veomni.models.utils.linear_utils import has_plain_projections, optional_bias
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
@@ -60,7 +60,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.models.utils.linear_utils", names=["optional_bias"])
+config.add_import("veomni.models.utils.linear_utils", names=["has_plain_projections", "optional_bias"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
@@ -204,17 +204,34 @@ def qwen3_attention_forward_patched(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states = self.q_norm(
-        self.veomni_linear(hidden_states, self.q_proj.weight, optional_bias(self.q_proj)).view(hidden_shape)
-    ).transpose(1, 2)
-    key_states = self.k_norm(
-        self.veomni_linear(hidden_states, self.k_proj.weight, optional_bias(self.k_proj)).view(hidden_shape)
-    ).transpose(1, 2)
-    value_states = (
-        self.veomni_linear(hidden_states, self.v_proj.weight, optional_bias(self.v_proj))
-        .view(hidden_shape)
-        .transpose(1, 2)
-    )
+    # A linear row reads the projection's weight as a tensor, which a wrapped
+    # projection such as LoraLinear does not own. Falling back would run the
+    # base layer unquantized while the config still claims MXFP4 QAT, so a
+    # quantizing selection is refused instead.
+    plain = has_plain_projections(self, ("q_proj", "k_proj", "v_proj", "o_proj"))
+    if not plain and self.veomni_linear.impl != "eager":
+        raise ValueError(
+            f"linear_implementation={self.veomni_linear.impl!r} cannot run on a wrapped projection: "
+            "the row fake-quantizes a projection's own weight, and a layer substituted after "
+            "construction (LoRA) keeps it at `base_layer`. Set linear_implementation='eager' for "
+            "adapter training, or drop the adapter on the attention projections."
+        )
+    if not plain:
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    else:
+        query_states = self.q_norm(
+            self.veomni_linear(hidden_states, self.q_proj.weight, optional_bias(self.q_proj)).view(hidden_shape)
+        ).transpose(1, 2)
+        key_states = self.k_norm(
+            self.veomni_linear(hidden_states, self.k_proj.weight, optional_bias(self.k_proj)).view(hidden_shape)
+        ).transpose(1, 2)
+        value_states = (
+            self.veomni_linear(hidden_states, self.v_proj.weight, optional_bias(self.v_proj))
+            .view(hidden_shape)
+            .transpose(1, 2)
+        )
 
     cos, sin = position_embeddings
     query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -242,7 +259,10 @@ def qwen3_attention_forward_patched(
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    attn_output = self.veomni_linear(attn_output, self.o_proj.weight, optional_bias(self.o_proj))
+    if has_plain_projections(self, ("o_proj",)):
+        attn_output = self.veomni_linear(attn_output, self.o_proj.weight, optional_bias(self.o_proj))
+    else:
+        attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
 
 
