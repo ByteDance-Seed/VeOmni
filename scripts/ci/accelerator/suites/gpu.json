@@ -222,6 +222,16 @@
     ]
   },
   {
+    "name": "19b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_step_sync.py"
+    ]
+  },
+  {
     "name": "20-unit",
     "suite": "unit",
     "conditional": false,

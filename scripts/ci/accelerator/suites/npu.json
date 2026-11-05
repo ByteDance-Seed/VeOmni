@@ -151,6 +151,16 @@
     ]
   },
   {
+    "name": "npu-unit-13b",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_step_sync.py"
+    ]
+  },
+  {
     "name": "npu-unit-14",
     "suite": "unit",
     "args": [
