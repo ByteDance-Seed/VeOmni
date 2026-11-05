@@ -1,5 +1,5 @@
 # Modified by the VeOmni contributors for native HunyuanVideo 1.5 integration.
-# Changes include import/runtime adaptation and repository formatting; see veomni/models/diffusers/hunyuanvideo15/SOURCE.txt.
+# Changes include import/runtime adaptation and repository formatting; see docs/examples/hunyuanvideo15.md#source-provenance-and-licenses.
 
 # Licensed under the TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT (the "License");
 # you may not use this file except in compliance with the License.

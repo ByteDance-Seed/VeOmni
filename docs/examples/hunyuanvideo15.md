@@ -50,9 +50,6 @@ unverified**. Real-data training requires the complete pretrained components.
   sparse attention, condition caches, and a generation pipeline are outside its
   validated scope. Do not use `offline_training` or `offline_embedding`.
 
-The native code retains Tencent's license and provenance under
-`veomni/models/diffusers/hunyuanvideo15/`.
-
 The model family follows the two-model DiT layout:
 
 ```text
@@ -308,3 +305,47 @@ than duplicated here; they are the historical pre-review measurements, not a
 rerun of the optimized mask. They show close loss trajectories and a remaining
 gradient-norm difference; they do not establish gradient equivalence or long-run
 convergence.
+
+## Source provenance and licenses
+
+The source-derived components retain their original Tencent headers and a
+prominent VeOmni modification notice. The full
+[Tencent Hunyuan Community License Agreement](../licenses/hunyuanvideo15/LICENSE.txt)
+and [distribution and third-party notices](../licenses/hunyuanvideo15/NOTICE.txt)
+live under `docs/licenses/hunyuanvideo15/` and are included as license files in
+source distributions and wheels. They are retained in full because the upstream
+agreement's distribution section requires a copy of the agreement and a Notice
+text file. Moving them out of the model package does not relicense the native
+code under the repository's Apache-2.0 license.
+
+The source revision is `60783e704160023913bee78f0b470036d393d4dfa` in
+[Tencent-Hunyuan/HunyuanVideo-1.5](https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5/tree/60783e704160023913bee78f0b470036d393d4dfa).
+Paths in the right column are relative to `veomni/models/diffusers/hunyuanvideo15/`:
+
+| Upstream source | VeOmni location |
+| --- | --- |
+| `hyvideo/models/transformers/hunyuanvideo_1_5_transformer.py` | `hunyuanvideo15_transformer/native/transformer.py` |
+| `hyvideo/models/transformers/modules/{activation,norm,embed,posemb,mlp,modulate}_layers.py` and `token_refiner.py` | `hunyuanvideo15_transformer/native/modules/` |
+| `hyvideo/models/text_encoders/__init__.py` | `hunyuanvideo15_condition/native/text_encoder.py` |
+| `hyvideo/models/text_encoders/byT5/__init__.py` (`ByT5Mapper`) | `hunyuanvideo15_transformer/native/byt5.py` |
+| `hyvideo/models/text_encoders/byT5/__init__.py` (frozen encoder loading) | `hunyuanvideo15_condition/native/glyph_encoder.py` |
+| `hyvideo/models/autoencoders/hunyuanvideo_15_vae.py` | `hunyuanvideo15_condition/native/vae.py` |
+
+The native transformer uses `nn.Module` while the VeOmni adapter owns HF metadata;
+official parameter names are retained without a wrapper prefix. Source CUDA/SP,
+LoRA and save/load wrappers are omitted. Dense SDPA uses broadcast key masks and
+zeroed invalid queries. Blocks follow Transformers' `GradientCheckpointingLayer`
+contract; per-forward `RotaryTables` preserve FP32 constants across FSDP2 casting
+and recomputation, and native initialization is restored after meta materialization.
+Standard tuple utilities replace `hyvideo.commons`. Frozen loading stays local,
+and glyph checkpoints use `weights_only=True`. VAE imports use VeOmni parallel
+state; the training example leaves tile parallelism disabled, while the optional
+tile decoder uses current SP interfaces, rank-independent padding and restoring
+slicing/tiling contexts. Formatting and unused imports follow repository style.
+The adapter, condition orchestration and tests are VeOmni integration code;
+dataset preparation reuses the existing repository converter.
+
+The optional source-reference test executes pinned upstream bodies with external
+import/launch dependencies isolated, comparing random-weight FP32 outputs and
+gradients and the full meta parameter schema. This does not establish pretrained
+source numerical equivalence or fresh-process trainer checkpoint equivalence.
