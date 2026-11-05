@@ -191,7 +191,7 @@ class OmniTrainer:
     environ_meter: OmniEnvironMeter  # see in OmniStepMetricsCallback
     # OmniStepMetricsCallback.on_step_end: training + efficiency metrics (loss, grad_norm, lr, mfu, …).
     # WandbTraceCallback.on_step_end: logs step_env_metrics.
-    # TqdmCallback.on_step_end: progress-bar postfix from step_train_metrics.
+    # TqdmCallback.on_step_end: progress-bar postfix from step_train_metrics + mfu.
     step_env_metrics: Dict[str, Any] | None = None
     step_train_metrics: Dict[str, Any] | None = None
     LOG_SAMPLE: bool = True

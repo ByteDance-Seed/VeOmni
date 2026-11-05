@@ -58,6 +58,8 @@ def get_device_flops(unit="T"):
         flops = 148e12
     elif "910B" in device_name or "910_93" in device_name:
         flops = 354e12
+    elif "950" in device_name:
+        flops = 432e12
     elif "GB200" in device_name:
         flops = 2565e12
     elif "B200" in device_name:

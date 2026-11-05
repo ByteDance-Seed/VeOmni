@@ -293,6 +293,34 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        # ``step_env_metrics`` is populated by the meter callback dispatched just
+        # before this one; surface ``mfu`` here so the progress bar shows training
+        # efficiency without waiting for a wandb round-trip.
+        step_metrics = dict(self.trainer.step_train_metrics)
+        env_metrics = getattr(self.trainer, "step_env_metrics", None) or {}
+        if env_metrics.get("mfu") is not None:
+            step_metrics["mfu"] = env_metrics["mfu"]
+        postfix = ", ".join(
+            f"{name}: {value:{self._format_spec(name)}}"
+            for name, value in ((k.split("/", 1)[-1], v) for k, v in step_metrics.items())
+        )
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()
+
+    @staticmethod
+    def _format_spec(name: str) -> str:
+        """Format spec for a progress-bar metric.
+
+        Losses and gradient norms are routinely below 1 (and often below 0.1),
+        where two decimals flatten the step-to-step signal; verl prints them
+        with four. The learning rate spans orders of magnitude, so it uses
+        scientific notation. MFU is a fraction and reads better as a
+        percentage. The remaining metrics are O(1) or larger.
+        """
+        if name.endswith(("loss", "grad_norm")):
+            return ".6f"
+        if name == "mfu":
+            return ".2%"
+        if name == "lr":
+            return ".1e"
+        return ".2f"
