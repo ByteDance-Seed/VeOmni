@@ -70,6 +70,7 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
 def _model_load_planner(*, strict_model: bool, ple_rows_by_name):
+    """Select the PLE planner only when model weights have PLE row metadata."""
     if ple_rows_by_name:
         return PleLoadPlanner(strict_model=strict_model, ple_rows_by_name=ple_rows_by_name)
     return _ModelStrictLoadPlanner(strict_model=strict_model)
@@ -229,6 +230,7 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
+        """Extract model weights with their checkpoint sharding and optional PLE projection."""
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
@@ -1036,6 +1038,7 @@ class DistributedCheckpointer(CheckpointerBase):
         ple_counts = {f"model.{name}": counts for name, counts in ple_row_counts(state["model"]).items()}
 
         def _model_state() -> "ModelState":
+            """Build the model load target using its padded runtime shapes."""
             return ModelState(
                 state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
             )

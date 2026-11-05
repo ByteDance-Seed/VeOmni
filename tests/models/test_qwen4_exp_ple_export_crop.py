@@ -52,6 +52,7 @@ class _Model(nn.Module):
 
 
 def _padded_weight(logical_rows=10, padded_rows=16, cols=4):
+    """Create a deterministic PLE weight with a zero-filled padding tail."""
     weight = torch.arange(padded_rows * cols, dtype=torch.float32).reshape(padded_rows, cols)
     weight[logical_rows:] = 0
     return weight
@@ -77,6 +78,7 @@ def test_crop_leaves_unpadded_and_non_ple_tensors():
 
 
 def test_crop_rejects_a_short_ple_shard():
+    """Reject weights that cannot contain all logical PLE rows."""
     converter = create_qwen4_exp_checkpoint_tensor_converter(_Model())
     try:
         converter.crop_hf_export_tensor(_PLE, torch.zeros(9, 4))
@@ -102,6 +104,7 @@ def test_state_dict_helper_crops_a_dense_ple_shard():
 
 
 def test_multiple_layers_keep_their_own_rows():
+    """Verify each PLE table is cropped and restored using its own row counts."""
     model = _Model(layer_rows=[(10, 16), (19, 24), (8, 8)])
     state = {
         f"layers.{index}.ngram_embedding.shard_0.weight": _padded_weight(logical, padded)
@@ -128,6 +131,7 @@ def test_disabled_ple_does_not_break_converter_or_export():
 
 
 def test_hf_projection_cpu_offload_preserves_values_and_runtime_weights():
+    """Verify CPU projection preserves logical values, dtype, and runtime weights."""
     from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
 
     model = _Model()

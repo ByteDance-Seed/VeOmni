@@ -42,6 +42,7 @@ def ple_row_counts(model: nn.Module) -> Dict[str, Tuple[int, int]]:
 
 
 def _is_ple_weight(name: str) -> bool:
+    """Recognize PLE shard weights with or without the DCP model prefix."""
     if _PLE_SHARD_PATTERN.match(name):
         return True
     # DCP metadata keys are ``model.`` plus the state-dict name.
@@ -52,6 +53,7 @@ def _is_ple_weight(name: str) -> bool:
 
 def _checkpoint_name(name: str, counts: Dict[str, Tuple[int, int]]) -> str:
     # Prefer an exact FQN: the model itself may already have a ``model`` child.
+    """Resolve a PLE state dict key to its registered weight name."""
     if name in counts:
         return name
     if name.startswith("model.") and name[len("model.") :] in counts:
@@ -77,6 +79,7 @@ def _from_local(tensor: torch.Tensor, reference: DTensor, rows: int) -> DTensor:
 
 
 def _row_interval(rows: int, size: int, rank: int) -> Tuple[int, int]:
+    """Return the half-open row interval assigned to a rank."""
     chunk = (rows + size - 1) // size
     return min(rank * chunk, rows), min((rank + 1) * chunk, rows)
 
@@ -145,6 +148,7 @@ def _resize_dtensor(tensor: DTensor, rows: int, *, empty: bool = False) -> DTens
 
 
 def _project_one(tensor: torch.Tensor, crop, logical_rows: int, name: str, *, empty: bool) -> torch.Tensor:
+    """Project one PLE weight to its logical row count."""
     if tensor.shape[0] < logical_rows:
         raise RuntimeError(f"{name}: checkpoint rows {tensor.shape[0]} are shorter than logical rows {logical_rows}.")
     if tensor.shape[0] == logical_rows:
@@ -157,6 +161,7 @@ def _project_one(tensor: torch.Tensor, crop, logical_rows: int, name: str, *, em
 
 
 def _pad_one(tensor: torch.Tensor, padded_rows: int, name: str) -> torch.Tensor:
+    """Restore one PLE weight to its padded runtime row count."""
     rows = tensor.shape[0]
     if rows == padded_rows:
         return tensor

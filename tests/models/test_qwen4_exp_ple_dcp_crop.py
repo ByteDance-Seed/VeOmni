@@ -109,6 +109,7 @@ def _train_step(model, optimizer, step):
 
 
 def _check_optimizer(source, restored, source_opt, restored_opt):
+    """Compare optimizer tensor state for the original and restored parameters."""
     restored_parameters = dict(restored.named_parameters())
     for name, parameter in source.named_parameters():
         loaded_parameter = restored_parameters[name]
@@ -132,6 +133,7 @@ def _max_abs(left, right):
 
 
 def _check_resume(model, trained_rows, trained_other, source, source_opt, opt):
+    """Check restored weights and optimizer state before the next update."""
     loaded = _full(model.block.ngram_embedding["shard_0"].weight)
     logical_diff = _max_abs(loaded[:LOGICAL], trained_rows[:LOGICAL])
     tail_diff = _max_abs(loaded[LOGICAL:], torch.zeros_like(loaded[LOGICAL:]))
@@ -160,6 +162,7 @@ def _dcp_load(*args, **kwargs):
 def main():
     # The container's training backend is NPU, but these ranks use gloo so the
     # checkpointer's agreement collectives must stay on CPU.
+    """Exercise distributed PLE checkpoint save and resume."""
     import veomni.utils.dist_utils as dist_utils
 
     dist_utils.get_device_type = lambda: "cpu"
@@ -334,6 +337,7 @@ def main():
 
 
 def test_distributed_ple_checkpoint_roundtrip():
+    """Launch the PLE checkpoint round trip with the configured accelerator mesh."""
     from tests.tools.launch_utils import run_bounded_process_group
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", ASCEND_RT_VISIBLE_DEVICES="", TORCH_DEVICE_BACKEND_AUTOLOAD="0")

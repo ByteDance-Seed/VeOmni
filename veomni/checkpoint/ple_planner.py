@@ -46,11 +46,13 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
     """Record per-tensor source layouts in DCP metadata, including optimizer state."""
 
     def create_local_plan(self):
+        """Attach source expert layouts to the local write plan."""
         plan = super().create_local_plan()
         layouts = {key: layout for key, value in self.state_dict.items() if (layout := _expert_layout(value))}
         return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
 
     def create_global_plan(self, all_plans):
+        """Collect expert layouts across ranks while retaining DCP key mappings."""
         plans, metadata = super().create_global_plan(all_plans)
         # Reuse DCP's plan exchange; sparse optimizer states may appear on only
         # some ranks. Keep the ordinary FQN -> state-dict path mappings intact.
@@ -114,6 +116,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.strict_model = strict_model
 
     def create_local_plan(self):
+        """Validate expert layouts and require all model keys for strict restores."""
         self._validate_expert_layouts()
         plan = self._create_read_plan()
         if not self.strict_model:
@@ -135,9 +138,11 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         return plan
 
     def _create_read_plan(self):
+        """Build the read plan from the current tensor metadata."""
         return super().create_local_plan()
 
     def _validate_expert_layouts(self):
+        """Reject checkpoints with noncanonical or ambiguous expert ordering."""
         planner_data = self.metadata.planner_data or {}
         source = planner_data.get(_EXPERT_LAYOUTS_KEY)
         if source is not None:
