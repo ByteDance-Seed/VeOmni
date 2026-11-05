@@ -727,3 +727,21 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).
+
+### Temporarily disabling native dense adapters
+
+`VeOmniLoraModel.disable_adapter()` bypasses dense adapter contributions without
+changing base weights, adapter parameters, or their `requires_grad` flags:
+
+```python
+with model.disable_adapter():
+    with torch.no_grad():
+        reference_output = model(input_ids=input_ids)
+```
+
+The context restores the previous state on exit, including nested contexts and
+exceptions. It requires unmerged dense adapters; expert adapters are not yet
+supported. To use the result as a frozen base reference policy, train with
+`bias="none"` and no extra trainable base modules. Disabling adapters does not
+undo updates to trainable base biases or other base parameters. Keep the context
+active for any backward recomputation if using it outside inference.
