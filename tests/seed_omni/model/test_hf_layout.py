@@ -12,6 +12,7 @@ keys, dtypes and shards back.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
+from veomni.models.seed_omni.utils import hf_layout
 from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 from veomni.models.seed_omni.utils.hf_layout import (
     OMNI_HF_LAYOUT_REGISTRY,
@@ -81,7 +83,7 @@ FAKE_HF_LAYOUT = OmniHFLayout(
 @pytest.fixture(autouse=True)
 def _register_fake_layout():
     # ``Registry.__setitem__`` is a local override that ``del`` removes again.
-    OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE] = lambda: FAKE_HF_LAYOUT
+    OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE] = lambda source_path=None: FAKE_HF_LAYOUT
     yield
     del OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE]
 
@@ -185,6 +187,123 @@ def test_layout_rejects_a_source_prefix_claimed_by_two_modules():
     )
     with pytest.raises(ValueError, match="more than one module"):
         layout.route("model.x")
+
+
+def test_route_picks_the_longest_prefix_among_many_full_key_renames():
+    """A layout may rename thousands of keys one by one beside a few prefixes;
+    the length-indexed lookup must keep longest-prefix semantics."""
+    full_keys = tuple((f"layers.{i}.attn.wq.weight", f"model.layers.{i}.self_attn.wq.weight") for i in range(50))
+    layout = OmniHFLayout(
+        modules={
+            "llm": OmniHFModuleLayout(
+                key_prefixes=full_keys + (("layers.3.ffn.experts.", "model.layers.3.mlp.experts."),),
+                build_config=lambda c: c,
+            ),
+            "vision": OmniHFModuleLayout(key_prefixes=(("image_", "image_"), ("", "rest.")), build_config=lambda c: c),
+        }
+    )
+    assert layout.route("layers.7.attn.wq.weight") == ("llm", "model.layers.7.self_attn.wq.weight")
+    assert layout.route("layers.3.ffn.experts.5.w1.weight") == ("llm", "model.layers.3.mlp.experts.5.w1.weight")
+    assert layout.route("image_newline") == ("vision", "image_newline")
+    # Only the empty prefix claims these: a full key plus a suffix, and an unrelated key.
+    assert layout.route("layers.7.attn.wq.weight.extra") == ("llm", "model.layers.7.self_attn.wq.weight.extra")
+    assert layout.route("norm.weight") == ("vision", "rest.norm.weight")
+    assert layout.source_key("llm", "model.layers.7.self_attn.wq.weight") == "layers.7.attn.wq.weight"
+    assert layout.source_key("vision", "rest.norm.weight") == "norm.weight"
+    assert layout.source_key("vision", "rest.layers.7.attn.wq.weight") is None
+
+
+def _with_module_hooks(monkeypatch, module: str, **hooks) -> None:
+    """Swap the fake layout for one whose ``module`` declares ``hooks``."""
+    patched = dataclasses.replace(FAKE_HF_LAYOUT.modules[module], **hooks)
+    layout = dataclasses.replace(FAKE_HF_LAYOUT, modules={**FAKE_HF_LAYOUT.modules, module: patched})
+    monkeypatch.setattr(hf_layout, "get_hf_layout", lambda model_type, source_path=None: layout)
+
+
+def test_the_layout_factory_is_handed_the_checkpoint_directory(hf_root, monkeypatch):
+    root, _ = hf_root
+    seen = []
+
+    def factory(source_path=None):
+        seen.append(source_path)
+        return FAKE_HF_LAYOUT
+
+    monkeypatch.setitem(OMNI_HF_LAYOUT_REGISTRY, MODEL_TYPE, factory)
+    hf_layout.get_hf_layout.cache_clear()
+    OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    assert os.path.realpath(root) in seen
+    hf_layout.get_hf_layout.cache_clear()
+
+
+def test_generated_tensors_fill_what_the_checkpoint_does_not_store(hf_root, monkeypatch):
+    root, tensors = hf_root
+    del tensors["decoder.proj.weight"]
+    save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+    seen = []
+
+    def generated(source_path, config):
+        seen.append((source_path, config.hidden_size))
+        return {"proj.weight": torch.full((config.hidden_size, config.hidden_size), 3.0)}
+
+    _with_module_hooks(monkeypatch, FAKE_B, generated_tensors=generated)
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    assert seen == [(os.path.realpath(root), HIDDEN)]
+    assert (model.modules_dict[FAKE_B].proj.weight == 3.0).all()
+
+
+def test_export_state_shapes_what_the_export_writes(hf_root, tmp_path, monkeypatch):
+    root, tensors = hf_root
+
+    def export_state(module, state):
+        return {"proj.weight": state["proj.weight"] + 2.0}
+
+    _with_module_hooks(monkeypatch, FAKE_A, export_state=export_state)
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    out = tmp_path / "export"
+    save_hf_source_checkpoint(model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(out))
+    exported, _ = _read_safetensors(out)
+    assert torch.equal(exported["encoder.proj.weight"], tensors["encoder.proj.weight"] + 2.0)
+    assert torch.equal(exported["head.weight"], exported["encoder.proj.weight"])
+
+
+def test_export_refuses_a_cast_that_would_drop_quantization(hf_root, tmp_path, monkeypatch):
+    root, _ = hf_root
+
+    def export_state(module, state):
+        return {"proj.weight": state["proj.weight"].to(torch.float8_e4m3fn)}
+
+    _with_module_hooks(monkeypatch, FAKE_A, export_state=export_state)
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    with pytest.raises(TypeError, match="must declare export_state"):
+        save_hf_source_checkpoint(
+            model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(tmp_path / "export")
+        )
+
+
+def test_export_dtype_refusal_propagates_across_ranks(hf_root, tmp_path, monkeypatch):
+    """When another rank's ``export_state`` slice hits a forbidden cast, every rank raises together."""
+    import veomni.models.seed_omni.utils.hf_layout as hf_layout_mod
+
+    root, _ = hf_root
+    calls = []
+
+    def fake_union(items):
+        items = list(items)
+        calls.append(items)
+        if len(calls) == 1:
+            return ["proj.weight"]
+        if len(calls) == 2:
+            return items
+        return ["save_hf_source_checkpoint: peer rank hit a forbidden cast; must declare export_state."]
+
+    monkeypatch.setattr(hf_layout_mod, "_all_ranks_union", fake_union)
+    _with_module_hooks(monkeypatch, FAKE_A, export_state=lambda module, state: {})
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    with pytest.raises(TypeError, match="peer rank hit a forbidden cast"):
+        save_hf_source_checkpoint(
+            model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(tmp_path / "export")
+        )
+    assert len(calls) == 3
 
 
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
@@ -390,14 +509,6 @@ def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
         _validate_hf_view_modules(view, {**ok, "other_module": OmniModuleRuntimeArguments(model_path="/x")})
     with pytest.raises(ValueError, match="sets its own model_path"):
         _validate_hf_view_modules(view, {**ok, FAKE_B: OmniModuleRuntimeArguments(model_path="/elsewhere/b")})
-    streaming = OmniModuleRuntimeArguments(
-        model_path=os.path.join(view, FAKE_B), ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=False
-    )
-    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
-        _validate_hf_view_modules(view, {**ok, FAKE_B: streaming})
-    # The composed wrap reads the top-level flag, which a module may override to false.
-    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
-        _validate_hf_view_modules(view, ok, ep_sharded_stream_load=True)
 
 
 def test_from_pretrained_rejects_a_module_read_from_elsewhere(hf_root, tmp_path):

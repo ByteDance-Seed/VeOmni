@@ -117,7 +117,11 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: SeedOmni Models
 
+seed_omni/models/janus.md
 seed_omni/models/qwen3.md
+seed_omni/models/qwen3_moe.md
+seed_omni/models/qwen3vl.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}

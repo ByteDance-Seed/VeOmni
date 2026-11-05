@@ -28,6 +28,10 @@ class PretrainedOmniModule(PreTrainedModel):
     Subclasses hold weights, ``forward``, and FSM ``generate`` endpoints only.
     """
 
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""

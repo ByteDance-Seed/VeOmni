@@ -1,0 +1,19 @@
+# Janus-1.3B packed training DAG — joint understanding + image-generation SFT.
+#
+# Packed path: the text-encoder preprocessor builds packed tokens/masks on CPU.
+# Each module only mask-selects its embeddings and masked_scatters them back.
+# Dummy FSDP-anchor images stay off the packed sequence (folded via mean()*0).
+#
+#   janus_text_encoder.pack_encode
+#       -> janus_siglip.pack_encode
+#       -> janus_vqvae.pack_encode
+#       -> janus_llama.pack_forward
+#           -> janus_text_encoder.pack_decode -> end
+#           -> janus_vqvae.pack_decode        -> end
+- { from: janus_text_encoder.pack_encode, to: janus_siglip.pack_encode }
+- { from: janus_siglip.pack_encode,       to: janus_vqvae.pack_encode }
+- { from: janus_vqvae.pack_encode,        to: janus_llama.pack_forward }
+- { from: janus_llama.pack_forward,       to: janus_text_encoder.pack_decode }
+- { from: janus_llama.pack_forward,       to: janus_vqvae.pack_decode }
+- { from: janus_text_encoder.pack_decode, to: end }
+- { from: janus_vqvae.pack_decode,        to: end }

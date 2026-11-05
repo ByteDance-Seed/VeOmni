@@ -39,8 +39,9 @@ can be the **upstream checkpoint itself** — `base.yaml` already points at
 exports are then written in the upstream layout (see
 [Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
 
-The offline split still works, through the same layout, and is what a
-cross-family composed model needs:
+The offline split still works, through the same layout, and is what a composed
+model such as [§7](#7-visual-instruction-tuning-qwen3-06b-into-image-understanding)
+needs:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
@@ -92,7 +93,7 @@ Key knobs (override on the CLI):
 
 - `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length (`dyn_bsz` token budget unit: `micro_batch_size * max_seq_len`).
+- `--data.max_seq_len` — packed sequence length.
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -126,7 +127,8 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
-- Every module inherits the global `ulysses_size`. The wte is a per-token lookup, so its sequence shards exactly like
+- Every module inherits the global `ulysses_size`; do not set a per-module
+  `ulysses_size` (nothing validates that modules agree). The wte is a per-token lookup, so its sequence shards exactly like
   the LLM backbone.
 - `world % sp_size == 0`; a larger `micro_batch_size` gives longer packed
   sequences to slice across SP ranks.
@@ -171,7 +173,7 @@ python tasks/omni/infer_omni.py \
 A run trained from the upstream root exports `hf_ckpt/` as one Qwen3 checkpoint,
 so infer from it directly with `--model.model_path <step_dir>/hf_ckpt` (it loads
 in `transformers` too). A run trained from a split root exports one `hf_ckpt/`
-subfolder per module; assemble a flat root from them:
+subfolder per module; assemble a flat root from them (same pattern as Janus):
 
 ```bash
 STEP=outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
@@ -188,8 +190,21 @@ done
 ## 6. Alignment with the original text trainer
 
 Because Qwen3 is text-only, the omni path must compute the **same loss** as the
-classic text trainer (`tasks/train_text.py`). Run the classic text trainer on
-the same model + data and compare the loss curve:
+classic text trainer (`tasks/train_text.py`). Two checks:
+
+**(a) Numeric equivalence** — feed one identical token sequence through the
+monolithic `Qwen3ForCausalLM` and through the split path
+(`qwen3_text_encoder` embed → `qwen3_llm` → tied projection):
+
+```bash
+python scripts/seed_omni/check_qwen3_alignment.py \
+  --base /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+# -> max|logit diff| ~8e-5, CE loss identical to 6 d.p. (RESULT: ALIGNED)
+```
+
+**(b) Trainer comparison** — run the classic text trainer on the same model +
+data and compare the loss curve:
 
 ```bash
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
@@ -199,18 +214,202 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
   --train.max_steps 15 --train.wandb.enable false
 ```
 
-Two intentional input differences keep a small residual gap even on matched
-data:
+The classic `chatml` template labels the whole assistant block (role prefix +
+`<|im_end|>`); the omni `qwen3_text_encoder` template masks the
+`<|im_start|>assistant\n` prefix, which accounts for the small residual gap.
 
-1. **Assistant-prefix mask.** The classic `chatml` template labels the whole
-   assistant block (role prefix + `<|im_end|>`); the omni
-   `qwen3_text_encoder` template masks the `<|im_start|>assistant\n` prefix.
-2. **Tulu system turns.** For Tulu rows that open with a system message,
-   SeedOmni's `tulu_3_sft_mixture_preprocess` folds that system text into the
-   first user turn (`<system>…</system>\n…`), while the classic ChatML
-   template keeps a separate system turn. The two trainers therefore see
-   different token sequences on those rows.
+---
 
-For a parity comparison, filter to Tulu rows **without** a system message (or
-otherwise feed both trainers the same already-normalized conversations) and
-compare losses on those matched inputs and labels.
+## 7. Visual instruction tuning: Qwen3-0.6B into image understanding
+
+This recipe turns the **text-only** Qwen3-0.6B into an image-understanding model
+by bolting on the **Qwen3-VL ViT**. It trains the ViT's **patch merger**, the
+vision **special-token** embedding rows and the LLM backbone; the ViT blocks and
+the rest of the embedding table stay frozen.
+
+**No bespoke modeling or build script** — it reuses the standard `qwen3_text_encoder`,
+`qwen3_llm` and `qwen3vl_vision` modules; the image-understanding behaviour is
+switched on entirely through per-module `model_config:` overrides in the modules YAML.
+
+| Module | Source | `model_config` override | Trainable? |
+|--------|--------|--------|-----------|
+| `qwen3vl_vision` (ViT + **patch merger**) | Qwen3-VL-2B ViT | `out_hidden_size: 1024`, `disable_deepstack: true`, `freeze: true` | **patch merger only** (ViT blocks frozen) |
+| `qwen3_text_encoder` (tied wte/lm_head + tokenizer) | Qwen3-0.6B embed | `enable_image: true` | **only the vision special-token rows** |
+| `qwen3_llm` (decoder backbone) | Qwen3-0.6B | — | **yes** |
+
+### 7.1 Retarget the patch merger (no separate projector)
+
+Qwen3-VL's ViT outputs **2048-d** tokens (it was pretrained for the 2B LLM), but
+Qwen3-0.6B's hidden size is **1024**. Rather than bolt a separate `Linear` on top,
+we **retarget the ViT's own patch merger** to the LLM hidden size: the merger
+already ends in `linear_fc2: Linear(merger_hidden → out_hidden_size)`, so setting
+`out_hidden_size: 1024` via `model_config:` makes that the bridge into the LLM
+embedding space. `freeze: true` then freezes the ViT **blocks** but keeps the
+**merger** trainable (`freeze_model` re-enables `visual.merger`).
+
+Because a stock Qwen3-VL checkpoint's `merger.linear_fc2` is `→ 2048`, its shape
+no longer matches after retargeting. `Qwen3VLVisionEncoder`'s checkpoint converter
+(`_MergerProjectionConverter`) **drops the mismatched `linear_fc2`** at load so the
+weight loader re-initialises it (via the ViT's `_init_weights`); `merger.norm` and
+`merger.linear_fc1` still load from the checkpoint. No build-time surgery needed.
+
+The plain `qwen3_llm` backbone (flat `arange` positions) uses **neither M-RoPE nor
+DeepStack**, so `disable_deepstack: true` zeroes `deepstack_visual_indexes` — the
+ViT produces only the merged image tokens, which are packed into the sequence like
+any other embedding segment.
+
+### 7.2 Special tokens already exist — train only their rows
+
+Qwen3's tokenizer **already reserves** the vision special tokens
+(`<|vision_start|>`=151652, `<|vision_end|>`=151653, `<|image_pad|>`=151655, all
+below the 151936 embedding rows). So there is **no vocab/embedding expansion** to
+do (adding duplicates would be wrong — the tokenizer still maps to the reserved
+ids). The standard `qwen3_text_encoder` gains a single config knob (off by
+default → plain text-only Qwen3):
+
+- `enable_image: true` — use the **Qwen3-VL image ChatML template** (image →
+  `<|vision_start|>` · the vision-embed segment · `<|vision_end|>`) and handle
+  image/video parts in decode. With it off, the original text-only template runs
+  verbatim (`if self._enable_image:` branches in `accelerated/accelerated.py`). It also makes
+  `freeze_model()` keep the tied embedding's `requires_grad=True` but register a
+  **per-row gradient mask** that zeroes every row except the vision special tokens
+  (`<|vision_start|>`, `<|vision_end|>`, `<|image_pad|>`), so only those rows
+  update. **You don't pass the token ids** — the module resolves them from its own
+  tokenizer (`convert_tokens_to_ids`), since the user can't know them but the
+  module can. (With `enable_image: false` the embedding is fully trainable.)
+
+The mask is attached from a forward pre-hook on `embed_tokens`, after FSDP2 has
+unsharded it, to the rows the lookup reads, sliced to this rank's vocab rows when
+an `emb` plan splits the table. The tied `embed_tokens.project` reads that same
+parameter, so its gradient is masked too, provided `encode` runs before the first
+`decode` (it always does in this graph). It therefore holds under `ddp`, `fsdp2`
+and `emb` alike.
+
+AdamW's decoupled weight decay (`p *= 1 - lr * wd`) does not go through the
+gradient, so the mask alone would still let it shrink the frozen rows, and with
+them the tied output head. The module's `configure_optimizer` therefore takes the
+table's weight decay over: it sets that param group's `weight_decay` to 0 and
+applies the module's configured value (the model-level `optimizer.weight_decay`
+unless the module overrides it) to the vision rows alone, from an optimizer step
+pre-hook, before the update as AdamW would. The frozen rows stay bit-identical,
+and the vision rows decay like any other trained parameter.
+
+> The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved
+> stub). They start training from there; if you want a better starting point,
+> mean-init them before training (HF `mean_resizing` trick).
+
+### 7.3 Checkpoints (two standard converts, no combine step)
+
+No dual-source script and no combined directory: convert each upstream model once,
+then let the launcher compose them. `model.model_path` is the Qwen3-0.6B root
+(`qwen3_llm/`, `qwen3_text_encoder/` + tokenizer) and `modules_train.yaml` points
+`qwen3vl_vision` at the Qwen3-VL root's subfolder (ViT + image/video processors):
+
+```bash
+python scripts/seed_omni/convert_model.py \
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+
+python scripts/seed_omni/convert_model.py \
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+```
+
+At train time the `out_hidden_size` override retargets the merger and its
+mismatched `linear_fc2` is re-initialised; `disable_deepstack` drops the unused
+DeepStack mergers.
+
+### 7.4 Config
+
+The configs live alongside the text-only Qwen3-0.6B ones in
+`configs/seed_omni/Qwen/qwen3_0.6b/`, distinguished by a `visual_instruction_tuning`
+suffix:
+
+| File | Role |
+|------|------|
+| `visual_instruction_tuning/base.yaml` | Launcher (model paths, accelerator, data, train, infer). |
+| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze. Add `--model.accelerator.ulysses_size N` for Ulysses SP; there is no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
+| `visual_instruction_tuning/graph_train.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
+| `visual_instruction_tuning/data.yaml` | ShareGPT4V captions (image + text). |
+| `visual_instruction_tuning/graph_infer.yaml` | I2T generation FSM. |
+
+### 7.5 Train on ShareGPT4V
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
+```
+
+Trainable params are `qwen3vl_vision.visual.merger.*`, the whole `qwen3_llm`
+backbone, and the masked text-encoder embedding (only the vision special-token
+rows receive gradient; the ViT blocks are frozen).
+
+**Sequence parallelism**: the ViT, the text encoder and the LLM backbone all run at
+the shared SP size. Add `--model.accelerator.ulysses_size N` to the launcher; the
+dataloader replicates each DP shard across the SP group, and each module slices to
+its `1/sp` chunk, runs one forward, and all-gathers the output back. Same caveats
+as [§3.1](#31-sequence-parallelism-ulysses):
+
+```bash
+NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  --model.accelerator.ulysses_size 4 \
+  --train.global_batch_size 16 --train.micro_batch_size 4
+```
+
+### 7.6 Inference
+
+Run straight from `base.yaml`, this pairs the base Qwen3-0.6B root with the raw
+Qwen3-VL ViT whose merger `linear_fc2` is re-initialised for `out_hidden_size:
+1024`, so it only checks the wiring — the reply is meaningless until trained.
+Use the trained-checkpoint command below for real outputs.
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  --model.model_config.infer_type understanding \
+  --infer.images /path/to/image.jpg \
+  --infer.prompt "What is in this image?" \
+  --infer.output_dir qwen3_vit_out
+```
+
+To infer from a **trained** checkpoint (per-module weights live under
+`<step>/hf_ckpt/<module>/`), point `--model.model_path` at the checkpoint step
+dir and override each module's `model_path` **relative to that root** — do NOT
+repeat the `--model.model_path` prefix. Per-module override paths are joined
+under `--model.model_path` unless they are absolute (start with `/`); passing a
+cwd-relative full path double-joins it and fails with a cryptic
+`HFValidationError: Repo id must be in the form ...`.
+
+```bash
+STEP=outputs/qwen3_0.6b_visual_instruction_tuning/checkpoints/global_step_2000
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  --model.model_config.infer_type understanding \
+  --model.model_path "$STEP" \
+  --infer.images /path/to/image.jpg \
+  --infer.prompt "What is in this image?" \
+  --infer.output_dir qwen3_vit_out \
+  --model.model_config.modules.qwen3vl_vision.model_path hf_ckpt/qwen3vl_vision \
+  --model.model_config.modules.qwen3_text_encoder.model_path hf_ckpt/qwen3_text_encoder \
+  --model.model_config.modules.qwen3_llm.model_path hf_ckpt/qwen3_llm
+```
+
+A trained checkpoint of this recipe is available at
+`/mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-Visual-Instruction-Tuning`. It is a
+complete split checkpoint (root `config.json` plus graph sidecars), so it also
+loads without the launcher:
+
+```bash
+python tasks/omni/infer_omni_native.py \
+  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-Visual-Instruction-Tuning \
+  --infer_type understanding \
+  --prompt "Describe this image briefly." \
+  --image /path/to/image.jpg
+```
+
+> **Scope**: this is a deliberately minimal setup (frozen ViT blocks + a retargeted
+> patch merger + the vision special-token rows + the LLM). It exercises the full
+> image pipeline and trains, but real image-understanding quality needs more
+> capacity (unfreeze the ViT blocks, or use an aligned ViT). DeepStack is
+> disabled because the plain `qwen3_llm` backbone can't consume those features.
