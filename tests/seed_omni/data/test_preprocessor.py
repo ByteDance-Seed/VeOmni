@@ -25,6 +25,7 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     iter_desired_items,
 )
+from veomni.utils.constants import IGNORE_INDEX
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -201,11 +202,6 @@ def test_length_fns_size_a_packed_sample_by_its_packed_tensors():
     """A packed sample has no carrier, no `input_ids` and no `attention_mask`, so
     the generic branches cannot size it and dynamic batching would count it as one
     token. Read the packed tensors instead."""
-    import torch
-
-    from veomni.data.dataset import get_length_by_labels_fn, get_length_fn
-    from veomni.utils.constants import IGNORE_INDEX
-
     labels = torch.full((1, 40), IGNORE_INDEX, dtype=torch.long)
     labels[0, 10:22] = 7  # 12 supervised tokens
     packed = {

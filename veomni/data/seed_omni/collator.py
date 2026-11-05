@@ -204,5 +204,14 @@ def _collate_visual_rows(features: Sequence[Dict[str, Any]], batch: Dict[str, An
         blocks_by_phase[1].extend(blocks[n_real:])
         grids_by_phase[0].append(grids[:n_real])
         grids_by_phase[1].append(grids[n_real:])
-    batch["pixel_values"] = torch.cat(blocks_by_phase[0] + blocks_by_phase[1], dim=0)
-    batch["image_grid_thw"] = torch.cat(grids_by_phase[0] + grids_by_phase[1], dim=0)
+    pixel_blocks = blocks_by_phase[0] + blocks_by_phase[1]
+    grid_rows = grids_by_phase[0] + grids_by_phase[1]
+    if not pixel_blocks:
+        # Both tensors present but empty: `torch.cat` on an empty list raises an
+        # opaque shape error, so say what actually went wrong.
+        raise ValueError(
+            "SeedOmniCollator: a packed sample carries an empty visual pair "
+            "(no `image_grid_thw` rows); the vision node needs at least one."
+        )
+    batch["pixel_values"] = torch.cat(pixel_blocks, dim=0)
+    batch["image_grid_thw"] = torch.cat(grid_rows, dim=0)

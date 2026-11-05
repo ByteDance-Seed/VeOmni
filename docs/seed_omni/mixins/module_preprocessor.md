@@ -141,10 +141,10 @@ class VisionPreprocessor(ModulePreprocessorBase):
 ## Tests
 
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
-  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L91),
-  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L101),
-  - [per-sample dummy anchor injection when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L145), and
-  - [`seedomni_transform` runs `OmniProcessor` and populates `dyn_bsz` total/effective lengths](../../../tests/seed_omni/data/test_preprocessor.py#L164).
+  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L92),
+  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L102),
+  - [per-sample dummy anchor injection when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L146), and
+  - [`seedomni_transform` runs `OmniProcessor` and populates `dyn_bsz` total/effective lengths](../../../tests/seed_omni/data/test_preprocessor.py#L165).
 - [`tests/seed_omni/model/test_processor.py`](../../../tests/seed_omni/model/test_processor.py):
   - [preprocessors run in module order](../../../tests/seed_omni/model/test_processor.py#L36),
   - [`model_config` and `processor_config` overrides reach `from_pretrained`](../../../tests/seed_omni/model/test_processor.py#L162), and
