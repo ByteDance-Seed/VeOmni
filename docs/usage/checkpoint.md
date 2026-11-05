@@ -438,7 +438,7 @@ unversioned checkpoint, a changed optimizer layout, or a model/optimizer/sidecar
 from different saves. An old checkpoint whose original group and scheduler
 identity cannot be established needs a verified offline migration.
 
-The generic codec supports AdamW, AnyPrecisionAdamW and DistributedMuon
+The generic codec supports AdamW, AnyPrecisionAdamW, SwapAdamW and DistributedMuon
 without ExtraParallel when every checkpoint rank has the same logical parameter
 inventory and replicated values already agree. For the ExtraParallel candidate,
 optimizer state is stored under rank-specific keys and recovery requires the
@@ -447,7 +447,7 @@ and uninitialized states, but increases checkpoint storage for replicated
 optimizer shards and does not support elastic resharding. All ranks must use
 the same trusted model and configuration, including optimizer leaf ordering.
 Owner-specific freezing that removes a whole leaf from only some ranks is not
-supported or checked and can cause checkpoint collectives to hang. Replica
+supported; differing leaf names or order are rejected before checkpoint collectives. Replica
 values, trainability, dtype, shape and geometry
 are trusted to be consistent across ranks. Source and target checkpoint layout
 metadata are checked during restore; tensor bytes are not hashed for replica
@@ -464,7 +464,7 @@ parameter-group bindings, and scheduler behavior to match; when necessary, a
 matching load hook must undo the transformation. The persisted recipe does not
 verify arbitrary hook or
 wrapper code. MultiOptimizer asynchronous saves and detected unsupported layouts fail
-closed; the cross-rank leaf mismatch above is not detected. Synchronous staged
+closed. Synchronous staged
 saves are supported.
 The runtime assumes ranks use a consistent model configuration and compatible
 replica geometries; saved source layout is validated on restore.
@@ -472,6 +472,21 @@ Group/state inventory and generation mismatches are rejected before model
 copying. If an I/O or optimizer-application error occurs after model copying,
 the load fails and clears its receipt but does not roll back in-memory objects;
 discard and rebuild that runtime before retrying.
+When a proven `MultiOptimizer` includes `SwapAdamW`, restore first reads its
+moments into separate CPU buffers. Budget approximately one additional copy of
+the saved SwapAdamW moment shards in host memory while loading, plus DCP's own
+temporary storage. Those buffers are discarded after restore; they do not add
+accelerator-resident optimizer state. A failed restore marks the optimizer
+unusable until it is rebuilt. SwapAdamW stores its moments in the parameter
+dtype and does not provide FP32 master weights; it is not equivalent to an
+FP32-master optimizer. Its float32 checkpoint step is accepted only while the
+integer step is exactly representable (at most 2**24).
+For a standalone SwapAdamW, use `DistributedCheckpointer` when parameters may
+be frozen during recovery: it restores their saved optimizer history before
+they are unfrozen. If a frozen parameter has saved history, custom optimizer
+load-state hooks and trainable-only model checkpoints are rejected; model hooks
+see the original frozen flags. Raw DCP `OptimizerState` does not inspect checkpoint owner
+metadata and can silently omit that history; it retains its original behavior.
 `MultiOptimizer.state_dict()` returns a detached inspection snapshot for
 supported leaves, but `load_state_dict()` alone cannot prove group/scheduler
 identity and rejects restoration; use the proven DCP path instead.
