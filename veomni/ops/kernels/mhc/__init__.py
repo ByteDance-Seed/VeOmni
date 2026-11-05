@@ -16,14 +16,15 @@
 
 Three independent variants share this package. They are not a compound
 kernel. Eager is the modeling math (regular autograd). ``tilelang`` is
-TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
+TileKernels on SM90+ NVIDIA and gfx942/gfx950 AMD GPUs. ``post`` /
+``tilelang`` is a raw pair; ``pre`` and
 ``head`` keep an opaque wrapper because TileKernels owns that autograd.
 ``cann`` is the Ascend CANN fused pre and post. CANN has no head kernel,
 so ``head`` / ``cann`` runs the eager math and lets one
 ``mhc_implementation`` name cover all three variants.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
+from ...platform import TILELANG_GPUS, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .head import eager as head_eager
 from .head import tilelang as head_tilelang
@@ -35,7 +36,7 @@ from .pre import eager as pre_eager
 from .pre import tilelang as pre_tilelang
 
 
-_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_TILELANG = GpuKernelRequirement(platforms=TILELANG_GPUS)
 _CANN = NpuKernelRequirement()
 
 register_op(

@@ -31,7 +31,7 @@ import tilelang
 import torch
 from tilelang import language as T
 
-from veomni.utils.device import get_torch_device
+from veomni.utils.device import get_max_shared_memory_per_block
 
 
 @tilelang.jit(
@@ -85,7 +85,7 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
     D = dim
 
     smem_lower_bound = H_per_block * D * 2 + BI * D * 2
-    smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
+    smem_limit = get_max_shared_memory_per_block()
     if smem_lower_bound > smem_limit:
         raise RuntimeError(
             f"block_I={block_I}, dim={dim}, heads={heads} needs at least {smem_lower_bound} B "
@@ -164,6 +164,32 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
     return main
 
 
+def fit_target_tiling(heads, dim, block_I=64, threads=256):
+    """Return the ``block_I``/``threads``/``head_chunk`` of the largest target tile that fits this device.
+
+    Hopper and gfx950 host the requested tile with every head in one CTA, which is returned
+    unchanged. gfx942's 64 KB LDS cannot hold the 64-row KV tile next to Q at dim=512, so the
+    gather block halves there; the CTA narrows with it so that every warp keeps a whole
+    matrix-core tile (16 wide on MFMA, 8 on MMA) of the FullRow QK^T product. Where not even
+    the narrowest gather block fits next to every head (64 heads at dim=512 on gfx942), the
+    heads are split into chunks of ``head_chunk``.
+    """
+    smem_limit = get_max_shared_memory_per_block()
+    warp_size, n_per_warp = (64, 16) if torch.version.hip is not None else (32, 8)
+
+    def fits(head_block, gather_block):
+        # 2048 B is the inter-buffer alignment TileLang adds on top of the Q and KV tiles.
+        return (head_block + gather_block) * dim * 2 + 2048 <= smem_limit
+
+    head_chunk = max(tilelang.math.next_power_of_2(heads), 16)
+    while head_chunk > 16 and not fits(head_chunk, n_per_warp):
+        head_chunk //= 2
+    while block_I > n_per_warp and not fits(head_chunk, block_I):
+        block_I //= 2
+        threads = min(threads, head_chunk // 16 * (block_I // n_per_warp) * warp_size)
+    return {"block_I": block_I, "threads": threads, "head_chunk": head_chunk}
+
+
 def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_I=64, threads=256):
     """Head-summed, unnormalised attention probability over the compressed slice.
 
@@ -207,6 +233,26 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
         raise RuntimeError(f"lse must be [B, S, H], got {tuple(lse.shape)}")
     topk = topk_idxs.shape[-1]
 
+    tiling = fit_target_tiling(heads, dim, block_I, threads)
+    if tiling["head_chunk"] < heads:
+        # The target is a head sum, so heads that do not fit one CTA are summed chunk by chunk.
+        chunk = tiling["head_chunk"]
+        target = None
+        for h in range(0, heads, chunk):
+            part = sparse_mqa_target_fwd_interface(
+                q[:, :, h : h + chunk].contiguous(),
+                kv,
+                topk_idxs,
+                lse[:, :, h : h + chunk].contiguous(),
+                sm_scale,
+                block_I=block_I,
+                threads=threads,
+            )
+            target = part if target is None else target + part
+        return target
+    block_I, threads = tiling["block_I"], tiling["threads"]
+    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
+
     padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
         pad = torch.full((batch, seq_len, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
@@ -220,7 +266,6 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
     # still contribute exp2(0 - lse_pad). Padding the LSE with +inf is what makes
     # the contribution exactly exp2(-inf) == 0. Every score is finite or -inf, so
     # the exponent is never inf - inf and no NaN can enter the head sum.
-    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
     if padded_heads != heads:
         q = torch.cat([q, q.new_zeros(batch, seq_len, padded_heads - heads, dim)], dim=2).contiguous()
         lse = torch.cat([lse, lse.new_full((batch, seq_len, padded_heads - heads), float("inf"))], dim=2).contiguous()

@@ -29,7 +29,8 @@ Every scale is derived from its own block's amax, and ``ue8m0`` rounds that
 scale up, so ``x / scale`` stays inside the representable FP8 range and no
 element sits in a saturated region whose gradient would have to be masked.
 
-Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU.
+Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU or an AMD
+gfx942/gfx950 GPU.
 ``qat_linear(..., enabled=False)`` calls the original module directly and
 bypasses quantization and those restrictions.
 """
@@ -38,7 +39,7 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from ._hardware import require_tilelang_sm90
+from ._hardware import require_tilelang_gpu
 
 
 # DeepSeek-V4 rounds every scale up to a power of two so that it survives
@@ -59,7 +60,7 @@ __all__ = [
 
 def act_quant(*args, **kwargs):
     """Lazily call the TileLang activation quantizer."""
-    require_tilelang_sm90()
+    require_tilelang_gpu()
     from .quant import act_quant as quantize
 
     return quantize(*args, **kwargs)
@@ -67,7 +68,7 @@ def act_quant(*args, **kwargs):
 
 def fp8_weight_quant(*args, **kwargs):
     """Lazily call the TileLang FP8 weight quantizer."""
-    require_tilelang_sm90()
+    require_tilelang_gpu()
     from .quant import fp8_weight_quant as quantize
 
     return quantize(*args, **kwargs)

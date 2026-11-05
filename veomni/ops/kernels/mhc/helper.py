@@ -16,8 +16,8 @@
 
 Eager inlines unweighted RMSNorm. TileLang adapters validate CUDA placement,
 BF16 dtype, rank-4 layout, and ``hc_mult=4`` here. Registry requirements
-separately restrict those rows to NVIDIA SM90 or later and require the
-``tile_kernels`` package.
+separately restrict those rows to NVIDIA SM90 or later and AMD gfx942/gfx950
+and require the ``tile_kernels`` package.
 """
 
 from __future__ import annotations

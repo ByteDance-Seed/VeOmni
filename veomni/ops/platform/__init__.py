@@ -19,7 +19,9 @@ from .gpu import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
     NVIDIA_SM100_PLUS,
+    ROCM_GFX942_GFX950,
     ROCM_GPU,
+    TILELANG_GPUS,
     GpuPlatform,
     NvidiaGpuPlatform,
     RocmGpuPlatform,
@@ -45,6 +47,8 @@ __all__ = [
     "NVIDIA_SM100_PLUS",
     "NpuKernelRequirement",
     "NvidiaGpuPlatform",
+    "ROCM_GFX942_GFX950",
     "ROCM_GPU",
     "RocmGpuPlatform",
+    "TILELANG_GPUS",
 ]

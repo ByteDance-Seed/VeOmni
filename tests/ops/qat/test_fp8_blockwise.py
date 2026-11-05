@@ -23,7 +23,7 @@ from torch import nn
 
 import veomni.ops.qat as qat
 from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
-from tests.ops.utils import require_nvidia_cuda
+from tests.ops.utils import require_nvidia_cuda, require_tilelang_gpu
 from veomni.ops.qat import _hardware as qat_hardware
 from veomni.ops.qat import (
     fp4_blockwise,
@@ -44,9 +44,11 @@ DEVICE = get_device_type()
 @pytest.fixture(autouse=True)
 def clear_qat_hardware_gate_cache():
     """Keep process-level hardware caching isolated between QAT tests."""
-    qat_hardware.require_tilelang_sm90.cache_clear()
+    qat_hardware.require_tilelang_gpu.cache_clear()
+    qat_hardware.require_tilelang_fp4_gpu.cache_clear()
     yield
-    qat_hardware.require_tilelang_sm90.cache_clear()
+    qat_hardware.require_tilelang_gpu.cache_clear()
+    qat_hardware.require_tilelang_fp4_gpu.cache_clear()
 
 
 def _qat_entry_calls():
@@ -84,35 +86,83 @@ def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
     monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
 
 
-def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
+def test_qat_entry_points_reject_unsupported_gpu_before_vendor_import(monkeypatch):
     """Every quantizing QAT path checks hardware before entering TileLang."""
     vendor_calls = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
+    monkeypatch.setattr(qat_hardware, "is_tilelang_gpu_supported", lambda: False)
 
     for name, call in _qat_entry_calls():
-        with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
+        with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU or an AMD gfx942/gfx950 GPU"):
             call()
         assert vendor_calls == [], f"{name} entered the vendor backend before the hardware check"
 
 
-def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
+def test_qat_entry_points_reach_vendor_backend_after_hardware_check(monkeypatch):
     """The hardware gate does not intercept supported QAT calls."""
     vendor_calls = []
     hardware_checks = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
 
-    def supports_sm90(self):
+    def supported():
         hardware_checks.append(True)
         return True
 
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", supports_sm90)
+    monkeypatch.setattr(qat_hardware, "is_tilelang_gpu_supported", supported)
+    monkeypatch.setattr(qat_hardware, "is_tilelang_fp4_gpu_supported", lambda: True)
 
     for name, call in _qat_entry_calls():
         vendor_calls.clear()
         call()
         assert vendor_calls, f"{name} did not reach the vendor backend after the hardware check"
     assert hardware_checks == [True]
+
+
+@pytest.mark.parametrize(
+    ("hip", "capability", "arch", "supported"),
+    (
+        (None, 89, None, False),
+        (None, 90, None, True),
+        ("6.0", 0, "gfx90a", False),
+        ("6.0", 0, "gfx942", True),
+        ("6.0", 0, "gfx950", True),
+    ),
+    ids=("sm89", "sm90", "gfx90a", "gfx942", "gfx950"),
+)
+def test_tilelang_gpu_gate_follows_platform(monkeypatch, hip, capability, arch, supported):
+    """SM90+ NVIDIA and the validated AMD architectures pass; everything else is rejected."""
+    from veomni.ops.platform import gpu
+
+    monkeypatch.setattr(gpu.torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(gpu, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(gpu, "get_gpu_compute_capability", lambda: capability)
+    monkeypatch.setattr(gpu, "get_rocm_gcn_arch", lambda: arch)
+
+    assert qat_hardware.is_tilelang_gpu_supported() is supported
+    if supported:
+        qat_hardware.require_tilelang_gpu()
+    else:
+        with pytest.raises(RuntimeError, match="gfx942/gfx950"):
+            qat_hardware.require_tilelang_gpu()
+
+
+def test_fp4_quantizers_reject_rocm_before_vendor_import(monkeypatch):
+    """TileLang's HIP backend miscompiles FP4 casts, so FP4 stays NVIDIA-only while FP8 runs on ROCm."""
+    from veomni.ops.platform import gpu
+
+    vendor_calls = []
+    _install_fake_quant_backend(monkeypatch, vendor_calls)
+    monkeypatch.setattr(gpu.torch.version, "hip", "6.0", raising=False)
+    monkeypatch.setattr(gpu, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(gpu, "get_rocm_gcn_arch", lambda: "gfx950")
+
+    fp4_weight = torch.zeros(2, 32, dtype=torch.bfloat16)
+    for call in (lambda: qat.fp4_act_quant(fp4_weight), lambda: qat.fp4_fake_quant_weight(fp4_weight)):
+        with pytest.raises(RuntimeError, match="FP4 quantizer requires an SM90 or later NVIDIA CUDA GPU"):
+            call()
+    assert vendor_calls == []
+    qat.fp8_weight_quant(torch.zeros(128, 128, dtype=torch.bfloat16))
+    assert vendor_calls == ["fp8_weight_quant"]
 
 
 @pytest.fixture
@@ -133,7 +183,7 @@ def reference_fp4_quantizer(monkeypatch):
     backend = ModuleType("veomni.ops.qat.quant")
     backend.fp4_act_quant = reference_fp4_act_quant
     monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
-    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda: None)
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_fp4_gpu", lambda: None)
 
 
 def _act_qdq(x, block_size=128, round_scale=True):
@@ -495,7 +545,7 @@ def test_qat_linear_restores_the_parameter_after_the_call(reference_quantizers):
 
 
 def test_qat_linear_runs_on_the_tilelang_kernels():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     torch.manual_seed(21)
     linear = nn.Linear(256, 128, bias=False, device=DEVICE, dtype=torch.bfloat16)
     x = torch.randn(8, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -527,7 +577,7 @@ def test_fp4_fake_quant_runs_on_tilelang_with_reference_forward_and_gradient():
 
 
 def test_stacked_fp8_weight_runs_on_tilelang_with_per_expert_reference_and_gradient():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     torch.manual_seed(23)
     weight = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
     grad_output = torch.randn_like(weight)

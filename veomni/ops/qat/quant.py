@@ -38,6 +38,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from veomni.utils.device import get_rocm_gcn_arch
+
 from .scale import validate_fp8_scale_pairing
 
 
@@ -54,6 +56,18 @@ FE8M0 = "float8_e8m0fnu"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+
+# TileLang's HIP backend lowers every e4m3 dtype to the target's native FP8, which is
+# e4m3fnuz on gfx94x. Those bits encode exactly half the e4m3fn value of the same bits
+# (exponent bias 8 instead of 7) on an identically spaced grid, so casting v / 2 yields
+# the e4m3fn bytes of v, and widening them and doubling yields v back. The kernels clamp
+# to e4m3fn's +-448 first, which keeps v / 2 within FNUZ's +-240.
+_FNUZ_FP8_ARCHS = ("gfx940", "gfx941", "gfx942")
+
+
+def _fp8_cast_scale() -> float:
+    """Factor applied before the native FP8 cast so it produces e4m3fn bytes."""
+    return 0.5 if get_rocm_gcn_arch() in _FNUZ_FP8_ARCHS else 1.0
 
 
 def fast_log2_ceil(x):
@@ -75,9 +89,27 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+def _to_fp8(v, cast_scale):
+    """Cast to TileLang's FP8 so that the stored bytes are e4m3fn; see _FNUZ_FP8_ARCHS."""
+    return T.Cast(FP8, v if cast_scale == 1.0 else v * cast_scale)
+
+
+def _from_fp8(q, cast_scale):
+    """Widen FP8 bytes written by _to_fp8 back to their e4m3fn value in FP32."""
+    v = T.Cast(FP32, q)
+    return v if cast_scale == 1.0 else v * (1.0 / cast_scale)
+
+
 @tilelang.jit(pass_configs=pass_configs)
 def act_quant_kernel(
-    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, dequant=False
+    N,
+    block_size=128,
+    in_dtype=BF16,
+    out_dtype=FP8,
+    scale_dtype=FP32,
+    round_scale=False,
+    dequant=False,
+    fp8_cast_scale=1.0,
 ):
     """Block-wise FP8 quantization. dequant=True writes the fused quant+dequant round trip to Y as BF16."""
     M = T.symbolic("M")
@@ -123,12 +155,15 @@ def act_quant_kernel(
                     for i, j in T.Parallel(blk_m, group_size):
                         y_local[i, j] = T.Cast(
                             out_dtype,
-                            T.Cast(compute_dtype, T.Cast(FP8, T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)))
+                            _from_fp8(
+                                _to_fp8(T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max), fp8_cast_scale),
+                                fp8_cast_scale,
+                            )
                             * s_local[i],
                         )
                 else:
                     for i, j in T.Parallel(blk_m, group_size):
-                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
+                        y_local[i, j] = _to_fp8(T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max), fp8_cast_scale)
                 for i in T.Parallel(blk_m):
                     if pid_m * blk_m + i < M:
                         S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
@@ -161,6 +196,7 @@ def act_quant(
         scale_dtype=tl_dtype,
         round_scale=scale_fmt is not None,
         dequant=dequant,
+        fp8_cast_scale=_fp8_cast_scale(),
     )
     kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
     if dequant:
@@ -176,6 +212,7 @@ def fp8_weight_quant_kernel(
     scale_dtype=FP32,
     round_scale=False,
     dequant=False,
+    fp8_cast_scale=1.0,
 ):
     """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA.
     round_scale=True rounds each tile scale up to a power of two (MXFP).
@@ -197,7 +234,9 @@ def fp8_weight_quant_kernel(
         """TileLang primitive for square-tile FP8 weight quantization."""
         with T.Kernel(N // block_size, M // block_size, threads=128) as (bx, by):
             x_shared = T.alloc_shared((block_size, block_size), BF16)
-            y_shared = T.alloc_shared((block_size, block_size), out_dtype)
+            # The BF16 round trip is written back over the tile it reads, element by
+            # element: a second 32 KB tile would not fit gfx942's 64 KB LDS.
+            y_shared = x_shared if dequant else T.alloc_shared((block_size, block_size), out_dtype)
             amax_row_local = T.alloc_fragment((block_size,), FP32)
             scale_local = T.alloc_fragment((1,), FP32)
             scale_shared = T.alloc_shared((1,), FP32)
@@ -219,12 +258,17 @@ def fp8_weight_quant_kernel(
                 for i, j in T.Parallel(block_size, block_size):
                     y_shared[i, j] = T.Cast(
                         out_dtype,
-                        T.Cast(FP32, T.Cast(FP8, T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)))
+                        _from_fp8(
+                            _to_fp8(T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max), fp8_cast_scale),
+                            fp8_cast_scale,
+                        )
                         * scale_shared[0],
                     )
             else:
                 for i, j in T.Parallel(block_size, block_size):
-                    y_shared[i, j] = T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)
+                    y_shared[i, j] = _to_fp8(
+                        T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max), fp8_cast_scale
+                    )
 
             T.copy(y_shared, Y[by * block_size, bx * block_size])
             if T.get_thread_binding(0) == 0:
@@ -280,6 +324,7 @@ def fp8_weight_quant(
         scale_dtype=scale_dtype,
         round_scale=scale_fmt is not None,
         dequant=dequant,
+        fp8_cast_scale=_fp8_cast_scale(),
     )
     kernel(z, y, s)
     if dequant:
