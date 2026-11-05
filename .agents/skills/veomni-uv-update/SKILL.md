@@ -12,8 +12,8 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
 - every Dockerfile is standalone and hand-maintained; there is no generator or
   matrix, so a version bump has to be applied file by file
 - torch uses **direct wheel URLs** (not just version bumps)
-- three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
-  each a complete superset, plus optional `--extra magi` (combine with `gpu`)
+- four mutually exclusive hardware extras (`gpu` / `rocm` / `npu` /
+  `npu_aarch64`), plus optional `--extra magi` (combine with `gpu`)
 
 `pyproject.toml` is the source of truth for every version claim below. Read the
 relevant block before editing — this file describes *where* things live, not
@@ -79,7 +79,32 @@ This is the most complex update. torch versions are pinned in **multiple places*
 **For NPU (`npu` / `npu_aarch64` extras):**
 - Same pattern but with `+cpu` suffix or no suffix
 
-**Steps:**
+**For ROCm (`rocm` extra)** — versions move together per ROCm release on AMD's
+release index (never the pruned nightly index):
+- `rocm` extra: torch / torchvision / torchaudio / triton and every runtime
+  wheel (`rocm`, `rocm-sdk-*`, `amd-torch(vision)-device-gfx942/950`)
+- `override-dependencies` (the `extra == 'rocm'` entries)
+- `[tool.uv.sources]`: direct wheel URLs for torch / torchvision / torchaudio /
+  torchcodec, `amd-rocm` index entries for the runtime wheels
+- `[[tool.uv.dependency-metadata]]` for the sdist-only `rocm` package
+- `docker/rocm/Dockerfile.ROCm7.14`: the flash-attn and aiter commits it
+  source-builds against that torch
+
+**ROCm steps:**
+1. Select the matching release wheels from
+   https://repo.amd.com/rocm/whl-multi-arch/.
+2. Update every ROCm location listed above, including the Dockerfile's
+   flash-attn and aiter commits when the torch ABI changes.
+3. Regenerate the lockfile and validate the ROCm fork explicitly:
+
+```bash
+uv lock
+uv sync --extra rocm --dev
+```
+
+4. Rebuild `docker/rocm/Dockerfile.ROCm7.14` and rerun the affected ROCm tests.
+
+**CUDA steps:**
 1. Identify the target torch version and matching wheel URLs from https://download.pytorch.org/whl/
 2. Update all pinned versions in `pyproject.toml` (extras, overrides, sources)
 3. Check attention-kernel compatibility. Three groups behave differently —
