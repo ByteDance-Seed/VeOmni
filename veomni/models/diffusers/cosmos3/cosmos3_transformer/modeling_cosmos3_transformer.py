@@ -19,6 +19,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.utils import logging
@@ -174,6 +175,10 @@ class Cosmos3MoTTransformer(PreTrainedModel):
     def freeze_model(self) -> None:
         """Called by ``VeOmniModelRuntime`` before FSDP wrapping."""
         train_joint = self.config.train_joint_reasoner
+        if train_joint and get_parallel_state().dp_mode == "ddp":
+            # `norm` and the last block's reasoner-side parameters never reach the loss, and DDP
+            # runs without `find_unused_parameters`; FSDP2 tolerates them.
+            raise NotImplementedError("train_joint_reasoner=True requires fsdp_mode='fsdp2', not 'ddp'.")
         for name, parameter in self.named_parameters():
             if name.startswith(ALWAYS_FROZEN_NAME_PREFIXES):
                 parameter.requires_grad_(False)

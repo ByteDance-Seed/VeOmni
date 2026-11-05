@@ -136,6 +136,18 @@ def test_lm_head_is_always_frozen(train_joint):
         assert all(p.requires_grad for name, p in model.named_parameters() if not name.startswith("lm_head."))
 
 
+def test_joint_training_is_rejected_under_ddp(monkeypatch):
+    """The final norm and the last block's reasoner side never reach the loss, which DDP cannot tolerate."""
+    from types import SimpleNamespace
+
+    from veomni.models.diffusers.cosmos3.cosmos3_transformer import modeling_cosmos3_transformer as modeling
+
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(dp_mode="ddp"))
+    with pytest.raises(NotImplementedError, match="fsdp2"):
+        _tiny_model(train_joint_reasoner=True)
+    _tiny_model(train_joint_reasoner=False)
+
+
 def test_loss_is_a_scaled_per_sample_mean():
     """``DiTTrainer.postforward`` divides by the micro-batch count, so the model must not sum."""
     model = _tiny_model()
@@ -214,5 +226,9 @@ def test_sft_jsonl_preprocess():
     assert cosmos3_sft_jsonl_preprocess(row, cfg_dropout_rate=1.0)[0] == ""
 
     # An empty structured caption falls back to the dense one; a URI is not joined to data_dir.
-    blank = {"vision_path": "s3://bucket/a.mp4", "t2w_windows": [{"caption_json": " ", "caption": "a bridge"}]}
-    assert cosmos3_sft_jsonl_preprocess(blank, data_dir="/data") == ("a bridge.", {}, [], ["s3://bucket/a.mp4"])
+    blank = {
+        "vision_path": "https://host/a.mp4",
+        "t2w_windows": [{"caption_json": " ", "caption": " "}],
+        "caption": "a bridge",
+    }
+    assert cosmos3_sft_jsonl_preprocess(blank, data_dir="/data") == ("a bridge.", {}, [], ["https://host/a.mp4"])

@@ -136,10 +136,10 @@ def cosmos3_sft_jsonl_preprocess(conversations, data_dir="", cfg_dropout_rate=0.
                 return structured.strip()
         elif structured is not None:
             return json.dumps(structured, ensure_ascii=False)
-        caption = window.get("caption") or example.get("caption")
-        if not isinstance(caption, str) or not caption.strip():
-            raise ValueError(f"cosmos3_sft_jsonl needs 'caption_json' or a 'caption'; keys {sorted(window)}.")
-        return caption.strip().rstrip(".") + "."
+        for caption in (window.get("caption"), example.get("caption")):
+            if isinstance(caption, str) and caption.strip():
+                return caption.strip().rstrip(".") + "."
+        raise ValueError(f"cosmos3_sft_jsonl needs 'caption_json' or a 'caption'; keys {sorted(window)}.")
 
     window = conversations["t2w_windows"][0]
     prompt = caption_of(window, conversations)

@@ -89,7 +89,7 @@ tokenizer relative to it.
 
 ## 2. The two towers, and the freeze switch
 
-`train_joint_reasoner` is the only knob:
+`train_joint_reasoner` is the only knob (joint training needs `fsdp_mode: fsdp2`; `ddp` is rejected):
 
 | Value | Meaning | Recipe |
 | --- | --- | --- |
@@ -118,7 +118,7 @@ in the reference repository; the fields this transform actually reads are:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `vision_path` | yes | clip path; relative paths resolve against `mm_configs.data_dir`, absolute paths and `://` URIs are used as-is |
+| `vision_path` | yes | clip path; relative paths resolve against `mm_configs.data_dir`, absolute paths and `://` URLs are used as-is (the video loader reads local files and http(s) URLs) |
 | `t2w_windows` | yes | non-empty list of time windows; the adapter takes `t2w_windows[0]` only |
 | `t2w_windows[i].caption_json` | preferred | structured caption, serialised verbatim (a string is stripped, everything else is `json.dumps`-ed) |
 | `t2w_windows[i].caption` | fallback | dense caption string, used when the window has no `caption_json` |
