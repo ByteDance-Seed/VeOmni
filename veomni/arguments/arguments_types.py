@@ -598,6 +598,34 @@ class TorchCompileConfig:
 
 
 @dataclass
+class MXFP8Config:
+    """Optional native MXFP8 compute and parameter transport for dense Qwen3."""
+
+    enable: bool = False
+    target_modules: List[str] = field(
+        default_factory=lambda: [
+            "model.layers.*.mlp.gate_proj",
+            "model.layers.*.mlp.up_proj",
+            "model.layers.*.mlp.down_proj",
+        ]
+    )
+    enable_fsdp_all_gather: bool = False
+
+    def __post_init__(self):
+        for name in ("enable", "enable_fsdp_all_gather"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"mxfp8.{name} must be a boolean.")
+        if (
+            not isinstance(self.target_modules, list)
+            or not self.target_modules
+            or any(not isinstance(pattern, str) or not pattern for pattern in self.target_modules)
+        ):
+            raise ValueError("mxfp8.target_modules must be a nonempty list of module-name patterns.")
+        if self.enable_fsdp_all_gather and not self.enable:
+            raise ValueError("mxfp8.enable_fsdp_all_gather requires mxfp8.enable=true.")
+
+
+@dataclass
 class MixedPrecisionConfig:
     """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
 
@@ -620,6 +648,10 @@ class MixedPrecisionConfig:
     cast_forward_inputs: bool = field(
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
+    )
+    mxfp8: Optional[MXFP8Config] = field(
+        default=None,
+        metadata={"help": "Native MXFP8 recipe. Unset preserves saved model metadata; enable=false disables it."},
     )
 
     def __post_init__(self):

@@ -33,6 +33,7 @@ pyproject.toml
 ├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
 │   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
+│   │                  + torchao 0.18.0 (optional MXFP8 training at runtime)
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
 │   │                  + FA3 / FlashMLA / DeepGEMM wheels on both architectures
 │   │                  + FA4 / FlashQLA (pure-Python PyPI wheels)
