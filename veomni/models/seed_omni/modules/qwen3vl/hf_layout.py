@@ -38,10 +38,12 @@ def _vision_config(hf_config: Any) -> Qwen3VLVisionEncoderConfig:
 def _tie_word_embeddings(hf_config: Any) -> bool:
     """Whether the checkpoint ties its embedding to the LM head.
 
-    Official Qwen3-VL states this on the *top-level* config (2B ties, 8B does
-    not); a nested ``text_config`` may carry the field too, and a hand-written
-    config may set only that one. Read the outer first and fall back to the
-    nested value, treating an absent field as absent rather than as ``False``.
+    ``Qwen3VLConfig`` declares ``tie_word_embeddings`` as its own field defaulting
+    to ``False``, so it is always present and always wins — which is correct for
+    the official checkpoints, where the value lives on the top level (2B ties, 8B
+    does not). A nested ``text_config`` value is only consulted when the outer one
+    is genuinely absent, which happens for a duck-typed config rather than a real
+    ``Qwen3VLConfig``.
     """
     outer = getattr(hf_config, "tie_word_embeddings", None)
     if outer is not None:

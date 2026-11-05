@@ -139,8 +139,7 @@ class OmniEnvironMeter:
             cu = micro_batch.get("packed_cu_seqlens")
             self.batch_count += max(0, int(cu.numel()) - 1) if cu is not None else 1
         if self.enable_multisource:
-            # Pops `ds_idx` / `source_name` / `cur_token_num` off the batch, so it
-            # must run after the count above reads them.
+            # Pops `ds_idx` / `source_name` / `cur_token_num` off the batch.
             self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
     def step(

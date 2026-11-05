@@ -355,24 +355,30 @@ def test_packed_collation_puts_every_real_visual_before_every_dummy():
     from veomni.data.seed_omni.collator import SeedOmniCollator
     from veomni.models.seed_omni.modules.qwen3vl.packing import visual_token_count
 
-    def _packed(real_grid: list[int], dummy_grid: list[int], n_real: int) -> dict:
+    def _packed(real_grid: list[int], dummy_grid: list[int], n_real: int, base: int) -> dict:
         grids = torch.tensor([real_grid, dummy_grid])
+        rows = int(grids.prod(dim=1).sum())
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 8, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 8, dtype=torch.long),
             PACKED_ATTENTION_MASK: torch.ones(1, 8, dtype=torch.long),
-            PIXEL_VALUES: torch.arange(int(grids.prod(dim=1).sum()), dtype=torch.float).unsqueeze(1),
+            # A distinct origin per sample, so a reorder that moves the grids but
+            # leaves the pixels in per-sample order cannot pass.
+            PIXEL_VALUES: torch.arange(base, base + rows, dtype=torch.float).unsqueeze(1),
             IMAGE_GRID_THW: grids,
             VISUAL_NUM_REAL: n_real,
         }
 
     # Asymmetric on purpose: a plain per-sample concat would interleave them as
     # [[1,4,4], [1,8,8], [1,4,4], [1,8,8]] and count sample 0's dummy as real.
-    batch = SeedOmniCollator()([_packed([1, 4, 4], [1, 8, 8], 1), _packed([1, 4, 4], [1, 8, 8], 1)])
+    batch = SeedOmniCollator()([_packed([1, 4, 4], [1, 8, 8], 1, base=0), _packed([1, 4, 4], [1, 8, 8], 1, base=1000)])
     assert batch[IMAGE_GRID_THW].tolist() == [[1, 4, 4], [1, 4, 4], [1, 8, 8], [1, 8, 8]]
     assert batch[VISUAL_NUM_REAL] == 2
     # The first `visual_num_real` rows are the real ones, so their merged-token
     # count is what the vision hook consumes.
     assert visual_token_count(batch[IMAGE_GRID_THW], 2, batch[VISUAL_NUM_REAL]) == (16 + 16) // 4
-    # Pixels follow their grids: 16 + 16 + 64 + 64 patch rows.
+    # Pixels follow their grids: real(16) + real(16) + dummy(64) + dummy(64).
     assert tuple(batch[PIXEL_VALUES].shape) == (160, 1)
+    assert batch[PIXEL_VALUES][:16, 0].tolist() == list(range(0, 16)), "sample 0's real block leads"
+    assert batch[PIXEL_VALUES][16:32, 0].tolist() == list(range(1000, 1016)), "sample 1's real block"
+    assert batch[PIXEL_VALUES][32:48, 0].tolist() == list(range(16, 32)), "sample 0's dummy block"

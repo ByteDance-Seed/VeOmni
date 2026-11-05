@@ -177,18 +177,32 @@ def _collate_visual_rows(features: Sequence[Dict[str, Any]], batch: Dict[str, An
     dummies and then either scatter them into the real mask or crash on a shape
     mismatch. Reorder so every real row precedes every dummy row.
     """
-    if "pixel_values" not in features[0] or "image_grid_thw" not in features[0]:
+    has_pixels = "pixel_values" in features[0]
+    has_grids = "image_grid_thw" in features[0]
+    if not (has_pixels and has_grids):
+        # Both keys are skipped by the main loop, so a half-present pair would be
+        # dropped silently. Say so instead: the graph node needs both.
+        if has_pixels or has_grids:
+            missing = "image_grid_thw" if has_pixels else "pixel_values"
+            raise KeyError(
+                f"SeedOmniCollator: a packed sample carries visual patches but no {missing!r}; "
+                "the vision node needs both."
+            )
         return
-    real_grids, dummy_grids, real_pixels, dummy_pixels = [], [], [], []
+
+    # One ordered list of blocks per sample, concatenated once: real blocks for
+    # every sample, then dummy blocks for every sample. Copying per sample and
+    # again for the join would copy every pixel twice.
+    blocks_by_phase: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
+    grids_by_phase: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
     for feature in features:
         grids = feature["image_grid_thw"]
-        pixels = feature["pixel_values"]
         n_real = int(feature.get("visual_num_real", 0))
         # One patch block per visual row, so pixels and grids reorder together.
-        blocks = torch.split(pixels, grids.prod(dim=1).tolist(), dim=0)
-        real_grids.append(grids[:n_real])
-        dummy_grids.append(grids[n_real:])
-        real_pixels.append(torch.cat(blocks[:n_real], dim=0) if n_real else pixels[:0])
-        dummy_pixels.append(torch.cat(blocks[n_real:], dim=0) if n_real < len(blocks) else pixels[:0])
-    batch["pixel_values"] = torch.cat(real_pixels + dummy_pixels, dim=0)
-    batch["image_grid_thw"] = torch.cat(real_grids + dummy_grids, dim=0)
+        blocks = torch.split(feature["pixel_values"], grids.prod(dim=1).tolist(), dim=0)
+        blocks_by_phase[0].extend(blocks[:n_real])
+        blocks_by_phase[1].extend(blocks[n_real:])
+        grids_by_phase[0].append(grids[:n_real])
+        grids_by_phase[1].append(grids[n_real:])
+    batch["pixel_values"] = torch.cat(blocks_by_phase[0] + blocks_by_phase[1], dim=0)
+    batch["image_grid_thw"] = torch.cat(grids_by_phase[0] + grids_by_phase[1], dim=0)

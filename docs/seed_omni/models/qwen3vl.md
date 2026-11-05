@@ -221,8 +221,8 @@ Reproduce: `python scripts/seed_omni/bench_packed_qwen3vl.py`.
 
 Note the packed launcher reports no per-sample sequence lengths to the metric
 meter, so per-module token accounting and multi-source token counts read zero on
-this path. The sample count is correct (`OmniEnvironMeter.add` reads the collated
-`ds_idx`), and the collator now teaches `get_length_fn` the packed keys, so
+this path. The sample count is correct (`OmniEnvironMeter.add` counts the batch's
+`packed_cu_seqlens` boundaries), and `get_length_fn` now knows the packed keys, so
 `dyn_bsz` can size packed samples too.
 
 ---
