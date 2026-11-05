@@ -1,6 +1,6 @@
 ---
 name: veomni-gpu-ci-migrate
-description: "Migrate a caller-selected VeOmni GPU workflow or test scope to Ascend NPU. Guides workflow tracing, portability classification, semantic-preserving adaptation, real execution, CI wiring and fixed-denominator reporting. Trigger: 'migrate GPU CI to NPU', 'port CUDA tests', '迁移 GPU CI'. For new module coverage without an existing GPU scope use veomni-npu-ci-generate."
+description: "Migrate a caller-selected VeOmni GPU workflow or test scope to Ascend NPU. Guides workflow tracing, portability classification, semantic-preserving adaptation, real execution, CI wiring and fixed-denominator reporting. Trigger: 'migrate GPU CI to NPU', 'port CUDA tests', 'migrate GPU CI'. For new module coverage without an existing GPU scope use veomni-npu-ci-generate."
 ---
 
 ## Before You Start

@@ -1,6 +1,6 @@
 ---
 name: veomni-npu-ci-generate
-description: "Generate or extend Ascend NPU tests and CI for a specified VeOmni module, file, or feature. Guides source inspection, UT/ST design, real-device execution, failure diagnosis and CI wiring. Trigger: 'generate NPU CI', 'add Ascend tests', '补齐 NPU 测试'. Use veomni-gpu-ci-migrate for an existing GPU test scope and veomni-new-op for a missing production kernel."
+description: "Generate or extend Ascend NPU tests and CI for a specified VeOmni module, file, or feature. Guides source inspection, UT/ST design, real-device execution, failure diagnosis and CI wiring. Trigger: 'generate NPU CI', 'add Ascend tests', 'fill gaps in NPU test coverage'. Use veomni-gpu-ci-migrate for an existing GPU test scope and veomni-new-op for a missing production kernel."
 ---
 
 ## Before You Start
