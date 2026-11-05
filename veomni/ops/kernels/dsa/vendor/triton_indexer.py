@@ -39,11 +39,11 @@ __all__ = ["triton_lighting_indexer"]
 _SCORES_BLOCK_S = 16
 _SCORES_BLOCK_P = 128
 _SCORES_NUM_WARPS = 4
-# Bound the transient FP32 score chunk. Production through roughly 32K tokens
+# Bound the transient FP32 score chunk. Production through roughly 64K tokens
 # stays one-shot; longer contexts stream pool columns through a running exact
-# top-k. A 512 MiB budget split the 24K shape for only 64 MiB of savings and
-# regressed its forward by 22%, while 1 GiB keeps that shape on the fast path.
-_SCORES_CHUNK_BYTES = 1 << 30
+# top-k. At S=128K, 4 GiB cuts the measured peak from 18 to 11 GiB while keeping
+# fwd+bwd within 9% of one-shot. This matches #1271's backward workspace cap.
+_SCORES_CHUNK_BYTES = 4 << 30
 _MAX_POOL_CHUNK = 32768
 # One unpipelined wavefront per query with 16-entry tiles hides the dK atomics best on
 # gfx942 (V4 widths, S=4096: 3.0 ms against 6.7 ms for 32-entry tiles on four wavefronts).
