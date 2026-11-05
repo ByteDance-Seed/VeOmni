@@ -438,8 +438,11 @@ class OptimizerState(Stateful):
             # contain collectives. A single rank's type error must not race
             # another rank's optimizer collective against our error reduction.
             error = None
-            if not getattr(self.optimizer, "_is_multi_optimizer", False):
-                error = RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+            try:
+                if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                    raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+            except BaseException as exc:
+                error = exc
             raise_if_any_rank_failed(error, "validating ExtraParallel optimizer type", group=self.process_group)
 
             optim_sd_with_extra_parallel_dim, error = None, None
