@@ -507,6 +507,8 @@ def _init_parallel_state(
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
     name: Optional[str] = "base",
+    npu_ep_hccl_buffer_mib: Optional[int] = None,
+    npu_ep_hccl_expansion_mode: Optional[str] = None,
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
@@ -546,6 +548,12 @@ def _init_parallel_state(
     if device_type is None:
         device_type = get_device_type()
 
+    from .hccl_options import ep_backend_override
+
+    ep_override = ep_backend_override(device_type, npu_ep_hccl_buffer_mib, npu_ep_hccl_expansion_mode)
+    if ep_override and dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1) <= 1:
+        raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
+
     # Set dp_shard_size to dp_size if dp_shard_size and dp_replicate_size are not set when dp enabled
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
@@ -581,6 +589,8 @@ def _init_parallel_state(
         extra_parallel_placement_innermost,
         extra_parallel_names,
         async_enabled,
+        npu_ep_hccl_buffer_mib,
+        npu_ep_hccl_expansion_mode,
     )
     cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
     if cached_state is not None:
@@ -695,6 +705,7 @@ def _init_parallel_state(
                 device_type=device_type,
                 mesh_shape=param_mesh_shape,
                 mesh_dim_names=para_mesh_dim_names,
+                **({"backend_override": ep_override} if para_name == "ep" and ep_override else {}),
             )
             extra_parallel_fsdp_device_mesh[f"{para_name}"] = para_mesh
             # Qwen4-Exp PLE routes sparse lookup requests across the complete
@@ -755,6 +766,8 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         extra_parallel_names=accelerator.extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
+        npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
+        npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,
     )
 
