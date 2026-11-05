@@ -78,6 +78,7 @@ def calculate_frame_indices(
     frame_factor_remainder: int = 0,
     min_frames: int = None,
     max_frames: int = None,
+    frame_selection: str = "linspace",
     **kwargs,
 ) -> tuple[List[int], int]:
     """Calculate frame indices to sample and padding count.
@@ -94,6 +95,9 @@ def calculate_frame_indices(
             temporal VAE compresses T frames to (T-1)/factor + 1 latents.
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
+        frame_selection: ``"linspace"`` (default) spreads the frames over the whole
+            clip; ``"prefix"`` takes a fixed-stride prefix and drops the tail, like the
+            Cosmos video readers.
         **kwargs: Extra arguments (ignored)
 
     Returns:
@@ -138,7 +142,18 @@ def calculate_frame_indices(
 
     # Uniform sampling
     if sample_count > 0:
-        indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
+        if frame_selection == "linspace":
+            indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
+        elif frame_selection == "prefix":
+            # Mirrors cosmos-framework's SFT reader (frame_selection_mode="first"): a fixed stride from frame 0.
+            # A fixed stride can land on fewer frames than asked for on a short clip; report the
+            # shortfall through ``pad_count`` (the caller repeats the last frame) rather than
+            # fabricating duplicate indices, which would feed the VAE a stale frame silently.
+            stride = max(1, int(round(total_frames / max(sample_count, 1))))
+            indices = list(range(0, total_frames, stride))[:sample_count]
+            pad_count += sample_count - len(indices)
+        else:
+            raise ValueError(f"frame_selection must be 'linspace' or 'prefix', got {frame_selection!r}.")
     else:
         indices = []
 
@@ -152,6 +167,7 @@ def smart_video_nframes(
     frame_factor: int = None,
     min_frames: int = None,
     max_frames: int = None,
+    frame_selection: str = "linspace",
     **kwargs,
 ) -> tuple[torch.Tensor, Dict[str, Union[float, int, torch.Tensor]]]:
     """Sample video frames with fps and alignment constraints.
@@ -163,6 +179,7 @@ def smart_video_nframes(
         frame_factor: Align output frame count to multiples of this
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
+        frame_selection: Passed through to ``calculate_frame_indices``.
         **kwargs: Additional arguments (e.g., 'frames' for explicit count)
 
     Returns:
@@ -182,6 +199,7 @@ def smart_video_nframes(
             frame_factor=frame_factor,
             min_frames=target_frames,
             max_frames=target_frames,
+            frame_selection=frame_selection,
         )
     else:
         indices, pad_count = calculate_frame_indices(
@@ -191,6 +209,7 @@ def smart_video_nframes(
             frame_factor=frame_factor,
             min_frames=min_frames,
             max_frames=max_frames,
+            frame_selection=frame_selection,
         )
 
     video = video[indices]

@@ -1,0 +1,102 @@
+# Cosmos3-Nano stage 2 of 2: train on the latent cache written by cosmos3_sft_embedding.yaml.
+
+model:
+  model_path: pretrained_models/Cosmos3-Nano/transformer
+  condition_model_path: pretrained_models/Cosmos3-Nano
+  config_path: configs/model_configs/cosmos3/cosmos3_nano.json
+  model_config:
+    loss_scale: 1.0
+  condition_model_cfg:
+    vae_dtype: bfloat16
+    resolution: "256"
+    num_train_timesteps: 1000
+    train_time_video_distribution: "waver"
+    latent_patch_size: 2
+    max_sequence_length: 2048
+    conditioning_config:  # clean latent-prefix frames: 70% T2V, 20% I2V, 10% V2V
+      0: 0.7
+      1: 0.2
+      2: 0.1
+    shift:
+      "256": 3
+      "480": 5
+      "720": 10
+
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 0.0
+    lr_warmup_ratio: 0.1
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.0
+    max_grad_norm: 0.1
+    betas: [0.9, 0.95]
+
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      mixed_precision:
+        enable: false
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      enable_async_activation: false
+
+data:
+  train_path: output/cosmos3_latent_cache
+  train_size: 1000000000000
+  datasets_type: mapping
+  data_type: diffusion
+  text_keys: caption
+  max_seq_len: 45056
+  dyn_bsz_buffer_size: 1
+  log_sample: false
+  source_name: cosmos3_sft_jsonl
+  data_transform: dit_offline
+  dataloader:
+    type: native
+    num_workers: 1
+    use_background_prefetcher: true
+    drop_last: true
+  mm_configs:
+    data_dir: dataset/cosmos3-demo
+    fps: 5
+    min_frames: 5
+    max_frames: 117
+    frame_selection: prefix
+    frame_factor: 4
+    frame_factor_remainder: 1
+    cfg_dropout_rate: 0.1
+
+train:
+  training_task: offline_training
+  global_batch_size: 16
+  micro_batch_size: 1
+  dyn_bsz: true
+  bsz_warmup_ratio: 0.0
+  max_steps: 500
+  num_train_epochs: 1
+  seed: 42
+  checkpoint:
+    output_dir: output/cosmos3_sft
+    save_steps: 999999
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: veomni_dit
+    name: cosmos3_nano_sft

@@ -1,0 +1,45 @@
+{
+  "_class_name": "Cosmos3MoTTransformer",
+  "model_type": "Cosmos3MoTTransformer",
+  "condition_model_type": "Cosmos3ConditionModel",
+  "architectures": [
+    "Cosmos3MoTTransformer"
+  ],
+  "tie_word_embeddings": false,
+  "vocab_size": 151936,
+  "hidden_size": 4096,
+  "intermediate_size": 12288,
+  "moe_intermediate_size": 12288,
+  "num_hidden_layers": 36,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "max_position_embeddings": 262144,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 5000000.0,
+  "rope_scaling": {
+    "mrope_interleaved": true,
+    "mrope_section": [
+      24,
+      20,
+      20
+    ],
+    "rope_type": "default"
+  },
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "qk_norm_for_text": true,
+  "qk_norm_for_diffusion": true,
+  "use_und_k_norm_for_gen": true,
+  "latent_downsample_factor": 16,
+  "latent_channel": 48,
+  "latent_patch_size": 2,
+  "patch_latent_dim": 192,
+  "timestep_scale": 0.001,
+  "base_fps": 24,
+  "enable_fps_modulation": true,
+  "temporal_compression_factor": 4,
+  "unified_3d_mrope_temporal_modality_margin": 15000,
+  "train_joint_reasoner": false
+}
