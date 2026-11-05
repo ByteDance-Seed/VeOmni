@@ -23,10 +23,12 @@ from veomni.checkpoint.dcp_checkpointer import (
     _export_extra_parallel_layout_key,
     _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
+    _from_local_preserve_device,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
     _needs_extra_parallel_layout_marker,
     _process_shard,
+    drop_extra_parallel_dim,
     drop_extra_parallel_dim_v2,
     restore_extra_parallel_dim,
     restore_extra_parallel_dim_v2,
@@ -35,6 +37,66 @@ from veomni.distributed.parallel_plan import SpecInfo
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+@pytest.mark.parametrize("requires_grad", [False, True])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_legacy_cpu_shards_keep_stride_and_negative_axis(requires_grad, noncontiguous, grad_enabled):
+    class FakeMesh:
+        def __init__(self, shape):
+            self.device_type = "xpu"
+            self.mesh = torch.zeros(shape, dtype=torch.int64)
+            self.ndim = len(shape)
+            self.mesh_dim_names = tuple(f"d{i}" for i in range(self.ndim))
+
+        def size(self, dim=None):
+            return self.mesh.numel() if dim is None else self.mesh.size(dim)
+
+        def get_coordinate(self):
+            return [0] * self.ndim
+
+    full, sub = FakeMesh((2, 2)), FakeMesh((2,))
+    local = torch.arange(24, dtype=torch.float32).reshape(3, 8)[:, ::2]
+    if not noncontiguous:
+        local = local.contiguous()
+    local.requires_grad_(requires_grad)
+    with torch.set_grad_enabled(grad_enabled):
+        original = _from_local_preserve_device(local, sub, [Shard(0)])
+        restored = restore_extra_parallel_dim(original, full, sub, ep_shard_dim=-2, fsdp_shard_dim=0)
+        dropped = drop_extra_parallel_dim(restored, sub, fsdp_shard_dim=-2)
+    assert dropped.placements == (Shard(0),)
+    for value in (original, restored, dropped):
+        assert value.to_local().data_ptr() == local.data_ptr()
+        assert value.to_local().stride() == local.stride()
+        assert value.stride() == local.stride()
+        assert value.requires_grad == requires_grad
+        assert value._local_tensor.requires_grad == requires_grad
+
+
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_matching_cpu_mesh_matches_native_dtensor_grad_state(grad_enabled):
+    class FakeMesh:
+        device_type = "cpu"
+        ndim = 1
+        mesh = torch.zeros(2, dtype=torch.int64)
+        mesh_dim_names = ("d0",)
+
+        def size(self, dim=None):
+            return 2
+
+        def get_coordinate(self):
+            return [0]
+
+    local = torch.arange(24, dtype=torch.float32).reshape(3, 8)[:, ::2].detach().requires_grad_(True)
+    mesh = FakeMesh()
+    with torch.set_grad_enabled(grad_enabled):
+        reference = DTensor.from_local(local, device_mesh=mesh, placements=[Shard(0)], run_check=False)
+        actual = _from_local_preserve_device(local, mesh, [Shard(0)])
+    assert actual.requires_grad == reference.requires_grad
+    assert actual._local_tensor.requires_grad == reference._local_tensor.requires_grad
+    assert actual._local_tensor.data_ptr() == local.data_ptr()
+    assert actual.stride() == reference.stride()
 
 
 def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim, rows=5):
