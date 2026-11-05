@@ -260,8 +260,8 @@ def _streaming_topk(
     batch, seq_len, _, _ = q.shape
     pool = k.shape[1]
     width = min(topk, pool)
-    if width == 0:
-        shape = (batch, seq_len, 0)
+    if batch * seq_len == 0 or width == 0:
+        shape = (batch, seq_len, width)
         return q.new_empty(shape, dtype=torch.float32), torch.empty(shape, dtype=torch.int32, device=q.device)
 
     chunk = _pool_chunk_width(batch, seq_len, pool)
@@ -270,7 +270,9 @@ def _streaming_topk(
         pool_end = min(pool_start + chunk, pool)
         scores = _pool_scores(q, k, w, ks, ke, pool_start, pool_end)
         values, local_indices = scores.topk(min(width, pool_end - pool_start), dim=-1)
+        del scores
         indices = local_indices + pool_start
+        del local_indices
         indices = torch.where(torch.isfinite(values), indices, -1).to(torch.int32)
         if running_values is None:
             running_values, running_indices = values, indices
@@ -279,8 +281,11 @@ def _streaming_topk(
         candidate_indices = torch.cat((running_indices, indices), dim=-1)
         running_values, selected = candidate_values.topk(min(width, candidate_values.shape[-1]), dim=-1)
         running_indices = torch.gather(candidate_indices, -1, selected)
+        del candidate_values, candidate_indices, selected, values, indices
 
-    running_indices = torch.where(torch.isfinite(running_values), running_indices, -1)
+    finite = torch.isfinite(running_values)
+    running_indices = torch.where(finite, running_indices, -1)
+    running_values = torch.where(finite, running_values, float("-inf"))
     return running_values, running_indices
 
 
@@ -445,8 +450,8 @@ def triton_lighting_indexer(
                 f"DeepSeek V4 Triton indexer requires topk_indices [B={batch}, S={seq_len}, K], "
                 f"got {tuple(topk_indices.shape)}"
             )
-        if topk_indices.dtype not in (torch.int32, torch.int64):
-            raise ValueError(f"DeepSeek V4 Triton indexer requires int32/int64 topk_indices, got {topk_indices.dtype}")
+        if topk_indices.dtype is not torch.int32:
+            raise ValueError(f"DeepSeek V4 Triton indexer requires int32 topk_indices, got {topk_indices.dtype}")
         if topk_indices.device != index_q.device:
             raise ValueError(
                 "DeepSeek V4 Triton indexer requires topk_indices on the q device, got "
@@ -464,12 +469,9 @@ def triton_lighting_indexer(
                 "Packed indexer ranges must have shape "
                 f"({seq_len},), got {tuple(cu_seqlen_ks.shape)} and {tuple(cu_seqlen_ke.shape)}"
             )
-        if cu_seqlen_ks.dtype not in (torch.int32, torch.int64) or cu_seqlen_ke.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
+        if cu_seqlen_ks.dtype is not torch.int32 or cu_seqlen_ke.dtype is not torch.int32:
             raise ValueError(
-                "DeepSeek V4 Triton indexer requires int32/int64 packed ranges, got "
+                "DeepSeek V4 Triton indexer requires int32 packed ranges, got "
                 f"{cu_seqlen_ks.dtype} and {cu_seqlen_ke.dtype}"
             )
         if cu_seqlen_ks.device != index_q.device or cu_seqlen_ke.device != index_q.device:

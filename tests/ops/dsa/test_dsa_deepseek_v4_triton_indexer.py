@@ -16,6 +16,7 @@
 
 import importlib.util
 import sys
+import weakref
 from types import ModuleType
 
 import pytest
@@ -137,6 +138,37 @@ def test_triton_indexer_streaming_topk_matches_packed_reference(monkeypatch):
 
 
 @requires_rocm
+def test_triton_indexer_releases_score_chunk_before_allocating_the_next(monkeypatch):
+    from veomni.ops.kernels.dsa.vendor import triton_indexer
+
+    q, k, weights = _inputs(4, 1, 8, 128, 4, seed=15)
+    ks = torch.zeros(4, device="cuda", dtype=torch.int32)
+    ke = torch.full((4,), 4, device="cuda", dtype=torch.int32)
+    references = []
+
+    def fake_pool_scores(q, _k, _w, _ks, _ke, pool_start, pool_end):
+        if references:
+            assert references[-1]() is None, "the previous full score chunk survived into the next allocation"
+        scores = (
+            torch.arange(pool_start, pool_end, device=q.device, dtype=torch.float32)
+            .view(1, 1, -1)
+            .expand(q.shape[0], q.shape[1], -1)
+            .clone()
+        )
+        references.append(weakref.ref(scores))
+        return scores
+
+    monkeypatch.setattr(triton_indexer, "_pool_scores", fake_pool_scores)
+    monkeypatch.setattr(triton_indexer, "_SCORES_CHUNK_BYTES", q.shape[0] * q.shape[1] * 2 * 4)
+    values, indices = triton_indexer._streaming_topk(
+        q.transpose(0, 1), k.transpose(0, 1), weights.transpose(0, 1), ks, ke, 2
+    )
+
+    assert values.shape == indices.shape == (1, 4, 2)
+    assert references[-1]() is None
+
+
+@requires_rocm
 def test_triton_indexer_score_chunk_budget_bounds_long_context_memory():
     from veomni.ops.kernels.dsa.vendor import triton_indexer
 
@@ -188,6 +220,38 @@ def test_triton_indexer_handles_an_empty_pool():
 
 
 @requires_rocm
+@pytest.mark.parametrize(("seq_len", "batch"), ((0, 1), (4, 0)))
+def test_triton_indexer_handles_empty_query_rows(seq_len, batch):
+    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+
+    heads, dim, pool, topk = 8, 128, 2, 2
+    q = torch.empty(seq_len, batch, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.empty(pool, batch, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.empty(seq_len, batch, heads, device="cuda", dtype=torch.float32, requires_grad=True)
+
+    scores, indices = triton_lighting_indexer(q, k, weights, compress_ratio=4, topk=topk)
+    assert scores.shape == indices.shape == (batch, seq_len, topk)
+    (scores.sum() + q.float().sum() * 0 + k.float().sum() * 0 + weights.sum() * 0).backward()
+    for grad in (q.grad, k.grad, weights.grad):
+        assert torch.equal(grad, torch.zeros_like(grad))
+
+
+@requires_rocm
+def test_triton_indexer_turns_nonfinite_topk_scores_into_invalid_slots():
+    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+
+    value = torch.finfo(torch.bfloat16).max
+    q = torch.full((2, 1, 16, 64), value, device="cuda", dtype=torch.bfloat16)
+    k = torch.full((2, 1, 64), value, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(2, 1, 16, device="cuda", dtype=torch.float32)
+
+    scores, indices = triton_lighting_indexer(q, k, weights, compress_ratio=1, topk=2)
+    assert torch.equal(indices, torch.full_like(indices, -1))
+    assert torch.isneginf(scores).all()
+    assert not torch.isnan(scores).any()
+
+
+@requires_rocm
 @pytest.mark.parametrize(
     ("heads", "dim", "q_dtype", "w_dtype", "match"),
     (
@@ -228,14 +292,16 @@ def test_triton_indexer_rejects_mismatched_shapes_devices_and_indices():
     bad_shape = torch.zeros(2, 8, 2, device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match=r"topk_indices \[B=1, S=8, K\]"):
         triton_lighting_indexer(q, k, weights, 4, 2, bad_shape)
-    bad_dtype = torch.zeros(1, 8, 2, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="int32/int64 topk_indices"):
-        triton_lighting_indexer(q, k, weights, 4, 2, bad_dtype)
+    for bad_dtype in (torch.float32, torch.int64):
+        bad_indices = torch.zeros(1, 8, 2, device="cuda", dtype=bad_dtype)
+        with pytest.raises(ValueError, match="int32 topk_indices"):
+            triton_lighting_indexer(q, k, weights, 4, 2, bad_indices)
 
-    ks = torch.zeros(8, device="cuda", dtype=torch.float32)
     ke = torch.ones(8, device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match="int32/int64 packed ranges"):
-        triton_lighting_indexer(q, k, weights, 4, 2, cu_seqlen_ks=ks, cu_seqlen_ke=ke)
+    for bad_dtype in (torch.float32, torch.int64):
+        ks = torch.zeros(8, device="cuda", dtype=bad_dtype)
+        with pytest.raises(ValueError, match="int32 packed ranges"):
+            triton_lighting_indexer(q, k, weights, 4, 2, cu_seqlen_ks=ks, cu_seqlen_ke=ke)
 
 
 @requires_rocm
