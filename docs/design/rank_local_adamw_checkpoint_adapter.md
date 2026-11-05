@@ -62,14 +62,14 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L105)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L170)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
-[`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L89)
+[`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L121)
 uses `state_dtype` to check initialized fields against their declared precision.
 During load,
-[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L408)
+[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L466)
 checks stored field dtypes and uses `state_is_offloaded` to allocate missing
 destination state on CPU when the adapter specifies offload.
 [`rank_local_adamw_context`](../../veomni/optim/checkpoint_adapter.py#L55)
@@ -87,7 +87,7 @@ must also be validated for an offloading implementation.
 
 ## Framework call sites and restore behavior
 
-1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L563)
+1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L568)
    enters the context around PyTorch's
    optimizer-state serialization. Registered adapter implementations must
    preserve live state and serialize all initialized fields and group options
@@ -98,7 +98,7 @@ must also be validated for an offloading implementation.
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
-3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L601)
+3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L622)
    enters the context again while
    PyTorch applies the optimizer state. The trusted adapter must restore every
    validated field without changing its value or dtype. An optimizer may

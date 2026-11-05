@@ -246,7 +246,7 @@ The resource queue, plan model, batching, inventory reconciliation, and result
 format are backend-neutral. Device discovery, permitted physical IDs, child
 visibility, logical-rank mapping, and backend-specific cleanup belong to a
 small accelerator adapter. Use the
-[device helpers](../../veomni/utils/device.py#L41) for CUDA/NPU and NCCL/HCCL
+[device helpers](../../veomni/utils/device.py#L46) for CUDA/NPU and NCCL/HCCL
 selection.
 
 The adapter may allocate only from the runner's owned slice. NPU
