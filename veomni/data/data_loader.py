@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Literal, Optional
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler as TorchDataStatefulDistributedSampler
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
@@ -46,6 +46,22 @@ logger = logging.get_logger(__name__)
 
 def build_dataloader(dataloader_type: str, **kwargs):
     return DATALOADER_REGISTRY[dataloader_type](**kwargs)
+
+
+class StatefulDistributedSampler(TorchDataStatefulDistributedSampler):
+    """Checkpoint shuffle epoch together with the consumed sample position."""
+
+    def set_epoch(self, epoch: int) -> None:
+        super().set_epoch(epoch)
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+
+    def state_dict(self):
+        return {**super().state_dict(), "epoch": self.epoch}
+
+    def load_state_dict(self, state):
+        self.set_epoch(state.get("epoch", self.epoch))
+        super().load_state_dict(state)
 
 
 class DistributedDataloader(StatefulDataLoader):

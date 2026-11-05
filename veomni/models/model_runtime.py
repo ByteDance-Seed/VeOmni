@@ -440,6 +440,9 @@ class VeOmniModelRuntime:
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping
+        additional_weight_sources = self._additional_weight_sources()
+        if additional_weight_sources:
+            kwargs["additional_weight_sources"] = additional_weight_sources
 
         skip_hf_weight_load = self.skip_hf_weight_load
         if skip_hf_weight_load:
@@ -488,6 +491,9 @@ class VeOmniModelRuntime:
             **kwargs,
         )
         self.model.train()
+
+    def _additional_weight_sources(self) -> tuple[tuple[str, str], ...]:
+        return ()
 
     def _setup_lora(self) -> None:
         """Wrap :attr:`model` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.

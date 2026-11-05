@@ -37,6 +37,8 @@ usage/support_new_models/dit_model_guide.md
 usage/checkpoint.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/trainer_loss_reduction.md
+usage/clef_decision.md
 usage/agent_workflow.md
 usage/hdfs_fuse_patch.md
 testing.md
@@ -130,6 +132,7 @@ design/module_config.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/decision_models.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md

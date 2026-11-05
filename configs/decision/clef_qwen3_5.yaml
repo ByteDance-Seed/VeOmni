@@ -1,0 +1,52 @@
+model:
+  model_path: /path/to/Cloudflare/clef-flash
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: liger_kernel
+    rms_norm_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+    rotary_pos_emb_implementation: liger_kernel
+    load_balancing_loss_implementation: triton
+    rms_norm_gated_implementation: fla
+    causal_conv1d_implementation: fla
+    chunk_gated_delta_rule_implementation: fla
+  accelerator:
+    dp_replicate_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  optimizer:
+    type: adamw
+    lr: 0.00002
+    lr_min: 0.000002
+    lr_warmup_ratio: 0.05
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+train:
+  dyn_bsz: true
+  micro_batch_size: 1
+  global_batch_size: 8
+  num_train_epochs: 3
+  checkpoint:
+    output_dir: outputs/decision/clef_qwen3_5
+    save_steps: 50
+    save_hf_weights: true
+data:
+  dataset: LocalLLaMA/typed-decisions
+  validation_fraction: 0.1
+  max_seq_len: 4096
+  train_size: 10000000
+  shuffle_choices: false
+  dataloader:
+    num_workers: 2
+    pin_memory: false
+    drop_last: false
+decision:
+  decision_model: clef
+  decision_model_config: {}  # Optional CLEF head_config / head_path overrides.
+  loss_type: soft_ce
