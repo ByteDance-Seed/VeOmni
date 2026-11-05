@@ -34,7 +34,9 @@ from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RT
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
+from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.import_utils import is_package_available
 
 
 def _qwen3_classes():
@@ -389,3 +391,72 @@ def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
         )
         torch.testing.assert_close(sp_attn_proj, ref_attn_proj, atol=EAGER_ATOL, rtol=EAGER_RTOL)
         assert ref_logits.shape == (1, 8, config.vocab_size)
+
+
+@pytest.mark.skipif(
+    not is_package_available("torchao"),
+    reason="the torchao_mxfp4 linear/swiglu_mlp rows need the optional 'torchao' package",
+)
+@pytest.mark.parametrize("linear_impl", ["eager", "torchao_mxfp4"])
+def test_qwen3_wires_the_configured_linear_implementation(linear_impl: str):
+    """Attention projections and the fused MLP read their own op field, not module type."""
+    import copy
+
+    config = copy.deepcopy(_tiny_config())
+    ours = _build_qwen3(
+        config,
+        SimpleNamespace(
+            **{
+                **vars(eager_ops_config()),
+                "linear_implementation": linear_impl,
+                "swiglu_mlp_implementation": "eager",
+            }
+        ),
+    )
+
+    attention = ours.model.layers[0].self_attn
+    assert isinstance(attention.veomni_linear, VeomniOp)
+    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
+    assert attention.veomni_linear.impl == linear_impl
+    assert ours.model.layers[0].mlp.veomni_swiglu_mlp.impl == "eager"
+
+
+@pytest.mark.skipif(
+    not is_package_available("torchao"),
+    reason="the torchao_mxfp4 linear/swiglu_mlp rows need the optional 'torchao' package",
+)
+def test_qwen3_mxfp4_qat_trains_and_rounds():
+    """Both op families quantize: logits move away from eager and every gradient stays finite."""
+    import copy
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    eager = _build_qwen3(copy.deepcopy(config))
+    quantized = _build_qwen3(
+        copy.deepcopy(config),
+        SimpleNamespace(
+            **{
+                **vars(eager_ops_config()),
+                "linear_implementation": "torchao_mxfp4",
+                "swiglu_mlp_implementation": "torchao_mxfp4",
+            }
+        ),
+    )
+    quantized.load_state_dict(eager.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    eager_logits = eager(input_ids=input_ids, use_cache=False).logits
+    quantized_logits = quantized(input_ids=input_ids, use_cache=False).logits
+    assert not torch.equal(quantized_logits, eager_logits)
+    assert torch.isfinite(quantized_logits).all()
+
+    loss = quantized(input_ids=input_ids, labels=input_ids, use_cache=False).loss
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    attention = quantized.model.layers[0].self_attn
+    for name, param in _named_trainable(quantized).items():
+        assert param.grad is not None, name
+        assert torch.isfinite(param.grad).all(), name
+    assert torch.count_nonzero(attention.q_proj.weight.grad) > 0
+    assert torch.count_nonzero(quantized.model.layers[0].mlp.gate_proj.weight.grad) > 0
