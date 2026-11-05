@@ -32,8 +32,8 @@ Two Qwen3-VL specifics the backbone reconstructs from `conversation_list`:
 replace each with an absolute path (or an `hdfs://` URL) this job can read before
 launching. Both are resolved by plain filesystem checks — `model_path` by looking
 for `config.json`, a dataset source by `os.path.isdir` / `isfile` — so a bare
-name fails instead of being expanded against some storage root. Checkpoints are
-split first (step 1), datasets are your own copies.
+name fails instead of being expanded against some storage root. The checkpoint
+may be the upstream HF root or a split one (step 1); datasets are your own copies.
 
 Config dir: `configs/seed_omni/Qwen/qwen3vl/`
 
@@ -56,22 +56,32 @@ checkpoint, and `model.model_path` alone picks which one.
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Checkpoint
 
-The converter reads `model_type=qwen3_vl` from the HF `config.json` and dispatches
-to the Qwen3-VL family converter (`modules/qwen3vl/convert_model.py`), splitting
-the weights into `qwen3vl_vision/`, `qwen3vl_text_encoder/` (embeddings +
-tokenizer) and `qwen3vl_llm/` (backbone).
+Qwen3-VL registers an HF layout (`modules/qwen3vl/hf_layout.py`), so
+`model.model_path` can be the **upstream checkpoint itself** — `base.yaml` already
+points at one, and no offline split is needed. The layout routes
+`model.visual.*` to `qwen3vl_vision`, `model.language_model.embed_tokens.*` (and
+`lm_head.*`) plus the tokenizer and both image/video processors to
+`qwen3vl_text_encoder`, and the rest of `model.language_model.*` to
+`qwen3vl_llm`. HF exports are then written in the upstream layout (see
+[Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
+
+The offline split still works, through the same key map, and is what a
+cross-family composed model needs:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir Qwen3-VL-2B-Instruct-split
+  --model_path /abs/path/to/Qwen3-VL-2B-Instruct \
+  --output_dir /abs/path/to/Qwen3-VL-2B-Instruct-split
 ```
 
-The `output_dir` becomes `model.model_path` in `base.yaml`.
+Either root works as `model.model_path`; a split root holds `qwen3vl_vision/`,
+`qwen3vl_text_encoder/` and `qwen3vl_llm/`.
 (Qwen3-VL-2B has `tie_word_embeddings=True`, so `qwen3vl_text_encoder` stores only
-`embed_tokens` and the decode head reuses that table via `embed_tokens.project`.)
+`embed_tokens` and the decode head reuses that table via `embed_tokens.project`.
+The upstream file still stores a copy as `lm_head.weight`; the load skips it and
+the export rewrites it from the trained embedding.)
 
 ---
 
@@ -176,15 +186,16 @@ SeedOmni has **two inference entry points**:
 
 | Script | Checkpoint | Runtime | When to use |
 |--------|------------|---------|-------------|
-| `tasks/omni/infer_omni.py` | Split SeedOmni root | VeOmni runtime — `OmniModelRuntimeArguments` + generation FSM; optional per-module FSDP | Distributed inference or launcher-YAML overrides |
-| `tasks/omni/infer_omni_native.py` | Split SeedOmni root | ``OmniModel.from_pretrained`` — all modules eager, simple process + generate | Single-process smoke tests and quick experiments |
+| `tasks/omni/infer_omni.py` | Upstream HF root or split SeedOmni root | VeOmni runtime — `OmniModelRuntimeArguments` + generation FSM; optional per-module FSDP | Distributed inference or launcher-YAML overrides |
+| `tasks/omni/infer_omni_native.py` | Upstream HF root or split SeedOmni root | ``OmniModel.from_pretrained`` — all modules eager, simple process + generate | Single-process smoke tests and quick experiments |
 
 ### 5.1 VeOmni runtime (`infer_omni.py`)
 
-`tasks/omni/infer_omni.py` runs the `vision_understanding` generation graph. Point
-`model.model_path` at a **split-checkpoint root** holding `qwen3vl_vision/`,
-`qwen3vl_text_encoder/` and `qwen3vl_llm/`. The step-1 converter output already
-has this layout, so you can infer directly:
+`tasks/omni/infer_omni.py` runs the `vision_understanding` generation graph.
+`model.model_path` is either the **upstream Qwen3-VL root** (what `base.yaml`
+points at, loaded through the HF layout) or a split root holding
+`qwen3vl_vision/`, `qwen3vl_text_encoder/` and `qwen3vl_llm/`. `base.yaml` already
+points at an upstream root, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
@@ -214,8 +225,12 @@ Qwen3-VL has no audio tower — `vision/processing.py` decodes only a clip's fra
 and skips its waveform — so keep `--infer.mm_configs.use_audio_in_video false`
 (the default) and never also pass `--infer.audios`.
 
-To infer from a **trained** checkpoint, assemble a flat root from the per-module
-`hf_ckpt/` subfolders (same pattern as Janus):
+To infer from a **trained** checkpoint, there are two shapes depending on what
+`model.model_path` was. Trained from the **upstream root**, the export is one
+Qwen3-VL checkpoint under `<step_dir>/hf_ckpt/`, so infer from it directly with
+`--model.model_path <step_dir>/hf_ckpt` (it loads in `transformers` too). Trained
+from a **split root**, each module exports its own `hf_ckpt/` subfolder; assemble
+a flat root from them:
 
 ```bash
 STEP=outputs/qwen3vl_omni_sft/checkpoints/global_step_500
@@ -249,7 +264,7 @@ CLI equivalent:
 
 ```bash
 python tasks/omni/infer_omni_native.py \
-  --model_path Qwen3-VL-2B-Instruct-split \
+  --model_path /abs/path/to/Qwen3-VL-2B-Instruct \
   --infer_type vision_understanding \
   --prompt "Describe this image." \
   --image /path/to/image.jpg \

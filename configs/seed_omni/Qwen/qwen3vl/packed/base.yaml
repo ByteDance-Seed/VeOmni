@@ -4,8 +4,9 @@
 # preprocessor; graph nodes are pack_encode / pack_forward / pack_decode.
 # Inference graphs are unchanged (conversation FSM).
 #
-# Prerequisite — split the upstream Qwen3-VL checkpoint (there is no `qwen3_vl`
-# HF layout, so this recipe cannot load the upstream root directly):
+# Prerequisite — split the upstream Qwen3-VL checkpoint, OR point `model_path`
+# straight at the upstream root: `qwen3vl/hf_layout.py` registers a `qwen3_vl`
+# HF layout, so an upstream checkpoint loads with no offline split.
 #   python scripts/seed_omni/convert_model.py \
 #     --model_path Qwen3-VL-2B-Instruct \
 #     --output_dir Qwen3-VL-2B-Instruct-split
@@ -19,7 +20,7 @@
 # `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
 # absolute paths this job can read before training.
 model:
-  model_path: Qwen3-VL-2B-Instruct-split
+  model_path: Qwen3-VL-2B-Instruct
   model_config:
     modules: configs/seed_omni/Qwen/qwen3vl/packed/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3vl/packed/graph_train.yaml

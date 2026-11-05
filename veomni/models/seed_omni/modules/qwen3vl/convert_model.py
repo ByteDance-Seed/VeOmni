@@ -43,6 +43,16 @@ def _qwen3vl_for_causal_lm():
     return Qwen3VLForConditionalGeneration
 
 
+def _build_kwargs(attn_implementation: str | None) -> dict[str, Any]:
+    """``_from_config`` kwargs recording an explicit attention backend, if one was asked for.
+
+    A module built without one keeps its config default, which is what a plain
+    convert wants; on a host that cannot run that default (CPU, no flash-attn)
+    the caller passes ``eager`` and the split records it.
+    """
+    return {"attn_implementation": attn_implementation} if attn_implementation is not None else {}
+
+
 def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Split an upstream Qwen3-VL checkpoint into three SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
@@ -52,6 +62,11 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
         training_graph=kwargs.pop("training_graph", None),
         generation_graph=kwargs.pop("generation_graph", None),
     )
+    # The upstream model is instantiated to read its weights, so it needs an
+    # attention backend this host can actually build. `convert_with_hf_layout`
+    # honours this argument for layout-driven families; the converter path has to
+    # do the same or a CPU host dies in `_check_and_adjust_attn_implementation`.
+    attn_implementation = kwargs.pop("attn_implementation", None)
     del kwargs
     print(f"Loading Qwen3-VL from: {model_path}")
     import veomni.models.seed_omni.modules  # noqa: F401
@@ -64,7 +79,11 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     Qwen3VLLlm = OMNI_MODEL_REGISTRY["qwen3vl_llm"]()
     Qwen3VLLlmConfig = OMNI_CONFIG_REGISTRY["qwen3vl_llm"]()
 
-    model = _qwen3vl_for_causal_lm().from_pretrained(model_path, device_map="cpu")
+    model = _qwen3vl_for_causal_lm().from_pretrained(
+        model_path,
+        device_map="cpu",
+        **({"attn_implementation": attn_implementation} if attn_implementation is not None else {}),
+    )
     model.eval()
     cfg = model.config
     text_cfg = cfg.text_config
@@ -73,7 +92,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     print("Extracting qwen3vl_vision ...")
     vision_cfg = Qwen3VLVisionEncoderConfig(vision_config=cfg.vision_config.to_dict())
     with no_init_weights(), init_empty_weights():
-        vision = Qwen3VLVisionEncoder._from_config(vision_cfg)
+        vision = Qwen3VLVisionEncoder._from_config(vision_cfg, **_build_kwargs(attn_implementation))
     vision.visual.load_state_dict(inner.visual.state_dict(), assign=True)
     # Two distinct processors / configs, both loaded by the vision module:
     #   image -> preprocessor_config.json       (Qwen2VLImageProcessor)
@@ -92,7 +111,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
         lm_head_bias=False,
     )
     with no_init_weights(), init_empty_weights():
-        te = Qwen3VLTextEncoder._from_config(te_cfg)
+        te = Qwen3VLTextEncoder._from_config(te_cfg, **_build_kwargs(attn_implementation))
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict(), assign=True)
     if not tie_word_embeddings and model.lm_head is not None:
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
@@ -106,7 +125,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
         spatial_merge_size=cfg.vision_config.spatial_merge_size,
     )
     with no_init_weights(), init_empty_weights():
-        llm = Qwen3VLLlm._from_config(llm_cfg)
+        llm = Qwen3VLLlm._from_config(llm_cfg, **_build_kwargs(attn_implementation))
     src = {k: v for k, v in inner.language_model.state_dict().items() if not k.startswith("embed_tokens.")}
     llm.language_model.load_state_dict(src, assign=True, strict=False)
 
