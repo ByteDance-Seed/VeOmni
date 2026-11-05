@@ -33,19 +33,27 @@ from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
 
+#: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
+#: Only these need a projection's own ``weight``; every other row is a plain
+#: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
+QUANTIZING_IMPLS = frozenset({"torchao_mxfp4"})
+
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
     A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead.
+    its own forward, so the MLP has to call the projection modules instead. The
+    fused rows that only read the tensors still work that way, because their own
+    ``forward`` accepts the modules' inputs.
 
     Raises:
         ValueError: when the projections are wrapped while ``mlp``'s own
-            ``swiglu_mlp`` selection quantizes. Falling back would run the base
+            ``swiglu_mlp`` selection is a fake-quantizing row. Such a row cannot
+            read a weight it is not handed, and falling back would run the base
             layers at full precision while the config still claims
-            quantization-aware training, which is a silent correctness bug
-            rather than a graceful degradation.
+            quantization-aware training -- a silent correctness bug, not a
+            graceful degradation. Every non-quantizing row keeps the fallback.
     """
     plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
     if plain:
@@ -53,7 +61,7 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
 
     handle = getattr(mlp, "veomni_swiglu_mlp", None)
     impl = getattr(handle, "impl", None)
-    if impl is not None and impl != "eager":
+    if impl in QUANTIZING_IMPLS:
         raise ValueError(
             f"swiglu_mlp_implementation={impl!r} cannot run on a wrapped projection: the row fake-quantizes "
             "the projection weights it is handed, and a layer substituted after construction (LoRA) keeps "
