@@ -975,6 +975,16 @@ def test_omni_model_resolve_generation_kwargs_uses_config_defaults():
     }
     assert model.resolve_generation_kwargs({"max_new_tokens": 8}) == {"max_new_tokens": 8}
 
+    model.config.infer_type = "infer_gen"
+    assert model.resolve_generation_kwargs(None) == {
+        "max_new_tokens": 64,
+        "infer_type": "infer_gen",
+    }
+    assert model.resolve_generation_kwargs({"infer_type": "infer_und"}) == {
+        "max_new_tokens": 64,
+        "infer_type": "infer_und",
+    }
+
 
 def test_omni_model_post_init_unions_child_no_split_modules():
     """HF ``post_init`` (re-run after children are attached) is the aggregator."""

@@ -502,6 +502,11 @@ class _FakeBagelTokenizer:
     def convert_tokens_to_ids(self, token):
         return self.special_tokens.get(token, self.unk_token_id)
 
+    def decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        special_by_id = {v: k for k, v in self.special_tokens.items()}
+        return "".join(special_by_id.get(int(t), chr(max(32, int(t)))) for t in token_ids)
+
     def __call__(self, text, add_special_tokens=False):
         del add_special_tokens
         input_ids = []

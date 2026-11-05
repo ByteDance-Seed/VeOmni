@@ -99,7 +99,7 @@ class BagelTextEncoder(TextEncoder):
                 device=self.device,
                 dtype=self.dtype,
             )
-            infer_type = str((generation_kwargs or {}).get("infer_type", ""))
+            infer_type = str((generation_kwargs or {}).get("infer_type") or "infer_und")
             if infer_type == "infer_und" and not self._bos_injected:
                 input_ids = self._token_id_tensor(self._chat_template.bos_token_id)
                 start_embed = self.encode(input_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)

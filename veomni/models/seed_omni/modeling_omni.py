@@ -664,6 +664,8 @@ class OmniModel(PreTrainedModel):
         self.generation_graph.validate_modules({name: self.get_module(name) for name in self._module_names})
         ctx: dict[str, Any] = request
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
+        if "infer_type" not in generation_kwargs and self.config.generation_graphs:
+            generation_kwargs["infer_type"] = next(iter(self.config.generation_graphs))
 
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         max_steps = max_new_tokens
@@ -715,6 +717,8 @@ class OmniModel(PreTrainedModel):
     ) -> dict[str, Any]:
         """Merge :attr:`~OmniConfig.generation_kwargs` defaults with per-request overrides."""
         resolved = dict(self.config.generation_kwargs or {})
+        if self.config.infer_type is not None:
+            resolved.setdefault("infer_type", self.config.infer_type)
         resolved.update(generation_kwargs or {})
         return resolved
 

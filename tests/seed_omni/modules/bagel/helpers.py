@@ -87,7 +87,9 @@ def load_omni_config(
     if train_graph_path is not None:
         model_config["train_graph"] = str(train_graph_path)
     if infer_graph_path is not None:
-        model_config["infer_graph"] = str(infer_graph_path)
+        scenario = infer_graph_path.stem.removeprefix("graph_")
+        model_config["infer_graph"] = {scenario: str(infer_graph_path)}
+        model_config["infer_type"] = scenario
     args = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=model_path,

@@ -553,3 +553,134 @@ class _InferEditBagelFlow(_InferGenBagelFlow):
                 item.value = torch.zeros(16, 8)
                 item.meta = {BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT}
         return {"conversation_list": conversation_list}
+
+
+def test_bagel_native_omni_model_and_processor_propagate_resolved_infer_type_without_duplication(tmp_path):
+    """Verify native ``OmniProcessor`` and ``OmniModel.generate`` propagate ``config.infer_type`` to preprocessing and module calls without caller duplication."""
+    from tests.seed_omni.modules.bagel.test_processing import _bagel_template, _FakeBagelTokenizer
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+        BagelSiglipNavitPreprocessor,
+        BagelSiglipNavitProcessor,
+    )
+    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import BagelTextEncoderPreprocessor
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEPreprocessor, BagelVAEProcessor
+    from veomni.models.seed_omni.processing_omni import OmniProcessor
+
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (8, 8), color=(12, 34, 56)).save(str(image_path))
+
+    def _build_preprocessors():
+        return {
+            "bagel_vae": BagelVAEPreprocessor(
+                BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+                dtype=torch.float32,
+            ),
+            "bagel_siglip_navit": BagelSiglipNavitPreprocessor(
+                BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
+                dtype=torch.float32,
+            ),
+            "bagel_text_encoder": BagelTextEncoderPreprocessor(_bagel_template()),
+        }
+
+    # 1. Default converted checkpoint scenario (infer_und): real BagelTextEncoder + BagelQwen2MoT
+    und_cfg = load_omni_config(
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_und.yaml",
+    )
+    und_cfg.training_graphs = {}
+    assert und_cfg.infer_type == "infer_und"
+
+    BagelTextEncoder = native_model_cls("bagel_text_encoder")
+    BagelTextEncoderConfig = config_cls("bagel_text_encoder")
+    BagelQwen2MoT = native_model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+
+    qwen_kwargs = {
+        **tiny_bagel_qwen2_cfg(),
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+    }
+    hidden_size = int(qwen_kwargs["hidden_size"])
+
+    def _make_real_text_and_mot():
+        text_enc = BagelTextEncoder(
+            BagelTextEncoderConfig(vocab_size=int(qwen_kwargs["vocab_size"]), hidden_size=hidden_size)
+        ).eval()
+        text_enc._tokenizer = _FakeBagelTokenizer()
+        text_enc._chat_template = _bagel_template()
+        text_enc._sample_token = lambda hidden_states, **kwargs: text_enc._chat_template.eos_token_id
+        mot = BagelQwen2MoT(BagelQwen2MoTConfig(**qwen_kwargs)).eval()
+        return text_enc, mot
+
+    class _DimAlignedSiglip(_NoopBagelSiglip):
+        def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+            del kwargs
+            assert conversation_list is not None
+            for item in conversation_list:
+                if item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT:
+                    item.value = torch.zeros(4, hidden_size)
+            return {"conversation_list": conversation_list}
+
+    und_text_encoder, und_qwen_mot = _make_real_text_and_mot()
+    und_model = OmniModel(
+        und_cfg,
+        {
+            "bagel_text_encoder": und_text_encoder,
+            "bagel_siglip_navit": _DimAlignedSiglip(),
+            "bagel_qwen2_mot": und_qwen_mot,
+            "bagel_flow_connector": _InferGenBagelFlow(),
+            "bagel_vae": _InferGenBagelVAE(),
+        },
+    ).eval()
+    und_processor = OmniProcessor(_build_preprocessors(), infer_type=und_model.config.infer_type)
+
+    # Caller passes neither infer_type to processor(...) nor infer_type in generation_kwargs
+    und_request = und_processor(text="hi", images=str(image_path))
+    assert [item.meta.get(BAGEL_CONTEXT_KEY) for item in und_request["conversation_list"] if item.type == "image"] == [
+        BAGEL_SIGLIP_CONTEXT
+    ]
+    und_model.reset()
+    und_generated = und_model.generate(und_request, generation_kwargs={"max_new_tokens": 4})
+    assert any(item["type"] == "text" for item in und_generated)
+    assert und_qwen_mot._generation_state.main.cache is not None
+
+    # 2. Image edit scenario (infer_edit): processor routes both VAE + SigLIP and real text_encoder + qwen_mot run edit FSM
+    edit_cfg = load_omni_config(
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_edit.yaml",
+    )
+    edit_cfg.training_graphs = {}
+    assert edit_cfg.infer_type == "infer_edit"
+
+    edit_text_encoder, edit_qwen_mot = _make_real_text_and_mot()
+    edit_model = OmniModel(
+        edit_cfg,
+        {
+            "bagel_text_encoder": edit_text_encoder,
+            "bagel_siglip_navit": _DimAlignedSiglip(),
+            "bagel_qwen2_mot": edit_qwen_mot,
+            "bagel_flow_connector": _InferEditBagelFlow(),
+            "bagel_vae": _InferEditBagelVAE(),
+        },
+    ).eval()
+    edit_processor = OmniProcessor(_build_preprocessors(), infer_type=edit_model.config.infer_type)
+
+    # Caller passes neither infer_type to processor(...) nor infer_type in generation_kwargs
+    edit_request = edit_processor(text="edit", images=str(image_path))
+    assert [
+        item.meta.get(BAGEL_CONTEXT_KEY) for item in edit_request["conversation_list"] if item.type == "image"
+    ] == [
+        BAGEL_VAE_CONTEXT,
+        BAGEL_SIGLIP_CONTEXT,
+    ]
+    edit_model.reset()
+    edit_generated = edit_model.generate(
+        edit_request,
+        generation_kwargs={"max_new_tokens": 8, "do_sample": False, "image_height": 64, "image_width": 64},
+    )
+    assert any(item["type"] == "image" for item in edit_generated)
+    assert edit_qwen_mot._generation_state.main.cache is not None

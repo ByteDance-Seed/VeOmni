@@ -468,6 +468,8 @@ class OmniModelRuntime:
         modules = {name: self.get_module(name) for name in model._module_names}
         model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
+        if "infer_type" not in generation_kwargs and model.config.generation_graphs:
+            generation_kwargs["infer_type"] = next(iter(model.config.generation_graphs))
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         max_steps = max_new_tokens
         total_steps = 0
