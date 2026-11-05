@@ -1085,8 +1085,10 @@ class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
                     "sequence: attention_mask must be None or a [1, seq_len] all-ones mask."
                 )
             sequence_length = inputs_embeds.shape[1]
-            cu_seq_lens = torch.tensor(
-                [0, sequence_length],
+            cu_seq_lens = torch.arange(
+                0,
+                2 * sequence_length,
+                sequence_length,
                 dtype=torch.int32,
                 device=torch.device("cpu") if IS_NPU_AVAILABLE else inputs_embeds.device,
             )

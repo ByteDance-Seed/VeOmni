@@ -715,7 +715,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +1044,90 @@
+@@ -738,48 +1044,92 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -765,8 +765,10 @@
 +                    "sequence: attention_mask must be None or a [1, seq_len] all-ones mask."
 +                )
 +            sequence_length = inputs_embeds.shape[1]
-+            cu_seq_lens = torch.tensor(
-+                [0, sequence_length],
++            cu_seq_lens = torch.arange(
++                0,
++                2 * sequence_length,
++                sequence_length,
 +                dtype=torch.int32,
 +                device=torch.device("cpu") if IS_NPU_AVAILABLE else inputs_embeds.device,
 +            )
@@ -833,7 +835,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1137,6 @@
+@@ -789,180 +1139,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -1014,7 +1016,7 @@
          )
 
 
-@@ -990,6 +1164,12 @@
+@@ -990,6 +1166,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -1027,7 +1029,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,14 +1199,34 @@
+@@ -1019,14 +1201,34 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -1070,7 +1072,7 @@
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
              self.theta ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32, device=device) / self.axis_dim)
-@@ -1049,11 +1249,18 @@
+@@ -1049,11 +1251,18 @@
      return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
@@ -1089,7 +1091,7 @@
      def __init__(self, config: MiniMaxM3VLVisionConfig):
          super().__init__()
          self.config = config
-@@ -1071,15 +1278,10 @@
+@@ -1071,15 +1280,10 @@
          # The vision tower has no grouped-query attention; the shared eager kernel
          # still expects this attribute to drive its (no-op) `repeat_kv`.
          self.num_key_value_groups = 1
@@ -1109,7 +1111,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -1091,10 +1293,7 @@
+@@ -1091,10 +1295,7 @@
          queries, keys = apply_rotary_pos_emb_vision(queries, keys, cos, sin)
          queries, keys = queries.transpose(1, 2), keys.transpose(1, 2)
 
@@ -1121,7 +1123,7 @@
              self,
              queries,
              keys,
-@@ -1156,6 +1355,12 @@
+@@ -1156,6 +1357,12 @@
          return hidden_states
 
 
@@ -1134,7 +1136,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1383,134 @@
+@@ -1178,23 +1385,134 @@
          )
          self.post_init()
 
@@ -1275,7 +1277,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1594,26 @@
+@@ -1278,6 +1596,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1302,7 +1304,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1686,141 @@
+@@ -1350,46 +1688,141 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1461,7 +1463,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,15 +1857,25 @@
+@@ -1426,15 +1859,25 @@
          return vision_outputs
 
 
@@ -1488,7 +1490,7 @@
          self.post_init()
 
      def get_output_embeddings(self) -> nn.Module:
-@@ -1448,48 +1889,25 @@
+@@ -1448,48 +1891,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1555,7 +1557,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1922,29 @@
+@@ -1504,15 +1924,29 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1590,7 +1592,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1956,19 @@
+@@ -1524,9 +1958,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

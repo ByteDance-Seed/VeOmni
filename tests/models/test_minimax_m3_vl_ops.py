@@ -231,7 +231,8 @@ def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name):
+@pytest.mark.parametrize("with_attention_mask", [False, True], ids=["no_mask", "all_ones_mask"])
+def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name, with_attention_mask):
     """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
@@ -239,7 +240,8 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
     position_ids = torch.arange(7).unsqueeze(0)
 
     with torch.no_grad():
-        output = model(inputs_embeds=hidden_states, attention_mask=torch.ones(1, 7, dtype=torch.long))
+        attention_mask = torch.ones(1, 7, dtype=torch.long) if with_attention_mask else None
+        output = model(inputs_embeds=hidden_states, attention_mask=attention_mask)
         packed = model(
             inputs_embeds=hidden_states,
             position_ids=position_ids,
