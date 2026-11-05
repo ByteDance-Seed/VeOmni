@@ -217,6 +217,7 @@ guarantees:
 | qwen2_vl | ✅ wired | Own `collate_multimodal_metadata` (non-window ViT, same formula as qwen3_vl). |
 | qwen2_5_vl | ✅ wired | Window-attention ViT. `collate_multimodal_metadata` ports `get_window_index` host-side; `get_metadata_collate_func` `partial`-closes the vision-config dims. |
 | qwen2_5_omni | ✅ wired | Same window-attention ViT as qwen2_5_vl. Also exposes `get_extra_collate_infos` (audio); `get_metadata_collate_func` is patched on the thinker, the top-level model delegates. |
+| minimax_m3_vl | ✅ wired | Own `collate_multimodal_metadata`: `{image,video}_grid_thw_list` plus per-modality `vit_{image,video}_cu_seqlens` / `max_seqlen` that keep visual sample boundaries and isolate the SP padding tail. |
 
 ## Adding the hook to a new model (checklist)
 
