@@ -128,10 +128,13 @@ def _mock_identity_comm(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_all_to_all(tensor: Tensor, **kwargs):
         return (lambda: tensor) if kwargs.get("async_op") else tensor
 
+    # A dropped group falls back to the ambient Ulysses group inside the real helpers.
     def fake_pad(tensor: Tensor, dim, **kwargs):
+        assert kwargs.get("group") is not None
         return tensor
 
     def fake_unpad(tensor: Tensor, dim, size, **kwargs):
+        assert kwargs.get("group") is not None
         return tensor
 
     for op, variant in _EAGER_ROWS:
@@ -140,7 +143,7 @@ def _mock_identity_comm(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(module, "padding_tensor_for_seqeunce_parallel", fake_pad)
         monkeypatch.setattr(module, "unpadding_tensor_for_seqeunce_parallel", fake_unpad)
         if hasattr(module, "get_ulysses_sequence_parallel_world_size"):
-            monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda: 1)
+            monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda group=None: 1)
         if hasattr(module, "get_ulysses_sequence_parallel_group"):
             monkeypatch.setattr(module, "get_ulysses_sequence_parallel_group", lambda: object())
 
@@ -224,7 +227,7 @@ def _sequential_dit_qkv(
 def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reject KV-head layouts that cannot scatter evenly across Ulysses ranks."""
     module = _eager_module("async_ulysses_qkv", "standard")
-    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda group=None: 4)
 
     def unexpected_collective(*args, **kwargs):
         pytest.fail("head validation must run before the first collective")
@@ -250,6 +253,42 @@ def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPa
             unpadded_dim_size=2,
             head_dim=head_dim,
             group=object(),
+        )
+
+
+def test_standard_qkv_sizes_heads_from_explicit_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Head validation follows the group passed in, not the ambient Ulysses group."""
+    module = _eager_module("async_ulysses_qkv", "standard")
+    explicit = object()
+    monkeypatch.setattr(
+        module, "get_ulysses_sequence_parallel_world_size", lambda group=None: 2 if group is explicit else 4
+    )
+
+    class _ReachedCollective(Exception):
+        pass
+
+    def stop_at_collective(*args, **kwargs):
+        raise _ReachedCollective
+
+    monkeypatch.setattr(module, "all_to_all_tensor", stop_at_collective)
+    head_dim = 2
+    hidden_states = torch.randn(1, 2, 8, dtype=torch.float64)
+    # 6 KV heads split over the explicit group's 2 ranks, but not over the ambient 4.
+    weights = _qkv_weights(8, 12 * head_dim, 6 * head_dim, bias=False, requires_grad=False)
+
+    with pytest.raises(_ReachedCollective):
+        VeomniOp("async_ulysses_qkv", "standard")(
+            hidden_states,
+            *weights,
+            None,
+            None,
+            None,
+            None,
+            seq_dimension=1,
+            head_dimension=2,
+            unpadded_dim_size=2,
+            head_dim=head_dim,
+            group=explicit,
         )
 
 
@@ -325,7 +364,7 @@ def test_standard_qkv_repeated_kv_heads_matches_sequential(monkeypatch: pytest.M
     """Exercise repeated-KV reduction through the public compound op."""
     _mock_identity_comm(monkeypatch)
     module = _eager_module("async_ulysses_qkv", "standard")
-    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda group=None: 4)
     torch.manual_seed(6105)
     batch, seq, hidden, head_dim = 2, 3, 20, 5
     inputs = (
