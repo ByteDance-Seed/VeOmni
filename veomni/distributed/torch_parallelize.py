@@ -463,6 +463,10 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
+    from ..models.qat import validate_mxfp4_qat_parallelism
+
+    validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config, **kwargs)
+
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
@@ -1059,6 +1063,9 @@ def build_parallelize_model(
             Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
+
+    from ..models.qat import validate_mxfp4_qat_parallelism
+
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -1085,6 +1092,8 @@ def build_parallelize_model(
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
+
+    validate_mxfp4_qat_parallelism(model, mixed_precision, compile_config, **kwargs)
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):

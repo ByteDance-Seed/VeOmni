@@ -299,6 +299,12 @@ def build_foundation_model(
         init_device=init_device,
     )
 
+    from .qat import prepare_mxfp4_qat
+
+    # Replay the config-owned recipe for both eager reloads and meta-init before
+    # FSDP wrapping, keeping the checkpoint's original parameter names.
+    prepare_mxfp4_qat(model)
+
     if IS_NPU_AVAILABLE:
         logger.info_rank0(
             "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"

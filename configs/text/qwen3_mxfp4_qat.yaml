@@ -1,0 +1,52 @@
+model:
+  model_path: Qwen/Qwen3-0.6B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    qat_implementation: torchao_mxfp4
+    qat_target_modules:
+      - model.layers.*.mlp.gate_proj
+      - model.layers.*.mlp.up_proj
+      - model.layers.*.mlp.down_proj
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: true
+    offload_config:
+      enable_activation: false
+      enable_async_activation: false
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  text_keys: messages
+  max_seq_len: 2048
+  train_size: 750000
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: null
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: exp/qwen3-mxfp4-qat
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: qwen3-mxfp4-qat

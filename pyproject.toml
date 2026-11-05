@@ -46,6 +46,7 @@ dev = [
 
 gpu = [
   "torch==2.11.0+cu130",
+  "torchao==0.18.0",
   "torchvision==0.26.0+cu130",
   "torchaudio==2.11.0+cu130",
   "torchcodec==0.12.0",
