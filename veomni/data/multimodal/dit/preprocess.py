@@ -131,9 +131,10 @@ def cosmos3_sft_jsonl_preprocess(conversations, data_dir="", cfg_dropout_rate=0.
 
     def caption_of(window, example):
         structured = window.get("caption_json")
-        if isinstance(structured, str) and structured.strip():
-            return structured.strip()
-        if structured is not None:
+        if isinstance(structured, str):
+            if structured.strip():
+                return structured.strip()
+        elif structured is not None:
             return json.dumps(structured, ensure_ascii=False)
         caption = window.get("caption") or example.get("caption")
         if not isinstance(caption, str) or not caption.strip():
@@ -147,6 +148,6 @@ def cosmos3_sft_jsonl_preprocess(conversations, data_dir="", cfg_dropout_rate=0.
     if rate >= 1.0 or (rate > 0.0 and random.random() < rate):
         prompt = ""
     vision_path = conversations["vision_path"]
-    if data_dir and not os.path.isabs(vision_path):
+    if data_dir and "://" not in vision_path and not os.path.isabs(vision_path):
         vision_path = os.path.join(data_dir, vision_path)
     return prompt, {}, [], [vision_path]

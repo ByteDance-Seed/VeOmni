@@ -88,7 +88,7 @@ train:
   training_task: offline_embedding
   global_batch_size: 16
   micro_batch_size: 1
-  dyn_bsz: true
+  dyn_bsz: false
   bsz_warmup_ratio: 0.0
   max_steps: 500
   num_train_epochs: 1

@@ -212,3 +212,7 @@ def test_sft_jsonl_preprocess():
     dense = {"vision_path": "/abs/a.mp4", "t2w_windows": [{"caption": "a bridge"}]}
     assert cosmos3_sft_jsonl_preprocess(dense, data_dir="/data") == ("a bridge.", {}, [], ["/abs/a.mp4"])
     assert cosmos3_sft_jsonl_preprocess(row, cfg_dropout_rate=1.0)[0] == ""
+
+    # An empty structured caption falls back to the dense one; a URI is not joined to data_dir.
+    blank = {"vision_path": "s3://bucket/a.mp4", "t2w_windows": [{"caption_json": " ", "caption": "a bridge"}]}
+    assert cosmos3_sft_jsonl_preprocess(blank, data_dir="/data") == ("a bridge.", {}, [], ["s3://bucket/a.mp4"])
