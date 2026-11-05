@@ -99,15 +99,16 @@ including `captions.txt`, `videos.txt`, and the referenced videos. Then, from
 the VeOmni repository root:
 
 ```bash
-python scripts/dataset/prepare_tom_and_jerry.py \
-  --dataset-root "$DATASET_ROOT" \
-  --output "$PREPARED_DATA/train.jsonl"
+python scripts/multimodal/convert_data/tom-and-jerry.py \
+  --dataset_path "$DATASET_ROOT" \
+  --output_dir "$PREPARED_DATA"
 ```
 
-The converter validates all caption/video pairs before writing, rejects missing,
-escaping or duplicate paths, and refuses to overwrite a manifest. It records
-source-list and output hashes in a `.manifest` sidecar. Videos are referenced by
-absolute path; they are not copied. Recreate the JSONL after moving the dataset.
+The existing converter writes Parquet shards with `prompt`, `video_bytes`, and
+`source` columns. Each row contains the caption and video bytes consumed by the
+existing Tom-and-Jerry preprocessor; no JSONL manifest or model-specific
+converter is needed. Set `PREPARED_DATA` to the output directory (the example
+config defaults to `Tom-and-Jerry-VideoGeneration-Dataset-parquet`).
 
 The example reuses `dit_online` and the existing Tom-and-Jerry preprocessor.
 It selects 33 frames with the existing uniform sampling rules, aligns to 4n+1,
@@ -133,7 +134,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" \
   tasks/train_dit.py configs/dit/hunyuanvideo15_t2v.yaml \
   --model.model_path "$MODEL_ROOT/transformer/480p_t2v" \
   --model.condition_model_path "$MODEL_ROOT" \
-  --data.train_path "$PREPARED_DATA/train.jsonl" \
+  --data.train_path "$PREPARED_DATA" \
   --train.global_batch_size "${NPROC_PER_NODE:-1}" \
   --train.checkpoint.output_dir "$RUN_DIR"
 ```

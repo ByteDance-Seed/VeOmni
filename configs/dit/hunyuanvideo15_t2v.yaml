@@ -33,7 +33,7 @@ model:
         enable: true
 
 data:
-  train_path: ./data/tom_and_jerry/train.jsonl
+  train_path: Tom-and-Jerry-VideoGeneration-Dataset-parquet
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
   datasets_type: mapping
   data_type: diffusion
