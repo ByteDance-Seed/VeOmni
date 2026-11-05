@@ -31,7 +31,7 @@ from veomni.utils.constants import IGNORE_INDEX
 
 
 def _cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3vl_2b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3vl"
 
 
 class _FakeTokenizer:

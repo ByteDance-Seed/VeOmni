@@ -14,18 +14,23 @@ All paths below assume the upstream HuggingFace checkpoint (the post-trained
 chat model) lives at `/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. Adjust to your own
 storage.
 
-Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/`.
+Config dir: `configs/seed_omni/Qwen/qwen3/`.
 
 The layout follows [the shared config layout](../usage/training_and_inference.md#1-config-layout).
 Both training and inference take the **same** `base.yaml`.
 
 | File | Role |
 |------|------|
-| `qwen3_0.6b/train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. |
-| `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
-| `qwen3_0.6b/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
-| `qwen3_0.6b/train/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
-| `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
+| `qwen3/train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. |
+| `qwen3/train/modules_train.yaml` | Per-module training overrides. Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `qwen3/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
+| `qwen3/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). Shared by every task. |
+| `qwen3/infer/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
+
+The directory name carries no size: the modules, graphs and kernels are the same
+at every Qwen3 size, and `model.model_path` alone picks the checkpoint. A recipe
+that genuinely needs its own plumbing (Qwen3-MoE, visual instruction tuning) gets
+its own task folder beside `train/`.
 
 ---
 
@@ -64,7 +69,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3_0.6b/train/data.yaml
+# configs/seed_omni/Qwen/qwen3/data.yaml
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
 names:
@@ -85,7 +90,7 @@ The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml
+  configs/seed_omni/Qwen/qwen3/train/base.yaml
 ```
 
 Key knobs (override on the CLI):
@@ -101,7 +106,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
@@ -121,7 +126,7 @@ the output back:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -144,7 +149,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --train.checkpoint.load_path outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -159,7 +164,7 @@ upstream Qwen3 root (what `base.yaml` points at) or a split root holding
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.model_config.infer_type infer_text \
   --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \

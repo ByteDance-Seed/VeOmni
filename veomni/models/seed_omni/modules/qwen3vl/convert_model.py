@@ -2,7 +2,7 @@
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_vl"]`` and dispatched by
 ``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).
-Graphs come from ``configs/seed_omni/Qwen/qwen3vl_2b/``.
+Graphs come from ``configs/seed_omni/Qwen/qwen3vl/``.
 
 Output layout::
 
@@ -46,7 +46,7 @@ def _qwen3vl_for_causal_lm():
 def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Split an upstream Qwen3-VL checkpoint into three SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
-        "configs/seed_omni/Qwen/qwen3vl_2b",
+        "configs/seed_omni/Qwen/qwen3vl",
         training="train/graph_train.yaml",
         generation={"vision_understanding": "infer/graph_infer.yaml"},
         training_graph=kwargs.pop("training_graph", None),

@@ -33,18 +33,24 @@ and the dataset loader, so nothing in this recipe pins a machine-specific
 location. Pass your own storage root with `--model.model_path` (or
 `$HF_HOME`-relative ids) when it differs.
 
-Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
+Config dir: `configs/seed_omni/Qwen/qwen3vl/`
+
+Layout follows [the shared config layout](../usage/training_and_inference.md#1-config-layout):
+`data.yaml` and `infer/` sit at the model root because both tasks use them.
 
 | File | Role |
 |------|------|
 | `train/base.yaml` | Launcher: `model` (incl. `model.accelerator`) / `data` (incl. `mm_configs`) / `train` + `infer` block. |
 | `train/modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
-| `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
-| `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). |
-| `packed/base.yaml` | Launcher for the packed training graph. Shares `data.yaml` / `infer/graph_infer.yaml`; `model_config` points at the two files below. |
+| `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). Shared by both tasks. |
+| `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). Shared by both tasks. |
+| `packed/base.yaml` | Launcher for the packed training graph. |
 | `packed/modules_train.yaml` | Same module overrides plus `processor_config: {packed_preprocess: true}` on the text encoder. |
 | `packed/graph_train.yaml` | Packed DAG (`pack_encode → pack_encode → pack_forward → pack_decode`). |
+
+The directory name carries no size: one `qwen3vl/` recipe serves every Qwen3-VL
+checkpoint, and `model.model_path` alone picks which one.
 
 ---
 
@@ -77,7 +83,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `tulu-3-sft-mixture` adds pure-text turns so text ability isn't lost.
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3vl_2b/data.yaml
+# configs/seed_omni/Qwen/qwen3vl/data.yaml
 sources:
   - sharegpt4v_cap_100k
   - LLaVA-Video-178K_0_30_s_academic_v0_1
@@ -107,7 +113,7 @@ no audio modality. The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml
+  configs/seed_omni/Qwen/qwen3vl/train/base.yaml
 ```
 
 Key knobs (override on the CLI):
@@ -130,7 +136,7 @@ DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3vl/train/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -153,8 +159,8 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
-  --train.checkpoint.load_path outputs/qwen3vl_2b_omni_sft/checkpoints/global_step_500
+  configs/seed_omni/Qwen/qwen3vl/train/base.yaml \
+  --train.checkpoint.load_path outputs/qwen3vl_omni_sft/checkpoints/global_step_500
 ```
 
 ---
@@ -177,7 +183,7 @@ has this layout, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3vl/train/base.yaml \
   --model.model_config.infer_type vision_understanding \
   --infer.prompt "What is in this image?" \
   --infer.images /path/to/image.jpg \
@@ -189,8 +195,8 @@ To infer from a **trained** checkpoint, assemble a flat root from the per-module
 `hf_ckpt/` subfolders (same pattern as Janus):
 
 ```bash
-STEP=outputs/qwen3vl_2b_omni_sft/checkpoints/global_step_500
-ASM=outputs/qwen3vl_2b_omni_sft/infer_ckpt/global_step_500
+STEP=outputs/qwen3vl_omni_sft/checkpoints/global_step_500
+ASM=outputs/qwen3vl_omni_sft/infer_ckpt/global_step_500
 mkdir -p "$ASM"
 for m in qwen3vl_vision qwen3vl_text_encoder qwen3vl_llm; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
