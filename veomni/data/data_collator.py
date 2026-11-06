@@ -223,6 +223,8 @@ class MakeMicroBatchCollator(DataCollator):
 @dataclass
 class PrecomputePositionIDsCollator(DataCollator):
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        # Never add derived keys to source dataset mappings shared across epochs.
+        features = [feature.copy() for feature in features]
         for feature in features:
             if "position_ids" not in feature:
                 # default position_ids is 0 ~ seq_len - 1 for text models
@@ -300,11 +302,28 @@ class PackingCollator(DataCollator):
                 pack_dim = collate_info.pack_dim
 
                 # first token of packed sequence must be IGNORE_INDEX
+                label_boundaries = None
                 if key == "labels" and not self.seq_classification:
-                    for i in range(1, len(batch[key])):
-                        batch[key][i][0] = IGNORE_INDEX
+                    if pack_dim in (-1, 0) and all(label.ndim == 1 for label in batch[key]):
+                        # Mask the concatenated output, preserving source labels
+                        # without allocating a full clone of every sample.
+                        label_boundaries = []
+                        offset = 0
+                        for i, label in enumerate(batch[key]):
+                            if i:
+                                if label.numel() == 0:
+                                    raise IndexError("Cannot mask the first token of an empty label")
+                                label_boundaries.append(offset)
+                            offset += label.numel()
+                    else:
+                        # Preserve custom non-1D/pack-dimension semantics.
+                        for i in range(1, len(batch[key])):
+                            batch[key][i] = batch[key][i].clone()
+                            batch[key][i][0] = IGNORE_INDEX
 
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
+                if label_boundaries:
+                    batch[key][label_boundaries] = IGNORE_INDEX
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 

@@ -96,6 +96,7 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    _dpo_no_synthetic_padding: bool = False,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -149,6 +150,17 @@ def build_native_dataloader(
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
+    if (
+        dyn_bsz
+        and dyn_bsz_runtime == "main"
+        and not drop_last
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+        and not _dpo_no_synthetic_padding
+    ):
+        raise ValueError(
+            "Distributed main-process dynamic batching requires drop_last=True until tail steps are aligned"
+        )
 
     if collate_fn is None:
         if build_collate_fn:
@@ -279,5 +291,7 @@ def build_native_dataloader(
             length=train_steps,
             drop_last=drop_last,
         )
+        if _dpo_no_synthetic_padding:
+            dataloader._dpo_disallow_implicit_restart = True
 
     return dataloader

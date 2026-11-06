@@ -16,6 +16,7 @@ import copy
 import inspect
 import math
 import re
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from ..utils.dpo_provenance import (
     DPOInvalidProof,
     DPOPackedProof,
 )
+from ..utils.loss_utils import contains_padding, step_batch_structure
 from .base import BaseTrainer, VeOmniIter
 from .callbacks.channel_loss_callback import _validate_segment_count
 from .dpo_provenance import next_dpo_microbatches
@@ -162,14 +164,19 @@ def _dpo_pair_weighting(
                 raise ValueError(
                     "DPO forward_backward_step overrides must accept pair_normalization and apply it to the pair-loss sum"
                 ) from exc
-        if not isinstance(micro_batches, list) or not micro_batches:
-            raise ValueError("DPO optimizer step requires a nonempty list of microbatches")
+        allowed_tuple = not provenance_enabled and isinstance(micro_batches, tuple)
+        if (not isinstance(micro_batches, list) and not allowed_tuple) or not micro_batches:
+            raise ValueError(
+                "DPO optimizer step requires nonempty microbatches with the expected provenance structure"
+            )
         vocabulary = vocab_size() if vocab_size is not None else None
         if vocabulary is not None and (type(vocabulary) is not int or vocabulary <= 0):
             raise ValueError("DPO model vocabulary size must be a positive integer")
         for batch in micro_batches:
             if not isinstance(batch, dict):
                 raise ValueError("DPO microbatch must be a dictionary")
+            if batch.get("loss_weight") is not None or batch.get("loss_weights") is not None:
+                raise ValueError("DPO does not support token loss_weights")
             if batch.get("padding_flag", False) is not False:
                 raise ValueError("DPO does not support duplicated padding microbatches in pair-mean training")
             input_ids, labels, cu_q = batch.get("input_ids"), batch.get("labels"), batch.get("cu_seq_lens_q")
@@ -329,6 +336,8 @@ def _dpo_pair_weighting(
 def _dpo_sync_step_begin_error(error: Exception | None, *, context: str = "step-begin callback") -> None:
     """Prevent a local pre-forward callback failure stranding peers at the next collective."""
     if not dist.is_available() or not dist.is_initialized():
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"DPO {context} raised StopIteration") from error
         if error is not None:
             raise error
         return
@@ -693,7 +702,7 @@ class TextDPOTrainer:
                         else ()
                     ),
                 )
-            self.base._build_dataloader()
+            self.base._build_dataloader(dpo_no_synthetic_padding=True)
             from ..data.data_loader import DistributedDataloader
             from ..data.dynamic_batching import DynamicBatchSizeDataLoader
 
@@ -1135,6 +1144,8 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor], *, pair_normalization: float | None = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if contains_padding(micro_batch):
+            raise ValueError("DPO does not support padded micro-batches")
         channel_loss_callback = getattr(self.base, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -1217,6 +1228,7 @@ class TextDPOTrainer:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
         except Exception as exc:  # noqa: BLE001 - synchronize before callbacks/model collectives
             micro_batches, loader_error = None, exc
+        self.base._step_preflight_start_time = time.time()
 
         weighting = _dpo_pair_weighting(
             micro_batches,
@@ -1229,24 +1241,53 @@ class TextDPOTrainer:
         )
         # An exhausted iterable does not perform an optimizer update. Advance
         # only after all ranks have obtained and validated this step's data.
+        previous_step = self.state.global_step
         self.state.global_step = next_step
-
-        step_begin_error = None
+        expected_microsteps = len(micro_batches)
+        original_structure = step_batch_structure(micro_batches) if provenance_enabled else None
+        original_proofs = (
+            tuple((batch.get(DPO_APPROVED_KEY), batch.get(DPO_AGREED_KEY)) for batch in micro_batches)
+            if provenance_enabled
+            else None
+        )
         try:
-            self.base._reset_async_activation_offload_if_enabled(self.policy_model)
-            self.on_step_begin(micro_batches=micro_batches)
-        except Exception as exc:  # noqa: BLE001 - report a local callback error to every rank before forwarding
-            step_begin_error = exc
-        _dpo_sync_step_begin_error(step_begin_error)
-        if not provenance_enabled:
-            weighting = _dpo_pair_weighting(
-                micro_batches,
-                self.post_forward,
-                self.policy_model.parallel_state,
-                False,
-                vocab_size=self._dpo_vocabulary_size,
-            )
-        self.base.sync_before_train_step()
+            step_begin_error = None
+            try:
+                self.base._reset_async_activation_offload_if_enabled(self.policy_model)
+                self.on_step_begin(micro_batches=micro_batches)
+                if contains_padding(micro_batches):
+                    raise ValueError("DPO step-begin callback introduced padding")
+                if any(
+                    batch.get("loss_weight") is not None or batch.get("loss_weights") is not None
+                    for batch in micro_batches
+                    if isinstance(batch, dict)
+                ):
+                    raise ValueError("DPO does not support token loss_weights")
+                if provenance_enabled and len(micro_batches) != expected_microsteps:
+                    raise ValueError("DPO step-begin callback changed proven microbatch count")
+                if provenance_enabled and step_batch_structure(micro_batches) != original_structure:
+                    raise ValueError("DPO step-begin callback changed proven microbatch structure")
+                if (
+                    provenance_enabled
+                    and tuple((batch.get(DPO_APPROVED_KEY), batch.get(DPO_AGREED_KEY)) for batch in micro_batches)
+                    != original_proofs
+                ):
+                    raise ValueError("DPO step-begin callback changed proven microbatch provenance")
+            except Exception as exc:  # noqa: BLE001 - report a local callback error before forwarding
+                step_begin_error = exc
+            _dpo_sync_step_begin_error(step_begin_error)
+            if not provenance_enabled:
+                weighting = _dpo_pair_weighting(
+                    micro_batches,
+                    self.post_forward,
+                    self.policy_model.parallel_state,
+                    False,
+                    vocab_size=self._dpo_vocabulary_size,
+                )
+            self.base.sync_before_train_step()
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
