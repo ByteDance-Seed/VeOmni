@@ -534,9 +534,10 @@ class WeightedMultiSourceDataset(IterableDataset):
     - Optional resume-index passthrough for checkpointing buffers by index.
 
     New snapshots record whether this dataset instance has initialized its
-    sampling RNG and its epoch. Legacy snapshots keep the previous behavior
-    and cannot guarantee a not-yet-started worker's first sample. The dataset
-    state alone does not identify one of multiple active or restarted iterators.
+    sampling RNG and, when known, its epoch. Legacy snapshots cannot guarantee a
+    not-yet-started worker's first sample; provide their epoch before sampling
+    if the epoch will later be changed. The dataset state alone does not
+    identify one of multiple active or restarted iterators.
     """
 
     def __init__(
@@ -632,6 +633,7 @@ class WeightedMultiSourceDataset(IterableDataset):
 
         self._just_resumed = False
         self._sampling_initialized = False
+        self._resume_epoch_unknown = False
 
     @property
     def output_index_for_resume(self) -> bool:
@@ -696,6 +698,14 @@ class WeightedMultiSourceDataset(IterableDataset):
         Args:
             epoch: Current epoch number.
         """
+        if self._resume_epoch_unknown:
+            if not self._just_resumed:
+                raise ValueError("a legacy multi-source checkpoint needs its epoch before sampling")
+            # The caller supplies the epoch missing from a legacy snapshot.
+            self._resume_epoch_unknown = False
+        elif epoch != self._epoch:
+            self._sampling_initialized = False
+            self._just_resumed = False
         self._epoch = epoch
         for dataset in self._datasets:
             set_epoch_fn = getattr(dataset, "set_epoch", None)
@@ -723,7 +733,6 @@ class WeightedMultiSourceDataset(IterableDataset):
             self._sampling_initialized = True
         else:
             self._just_resumed = False
-
         self._iters = [iter(ds) for ds in self._datasets]
         while True:
             ds_idx = self._random_state.choice(self._ds_num, p=self._runtime_weights())
@@ -882,7 +891,7 @@ class WeightedMultiSourceDataset(IterableDataset):
                 "stopping_strategy": self._stopping_strategy,
             },
             "runtime": {
-                "epoch": self._epoch,
+                **({} if self._resume_epoch_unknown else {"epoch": self._epoch}),
                 "sampling_initialized": self._sampling_initialized,
                 "random_state": self._random_state.get_state(),
                 "avg_len_sum": avg_len_sum_by_id,
@@ -972,6 +981,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._epoch = runtime.get("epoch", self._epoch)
         self._sampling_initialized = initialized
         self._just_resumed = initialized
+        self._resume_epoch_unknown = "epoch" not in runtime
 
 
 class _MapStyleSamplerWrapper(IterableDataset):
