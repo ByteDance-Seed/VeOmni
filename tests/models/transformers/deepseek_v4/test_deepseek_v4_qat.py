@@ -97,9 +97,10 @@ _EXPECTED_STORAGE_ROUND = {
         ("round_stored_kv", "compressed"),
     ],
     "DeepseekV4MLP.forward": [],
-    # The routed experts hand their raw weights to the family row, which does the
-    # rounding; there is no model-side call site left to count.
-    "DeepseekV4Experts.forward": [],
+    # The routed experts hand their raw weights to the family row on the fused
+    # path. The non-SwiGLU branch cannot call the row, so it re-applies that
+    # row's rounding itself -- pinned here so the recipe cannot silently lose it.
+    "DeepseekV4Experts.forward": [("round_expert_operands", "self.moe_implementation")],
 }
 
 
@@ -116,7 +117,7 @@ def _storage_round_calls(module, qualname):
     for node in ast.walk(_method_ast(module, qualname)):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
-        if node.func.id in ("round_stored_kv", "round_indexer_act"):
+        if node.func.id in ("round_stored_kv", "round_indexer_act", "round_expert_operands"):
             calls.append((node.func.id, ast.unparse(node.args[0])))
     return sorted(calls)
 
@@ -135,7 +136,22 @@ def _projection_calls(module, qualname):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Attribute) and func.attr.startswith("veomni_"):
+        # ``project_through_op(self.veomni_x, self.x, ...)`` names the projection
+        # as its second argument; a direct handle call names it by its ``weight``.
+        if isinstance(func, ast.Name) and func.id == "project_through_op":
+            operand = node.args[1]
+            if isinstance(operand, ast.Attribute) and isinstance(operand.value, ast.Name):
+                if operand.value.id == "self":
+                    via_handle.add(operand.attr)
+            elif (
+                isinstance(operand, ast.Attribute)
+                and isinstance(operand.value, ast.Attribute)
+                and isinstance(operand.value.value, ast.Name)
+                and operand.value.value.id == "self"
+            ):
+                # ``attn.q_a_proj`` in dspark-style helpers.
+                via_handle.add(operand.attr)
+        elif isinstance(func, ast.Attribute) and func.attr.startswith("veomni_"):
             for arg in node.args:
                 if (
                     isinstance(arg, ast.Attribute)
@@ -258,3 +274,54 @@ class _FakeOp:
         from veomni.ops.kernels.kv_round.fp8.eager import fp8_roundtrip
 
         return fp8_roundtrip(x, **kwargs)
+
+
+def _build_tiny_model(linear_impl: str):
+    """A tiny DeepSeek-V4 on the reference rows, with ``linear_impl`` for the projections."""
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
+    else:
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
+
+    config = tiny_deepseek_v4_config()
+    config._set_ops_implementation(
+        OpsImplementationConfig(
+            attn_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            linear_implementation=linear_impl,
+            moe_implementation="eager",
+            dsa_attention_implementation="eager",
+            dsa_indexer_implementation="eager",
+            mhc_implementation="eager",
+        )
+    )
+    return gen.DeepseekV4ForCausalLM(config), config
+
+
+# ``o_a_proj`` is a block-diagonal ``DeepseekV4GroupedLinear`` whose forward is a
+# 3D ``bmm``, so a plain LoRA adapter never fit it. These are the projections the
+# rows actually drive one-for-one.
+_LORA_TARGETS = ["q_a_proj", "q_b_proj", "kv_proj", "o_b_proj"]
+
+
+def test_deepseek_v4_lora_runs_on_the_reference_linear_row():
+    """A wrapped projection has no ``weight``; the reference row must fall back to calling it."""
+    import torch
+
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    model, config = _build_tiny_model("eager")
+    model.eval()
+    inject_dense_lora(model.model, VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=_LORA_TARGETS), "default")
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with torch.no_grad():
+        out = model(input_ids=input_ids)
+
+    assert out.logits.shape == (1, 4, config.vocab_size)
