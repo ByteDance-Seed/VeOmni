@@ -285,6 +285,8 @@ class Llama2Template(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
+    supports_loss_weights = True
+
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         """Tokenize ChatML turns and retain optional per-token supervision weights."""
         input_ids, attention_mask, labels = [], [], []
@@ -343,8 +345,6 @@ class ChatmlTemplate(ChatTemplate):
             "{% endfor %}"
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
-
-    supports_loss_weights = True
 
 
 class MTPLabelMixin:
