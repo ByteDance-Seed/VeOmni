@@ -792,13 +792,14 @@ class BagelQwen2MoTAttention(nn.Module):
         attn_impl = (
             config.ops_config.attn_implementation if "attn_implementation" in config.ops_implementation else "sdpa"
         )
-        self.veomni_attn_impl = attn_impl
         self.veomni_attn: VeomniOp | None = None
         if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
             try:
                 self.veomni_attn = VeomniOp("attention", "standard", "veomni_flex_attention")
             except RuntimeError:
                 self.veomni_attn = None
+                attn_impl = "sdpa"
+        self.veomni_attn_impl = attn_impl
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)

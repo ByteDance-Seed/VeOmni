@@ -621,7 +621,7 @@ def test_bagel_qwen2_rotary_embedding_to_empty_from_meta_rebuilds_fp32_table() -
     torch.testing.assert_close(rotary.original_inv_freq, ref_rotary.original_inv_freq)
 
 
-def test_bagel_qwen2_mot_config_defaults_to_flex_attention() -> None:
+def test_bagel_qwen2_mot_config_defaults_to_flex_attention(available_nvidia_ops) -> None:  # noqa: F811
     """Verify ``BagelQwen2MoTConfig`` defaults to ``veomni_flex_attention`` when no attention backend is specified."""
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
 
@@ -633,6 +633,8 @@ def test_bagel_qwen2_mot_config_defaults_to_flex_attention() -> None:
         num_attention_heads=4,
         num_key_value_heads=1,
         max_position_embeddings=64,
+        bos_token_id=1,
+        eos_token_id=2,
     )
     assert cfg._attn_implementation == "veomni_flex_attention"
     model = BagelQwen2MoT(cfg).eval()
