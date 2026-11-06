@@ -68,8 +68,9 @@ export behave exactly as they did before MTP support existed. There is deliberat
 no second boolean flag: `mtp_num_hidden_layers` describes the checkpoint architecture,
 and MTP is enabled only when both the layer count and loss weight are positive.
 
-Fractional per-message `loss_weight` is not supported with batches containing
-`mtp_labels`; the collator rejects this combination before the model forward.
+Within one train step, `loss_weights` and `mtp_labels` cannot both be present,
+even on different micro-batches or ranks. The trainer rejects this combination
+at the start of `train_step`, before any micro-batch forward.
 This also applies when the template emits MTP labels but the MTP objective is
 disabled. Ordinary binary loss masks and unweighted MTP remain supported.
 

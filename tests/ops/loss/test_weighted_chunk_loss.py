@@ -494,7 +494,7 @@ def test_chunk_weights_use_fp32_sum_on_long_sequence(dtype):
     torch.testing.assert_close(result, torch.tensor(2.0).log())
 
 
-def test_weighted_mtp_labels_fail_before_forward(monkeypatch):
+def test_collator_keeps_weights_and_mtp_labels_for_trainer_rejection(monkeypatch):
     from types import SimpleNamespace
 
     from veomni.data import data_collator as m
