@@ -53,14 +53,25 @@ class CacheAwareFileSystemReader(FileSystemReader):
 
 def cache_aware_checkpointer(checkpointer):
     """Enable cache advice on a manager without changing save ownership."""
+    import inspect
+
     from .dcp_checkpointer import DistributedCheckpointer
 
     if not isinstance(checkpointer, type) or not issubclass(checkpointer, DistributedCheckpointer):
         raise ValueError("DCP source cache advice requires the distributed checkpointer")
+    load_signature = inspect.signature(checkpointer.load)
+    cache_parameter = load_signature.parameters.get("evict_source_cache")
+    if cache_parameter is None or cache_parameter.kind not in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        raise ValueError("DCP source cache advice requires an explicit keyword-capable evict_source_cache parameter")
 
     class CheckpointerWithCacheAdvice:
         def load(self, *args, **kwargs):
-            kwargs.setdefault("evict_source_cache", True)
+            bound = load_signature.bind_partial(*args, **kwargs)
+            if "evict_source_cache" not in bound.arguments:
+                kwargs["evict_source_cache"] = True
             return checkpointer.load(*args, **kwargs)
 
         def __getattr__(self, name):

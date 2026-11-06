@@ -297,3 +297,70 @@ def test_enabled_reader_for_legacy_module_and_partial_model(tmp_path, monkeypatc
     assert torch.equal(
         optimizer.state_dict()["state"][0]["exp_avg"], new_optimizer.state_dict()["state"][0]["exp_avg"]
     )
+
+
+def test_cache_aware_load_preserves_positional_and_keyword_api():
+    import inspect
+
+    from veomni.checkpoint.checkpointer import cache_aware_load
+
+    class Dummy:
+        @classmethod
+        @cache_aware_load
+        def load(cls, path, state, *, extra=None):
+            return cls, path, state, extra
+
+    assert (
+        inspect.signature(Dummy.load).parameters["evict_source_cache"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    for positional in (False, True):
+        args = ("path", {}, True) if positional else ("path", {})
+        kwargs = {"extra": 7} if positional else {"evict_source_cache": True, "extra": 7}
+        selected, path, state, extra = Dummy.load(*args, **kwargs)
+        assert issubclass(selected, Dummy) and selected is not Dummy
+        assert (path, state, extra) == ("path", {}, 7)
+    assert Dummy.load("path", {}, False)[0] is Dummy
+    with pytest.raises(TypeError, match="multiple values"):
+        Dummy.load("path", {}, True, evict_source_cache=False)
+
+
+def test_cache_aware_proxy_preserves_explicit_positional_and_keyword_options():
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class RecordingCheckpointer(DistributedCheckpointer):
+        @classmethod
+        def load(cls, path, state, evict_source_cache=False):
+            return path, state, evict_source_cache
+
+    wrapped = cache_aware_checkpointer(RecordingCheckpointer)
+    assert wrapped.load("path", {}) == ("path", {}, True)
+    assert wrapped.load("path", {}, False) == ("path", {}, False)
+    assert wrapped.load("path", {}, True) == ("path", {}, True)
+    assert wrapped.load("path", {}, evict_source_cache=False) == ("path", {}, False)
+    assert wrapped.load("path", {}, evict_source_cache=True) == ("path", {}, True)
+    with pytest.raises(TypeError, match="multiple values"):
+        wrapped.load("path", {}, True, evict_source_cache=False)
+
+
+def test_cache_aware_proxy_rejects_opaque_passthrough_load():
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class OpaqueCheckpointer(DistributedCheckpointer):
+        @classmethod
+        def load(cls, *args, **kwargs):
+            return super().load(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="requires an explicit keyword-capable evict_source_cache parameter"):
+        cache_aware_checkpointer(OpaqueCheckpointer)
+
+
+def test_cache_aware_proxy_rejects_positional_only_cache_option():
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class PositionalOnlyCheckpointer(DistributedCheckpointer):
+        @classmethod
+        def load(cls, path, state, evict_source_cache=False, /):
+            return path, state, evict_source_cache
+
+    with pytest.raises(ValueError, match="requires an explicit keyword-capable evict_source_cache parameter"):
+        cache_aware_checkpointer(PositionalOnlyCheckpointer)
