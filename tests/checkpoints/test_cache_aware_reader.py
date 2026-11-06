@@ -15,6 +15,32 @@ _TWO_RANK = LaunchSpec(nproc=2, device="cpu")
 _NO_CACHE_ADVICE = not hasattr(os, "posix_fadvise") or not hasattr(os, "O_NOFOLLOW")
 
 
+@pytest.mark.parametrize("use_proxy", [False, True])
+def test_legacy_cache_and_expert_layout_positional_arguments(use_proxy):
+    from veomni.checkpoint.checkpointer import cache_aware_load
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class RecordingCheckpointer(DistributedCheckpointer):
+        @classmethod
+        @cache_aware_load
+        def load(cls, path, state, legacy_expert_source_layout=None):
+            return cls, legacy_expert_source_layout
+
+    checkpointer = cache_aware_checkpointer(RecordingCheckpointer) if use_proxy else RecordingCheckpointer
+    cls, layout = checkpointer.load("path", {}, False)
+    assert cls is RecordingCheckpointer and layout is None
+    cls, layout = checkpointer.load("path", {}, True)
+    assert cls is not RecordingCheckpointer and issubclass(cls, RecordingCheckpointer) and layout is None
+    cls, layout = checkpointer.load("path", {}, "veomni_tp1_no_ep")
+    assert (cls is not RecordingCheckpointer) == use_proxy and layout == "veomni_tp1_no_ep"
+    cls, layout = checkpointer.load("path", {}, True, legacy_expert_source_layout="veomni_tp1_no_ep")
+    assert cls is not RecordingCheckpointer and layout == "veomni_tp1_no_ep"
+    cls, layout = checkpointer.load("path", {}, None, True)
+    assert cls is not RecordingCheckpointer and layout is None
+    with pytest.raises(TypeError, match="multiple values.*evict_source_cache"):
+        checkpointer.load("path", {}, True, evict_source_cache=False)
+
+
 def test_cache_advice_keeps_save_and_async_drain_on_original_checkpointer(monkeypatch):
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 

@@ -55,6 +55,7 @@ def cache_aware_checkpointer(checkpointer):
     """Enable cache advice on a manager without changing save ownership."""
     import inspect
 
+    from .checkpointer import _normalize_legacy_cache_arguments
     from .dcp_checkpointer import DistributedCheckpointer
 
     if not isinstance(checkpointer, type) or not issubclass(checkpointer, DistributedCheckpointer):
@@ -69,6 +70,7 @@ def cache_aware_checkpointer(checkpointer):
 
     class CheckpointerWithCacheAdvice:
         def load(self, *args, **kwargs):
+            args, kwargs = _normalize_legacy_cache_arguments(load_signature, args, kwargs)
             bound = load_signature.bind_partial(*args, **kwargs)
             if "evict_source_cache" not in bound.arguments:
                 kwargs["evict_source_cache"] = True
