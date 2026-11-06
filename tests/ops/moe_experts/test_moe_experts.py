@@ -54,8 +54,8 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import assert_close_with_error, assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
+from veomni.ops.kernels.moe_experts.shared import scheduling as same_nk_scheduling
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
-from veomni.ops.kernels.moe_experts.standard import triton as triton_moe_module
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
@@ -1023,15 +1023,15 @@ def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monk
         def unexpected_device_query():
             raise AssertionError("Compilation must not query a live device")
 
-        monkeypatch.setattr(triton_moe_module, "get_torch_device", unexpected_device_query)
+        monkeypatch.setattr(same_nk_scheduling, "get_torch_device", unexpected_device_query)
     elif mode == "unknown":
-        monkeypatch.setattr(triton_moe_module, "get_torch_device", object)
+        monkeypatch.setattr(same_nk_scheduling, "get_torch_device", object)
     elif mode == "noncallable":
 
         class DeviceAPI:
             is_current_stream_capturing = False
 
-        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+        monkeypatch.setattr(same_nk_scheduling, "get_torch_device", DeviceAPI)
     else:
 
         class DeviceAPI:
@@ -1042,9 +1042,9 @@ def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monk
                     return None
                 return mode == "capturing"
 
-        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+        monkeypatch.setattr(same_nk_scheduling, "get_torch_device", DeviceAPI)
 
-    assert triton_moe_module._must_use_shape_derived_bound() is expected
+    assert same_nk_scheduling._must_use_shape_derived_bound() is expected
 
 
 @pytest.mark.parametrize(
@@ -1054,7 +1054,7 @@ def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monk
 def test_triton_merged_same_nk_compact_schedule(
     routing_kind: str, assume_distinct_experts: bool, monkeypatch: pytest.MonkeyPatch
 ):
-    """Build one prefix and reuse it for all four merged forward/backward calls."""
+    """Build independent split/merged prefixes and reuse each during backward."""
     require_nvidia_cuda("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
 
@@ -1105,18 +1105,21 @@ def test_triton_merged_same_nk_compact_schedule(
     # The helper runs split forward, merged forward, split backward, merged backward.
     assert nk_bounds == [shape_bound] * 5 + [num_tokens * top_k] * 3 + [shape_bound] * 2
     assert mn_bounds == [num_tokens * top_k] * 5
-    assert len(prefixes) == 1 and prefixes[0] is not None
-    assert all(schedule is None for schedule in schedules[:3] + schedules[5:8])
-    assert all(schedule.data_ptr() == prefixes[0].data_ptr() for schedule in schedules[3:5] + schedules[8:])
+    assert len(prefixes) == 2 and all(prefix is not None for prefix in prefixes)
+    assert prefixes[0].data_ptr() != prefixes[1].data_ptr()
+    assert all(schedule.data_ptr() == prefixes[0].data_ptr() for schedule in schedules[:3] + schedules[5:8])
+    assert all(schedule.data_ptr() == prefixes[1].data_ptr() for schedule in schedules[3:5] + schedules[8:])
     counts = torch.bincount(selected.flatten(), minlength=num_experts)
     expected = torch.cumsum(torch.div(counts + 127, 128, rounding_mode="floor"), dim=0)
-    torch.testing.assert_close(prefixes[0], expected, rtol=0, atol=0)
+    for prefix in prefixes:
+        torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("reason", ["cpu", "empty", "too_many_experts", "no_rows", "other_tile"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_merged_same_nk_prefix_metadata_fallback(reason: str, monkeypatch: pytest.MonkeyPatch):
     """Unsupported metadata must return before launching or allocating a prefix."""
+    pytest.importorskip("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
 
     class Metadata:
@@ -1181,7 +1184,7 @@ def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...], b
         """Build a device prefix and consume it in the native grouped GEMM."""
         prefix = gemm_module.merged_same_nk_tile_prefix(cumsum, total)
         output = gemm_module.group_gemm_same_nk(
-            a, weights, cumsum, max_M=max(counts), transpose_b=True, tile_cumsum=prefix
+            a, weights, cumsum, max_M=max(counts), transpose_b=True, tile_cumsum=prefix, tile_total_M=sum(counts)
         )
         return prefix, output
 
@@ -1239,7 +1242,7 @@ def test_triton_merged_shape_fallback_does_not_synchronize(reason: str, monkeypa
 
     monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_bound)
     if reason == "capture_unavailable":
-        monkeypatch.setattr(triton_moe_module, "get_torch_device", object)
+        monkeypatch.setattr(same_nk_scheduling, "get_torch_device", object)
     previous_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -1289,7 +1292,7 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     warmup_stream.wait_stream(torch.cuda.current_stream())
     # Warm the shape-only specialization that the real capture will select.
     with monkeypatch.context() as warmup_patch:
-        warmup_patch.setattr(triton_moe_module, "_must_use_shape_derived_bound", lambda: True)
+        warmup_patch.setattr(same_nk_scheduling, "_must_use_shape_derived_bound", lambda: True)
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
                 forward().sum().backward()

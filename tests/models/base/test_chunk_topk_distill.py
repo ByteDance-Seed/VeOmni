@@ -39,7 +39,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import veomni.models.loss_utils.chunk_logprobs as cl
 import veomni.models.loss_utils.chunk_topk_distill as ctkd
 from veomni.models.loss_utils import chunk_logprobs_function
 from veomni.utils.constants import IGNORE_INDEX
@@ -61,11 +60,6 @@ class _FakePS:
 def _no_sp(monkeypatch):
     """Default: SP disabled. Tests that need SP-on monkeypatch this again."""
     monkeypatch.setattr(ctkd, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
-    # Force the gather-fallback path for the per-token NLL helper so the
-    # tests run on CPU. The fa_ce triton kernel requires a real CUDA device;
-    # the fallback path is bitwise-equivalent on the IGN-zero contract and
-    # numerically identical on fp32 inputs.
-    monkeypatch.setattr(cl, "_FA_CE_AVAILABLE", False)
 
 
 def _dense_reference(

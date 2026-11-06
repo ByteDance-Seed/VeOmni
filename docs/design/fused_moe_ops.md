@@ -58,7 +58,7 @@ grad_fc2_output = moe_scatter(grad_output, scatter_index)
 num_scattered_tokens = grad_fc2_output.shape[0]
 ```
 
-The split-FC1 backward uses `num_scattered_tokens` for the downstream
+With the shape-derived fallback, split-FC1 backward uses `num_scattered_tokens` for the downstream
 `group_gemm_same_nk(..., max_M=...)` calls. The merged backward reuses its
 forward's shape-derived bound: total routed rows by default, or original
 tokens only when the caller explicitly guarantees distinct top-k routes.
@@ -70,10 +70,19 @@ have at most `tokens` scattered rows.
 
 ## Device-side row-tile schedule
 
-Eligible eager merged-FC1 calls build a device prefix of each expert's
-`ceil(expert_rows / 128)` output-row tiles. The same prefix is saved for
-backward and reused by both forward and both input-gradient same-NK GEMMs.
-Expert counts remain on-device; there is no scalar read back to the host.
+Eligible eager calls build one device prefix of each expert's
+`ceil(expert_rows / 128)` output-row tiles. Standard split/merged FC1, their
+EP-local counterparts, and shared/independent MoE-LoRA (with and without EP)
+use the same schedule selection. EP builds its prefix from the local,
+already-permuted rows and local expert boundaries.
+
+The prefix is saved for backward. Split experts reuse it for three forward
+and three input-gradient same-NK GEMMs; merged experts reuse it for two plus
+two. Shared LoRA applies it to the base grouped GEMMs; its dense adapter
+projections are unchanged. Independent LoRA also passes it through the
+per-expert A/B projections and their input gradients, sharing one prefix
+across eight forward and eight backward same-NK calls. Each forward owns
+its prefix; equal shapes do not permit reuse across different routing inputs.
 
 The host can bound the row-tile grid using tensor shapes:
 
@@ -87,11 +96,21 @@ into `grid.x`, preserving the original launch's supported column range.
 The schedule may launch a few unused tail tiles but avoids repeating the
 whole per-expert upper bound for every expert.
 
+`same_nk_tile_schedule(cumsum, rows)` returns the optional prefix together
+with its Python integer row total. Every `group_gemm_same_nk` consumer passes
+both `tile_cumsum` and `tile_total_M`. With a prefix, the latter must match
+`a.shape[0]`; a missing, tensor-valued or mismatched total is rejected before
+output allocation or kernel launch. This checks the producer/consumer row
+contract without copying the prefix's last value to the host. Consumers must
+also preserve the original expert boundaries and row ordering.
+
 The prefix applies to CUDA tensors, 1–256 experts, nonempty routed input
-and the existing 128-row GEMM tiles. Other cases use the shape-derived
-schedule. Compilation, stream capture and unavailable capture-state queries
-also retain that schedule. Neither path reads a device scalar on the host.
-Split-FC1, expert-parallel routing and GEMM tile parameters are unchanged.
+and the existing 128-row GEMM tiles. Compilation, stream capture, unavailable
+capture-state queries and unsupported metadata retain each entry point's
+original shape-derived bound. The unused schedule and its row total are both
+`None`. Neither selection reads a device scalar. Existing EP preprocessing
+and communication are unchanged. Weight-gradient same-MN reduction bounds,
+GEMM tile parameters, routing weights and activation rounding are unchanged.
 
 ## Why ordinary top-k routing may hide the bug
 

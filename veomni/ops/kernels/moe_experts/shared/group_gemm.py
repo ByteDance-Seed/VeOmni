@@ -23,6 +23,7 @@ import triton
 import triton.language as tl
 
 from .....utils.device import get_torch_device
+from . import scheduling
 
 
 _GROUP_GEMM_BLOCK = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8}
@@ -300,6 +301,22 @@ def group_gemm_same_nk_kernel(
     store_with_pred_2d(c_ptrs, c, False, N_ALIGNED, offs_m[:, None] < m_size, offs_n[None, :] < N)
 
 
+def same_nk_tile_schedule(cumsum_M: torch.Tensor, total_M: int) -> tuple[Optional[torch.Tensor], Optional[int]]:
+    """Build one eager row-tile prefix and its host-side total-row contract.
+
+    The prefix follows the expert boundaries in ``cumsum_M`` and can be reused
+    only by inputs with the same row grouping and ``total_M`` rows. Compile,
+    capture and unsupported metadata retain the original shape-based schedule.
+    No device scalar is read by this selection or prefix construction.
+    """
+    if scheduling._must_use_shape_derived_bound():
+        return None, None
+    if type(total_M) is not int:
+        raise TypeError("Schedule total_M must be a Python int")
+    prefix = merged_same_nk_tile_prefix(cumsum_M, total_M)
+    return prefix, total_M if prefix is not None else None
+
+
 def group_gemm_same_nk(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -311,6 +328,7 @@ def group_gemm_same_nk(
     save_activation: bool = False,
     c: Optional[torch.Tensor] = None,
     tile_cumsum: Optional[torch.Tensor] = None,
+    tile_total_M: Optional[int] = None,
 ):
     """Grouped gemm for same nk
 
@@ -325,6 +343,8 @@ def group_gemm_same_nk(
     save_activation -- return the activation's input or not
     c -- which tensor accumulate to, c = c + ggemm(a, b)
     tile_cumsum -- optional device prefix of per-expert 128-row tile counts
+    tile_total_M -- host integer row total used to build tile_cumsum; required
+                    with a prefix and equal to a.shape[0]
     """
     if transpose_b:
         G, N, K = b.shape
@@ -345,6 +365,14 @@ def group_gemm_same_nk(
 
     assert a.is_contiguous() and b.is_contiguous(), "Not implemented: Noncontiguous input."
 
+    if tile_cumsum is not None:
+        if type(tile_total_M) is not int:
+            raise TypeError("tile_total_M must be a Python int when a tile prefix is provided")
+        if tile_total_M != a.shape[0]:
+            raise ValueError("Tile prefix total does not match the grouped-GEMM input row count")
+        assert tile_cumsum.device == cumsum_M.device and tile_cumsum.shape == cumsum_M.shape
+        assert tile_cumsum.dtype == cumsum_M.dtype and tile_cumsum.is_contiguous()
+
     c_is_none = c is None
     if c_is_none:
         c = torch.empty((a.shape[1] if transpose_a else a.shape[0], N), dtype=a.dtype, device=a.device)
@@ -352,9 +380,6 @@ def group_gemm_same_nk(
     if save_activation:
         act = torch.empty_like(c)
 
-    if tile_cumsum is not None:
-        assert tile_cumsum.device == cumsum_M.device and tile_cumsum.shape == cumsum_M.shape
-        assert tile_cumsum.dtype == cumsum_M.dtype and tile_cumsum.is_contiguous()
     use_compact = tile_cumsum is not None and _GROUP_GEMM_BLOCK["BLOCK_M"] == 128
 
     def grid(meta):

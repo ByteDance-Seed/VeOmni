@@ -79,6 +79,7 @@ from veomni.lora.moe_layers import (
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.models.configuration_base import as_veomni_config
 from veomni.ops.kernels.moe_experts_lora.routing import group_routing_assignments
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -253,8 +254,6 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_selects_op_impl(mode: str):
     """Wrapper constructs ``moe_experts_lora`` from the experts' ``moe_experts`` handle."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
@@ -273,50 +272,41 @@ def test_wrapper_selects_op_impl(mode: str):
 
     if not IS_CUDA_AVAILABLE:
         return
-    saved_cfg = get_ops_config()
-    try:
-        torch.manual_seed(0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model_f = build_toy("qwen3_moe_toy", ops=fused_triton_moe_ops())
-        lora_cfg_f = resolve_fused_moe_lora_targets(model_f, load_lora_config("qwen3_moe_toy"))
-        fqn_f, _ = find_first_matching_module(model_f, experts_module_globs(lora_cfg_f["target_parameters"]))
-        _apply(
-            mode,
-            model_f,
-            target_parameter_patterns=lora_cfg_f["target_parameters"],
-            r=lora_cfg_f["rank"],
-            lora_alpha=lora_cfg_f["alpha"],
-            freeze_base_model=True,
-        )
-        wrapper_f = model_f.get_submodule(fqn_f)
-        assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
-    finally:
-        set_ops_config(saved_cfg)
+    torch.manual_seed(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model_f = build_toy("qwen3_moe_toy", ops=fused_triton_moe_ops())
+    lora_cfg_f = resolve_fused_moe_lora_targets(model_f, load_lora_config("qwen3_moe_toy"))
+    fqn_f, _ = find_first_matching_module(model_f, experts_module_globs(lora_cfg_f["target_parameters"]))
+    _apply(
+        mode,
+        model_f,
+        target_parameter_patterns=lora_cfg_f["target_parameters"],
+        r=lora_cfg_f["rank"],
+        lora_alpha=lora_cfg_f["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper_f = model_f.get_submodule(fqn_f)
+    assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-def test_wrapper_follows_experts_handle_not_global_config(mode: str):
-    """A global config installed after model build must not change the wrapped experts' impl."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
+def test_wrapper_follows_experts_handle_after_config_changes(mode: str):
+    """A config change after model build must not change the wrapped experts' impl."""
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
     assert experts.veomni_moe.impl == "eager"
-    saved_cfg = get_ops_config()
-    try:
-        set_ops_config(fused_triton_moe_ops())
-        _apply(
-            mode,
-            model,
-            target_parameter_patterns=patterns,
-            r=lora_cfg["rank"],
-            lora_alpha=lora_cfg["alpha"],
-            freeze_base_model=True,
-        )
-    finally:
-        set_ops_config(saved_cfg)
+    as_veomni_config(model.config, validate=False)._set_ops_implementation({"moe_implementation": None})
+    assert model.config.ops_config.moe_implementation is None
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
     assert model.get_submodule(sample_fqn).veomni_moe_lora.impl == "eager"
 
 
@@ -372,7 +362,6 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
     from veomni.arguments import OpsImplementationConfig
     from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
     from veomni.ops import OP_REGISTRY, VeomniOp
-    from veomni.ops.config import get_ops_config, set_ops_config
 
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)
     monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
@@ -386,15 +375,17 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
     with pytest.raises(RuntimeError, match="not registered for device 'mlu'"):
         VeomniOp("moe_experts_lora", mode, "fused_triton")
 
-    config = Qwen3MoeConfig(hidden_size=16, moe_intermediate_size=8, num_experts=4, hidden_act="silu")
-    saved_cfg = get_ops_config()
-    set_ops_config(ops)
-    try:
-        experts = Qwen3MoeExperts(config)
-        assert experts.veomni_moe.impl == "fused_triton"
-        wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)
-    finally:
-        set_ops_config(saved_cfg)
+    config = Qwen3MoeConfig(
+        hidden_size=16,
+        moe_intermediate_size=8,
+        num_experts=4,
+        hidden_act="silu",
+        ops_implementation=ops,
+    )
+    as_veomni_config(config, validate=False)
+    experts = Qwen3MoeExperts(config)
+    assert experts.veomni_moe.impl == "fused_triton"
+    wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)
     assert wrapper.veomni_moe_lora.impl == "eager"
 
 
@@ -784,3 +775,107 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
     assert set(s1) == set(s2), f"{mode}: reload key set mismatch"
     for k in s1:
         assert torch.equal(s1[k], s2[k]), f"{mode}: value mismatch: {k}"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_qwen3_fused_lora_model_matches_eager_gradients_and_update(tmp_path, mode, monkeypatch):
+    """Run nonzero adapters through a registered model and compare a full update."""
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("triton")
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    from transformers import Qwen3MoeConfig
+
+    from tests.ops.moe_experts_lora.test_moe_experts_lora import (
+        _FWD_L2REL_TOL,
+        _GRAD_L2REL_TOL,
+        _l2_rel,
+    )
+    from veomni.ops.kernels.moe_experts.shared import group_gemm
+
+    from .utils import build_lora_test_model, full_eager_ops
+
+    config = Qwen3MoeConfig(
+        architectures=["Qwen3MoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        attention_dropout=0.0,
+        use_cache=False,
+    )
+    config.save_pretrained(tmp_path)
+    lora_config = load_lora_config("qwen3_moe_toy")
+
+    def build(ops):
+        model = build_lora_test_model(
+            str(tmp_path),
+            weights_path=None,
+            torch_dtype="bfloat16",
+            init_device=get_device_type(),
+            ops_implementation=ops,
+        )
+        resolved = resolve_fused_moe_lora_targets(model, lora_config)
+        _apply(
+            mode,
+            model,
+            target_parameter_patterns=resolved["target_parameters"],
+            r=resolved["rank"],
+            lora_alpha=resolved["alpha"],
+            freeze_base_model=True,
+        )
+        return model.eval()
+
+    torch.manual_seed(20261105)
+    reference = build(full_eager_ops())
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            if parameter.requires_grad:
+                parameter.normal_(mean=0.0, std=0.02)
+    actual = build(fused_triton_moe_ops())
+    actual.load_state_dict(reference.state_dict())
+    reference_params = {n: p for n, p in reference.named_parameters() if p.requires_grad}
+    actual_params = {n: p for n, p in actual.named_parameters() if p.requires_grad}
+    assert actual_params.keys() == reference_params.keys() and actual_params
+    frozen = {n: p.detach().clone() for n, p in actual.named_parameters() if not p.requires_grad}
+    prefix_calls = []
+    original = group_gemm.merged_same_nk_tile_prefix
+
+    def record(*args, **kwargs):
+        prefix = original(*args, **kwargs)
+        prefix_calls.append(prefix)
+        return prefix
+
+    monkeypatch.setattr(group_gemm, "merged_same_nk_tile_prefix", record)
+    ids = torch.arange(32, device=get_device_type()).reshape(2, 16) % config.vocab_size
+    with torch.no_grad():
+        expected_logits = reference(input_ids=ids, use_cache=False).logits
+        observed_logits = actual(input_ids=ids, use_cache=False).logits
+    assert _l2_rel(observed_logits, expected_logits) <= _FWD_L2REL_TOL
+    prefix_calls.clear()
+    expected = reference(input_ids=ids, labels=ids, use_cache=False)
+    observed = actual(input_ids=ids, labels=ids, use_cache=False)
+    assert len(prefix_calls) == config.num_hidden_layers and all(p is not None for p in prefix_calls)
+    torch.testing.assert_close(observed.loss, expected.loss, rtol=_FWD_L2REL_TOL, atol=0)
+    expected.loss.backward()
+    observed.loss.backward()
+    for name in actual_params:
+        assert actual_params[name].grad is not None and reference_params[name].grad is not None, name
+        assert _l2_rel(actual_params[name].grad, reference_params[name].grad) <= _GRAD_L2REL_TOL, name
+    before = {n: p.detach().clone() for n, p in actual_params.items()}
+    torch.optim.SGD(reference_params.values(), lr=0.1).step()
+    torch.optim.SGD(actual_params.values(), lr=0.1).step()
+    assert any(not torch.equal(p, before[n]) for n, p in actual_params.items())
+    for name in actual_params:
+        assert _l2_rel(actual_params[name], reference_params[name]) <= _GRAD_L2REL_TOL, name
+    for name, parameter in actual.named_parameters():
+        if not parameter.requires_grad:
+            assert parameter.grad is None, name
+            torch.testing.assert_close(parameter, frozen[name], rtol=0, atol=0, msg=name)

@@ -82,7 +82,7 @@ Use these separate mechanisms only when their semantics require them:
 4. Import the family from `veomni/ops/kernels/__init__.py` so registration
    happens when `veomni.ops` is imported.
 5. In each consuming model, construct a `VeomniOp` from
-   `resolve_op_impl(...)` and store it on the model/module instance.
+   `config.ops_config.<field>` and store it on the model/module instance.
 6. For a compound raw kernel, call the nested row's raw `forward`/`backward`
    and use the saved-state helpers in `veomni/ops/compound.py`; do not call
    the nested autograd wrapper.
@@ -149,3 +149,22 @@ Use these separate mechanisms only when their semantics require them:
 - Letting an unavailable optimized implementation fall back silently.
 - Editing patchgen-generated files instead of their patch config.
 - Renaming `ops_implementation` while changing the internal kernel plumbing.
+
+## Configuration ownership
+
+Model ops selections belong to `VeOmniPretrainedConfig.ops_implementation`.
+Read `config.ops_config.<field>` when binding a handle. HF config methods are
+never patched globally; standalone module tests must construct an adapted config
+with `get_veomni_config_class` or opt in with `as_veomni_config`.
+Attention's HF accessors alias the same dictionary; do not add synchronization
+fields or repair attention state in builders. See `docs/design/module_config.md`.
+
+Merge all load-time ops layers as dictionaries before validation. The owning
+config caches a standard `OpsImplementationConfig` instance after the final
+selection is known; do not bypass its dataclass constructor or introduce an
+ambient validation context. Caches stay out of saved config dictionaries.
+
+Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
+supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
+`eager` row preserves model-local eager math when present and otherwise
+forwards to `veomni_sdpa`; consumers do not remap eager themselves.

@@ -15,9 +15,9 @@
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -89,6 +89,17 @@ class OptimizerConfig:
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
+    state_offload: Literal["none", "cpu"] = field(
+        default="none",
+        metadata={
+            "help": (
+                "Optimizer-managed state offload. 'none' disables it (training state may still be "
+                "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
+                "in host buffers and streams them to the device in batches, lowering peak device "
+                "memory (type='adamw' only)."
+            )
+        },
+    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or default learning rate, or init learning rate for warmup."},
@@ -144,6 +155,27 @@ class OptimizerConfig:
     betas: Tuple[float, float] = field(
         default=(0.9, 0.95),
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
+    # ---- state_offload-specific (only consulted when state_offload == "cpu") ----
+    state_offload_device_memory_fraction: float = field(
+        default=0.8,
+        metadata={
+            "help": (
+                "With model.optimizer.state_offload='cpu', the fraction of currently free device memory "
+                "used to size one streamed batch of optimizer states. It is recomputed every step; "
+                "a parameter whose states exceed it cannot be swapped in and step() raises."
+            )
+        },
+    )
+    state_offload_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "With model.optimizer.state_offload='cpu', pin the host-side optimizer state buffers. "
+                "Disable if page-locked memory is scarce; a failed pinned allocation degrades to "
+                "pageable buffers (rank-0 warning)."
+            )
+        },
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -247,6 +279,28 @@ class OptimizerConfig:
             )
         },
     )
+
+    def __post_init__(self):
+        # Annotations are not enforced for YAML values (see constraints), so the
+        # literal is validated explicitly; otherwise a typo would silently fall
+        # back to the stock path in the builder.
+        if self.state_offload not in ("none", "cpu"):
+            raise ValueError(f"model.optimizer.state_offload must be 'none' or 'cpu', got {self.state_offload!r}")
+        if self.state_offload == "cpu":
+            if self.type == "adamw":
+                # YAML resolves an exponent literal without a decimal point
+                # (``8e-1``) to a string, so coerce before the range check (same
+                # reason as ``_collect_muon_kwargs`` does for ``muon_lr``).
+                self.state_offload_device_memory_fraction = float(self.state_offload_device_memory_fraction)
+                if not 0.0 < self.state_offload_device_memory_fraction <= 1.0:
+                    raise ValueError(
+                        "model.optimizer.state_offload_device_memory_fraction must be in (0, 1], "
+                        f"got {self.state_offload_device_memory_fraction}"
+                    )
+            else:
+                raise ValueError(
+                    f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={self.type!r}."
+                )
 
 
 @dataclass
@@ -610,6 +664,12 @@ def validate_low_precision_reduce_scatter_comm(
     return True
 
 
+def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
+    """Validate an explicit expert FSDP placement independently of its optimizer."""
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+        raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -666,6 +726,18 @@ class FSDPConfig:
             )
         },
     )
+    expert_fsdp_shard_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
+        },
+    )
+    expert_weight_fp8_all_gather: bool = field(
+        default=False,
+        metadata={
+            "help": "Use FP8 payloads plus block scales for FSDP2 all-gather of DeepGEMM routed expert weights. Does not change EP token communication, gradient reduction or other parameters. Ignored without matching experts; requires BF16 mixed precision, block-aligned shards and no parameter CPU offload."
+        },
+    )
     low_precision_reduce_scatter_comm: bool = field(
         default=False,
         metadata={
@@ -697,6 +769,9 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        if not isinstance(self.expert_weight_fp8_all_gather, bool):
+            raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
+        validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
@@ -790,6 +865,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Expert parallel size."},
     )
+    npu_ep_hccl_buffer_mib: Optional[int] = field(
+        default=None,
+        metadata={"help": "Opt-in HCCL EP buffer size in MiB; may increase device memory use."},
+    )
+    npu_ep_hccl_expansion_mode: Optional[Literal["host", "device"]] = field(
+        default=None,
+        metadata={"help": "Opt-in HCCL EP operator expansion placement (host or device)."},
+    )
     ep_outside: bool = field(
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
@@ -834,6 +917,9 @@ class AcceleratorConfig:
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
     def __post_init__(self):
+        from ..distributed.hccl_options import validate_ep_hccl_options
+
+        validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
         # although expert parallel and extra parallel are both provided in the arguments,
         # the implementation is configuring extra parallelism to include expert parallelism.
         # Guarded so re-instantiating from a saved config (asdict round-trip) does not
@@ -842,6 +928,10 @@ class AcceleratorConfig:
             self.extra_parallel_sizes.append(self.ep_size)
             self.extra_parallel_names.append("ep")
             self.extra_parallel_placement_innermost.append(self.ep_outside)
+
+        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
+            raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
         # world_size and dp_size are plain attributes rather than fields: an omni model
         # builds one of these per module, and a field would let asdict() round-trip a
@@ -1341,12 +1431,6 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
 }
 
-# Compatibility aliases for explicit values on variants without that backend.
-# Unset values remain None and use the registry's per-variant default.
-_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
-}
-
 # Values that were never implementation names and have no implementation equivalent.
 _REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
     "rms_norm_implementation": {
@@ -1444,8 +1528,8 @@ class OpsImplementationConfig:
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend; the unweighted "
-            "variant has no Ascend kernel and uses 'eager') | "
+            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend weighted variants only; "
+            "unweighted requires 'eager' or an unset selection on Ascend) | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
@@ -1615,17 +1699,23 @@ class OpsImplementationConfig:
         """Validate Hub and AITER requests and resolve their registered VeOmni names."""
         OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
-        return {
+        return OpsImplementationConfig.normalize_attention_backend(implementation, veomni_names=False)
+
+    @staticmethod
+    def normalize_attention_backend(implementation: Optional[str], *, veomni_names: bool = True) -> Optional[str]:
+        """Normalize names without validating an intermediate config selection."""
+        aliases = _DEPRECATED_IMPLEMENTATION_ALIASES["attn_implementation"]
+        if implementation in aliases:
+            replacement = aliases[implementation]
+            OpsImplementationConfig._warn_deprecated("attn_implementation", implementation, replacement)
+            implementation = replacement
+        implementation = {
             "aiter": "veomni_flash_attention_aiter",
             "flash_attention_2_hub": "veomni_flash_attention_2_hub",
             "flash_attention_3_hub": "veomni_flash_attention_3_hub",
         }.get(implementation, implementation)
-
-    def __post_init__(self):
-        self._apply_deprecated_aliases()
-        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
-        if get_env("MODELING_BACKEND") == "veomni":
-            replacements = {
+        if veomni_names and get_env("MODELING_BACKEND") == "veomni":
+            return {
                 "flash_attention_2": "veomni_flash_attention_2",
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
@@ -1633,13 +1723,19 @@ class OpsImplementationConfig:
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
-            }
-            if self.attn_implementation in replacements:
-                new_impl = replacements[self.attn_implementation]
-                logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
-                self.attn_implementation = new_impl
+            }.get(implementation, implementation)
+        return implementation
 
+    def __post_init__(self):
+        self._apply_deprecated_aliases()
+        self.validate_attention_backend(self.attn_implementation)
+        self.validate_hub_attention_backend(self.attn_implementation)
+        self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize non-None op implementation selections to a dict."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""
@@ -1910,6 +2006,13 @@ class ModelArguments(BaseModelArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Both move training state to host; running them together would double
+        # the host footprint and fight over the accelerator. Reject at parse time.
+        if self.optimizer.state_offload == "cpu" and self.accelerator.fsdp_config.offload:
+            raise ValueError(
+                "model.optimizer.state_offload='cpu' cannot be combined with "
+                "model.accelerator.fsdp_config.offload; both move training state to host."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
