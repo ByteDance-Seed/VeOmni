@@ -173,9 +173,11 @@ embeddings and `masked_scatter`s them back, instead of walking the conversation
 carrier item by item.
 
 It works because these three modules are one family over one sequence: the text
-encoder owns the text rows, the vision tower owns the visual rows, and the backbone
-reads all of them at a shared width. A graph that composes modules with different
-sequence lengths, tokenisations or hidden sizes cannot be packed — see
+encoder owns the text rows, the vision tower owns the visual rows, and the
+backbone reads all of them at one shared width — the tower's own 1024-wide
+features are projected to it by its merger before the scatter. A graph whose
+modules write rows of a different width into that tensor, or that need a different
+sequence length or tokenisation per module, cannot be packed — see
 [Adding a model §4.1](../usage/adding_a_model.md#41-packing-optional) for the
 conditions.
 

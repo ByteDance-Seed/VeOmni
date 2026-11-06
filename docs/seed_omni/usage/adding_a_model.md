@@ -173,24 +173,29 @@ real_tokens = visual_row_mask(grid, merge, is_real)   # (T,) where this module o
 packed = masked_scatter_embeds(packed, mask, real_tokens)
 ```
 
-Every participant therefore has to agree on both `T` (what one row means) and `D`
-(the embedding width), and every row must be owned by exactly one module. That
-holds for a family whose modules are different *views of the same sequence* — the
-text encoder owns tokens, the vision tower owns visual rows, the backbone reads
-the whole thing — which is what the packed graphs of Qwen3-VL and Janus are.
+Every participant therefore has to agree on **what it writes**: `T` (what one row
+of the shared tensor means) and `D` (the width it is written at), with each row
+owned by exactly one module. A module's *own* internals are unconstrained — it may
+run at any width or length as long as it adapts to the packed layout before the
+scatter. That holds for a family whose modules are different *views of the same
+sequence* — the text encoder owns tokens, the vision tower owns visual rows, the
+backbone reads the whole thing — which is what the packed graphs of Qwen3-VL and
+Janus are.
 
 It does **not** hold for an arbitrary assembly of modules:
 
-- **Different sequence lengths or tokenisations.** A talker consuming one
-  utterance at a time, an audio codec producing a different frame rate, a module
-  with its own resampler — each would need its own `T`, and one shared tensor
-  cannot carry two.
-- **Different hidden sizes.** A module whose output width differs from the
-  backbone's input needs a projection between them, which is a node that reads one
-  sequence and writes another — not a `masked_scatter` into the same buffer.
-- **Two modules owning the same rows**, or a module whose rows depend on another
-  module's *output* rather than on the CPU-packed input. Packing is decided on the
-  CPU before any module runs, so the ownership split has to be known statically.
+- **A row set that cannot be known before the modules run.** Packing decides the
+  row layout on the CPU, so a module whose rows depend on another module's *output*
+  has no static split to pack. (A module that merely *reads* a shorter sequence
+  internally is fine — the vision tower sees patch rows, not the LLM sequence — as
+  long as what it writes still covers exactly the rows it owns.) Two modules
+  claiming the same rows is the same defect seen from the other side.
+- **A row written at the wrong width.** The constraint is on what a module
+  *writes into* `packed_features`, not on its internal width: a tower may run at
+  any hidden size as long as it projects before the scatter — Qwen3-VL's ViT is
+  1024-wide and its merger emits 2048. A module that cannot produce the shared
+  width, or that needs to hand its output to another module at a different width,
+  is not a `masked_scatter` participant.
 - **A graph composed across families** (say a ViT from one checkpoint with a
   backbone from another). The packer's token layout is family-specific — Qwen3-VL
   builds M-RoPE and a `visual_pos_mask`; another family would build different
