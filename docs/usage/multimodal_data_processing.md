@@ -231,9 +231,10 @@ data:
 Select `openai_chatml_qwenvl` as the model chat template: it installs the same
 ChatML rendering on the saved processor and tokenizer. The Qwen-VL transform
 accepts a `messages` array with string content for text and typed content
-blocks for image conversations. Samples with `messages` automatically select
-this path unless they explicitly declare a `source`; the explicit source for
-this format is `openai_chatml`. Assistant messages default to
+blocks for image conversations. Samples with `messages` use this path even if
+a dataset-level `source_name` is set. A non-null per-sample `source` must be
+`openai_chatml`; other non-null values, including registered preprocessors, are
+rejected. Assistant messages default to
 `loss_mask: 1` and other roles default to `0`; either can explicitly set a
 binary mask. Images are currently accepted only as unsupervised user input.
 
@@ -255,9 +256,9 @@ its null image blocks, in conversation order. Text blocks may include
 still backpropagate through an unfrozen vision encoder. The text-only renderer
 uses the same ChatML label and truncation convention as VeOmni's text path;
 overlength image conversations are rejected rather than partially truncating
-an image. Nonempty `tools` metadata requires `tools_in_system=true` and every
-tool name must already occur in the system message. Fractional `loss_weight`
-requires the complete weighted-loss feature (renderer, collator, model loss, and
+an image. Nonempty `tools` metadata requires `data.mm_configs.tools_in_system`
+to be `true`, and every tool name must already occur in the system message.
+Fractional `loss_weight` requires the complete weighted-loss feature (renderer, collator, model loss, and
 trainer normalization) and is rejected if the weighted renderer is not
 installed. MTP, video/audio blocks and structured tool calls are outside this contract.
 When this template is selected, exported processor and tokenizer assets retain
