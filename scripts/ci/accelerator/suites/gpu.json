@@ -119,6 +119,16 @@
     ]
   },
   {
+    "name": "gpu-bounded-activation-offload-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_bounded_activation_offload.py"
+    ]
+  },
+  {
     "name": "10-unit",
     "suite": "unit",
     "conditional": false,
