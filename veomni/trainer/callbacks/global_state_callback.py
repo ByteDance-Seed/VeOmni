@@ -328,9 +328,31 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-        payload = None
-        state_error = None
+        step_root, path_error = None, None
+        try:
+            step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        except Exception as exc:  # noqa: BLE001 - all ranks must agree before invalidating a manifest
+            path_error = exc
+        raise_if_any_rank_failed(path_error, "preparing the trainer checkpoint path")
+        assert step_root is not None
+
+        # A restarted run reaching this step again overwrites the cursor files, so
+        # the manifest an earlier attempt left has to go before the first of them
+        # lands -- otherwise a rewrite that dies half-way leaves a step that still
+        # reads as complete. Only this file: DCP's markers belong to
+        # ``DistributedCheckpointer``, which drops them when it rewrites a module.
+        # Rank 0 owns it, so rank 0 clears it, and every rank waits for that
+        # before writing anything of its own.
+        remove_error: Optional[Exception] = None
+        if self.rank == 0:
+            try:
+                layout.remove_manifest(step_root)
+            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
+                logger.error(f"[RANK {self.rank}] failed to remove the manifest under {step_root}", exc_info=True)
+                remove_error = e
+        raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
+
+        payload, state_error = None, None
         try:
             payload = self.state_dict(state)
             receipts = {}
@@ -355,22 +377,6 @@ class GlobalStateCallback(Callback):
         raise_if_any_rank_failed(state_error, "collecting the trainer state", group=group)
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
-
-        # A restarted run reaching this step again overwrites the cursor files, so
-        # the manifest an earlier attempt left has to go before the first of them
-        # lands -- otherwise a rewrite that dies half-way leaves a step that still
-        # reads as complete. Only this file: DCP's markers belong to
-        # ``DistributedCheckpointer``, which drops them when it rewrites a module.
-        # Rank 0 owns it, so rank 0 clears it, and every rank waits for that
-        # before writing anything of its own.
-        remove_error: Optional[Exception] = None
-        if self.rank == 0:
-            try:
-                layout.remove_manifest(step_root)
-            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
-                logger.error(f"[RANK {self.rank}] failed to remove the manifest under {step_root}", exc_info=True)
-                remove_error = e
-        raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
 
         # Each rank writes its own files, so a full disk or a bad pickle starts out
         # visible to that rank alone. Reduce before the manifest: the manifest
@@ -472,6 +478,17 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        if dist.is_initialized():
+            local_policy = (
+                strict_sft,
+                tuple(name for name, _ in legacy_checkpoints),
+                tuple(unknown_checkpoints),
+                tuple(sorted(generations.items())),
+            )
+            policies = [None] * dist.get_world_size()
+            dist.all_gather_object(policies, local_policy)
+            if any(policy != local_policy for policy in policies):
+                raise RuntimeError("Checkpoint data and optimizer resume policy differs across ranks")
         coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
 
         if strict_optimizer:

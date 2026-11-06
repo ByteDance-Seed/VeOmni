@@ -235,19 +235,50 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
             _complete_stub_checkpoint(tmp_path, world_size=2)
         dist.barrier()
         step = 4 if mode == "optimizer_step" and rank == 1 else 3
-        trainer = _trainer(tmp_path, optimizer_step=step)
+        asymmetric_policy = mode in ("asymmetric_dynamic_missing", "asymmetric_optimizer_owner")
+        trainer = _trainer(tmp_path, optimizer_step=step, strict=not asymmetric_policy)
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
+        if mode == "asymmetric_dynamic_missing":
+            from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader
+
+            trainer._sft_dynamic_exact_resume = True
+            if rank == 0:
+                trainer.train_dataloader = object.__new__(DynamicBatchSizeDataLoader)
+                trainer.train_dataloader._dataloader = SimpleNamespace(dataset=[])
+        if mode == "asymmetric_optimizer_owner" and rank == 0:
+            trainer.model.checkpoint.confirm_legacy_loaded_checkpoint_for_reuse = lambda *_args: None
+        if mode == "asymmetric_generations" and rank == 1:
+            trainer.model.checkpoint._loaded_optimizer_generation = "different-generation"
+        if mode in ("asymmetric_loader", "asymmetric_loader_error"):
+            trainer.args.train_steps = 3
+
+            class Loader:
+                def __init__(self):
+                    self.iterations = 0
+
+                def load_state_dict(self, state):
+                    assert state == {"cursor": 2}
+
+                def __iter__(self):
+                    self.iterations += 1
+                    if mode == "asymmetric_loader_error":
+                        raise ValueError("injected iterator failure")
+                    return iter(())
+
+            trainer.train_dataloader = Loader() if rank == 0 else None
         callback = GlobalStateCallback(trainer)
+        rng_before_resume = torch.get_rng_state().clone()
         state = (
             None
-            if mode == "missing" and rank == 1
+            if (mode == "missing" and rank == 1) or asymmetric_policy
             else {
                 "global_step": 4 if mode == "trainer_step" and rank == 1 else 3,
                 "_veomni_optimizer_generations": {
                     "model": "older" if mode == "trainer_generation" and rank == 1 else "generation"
                 },
                 "torch_rng_state": torch.get_rng_state(),
+                "train_dataloader": {"cursor": 2},
             }
         )
         with (
@@ -255,12 +286,18 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
             patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None),
             patch("veomni.trainer.callbacks.global_state_callback.set_device_rng_state"),
         ):
-            if mode == "matching":
+            if mode in ("matching", "asymmetric_loader"):
                 callback.load_global_state()
                 assert trainer.state.global_step == 3
+            elif mode == "asymmetric_loader_error":
+                with pytest.raises((ValueError, RuntimeError), match="iterator failure|restored data iterator"):
+                    callback.load_global_state()
             else:
                 expected = {
                     "missing": (RuntimeError, "Trainer state is missing"),
+                    "asymmetric_dynamic_missing": (RuntimeError, "resume policy differs across ranks"),
+                    "asymmetric_optimizer_owner": (RuntimeError, "resume policy differs across ranks"),
+                    "asymmetric_generations": (RuntimeError, "resume policy differs across ranks"),
                     "optimizer_step": (RuntimeError, "Restored training position differs across ranks"),
                     "trainer_step": (
                         (ValueError, "checkpoint steps differ")
@@ -277,16 +314,34 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 with pytest.raises(error_type, match=message):
                     callback.load_global_state()
                 assert trainer.state.global_step == 0
-            completed = torch.tensor(1)
-            dist.all_reduce(completed)
-            assert completed.item() == 2
+                if asymmetric_policy or mode == "asymmetric_generations":
+                    assert torch.equal(torch.get_rng_state(), rng_before_resume)
+        if mode in ("asymmetric_loader", "asymmetric_loader_error") and rank == 0:
+            assert trainer.train_dataloader.iterations == 1
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
     finally:
         clear_parallel_state()
         dist.destroy_process_group()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("mode", ["missing", "optimizer_step", "trainer_step", "trainer_generation", "matching"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing",
+        "optimizer_step",
+        "trainer_step",
+        "trainer_generation",
+        "matching",
+        "asymmetric_loader",
+        "asymmetric_loader_error",
+        "asymmetric_dynamic_missing",
+        "asymmetric_optimizer_owner",
+        "asymmetric_generations",
+    ],
+)
 def test_multi_optimizer_trainer_resume_is_rank_coordinated(tmp_path, mode):
     spawn_with_rendezvous(_resume_worker, args=(str(tmp_path), mode), nprocs=2)
 
