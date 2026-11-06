@@ -1468,6 +1468,34 @@ def _requires_rank_local_optimizer_checkpoint(optimizer):
     )
 
 
+def _checkpoint_optimizer_policy(state, *, loading, group=None):
+    """Agree on the optimizer path before entering any checkpoint collective."""
+    optimizer, multi, swap, error = None, False, False, None
+    try:
+        from ..optim.swap_adamw import SwapAdamW
+
+        if not isinstance(state, dict) or "model" not in state:
+            if loading and state is None:
+                raise ValueError("State dict must be provided to load a distributed checkpoint.")
+            raise ValueError(f"Model must be provided to {'load' if loading else 'save'} a distributed checkpoint.")
+        optimizer = state.get("optimizer")
+        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        swap = type(optimizer) is SwapAdamW
+        if not multi and _requires_rank_local_optimizer_checkpoint(optimizer):
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking checkpoint optimizer policy", group=group)
+
+    if any_rank_failed(multi, group=group) and any_rank_failed(not multi, group=group):
+        raise RuntimeError("Checkpoint optimizer types differ across ranks")
+    if any_rank_failed(optimizer is None, group=group) and any_rank_failed(optimizer is not None, group=group):
+        raise RuntimeError("Checkpoint optimizer presence differs across ranks")
+    if any_rank_failed(swap, group=group) and any_rank_failed(not swap, group=group):
+        raise RuntimeError("Checkpoint optimizer offload types differ across ranks")
+    return optimizer, multi
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -1526,44 +1554,35 @@ class OptimizerState(Stateful):
         self._load = load
 
     def state_dict(self):
+        if self.should_extra_parallel_aware:
+            # Reject unsupported raw DCP on every rank before any optimizer
+            # can enter its own collectives, even if a local check fails.
+            error = None
+            try:
+                if _requires_rank_local_optimizer_checkpoint(self.optimizer):
+                    raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+                if self._layout_marker_key is not None:
+                    raise RuntimeError(
+                        "Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec"
+                    )
+                if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                    raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+                raise RuntimeError(
+                    "Raw DCP MultiOptimizer does not prove parameter groups or scheduler identity; "
+                    "use DistributedCheckpointer with the live scheduler."
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating ExtraParallel optimizer checkpoint", group=self.process_group)
+            raise RuntimeError("ExtraParallel optimizer checkpoint preflight unexpectedly succeeded")
+
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
-        if self.should_extra_parallel_aware and self._layout_marker_key is not None:
-            raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             raise RuntimeError(
                 "Raw DCP MultiOptimizer does not prove parameter groups or scheduler identity; "
                 "use DistributedCheckpointer with the live scheduler."
             )
-        if self.should_extra_parallel_aware:
-            logger.info_rank0(
-                "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
-            )
-            if not getattr(self.optimizer, "_is_multi_optimizer", False):
-                raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
-
-            optim_sd_with_extra_parallel_dim, error = None, None
-            try:
-                vanilla_optim_sd = self.optimizer.state_dict()
-                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                    vanilla_optim_sd, "restore"
-                )
-            except BaseException as exc:
-                error = exc
-            raise_if_any_rank_failed(
-                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
-            )
-            if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
-                optim_sd_with_extra_parallel_dim = _namespace_extra_parallel_layout_state(
-                    optim_sd_with_extra_parallel_dim, self._layout_marker_key
-                )
-            return optim_sd_with_extra_parallel_dim
-
-        if getattr(self.optimizer, "_is_multi_optimizer", False):
-            if self._load:
-                return self.optimizer.state_dict()
-            return self.optimizer._sparse_state_dict()
-
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -2375,16 +2394,10 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             None
         """
-        if not isinstance(state, dict) or "model" not in state:
-            raise ValueError("Model must be provided to save a distributed checkpoint.")
-        optimizer = state.get("optimizer")
-        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        optimizer, multi = _checkpoint_optimizer_policy(state, loading=False)
         # An async write may outlive a staged copy, so the modes cannot combine.
         if stage_dir and save_async:
             raise ValueError("stage_dir cannot be combined with save_async")
-        single_exact = not multi and _requires_rank_local_optimizer_checkpoint(optimizer)
-        if single_exact:
-            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi, saving=True
         )
@@ -2670,15 +2683,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if isinstance(state, dict):
             state.pop("_veomni_optimizer_identity_verified", None)
             state.pop("_veomni_optimizer_checkpoint_generation", None)
-        if not isinstance(state, dict) or "model" not in state:
-            if state is None:
-                raise ValueError("State dict must be provided to load a distributed checkpoint.")
-            raise ValueError("Model must be provided to load a distributed checkpoint.")
-        optimizer = state.get("optimizer")
-        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
-        single_exact = not multi and _requires_rank_local_optimizer_checkpoint(optimizer)
-        if single_exact:
-            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+        optimizer, multi = _checkpoint_optimizer_policy(state, loading=True, group=process_group)
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
