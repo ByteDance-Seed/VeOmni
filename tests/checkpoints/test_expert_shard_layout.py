@@ -36,6 +36,9 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _layout_worker(rank, world, directory, rendezvous):
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=180)
@@ -269,9 +272,6 @@ def _layout_worker(rank, world, directory, rendezvous):
                 assert local.count_nonzero() == 0
     finally:
         dist.destroy_process_group()
-
-
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
