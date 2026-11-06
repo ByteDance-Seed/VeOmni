@@ -128,6 +128,28 @@ def _layout_worker(rank, world, directory, rendezvous):
             local_dt = DTensor.from_local(local, submesh, placement)
             return restore_extra_parallel_dim(local_dt, mesh, submesh, 0, dim)
 
+        # File-backed writes must also retain main's EP layout metadata.
+        class Tracker:
+            consumed = 0
+
+            def checkpoint_commit_tensor(self, _value):
+                self.consumed += 1
+
+        tracker = Tracker()
+        path = directory + "file_backed_planner"
+        source = wrap(0)
+        dcp.save(
+            {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}},
+            checkpoint_id=path,
+            planner=_FileBackedSavePlanner(optimizers=[tracker]),
+        )
+        layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+        assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
+        assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
+        target = {"model": {"weight": wrap(1, empty=True)}}
+        dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
+        torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
+
         for source_dim in (0, 1):
             source = wrap(source_dim)
             torch.testing.assert_close(source.full_tensor(), global_weight, rtol=0, atol=0)
@@ -171,28 +193,6 @@ def _layout_worker(rank, world, directory, rendezvous):
                 planner=_ModelStrictLoadPlanner(strict_model=True, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1"),
             )
             torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
-
-        # File-backed writes must also retain main's EP layout metadata.
-        class Tracker:
-            consumed = 0
-
-            def checkpoint_commit_tensor(self, _value):
-                self.consumed += 1
-
-        tracker = Tracker()
-        path = directory + "file_backed_planner"
-        source = wrap(0)
-        dcp.save(
-            {"model": {"weight": source}, "optimizer": {"exp_avg": source.clone()}},
-            checkpoint_id=path,
-            planner=_FileBackedSavePlanner(optimizers=[tracker]),
-        )
-        layouts = dcp.FileSystemReader(path).read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
-        assert set(layouts) == {"model.weight", "optimizer.exp_avg"}
-        assert all(layout["expert_order"] == "canonical" for layout in layouts.values())
-        target = {"model": {"weight": wrap(1, empty=True)}}
-        dcp.load(target, checkpoint_id=path, planner=_ModelStrictLoadPlanner(strict_model=True))
-        torch.testing.assert_close(target["model"]["weight"].full_tensor(), global_weight, rtol=0, atol=0)
 
         # The public model-only load/export paths accept the same independently
         # verified declaration; unknown source and optimizer restore stay closed.
