@@ -286,7 +286,11 @@ class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         """Tokenize ChatML turns and retain optional per-token supervision weights."""
         input_ids, attention_mask, labels = [], [], []
-        has_weights = any(message.get("loss_weight") not in (None, 0, 1) for message in messages)
+        has_weights = any(
+            message.get("loss_mask", int(message["role"] == "assistant")) == 1
+            and message.get("loss_weight") not in (None, 0, 1)
+            for message in messages
+        )
         loss_weights = []
         for message in messages:
             content_str = "<|im_start|>" + message["role"] + "\n" + message["content"].strip() + "<|im_end|>\n"
@@ -307,7 +311,6 @@ class ChatmlTemplate(ChatTemplate):
                 or token_weight < 0
                 or token_weight > 1.0
                 or (0 < token_weight < torch.finfo(torch.float32).tiny)
-                or (loss_mask == 0 and token_weight not in (0, 1))
             ):
                 raise ValueError("loss_weight must be in [0, 1] and any positive weight must be normal float32")
             if loss_mask == 0:
@@ -426,7 +429,9 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         modality contract cannot land in one variant and miss the other.
         """
         input_ids, attention_mask, labels = [], [], []
-        has_weights = any(message.get("loss_weight") not in (None, 0, 1) for message in messages)
+        has_weights = any(
+            message["loss_mask"] == 1 and message.get("loss_weight") not in (None, 0, 1) for message in messages
+        )
         loss_weights = []
         for message in messages:
             content_str = message["content"].strip()
@@ -438,7 +443,6 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
                 or not math.isfinite(token_weight)
                 or not 0 <= token_weight <= 1
                 or (0 < token_weight < torch.finfo(torch.float32).tiny)
-                or (loss_mask == 0 and token_weight not in (0, 1))
             ):
                 raise ValueError("loss_weight must be in [0, 1] and any positive weight must be normal float32")
             if loss_mask == 0:

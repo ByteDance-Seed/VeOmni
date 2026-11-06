@@ -406,14 +406,17 @@ def test_dp_mixed_weighted_and_unweighted_matches_dense_gradient(tmp_path):
 
 
 @pytest.mark.parametrize("invalid", [-1, 1.01, 1e38, 1e-100, float("nan"), float("inf")])
-def test_chatml_rejects_out_of_range_weights(invalid):
+@pytest.mark.parametrize("loss_mask", [0, 1])
+def test_chatml_rejects_out_of_range_weights(invalid, loss_mask):
     from types import SimpleNamespace
 
     from veomni.data.chat_template import ChatmlTemplate
 
     template = ChatmlTemplate(SimpleNamespace(encode=lambda text, add_special_tokens: list(text.encode())))
     with pytest.raises(ValueError, match="loss_weight"):
-        template.encode_messages([{"role": "assistant", "content": "x", "loss_weight": invalid}])
+        template.encode_messages(
+            [{"role": "assistant", "content": "x", "loss_weight": invalid, "loss_mask": loss_mask}]
+        )
 
 
 def test_qwen3vl_remap_preserves_weight_and_masks_header():
@@ -539,7 +542,7 @@ def test_sharegpt_vlm_preserves_turn_masks_and_fractional_weights(template_cls):
     messages = [
         {"from": "human", "value": "<image>q", "loss_mask": 0},
         {"from": "gpt", "value": "downweighted", "loss_mask": 1, "loss_weight": 0.25},
-        {"from": "gpt", "value": "untrained", "loss_mask": 0},
+        {"from": "gpt", "value": "untrained", "loss_mask": 0, "loss_weight": 0.5},
         {"from": "gpt", "value": "full", "loss_mask": 1, "loss_weight": 1.0},
     ]
     conversations = conv_preprocess("sharegpt4v_sft", messages, preserve_loss_supervision=True)
@@ -549,6 +552,40 @@ def test_sharegpt_vlm_preserves_turn_masks_and_fractional_weights(template_cls):
     assert ((weights == 1.0) & (labels != -100)).any()
     assert torch.all(weights[labels == -100] == 0)
     assert messages[1]["loss_weight"] == 0.25
+    masked_messages = [{"from": "human", "value": "q", "loss_mask": 0}, messages[2]]
+    masked_only = conv_preprocess("sharegpt4v_sft", masked_messages, preserve_loss_supervision=True)
+    masked_result = template.encode_messages(masked_only)
+    assert "loss_weights" not in masked_result
+    assert torch.all(masked_result["labels"] == -100)
+    unweighted_messages = [
+        masked_messages[0],
+        {key: value for key, value in messages[2].items() if key != "loss_weight"},
+    ]
+    baseline = template.encode_messages(
+        conv_preprocess("sharegpt4v_sft", unweighted_messages, preserve_loss_supervision=True)
+    )
+    assert torch.equal(masked_result["input_ids"], baseline["input_ids"])
+    assert torch.equal(masked_result["labels"], baseline["labels"])
+
+
+def test_chatml_masked_fractional_weight_is_excluded():
+    """A mask excludes a valid weight instead of rejecting the sample."""
+    from types import SimpleNamespace
+
+    from veomni.data.chat_template import ChatmlTemplate
+
+    template = object.__new__(ChatmlTemplate)
+    template.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens: list(text.encode()))
+    messages = [
+        {"role": "assistant", "content": "masked", "loss_mask": 0, "loss_weight": 0.5},
+        {"role": "assistant", "content": "trained", "loss_mask": 1, "loss_weight": 0.25},
+    ]
+    masked = template.encode_messages(messages[:1])
+    assert all(label == -100 for label in masked["labels"])
+    assert "loss_weights" not in masked
+    combined = template.encode_messages(messages)
+    assert all(weight == 0 for weight in combined["loss_weights"][: len(masked["labels"])])
+    assert all(weight == 0.25 for weight in combined["loss_weights"][len(masked["labels"]) :])
 
 
 def test_qwen_vl_standard_transform_keeps_weighted_assistant_turns(monkeypatch):

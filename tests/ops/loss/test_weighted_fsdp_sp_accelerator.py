@@ -20,7 +20,7 @@ from veomni.utils.device import get_device_type  # noqa: E402
 
 
 _ACCELERATOR_16 = LaunchSpec(nproc=16, device="accelerator")
-_CAPABILITIES = runner_capabilities()
+_CAPABILITIES = runner_capabilities() if get_device_type() in ("cpu", "cuda", "npu") else None
 
 
 def _check_fsdp_sp(dtype, all_zero):
@@ -92,7 +92,7 @@ def _check_fsdp_sp(dtype, all_zero):
 
 @pytest.mark.skipif(
     os.environ.get("VEOMNI_TEST_REQUIRE_NPU") != "1"
-    and (_CAPABILITIES.backend == "cpu" or len(_CAPABILITIES.devices) < 16),
+    and (_CAPABILITIES is None or _CAPABILITIES.backend == "cpu" or len(_CAPABILITIES.devices) < 16),
     reason="requires 16 accelerators",
 )
 @pytest.mark.launch_plan(provider=_ACCELERATOR_16)
