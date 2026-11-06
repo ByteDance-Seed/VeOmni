@@ -1,0 +1,88 @@
+# Cosmos3-Nano stage 1 of 2: encode every clip once into the latent cache that
+# offline_training.yaml reads. Trains nothing; the step count comes from the data.
+#
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Cosmos3/cosmos3_nano/train/offline_embedding.yaml
+
+model:
+  model_path: pretrained_models/Cosmos3-Nano-omni
+  model_config:
+    # Only the VAE: the prompts are cached as text and tokenized by the training run.
+    modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_offline_embedding.yaml
+    train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_offline_embedding.yaml
+    infer_graph: configs/seed_omni/Cosmos3/cosmos3_nano/infer/graph_infer.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 0.0
+    lr_warmup_ratio: 0.1
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.0
+    max_grad_norm: 0.1
+    betas: [0.9, 0.95]
+
+  accelerator:
+    init_device: meta
+    # Joint attention spans a whole sample, so it cannot be sequence-sharded.
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      # bf16 weights end to end, like the reference: sigma, timesteps and the
+      # flow-matching targets stay fp32 because nothing casts the graph inputs.
+      mixed_precision:
+        enable: false
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      enable_async_activation: false
+
+data:
+  train_path: dataset/cosmos3-demo/video_dataset_file.jsonl
+  train_size: 1000000000000
+  datasets_type: mapping
+  data_type: seedomni
+  source_name: cosmos3_sft_jsonl
+  # Token budget of one packed micro-batch (the reference recipe's). Measured on 4 cards with recompute off:
+  # 45056 ran out of memory, 16384 peaked at 71 GB and 8192 at 49 GB of 91.75 GB.
+  max_seq_len: 45056
+  dyn_bsz_buffer_size: 1
+  dataloader:
+    type: native
+    num_workers: 1
+    drop_last: true
+  mm_configs:
+    data_dir: dataset/cosmos3-demo
+    # Hand every source frame to the VAE module, which picks them on the source
+    # timeline (sample_fps / max_frames in the modules file).
+    fps: null
+    cfg_dropout_rate: 0.1
+
+train:
+  training_task: offline_embedding
+  offline_cache_dir: outputs/cosmos3_nano_latent_cache
+  global_batch_size: 16
+  micro_batch_size: 1
+  dyn_bsz: false
+  bsz_warmup_ratio: 0.0
+  num_train_epochs: 1
+  seed: 42
+  checkpoint:
+    output_dir: outputs/cosmos3_nano_embedding
+    save_steps: 999999
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: VeOmni_omni
+    name: cosmos3_nano_embedding

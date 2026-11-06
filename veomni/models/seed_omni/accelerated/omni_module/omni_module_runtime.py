@@ -654,6 +654,25 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.checkpoint is not None:
             self.checkpoint.load()
 
+    def extra_state(self) -> dict[str, Any]:
+        """This module's own sampling stream, for a module that draws from one.
+
+        The trainer checkpoints the global RNGs; a module that keeps a private
+        generator (the Cosmos3 flow connector's sigma / noise stream) exposes it
+        as ``rng_state_dict`` / ``load_rng_state_dict``, the same pair a DiT
+        condition model does. Saved per rank beside this module's weights.
+        """
+        rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
+        return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        rng_state = extra_state.get("module_rng_state")
+        if rng_state is None:
+            return
+        # Scoped: a generator seeded on first use reads this module's dp rank.
+        with self._scoped():
+            self.omni_module.load_rng_state_dict(rng_state)
+
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""
         if self.checkpoint is not None:

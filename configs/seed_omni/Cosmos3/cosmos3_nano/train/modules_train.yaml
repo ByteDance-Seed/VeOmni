@@ -1,0 +1,52 @@
+# Cosmos3-Nano modules, shared by the two training recipes.
+#
+# Recompute (`gradient_checkpointing`, on in the recipes) only applies to cosmos3_mot, the one
+# module with decoder blocks; the others have nothing to recompute and do not support it.
+#
+# Joint training of both towers: set `train_joint_reasoner: true` on BOTH
+# cosmos3_text_encoder (releases embed_tokens) and cosmos3_mot (releases the
+# reasoner blocks). It needs `fsdp_mode: fsdp2`.
+cosmos3_text_encoder:
+  model_path: cosmos3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    train_joint_reasoner: false
+    max_sequence_length: 2048
+cosmos3_vae:
+  model_path: cosmos3_vae
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    # sample_fps frames per second of clip, aligned to 4k+1 (k+1 latent frames) within
+    # [min_frames, max_frames], read as a fixed-stride prefix of the source clip.
+    sample_fps: 5
+    min_frames: 5
+    max_frames: 117
+    frame_factor: 4
+    frame_factor_remainder: 1
+cosmos3_mot:
+  model_path: cosmos3_mot
+  model_config:
+    train_joint_reasoner: false
+cosmos3_flow_connector:
+  model_path: cosmos3_flow_connector
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    loss_scale: 1.0
+    num_train_timesteps: 1000
+    train_time_video_distribution: waver
+    resolution: "256"
+    shift:
+      "256": 3
+      "480": 5
+      "720": 10
+    conditioning_config:  # clean latent-prefix frames: 70% T2V, 20% I2V, 10% V2V
+      0: 0.7
+      1: 0.2
+      2: 0.1
+    seed: 42
