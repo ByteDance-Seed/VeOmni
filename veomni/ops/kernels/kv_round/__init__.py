@@ -15,9 +15,10 @@
 """KV cache and indexer activation storage-rounding kernel family.
 
 Variant ``fp8`` rounds contiguous ``block_size``-wide channel groups to
-``float8_e4m3fn`` with ``ue8m0`` power-of-two scales. Variant ``fp4`` rounds
-``block_size``-wide channel groups to E2M1 codepoints in ``[-6, 6]`` with
-``e4m3`` or ``ue8m0`` scales.
+``float8_e4m3fn`` with ``ue8m0`` power-of-two scales. That is the only variant
+because it is the only storage format in use: the routed experts of a
+V4-Flash checkpoint are FP4, but they are weights consumed by a GEMM, which the
+``moe_experts`` family quantizes, not a cache entry.
 
 These are *storage* round trips, not GEMM operand quantization: the point is to
 show training the values an inference cache would hold. ``quant_features``
@@ -29,8 +30,6 @@ scale derives from its own group's amax and rounds up, so no element saturates.
 
 from ...platform import GpuKernelRequirement
 from ...registry import register_op
-from .fp4 import eager as fp4_eager
-from .fp4 import triton as fp4_triton
 from .fp8 import eager as fp8_eager
 from .fp8 import triton as fp8_triton
 
@@ -53,27 +52,6 @@ register_op(
     fp8_triton.forward,
     fp8_triton.backward,
     description="Triton blockwise FP8 (E4M3 + UE8M0 scale) storage round-trip with straight-through backward",
-    requirement=_GPU,
-    requires=("triton",),
-    default=True,
-)
-
-register_op(
-    "kv_round",
-    "fp4",
-    "eager",
-    fp4_eager.forward,
-    fp4_eager.backward,
-    description="PyTorch blockwise FP4 (E2M1 + E4M3/UE8M0 scale) storage round-trip with straight-through backward",
-)
-
-register_op(
-    "kv_round",
-    "fp4",
-    "triton",
-    fp4_triton.forward,
-    fp4_triton.backward,
-    description="Triton blockwise FP4 (E2M1 + E4M3/UE8M0 scale) storage round-trip with straight-through backward",
     requirement=_GPU,
     requires=("triton",),
     default=True,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the ``kv_round`` operation family (``fp8`` and ``fp4``)."""
+"""Tests for the ``kv_round`` operation family (``fp8``)."""
 
 from __future__ import annotations
 
@@ -28,9 +28,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 def test_kv_round_registry_entries():
     assert OP_REGISTRY.list_registered("kv_round", "fp8") == ["eager", "triton"]
-    assert OP_REGISTRY.list_registered("kv_round", "fp4") == ["eager", "triton"]
     assert OP_REGISTRY.default_impl("kv_round", "fp8", device="cpu") == "eager"
-    assert OP_REGISTRY.default_impl("kv_round", "fp4", device="cpu") == "eager"
 
 
 @pytest.mark.parametrize("block_size", [32, 64, 128])
@@ -88,33 +86,8 @@ def test_fp8_scale_is_a_power_of_two():
     assert (y.abs() <= x.abs().max()).all()
 
 
-@pytest.mark.parametrize("scale_fmt,block_size", [("e4m3", 16), ("ue8m0", 32)])
-def test_fp4_eager_round_trip_and_straight_through_backward(scale_fmt: str, block_size: int):
-    op = VeomniOp("kv_round", "fp4", "eager")
-    x = torch.randn(2, 3, block_size * 2, dtype=torch.bfloat16, requires_grad=True)
-    y = op(x, block_size=block_size, scale_fmt=scale_fmt)
-
-    assert y.shape == x.shape
-    assert y.dtype == x.dtype
-    assert not torch.equal(y, x)
-    # E2M1 magnitudes are bounded by 6 per group scale; nothing should escape it.
-    assert torch.isfinite(y).all()
-
-    grad_out = torch.randn_like(y)
-    (grad_x,) = torch.autograd.grad(y, x, grad_out)
-    torch.testing.assert_close(grad_x, grad_out)
-
-
-def test_fp4_rejects_an_unknown_scale_format():
-    op = VeomniOp("kv_round", "fp4", "eager")
-    x = torch.randn(1, 2, 32, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="scale_fmt must be"):
-        op(x, block_size=16, scale_fmt="fp16")
-
-
-@pytest.mark.parametrize("variant", ["fp8", "fp4"])
-def test_empty_operand_is_returned_unchanged(variant: str):
-    op = VeomniOp("kv_round", variant, "eager")
+def test_empty_operand_is_returned_unchanged():
+    op = VeomniOp("kv_round", "fp8", "eager")
     x = torch.randn(0, 4, 32, dtype=torch.bfloat16)
     assert op(x, block_size=32).shape == x.shape
 
