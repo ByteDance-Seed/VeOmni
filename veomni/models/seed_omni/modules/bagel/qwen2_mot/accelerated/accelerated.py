@@ -743,7 +743,6 @@ class InferenceMixinAccelerated(InferenceMixin):
 class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen2MoTCore):
     _supports_flex_attn = True
     _supports_magi_attn = True
-    _export_hf_checkpoint_with_weight_conversions = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
     mlp_cls = Qwen2MLPAccelerated
     rms_norm_cls = Qwen2RMSNormAccelerated

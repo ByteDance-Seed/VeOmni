@@ -445,7 +445,6 @@ class BagelQwen2MoTCore(PretrainedOmniModule):
     supports_gradient_checkpointing = True
     _supports_sdpa = True
     _supports_flex_attn = True
-    _export_hf_checkpoint_with_weight_conversions = False
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)

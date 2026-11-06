@@ -137,7 +137,7 @@ def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) ->
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
-    from veomni.utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
+    from veomni.utils.save_safetensor_utils import get_model_save_state
 
     torch.manual_seed(3014)
     eager_cfg = BagelQwen2MoTConfig(**{**tiny_bagel_qwen2_cfg(), "num_key_value_heads": 1})
@@ -171,14 +171,22 @@ def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) ->
         torch.testing.assert_close(actual.weight, expected.weight)
         torch.testing.assert_close(actual.bias, expected.bias)
 
-    # HF export reverts fused QKV back to split q_proj/k_proj/v_proj keys.
-    reverted_hf_state = _revert_model_weight_conversions_for_hf(reference, dict(dcp_state))
+    # Distributed HF export routes through BagelQwen2MoTCheckpointTensorConverter.export_weights
+    # and splits fused QKV back into q_proj/k_proj/v_proj keys.
+    reverted_hf_state = get_model_save_state(reference, None)
     assert "model.layers.0.self_attn.q_proj.weight" in reverted_hf_state
     assert "model.layers.0.self_attn.k_proj.weight" in reverted_hf_state
     assert "model.layers.0.self_attn.v_proj.weight" in reverted_hf_state
     assert "model.layers.0.self_attn.q_proj_moe_gen.weight" in reverted_hf_state
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in reverted_hf_state
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in reverted_hf_state
+    for key in (
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.q_proj_moe_gen.weight",
+    ):
+        torch.testing.assert_close(reverted_hf_state[key], eager_split_state[key].to(torch.bfloat16))
 
     reference.save_pretrained(tmp_path)
     with safe_open(tmp_path / SAFE_WEIGHTS_NAME, framework="pt", device="cpu") as checkpoint:
