@@ -62,14 +62,14 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L105)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L177)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
-[`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L89)
+[`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L121)
 uses `state_dtype` to check initialized fields against their declared precision.
 During load,
-[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L408)
+[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L466)
 checks stored field dtypes and uses `state_is_offloaded` to allocate missing
 destination state on CPU when the adapter specifies offload.
 [`rank_local_adamw_context`](../../veomni/optim/checkpoint_adapter.py#L55)
@@ -87,7 +87,7 @@ must also be validated for an offloading implementation.
 
 ## Framework call sites and restore behavior
 
-1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L563)
+1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L568)
    enters the context around PyTorch's
    optimizer-state serialization. Registered adapter implementations must
    preserve live state and serialize all initialized fields and group options
@@ -98,7 +98,7 @@ must also be validated for an offloading implementation.
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
-3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L601)
+3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L618)
    enters the context again while
    PyTorch applies the optimizer state. The trusted adapter must restore every
    validated field without changing its value or dtype. An optimizer may
@@ -121,16 +121,16 @@ is not an acceptance test.
 ## Optional file-backed state abort hook
 
 An optimizer that owns file-backed state may provide the zero-argument
-`checkpoint_abort_file_backed_state()` hook. If the final distributed barrier
-in `ModelCheckpointManager.load()` fails after loading state, the manager
-calls this hook on the optimizer and on each `MultiOptimizer` leaf that defines
-it. The hook owns its optimizer's cleanup or invalidation: it should make any
-partially restored file-backed state unusable until the optimizer is rebuilt
-or explicitly recovered. It must not perform collectives and should be safe
-to call more than once. The manager ignores ordinary cleanup exceptions so the
-original barrier failure is propagated; it does not report the checkpoint as
-successfully loaded. Optimizers without file-backed state need no hook.
-
-The manager calls this hook only on its final-barrier failure path; it is not a
-general notification for every earlier load error. File-backed optimizers and
-checkpointers remain responsible for cleanup at their own failure sites.
+`checkpoint_abort_file_backed_state()` hook. `ModelCheckpointManager.load()`
+calls the hook on the optimizer and on each `MultiOptimizer` leaf that defines
+it if checkpoint loading, trainer step or scheduler restoration, generation
+validation, or the final distributed barrier fails. These failures may occur
+before, during, or after optimizer state restoration, so the hook must tolerate
+uninitialized, partially restored, and fully restored state. The hook owns its
+optimizer's cleanup or invalidation: it should make any partially restored
+file-backed state unusable until the optimizer is rebuilt or explicitly
+recovered. It must not perform collectives and should be safe to call more than
+once. The manager ignores ordinary cleanup exceptions so the original failure
+is propagated; it does not report the checkpoint as successfully loaded.
+Optimizers without file-backed state need no hook. Failures before checkpoint
+loading starts remain the responsibility of their original owners.
