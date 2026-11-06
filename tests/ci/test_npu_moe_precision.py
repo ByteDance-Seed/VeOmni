@@ -42,6 +42,38 @@ def test_valid_or_disabled_configuration_needs_no_process_group():
     _validate_config(MixedPrecisionConfig(npu_expert_fp32_wgrad=False), mode="ddp", tp=2)
 
 
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled(backend):
+    import importlib
+
+    module = importlib.import_module(
+        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
+    )
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=4,
+        moe_intermediate_size=3,
+        hidden_act="silu",
+        ops_config=SimpleNamespace(moe_implementation="eager"),
+    )
+    experts = module.Qwen4ExpTextExperts(config)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return args[0]
+
+    experts.veomni_moe = capture
+    inputs = torch.zeros(2, 4)
+    indices = torch.zeros(2, 1, dtype=torch.int64)
+    weights = torch.ones(2, 1)
+    assert experts(inputs, indices, weights) is inputs
+    assert calls.pop() == {"num_experts": 2}
+    experts._veomni_fp32_expert_wgrad = True
+    assert experts(inputs, indices, weights) is inputs
+    assert calls.pop() == {"num_experts": 2, "fp32_wgrad": True}
+
+
 @pytest.mark.parametrize(
     "mixed_changes,parallel_changes",
     [

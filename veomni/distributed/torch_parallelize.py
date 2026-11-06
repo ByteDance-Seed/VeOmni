@@ -485,6 +485,18 @@ def parallelize_model_fsdp2(
         if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
             raise ValueError("FP32 expert weight gradients require FSDP2")
 
+    expert_fp32_wgrad = mixed_precision.npu_expert_fp32_wgrad
+    if expert_fp32_wgrad:
+        if not IS_NPU_AVAILABLE or get_device_type() != "npu":
+            raise ValueError("FP32 expert weight gradients require an NPU")
+        from .npu_moe_precision import validate_qwen4_experts
+
+        expert_ids = validate_qwen4_experts(model)
+        basic_modules = list(_fsdp_target_classes(model, basic_modules, True))
+    else:
+        expert_ids = set()
+    wrapped_expert_ids = set()
+
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
@@ -504,18 +516,8 @@ def parallelize_model_fsdp2(
     elif low_precision_reduce_scatter_comm:
         logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
-    expert_fp32_wgrad = mixed_precision.npu_expert_fp32_wgrad
-    if expert_fp32_wgrad:
-        if not IS_NPU_AVAILABLE or get_device_type() != "npu":
-            raise ValueError("FP32 expert weight gradients require an NPU")
-        from .npu_moe_precision import validate_qwen4_experts
-
-        expert_ids = validate_qwen4_experts(model)
-    else:
-        expert_ids = set()
-    wrapped_expert_ids = set()
-
-    target_classes = _fsdp_target_classes(model, basic_modules, expert_fp32_wgrad)
+    model_no_split_modules = getattr(model, "_no_split_modules", None) or []
+    target_classes = set(model_no_split_modules) | set(basic_modules or [])
 
     # Make a list of tuples that contains target classes' name and module
     # Note that all target classes should include all ExtraParallel modules.
@@ -906,9 +908,6 @@ def parallelize_model_fsdp2(
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    if expert_fp32_wgrad and wrapped_expert_ids != expert_ids:
-        raise RuntimeError("Not every Qwen4-Exp expert was wrapped for FP32 weight gradients")
-
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
     # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
     # This keeps the root's params (lm_head + embeddings + final norm)
@@ -918,6 +917,8 @@ def parallelize_model_fsdp2(
     # `setStorage … storage of size 0` when the saved reference points
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
+    if expert_fp32_wgrad and wrapped_expert_ids != expert_ids:
+        raise RuntimeError("Not every Qwen4-Exp expert was wrapped for FP32 weight gradients")
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
