@@ -741,3 +741,36 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     assert torch.equal(masked_callback["gradient"], masked_reference["gradient"])
     assert torch.equal(masked_callback_weight, masked_reference_weight)
     assert masked_callback["loss"] == masked_reference["loss"]
+
+
+def _malformed_padding_metadata_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        for mode in ("sft_padding", "sft_key", "objective"):
+            batch = {"labels": torch.tensor([1, 2])}
+            if rank == 1 and mode in ("sft_padding", "objective"):
+                batch["padding_flag"] = torch.tensor([True, False])
+            if rank == 1 and mode == "sft_key":
+                batch[3] = torch.tensor([1])
+            if mode == "objective":
+                with pytest.raises(ValueError, match="does not support padded micro-batches"):
+                    loss_utils.reject_objective_padding([batch], "objective")
+            else:
+                with pytest.raises(RuntimeError, match="malformed batch metadata"):
+                    loss_utils.reject_distributed_padding([batch])
+            completed = torch.tensor(1)
+            dist.all_reduce(completed)
+            assert completed.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_malformed_padding_metadata_fails_collectively():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_malformed_padding_metadata_worker, nprocs=2)
