@@ -441,11 +441,11 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
         if mode == "cursor" and rank == 1:
             callback.state_dict = lambda _: (_ for _ in ()).throw(ValueError("injected cursor failure"))
         if rank == 0:
-            expected = (RuntimeError, "collecting the trainer state failed on another rank")
+            expected = (RuntimeError, "(collecting|preparing) trainer checkpoint state failed on another rank")
         elif mode == "cursor":
             expected = (ValueError, "injected cursor failure")
         else:
-            expected = (RuntimeError, "same-step MultiOptimizer checkpoint generation")
+            expected = (RuntimeError, "matching MultiOptimizer checkpoint generation")
         with pytest.raises(expected[0], match=expected[1]):
             callback.save_global_state(TrainerState(global_step=3))
         dist.barrier()
