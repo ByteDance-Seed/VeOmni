@@ -62,7 +62,7 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L170)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L177)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
@@ -98,7 +98,7 @@ must also be validated for an offloading implementation.
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
-3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L622)
+3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L618)
    enters the context again while
    PyTorch applies the optimizer state. The trusted adapter must restore every
    validated field without changing its value or dtype. An optimizer may
@@ -121,18 +121,16 @@ is not an acceptance test.
 ## Optional file-backed state abort hook
 
 An optimizer that owns file-backed state may provide the zero-argument
-`checkpoint_abort_file_backed_state()` hook. During
-`ModelCheckpointManager.load()`, the manager calls this hook on the optimizer
-and on each `MultiOptimizer` leaf that defines it after a coordinated checkpoint
-load, trainer-state/scheduler restoration, or generation validation failure,
-or if the final distributed barrier fails. The hook owns its optimizer's cleanup
-or invalidation: it should make any
-partially restored file-backed state unusable until the optimizer is rebuilt
-or explicitly recovered. It must not perform collectives and should be safe
-to call more than once. The manager ignores ordinary cleanup exceptions so the
-original error is propagated; it does not report the checkpoint as
-successfully loaded. Optimizers without file-backed state need no hook.
-
-The hook is not a general notification for failures before checkpoint loading
-starts. File-backed optimizers and checkpointers remain responsible for cleanup
-at their own failure sites.
+`checkpoint_abort_file_backed_state()` hook. `ModelCheckpointManager.load()`
+calls the hook on the optimizer and on each `MultiOptimizer` leaf that defines
+it if checkpoint loading, trainer step or scheduler restoration, generation
+validation, or the final distributed barrier fails. These failures may occur
+before, during, or after optimizer state restoration, so the hook must tolerate
+uninitialized, partially restored, and fully restored state. The hook owns its
+optimizer's cleanup or invalidation: it should make any partially restored
+file-backed state unusable until the optimizer is rebuilt or explicitly
+recovered. It must not perform collectives and should be safe to call more than
+once. The manager ignores ordinary cleanup exceptions so the original failure
+is propagated; it does not report the checkpoint as successfully loaded.
+Optimizers without file-backed state need no hook. Failures before checkpoint
+loading starts remain the responsibility of their original owners.
