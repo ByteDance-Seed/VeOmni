@@ -162,7 +162,7 @@ def test_plain_extra_parallel_values_survive_dcp_roundtrip(tmp_path):
     torch.multiprocessing.spawn(_plain_extra_parallel_roundtrip, args=(str(tmp_path),), nprocs=2, join=True)
 
 
-def _asymmetric_optimizer_preflight(rank, root, case):
+def _asymmetric_optimizer_preflight(rank, root):
     from datetime import timedelta
     from pathlib import Path
     from types import SimpleNamespace
@@ -178,18 +178,9 @@ def _asymmetric_optimizer_preflight(rank, root, case):
             return SimpleNamespace(size=lambda: 2)
 
     class FakeOptimizer:
-        called = False
-
-        @property
-        def _is_multi_optimizer(self):
-            if case == "type_property_error" and rank == 0:
-                raise ValueError("injected optimizer type lookup error")
-            return not (case.startswith("wrong_type") and rank == 0)
+        _is_multi_optimizer = True
 
         def state_dict(self):
-            self.called = True
-            if case in ("wrong_type_collective", "type_property_error"):
-                dist.barrier()
             return {"state.experts.weight.exp_avg": torch.ones(2, 3)} if rank == 0 else {}
 
     dist.init_process_group(
@@ -203,18 +194,9 @@ def _asymmetric_optimizer_preflight(rank, root, case):
         leaf = FakeOptimizer()
         optimizer = dcp_checkpointer.OptimizerState(model, leaf, parallel_state=parallel)
         checkpoint = Path(root) / "rejected"
-        if rank == 0 and case.startswith("wrong_type"):
-            message = "not a MultiOptimizer"
-        elif rank == 0 and case == "type_property_error":
-            message = "optimizer type lookup error"
-        elif case.startswith("wrong_type") or case == "type_property_error":
-            message = "validating ExtraParallel optimizer type"
-        else:
-            message = "no proven replica layout" if rank == 0 else "preparing ExtraParallel optimizer checkpoint state"
+        message = "no proven replica layout" if rank == 0 else "preparing ExtraParallel optimizer checkpoint state"
         with pytest.raises((RuntimeError, ValueError), match=message):
             dcp.save({"optimizer": optimizer}, checkpoint_id=checkpoint)
-        if case.startswith("wrong_type") or case == "type_property_error":
-            assert not leaf.called
         assert not (checkpoint / ".metadata").exists()
         value = torch.ones(())
         dist.all_reduce(value)
@@ -224,6 +206,14 @@ def _asymmetric_optimizer_preflight(rank, root, case):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("case", ["plain_state", "wrong_type", "wrong_type_collective", "type_property_error"])
-def test_asymmetric_optimizer_preflight_rejects_every_rank(tmp_path, case):
-    torch.multiprocessing.spawn(_asymmetric_optimizer_preflight, args=(str(tmp_path), case), nprocs=2, join=True)
+def test_asymmetric_optimizer_preflight_rejects_every_rank(tmp_path):
+    torch.multiprocessing.spawn(_asymmetric_optimizer_preflight, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def test_extra_parallel_rejects_non_multi_optimizer_locally():
+    from types import SimpleNamespace
+
+    model = SimpleNamespace(_fqn2spec_info={})
+    state = dcp_checkpointer.OptimizerState(model, object(), parallel_state=SimpleNamespace(dp_mode="fsdp2"))
+    with pytest.raises(RuntimeError, match="optimizer is not a MultiOptimizer"):
+        state.state_dict()
