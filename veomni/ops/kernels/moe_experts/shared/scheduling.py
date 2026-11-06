@@ -10,14 +10,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Select eager expert schedules without querying device tensor values."""
+"""Centralize compile/capture schedule selection for standard, EP and LoRA experts.
+
+All variants share this policy so their eager-versus-fallback rules stay aligned
+without querying device tensor values.
+"""
 
 import torch
 
 from .....utils.device import get_torch_device
 
 
-def _must_use_shape_derived_bound() -> bool:
+def must_use_shape_derived_bound() -> bool:
     """Retain the shape schedule while compiling or capture state is unknown."""
     if torch.compiler.is_compiling():
         return True

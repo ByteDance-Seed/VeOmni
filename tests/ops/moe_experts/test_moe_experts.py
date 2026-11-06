@@ -1044,7 +1044,7 @@ def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monk
 
         monkeypatch.setattr(same_nk_scheduling, "get_torch_device", DeviceAPI)
 
-    assert same_nk_scheduling._must_use_shape_derived_bound() is expected
+    assert same_nk_scheduling.must_use_shape_derived_bound() is expected
 
 
 @pytest.mark.parametrize(
@@ -1115,18 +1115,24 @@ def test_triton_merged_same_nk_compact_schedule(
         torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("reason", ["cpu", "empty", "too_many_experts", "no_rows", "other_tile"])
+@pytest.mark.parametrize("reason", ["cpu", "rocm", "empty", "too_many_experts", "no_rows", "other_tile"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_merged_same_nk_prefix_metadata_fallback(reason: str, monkeypatch: pytest.MonkeyPatch):
     """Unsupported metadata must return before launching or allocating a prefix."""
     pytest.importorskip("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
 
+    monkeypatch.setattr(torch.version, "hip", "mock-hip" if reason == "rocm" else None)
+
     class Metadata:
-        is_cuda = reason != "cpu"
+        device = torch.device("cpu" if reason == "cpu" else "cuda")
 
         def numel(self):
-            return 0 if reason == "empty" else 257 if reason == "too_many_experts" else 2
+            if reason == "empty":
+                return 0
+            if reason == "too_many_experts":
+                return gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS + 1
+            return 2
 
     if reason == "other_tile":
         monkeypatch.setitem(gemm_module._GROUP_GEMM_BLOCK, "BLOCK_M", 64)
@@ -1136,6 +1142,38 @@ def test_merged_same_nk_prefix_metadata_fallback(reason: str, monkeypatch: pytes
 
     monkeypatch.setattr(torch, "empty_like", unexpected_allocation)
     assert gemm_module.merged_same_nk_tile_prefix(Metadata(), 0 if reason == "no_rows" else 1) is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_same_nk_expert_limit_warns_once_before_allocation(monkeypatch: pytest.MonkeyPatch, caplog):
+    """An otherwise eligible oversized schedule explains its fallback once."""
+    pytest.importorskip("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+    from veomni.utils import logging
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    test_logger = logging.get_logger(__name__ + ".expert_limit_warning")
+    monkeypatch.setattr(gemm_module, "logger", test_logger)
+    experts = gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS + 1
+
+    class Metadata:
+        device = torch.device("cuda")
+
+        def numel(self):
+            return experts
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("An oversized prefix must not allocate a device tensor")
+
+    monkeypatch.setattr(torch, "empty_like", unexpected_allocation)
+    with caplog.at_level("WARNING", logger=test_logger.name):
+        for _ in range(2):
+            assert gemm_module.merged_same_nk_tile_prefix(Metadata(), 1) is None
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 1
+    assert f"{experts} experts (> {gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS})" in records[0].getMessage()
+    assert "shape-derived" in records[0].getMessage()
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -1162,15 +1200,20 @@ def test_same_nk_prefix_near_int32_limit(counts: tuple[int, ...], dtype):
         pytest.param((0, 1, 127, 128, 129, 257), 128, id="tile-boundaries"),
         pytest.param((256, 0, 0, 0), 128, id="concentrated"),
         pytest.param((0, 0, 0), 128, id="empty"),
-        pytest.param((0,) * 255 + (129,), 128, id="max-experts"),
-        pytest.param((0,) * 256 + (1,), 128, id="expert-fallback"),
+        pytest.param("at_expert_limit", 128, id="max-experts"),
+        pytest.param("above_expert_limit", 128, id="expert-fallback"),
         pytest.param((1, 129, 0), 64, id="tile-fallback"),
     ],
 )
-def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...], block_m: int, dtype, monkeypatch):
+def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...] | str, block_m: int, dtype, monkeypatch):
     """Cover tile tails, zero-load experts and shape fallbacks without a host read."""
     require_nvidia_cuda("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    if counts == "at_expert_limit":
+        counts = (0,) * (gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS - 1) + (129,)
+    elif counts == "above_expert_limit":
+        counts = (0,) * gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS + (1,)
 
     monkeypatch.setitem(gemm_module._GROUP_GEMM_BLOCK, "BLOCK_M", block_m)
     torch.manual_seed(42)
@@ -1208,7 +1251,7 @@ def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...], b
         tile_count += (count + 127) // 128
         expected_prefix.append(tile_count)
     torch.testing.assert_close(output, torch.cat(expected_outputs), rtol=MOE_FUSED_RTOL, atol=MOE_FUSED_ATOL)
-    if total and experts <= 256 and block_m == 128:
+    if total and experts <= gemm_module._COMPACT_SCHEDULE_MAX_EXPERTS and block_m == 128:
         assert prefix is not None
         assert prefix.cpu().tolist() == expected_prefix
     else:
@@ -1292,7 +1335,7 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     warmup_stream.wait_stream(torch.cuda.current_stream())
     # Warm the shape-only specialization that the real capture will select.
     with monkeypatch.context() as warmup_patch:
-        warmup_patch.setattr(same_nk_scheduling, "_must_use_shape_derived_bound", lambda: True)
+        warmup_patch.setattr(same_nk_scheduling, "must_use_shape_derived_bound", lambda: True)
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
                 forward().sum().backward()

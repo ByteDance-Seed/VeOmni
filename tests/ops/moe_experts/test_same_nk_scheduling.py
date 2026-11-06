@@ -144,7 +144,7 @@ def test_expert_variants_reuse_one_schedule_and_match_native_oracles(variant, fa
     from veomni.ops.kernels.moe_experts.shared import scheduling
 
     if fallback:
-        monkeypatch.setattr(scheduling, "_must_use_shape_derived_bound", lambda: True)
+        monkeypatch.setattr(scheduling, "must_use_shape_derived_bound", lambda: True)
     prefixes, calls = _observe_expert_schedules(monkeypatch)
     if variant in ["ep_split", "ep_merged"]:
         from tests.ops.moe_experts import test_moe_experts_ep as native

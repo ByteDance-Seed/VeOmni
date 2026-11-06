@@ -22,11 +22,18 @@ import torch
 import triton
 import triton.language as tl
 
-from .....utils.device import get_torch_device
+from .....utils import logging
+from .....utils.device import get_torch_device, is_nvidia_cuda_device
 from . import scheduling
 
 
+logger = logging.get_logger(__name__)
+
 _GROUP_GEMM_BLOCK = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8}
+# Bound the current single-program prefix scan and per-tile binary search.
+# This is a conservative support limit, not a measured performance crossover;
+# larger expert groups retain the shape-derived schedule until validated.
+_COMPACT_SCHEDULE_MAX_EXPERTS = 256
 
 
 class ActivationType(str, Enum):
@@ -169,7 +176,13 @@ def _same_nk_tile_prefix_kernel(cumsum_ptr, prefix_ptr, G: tl.constexpr, LANES: 
 def merged_same_nk_tile_prefix(cumsum_M: torch.Tensor, total_M: int) -> Optional[torch.Tensor]:
     """Build an optional device schedule without reading expert counts on the host."""
     G = cumsum_M.numel()
-    if not cumsum_M.is_cuda or _GROUP_GEMM_BLOCK["BLOCK_M"] != 128 or not 0 < G <= 256 or total_M <= 0:
+    if not is_nvidia_cuda_device(cumsum_M.device) or _GROUP_GEMM_BLOCK["BLOCK_M"] != 128 or G <= 0 or total_M <= 0:
+        return None
+    if G > _COMPACT_SCHEDULE_MAX_EXPERTS:
+        logger.warning_once(
+            f"MoE compact schedule disabled for {G} experts (> {_COMPACT_SCHEDULE_MAX_EXPERTS}); "
+            "using the shape-derived grouped-GEMM launch bound."
+        )
         return None
     assert cumsum_M.ndim == 1 and cumsum_M.is_contiguous()
     assert cumsum_M.dtype in (torch.int32, torch.int64)
@@ -309,7 +322,7 @@ def same_nk_tile_schedule(cumsum_M: torch.Tensor, total_M: int) -> tuple[Optiona
     capture and unsupported metadata retain the original shape-based schedule.
     No device scalar is read by this selection or prefix construction.
     """
-    if scheduling._must_use_shape_derived_bound():
+    if scheduling.must_use_shape_derived_bound():
         return None, None
     if type(total_M) is not int:
         raise TypeError("Schedule total_M must be a Python int")

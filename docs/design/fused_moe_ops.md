@@ -104,9 +104,22 @@ output allocation or kernel launch. This checks the producer/consumer row
 contract without copying the prefix's last value to the host. Consumers must
 also preserve the original expert boundaries and row ordering.
 
-The prefix applies to CUDA tensors, 1–256 experts, nonempty routed input
-and the existing 128-row GEMM tiles. Compilation, stream capture, unavailable
-capture-state queries and unsupported metadata retain each entry point's
+The prefix applies to NVIDIA CUDA tensors, nonempty routed input and the
+existing 128-row GEMM tiles. ROCm retains the shape-derived schedule. Expert
+counts are limited by `_COMPACT_SCHEDULE_MAX_EXPERTS` (currently 256).
+
+Building the prefix scans `next_power_of_2(experts)` positions in one program,
+and each valid GEMM tile binary-searches that prefix. These costs are traded
+against fewer empty GEMM programs; the net benefit depends on routed rows,
+matrix shapes and expert load distribution. The cap is a conservative support
+limit for this implementation, not a mathematical correctness bound or a
+measured universal performance crossover. Raising it does not change the scan
+size or lookup range for already-eligible calls: both use the actual expert
+count. Eligible eager calls above the cap warn once and keep the shape-derived
+bound before allocating or launching a prefix.
+
+Compilation, stream capture, unavailable capture-state queries and unsupported
+metadata retain each entry point's
 original shape-derived bound. The unused schedule and its row total are both
 `None`. Neither selection reads a device scalar. Existing EP preprocessing
 and communication are unchanged. Weight-gradient same-MN reduction bounds,
