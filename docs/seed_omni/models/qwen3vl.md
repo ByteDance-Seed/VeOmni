@@ -215,7 +215,7 @@ long ones.
 On Qwen3-Omni-30B-A3B the same fixed cost was −1.01% step time at a
 VRAM-saturating batch and −0.44% at mbs=2, against `fsdp_scope: model` alone
 recovering 0.47% / 0.21% of that gap, and 0.18% (inside its own jitter) in the
-speech round. See [Adding a model §4.1](../usage/adding_a_model.md#41-packing-is-optional)
+speech round. See [Adding a model §4.1](../usage/adding_a_model.md#41-packing-optional)
 for those numbers.
 
 Note the packed launcher reports no per-sample sequence lengths to the metric

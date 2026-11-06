@@ -109,7 +109,7 @@ conversation list.
 If the model needs a new data source, add a preprocessor as described in
 [Data Format](data_format.md#custom-datasets).
 
-### 4.1 Packing is optional
+### 4.1 Packing (Optional)
 
 A second graph shape exists: packed graphs (Qwen3-VL's
 `packed/graph_train.yaml` is the in-tree example) call `pack_*` methods and move
