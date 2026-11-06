@@ -16,6 +16,7 @@ import gc
 import os
 import shutil
 import time
+from functools import partial
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -24,13 +25,14 @@ import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
-from veomni.models.checkpoint.weights import _save_state_dict
+from veomni.models.checkpoint.weights import _save_state_dict as _save_safetensors
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
 
 
 logger = helper.create_logger(__name__)
+_save_state_dict = partial(_save_safetensors, legacy_fuse_fallback=True)
 
 
 @torch.no_grad()
@@ -455,9 +457,7 @@ def save_lora_adapter_with_dcp(
             # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
             consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
             adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-            _save_state_dict(
-                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
-            )
+            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
 
             # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
             # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
