@@ -48,7 +48,11 @@ from .vision.processing import _OMNI_GRID
 VISUAL_POS_MASK = "visual_pos_mask"
 PIXEL_VALUES = "pixel_values"
 IMAGE_GRID_THW = "image_grid_thw"
-VISUAL_NUM_REAL = "visual_num_real"
+# One bool per visual row: True for a real image/video, False for an FSDP-anchor
+# placeholder. Position in the batch is *not* load-bearing — a consumer selects
+# with `image_grid_thw[visual_is_real]` rather than "the first N rows", so the
+# collator can join samples with a plain `torch.cat` in any order.
+VISUAL_IS_REAL = "visual_is_real"
 DEEPSTACK_VISUAL_EMBEDS = "deepstack_visual_embeds"
 
 
@@ -99,10 +103,9 @@ def pack_qwen3vl_conversations(
     position_chunks: list[torch.Tensor] = []
     visual_chunks: list[torch.Tensor] = []
     sample_lengths: list[int] = []
-    real_pixels: list[torch.Tensor] = []
-    real_grids: list[list[int]] = []
-    dummy_pixels: list[torch.Tensor] = []
-    dummy_grids: list[list[int]] = []
+    visual_pixels: list[torch.Tensor] = []
+    visual_grids: list[list[int]] = []
+    visual_is_real: list[bool] = []
 
     merge = int(spatial_merge_size)
     pad_id = int(pad_token_id)
@@ -116,8 +119,9 @@ def pack_qwen3vl_conversations(
         for part in sample:
             if part.is_dummy:
                 if isinstance(part.value, torch.Tensor):
-                    dummy_pixels.append(_patches_2d(part.value))
-                    dummy_grids.append(_grid_from_item(part))
+                    visual_pixels.append(_patches_2d(part.value))
+                    visual_grids.append(_grid_from_item(part))
+                    visual_is_real.append(False)
                 continue
             if part.type == "text":
                 token_ids = as_1d_long(part.value)
@@ -142,8 +146,9 @@ def pack_qwen3vl_conversations(
             grid_thw = torch.tensor(grid, dtype=torch.long)
             sample_pos.append(qwen3vl_vision_position_ids(current_pos, grid_thw, merge))
             current_pos += qwen3vl_vision_position_advance(grid_thw, merge)
-            real_pixels.append(_patches_2d(part.value))
-            real_grids.append(grid)
+            visual_pixels.append(_patches_2d(part.value))
+            visual_grids.append(grid)
+            visual_is_real.append(True)
 
         if not sample_ids:
             continue
@@ -178,8 +183,14 @@ def pack_qwen3vl_conversations(
     packed_cu = torch.tensor(cu, dtype=torch.int32)
     max_length = max(sample_lengths)
 
-    visual_num_real = len(real_pixels)
-    pixel_values, image_grid_thw = _concat_patches(real_pixels, real_grids, dummy_pixels, dummy_grids)
+    if not visual_pixels:
+        raise ValueError(
+            "pack_qwen3vl_conversations: training requires at least one real or dummy "
+            "visual so FSDP ranks stay symmetric."
+        )
+    pixel_values = torch.cat(visual_pixels, dim=0)
+    image_grid_thw = torch.tensor(visual_grids, dtype=torch.long)
+    is_real = torch.tensor(visual_is_real, dtype=torch.bool)
 
     return {
         PACKED_INPUT_IDS: packed_ids,
@@ -191,32 +202,27 @@ def pack_qwen3vl_conversations(
         VISUAL_POS_MASK: visual_mask,
         PIXEL_VALUES: pixel_values,
         IMAGE_GRID_THW: image_grid_thw,
-        VISUAL_NUM_REAL: visual_num_real,
+        VISUAL_IS_REAL: is_real,
     }
 
 
-def _concat_patches(
-    real_pixels: list[torch.Tensor],
-    real_grids: list[list[int]],
-    dummy_pixels: list[torch.Tensor],
-    dummy_grids: list[list[int]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pixels = real_pixels + dummy_pixels
-    grids = real_grids + dummy_grids
-    if not pixels:
-        raise ValueError(
-            "pack_qwen3vl_conversations: training requires at least one real or dummy "
-            "visual so FSDP ranks stay symmetric."
-        )
-    return torch.cat(pixels, dim=0), torch.tensor(grids, dtype=torch.long)
+def visual_row_mask(grid_thw: torch.Tensor, spatial_merge_size: int, is_real: torch.Tensor) -> torch.Tensor:
+    """Per-*token* bool over the ViT's output rows: True where the row is real.
+
+    ``is_real`` is one flag per visual item; the ViT emits ``prod(grid) / merge²``
+    rows per item, so expand each flag to its row count. Returned on the same
+    device as ``grid_thw``.
+    """
+    rows = grid_thw.prod(dim=1) // (int(spatial_merge_size) ** 2)
+    return torch.repeat_interleave(is_real.to(grid_thw.device), rows)
 
 
-def visual_token_count(grid_thw: torch.Tensor, spatial_merge_size: int, num_real: int) -> int:
-    """Merged-token count for the first ``num_real`` visual items."""
-    if num_real <= 0:
+def visual_token_count(grid_thw: torch.Tensor, spatial_merge_size: int, is_real: torch.Tensor) -> int:
+    """Merged-token count over the real visual rows of a packed batch."""
+    if not bool(is_real.any()):
         return 0
     merge_area = int(spatial_merge_size) ** 2
-    return int(grid_thw[:num_real].prod(dim=1).sum().item()) // merge_area
+    return int(grid_thw[is_real].prod(dim=1).sum().item()) // merge_area
 
 
 __all__ = [
@@ -231,7 +237,7 @@ __all__ = [
     "VISUAL_POS_MASK",
     "PIXEL_VALUES",
     "IMAGE_GRID_THW",
-    "VISUAL_NUM_REAL",
+    "VISUAL_IS_REAL",
     "DEEPSTACK_VISUAL_EMBEDS",
     "pack_qwen3vl_conversations",
     "ensure_packed_batch_dim",
@@ -239,4 +245,5 @@ __all__ = [
     "fold_dummy_anchor",
     "shift_packed_labels",
     "visual_token_count",
+    "visual_row_mask",
 ]

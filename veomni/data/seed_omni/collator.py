@@ -30,12 +30,17 @@ from ..data_collator import DataCollator
 #   packed_position_ids   (3, 1, T)   -> (3, 1, sum T)
 #   pixel_values          (N, D)      -> (sum N, D)      (one row per visual)
 #   image_grid_thw        (N, 3)      -> (sum N, 3)
+#   visual_is_real        (N,)        -> (sum N,)
 #
 # A key that is not listed is not part of the packed sequence: it is batched by
 # ``default_collate``, exactly as the base ``PackingCollator`` treats a field the
 # model did not declare. That is also how the framework's own metadata
 # (``ds_idx`` / ``source_name`` / ``cur_token_num``, appended to a sample by the
 # dataset *after* the transform) reaches the trainer.
+#
+# Adding a modality means adding its rows here — not another helper. The per-row
+# axes are all dim 0 and ``default_collate`` handles the rest, so a new
+# ``audio_values`` / ``audio_grid`` / ``audio_is_real`` triple needs no code.
 _PACKED_CONCAT_DIM: Dict[str, int] = {
     "packed_input_ids": 1,
     "packed_labels": 1,
@@ -44,10 +49,8 @@ _PACKED_CONCAT_DIM: Dict[str, int] = {
     "visual_pos_mask": 1,
     "pixel_values": 0,
     "image_grid_thw": 0,
+    "visual_is_real": 0,
 }
-
-# Summed across the batch rather than joined: a count of visuals, not a tensor.
-_PACKED_SUM_KEYS = ("visual_num_real",)
 
 # Re-derived from the joined sequence, so the per-sample copies are ignored.
 _PACKED_REBUILT_KEYS = ("packed_cu_seqlens", "packed_max_length")
@@ -143,20 +146,13 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
         if key in _PACKED_REBUILT_KEYS:
             continue
         values = [f[key] for f in features]
-        if key in ("pixel_values", "image_grid_thw"):
-            # Reordered below, so the batch-wide real/dummy split stays contiguous.
-            continue
         if key in _PACKED_CONCAT_DIM:
             batch[key] = torch.cat(values, dim=_PACKED_CONCAT_DIM[key])
-        elif key in _PACKED_SUM_KEYS:
-            batch[key] = sum(int(v) for v in values)
         else:
             # Not part of the packed sequence — framework metadata, and whatever a
             # later preprocessor adds. Batch it the way every other trainer field
             # is batched.
             batch[key] = default_collate(values)
-
-    _collate_visual_rows(features, batch)
 
     cu = [0]
     for length in lengths:
@@ -164,54 +160,3 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
     batch["packed_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32)
     batch["packed_max_length"] = max(lengths)
     return batch
-
-
-def _collate_visual_rows(features: Sequence[Dict[str, Any]], batch: Dict[str, Any]) -> None:
-    """Join ``pixel_values`` / ``image_grid_thw`` with all real visuals first.
-
-    Each sample packs its own visuals as ``[real..., dummy...]`` and reports how
-    many of them are real in ``visual_num_real``. A plain concatenation would then
-    order the batch as ``[s0 real, s0 dummy, s1 real, s1 dummy]`` while the summed
-    ``visual_num_real`` stays ``Σ real`` — and the vision hook reads the first
-    ``visual_num_real`` **rows** as the real ones, which would count ``s0``'s
-    dummies and then either scatter them into the real mask or crash on a shape
-    mismatch. Reorder so every real row precedes every dummy row.
-    """
-    has_pixels = "pixel_values" in features[0]
-    has_grids = "image_grid_thw" in features[0]
-    if not (has_pixels and has_grids):
-        # Both keys are skipped by the main loop, so a half-present pair would be
-        # dropped silently. Say so instead: the graph node needs both.
-        if has_pixels or has_grids:
-            missing = "image_grid_thw" if has_pixels else "pixel_values"
-            raise KeyError(
-                f"SeedOmniCollator: a packed sample carries visual patches but no {missing!r}; "
-                "the vision node needs both."
-            )
-        return
-
-    # One ordered list of blocks per sample, concatenated once: real blocks for
-    # every sample, then dummy blocks for every sample. Copying per sample and
-    # again for the join would copy every pixel twice.
-    blocks_by_phase: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
-    grids_by_phase: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
-    for feature in features:
-        grids = feature["image_grid_thw"]
-        n_real = int(feature.get("visual_num_real", 0))
-        # One patch block per visual row, so pixels and grids reorder together.
-        blocks = torch.split(feature["pixel_values"], grids.prod(dim=1).tolist(), dim=0)
-        blocks_by_phase[0].extend(blocks[:n_real])
-        blocks_by_phase[1].extend(blocks[n_real:])
-        grids_by_phase[0].append(grids[:n_real])
-        grids_by_phase[1].append(grids[n_real:])
-    pixel_blocks = blocks_by_phase[0] + blocks_by_phase[1]
-    grid_rows = grids_by_phase[0] + grids_by_phase[1]
-    if not pixel_blocks:
-        # Both tensors present but empty: `torch.cat` on an empty list raises an
-        # opaque shape error, so say what actually went wrong.
-        raise ValueError(
-            "SeedOmniCollator: a packed sample carries an empty visual pair "
-            "(no `image_grid_thw` rows); the vision node needs at least one."
-        )
-    batch["pixel_values"] = torch.cat(pixel_blocks, dim=0)
-    batch["image_grid_thw"] = torch.cat(grid_rows, dim=0)

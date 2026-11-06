@@ -16,7 +16,7 @@ from veomni.models.seed_omni.modules.qwen3vl.packing import (
     PACKED_LABELS,
     PACKED_POSITION_IDS,
     PIXEL_VALUES,
-    VISUAL_NUM_REAL,
+    VISUAL_IS_REAL,
     VISUAL_POS_MASK,
     fold_dummy_anchor,
     masked_scatter_embeds,
@@ -107,7 +107,7 @@ def test_pack_qwen3vl_conversations_expands_variable_vision_and_skips_dummies():
     # 3 text + 4 vision + 2 text = 9 (dummy is not in the sequence)
     assert packed[PACKED_INPUT_IDS].shape[-1] == 9
     assert int(packed[VISUAL_POS_MASK].sum()) == 4
-    assert packed[VISUAL_NUM_REAL] == 1
+    assert packed[VISUAL_IS_REAL].tolist() == [True, False]
     assert packed[PIXEL_VALUES].shape[0] == 32  # 16 real + 16 dummy patches
     assert packed[IMAGE_GRID_THW].tolist() == [[1, 4, 4], [1, 4, 4]]
     assert packed[PACKED_LABELS][0, 3:7].tolist() == [IGNORE_INDEX] * 4
@@ -133,7 +133,7 @@ def test_pack_qwen3vl_two_samples_cu_seqlens():
         )
     packed = pack_qwen3vl_conversations(samples, pad_token_id=0, spatial_merge_size=2)
     assert packed[PACKED_CU_SEQLENS].tolist() == [0, 6, 12]
-    assert packed[VISUAL_NUM_REAL] == 2
+    assert packed[VISUAL_IS_REAL].tolist() == [True, True]
     assert int(packed[VISUAL_POS_MASK].sum()) == 8
 
 
@@ -229,7 +229,8 @@ def test_qwen3vl_packed_preprocessor_writes_batch_keys():
     preprocessor(batch, inference=False)
     assert PACKED_INPUT_IDS in batch
     assert VISUAL_POS_MASK in batch
-    assert batch[VISUAL_NUM_REAL] == 1
+    # One real image plus the FSDP-anchor placeholder each sample carries.
+    assert batch[VISUAL_IS_REAL].tolist() == [True, False]
     assert "conversation_list" not in batch
 
 
@@ -278,7 +279,7 @@ def test_packed_samples_survive_omni_preprocess_and_collation():
     assert batch[PACKED_CU_SEQLENS].tolist() == [0, per_sample, 2 * per_sample]
     assert batch["packed_max_length"] == per_sample
     # Per-visual rows and the scalar both accumulate.
-    assert batch[VISUAL_NUM_REAL] == 2
+    assert batch[VISUAL_IS_REAL].tolist() == [True, True]
     assert tuple(batch[IMAGE_GRID_THW].shape) == (2, 3)
     assert tuple(batch[PIXEL_VALUES].shape) == (32, 8)
 
@@ -346,39 +347,35 @@ def test_packed_collation_carries_cur_token_num():
     assert torch.equal(batch["cur_token_num"], torch.tensor([4, 6]))
 
 
-def test_packed_collation_puts_every_real_visual_before_every_dummy():
-    """Each sample packs its visuals as ``[real..., dummy...]`` and reports how many
-    are real. A plain concatenation would order the batch per sample while the
-    summed ``visual_num_real`` counts all real rows, so the vision hook would read
-    a dummy grid as real — scattering zeros into a real image's mask positions, or
-    crashing when the grids differ in size."""
+def test_packed_collation_keeps_each_samples_visual_flags():
+    """Collation joins visuals by concatenation and nothing else: the per-row
+    `visual_is_real` flag — not the row order — says which of them are real, so a
+    sample's real and dummy visuals may sit anywhere in the batch."""
     from veomni.data.seed_omni.collator import SeedOmniCollator
     from veomni.models.seed_omni.modules.qwen3vl.packing import visual_token_count
 
-    def _packed(real_grid: list[int], dummy_grid: list[int], n_real: int, base: int) -> dict:
+    def _packed(real_grid: list[int], dummy_grid: list[int], base: int) -> dict:
         grids = torch.tensor([real_grid, dummy_grid])
         rows = int(grids.prod(dim=1).sum())
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 8, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 8, dtype=torch.long),
             PACKED_ATTENTION_MASK: torch.ones(1, 8, dtype=torch.long),
-            # A distinct origin per sample, so a reorder that moves the grids but
-            # leaves the pixels in per-sample order cannot pass.
+            # A distinct origin per sample, so a flag that ends up on the wrong row
+            # is observable in the pixels too.
             PIXEL_VALUES: torch.arange(base, base + rows, dtype=torch.float).unsqueeze(1),
             IMAGE_GRID_THW: grids,
-            VISUAL_NUM_REAL: n_real,
+            VISUAL_IS_REAL: torch.tensor([True, False]),
         }
 
-    # Asymmetric on purpose: a plain per-sample concat would interleave them as
-    # [[1,4,4], [1,8,8], [1,4,4], [1,8,8]] and count sample 0's dummy as real.
-    batch = SeedOmniCollator()([_packed([1, 4, 4], [1, 8, 8], 1, base=0), _packed([1, 4, 4], [1, 8, 8], 1, base=1000)])
-    assert batch[IMAGE_GRID_THW].tolist() == [[1, 4, 4], [1, 4, 4], [1, 8, 8], [1, 8, 8]]
-    assert batch[VISUAL_NUM_REAL] == 2
-    # The first `visual_num_real` rows are the real ones, so their merged-token
-    # count is what the vision hook consumes.
-    assert visual_token_count(batch[IMAGE_GRID_THW], 2, batch[VISUAL_NUM_REAL]) == (16 + 16) // 4
-    # Pixels follow their grids: real(16) + real(16) + dummy(64) + dummy(64).
+    # Asymmetric grids: if a consumer ever went back to "the first N rows", the
+    # second sample's real 8x8 would be misread as a dummy.
+    batch = SeedOmniCollator()([_packed([1, 4, 4], [1, 8, 8], 0), _packed([1, 8, 8], [1, 4, 4], 1000)])
+
+    # Plain concatenation, per sample: no reordering anywhere.
+    assert batch[IMAGE_GRID_THW].tolist() == [[1, 4, 4], [1, 8, 8], [1, 8, 8], [1, 4, 4]]
+    assert batch[VISUAL_IS_REAL].tolist() == [True, False, True, False]
     assert tuple(batch[PIXEL_VALUES].shape) == (160, 1)
-    assert batch[PIXEL_VALUES][:16, 0].tolist() == list(range(0, 16)), "sample 0's real block leads"
-    assert batch[PIXEL_VALUES][16:32, 0].tolist() == list(range(1000, 1016)), "sample 1's real block"
-    assert batch[PIXEL_VALUES][32:48, 0].tolist() == list(range(16, 32)), "sample 0's dummy block"
+
+    # The flag drives the count, and it agrees with the grids it points at.
+    assert visual_token_count(batch[IMAGE_GRID_THW], 2, batch[VISUAL_IS_REAL]) == (16 + 64) // 4
