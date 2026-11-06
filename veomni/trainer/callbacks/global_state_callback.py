@@ -124,6 +124,16 @@ def _multi_optimizer_checkpoints(trainer):
     return result
 
 
+def _saved_multi_optimizer_generations(trainer, step):
+    generations = {}
+    for name, checkpoint in _multi_optimizer_checkpoints(trainer):
+        generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
+        if getattr(checkpoint, "_last_saved_step", None) != step or not isinstance(generation, str) or not generation:
+            raise RuntimeError("Trainer state has no matching MultiOptimizer checkpoint generation")
+        generations[name] = generation
+    return generations
+
+
 def _legacy_optimizer_checkpoints(trainer):
     """Find the model runtimes responsible for legacy checkpoint recovery."""
     root = getattr(trainer, "model", None)
@@ -373,33 +383,13 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-        payload = None
-        state_error = None
+        step_root, path_error = None, None
         try:
-            payload = self.state_dict(state)
-            receipts = {}
-            for name, checkpoint in _multi_optimizer_checkpoints(self.trainer):
-                generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
-                valid = not (
-                    getattr(checkpoint, "_last_saved_step", None) != state.global_step
-                    or not isinstance(generation, str)
-                    or not generation
-                )
-                if not valid:
-                    raise RuntimeError("Trainer cursor requires the same-step MultiOptimizer checkpoint generation")
-                if valid:
-                    receipts[name] = generation
-            if receipts:
-                payload["_veomni_optimizer_generations"] = receipts
-            else:
-                payload.pop("_veomni_optimizer_generations", None)
-        except BaseException as exc:
-            state_error = exc
-        group = dist.group.WORLD if dist.is_initialized() else None
-        raise_if_any_rank_failed(state_error, "collecting the trainer state", group=group)
-        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
-        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+            step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        except Exception as exc:  # noqa: BLE001 - all ranks must agree before invalidating a manifest
+            path_error = exc
+        raise_if_any_rank_failed(path_error, "preparing the trainer checkpoint path")
+        assert step_root is not None
 
         # A restarted run reaching this step again overwrites the cursor files, so
         # the manifest an earlier attempt left has to go before the first of them
@@ -417,11 +407,33 @@ class GlobalStateCallback(Callback):
                 remove_error = e
         raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
 
+        payload, state_error = None, None
+        try:
+            payload = self.state_dict(state)
+            if not isinstance(payload, dict):
+                raise TypeError("Trainer checkpoint state must be a dictionary")
+        except BaseException as exc:  # noqa: BLE001 - synchronize a rank-local cursor failure
+            state_error = exc
+        raise_if_any_rank_failed(state_error, "collecting trainer checkpoint state")
+        assert payload is not None
+        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
+        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+
         # Each rank writes its own files, so a full disk or a bad pickle starts out
         # visible to that rank alone. Reduce before the manifest: the manifest
         # claims every rank's cursor is down, and rank 0 only knows about its own.
         # A rank that raised here would otherwise leave its peers recording a step
         # whose state is incomplete, or waiting in a collective it never reaches.
+        generations, generation_error = {}, None
+        try:
+            generations = _saved_multi_optimizer_generations(self.trainer, state.global_step)
+        except BaseException as exc:  # noqa: BLE001 - all ranks must fail before writing
+            generation_error = exc
+        raise_if_any_rank_failed(generation_error, "preparing trainer checkpoint state")
+        if generations:
+            extra_payload["_veomni_optimizer_generations"] = generations
+        else:
+            extra_payload.pop("_veomni_optimizer_generations", None)
         write_error: Optional[Exception] = None
         try:
             for path, blob in (
@@ -517,6 +529,17 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        if dist.is_initialized():
+            local_policy = (
+                strict_sft,
+                tuple(name for name, _ in legacy_checkpoints),
+                tuple(unknown_checkpoints),
+                tuple(sorted(generations.items())),
+            )
+            policies = [None] * dist.get_world_size()
+            dist.all_gather_object(policies, local_policy)
+            if any(policy != local_policy for policy in policies):
+                raise RuntimeError("Checkpoint data and optimizer resume policy differs across ranks")
         coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
 
         if strict_optimizer:

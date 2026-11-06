@@ -447,6 +447,23 @@ def test_dpo_epoch_end_refreshes_checkpoint_position_without_changing_sft_behavi
     callback.save_global_state.assert_not_called()
 
 
+def test_dpo_epoch_refresh_capture_failure_invalidates_the_step(tmp_path):
+    from tests.checkpoints.test_multi_optimizer_trainer_step import _complete_stub_checkpoint, _trainer
+    from veomni.checkpoint import layout
+
+    trainer = _trainer(tmp_path)
+    trainer.args.train.world_size = 1
+    root = layout.step_dir(str(tmp_path), 3)
+    _complete_stub_checkpoint(root, world_size=1)
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._last_saved_step = 3
+    callback.state_dict = MagicMock(side_effect=ValueError("injected cursor failure"))
+    with pytest.raises(ValueError, match="injected cursor failure"):
+        callback.save_global_state(SimpleNamespace(global_step=3, epoch=0), refresh_epoch_state=True)
+    assert not layout.checkpoint_is_complete(root)
+
+
 @pytest.mark.parametrize("same_output", [False, True])
 def test_finished_dpo_resume_preserves_position_at_train_end(monkeypatch, same_output):
     trainer = _trainer(True)
