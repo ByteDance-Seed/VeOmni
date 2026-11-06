@@ -30,6 +30,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from veomni.models.checkpoint.convert import get_checkpoint_tensor_converter
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import _PLE_SHARD_PATTERN
 from veomni.utils import logging
+from veomni.utils.device import get_device_id, is_hccl_backend, is_nccl_backend
 
 
 logger = logging.get_logger(__name__)
@@ -135,9 +136,10 @@ def _resize_dtensor(tensor: DTensor, rows: int, *, empty: bool = False) -> DTens
     group = mesh.get_group(axis)
     send = local[: sum(send_sizes)].contiguous()
     receive = output[: sum(recv_sizes)]
-    if local.device.type == "cpu" and dist.get_backend(group) in ("nccl", "hccl"):
+    backend = dist.get_backend(group)
+    if local.device.type == "cpu" and (is_nccl_backend(backend) or is_hccl_backend(backend)):
         # Accelerator collectives require device buffers even with CPU offload.
-        device = torch.device(mesh.device_type, getattr(torch, mesh.device_type).current_device())
+        device = torch.device(mesh.device_type, get_device_id())
         send = send.to(device=device, non_blocking=False)
         receive = torch.empty(receive.shape, dtype=local.dtype, device=device)
         dist.all_to_all_single(receive, send, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=group)
