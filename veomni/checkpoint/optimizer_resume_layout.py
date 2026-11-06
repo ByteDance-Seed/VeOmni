@@ -439,16 +439,6 @@ def frozen_parameter_digest(model, *, enabled, group=None, chunk_bytes=4 << 20):
     return digest.hexdigest()
 
 
-def _validate_multi_leaf_order(optimizer, *, group=None):
-    """All ranks must enter per-leaf checkpoint collectives in the same order."""
-    if not dist.is_initialized():
-        return
-    orders = [None] * dist.get_world_size(group)
-    dist.all_gather_object(orders, tuple(optimizer.key_names), group=group)
-    if any(order != orders[0] for order in orders[1:]):
-        raise RuntimeError(f"MultiOptimizer leaf order differs across checkpoint ranks: {orders}")
-
-
 def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object, *, group=None, frozen_digest=None):
     """Validate the live save layout once, before creating checkpoint files."""
     encoded, error = None, None
@@ -467,7 +457,6 @@ def capture_multi_layout(model, optimizer, scheduler_snapshot, scheduler_object,
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "capturing MultiOptimizer checkpoint layout", group=group)
-    _validate_multi_leaf_order(optimizer, group=group)
     return encoded
 
 
@@ -517,7 +506,6 @@ def coordinated_multi_layout(
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "inspecting MultiOptimizer layout", group=group)
-    _validate_multi_leaf_order(optimizer, group=group)
     if dist.is_initialized():
         world = dist.get_world_size(group)
         digests = [None] * world

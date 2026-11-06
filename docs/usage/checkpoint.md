@@ -452,8 +452,9 @@ and uninitialized states, but increases checkpoint storage for replicated
 optimizer shards and does not support elastic resharding. All ranks must use
 the same trusted model and configuration, including optimizer leaf ordering.
 Owner-specific freezing that removes a whole leaf from only some ranks is not
-supported; differing leaf names or order are rejected before checkpoint collectives. Replica
-values, trainability, dtype, shape and geometry
+supported. Leaf names and order are not checked across ranks before checkpoint
+collectives; divergent configurations can hang or produce an invalid checkpoint.
+Replica values, trainability, dtype, shape and geometry
 are trusted to be consistent across ranks. Source and target checkpoint layout
 metadata are checked during restore; tensor bytes are not hashed for replica
 consistency. Trainable-only MultiOptimizer checkpoints do hash each rank's local
