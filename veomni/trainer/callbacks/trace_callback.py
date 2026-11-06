@@ -20,6 +20,7 @@ from tqdm import trange
 from ...utils import helper
 from ...utils.dist_utils import all_reduce
 from ...utils.logging import get_logger
+from ...utils.loss_utils import is_padding_microbatch
 from .base import Callback, TrainerState
 
 
@@ -231,8 +232,12 @@ class EnvironMeterCallback(Callback):
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
-            self.trainer.environ_meter.add(micro_batch)
-        self.start_time = time.time()
+            if not is_padding_microbatch(micro_batch):
+                self.trainer.environ_meter.add(micro_batch)
+        clock_owner = getattr(self.trainer, "base", self.trainer)
+        preflight_start = getattr(clock_owner, "_step_preflight_start_time", None)
+        self.start_time = preflight_start if preflight_start is not None else time.time()
+        clock_owner._step_preflight_start_time = None
 
     def on_step_end(
         self,

@@ -105,6 +105,32 @@ restarted source's CPU RNG ahead of the consumed cursor, so model RNG may
 diverge after resume even when the text samples are deterministic. Validate
 the loader and prefetch configuration used by a training profile.
 
+When main-process dynamic batching emits padded micro-batches in single-process
+SFT, padding is excluded from loss token counts, channel loss and auxiliary
+metrics, and its model forward/backward is skipped. Distributed main-process
+dynamic batching must use `drop_last=True` until tail step counts can be
+coordinated across ranks. All distributed loaders, including finite native
+worker-based loaders, must coordinate fetch failures and EOF before entering
+the trainer and avoid injecting padded micro-batches. DPO and Omni reject padded
+micro-batches; custom data loaders must not inject padding into those objectives.
+DiT also rejects marked padding.
+The distributed padding guard adds one small collective before step-begin
+callbacks. SFT propagates callback errors in its existing loss-token reduction;
+DPO, Omni and DiT use a separate small error synchronization after callbacks.
+SFT still counts valid loss tokens after step-begin callbacks, so callbacks can
+adjust labels before the loss denominator is computed. Distributed training
+rejects unequal microbatch counts across ranks. Step-begin callbacks must not
+replace or reorder microbatches, or change the microbatch count, target-key
+structure or padding flags. Callback-internal collectives must coordinate their
+own failures; a failure before such a collective can still strand another rank.
+If any rank has auxiliary target keys, their union is synchronized once per
+step; missing targets contribute zero and keys are reduced in sorted order.
+This includes MTP inputs; object-gather overhead on accelerators is unmeasured.
+Environment-meter token and FLOP estimates likewise count useful batches only.
+The main dynamic loader's configured `train_steps` limit is unchanged: a
+normal trainer does not consume extra flush batches beyond that limit, and a
+restartable source can be replayed to fill the requested number of steps.
+
 Three splits in the tree above are deliberate:
 
 - **`loader/` and `extra_state/` are per rank** because their contents are.
@@ -249,17 +275,6 @@ LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
 
-When resuming a legacy Adam checkpoint into its original output directory, the
-trainer reuses an unchanged same-step checkpoint only after a successful model
-and optimizer load and validation of the completed manifest, RNG state and
-available data cursor. This follows the built-in synchronous trainer lifecycle,
-which does not replace the optimizer or checkpoint provider between loading and
-cursor validation.
-If those cannot be established, use a different output directory: this avoids
-overwriting the source checkpoint during an immediate epoch-end or HF export.
-This guard does not prove optimizer group identity or claim exact recovery for
-legacy optimizer formats.
-
 Checkpoints from older layouts have no manifest; discovery falls back to a
 `.metadata` at the step root, which is what marked those steps complete, but
 only while the step is still entirely pre-split. See
@@ -302,6 +317,17 @@ save's own Gloo group so the ranks whose write finished first wait there
 rather than on the training backend.
 
 ## Resuming older checkpoints
+
+When resuming a legacy Adam checkpoint into its original output directory, the
+trainer reuses an unchanged same-step checkpoint only after a successful model
+and optimizer load and validation of the completed manifest, RNG state and
+available data cursor. This follows the built-in synchronous trainer lifecycle,
+which does not replace the optimizer or checkpoint provider between loading and
+cursor validation.
+If those cannot be established, use a different output directory: this avoids
+overwriting the source checkpoint during an immediate epoch-end or HF export.
+This guard does not prove optimizer group identity or claim exact recovery for
+legacy optimizer formats.
 
 Temporary. New saves never produce the older shapes, and the compatibility
 loader in `veomni/checkpoint/legacy_v0_1_12.py` will be removed. Current files

@@ -586,7 +586,13 @@ class DynamicBatchSizeDataLoader:
                 yield batch
                 batch = []
 
+        if not batch:
+            self._checkpoint_phase = "done"
+            self._checkpoint_flush_micro_batch = None
+            return
         while len(batch) < self.num_micro_batch:
+            if not isinstance(micro_batch, dict):
+                raise RuntimeError("Dynamic tail padding requires collated dictionary micro-batches")
             padding_batch = copy.deepcopy(micro_batch)
             padding_batch["padding_flag"] = True
             batch.append(padding_batch)

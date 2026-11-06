@@ -105,3 +105,25 @@ def test_dpo_main_collator_sp_enabled(monkeypatch):
 
     batch = m.MainCollator()([_make_flat_dpo_sample([1, 2, 3, 4], [5, 6, 7, 8])])
     assert batch["input_ids"].view(-1).shape[0] == 4  # 8 tokens / sp_size=2
+
+
+@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+def test_dpo_rejects_weighted_input_without_silently_dropping_it(key):
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example({"chosen": "a", "rejected": "b", key: 0.5}, tokenizer=_FakeTokenizer())
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example(
+            {"chosen": [{"role": "assistant", key: 0.5}], "rejected": []}, chat_template=_FakeChatTemplate()
+        )
+
+
+@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+def test_dpo_rejects_template_produced_weights(key):
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            result = super().encode_messages(messages, max_seq_len=max_seq_len)
+            result[key] = [0.5] * len(messages)
+            return result
+
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example({"chosen": [1, 2], "rejected": [3, 4]}, chat_template=WeightedTemplate())
