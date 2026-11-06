@@ -23,6 +23,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     _export_extra_parallel_layout_key,
     _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
+    _ExtraParallelSavePlanner,
     _from_local_preserve_device,
     _get_sharding_plan,
     _ModelStrictLoadPlanner,
@@ -443,13 +444,17 @@ def test_canonical_layout_rejects_mixed_legacy_shards():
 
 @pytest.mark.parametrize("shard_size", [None, 16])
 def test_v2_offline_hf_export_preserves_names_and_values(tmp_path, shard_size):
+    from veomni.distributed.parallel_state import ParallelState
+
     marker = _extra_parallel_layout_key({})
     source = {
         "model.layer.experts.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
         "model.layer.other.weight": torch.arange(4, dtype=torch.bfloat16),
     }
     dcp.save(
-        {"model": {marker: "ep-outer-v1", **{marker + "__" + k: v for k, v in source.items()}}}, checkpoint_id=tmp_path
+        {"model": {marker: "ep-outer-v1", **{marker + "__" + k: v for k, v in source.items()}}},
+        checkpoint_id=tmp_path,
+        planner=_ExtraParallelSavePlanner(parallel_state=ParallelState(device_type="cpu")),
     )
     plan, _, _ = _get_sharding_plan(str(tmp_path), shard_size=shard_size)
     actual = {}

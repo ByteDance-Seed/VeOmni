@@ -99,6 +99,7 @@ class OptimizerConfig:
     )
     state_offload: Literal["none", "cpu"] = field(
         default="none",
+        kw_only=True,
         metadata={
             "help": (
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
@@ -302,6 +303,8 @@ class OptimizerConfig:
     def __post_init__(self):
         if isinstance(self.lr, (list, tuple)):
             raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
+        if isinstance(self.lr, str) and self.lr in ("none", "cpu"):
+            raise TypeError("Pass state_offload by keyword; the second positional argument is learning rate")
         # YAML sequences arrive as lists; the declared tuple also prevents
         # optimizer defaults and groups from sharing mutable beta options.
         if isinstance(self.betas, list):

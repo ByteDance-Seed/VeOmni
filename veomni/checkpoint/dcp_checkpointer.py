@@ -241,6 +241,25 @@ def _ordinary_expert_fqns(model, parallel_state):
     return result - ambiguous
 
 
+def _logical_extra_parallel_key(key, state_dict):
+    # The save planner's metadata keeps the serialized key, but ownership is
+    # expressed in logical FQNs. Canonical v2 checkpoints namespace both model
+    # and optimizer keys, so strip only the verified layout marker for lookup.
+    root, sep, rest = key.partition(".")
+    if not sep or root not in ("model", "optimizer"):
+        return key
+    marker = _extra_parallel_layout_key({})
+    marker_value = state_dict.get(f"{root}.{marker}")
+    if isinstance(marker_value, str) and marker_value == "ep-outer-v1":
+        if rest == marker:
+            return None
+        prefix = marker + "__"
+        if not rest.startswith(prefix):
+            raise RuntimeError("ExtraParallel checkpoint mixes versioned and legacy tensor keys")
+        return f"{root}.{rest[len(prefix) :]}"
+    return key
+
+
 def _key_belongs_to_fqns(key, fqns):
     if key.startswith("model.") and (key in fqns or key.removeprefix("model.") in fqns):
         return True
@@ -545,12 +564,17 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
         for key, value in self.state_dict.items():
             if key in rank_local_keys:
                 continue
+            logical_key = _logical_extra_parallel_key(key, self.state_dict)
+            if logical_key is None:
+                continue
             extra_names = getattr(self.parallel_state, "extra_parallel_names", ())
             layout = (
                 _expert_layout(value, extra_names)
-                or _no_ep_expert_layout(key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns)
+                or _no_ep_expert_layout(
+                    logical_key, value, self.parallel_state, self.ordinary_fqns, self.shared_lora_fqns
+                )
                 or _tp_only_source_layout(
-                    key,
+                    logical_key,
                     value,
                     self.tp_only_parameters,
                     self.tp_only_mesh,
@@ -560,7 +584,7 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
             if layout is not None:
                 layouts[key] = layout
             elif _unidentified_same_axis_shards(value) or (
-                "experts" in key.split(".") and torch.is_tensor(value) and value.ndim > 0
+                "experts" in logical_key.split(".") and torch.is_tensor(value) and value.ndim > 0
             ):
                 layouts[key] = {"expert_order": "unproven"}
         return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
@@ -575,6 +599,20 @@ class _ExtraParallelSavePlanner(DefaultSavePlanner):
                 if key in layouts and layouts[key] != value:
                     raise RuntimeError(f"Checkpoint tensor {key!r} has inconsistent source layouts across ranks")
                 layouts[key] = value
+        has_v2_model = any(
+            key.startswith("model.") and _is_extra_parallel_layout_marker(key.split(".")[-1])
+            for key in metadata.state_dict_metadata
+        )
+        if has_v2_model:
+            unproven = sorted(
+                key
+                for key, value in layouts.items()
+                if key.startswith("model.") and value.get("expert_order") != "canonical"
+            )
+            if unproven:
+                raise RuntimeError(
+                    f"Cannot save canonical ExtraParallel checkpoint with unproven expert layout: {unproven[0]}"
+                )
         metadata.planner_data = {
             **(metadata.planner_data or {}),
             _EXPERT_LAYOUTS_KEY: {"version": 1, "tensors": layouts},
@@ -669,15 +707,14 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                         "Migrate model and optimizer state using the original training layout before loading."
                     )
 
-        # Checkpoints produced by the earlier version of this feature already
-        # used canonical coordinates, but did not record individual layouts.
-        if planner_data.get("__veomni_ep_first_layout__") == 1:
-            return
-
-        # Earlier v2 checkpoints used EP-first coordinates and a versioned
-        # namespace; matching source/target markers were checked above.
+        # The v2 namespace proves how sharded EP tensors were serialized, but
+        # not whether an ordinary/shared expert was a synchronized replica.
+        # Each saved expert needs its own layout proof even in a v2 checkpoint.
         marker = _extra_parallel_layout_key({})
-        if any(key.split(".")[-1] == marker for key in self.metadata.state_dict_metadata):
+        has_v2_marker = any(key.split(".")[-1] == marker for key in self.metadata.state_dict_metadata)
+        # Preserve the earlier unversioned EP-first contract. A v2 marker must
+        # not bypass the per-tensor proof even if both markers are present.
+        if not has_v2_marker and planner_data.get("__veomni_ep_first_layout__") == 1:
             return
 
         for key, value in self.state_dict.items():
@@ -687,23 +724,29 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             saved = self.metadata.state_dict_metadata.get(key)
             if saved is None or not torch.is_tensor(value) or not hasattr(saved, "size"):
                 continue
+            root = key.partition(".")[0]
+            root_marker = f"{root}.{marker}"
+            source_marker = {root_marker: "ep-outer-v1"} if root_marker in self.metadata.state_dict_metadata else {}
+            logical_key = _logical_extra_parallel_key(key, source_marker)
+            is_expert = logical_key is not None and "experts" in logical_key.split(".")
             if (
-                source is not None
-                and "experts" in key.split(".")
+                is_expert
                 and bool(saved.size)
-                and self.legacy_expert_source_layout is None
+                and (has_v2_marker or (source is not None and self.legacy_expert_source_layout is None))
             ):
                 raise RuntimeError(
-                    f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                    f"Cannot determine source expert order for {key!r}: checkpoint metadata omits its layout. "
                     "Verify and migrate the original training layout before loading."
                 )
+            if has_v2_marker:
+                continue
             # Unversioned chunks cannot identify the source EP axis. The
             # target axis is not source evidence: a source sharded along one
             # axis can appear whole along a different target expert axis.
             if layout is None:
                 # Offline export uses a plain CPU tensor as its target. Old
                 # stacked expert weights still require the same source check.
-                if "experts" not in key.split("."):
+                if not is_expert:
                     continue
             if all(tuple(chunk.sizes) == tuple(saved.size) for chunk in saved.chunks):
                 continue
@@ -1049,6 +1092,179 @@ def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, e
     return tuple(shape), tuple(stride)
 
 
+def drop_extra_parallel_dim_v2(
+    loaded_tensor: torch.Tensor,
+    device_mesh: DeviceMesh,
+    fsdp_shard_dim: int = 1,
+    *,
+    extra_parallel_name: Optional[str] = None,
+):
+    """
+    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
+
+    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
+    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
+    ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
+    the Muon zero-comm layout). The number of placements on the loaded DTensor
+    reflects the full saved mesh:
+
+    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
+      the 1D sub-mesh.
+    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
+      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
+    """
+
+    if not -loaded_tensor.ndim <= fsdp_shard_dim < loaded_tensor.ndim:
+        raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+    fsdp_shard_dim %= loaded_tensor.ndim
+    num_placements = len(loaded_tensor.placements)
+    if num_placements == 1:
+        tensor_to_put = loaded_tensor.to_local()
+    elif num_placements == 2:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
+        )
+    elif num_placements == 3:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
+        )
+    else:
+        raise RuntimeError(
+            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
+            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
+        )
+
+    return tensor_to_put
+
+
+def _validate_extra_parallel_tensor_v2(tensor, mesh, fsdp_mesh, ep_dim, fsdp_dim, global_shape):
+    if not isinstance(tensor, DTensor):
+        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
+    ndim = tensor.ndim
+    if not (-ndim <= ep_dim < ndim and -ndim <= fsdp_dim < ndim):
+        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+    ep_dim, fsdp_dim = ep_dim % ndim, fsdp_dim % ndim
+    if tensor.device_mesh != fsdp_mesh:
+        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP mesh")
+    if tuple(tensor.placements) != (Replicate(),) * (fsdp_mesh.ndim - 1) + (Shard(fsdp_dim),):
+        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP placement")
+    if global_shape is None or len(global_shape) != ndim:
+        raise RuntimeError("FSDP-only ExtraParallel tensors require the original global_shape")
+
+    expected = list(global_shape)
+    ep_size, ep_rank = mesh.size(-1), mesh.get_local_rank(-1)
+    ep_chunk = (expected[ep_dim] + ep_size - 1) // ep_size
+    expected[ep_dim] = max(min(expected[ep_dim] - ep_rank * ep_chunk, ep_chunk), 0)
+    if tuple(tensor.shape) != tuple(expected):
+        raise RuntimeError("ExtraParallel source tensor shape does not match the declared global shape")
+    local_size, local_rank = fsdp_mesh.size(-1), fsdp_mesh.get_local_rank(-1)
+    local_chunk = (expected[fsdp_dim] + local_size - 1) // local_size
+    expected[fsdp_dim] = max(min(expected[fsdp_dim] - local_rank * local_chunk, local_chunk), 0)
+    if tuple(tensor.to_local().shape) != tuple(expected):
+        raise RuntimeError("ExtraParallel local tensor shape does not match its declared FSDP placement")
+
+
+def restore_extra_parallel_dim_v2(
+    orgin_tensor: torch.Tensor,
+    fsdp_mesh: DeviceMesh,
+    extra_parallel_fsdp_mesh: DeviceMesh,
+    ep_shard_dim: int = 0,
+    fsdp_shard_dim: int = 1,
+    global_shape: Optional[tuple[int, ...]] = None,
+):
+    """
+    Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
+
+    The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
+    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
+    experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
+    layout). They must be mapped to the matching mesh dims explicitly.
+
+    args:
+        orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
+        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
+            ``(ep_fsdp, ep)`` for plain FSDP or 3D
+            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
+            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
+        ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
+        fsdp_shard_dim (int): Tensor dim FSDP shards along.
+        global_shape (tuple[int, ...], optional): The model parameter's shape
+            before ExtraParallel and FSDP sharding. It is required for an
+            FSDP-only DTensor: a local slice alone cannot prove global shape.
+
+    Note:
+        When both dimensions shard the same tensor axis, the FSDP placement
+        uses ``_StridedShard`` on the FSDP-first runtime mesh. If the global
+        axis is uneven across EP, use an EP-first mesh view instead: current
+        Torch strided metadata can report incorrect offsets for that case.
+    """
+    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
+    ndim = orgin_tensor.ndim
+    if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
+        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+    ep_shard_dim %= ndim
+    fsdp_shard_dim %= ndim
+
+    if isinstance(orgin_tensor, DTensor):
+        _validate_extra_parallel_tensor_v2(
+            orgin_tensor, fsdp_mesh, extra_parallel_fsdp_mesh, ep_shard_dim, fsdp_shard_dim, global_shape
+        )
+        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
+        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
+        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
+        same_axis = ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
+        if same_axis and global_shape[ep_shard_dim] % fsdp_mesh.size(-1):
+            checkpoint_mesh = _extra_parallel_first_mesh(fsdp_mesh)
+            placements = [Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
+            if checkpoint_mesh.ndim == 3:
+                placements.insert(0, Replicate())
+        else:
+            checkpoint_mesh = fsdp_mesh
+            fsdp_placement = (
+                _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1)) if same_axis else Shard(fsdp_shard_dim)
+            )
+            placements = [fsdp_placement, Shard(ep_shard_dim)]
+            if checkpoint_mesh.ndim == 3:
+                placements.insert(0, Replicate())
+        shape = tuple(global_shape)
+        stride = [1] * len(shape)
+        for index in range(len(shape) - 2, -1, -1):
+            stride[index] = stride[index + 1] * shape[index + 1]
+        dtensor = _from_local_preserve_device(
+            orgin_tensor._local_tensor,
+            device_mesh=checkpoint_mesh,
+            placements=placements,
+            shape=shape,
+            stride=tuple(stride),
+        )
+    elif torch.is_tensor(orgin_tensor):
+        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
+    else:
+        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
+
+    return dtensor
+
+
 def _apply_extra_parallel_dim(
     state_dict: Dict[str, Any],
     extra_parallel_fqn2spec_info: Dict[str, Any],
@@ -1252,6 +1468,34 @@ def _requires_rank_local_optimizer_checkpoint(optimizer):
     )
 
 
+def _checkpoint_optimizer_policy(state, *, loading, group=None):
+    """Agree on the optimizer path before entering any checkpoint collective."""
+    optimizer, multi, swap, error = None, False, False, None
+    try:
+        from ..optim.swap_adamw import SwapAdamW
+
+        if not isinstance(state, dict) or "model" not in state:
+            if loading and state is None:
+                raise ValueError("State dict must be provided to load a distributed checkpoint.")
+            raise ValueError(f"Model must be provided to {'load' if loading else 'save'} a distributed checkpoint.")
+        optimizer = state.get("optimizer")
+        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        swap = type(optimizer) is SwapAdamW
+        if not multi and _requires_rank_local_optimizer_checkpoint(optimizer):
+            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking checkpoint optimizer policy", group=group)
+
+    if any_rank_failed(multi, group=group) and any_rank_failed(not multi, group=group):
+        raise RuntimeError("Checkpoint optimizer types differ across ranks")
+    if any_rank_failed(optimizer is None, group=group) and any_rank_failed(optimizer is not None, group=group):
+        raise RuntimeError("Checkpoint optimizer presence differs across ranks")
+    if any_rank_failed(swap, group=group) and any_rank_failed(not swap, group=group):
+        raise RuntimeError("Checkpoint optimizer offload types differ across ranks")
+    return optimizer, multi
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -1310,44 +1554,35 @@ class OptimizerState(Stateful):
         self._load = load
 
     def state_dict(self):
+        if self.should_extra_parallel_aware:
+            # Reject unsupported raw DCP on every rank before any optimizer
+            # can enter its own collectives, even if a local check fails.
+            error = None
+            try:
+                if _requires_rank_local_optimizer_checkpoint(self.optimizer):
+                    raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+                if self._layout_marker_key is not None:
+                    raise RuntimeError(
+                        "Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec"
+                    )
+                if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                    raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+                raise RuntimeError(
+                    "Raw DCP MultiOptimizer does not prove parameter groups or scheduler identity; "
+                    "use DistributedCheckpointer with the live scheduler."
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "validating ExtraParallel optimizer checkpoint", group=self.process_group)
+            raise RuntimeError("ExtraParallel optimizer checkpoint preflight unexpectedly succeeded")
+
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
-        if self.should_extra_parallel_aware and self._layout_marker_key is not None:
-            raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             raise RuntimeError(
                 "Raw DCP MultiOptimizer does not prove parameter groups or scheduler identity; "
                 "use DistributedCheckpointer with the live scheduler."
             )
-        if self.should_extra_parallel_aware:
-            logger.info_rank0(
-                "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
-            )
-            assert self.optimizer._is_multi_optimizer, (
-                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-            )
-            vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim, error = None, None
-            try:
-                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                    vanilla_optim_sd, "restore"
-                )
-            except BaseException as exc:
-                error = exc
-            raise_if_any_rank_failed(
-                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
-            )
-            if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
-                optim_sd_with_extra_parallel_dim = _namespace_extra_parallel_layout_state(
-                    optim_sd_with_extra_parallel_dim, self._layout_marker_key
-                )
-            return optim_sd_with_extra_parallel_dim
-
-        if getattr(self.optimizer, "_is_multi_optimizer", False):
-            if self._load:
-                return self.optimizer.state_dict()
-            return self.optimizer._sparse_state_dict()
-
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -1645,178 +1880,6 @@ def restore_extra_parallel_dim(
             raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
         placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
         dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
-    else:
-        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
-
-    return dtensor
-
-
-def drop_extra_parallel_dim_v2(
-    loaded_tensor: torch.Tensor,
-    device_mesh: DeviceMesh,
-    fsdp_shard_dim: int = 1,
-    *,
-    extra_parallel_name: Optional[str] = None,
-):
-    """
-    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
-
-    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
-    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
-    ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
-    the Muon zero-comm layout). The number of placements on the loaded DTensor
-    reflects the full saved mesh:
-
-    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
-    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
-      the 1D sub-mesh.
-    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
-      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
-    """
-
-    if not -loaded_tensor.ndim <= fsdp_shard_dim < loaded_tensor.ndim:
-        raise RuntimeError("FSDP shard dimension is outside the tensor rank")
-    fsdp_shard_dim %= loaded_tensor.ndim
-    num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
-        tensor_to_put = loaded_tensor.to_local()
-    elif num_placements == 2:
-        ep_placement = loaded_tensor.placements[-1]
-        if not isinstance(ep_placement, Shard):
-            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
-        ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
-        tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Shard(fsdp_shard_dim)],
-            shape=shape,
-            stride=stride,
-        )
-    elif num_placements == 3:
-        ep_placement = loaded_tensor.placements[-1]
-        if not isinstance(ep_placement, Shard):
-            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
-        ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
-        tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
-            placements=[Replicate(), Shard(fsdp_shard_dim)],
-            shape=shape,
-            stride=stride,
-        )
-    else:
-        raise RuntimeError(
-            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
-            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
-        )
-
-    return tensor_to_put
-
-
-def _validate_extra_parallel_tensor_v2(tensor, mesh, fsdp_mesh, ep_dim, fsdp_dim, global_shape):
-    if not isinstance(tensor, DTensor):
-        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
-    ndim = tensor.ndim
-    if not (-ndim <= ep_dim < ndim and -ndim <= fsdp_dim < ndim):
-        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-    ep_dim, fsdp_dim = ep_dim % ndim, fsdp_dim % ndim
-    if tensor.device_mesh != fsdp_mesh:
-        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP mesh")
-    if tuple(tensor.placements) != (Replicate(),) * (fsdp_mesh.ndim - 1) + (Shard(fsdp_dim),):
-        raise RuntimeError("ExtraParallel source tensor does not use the declared FSDP placement")
-    if global_shape is None or len(global_shape) != ndim:
-        raise RuntimeError("FSDP-only ExtraParallel tensors require the original global_shape")
-
-    expected = list(global_shape)
-    ep_size, ep_rank = mesh.size(-1), mesh.get_local_rank(-1)
-    ep_chunk = (expected[ep_dim] + ep_size - 1) // ep_size
-    expected[ep_dim] = max(min(expected[ep_dim] - ep_rank * ep_chunk, ep_chunk), 0)
-    if tuple(tensor.shape) != tuple(expected):
-        raise RuntimeError("ExtraParallel source tensor shape does not match the declared global shape")
-    local_size, local_rank = fsdp_mesh.size(-1), fsdp_mesh.get_local_rank(-1)
-    local_chunk = (expected[fsdp_dim] + local_size - 1) // local_size
-    expected[fsdp_dim] = max(min(expected[fsdp_dim] - local_rank * local_chunk, local_chunk), 0)
-    if tuple(tensor.to_local().shape) != tuple(expected):
-        raise RuntimeError("ExtraParallel local tensor shape does not match its declared FSDP placement")
-
-
-def restore_extra_parallel_dim_v2(
-    orgin_tensor: torch.Tensor,
-    fsdp_mesh: DeviceMesh,
-    extra_parallel_fsdp_mesh: DeviceMesh,
-    ep_shard_dim: int = 0,
-    fsdp_shard_dim: int = 1,
-    global_shape: Optional[tuple[int, ...]] = None,
-):
-    """
-    Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
-
-    The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
-    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
-    experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
-    layout). They must be mapped to the matching mesh dims explicitly.
-
-    args:
-        orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
-        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
-            ``(ep_fsdp, ep)`` for plain FSDP or 3D
-            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
-        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
-            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
-        ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
-        fsdp_shard_dim (int): Tensor dim FSDP shards along.
-        global_shape (tuple[int, ...], optional): The model parameter's shape
-            before ExtraParallel and FSDP sharding. It is required for an
-            FSDP-only DTensor: a local slice alone cannot prove global shape.
-
-    Note:
-        When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
-        shards experts on dim 0 just like EP), both mesh dims split the SAME
-        tensor dim. The temporary checkpoint DTensor uses an EP-outer /
-        FSDP-inner mesh view so DCP metadata matches the optimizer's physical
-        local shards and global offsets instead of block-transposing the dim.
-    """
-    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
-    ndim = orgin_tensor.ndim
-    if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
-        raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
-    ep_shard_dim %= ndim
-    fsdp_shard_dim %= ndim
-
-    if isinstance(orgin_tensor, DTensor):
-        _validate_extra_parallel_tensor_v2(
-            orgin_tensor, fsdp_mesh, extra_parallel_fsdp_mesh, ep_shard_dim, fsdp_shard_dim, global_shape
-        )
-        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
-        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
-        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
-        if ep_shard_dim == fsdp_shard_dim:
-            checkpoint_mesh = _extra_parallel_first_mesh(fsdp_mesh)
-            if checkpoint_mesh.ndim == 3:
-                placements = [Replicate(), Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
-            else:
-                placements = [Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
-        else:
-            checkpoint_mesh = fsdp_mesh
-            if fsdp_mesh.ndim == 3:
-                placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-            else:
-                placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        shape = tuple(global_shape)
-        stride = [1] * len(shape)
-        for index in range(len(shape) - 2, -1, -1):
-            stride[index] = stride[index + 1] * shape[index + 1]
-        dtensor = _from_local_preserve_device(
-            orgin_tensor._local_tensor,
-            device_mesh=checkpoint_mesh,
-            placements=placements,
-            shape=shape,
-            stride=tuple(stride),
-        )
-    elif torch.is_tensor(orgin_tensor):
-        raise RuntimeError("The v2 ExtraParallel checkpoint layout requires an FSDP DTensor")
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -2331,16 +2394,10 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             None
         """
-        if not isinstance(state, dict) or "model" not in state:
-            raise ValueError("Model must be provided to save a distributed checkpoint.")
-        optimizer = state.get("optimizer")
-        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        optimizer, multi = _checkpoint_optimizer_policy(state, loading=False)
         # An async write may outlive a staged copy, so the modes cannot combine.
         if stage_dir and save_async:
             raise ValueError("stage_dir cannot be combined with save_async")
-        single_exact = not multi and _requires_rank_local_optimizer_checkpoint(optimizer)
-        if single_exact:
-            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, trainable_only=trainable_only, allow_proven_optimizer=multi, saving=True
         )
@@ -2626,15 +2683,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if isinstance(state, dict):
             state.pop("_veomni_optimizer_identity_verified", None)
             state.pop("_veomni_optimizer_checkpoint_generation", None)
-        if not isinstance(state, dict) or "model" not in state:
-            if state is None:
-                raise ValueError("State dict must be provided to load a distributed checkpoint.")
-            raise ValueError("Model must be provided to load a distributed checkpoint.")
-        optimizer = state.get("optimizer")
-        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
-        single_exact = not multi and _requires_rank_local_optimizer_checkpoint(optimizer)
-        if single_exact:
-            raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
+        optimizer, multi = _checkpoint_optimizer_policy(state, loading=True, group=process_group)
         _reject_unproven_extra_parallel_optimizer(
             state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
@@ -3176,8 +3225,10 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys, legacy_ex
                     f"Checkpoint tensor {key!r} has noncanonical expert order; migrate it before export"
                 )
 
-    marker_key = "model." + _extra_parallel_layout_key({})
-    if marker_key in metadata.state_dict_metadata or planner_data.get("__veomni_ep_first_layout__") == 1:
+    marker = _extra_parallel_layout_key({})
+    marker_key = "model." + marker
+    has_v2_marker = marker_key in metadata.state_dict_metadata
+    if not has_v2_marker and planner_data.get("__veomni_ep_first_layout__") == 1:
         return
 
     # An old expert-only chunk may use either EP-first or FSDP-first order.
@@ -3185,11 +3236,15 @@ def _validate_expert_export_provenance(metadata: Metadata, model_keys, legacy_ex
     for key in model_keys:
         tensor_metadata = metadata.state_dict_metadata[key]
         shape = getattr(tensor_metadata, "size", ())
-        if "experts" not in key.split(".") or not shape or key in layouts:
+        logical_key = key
+        if has_v2_marker:
+            fqn = _export_extra_parallel_layout_key(key.removeprefix("model."))
+            logical_key = f"model.{fqn}" if fqn is not None else ""
+        if "experts" not in logical_key.split(".") or not shape or key in layouts:
             continue
-        if recorded is not None and legacy_expert_source_layout is None:
+        if has_v2_marker or (recorded is not None and legacy_expert_source_layout is None):
             raise RuntimeError(
-                f"Cannot determine source expert order for {key!r}: version-1 metadata omits its layout. "
+                f"Cannot determine source expert order for {key!r}: checkpoint metadata omits its layout. "
                 "Verify and migrate the original training layout before exporting."
             )
         if legacy_expert_source_layout is None and not all(
