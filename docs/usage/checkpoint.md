@@ -235,6 +235,94 @@ To drop legacy resume, delete `veomni/checkpoint/legacy_v0_1_12.py` and the
 imports that load it (search for `legacy_v0_1_12`). An old checkpoint then fails
 resume instead of falling back.
 
+## Versioned ExtraParallel layout
+
+The separately namespaced EP-outer layout is opt-in through
+`SpecInfo.checkpoint_layout_v2`. A plan enabling it must retain the original
+`global_shape` and must use FSDP DTensor parameters. Every
+non-persistent ExtraParallel shard in a checkpoint must use the canonical
+layout: mixing legacy and canonical shards is rejected. For tensors whose
+source layout has been proved, the v2 namespace represents canonical global
+values independently of source geometry, so DCP can reshard a model checkpoint
+across supported FSDP shard axes. Use
+`DistributedCheckpointer` for save and resume: it rejects old/unversioned
+layouts before copying model tensors. Migrating a legacy checkpoint requires
+verified source layout information. Canonical v2 optimizer save and resume are
+rejected until an owner-aware codec can preserve rank-specific optimizer
+states; this opt-in therefore does not yet support resuming training. The
+standard VeOmni HF export strips the namespace.
+
+The namespace marker alone does not prove that an ordinary or shared expert's
+replicas were synchronized. Older v2 checkpoints whose planner metadata omits
+an expert's source layout are rejected on resume and export; verify and migrate
+them from their original training layout before use.
+
+The standard, non-v2 writer uses canonical EP-first coordinates for same-axis
+EP/FSDP shards and records source expert layouts in DCP planner metadata.
+Older readers may ignore that metadata and interpret these shards using the old
+FSDP-first order; do not use them for these checkpoints without a verified
+migration. Conversely, an old unversioned checkpoint with expert-only chunks
+may not prove its source order even when resumed with the same topology. The
+distributed reader rejects ambiguous sources for EP/FSDP as well as ordinary
+FSDP or unsharded targets. An old expert-only FSDP checkpoint without layout
+metadata also needs verified source-layout migration, since it cannot be
+distinguished safely from an old EP checkpoint.
+Offline export also rejects unversioned expert-only chunks for stacked tensors
+under an `experts` module when their source order cannot be established. Other
+legacy tensor naming schemes may still need explicit source-layout verification
+or migration before export.
+
+New planner metadata records supported named ExtraParallel/FSDP meshes rather
+than only `ep`. Ordinary FSDP expert shards are marked canonical only when the
+actual TP1 runtime proves that every ExtraParallel dimension has size one, or
+the model's applied plan and parameter aliases prove that the expert is not
+sharded by any active ExtraParallel dimension.
+An expert on the EP-complementary FSDP mesh is accepted only for trainable
+shared-expert LoRA A/B parameters whose wrapper installs cross-EP gradient
+synchronization; other parameters on that mesh remain unproven. A normal
+single-process save assumes the caller supplied the complete model, not a
+manually extracted expert shard. The singleton case is not a source-layout
+proof for external, manually sharded tensors.
+For a plain model tensor sharded on an ExtraParallel axis and replicated across
+its FSDP/HSDP axes, all replicas at the same ExtraParallel coordinate must have
+identical values; checkpoint serialization does not verify or synchronize them.
+Plain optimizer shards on multiple such ranks require a rank-local state codec.
+Older version-1 metadata may omit non-`ep` shards: an unrecorded expert tensor
+is rejected unless its source layout can be verified and migrated. This also
+rejects an indistinguishable old ordinary-FSDP expert tensor. Historical non-expert tensors
+with unrecorded ExtraParallel axes require separate source-layout verification
+before loading into a different mesh or offline export; their provenance cannot
+be inferred from chunks alone, and not all such cases can be rejected
+automatically when the target has no ExtraParallel mesh.
+
+There is currently no general, verified migration utility for these ambiguous
+legacy expert layouts. Preserve the original checkpoint and its training code,
+rank-to-expert mapping, mesh, and optimizer configuration. A model-specific
+migration needs to reconstruct both the global expert tensors and their matching
+optimizer states from that provenance, compare every expert against an
+independent reference, and save to a new location with the current writer. A
+fresh-process restore and next-update comparison are required before resuming.
+Without enough provenance to establish the mapping, do not resume or export the
+ambiguous state as if it were canonical; start from independently verified
+weights and a fresh optimizer instead. This describes necessary checks, not a
+provided or generally validated migration procedure.
+
+For ordinary TP/FSDP-only models, the writer may certify a strided same-axis
+layout when the active runtime mesh and a unique source-model parameter owner
+prove its provenance. Parameters with unknown ownership, unexpected meshes,
+partial placements, or any active ExtraParallel dimension remain unproven.
+
+All ranks in a checkpoint operation must use the same logical model and
+checkpoint configuration, including the layout version and corresponding
+sharding specifications. Normal rank-local shard contents and mesh coordinates
+may differ. Cross-rank agreement is an input contract, not a runtime preflight;
+divergent configurations are unsupported and can hang or produce an invalid
+checkpoint. Rank-local layout validation errors are still propagated to peers.
+
+Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
+supported migration API: it can return success without reading any tensor when
+the namespaces differ. Replicated values must already agree across ranks.
+
 ## Related pages
 
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
