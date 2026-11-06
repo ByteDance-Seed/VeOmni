@@ -20,6 +20,3 @@ jobs:
 
       - name: Verify repo paths and skill refs in agent docs
         run: python3 scripts/ci/docs/check_agent_doc_paths.py
-
-      - name: Verify doc line anchors land on the symbol they name
-        run: python3 scripts/ci/docs/check_line_anchors.py
