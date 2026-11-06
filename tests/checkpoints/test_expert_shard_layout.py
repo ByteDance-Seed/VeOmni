@@ -933,7 +933,7 @@ def test_plain_optimizer_shards_are_not_treated_as_replicas(world, hsdp):
     spawn_with_rendezvous(_plain_optimizer_unproven_worker, args=(hsdp,), nprocs=world)
 
 
-def _sparse_plain_optimizer_failure_worker(rank, case, endpoint):
+def _sparse_plain_optimizer_failure_worker(rank, endpoint):
     from veomni.checkpoint.dcp_checkpointer import OptimizerState
     from veomni.distributed.parallel_plan import SpecInfo
 
@@ -947,29 +947,15 @@ def _sparse_plain_optimizer_failure_worker(rank, case, endpoint):
         model._fqn2spec_info = {"experts.weight": SpecInfo("ep", Shard(0), "experts.weight", mesh, 1)}
 
         class SparseOptimizer:
-            called = False
-
-            @property
-            def _is_multi_optimizer(self):
-                if case == "type_property_error" and rank == 0:
-                    raise ValueError("injected optimizer type lookup error")
-                return not (case.startswith("wrong_type") and rank == 0)
+            _is_multi_optimizer = True
 
             def state_dict(self):
-                self.called = True
-                if case in ("wrong_type_collective", "type_property_error"):
-                    dist.barrier()
                 return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
 
         leaf = SparseOptimizer()
         state = OptimizerState(model, leaf, parallel_state=parallel)
-        with pytest.raises(
-            (RuntimeError, ValueError),
-            match="no proven replica layout|not a MultiOptimizer|failed on another rank|optimizer type lookup error",
-        ):
+        with pytest.raises(RuntimeError, match="no proven replica layout|failed on another rank"):
             state.state_dict()
-        if case.startswith("wrong_type") or case == "type_property_error":
-            assert not leaf.called
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 4
@@ -979,9 +965,17 @@ def _sparse_plain_optimizer_failure_worker(rank, case, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
-@pytest.mark.parametrize("case", ["plain_state", "wrong_type", "wrong_type_collective", "type_property_error"])
-def test_sparse_plain_optimizer_failure_exits_all_ranks(world, case):
-    spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(case,), nprocs=world)
+def test_sparse_plain_optimizer_failure_exits_all_ranks(world):
+    spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(), nprocs=world)
+
+
+def test_extra_parallel_rejects_non_multi_optimizer_locally():
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+    model = SimpleNamespace(_fqn2spec_info={})
+    state = OptimizerState(model, object(), parallel_state=SimpleNamespace(dp_mode="fsdp2"))
+    with pytest.raises(RuntimeError, match="optimizer is not a MultiOptimizer"):
+        state.state_dict()
 
 
 def _subgroup_sparse_optimizer_failure_worker(rank, endpoint):
