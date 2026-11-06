@@ -166,9 +166,9 @@ MultiOptimizer checkpoint identity supports VeOmni's built-in constant, linear
 and cosine schedules. Custom `LambdaLR` functions must use immutable captures
 and the supported pure builtins or standard `math` members; global state,
 dynamic lookup, mutable closures and unrecognized attribute access are rejected
-at save and resume. Set construction, frozenset constants and f-string object
-formatting are also rejected because their results can differ between processes.
-Custom scheduler authors must ensure that the schedule is deterministic across
+at save and resume. Set construction and frozenset constants are also rejected
+because their iteration order can differ between processes. Custom scheduler
+authors must ensure that formatting and the overall schedule are deterministic across
 processes and recovery: the identity check does not prove arbitrary Python
 functions deterministic. Older custom scheduler checkpoints that cannot meet
 this contract require a verified migration or weights-only restart. Identity checks
