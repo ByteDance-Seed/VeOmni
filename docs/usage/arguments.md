@@ -928,6 +928,7 @@ and is not intended to be captured by `torch.compile`.
 | hf_save_steps | `int` | `0` | Steps between HuggingFace weight saves. `0` to disable. |
 | hf_save_epochs | `int` | `0` | Epochs between HuggingFace weight saves. `0` to disable. |
 | save_hf_weights | `bool` | `True` | Save HuggingFace-format weights to the last checkpoint directory. |
+| extra_parallel_canonical_layout | `bool` | `False` | Opt in to versioned canonical EP/PLE model checkpoint layout. See [layout compatibility and migration restrictions](checkpoint.md#versioned-extraparallel-layout). |
 
 ### InferArguments
 
