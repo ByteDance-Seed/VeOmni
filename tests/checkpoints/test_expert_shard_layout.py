@@ -466,6 +466,33 @@ def test_v2_checkpoint_missing_expert_proof_rejects_load_and_export(tmp_path, fq
         dcp_to_torch_state_dict(tmp_path)
 
 
+def test_existing_v2_unproven_expert_checkpoint_rejects_load_and_export(tmp_path):
+    """Historical invalid checkpoints remain unreadable after save-side checks."""
+    marker = _extra_parallel_layout_key({})
+    name = f"{marker}__layers.0.experts.weight"
+
+    class HistoricalUnprovenPlanner(DefaultSavePlanner):
+        def create_global_plan(self, plans):
+            global_plans, metadata = super().create_global_plan(plans)
+            metadata.planner_data[_EXPERT_LAYOUTS_KEY] = {
+                "version": 1,
+                "tensors": {f"model.{name}": {"expert_order": "unproven"}},
+            }
+            return global_plans, metadata
+
+    dcp.save(
+        {"model": {marker: "ep-outer-v1", name: torch.ones(2, 2)}},
+        checkpoint_id=tmp_path,
+        planner=HistoricalUnprovenPlanner(),
+    )
+    target = {"model": {marker: "", name: torch.zeros(2, 2)}}
+    with pytest.raises(dcp.CheckpointException, match="noncanonical expert order"):
+        dcp.load(target, checkpoint_id=tmp_path, planner=_ModelStrictLoadPlanner(strict_model=True))
+    assert target["model"][name].count_nonzero() == 0
+    with pytest.raises(RuntimeError, match="noncanonical expert order"):
+        dcp_to_torch_state_dict(tmp_path)
+
+
 def _lora_export_worker(rank, world, shard_dim, directory, ep_dim, canonical, endpoint):
     from veomni.distributed.parallel_plan import SpecInfo
     from veomni.lora import VeOmniLoraConfig
@@ -1270,6 +1297,60 @@ def _sparse_plain_optimizer_failure_worker(rank, endpoint):
 @pytest.mark.parametrize("world", [4])
 def test_raw_multi_optimizer_is_rejected_on_all_ranks(world):
     spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(), nprocs=world)
+
+
+def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+    from veomni.distributed.parallel_plan import SpecInfo
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        parallel = SimpleNamespace(
+            dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
+        )
+        model = torch.nn.Module()
+        model._fqn2spec_info = {"experts.weight": SpecInfo("ep", Shard(0), "experts.weight", mesh, 1)}
+
+        class SparseOptimizer:
+            called = False
+
+            @property
+            def _is_multi_optimizer(self):
+                if case == "type_property_error" and rank == 0:
+                    raise ValueError("injected optimizer type lookup error")
+                return not (case == "wrong_type_collective" and rank == 0)
+
+            def state_dict(self):
+                self.called = True
+                dist.barrier()
+                return {"state.experts.weight.exp_avg": torch.ones(4, 4)} if rank == 0 else {}
+
+        leaf = SparseOptimizer()
+        state = OptimizerState(model, leaf, parallel_state=parallel)
+        expected_type = ValueError if case == "type_property_error" and rank == 0 else RuntimeError
+        expected_message = (
+            "injected optimizer type lookup error"
+            if expected_type is ValueError
+            else "optimizer is not a MultiOptimizer"
+            if rank == 0
+            else "Raw DCP MultiOptimizer"
+        )
+        with pytest.raises(expected_type, match=expected_message):
+            state.state_dict()
+        assert not leaf.called
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 4
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
+@pytest.mark.parametrize("world", [4])
+@pytest.mark.parametrize("case", ["wrong_type_collective", "type_property_error"])
+def test_inconsistent_optimizer_preflight_exits_all_ranks(world, case):
+    spawn_with_rendezvous(_inconsistent_optimizer_preflight_worker, args=(case,), nprocs=world)
 
 
 def test_extra_parallel_rejects_non_multi_optimizer_locally():
