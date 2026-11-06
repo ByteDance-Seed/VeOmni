@@ -2068,7 +2068,7 @@ def test_scheduler_recipe_accepts_math_attribute_with_unrelated_global(monkeypat
     assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
 
 
-@pytest.mark.parametrize("kind", ["set", "frozenset_constant", "object_format"])
+@pytest.mark.parametrize("kind", ["set", "frozenset_constant"])
 def test_scheduler_recipe_rejects_process_dependent_computation(kind):
     from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
 
@@ -2078,12 +2078,33 @@ def test_scheduler_recipe_rejects_process_dependent_computation(kind):
     def unordered_constant(step):
         return step in {1, 2, 3}
 
-    def object_format(step):
-        return int(f"{(lambda: 0)}"[-5], 16) / 20
-
-    schedule = {"set": unordered, "frozenset_constant": unordered_constant, "object_format": object_format}[kind]
+    schedule = {"set": unordered, "frozenset_constant": unordered_constant}[kind]
     with pytest.raises(RuntimeError, match="unsupported.*state"):
         _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
+
+
+def test_scheduler_recipe_accepts_deterministic_format_and_records_its_identity():
+    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
+
+    def build_schedule(two_decimals):
+        if two_decimals:
+
+            def schedule(step):
+                return float(f"{step / 300:.2f}")
+        else:
+
+            def schedule(step):
+                return float(f"{step / 300:.3f}")
+
+        return schedule
+
+    two_decimals = build_schedule(True)
+    three_decimals = build_schedule(False)
+    assert two_decimals.__qualname__ == three_decimals.__qualname__
+    two = _scheduler_functions(SimpleNamespace(lr_lambdas=[two_decimals]))
+    three = _scheduler_functions(SimpleNamespace(lr_lambdas=[three_decimals]))
+    assert two_decimals(13) != three_decimals(13)
+    assert two != three
 
 
 def test_scheduler_recipe_rejects_nonlocal_mutation():
@@ -2168,6 +2189,88 @@ def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
     for actual, expected in zip(target_model.parameters(), model.parameters(), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(target_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0)
+
+
+def test_deterministic_formatted_scheduler_recovers_next_update(tmp_path):
+    import weakref
+
+    from veomni.optim.lr_scheduler import _CHECKPOINT_SCHEDULER_BINDINGS, MultiLRScheduler
+
+    def build_formatted_scheduler(optimizer, *, precision=4):
+        schedules = {}
+        for name, leaf in optimizer.optimizers_dict.items():
+            if precision == 4:
+
+                def lr_lambda(step):
+                    return float(f"{1 / (step + 1):.4f}")
+            else:
+
+                def lr_lambda(step):
+                    return float(f"{1 / (step + 1):.3f}")
+
+            schedule = torch.optim.lr_scheduler.LambdaLR(leaf, lr_lambda)
+            _CHECKPOINT_SCHEDULER_BINDINGS[leaf] = weakref.ref(schedule)
+            schedules[name] = schedule
+        return MultiLRScheduler(schedules)
+
+    torch.manual_seed(12)
+    model, optimizer = _model_and_optimizer()
+    scheduler = build_formatted_scheduler(optimizer)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad()
+    scheduler.step()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {
+            "model": model,
+            "optimizer": optimizer,
+            "extra_state": {"lr_scheduler": scheduler.state_dict()},
+            "_veomni_scheduler_object": scheduler,
+        },
+        parallel_state=parallel,
+    )
+    changed, changed_optimizer = _model_and_optimizer()
+    changed_scheduler = build_formatted_scheduler(changed_optimizer, precision=3)
+    before = [parameter.detach().clone() for parameter in changed.parameters()]
+    with pytest.raises(RuntimeError, match="(?i)(scheduler|identity|layout)"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {
+                "model": changed,
+                "optimizer": changed_optimizer,
+                "extra_state": {},
+                "_veomni_scheduler_object": changed_scheduler,
+            },
+            parallel_state=parallel,
+        )
+    for parameter, original in zip(changed.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, original, rtol=0, atol=0)
+    assert all(not leaf.state for leaf in changed_optimizer.optimizers_dict.values())
+
+    target, target_optimizer = _model_and_optimizer()
+    target_scheduler = build_formatted_scheduler(target_optimizer)
+    restored = {
+        "model": target,
+        "optimizer": target_optimizer,
+        "extra_state": {},
+        "_veomni_scheduler_object": target_scheduler,
+    }
+    DistributedCheckpointer.load(str(tmp_path), restored, parallel_state=parallel)
+    target_scheduler.load_state_dict(restored["extra_state"]["lr_scheduler"])
+    for source_parameter, target_parameter in zip(model.parameters(), target.parameters(), strict=True):
+        source_parameter.grad = torch.full_like(source_parameter, 0.25)
+        target_parameter.grad = torch.full_like(target_parameter, 0.25)
+    optimizer.step()
+    target_optimizer.step()
+    scheduler.step()
+    target_scheduler.step()
+    assert scheduler.state_dict() == target_scheduler.state_dict()
+    for source_parameter, target_parameter in zip(model.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(source_parameter, target_parameter, rtol=0, atol=0)
+    torch.testing.assert_close(optimizer.state_dict(), target_optimizer.state_dict(), rtol=0, atol=0)
 
 
 def test_direct_multi_checkpoint_applies_returned_scheduler_state(tmp_path):
