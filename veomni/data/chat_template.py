@@ -14,6 +14,7 @@
 
 
 import json
+import math
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -284,6 +285,8 @@ class Llama2Template(ChatTemplate):
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
+        has_weights = any(message.get("loss_weight") not in (None, 0, 1) for message in messages)
+        loss_weights = []
         for message in messages:
             content_str = "<|im_start|>" + message["role"] + "\n" + message["content"].strip() + "<|im_end|>\n"
             content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
@@ -294,12 +297,30 @@ class ChatmlTemplate(ChatTemplate):
                 loss_mask = message["loss_mask"]
             else:
                 loss_mask = 1 if message["role"] == "assistant" else 0
-            if loss_mask == 1:
+            if loss_mask not in (0, 1):
+                raise ValueError("loss_mask must be binary; use loss_weight for fractional weights")
+            token_weight = message.get("loss_weight")
+            token_weight = float(loss_mask) if token_weight is None else float(token_weight)
+            if (
+                not math.isfinite(token_weight)
+                or token_weight < 0
+                or token_weight > 1.0
+                or (0 < token_weight < torch.finfo(torch.float32).tiny)
+                or (loss_mask == 0 and token_weight not in (0, 1))
+            ):
+                raise ValueError("loss_weight must be in [0, 1] and any positive weight must be normal float32")
+            if loss_mask == 0:
+                token_weight = 0.0
+            if loss_mask == 1 and token_weight > 0:
                 labels += content_ids
             else:
                 labels += [IGNORE_INDEX] * len(content_ids)
+            if has_weights:
+                loss_weights.extend([token_weight] * len(content_ids))
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        if has_weights:
+            model_inputs["loss_weights"] = loss_weights
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
         return model_inputs
 
@@ -404,9 +425,23 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         modality contract cannot land in one variant and miss the other.
         """
         input_ids, attention_mask, labels = [], [], []
+        has_weights = any(message.get("loss_weight") not in (None, 0, 1) for message in messages)
+        loss_weights = []
         for message in messages:
             content_str = message["content"].strip()
             loss_mask = message["loss_mask"]
+            token_weight = message.get("loss_weight")
+            token_weight = float(loss_mask) if token_weight is None else float(token_weight)
+            if (
+                loss_mask not in (0, 1)
+                or not math.isfinite(token_weight)
+                or not 0 <= token_weight <= 1
+                or (0 < token_weight < torch.finfo(torch.float32).tiny)
+                or (loss_mask == 0 and token_weight not in (0, 1))
+            ):
+                raise ValueError("loss_weight must be in [0, 1] and any positive weight must be normal float32")
+            if loss_mask == 0:
+                token_weight = 0.0
             message_ids = self.tokenizer.encode("<|im_start|>" + message["role"] + "\n", add_special_tokens=False)
             # The "<|im_start|>{role}\n" header is a fixed prompt prefix, never a training target.
             prefix_len = len(message_ids)
@@ -418,13 +453,17 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
 
             input_ids += message_ids
             attention_mask += [1] * len(message_ids)
-            if loss_mask == 1:
+            if loss_mask == 1 and token_weight > 0:
                 labels += [IGNORE_INDEX] * prefix_len + message_ids[prefix_len:]
             else:
                 labels += [IGNORE_INDEX] * len(message_ids)
+            if has_weights:
+                loss_weights += [0.0] * prefix_len + [token_weight] * (len(message_ids) - prefix_len)
 
         tokenized_example = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+        if has_weights:
+            tokenized_example["loss_weights"] = torch.tensor(loss_weights, dtype=torch.float32)
 
         # Replace the Qwen image/video pad ids with VeOmni's modality sentinels,
         # which is what process_sample_qwen_vl turns into image_mask / video_mask.
@@ -467,8 +506,13 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
         for message in conversations:
             role = message[0]
             content = ""
+            supervision = {}
             for value in message[1:]:
-                if value[0] == "text":
+                if value[0] in ("loss_mask", "loss_weight"):
+                    if value[0] in supervision:
+                        raise ValueError(f"Duplicate supervision metadata: {value[0]}")
+                    supervision[value[0]] = value[1]
+                elif value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
@@ -480,7 +524,8 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
                 {
                     "role": role,
                     "content": content,
-                    "loss_mask": 1 if role == "assistant" else 0,
+                    "loss_mask": supervision.get("loss_mask", 1 if role == "assistant" else 0),
+                    **({"loss_weight": supervision["loss_weight"]} if "loss_weight" in supervision else {}),
                 }
             )
 
@@ -530,8 +575,13 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
         for message in conversations:
             role = message[0]
             content = ""
+            supervision = {}
             for value in message[1:]:
-                if value[0] == "text":
+                if value[0] in ("loss_mask", "loss_weight"):
+                    if value[0] in supervision:
+                        raise ValueError(f"Duplicate supervision metadata: {value[0]}")
+                    supervision[value[0]] = value[1]
+                elif value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
@@ -603,7 +653,8 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                 {
                     "role": role,
                     "content": content,
-                    "loss_mask": 1 if role == "assistant" else 0,
+                    "loss_mask": supervision.get("loss_mask", 1 if role == "assistant" else 0),
+                    **({"loss_weight": supervision["loss_weight"]} if "loss_weight" in supervision else {}),
                 }
             )
 

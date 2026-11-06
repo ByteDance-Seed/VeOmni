@@ -31,7 +31,7 @@ from ..models import build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
-from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
+from ..utils.loss_utils import count_loss_token, prepare_loss_token_counts
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
@@ -322,8 +322,9 @@ class VLMTrainer:
         total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
-        self.base.micro_batches_token_len = count_loss_token(micro_batches)
-        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
+        weighted_normalization, self.base.micro_batches_token_len, self.base.global_micro_batches_token_len = (
+            prepare_loss_token_counts(micro_batches, self.base.model)
+        )
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
@@ -334,7 +335,9 @@ class VLMTrainer:
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=weighted_normalization
+            )
             loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()

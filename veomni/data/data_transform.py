@@ -315,7 +315,8 @@ def _process_sample_qwen_vl_base(
         conversations = sample["conversations"]
     else:
         conversations = sample
-    conversations = conv_preprocess(source, conversations, **kwargs)
+    preprocess_kwargs = {**kwargs, "preserve_loss_supervision": True}
+    conversations = conv_preprocess(source, conversations, **preprocess_kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None

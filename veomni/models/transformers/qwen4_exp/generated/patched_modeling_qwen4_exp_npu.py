@@ -3881,6 +3881,9 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
     ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
         # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
         position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
+        loss_weights = kwargs.pop("loss_weights", None)
+        if loss_weights is not None and kwargs.get("output_router_logits", False):
+            raise ValueError("loss_weights cannot be combined with router auxiliary loss")
         # --- Patch.1 ---
         outputs = self.model(
             input_ids=input_ids,
@@ -3912,6 +3915,7 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
+                loss_weights=loss_weights,
                 **kwargs,
             )
         else:

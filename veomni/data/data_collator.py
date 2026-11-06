@@ -152,6 +152,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "loss_weights": DataCollateInfo(-1, True, 0, 1),
     "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
@@ -281,9 +282,25 @@ class PackingCollator(DataCollator):
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch = defaultdict(list)
+        weighted = any("loss_weights" in feature for feature in features)
+        mtp_example = next((feature["mtp_labels"] for feature in features if "mtp_labels" in feature), None)
         for feature in features:
+            if "loss_weights" in feature:
+                weights = feature["loss_weights"]
+                if (
+                    not torch.isfinite(weights).all()
+                    or (weights < 0).any()
+                    or (weights > 1).any()
+                    or ((weights > 0) & (weights < torch.finfo(torch.float32).tiny)).any()
+                ):
+                    raise ValueError("loss_weights must be in [0, 1] and positive weights must be normal float32")
             for key in feature.keys():
                 batch[key].append(feature[key])
+            if weighted and "loss_weights" not in feature:
+                batch["loss_weights"].append((feature["labels"] != IGNORE_INDEX).to(torch.float32))
+            if weighted and mtp_example is not None and "mtp_labels" not in feature:
+                shape = (*mtp_example.shape[:-1], feature["labels"].shape[-1])
+                batch["mtp_labels"].append(mtp_example.new_full(shape, IGNORE_INDEX))
 
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
@@ -389,6 +406,9 @@ class SequenceParallelCollator(DataCollator):
             labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
+            if "loss_weights" in batch:
+                weights = batch["loss_weights"][..., 1:].contiguous()
+                batch["loss_weights"] = F.pad(weights, (0, 1), "constant", 0)
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 

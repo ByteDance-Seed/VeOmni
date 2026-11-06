@@ -69,7 +69,11 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
+from ..utils.loss_utils import (
+    count_loss_token,
+    mean_global_loss,
+    prepare_loss_token_counts,
+)
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
@@ -758,8 +762,9 @@ class BaseTrainer(Stateful, ABC):
         total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
-        self.micro_batches_token_len = count_loss_token(micro_batches)
-        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
+        weighted_normalization, self.micro_batches_token_len, self.global_micro_batches_token_len = (
+            prepare_loss_token_counts(micro_batches, self.model)
+        )
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
@@ -770,7 +775,7 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.micro_batch_token_len = count_loss_token(micro_batch, weighted_normalization=weighted_normalization)
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()

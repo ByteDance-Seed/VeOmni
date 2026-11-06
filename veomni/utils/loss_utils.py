@@ -19,9 +19,12 @@ import torch
 from ..distributed.parallel_state import get_parallel_state
 from .constants import IGNORE_INDEX
 from .dist_utils import all_reduce
+from .env import get_env
 
 
-def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
+def count_loss_token(
+    batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]], *, weighted_normalization: bool = False
+):
     """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
     if isinstance(batches, dict):
         batches = [batches]
@@ -31,7 +34,20 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
 
     def _count(obj):
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
-            token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
+            valid = obj["labels"] != IGNORE_INDEX
+            weights = obj.get("loss_weights")
+            if weights is None:
+                if weighted_normalization and not get_parallel_state().sp_enabled:
+                    valid = valid[..., 1:]
+                token_len["foundation_tokens"] = token_len["foundation_tokens"] + valid.sum()
+            else:
+                if weights.shape != valid.shape:
+                    raise ValueError("loss_weights must match labels")
+                # SP collators already shift labels and weights; without SP the
+                # causal loss shifts in the model, so the first target is unused.
+                if not get_parallel_state().sp_enabled:
+                    weights, valid = weights[..., 1:], valid[..., 1:]
+                token_len["foundation_tokens"] = token_len["foundation_tokens"] + (weights * valid).sum()
 
             for key in obj.keys():
                 if key.endswith("_labels"):
@@ -95,3 +111,70 @@ def mean_global_loss(
 def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
     """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
+
+
+def has_weighted_loss_in_step(batches: list[dict[str, torch.Tensor]]) -> bool:
+    """Synchronize opt-in across DP ranks before counting non-SP causal targets."""
+    local_has_weights = any("loss_weights" in batch for batch in batches)
+    if get_parallel_state().sp_enabled or not torch.distributed.is_initialized():
+        return local_has_weights
+    return bool(all_reduce(int(local_has_weights), op="max"))
+
+
+def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runtime=None):
+    """Reuse the denominator reduction to agree on weighted causal normalization.
+
+    For non-SP training a weighted rank can coexist with an unweighted rank.
+    Reduce both denominator variants and the opt-in flag together so that all
+    ranks choose the same normalization without an additional collective.
+    """
+    local_weighted = any("loss_weights" in batch for batch in batches)
+    local_mtp = any("mtp_labels" in batch for batch in batches)
+    local_unsupported = False
+    if model_runtime is not None:
+        try:
+            local_unsupported = (
+                model_runtime.model_config.model_type != "qwen4_exp"
+                or get_env("MODELING_BACKEND") == "hf"
+                or model_runtime.unwrapped_module.veomni_ce.impl != "chunk_loss"
+            )
+        except (AttributeError, TypeError):
+            local_unsupported = True
+    router_flags = [batch.get("output_router_logits", False) for batch in batches]
+    local_router = any(value is True for value in router_flags)
+    invalid_router = any(type(value) is not bool for value in router_flags)
+    legacy = count_loss_token(batches)
+    shifted = legacy if get_parallel_state().sp_enabled else count_loss_token(batches, weighted_normalization=True)
+    reduced = all_reduce(
+        [
+            legacy["foundation_tokens"].item(),
+            shifted["foundation_tokens"].item(),
+            int(local_weighted),
+            int(local_router),
+            int(invalid_router),
+            int(local_mtp),
+            int(local_unsupported),
+        ],
+        op="sum",
+    )
+    weighted = bool(reduced[2])
+    if weighted and reduced[4]:
+        raise ValueError("output_router_logits must be boolean when using loss_weights")
+    if weighted and reduced[3]:
+        raise ValueError("loss_weights cannot be combined with router auxiliary loss")
+    if weighted and reduced[5]:
+        raise ValueError("loss_weights cannot be combined with MTP labels in the same step")
+    if weighted and reduced[6]:
+        raise ValueError("loss_weights require the VeOmni qwen4_exp backend with chunk_loss on every rank")
+    counts = shifted if weighted else legacy
+    global_counts = {"foundation_tokens": reduced[1] if weighted else reduced[0]}
+    global_counts.update(
+        {key: all_reduce(value.item(), op="sum") for key, value in counts.items() if key != "foundation_tokens"}
+    )
+    return weighted, counts, global_counts
+
+
+def validate_weighted_loss_model(weighted: bool, model_type: str):
+    """Do not silently ignore supervision weights on models without explicit support."""
+    if weighted and (model_type != "qwen4_exp" or get_env("MODELING_BACKEND") == "hf"):
+        raise ValueError("loss_weights require the VeOmni qwen4_exp model backend")
