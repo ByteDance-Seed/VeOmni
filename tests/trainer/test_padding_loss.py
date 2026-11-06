@@ -207,7 +207,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [4, 2] for _, _, sizes, *_ in results)
+        assert all(sizes == [7, 2] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
         assert results[1][3] and results[1][4] is None
 
@@ -856,3 +856,48 @@ def test_dpo_preflight_timer_includes_padding_validation(monkeypatch):
         trainer.train_step(iter([[{"padding_flag": True}]]))
     assert trainer.base._step_preflight_start_time == 123
     assert events == ["timer", "padding"]
+
+
+def _sft_fetch_guard_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.text_trainer import TextTrainer
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        for owner in (BaseTrainer, TextTrainer, VLMTrainer):
+            base = object.__new__(BaseTrainer)
+            base.state = SimpleNamespace(global_step=3)
+            trainer = base if owner is BaseTrainer else object.__new__(owner)
+            if owner is not BaseTrainer:
+                trainer.base = base
+
+            def input_iterator():
+                if rank == 1:
+                    raise ValueError("rank-local data failure")
+                yield [{"labels": torch.tensor([1, 2])}]
+
+            with pytest.raises(RuntimeError, match="SFT data loading failed on a rank"):
+                trainer.train_step(input_iterator())
+            assert base.state.global_step == 3
+        base = object.__new__(BaseTrainer)
+        with pytest.raises(RuntimeError, match="end of the data at different times"):
+            base._fetch_sft_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
+        with pytest.raises(StopIteration):
+            base._fetch_sft_micro_batches(iter([]))
+        result = torch.ones(1)
+        dist.all_reduce(result)
+        assert result.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_sft_loader_failure_and_eof_are_synchronized():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_sft_fetch_guard_worker, args=(), nprocs=2)

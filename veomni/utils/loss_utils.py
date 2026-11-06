@@ -103,12 +103,31 @@ def synchronize_training_error(error, objective, *, microbatch_count=None):
         raise error
 
 
-def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool = False):
+def _distributed_batch_status(
+    batch, invalid: bool, has_auxiliary_targets: bool = False, *, check_fetch=False, fetch_error=None
+):
     count = len(batch) if isinstance(batch, (list, tuple)) else 1
     device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
-    flags = torch.tensor([int(invalid), int(has_auxiliary_targets), count, -count], dtype=torch.int32, device=device)
+    values = [int(invalid), int(has_auxiliary_targets), count, -count]
+    if check_fetch:
+        values.extend(
+            [
+                int(fetch_error is None),
+                int(isinstance(fetch_error, StopIteration)),
+                int(fetch_error is not None and not isinstance(fetch_error, StopIteration)),
+            ]
+        )
+    flags = torch.tensor(values, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
     values = flags.tolist()
+    if check_fetch:
+        any_loaded, any_eof, any_error = values[4:]
+        if any_error:
+            raise RuntimeError("SFT data loading failed on a rank") from fetch_error
+        if any_eof:
+            if not any_loaded:
+                raise StopIteration
+            raise RuntimeError("SFT ranks reached the end of the data at different times") from fetch_error
     return bool(values[0]) or values[2] != -values[3], bool(values[1])
 
 
@@ -148,17 +167,25 @@ def _has_auxiliary_labels(batch) -> bool:
     return False
 
 
-def reject_distributed_padding(batch) -> bool:
+def reject_distributed_padding(batch, *, check_fetch=False, fetch_error=None) -> bool:
     """Reject unequal/padded steps and return whether any rank has auxiliary labels."""
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         validation_error = None
         try:
-            invalid = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+            invalid = (
+                contains_padding(batch)
+                or (isinstance(batch, (list, tuple)) and not batch)
+                or (check_fetch and fetch_error is None and not isinstance(batch, (list, tuple)))
+            )
             has_auxiliary_targets = _has_auxiliary_labels(batch)
         except Exception as exc:  # noqa: BLE001 - peers must reach the same status collective
             invalid, has_auxiliary_targets, validation_error = True, False, exc
         found, has_auxiliary_targets = _distributed_batch_status(
-            batch, invalid, has_auxiliary_targets=has_auxiliary_targets
+            batch,
+            invalid,
+            has_auxiliary_targets=has_auxiliary_targets,
+            check_fetch=check_fetch,
+            fetch_error=fetch_error,
         )
         if found:
             raise RuntimeError(
@@ -166,6 +193,10 @@ def reject_distributed_padding(batch) -> bool:
                 "unequal microbatch counts across ranks, or malformed batch metadata"
             ) from validation_error
         return has_auxiliary_targets
+    if check_fetch and fetch_error is not None:
+        raise fetch_error
+    if check_fetch and not isinstance(batch, (list, tuple)):
+        raise ValueError("SFT data loader must return a list of micro-batches")
     return False
 
 

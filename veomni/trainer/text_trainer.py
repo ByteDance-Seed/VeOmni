@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import torch
 
@@ -89,8 +89,10 @@ class TextTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        real_micro_steps = self.base._sft_step_preflight(micro_batches, self)
+        micro_batches, has_auxiliary_targets = self.base._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self.base._sft_step_preflight(
+            micro_batches, self, has_auxiliary_targets=has_auxiliary_targets
+        )
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()
