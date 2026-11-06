@@ -235,9 +235,13 @@ def _graph_loss(modules: dict[str, torch.nn.Module], edges: list[dict[str, str]]
 def test_conversation_and_packed_graphs_agree_on_cpu():
     """The two graphs encode the same model, so a one-step loss must match.
 
-    Each graph gets its own freshly built modules: a graph run leaves per-module
-    inference state (carriers, cached masks) on the instances, so reusing them
-    would compare a used model against a stale one.
+    Each graph gets its own modules *and its own samples*. A conversation run is
+    destructive to the carrier: `scatter_qwen3vl_visual_embeds` writes the vision
+    output back onto the item (`slot.item.value = embeds_split[idx]`), so an image
+    item that entered as `(16, 1536)` patches leaves as `(4, 16)` merged embeds.
+    Feeding that item to the packed graph makes the ViT slice it as raw patches
+    and fail on the shape. Nothing is wrong with the design — one carrier is meant
+    to be consumed once — the test just must not share one.
     """
     conversation_loss = _graph_loss(
         _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32),
