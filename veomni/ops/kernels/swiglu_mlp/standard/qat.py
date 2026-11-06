@@ -15,8 +15,10 @@
 """standard SwiGLU MLP blockwise-FP8 QAT implementation.
 
 Mirrors ``standard/eager.py`` except that every projection consumes fake-quantized
-operands. The clamp and ``silu * up`` run on the dequantized projection outputs,
-not on stored values, so they stay in the model dtype.
+operands. The clamp and ``silu * up`` run in the model dtype on the dequantized
+projection outputs, not in the FP32 space ``eager`` uses: a deployment fused
+kernel consumes BF16 projection outputs and clamps them there, so widening to
+FP32 would train a slightly different function than the one that will run.
 """
 
 from __future__ import annotations
@@ -48,8 +50,6 @@ def wrapper(
     gate = F.linear(x_gate_q, fp8_fake_quant_weight(gate_w, block_size=block_size), _eager.optional_bias(gate_b))
     up = F.linear(x_gate_q, fp8_fake_quant_weight(up_w, block_size=block_size), _eager.optional_bias(up_b))
 
-    if swiglu_limit is not None:
-        gate, up = gate.float(), up.float()
     gate_c, up_c = _eager.clamp_gate_up(gate, up, swiglu_limit)
     hidden = _eager.silu_mul(gate_c, up_c)
     if hidden.dtype != x.dtype:

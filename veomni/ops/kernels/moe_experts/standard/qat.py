@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
-from ....qat import fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
+from ....qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
 from . import triton as standard_triton
 
 
@@ -55,7 +55,9 @@ def wrapper(
         if weight.numel() == 0:
             return weight
         if expert_dtype == "fp4":
-            return fp4_fake_quant_weight(weight, block_size=block_size)
+            # FP4 group width is fixed by the checkpoint's scale layout, which is
+            # one scale per 32 input channels; ``block_size`` is the FP8 tile.
+            return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
         return fp8_fake_quant_stacked_weight(weight, block_size=block_size)
 
     hidden_q = fp8_fake_quant_act(hidden_states, block_size=block_size) if hidden_states.numel() > 0 else hidden_states

@@ -662,3 +662,45 @@ def test_torchao_mxfp4_empty_input_falls_back_to_eager():
         grad = getattr(mlp, name).weight.grad
         assert grad is not None, name
         torch.testing.assert_close(grad, torch.zeros_like(grad))
+
+
+def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
+    """A deployment fused kernel clamps BF16 projection outputs, not FP32 ones.
+
+    Widening the clamp to FP32 (what ``eager`` does) changes the trained function
+    for values around ``swiglu_limit``, so the QAT row must not inherit that. The
+    quantizers are stubbed to identity here so the assertion isolates the clamp;
+    the real ones need an SM90 GPU.
+    """
+    import veomni.ops.kernels.swiglu_mlp.standard.qat as qat_impl
+
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_act", lambda t, block_size=128: t)
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_weight", lambda t, block_size=128: t)
+
+    limit = 10.0
+    torch.manual_seed(0)
+    # Identity gate/up weights make the projection a known, invertible passthrough
+    # of the input, so the expected value is computable without the op.
+    hidden_dim = 64
+    eye = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    down = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    x = torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 40
+
+    actual = qat_impl.wrapper(
+        x,
+        eye,
+        eye.new_empty(0),
+        eye,
+        eye.new_empty(0),
+        down,
+        down.new_empty(0),
+        swiglu_limit=limit,
+    )
+
+    clamped = x.clamp(max=limit)
+    expected = F.silu(clamped) * x.clamp(min=-limit, max=limit)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # The FP32 clamp disagrees, so the assertion above is not vacuous.
+    widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
+    assert not torch.equal(expected, widened)
