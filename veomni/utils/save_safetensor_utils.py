@@ -16,6 +16,7 @@ import gc
 import os
 import shutil
 import time
+from functools import partial
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -31,6 +32,7 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 
 
 logger = helper.create_logger(__name__)
+_save_state_dict = partial(_save_state_dict, legacy_fuse_fallback=True)
 
 
 @torch.no_grad()
@@ -245,7 +247,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets, legacy_fuse_fallback=True)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -297,7 +299,8 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 reads and converts the checkpoint. Every rank must call
+            this function to participate in distributed failure coordination.
             Required by non-dcp checkpoint managers (e.g., omnistore).
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
@@ -322,15 +325,23 @@ def save_hf_safetensor(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
-        if is_rank_0:
-            _save_hf_safetensor_legacy(
-                save_checkpoint_path,
-                save_hf_safetensor_path,
-                model_assets,
-                ckpt_manager,
-                output_dir,
-            )
+        from veomni.utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if is_rank_0:
+                _save_hf_safetensor_legacy(
+                    save_checkpoint_path,
+                    save_hf_safetensor_path,
+                    model_assets,
+                    ckpt_manager,
+                    output_dir,
+                )
+        except BaseException as exc:
+            error = exc
+        group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(error, "rank-0 HuggingFace export", group=group)
+        return
 
     # Ensure all ranks finish saving before anyone proceeds
     if dist.is_initialized():
@@ -359,6 +370,8 @@ def save_lora_adapter_with_dcp(
     """
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict
+
+    from .dist_utils import raise_if_any_rank_failed
 
     if not is_veomni_lora_model(model):
         raise TypeError(
@@ -433,27 +446,30 @@ def save_lora_adapter_with_dcp(
         dist.barrier()
 
     is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-    if is_rank_0:
-        consolidated_state = ckpt_to_state_dict(
-            save_checkpoint_path=dcp_save_path,
-            ckpt_manager="dcp",
-        )
-        # safetensors needs contiguous, non-aliased tensors; consolidation returns
-        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
-        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
-        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+    error = None
+    try:
+        if is_rank_0:
+            consolidated_state = ckpt_to_state_dict(
+                save_checkpoint_path=dcp_save_path,
+                ckpt_manager="dcp",
+            )
+            # safetensors needs contiguous, non-aliased tensors; consolidation returns
+            # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+            consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+            adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
 
-        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
-        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
-        # separate sidecar).
-        model.get_lora_config().save_pretrained(save_path)
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+            # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+            # separate sidecar).
+            model.get_lora_config().save_pretrained(save_path)
 
-        shutil.rmtree(dcp_save_path, ignore_errors=True)
-        logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
-
-    if dist.is_initialized():
-        dist.barrier()
+            shutil.rmtree(dcp_save_path, ignore_errors=True)
+            logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+    except BaseException as exc:
+        error = exc
+    group = dist.group.WORLD if dist.is_initialized() else None
+    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export", group=group)
 
     gc.collect()
     helper.empty_cache()
