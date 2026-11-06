@@ -123,3 +123,41 @@ def test_explicit_unavailable_impl_raises_on_cpu():
     """The Triton row is CUDA-only and must fail loudly rather than fall back."""
     with pytest.raises(RuntimeError, match="not registered for device|requires unavailable package"):
         VeomniOp("kv_round", "fp8", "triton")
+
+
+def test_fp8_round_trip_matches_the_deepseek_v4_reference_bitwise():
+    """The ported eager path must reproduce the values the previous QAT helpers produced.
+
+    DeepSeek-V4's recipe rounds window KV in 64-wide groups over the NoPE prefix
+    and indexer logits in 128-wide groups over the whole head. Both were served by
+    one TileLang helper before this family existed, so a difference here means
+    training would silently drift from the deployment kernel.
+    """
+    from veomni.ops.kernels.kv_round.fp8.eager import fp8_roundtrip
+
+    fp8_max = 448.0
+
+    def reference(x: torch.Tensor, block_size: int) -> torch.Tensor:
+        last = x.shape[-1]
+        dtype = x.dtype
+        rows = x.reshape(-1, last).float()
+        blocks = rows.reshape(rows.shape[0], last // block_size, block_size)
+        amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+        scaled = (amax / fp8_max).contiguous()
+        bits = scaled.view(torch.int32)
+        exponent = ((bits >> 23) & 0xFF) - 127
+        log2_ceil = exponent + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
+        scale = ((log2_ceil + 127) << 23).view(torch.float32)
+        quantized = (blocks / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn).float()
+        return (quantized * scale).reshape_as(x).to(dtype)
+
+    torch.manual_seed(0)
+    for block_size in (32, 64, 128):
+        x = torch.randn(3, 7, 128, dtype=torch.bfloat16)
+        torch.testing.assert_close(fp8_roundtrip(x, block_size=block_size), reference(x, block_size), rtol=0, atol=0)
+
+    # The prefix form must equal quantizing the slice and keeping the tail.
+    kv = torch.randn(2, 5, 192, dtype=torch.bfloat16)
+    prefixed = fp8_roundtrip(kv, block_size=64, quant_features=128)
+    expected = torch.cat([reference(kv[..., :128], 64), kv[..., 128:]], dim=-1)
+    torch.testing.assert_close(prefixed, expected, rtol=0, atol=0)
