@@ -471,6 +471,117 @@ def test_modelstate_marker_preserves_both_hf_export_paths(tmp_path, model_type):
         assert _QWEN4_GDN_FP32_MARKER not in actual
 
 
+@pytest.mark.parametrize("mode", ["hf", "lora"])
+def test_qwen4_gdn_fuse_fallback_preserves_fp32(tmp_path, monkeypatch, mode):
+    from safetensors import SafetensorError
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import load_adapter_state_dict
+    from veomni.models.checkpoint import weights
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    output = tmp_path / "output"
+    model = _populated_model("qwen4_exp")
+    source = {name: getattr(model.linear_attn, name).detach().clone() for name in ("A_log", "dt_bias")}
+    if mode == "hf":
+        dcp.save(
+            {"model": ModelState(model, parallel_state=SimpleNamespace(dp_mode="fsdp2"))},
+            checkpoint_id=tmp_path / "dcp",
+        )
+    else:
+        model = VeOmniLoraModel(model, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["proj"], bias="all"))
+
+    real_save = weights.save_file
+    attempts = []
+
+    def fail_destination(data, path, metadata):
+        if str(path).startswith(str(output)):
+            attempts.append("destination")
+            raise SafetensorError("I/O error: Function not implemented (os error 38)")
+        attempts.append("local")
+        real_save(data, path, metadata=metadata)
+
+    monkeypatch.setattr(weights, "save_file", fail_destination)
+    if mode == "hf":
+        _save_hf_safetensor_legacy(str(tmp_path / "dcp"), str(output), None, "dcp", None, model=model)
+        exported = load_file(str(output / "model.safetensors"))
+        expected = {f"linear_attn.{name}": value for name, value in source.items()}
+    else:
+        save_lora_adapter_with_dcp(model, str(output))
+        exported = load_adapter_state_dict(str(output))
+        expected = {"base_model.model.linear_attn.dt_bias": source["dt_bias"]}
+    assert attempts == ["destination", "local"]
+    for key, value in expected.items():
+        assert exported[key].dtype == torch.float32
+        assert torch.equal(exported[key], value)
+
+
+def test_qwen4_muon_lora_gdn_dcp_and_fuse_export(tmp_path, monkeypatch):
+    from safetensors import SafetensorError
+
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import load_adapter_state_dict
+    from veomni.models.checkpoint import weights
+    from veomni.optim.optimizer import build_optimizer
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    def build():
+        torch.manual_seed(123)
+        config = VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["proj"], bias="all")
+        model = VeOmniLoraModel(_populated_model(), config)
+        return model, build_optimizer(model, optimizer_type="qwen38_muon", lr=0.002, weight_decay=0.0)
+
+    def advance(model, optimizer, factor):
+        optimizer.zero_grad()
+        for index, (_, param) in enumerate(model.named_parameters()):
+            if param.requires_grad:
+                param.grad = torch.full_like(param, factor * (index + 1) / 64)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    model, optimizer = build()
+    initial_bias = model.get_base_model().linear_attn.dt_bias.detach().clone()
+    advance(model, optimizer, 1)
+    assert not torch.equal(model.get_base_model().linear_attn.dt_bias, initial_bias)
+    for leaf in optimizer.optimizers_dict.values():
+        for values in leaf.state.values():
+            assert all(values[key].dtype == torch.float32 for key in ("master_weight", "exp_avg", "exp_avg_sq"))
+    parallel = SimpleNamespace(dp_mode="ddp")
+    path = str(tmp_path / "dcp")
+    state = {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}
+    DistributedCheckpointer.save(path, state, parallel_state=parallel, trainable_only=True)
+    restored, restored_optimizer = build()
+    restored_state = {"model": restored, "optimizer": restored_optimizer, "_veomni_scheduler_object": None}
+    DistributedCheckpointer.load(path, restored_state, parallel_state=parallel, trainable_only=True)
+    advance(model, optimizer, 2)
+    advance(restored, restored_optimizer, 2)
+    for (name, param), (other_name, other) in zip(model.named_parameters(), restored.named_parameters(), strict=True):
+        assert name == other_name
+        torch.testing.assert_close(param, other, rtol=0, atol=0)
+    expected = model.get_base_model().linear_attn.dt_bias.detach().clone()
+
+    output = tmp_path / "adapter"
+    real_save = weights.save_file
+    attempts = []
+
+    def fail_destination(data, path, metadata):
+        if str(path).startswith(str(output)):
+            attempts.append("destination")
+            raise SafetensorError("I/O error: Function not implemented (os error 38)")
+        attempts.append("local")
+        real_save(data, path, metadata=metadata)
+
+    monkeypatch.setattr(weights, "save_file", fail_destination)
+    save_lora_adapter_with_dcp(model, str(output))
+    actual = load_adapter_state_dict(str(output))
+    key = "base_model.model.linear_attn.dt_bias"
+    assert attempts == ["destination", "local"]
+    assert actual[key].dtype == torch.float32
+    torch.testing.assert_close(actual[key], expected, rtol=0, atol=0)
+    assert all(value.dtype == torch.bfloat16 for name, value in actual.items() if ".lora_" in name)
+
+
 def test_qwen4_sparse_only_text_has_no_gdn_marker_and_exports(tmp_path):
     model = nn.Module()
     model.config = SimpleNamespace(model_type="qwen4_exp_text", layer_types=["qwen_sparse_attention"])

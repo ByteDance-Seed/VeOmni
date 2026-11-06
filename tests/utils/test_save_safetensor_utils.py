@@ -11,17 +11,190 @@ Usage:
 """
 
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _legacy_hf_failure_worker(rank, endpoint):
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(save_safetensor_utils, "should_use_distributed_hf_safetensor_save", return_value=False),
+            patch.object(
+                save_safetensor_utils, "_save_hf_safetensor_legacy", side_effect=OSError("injected I/O failure")
+            ),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected I/O failure|failed on another rank"):
+                save_safetensor_utils.save_hf_safetensor(is_rank_0=rank == 0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_legacy_hf_export_failure_reaches_all_ranks():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_legacy_hf_failure_worker, nprocs=2)
+
+
+def test_legacy_hf_export_selects_fuse_fallback():
+    from veomni.utils import save_safetensor_utils
+
+    model_state = {"weight": torch.ones(2)}
+    with (
+        patch.object(save_safetensor_utils, "ckpt_to_state_dict", return_value=model_state),
+        patch.object(save_safetensor_utils, "save_model_weights") as save_model_weights,
+    ):
+        save_safetensor_utils._save_hf_safetensor_legacy("checkpoint", "output", None, "dcp", None)
+    save_model_weights.assert_called_once_with(
+        "output", model_state, model_assets=None, qwen4_gdn_fp32=False, legacy_fuse_fallback=True
+    )
+
+
+def test_lora_adapter_export_uses_fuse_fallback(tmp_path, monkeypatch):
+    from safetensors import SafetensorError
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
+    from veomni.models.checkpoint import weights
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+    with torch.no_grad():
+        for name, value in model.named_parameters():
+            if ".lora_" in name:
+                value.fill_(0.12345679)
+    expected = {
+        name: tensor.to(torch.bfloat16)
+        for name, tensor in get_lora_state_dict(model, config=model.get_lora_config()).items()
+    }
+    original_save = weights.save_file
+    save_attempts = []
+
+    def inject_enosys(data, path, metadata):
+        if str(path).startswith(str(tmp_path)):
+            save_attempts.append("destination")
+            raise SafetensorError("Error while serializing: I/O error: Function not implemented (os error 38)")
+        save_attempts.append("local")
+        original_save(data, path, metadata=metadata)
+
+    monkeypatch.setattr(weights, "save_file", inject_enosys)
+    save_lora_adapter_with_dcp(model, str(tmp_path / "adapter"))
+    assert save_attempts == ["destination", "local"]
+    actual = load_adapter_state_dict(str(tmp_path / "adapter"))
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
+def _lora_export_failure_worker(rank, directory, endpoint):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        base = nn.Module()
+        base.linear = nn.Linear(4, 4, bias=False)
+        model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(save_safetensor_utils, "_save_state_dict", side_effect=OSError("injected I/O failure")),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected I/O failure|failed on another rank"):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_export_failure_reaches_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_lora_export_failure_worker, args=(str(tmp_path),), nprocs=2)
+
+
+def _lora_fallback_copy_failure_worker(rank, directory, local_temp, endpoint):
+    from pathlib import Path
+
+    from safetensors import SafetensorError
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.checkpoint import weights
+    from veomni.utils import dist_utils, save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        base = nn.Module()
+        base.linear = nn.Linear(4, 4, bias=False)
+        model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+        original_save = weights.save_file
+        save_attempts = []
+
+        def inject_enosys(data, path, metadata):
+            if str(path).startswith(directory):
+                save_attempts.append("destination")
+                raise SafetensorError("I/O error: Function not implemented (os error 38)")
+            assert Path(path).is_relative_to(local_temp)
+            save_attempts.append("local")
+            return original_save(data, path, metadata=metadata)
+
+        def fail_after_partial_copy(source, destination, **kwargs):
+            destination.write(source.read(8))
+            raise OSError("injected fallback copy failure")
+
+        with (
+            patch.object(dist_utils, "get_device_type", return_value="npu"),
+            patch.object(save_safetensor_utils, "synchronize"),
+            patch.object(weights.tempfile, "tempdir", local_temp),
+            patch.object(weights, "save_file", side_effect=inject_enosys),
+            patch.object(weights.shutil, "copyfileobj", side_effect=fail_after_partial_copy),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected fallback copy failure|failed on another rank"):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory)
+        if rank == 0:
+            assert save_attempts == ["destination", "local"]
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_fallback_copy_failure_preserves_previous_adapter(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    output = tmp_path / "adapter"
+    output.mkdir()
+    local_temp = tmp_path / "local-temp"
+    local_temp.mkdir()
+    adapter_path = output / "adapter_model.safetensors"
+    adapter_path.write_bytes(b"previous adapter generation")
+    spawn_with_rendezvous(_lora_fallback_copy_failure_worker, args=(str(output), str(local_temp)), nprocs=2)
+    assert adapter_path.read_bytes() == b"previous adapter generation"
+    assert not list(output.glob(".veomni-safetensors-*"))
+    assert not list(local_temp.iterdir())
 
 
 # ---------------------------------------------------------------------------
@@ -824,8 +997,12 @@ def _lora_extra_parallel_export_worker(rank, rendezvous, output_dir, ep_dim, fsd
             checkpoint_layout_v2=True,
         )
 
-        class TinyAdapter:
+        class TinyAdapter(nn.Module):
             _fqn2spec_info = {spec_name: spec}
+
+            def __init__(self):
+                super().__init__()
+                self.adapter_weight = nn.Parameter(tensor)
 
             def get_lora_config(self):
                 return self
@@ -833,11 +1010,12 @@ def _lora_extra_parallel_export_worker(rank, rendezvous, output_dir, ep_dim, fsd
             def save_pretrained(self, path):
                 pass
 
+        model = TinyAdapter()
         with (
-            patch("veomni.lora.state_dict.get_lora_state_dict", return_value={name: tensor}),
+            patch("veomni.lora.state_dict.get_lora_state_dict", return_value={name: model.adapter_weight}),
             patch("veomni.lora.is_veomni_lora_model", return_value=True),
         ):
-            save_lora_adapter_with_dcp(TinyAdapter(), output_dir)
+            save_lora_adapter_with_dcp(model, output_dir)
         if rank == 0:
             restored = load_file(f"{output_dir}/adapter_model.safetensors")
             torch.testing.assert_close(restored[name], full, rtol=0, atol=0)

@@ -1141,6 +1141,31 @@ def test_single_process_lora_export_without_parallel_state(tmp_path, monkeypatch
         torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
 
 
+def _lora_incomplete_export_worker(rank, directory, endpoint):
+    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = _lora_model()
+        if rank == 0:
+            selected = {id(p) for p in get_lora_state_dict(model).values()}
+            next(p for p in model.parameters() if id(p) not in selected).requires_grad_(True)
+        with pytest.raises((ValueError, RuntimeError), match="omit trainable parameters|failed on another rank"):
+            save_lora_adapter_with_dcp(model, directory)
+        assert not Path(directory).exists()
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_export_untracked_trainable_weight_is_coordinated(tmp_path):
+    spawn_with_rendezvous(_lora_incomplete_export_worker, args=(str(tmp_path / "adapter"),), nprocs=2)
+
+
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [2])
 def test_ple_with_ep1_proves_ordinary_expert_from_plan(world, tmp_path):

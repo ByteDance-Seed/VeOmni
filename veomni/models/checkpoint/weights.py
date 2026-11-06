@@ -18,13 +18,16 @@ Public entry points cover meta-device construction, safetensors / bin load,
 ExtraParallel slice streaming, rank-0 broadcast, and sharded save.
 """
 
+import errno
 import gc
 import itertools
 import json
 import math
 import os
 import re
+import shutil
 import stat
+import tempfile
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -40,7 +43,7 @@ try:
     from hdfs_io import copy  # for internal use only
 except ImportError:
     from veomni.utils.hdfs_io import copy
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
@@ -1956,15 +1959,59 @@ def _get_shard_info(
     return is_sharded, total_size, weight_map
 
 
+def _cleanup_safetensors_temp(path: str) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("Could not remove temporary safetensors directory %s: %s", path, error)
+
+
+def _save_legacy_safetensors(state_dict: Dict[str, "torch.Tensor"], path_to_save: "os.PathLike") -> None:
+    """Write a single HF shard, staging locally when serialization reports ENOSYS."""
+    destination_dir = os.path.dirname(os.path.abspath(path_to_save))
+    destination_stage = tempfile.mkdtemp(prefix=".veomni-safetensors-", dir=destination_dir)
+    temporary_path = os.path.join(destination_stage, "weights.safetensors")
+    try:
+        try:
+            save_file(state_dict, temporary_path, metadata={"format": "pt"})
+        except SafetensorError as error:
+            # The Rust exception has no errno attribute; restrict retry to ENOSYS.
+            if f"(os error {errno.ENOSYS})" not in str(error):
+                raise
+            logger.warning_once(
+                "safetensors direct save returned ENOSYS; staging one shard in the local temporary directory"
+            )
+            stage_dir = tempfile.mkdtemp(prefix="veomni-safetensors-")
+            try:
+                local_path = os.path.join(stage_dir, "weights.safetensors")
+                save_file(state_dict, local_path, metadata={"format": "pt"})
+                permissions = stat.S_IMODE(os.stat(local_path).st_mode)
+                temporary_path = os.path.join(destination_stage, "fallback.safetensors")
+                descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, permissions)
+                with os.fdopen(descriptor, "wb") as target, open(local_path, "rb") as source:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            finally:
+                _cleanup_safetensors_temp(stage_dir)
+        os.replace(temporary_path, path_to_save)
+    finally:
+        _cleanup_safetensors_temp(destination_stage)
+
+
 def _save_state_dict(
     state_dict: Dict[str, "torch.Tensor"],
     path_to_save: "os.PathLike",
     safe_serialization: bool,
+    *,
+    legacy_fuse_fallback: bool = False,
 ) -> None:
     """
     Save function.
     """
-    if safe_serialization:
+    if safe_serialization and legacy_fuse_fallback:
+        _save_legacy_safetensors(state_dict, path_to_save)
+    elif safe_serialization:
         save_file(state_dict, path_to_save, metadata={"format": "pt"})
     else:
         torch.save(state_dict, path_to_save)
@@ -1980,12 +2027,15 @@ def save_model_weights(
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
     qwen4_gdn_fp32: bool = False,
+    legacy_fuse_fallback: bool = False,
 ) -> None:
     """
     Saves full model weights. The model parameters should be either tensor or dtensor.
 
     If global_rank is given, it will assume it is executed on all ranks.
     """
+    if legacy_fuse_fallback and global_rank is not None:
+        raise ValueError("legacy_fuse_fallback requires a rank-0-only export")
     if output_dir.startswith("hdfs://"):
         hdfs_dir = output_dir
         hdfs_upper_dir = output_dir.rstrip("/")
@@ -2037,7 +2087,12 @@ def save_model_weights(
 
         if prev_file_name is not None and weight_map[name] != prev_file_name:
             if global_rank is None or global_rank == 0:
-                _save_state_dict(full_state_dict, os.path.join(output_dir, prev_file_name), safe_serialization)
+                _save_state_dict(
+                    full_state_dict,
+                    os.path.join(output_dir, prev_file_name),
+                    safe_serialization,
+                    legacy_fuse_fallback=legacy_fuse_fallback,
+                )
                 full_state_dict = OrderedDict()
 
             empty_cache()
@@ -2053,7 +2108,12 @@ def save_model_weights(
 
     if global_rank is None or global_rank == 0:
         if len(full_state_dict):
-            _save_state_dict(full_state_dict, os.path.join(output_dir, prev_file_name), safe_serialization)
+            _save_state_dict(
+                full_state_dict,
+                os.path.join(output_dir, prev_file_name),
+                safe_serialization,
+                legacy_fuse_fallback=legacy_fuse_fallback,
+            )
 
         if is_sharded:
             index = {

@@ -69,12 +69,9 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     replicated by construction; ``LoraSharedExperts._ensure_ep_grad_sync_hooks``
     keeps their gradients in lock-step across the EP group).
 
-    Excluding these param ids from the ``"ep"`` optimizer/clip-grad-norm
-    bucket and putting them in the ``"non_extra_parallel"`` bucket gives
-    the right semantics: gradients still get cross-EP-summed (by the
-    LoraSharedExperts hook), the optimizer steps consistently on every
-    rank, and ``clip_grad_norm`` only reduces them across the FSDP mesh
-    (not the EP mesh) so the norm is computed once.
+    These parameters remain in their owning optimizer bucket because their
+    FSDP mesh differs from ordinary parameters. The clipper uses this sidecar
+    to count their synchronized gradients only once across the EP group.
 
     Detection by class name (``LoraSharedExperts``) so this stays free of
     a circular import (``veomni.lora.moe_layers`` already imports from
@@ -97,6 +94,8 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     """
     from torch.distributed._tensor import DTensor
 
+    from ..lora.moe_layers import _is_lora_param_name
+
     out: set[int] = set()
     for mod in model.modules():
         # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
@@ -105,7 +104,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
         # would silently skip every wrapper post-FSDP.
         if any(b.__name__ == "LoraSharedExperts" for b in type(mod).__mro__):
             for n, p in mod.named_parameters(recurse=True):
-                if not p.requires_grad:
+                if not p.requires_grad or not _is_lora_param_name(n):
                     continue
                 # Catches wrong call-order misuse: if any matched LoRA param
                 # is still a plain ``nn.Parameter`` (not a DTensor) at this

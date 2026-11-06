@@ -326,7 +326,11 @@ def _save_hf_safetensor_legacy(
     if qwen4_gdn_fp32:
         validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
     save_model_weights(
-        save_hf_safetensor_path, model_state_dict, model_assets=model_assets, qwen4_gdn_fp32=qwen4_gdn_fp32
+        save_hf_safetensor_path,
+        model_state_dict,
+        model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
+        legacy_fuse_fallback=True,
     )
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
@@ -379,7 +383,8 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 reads and converts the checkpoint. Every rank must call
+            this function to participate in distributed failure coordination.
             Required by non-dcp checkpoint managers (e.g., omnistore).
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
@@ -455,7 +460,7 @@ def save_lora_adapter_with_dcp(
 
     from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
     from veomni.lora import is_veomni_lora_model
-    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.lora.state_dict import get_lora_state_dict, validate_lora_export_covers_trainable
 
     if not is_veomni_lora_model(model):
         raise TypeError(
@@ -472,8 +477,10 @@ def save_lora_adapter_with_dcp(
     from .dist_utils import raise_if_any_rank_failed
 
     fqn2spec_info = getattr(model, "_fqn2spec_info", None)
-    error = None
+    lora_state, error = None, None
     try:
+        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
+        validate_lora_export_covers_trainable(model, lora_state)
         if _needs_extra_parallel_layout_marker(fqn2spec_info):
             _extra_parallel_layout_key(fqn2spec_info)
     except BaseException as exc:
@@ -486,9 +493,8 @@ def save_lora_adapter_with_dcp(
 
     os.makedirs(save_path, exist_ok=True)
     dcp_save_path = os.path.join(save_path, dcp_subdir)
-    lora_state, error = None, None
+    error = None
     try:
-        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
         qwen4_model = is_qwen4_exp_model(model)
         for name, value in lora_state.items():
             if qwen4_model and is_qwen4_gdn_parameter(name):
@@ -621,7 +627,9 @@ def save_lora_adapter_with_dcp(
             # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
             consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
             adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+            _save_state_dict(
+                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
+            )
 
             # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
             # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no

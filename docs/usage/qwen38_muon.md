@@ -7,7 +7,8 @@ Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
 
 ## Recipe
 
-- FP32 master weights and FP32 optimizer states; BF16 model compute copies.
+- FP32 master weights and FP32 optimizer states; ordinary model compute
+  copies may be BF16. Qwen4 GDN `A_log` and `dt_bias` remain FP32.
 - Muon: Nesterov momentum 0.95, eight explicitly pinned Polar Express iterations,
   Frobenius normalization epsilon `1e-14`, update scale `0.2*sqrt(max(rows, cols))`.
   Autocast and Ascend HF32 are disabled during NS. CUDA TF32 must already be
@@ -24,7 +25,51 @@ Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
   CPU offload while the compute tables retain their distributed device placement.
 - Indexer and vision tower must remain frozen. The optional CPU-only PLE lookup
   remains a frozen-table feature; disable it to train the lookup tables. Unknown
-  trainable maps and LoRA parameters fail closed rather than silently receiving Muon.
+  trainable maps fail closed rather than silently receiving Muon.
+- Native dense LoRA and shared or independent expert LoRA A/B weights use the
+  AdamW fallback with FP32 masters and FP32 moments. They are not orthogonalized.
+  Standard LoRA freezes the base weights, so an adapter-only run uses AdamW for
+  all trainable weights; Muon applies only if other eligible matrices are also
+  trainable. Unsupported or unrecognized adapter layouts fail closed. If a
+  base matrix is also trained, use a full training DCP checkpoint and export
+  the updated base separately: adapter-only export rejects that configuration
+  rather than silently omitting the trained base weights. Set
+  `train.checkpoint.save_hf_weights: false` for such a run (it defaults to
+  true), and retain a nonzero DCP save interval. The LoRA training DCP contains
+  trainable parameters, not the frozen base; restoring it requires the exact
+  original base checkpoint and model configuration.
+
+For Qwen4-Exp, select fused routed experts explicitly with
+`target_parameters`, and exclude the frozen QSA indexer and vision tower when a
+dense target pattern would also match them. For example:
+
+```yaml
+model:
+  optimizer:
+    type: qwen38_muon
+    cpu_offload_param_patterns: ['lora_[AB]']
+    cpu_offload_resident_moment_dtype: float32
+    cpu_offload_cpu_moment_dtype: float32
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules: [q_proj, v_proj]
+    exclude_modules: '.*[.](indexer|visual)[.].*'
+    target_parameters:
+      - 'model.language_model.layers.*.mlp.experts.gate_up_proj'
+      - 'model.language_model.layers.*.mlp.experts.down_proj'
+    share_expert_lora: true
+```
+
+Shared expert adapters use the existing cross-EP gradient sum; their replicated
+gradients are counted only once by the ExtraParallel grad clipper. Independent
+expert adapters follow the expert sharding plan. The synchronization and model
+compute still use their configured gradient and compute dtypes; FP32 optimizer
+state does not turn BF16 forward/backward into FP32 computation.
+Training DCP preserves the FP32 optimizer state. Distributed HF adapter export
+casts ordinary FP32 adapter tensors to BF16, while a trainable Qwen4 GDN
+`dt_bias` (for example with `bias: all`) remains FP32. The adapter is an
+inference artifact, not a full-precision optimizer checkpoint.
 
 The schedule is generated from the Polar Express authors' implementation with
 `l=1e-3, num_iters=8, degree=5, safety_factor_eps=1e-2, cushion=0.02` and pinned in

@@ -5,6 +5,7 @@
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import types
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from veomni.optim import qwen38_muon as module
 
 
@@ -282,6 +283,521 @@ def test_logical_model_layout_and_frozen_rules():
     assert plans["gdn.in_proj_z.weight"] == [("adamw", 0, 12)]
     with pytest.raises(ValueError, match="Unclassified"):
         module.logical_plan(model, "unknown.weight", model.unknown.weight)
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_native_lora_plans_keep_adapters_on_adamw(mode):
+    from tests.lora.test_veomni_lora_moe_native import ToyMoE, _moe_config
+    from veomni.lora import VeOmniLoraModel
+
+    base = ToyMoE()
+    base.o_proj = torch.nn.Linear(16, 16, bias=False)
+    config = _moe_config(mode)
+    config.target_modules = ["o_proj"]
+    model = VeOmniLoraModel(base, config)
+    model.base_model.model.extra = torch.nn.Module()
+    model.base_model.model.extra.down_proj = torch.nn.Linear(16, 16, bias=False)
+    model.base_model.model.extra.down_proj.weight.requires_grad_(True)
+    plans = {
+        name: module.logical_plan(model, name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+    adapters = {name: plan for name, plan in plans.items() if ".lora_" in name}
+    assert len(adapters) == 8
+    assert all(
+        plan == [("adamw", 0, dict(model.named_parameters())[name].shape[-2])] for name, plan in adapters.items()
+    )
+    assert plans["base_model.model.extra.down_proj.weight"] == [("muon", 0, 16)]
+    expected_dim = 2 if mode == "shared" else 3
+    assert all(
+        param.ndim == expected_dim
+        for name, param in model.named_parameters()
+        if ".experts." in name and ".lora_" in name
+    )
+
+
+def test_lora_names_do_not_bypass_frozen_or_unknown_parameter_guards():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = torch.nn.Module()
+            self.indexer.o_proj = torch.nn.Linear(4, 4, bias=False)
+            self.visual = torch.nn.Module()
+            self.visual.o_proj = torch.nn.Linear(4, 4, bias=False)
+
+    model = VeOmniLoraModel(Model(), VeOmniLoraConfig(r=2, lora_alpha=2, target_modules=["o_proj"]))
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            with pytest.raises(ValueError, match="remain frozen"):
+                module.logical_plan(model, name, param)
+    spoof = torch.nn.Module()
+    spoof.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 2, bias=False)})
+    with pytest.raises(ValueError, match="LoRA"):
+        module.logical_plan(spoof, "lora_A.default.weight", spoof.lora_A["default"].weight)
+
+
+def test_lora_factory_rejects_bf16_optimizer_moments():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.optim.optimizer import build_optimizer
+
+    model = torch.nn.Module()
+    model.o_proj = torch.nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(model, VeOmniLoraConfig(r=2, lora_alpha=2, target_modules=["o_proj"]))
+    with pytest.raises(ValueError, match="FP32"):
+        build_optimizer(
+            model,
+            optimizer_type="qwen38_muon",
+            cpu_offload_param_patterns=[r"lora_[AB]"],
+            cpu_offload_cpu_moment_dtype="bfloat16",
+        )
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_lora_factory_fp32_adam_and_dcp_next_update(tmp_path, offload, mixed):
+    from types import SimpleNamespace
+
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.optim.optimizer import build_optimizer
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.o_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            self.down_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return self.down_proj(self.o_proj(x))
+
+    def build():
+        torch.manual_seed(17)
+        model = VeOmniLoraModel(Model(), VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["o_proj"]))
+        model.base_model.model.down_proj.weight.requires_grad_(mixed)
+        with torch.no_grad():
+            model.base_model.model.o_proj.lora_B["default"].weight.fill_(0.125)
+        opt = build_optimizer(
+            model,
+            optimizer_type="qwen38_muon",
+            lr=0.002,
+            betas=(0.9, 0.95),
+            weight_decay=0.03,
+            cpu_offload_param_patterns=[r"lora_[AB]"] if offload else None,
+        )
+        leaf = next(iter(opt.optimizers_dict.values()))
+        params = dict(model.named_parameters())
+        adapters = {name: param for name, param in params.items() if ".lora_" in name}
+        groups = {id(group["params"][0]): group for group in leaf.param_groups}
+        assert all(json.loads(groups[id(param)]["qwen38_plan"])[0][0] == "adamw" for param in adapters.values())
+        if mixed:
+            assert json.loads(groups[id(model.base_model.model.down_proj.weight)]["qwen38_plan"])[0][0] == "muon"
+        else:
+            assert all(json.loads(group["qwen38_plan"])[0][0] == "adamw" for group in groups.values())
+        assert all((id(param) in leaf._offloaded) == offload for param in adapters.values())
+        return model, opt, leaf, adapters
+
+    model, opt, leaf, adapters = build()
+    refs = {name: torch.nn.Parameter(param.detach().float().clone()) for name, param in adapters.items()}
+    reference = torch.optim.AdamW(list(refs.values()), lr=0.002, betas=(0.9, 0.95), weight_decay=0.03, foreach=False)
+    x = torch.arange(1, 9, dtype=torch.bfloat16).view(2, 4) / 8
+
+    def advance(model, optimizer, leaf, adapters, reference=None):
+        optimizer.zero_grad()
+        loss = model(x).float().square().sum()
+        loss.backward()
+        assert all(param.grad is not None and torch.isfinite(param.grad).all() for param in adapters.values())
+        if reference is not None:
+            reference.zero_grad()
+            for name, param in adapters.items():
+                refs[name].grad = param.grad.float().clone()
+            reference.step()
+        optimizer.step()
+        for name, param in adapters.items():
+            state = leaf.state[param]
+            for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+                assert state[key].dtype == torch.float32
+            if reference is not None:
+                torch.testing.assert_close(state["master_weight"], refs[name], rtol=1e-6, atol=1e-7)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(state[key], reference.state[refs[name]][key], rtol=1e-6, atol=1e-7)
+        return loss.detach()
+
+    advance(model, opt, leaf, adapters, reference)
+    opt.zero_grad()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    checkpoint = {"model": model, "optimizer": opt, "_veomni_scheduler_object": None}
+    DistributedCheckpointer.save(str(tmp_path), checkpoint, parallel_state=parallel, trainable_only=True)
+    target, restored, target_leaf, target_adapters = build()
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+        trainable_only=True,
+    )
+    source_loss = advance(model, opt, leaf, adapters, reference)
+    target_loss = advance(target, restored, target_leaf, target_adapters)
+    torch.testing.assert_close(source_loss, target_loss, rtol=0, atol=0)
+    for (name, param), (target_name, target_param) in zip(
+        model.named_parameters(), target.named_parameters(), strict=True
+    ):
+        assert name == target_name
+        torch.testing.assert_close(param, target_param, rtol=0, atol=0)
+        if param.requires_grad:
+            for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    leaf.state[param][key], target_leaf.state[target_param][key], rtol=0, atol=0
+                )
+
+
+def _shared_lora_factory_worker(rank, device_type, endpoint):
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.tensor import Shard
+    from torch.utils.checkpoint import DefaultDeviceType
+
+    from tests.lora.test_veomni_lora_moe_native import (
+        _SHARED_LORA_PROBE_MODULES,
+        INTER,
+        RANK,
+        ToyExperts,
+        _SharedLoraAccumulationProbe,
+    )
+    from veomni.distributed.fsdp2.clip_grad_norm import clip_grad_norm
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+    from veomni.optim.optimizer import _collect_ep_replicated_lora_param_ids, build_optimizer
+
+    previous = DefaultDeviceType.get_device_type()
+    if device_type == "npu":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(rank)
+    device = torch.device(device_type, rank) if device_type == "npu" else torch.device("cpu")
+    dist.init_process_group(
+        "hccl" if device_type == "npu" else "gloo", store=endpoint.connect(), rank=rank, world_size=2
+    )
+    try:
+        DefaultDeviceType.set_device_type(device_type)
+        ps = _init_parallel_state(
+            dp_size=2,
+            dp_shard_size=2,
+            dp_mode="fsdp2",
+            device_type=device_type,
+            extra_parallel_names=("ep",),
+            extra_parallel_sizes=(2,),
+            extra_parallel_placement_innermost=(False,),
+        )
+        with use_parallel_state(ps):
+            torch.manual_seed(31)
+            experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8).to(device)
+            experts.gate_up_proj.base_layer.weight.requires_grad_(True)
+            mesh = ps.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"]
+            fully_shard(experts, mesh=mesh, shard_placement_fn=lambda _: Shard(1))
+            experts.set_gradient_divide_factor(2)
+            base = experts.gate_up_proj.base_layer.weight
+            weights = {name: experts.get_submodule(name).weight for name in _SHARED_LORA_PROBE_MODULES}
+            assert _collect_ep_replicated_lora_param_ids(experts) == {id(p) for p in weights.values()}
+            assert id(base) not in _collect_ep_replicated_lora_param_ids(experts)
+            base.requires_grad_(False)
+            optimizer = build_optimizer(experts, optimizer_type="qwen38_muon", lr=0.001, weight_decay=0.0)
+            assert experts._ep_replicated_lora_param_ids == {id(p) for p in weights.values()}
+            leaf = optimizer.optimizers_dict["ep"]
+            refs = {name: torch.nn.Parameter(p.to_local().detach().clone()) for name, p in weights.items()}
+            reference = torch.optim.AdamW(list(refs.values()), lr=0.001, betas=(0.9, 0.95), weight_decay=0.0)
+            for micro in (1, 2):
+                x = torch.arange(1, INTER + 1, dtype=torch.float32, device=device).unsqueeze(0) * micro * (rank + 1)
+                sum(output.sum() for output in experts(x)).backward()
+            expected_grads = {}
+            for coefficient, (name, param) in enumerate(weights.items(), start=1):
+                columns = torch.arange(1, refs[name].shape[1] + 1, dtype=torch.float32, device=device)
+                expected = (4.5 * coefficient * columns).expand_as(refs[name])
+                torch.testing.assert_close(param.grad.to_local(), expected, rtol=0, atol=0)
+                expected_grads[name] = expected
+            expected_norm = torch.stack([grad.square().sum() for grad in expected_grads.values()]).sum().sqrt()
+            norm = clip_grad_norm(experts, max_norm=5.0)
+            torch.testing.assert_close(norm, expected_norm, rtol=1e-6, atol=1e-6)
+            scale = min(1.0, 5.0 / (expected_norm.item() + 1e-6))
+            for name, param in weights.items():
+                refs[name].grad = expected_grads[name] * scale
+                torch.testing.assert_close(param.grad.to_local(), refs[name].grad, rtol=1e-6, atol=1e-7)
+            reference.step()
+            optimizer.step()
+            for name, param in weights.items():
+                state = leaf.state[param]
+                for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+                    assert state[key].dtype == torch.float32
+                torch.testing.assert_close(state["master_weight"].to_local(), refs[name], rtol=1e-6, atol=1e-7)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(
+                        state[key].to_local(), reference.state[refs[name]][key], rtol=1e-6, atol=1e-7
+                    )
+    finally:
+        DefaultDeviceType.set_device_type(previous)
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=_CI_SHARD_LAUNCH)
+def test_shared_lora_factory_ep_sync_clipping_and_fp32_adam():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_shared_lora_factory_worker, args=("cpu",), nprocs=2)
+
+
+def _require_lora_npus(count):
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if not IS_NPU_AVAILABLE:
+        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+            pytest.fail("Native NPU test was required but no NPU backend was detected")
+        pytest.skip(f"Requires {count} Ascend NPUs")
+    if torch.npu.device_count() < count:
+        pytest.fail(f"Native LoRA test requires {count} visible NPUs")
+
+
+def _npu_lora_launch(count):
+    def resolve(context):
+        caps = context.capabilities
+        if caps.backend == "npu" and len(caps.devices) >= count:
+            return LaunchSpec(nproc=count, device="accelerator")
+        # Keep required-but-unavailable tests runnable so _require_lora_npus fails explicitly.
+        return LaunchSpec(device="cpu")
+
+    return resolve
+
+
+def _skip_optional_npu_lora(count):
+    caps = runner_capabilities()
+    return os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") != "1" and (caps.backend != "npu" or len(caps.devices) < count)
+
+
+@pytest.mark.parametrize(
+    "backend,devices,count,expected",
+    [
+        ("cpu", (), 2, "cpu"),
+        ("cuda", ("0", "1"), 2, "cpu"),
+        ("npu", ("0",), 2, "cpu"),
+        ("npu", ("0", "1"), 2, "accelerator"),
+    ],
+)
+def test_native_lora_launch_respects_owned_capacity(backend, devices, count, expected):
+    from scripts.ci.accelerator.launch_plan import PlanContext, RunnerCapabilities
+
+    context = PlanContext({}, RunnerCapabilities(backend, devices))
+    result = _npu_lora_launch(count)(context)
+    assert result.device == expected
+    assert result.nproc == (count if expected == "accelerator" else 1)
+
+
+def test_required_native_lora_test_rejects_missing_npu(monkeypatch):
+    import veomni.utils.device as device
+
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
+    with pytest.raises(pytest.fail.Exception, match="Native NPU test was required"):
+        _require_lora_npus(2)
+
+
+@pytest.mark.skipif(_skip_optional_npu_lora(2), reason="requires two Ascend NPUs")
+@pytest.mark.launch_plan(provider=_npu_lora_launch(2))
+def test_native_shared_lora_factory_ep_sync_clipping_and_fp32_adam():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    _require_lora_npus(2)
+    spawn_with_rendezvous(_shared_lora_factory_worker, args=("npu",), nprocs=2)
+
+
+def _lora_ep_checkpoint_worker(rank, root, mode, phase, device_type, endpoint):
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor, Shard
+
+    from tests.checkpoints.test_expert_shard_layout import _lora_model
+    from veomni.arguments.arguments_types import CheckpointConfig
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.distributed.parallel_plan import ParallelPlan, get_runtime_parallel_plan
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+    from veomni.lora import VeOmniLoraConfig
+    from veomni.models.model_runtime import _configure_extra_parallel_checkpoint_layout
+    from veomni.optim.optimizer import build_optimizer
+
+    torch.set_num_threads(1)
+    if device_type == "npu":
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(rank)
+    device = torch.device(device_type, rank) if device_type == "npu" else torch.device("cpu")
+    dist.init_process_group(
+        "hccl" if device_type == "npu" else "gloo", store=endpoint.connect(), rank=rank, world_size=4
+    )
+    try:
+        ps = _init_parallel_state(
+            dp_size=4,
+            dp_shard_size=4,
+            dp_mode="fsdp2",
+            device_type=device_type,
+            extra_parallel_names=("ep",),
+            extra_parallel_sizes=(2,),
+            extra_parallel_placement_innermost=(False,),
+        )
+        with use_parallel_state(ps):
+            torch.manual_seed(34)
+            config = VeOmniLoraConfig.from_yaml(
+                {
+                    "rank": 8,
+                    "alpha": 16,
+                    "target_parameters": ["experts.gate_up_proj", "experts.down_proj"],
+                    "share_expert_lora": mode == "shared",
+                }
+            )
+            model = _lora_model(config).to(dtype=torch.bfloat16)
+            base = model.base_model.model
+            base.probe = torch.nn.Module()
+            base.probe.experts = torch.nn.Module()
+            base.probe.experts.down_proj = torch.nn.Parameter(torch.arange(512).reshape(8, 8, 8).float() / 512 + 1)
+            model.to(device)
+            base.get_parallel_plan = lambda: ParallelPlan(
+                {
+                    "ep": {
+                        "experts.gate_up_proj": Shard(0),
+                        "experts.down_proj": Shard(0),
+                        "probe.experts.down_proj": Shard(0),
+                    }
+                }
+            )
+            plan = get_runtime_parallel_plan(model)
+            model._fqn2spec_info = plan.apply(model, ps.extra_parallel_fsdp_device_mesh)
+            for name, spec in model._fqn2spec_info.items():
+                if spec.para_name == "ep":
+                    spec.fsdp_shard_dim = 0 if "probe.experts" in name else 1
+            ep_mesh = ps.extra_parallel_fsdp_device_mesh["ep"]
+            fsdp_mesh = ep_mesh[ep_mesh.mesh_dim_names[:-1]]
+            coordinate = ep_mesh.get_coordinate()
+            fsdp_rank = coordinate[ep_mesh.mesh_dim_names.index("ep_fsdp")]
+            ep_rank = coordinate[ep_mesh.mesh_dim_names.index("ep")]
+            fully_shard(base.experts, mesh=fsdp_mesh, shard_placement_fn=lambda _: Shard(1))
+            fully_shard(base.probe.experts, mesh=fsdp_mesh, shard_placement_fn=lambda _: Shard(0))
+            fully_shard(model, mesh=ps.dp_shard_mesh)
+            _configure_extra_parallel_checkpoint_layout(model, CheckpointConfig(extra_parallel_canonical_layout=True))
+            optimizer = build_optimizer(
+                model,
+                optimizer_type="qwen38_muon",
+                lr=0.001,
+                weight_decay=0.0,
+                cpu_offload_param_patterns=[r"lora_[AB]", r"probe\.experts\.down_proj"],
+            )
+            names = {id(param): name for name, param in model.named_parameters()}
+            leaves = optimizer.optimizers_dict.values()
+            groups = {names[id(g["params"][0])]: g for leaf in leaves for g in leaf.param_groups}
+            assert sum(".lora_" in name for name in groups) == 6
+            assert all(
+                json.loads(group["qwen38_plan"])[0][0] == ("adamw" if ".lora_" in name else "muon")
+                for name, group in groups.items()
+            )
+
+            def advance(step):
+                optimizer.zero_grad()
+                for index, (_, param) in enumerate(model.named_parameters()):
+                    if param.requires_grad:
+                        local = param.to_local() if isinstance(param, DTensor) else param
+                        values = torch.arange(local.numel(), device=local.device, dtype=torch.float32).reshape(
+                            local.shape
+                        )
+                        # Shared 2-D LoRA replicas agree across EP; 3-D expert
+                        # shards and both FSDP shards have distinct moments.
+                        values = values.remainder(23) + index + 1 + 3 * fsdp_rank + 7 * ep_rank * (param.ndim == 3)
+                        values = (values * step / 128).to(dtype=local.dtype)
+                        param.grad = (
+                            DTensor.from_local(
+                                values,
+                                param.device_mesh,
+                                param.placements,
+                                shape=param.shape,
+                                stride=param.stride(),
+                                run_check=False,
+                            )
+                            if isinstance(param, DTensor)
+                            else values
+                        )
+                optimizer.step()
+                optimizer.zero_grad()
+
+            def snapshot():
+                params = {
+                    name: (param.to_local() if isinstance(param, DTensor) else param).detach().cpu().clone()
+                    for name, param in model.named_parameters()
+                    if param.requires_grad
+                }
+                state = {}
+                for leaf in optimizer.optimizers_dict.values():
+                    for param, values in leaf.state.items():
+                        state[names[id(param)]] = {
+                            key: (value.to_local() if isinstance(value, DTensor) else value).detach().cpu().clone()
+                            for key, value in values.items()
+                        }
+                        assert all(value.dtype == torch.float32 for value in state[names[id(param)]].values())
+                return {"params": params, "state": state}
+
+            def compare(actual, expected):
+                assert actual.keys() == expected.keys()
+                for section in actual:
+                    assert actual[section].keys() == expected[section].keys()
+                    for name in actual[section]:
+                        a, b = actual[section][name], expected[section][name]
+                        if isinstance(a, dict):
+                            assert a.keys() == b.keys()
+                            for key in a:
+                                torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+                        else:
+                            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+            checkpoint = str(Path(root) / "checkpoint")
+            reference = Path(root) / f"rank-{rank}.pt"
+            state = {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}
+            if phase == "save":
+                initial = snapshot()["params"]
+                advance(1)
+                before = snapshot()
+                assert before["state"].keys() == initial.keys()
+                for name in initial:
+                    assert not torch.equal(before["state"][name]["master_weight"], initial[name].float())
+                    assert torch.count_nonzero(before["state"][name]["exp_avg"]) > 0
+                    if ".lora_" in name:
+                        assert torch.count_nonzero(before["state"][name]["exp_avg_sq"]) > 0
+                DistributedCheckpointer.save(checkpoint, state, parallel_state=ps, trainable_only=True)
+                advance(2)
+                torch.save({"before": before, "after": snapshot()}, reference)
+            else:
+                expected = torch.load(reference, weights_only=True)
+                DistributedCheckpointer.load(checkpoint, state, parallel_state=ps, trainable_only=True)
+                compare(snapshot(), expected["before"])
+                advance(2)
+                compare(snapshot(), expected["after"])
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_lora_factory_ep_fsdp_dcp_fresh_process(tmp_path, mode):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    for phase in ("save", "load"):
+        spawn_with_rendezvous(_lora_ep_checkpoint_worker, args=(str(tmp_path), mode, phase, "cpu"), nprocs=4)
+
+
+@pytest.mark.skipif(_skip_optional_npu_lora(4), reason="requires four Ascend NPUs")
+@pytest.mark.launch_plan(provider=_npu_lora_launch(4))
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_native_lora_factory_ep_fsdp_dcp_fresh_process(tmp_path, mode):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    _require_lora_npus(4)
+    for phase in ("save", "load"):
+        spawn_with_rendezvous(_lora_ep_checkpoint_worker, args=(str(tmp_path), mode, phase, "npu"), nprocs=4)
 
 
 def test_workspace_limits_fail_before_allocation():
