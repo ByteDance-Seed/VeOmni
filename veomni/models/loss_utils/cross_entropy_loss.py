@@ -37,6 +37,14 @@ from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function
 
 
+def pop_loss_weights(kwargs: dict[str, Any]) -> Tensor | None:
+    """Remove SFT weights after rejecting unsupported router auxiliary loss."""
+    loss_weights = kwargs.pop("loss_weights", None)
+    if loss_weights is not None and kwargs.get("output_router_logits", False):
+        raise ValueError("loss_weights cannot be combined with router auxiliary loss")
+    return loss_weights
+
+
 def _default_op() -> VeomniOp:
     """Return the default eager token-level cross-entropy op."""
     return VeomniOp("cross_entropy_loss", "standard", "eager")

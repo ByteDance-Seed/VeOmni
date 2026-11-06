@@ -589,6 +589,19 @@ def test_multimodal_preprocess_rejects_weight_instead_of_dropping_it():
         conv_preprocess("doom", [{"from": "gpt", "value": "x", "loss_weight": 0.25}])
 
 
+def test_qwen_vl_supervision_uses_registered_dispatch(monkeypatch):
+    import veomni.data.multimodal as multimodal
+    from veomni.data.multimodal.preprocess import conv_preprocess_qwen_vl
+
+    seen = {}
+    monkeypatch.setattr(
+        multimodal, "conv_preprocess", lambda source, records, **kwargs: seen.update(kwargs) or records
+    )
+    records = [{"loss_weight": 0.25}]
+    assert conv_preprocess_qwen_vl("custom", records, preserve_loss_supervision=False) is records
+    assert seen["preserve_loss_supervision"] is True
+
+
 def test_multimodal_preprocess_nested_numpy_and_nullable_weights():
     import numpy as np
 

@@ -55,6 +55,13 @@ def conv_preprocess(source: str, conversations, **kwargs):
     return PREPROCESSOR_REGISTRY[source](conversations, **kwargs)
 
 
+def conv_preprocess_qwen_vl(source: str, conversations, **kwargs):
+    """Preserve supported turn supervision in the Qwen-VL data path."""
+    from . import conv_preprocess as dispatch
+
+    return dispatch(source, conversations, **{**kwargs, "preserve_loss_supervision": True})
+
+
 # ============================================================================
 # Built-in Dataset Preprocessors
 # ============================================================================

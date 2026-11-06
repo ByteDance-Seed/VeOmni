@@ -950,6 +950,16 @@ def test_channel_loss_source_registry_round_trips_across_resume():
     assert "channel_loss/source-i-2__train_a" in metrics
 
 
+@pytest.mark.parametrize("field", ["source_id_keys", "source_name_keys", "extra_strip_keys"])
+def test_channel_loss_cannot_strip_training_loss_weights(field):
+    cfg = ChannelLossConfig(enable=True)
+    setattr(cfg, field, ["loss_weights"])
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+    with pytest.raises(ValueError, match="must not strip loss_weights"):
+        callback.on_step_begin(SimpleNamespace(global_step=1), micro_batches=[{"loss_weights": torch.ones(2)}])
+
+
 def test_channel_loss_callback_strips_metadata_after_preforward():
     cfg = ChannelLossConfig(enable=True, interval=1)
     trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
@@ -1777,13 +1787,3 @@ def _gloo_channel_data_metrics_worker(rank, world_size, sp_size, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
 def test_channel_data_metrics_gloo_sp_and_dp(sp_size):
     spawn_with_rendezvous(_gloo_channel_data_metrics_worker, args=(4, sp_size), nprocs=4)
-
-
-@pytest.mark.parametrize("field", ["source_id_keys", "source_name_keys", "extra_strip_keys"])
-def test_channel_loss_cannot_strip_training_loss_weights(field):
-    cfg = ChannelLossConfig(enable=True)
-    setattr(cfg, field, ["loss_weights"])
-    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
-    callback = ChannelLossCallback(trainer)
-    with pytest.raises(ValueError, match="must not strip loss_weights"):
-        callback.on_step_begin(SimpleNamespace(global_step=1), micro_batches=[{"loss_weights": torch.ones(2)}])
