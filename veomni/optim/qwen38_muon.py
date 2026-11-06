@@ -148,6 +148,39 @@ def _polar_express(matrix):
     return x.mT if transposed else x
 
 
+def _is_native_lora_weight(modules, name, param):
+    """Recognize native dense or MoE adapter A/B weights, not arbitrary names."""
+    parts = name.split(".")
+    if len(parts) < 3 or parts[-3] not in ("lora_A", "lora_B") or parts[-1] != "weight":
+        return False
+
+    from ..lora.layers import LoraLinear
+    from ..lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
+
+    wrapper_path = ".".join(parts[:-3])
+    wrapper = modules.get(wrapper_path)
+    if isinstance(wrapper, LoraLinear):
+        expected_ndim = 2
+    else:
+        experts_path, _, projection = wrapper_path.rpartition(".")
+        experts = modules.get(experts_path)
+        if projection not in ("gate_proj", "up_proj", "down_proj"):
+            return False
+        if isinstance(experts, LoraSharedExperts):
+            expected_ndim = 2
+        elif isinstance(experts, LoraIndependentExperts):
+            expected_ndim = 3
+        else:
+            return False
+    factors = getattr(wrapper, parts[-3], None)
+    return (
+        isinstance(factors, torch.nn.ModuleDict)
+        and parts[-2] in factors
+        and getattr(factors[parts[-2]], "weight", None) is param
+        and param.ndim == expected_ndim
+    )
+
+
 def logical_plan(model, name, param):
     """Return exhaustive output-row intervals; reject unknown trainable maps.
 
@@ -164,10 +197,12 @@ def logical_plan(model, name, param):
     adam = [("adamw", 0, rows)]
     if not param.requires_grad:
         raise ValueError("Frozen parameters must not enter the optimizer")
-    if "lora_" in name:
-        raise ValueError("The Qwen3.8 Muon recipe does not support LoRA")
     if "indexer" in name or ".visual." in name:
         raise ValueError("This recipe requires the QSA indexer and vision tower to remain frozen")
+    if "lora_" in name:
+        if _is_native_lora_weight(modules, name, param):
+            return adam
+        raise ValueError(f"Unsupported LoRA parameter for the Qwen3.8 Muon recipe: {name}")
     if isinstance(owner, torch.nn.Embedding):
         return adam
     if param.ndim < 2 or leaf == "bias" or isinstance(owner, (torch.nn.Conv1d, torch.nn.Conv2d)):

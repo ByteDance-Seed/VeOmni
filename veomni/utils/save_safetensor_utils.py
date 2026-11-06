@@ -383,7 +383,7 @@ def save_lora_adapter_with_dcp(
 
     from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
     from veomni.lora import is_veomni_lora_model
-    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.lora.state_dict import get_lora_state_dict, validate_lora_export_covers_trainable
 
     if not is_veomni_lora_model(model):
         raise TypeError(
@@ -400,8 +400,10 @@ def save_lora_adapter_with_dcp(
     from .dist_utils import raise_if_any_rank_failed
 
     fqn2spec_info = getattr(model, "_fqn2spec_info", None)
-    error = None
+    lora_state, error = None, None
     try:
+        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
+        validate_lora_export_covers_trainable(model, lora_state)
         if _needs_extra_parallel_layout_marker(fqn2spec_info):
             _extra_parallel_layout_key(fqn2spec_info)
     except BaseException as exc:
@@ -414,9 +416,8 @@ def save_lora_adapter_with_dcp(
 
     os.makedirs(save_path, exist_ok=True)
     dcp_save_path = os.path.join(save_path, dcp_subdir)
-    lora_state, error = None, None
+    error = None
     try:
-        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
         lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
         for name, value in lora_state.items():
             spec = (fqn2spec_info or {}).get(name)
