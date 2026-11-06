@@ -131,14 +131,17 @@ def install_cpu_ngram(model):
             old = embedding.weight
             mesh = old.device_mesh
             if id(mesh) not in cpu_meshes:
-                cpu_meshes[id(mesh)] = DeviceMesh(
-                    "cpu", mesh.mesh.clone(), mesh_dim_names=mesh.mesh_dim_names, _init_backend=False
+                # Keep the source mesh alive until installation finishes, so
+                # an identity-keyed cache entry cannot alias a reused id.
+                cpu_meshes[id(mesh)] = (
+                    mesh,
+                    DeviceMesh("cpu", mesh.mesh.clone(), mesh_dim_names=mesh.mesh_dim_names, _init_backend=False),
                 )
             local = old.to_local().detach().to(device="cpu", copy=True).contiguous()
             cpu_weight = torch.nn.Parameter(
                 DTensor.from_local(
                     local,
-                    cpu_meshes[id(mesh)],
+                    cpu_meshes[id(mesh)][1],
                     old.placements,
                     run_check=False,
                     shape=old.shape,
