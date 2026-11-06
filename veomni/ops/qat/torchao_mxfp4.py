@@ -43,13 +43,13 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor
 
 
 __all__ = [
     "MXFP4_BLOCK_SIZE",
+    "local_shard",
     "mxfp4_fake_quant",
-    "replicated_local",
 ]
 
 #: The OCP MX group width. Deployment kernels consume 32-wide groups, so a
@@ -89,29 +89,22 @@ class _MxFp4FakeQuant(torch.autograd.Function):
         return grad_output, None
 
 
-def replicated_local(tensor: Tensor, what: str) -> Tensor:
-    """Return the local tensor of a replicated DTensor, or ``tensor`` unchanged.
+def local_shard(tensor: Tensor) -> Tensor:
+    """Return the local tensor of a DTensor, or ``tensor`` unchanged.
 
-    FSDP2 hands a projection its parameter as a ``Replicate`` DTensor after the
-    all-gather, so the local shard is the whole tensor and using it is exact.
-    Any other placement is refused instead of quantized: MX groups run along the
-    last dimension, so a shard boundary through that dimension would pair
-    channels with another shard's scale and only change the numbers.
+    Quantization runs on whatever this rank holds. That is exact under every
+    placement the parallel plans produce, because MX groups run along the last
+    dimension and a group is never split: a ``Replicate`` placement holds the
+    whole tensor, a shard along an earlier dimension copies whole groups, and a
+    shard along the last dimension is only produced when its width is a multiple
+    of the group size -- which :func:`mxfp4_fake_quant` checks.
 
-    The bias is returned through this too. Leaving it a DTensor while the weight
-    became a plain tensor makes ``addmm`` reject the call with "got mixed
-    torch.Tensor and DTensor", and the bias is not quantized, so its local form
-    is the same value.
+    The bias goes through this too. Leaving it a DTensor while the weight became
+    a plain tensor makes ``addmm`` reject the call with "got mixed torch.Tensor
+    and DTensor", and the bias is not quantized, so its local form is the same
+    value.
     """
-    if not isinstance(tensor, DTensor):
-        return tensor
-    if not all(isinstance(placement, Replicate) for placement in tensor.placements):
-        raise TypeError(
-            f"MXFP4 fake quantization requires a replicated DTensor {what}, got placements "
-            f"{tuple(str(placement) for placement in tensor.placements)}; sharding the last dimension "
-            "would split a quantization group across shards."
-        )
-    return tensor.to_local()
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def mxfp4_fake_quant(x: Tensor, block_size: int = MXFP4_BLOCK_SIZE) -> Tensor:
@@ -133,7 +126,7 @@ def mxfp4_fake_quant(x: Tensor, block_size: int = MXFP4_BLOCK_SIZE) -> Tensor:
         return x
     if x.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"MXFP4 fake quantization expects a bfloat16 or float32 operand, got {x.dtype}")
-    x = replicated_local(x, "operand")
+    x = local_shard(x)
     if x.shape[-1] % block_size:
         raise ValueError(
             f"MXFP4 fake quantization needs the last dimension ({x.shape[-1]}) divisible by block_size "

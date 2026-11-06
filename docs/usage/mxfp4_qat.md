@@ -102,20 +102,43 @@ convergence recipe.
 ## Distributed behaviour
 
 The fake quantization runs inside the op, on whichever tensor the caller passes,
-and the operand must be a full local tensor. FSDP2 shards the parameter and
-all-gathers it before the block forward, so the op sees a plain tensor and
-gradients flow back to the FP32 master shard through the existing FSDP2 path.
+and it is per-row: MX groups span the last dimension, so a row split is never a
+group split. Every placement the parallel plans produce quantizes the same
+values it would unsharded:
 
-A DTensor operand is accepted only with a `Replicate` placement, whose local
-shard is the whole tensor; any other placement raises. MX groups run along the
-last dimension, so a shard boundary through that dimension would pair channels
-with another shard's scale and silently change the numbers instead of failing.
-That guard is a contract for the placements FSDP2 can produce rather than a
-description of today's forward, which is already a plain tensor.
+| Operand | Result |
+| --- | --- |
+| Plain tensor (FSDP2 after the all-gather) | exact |
+| `Replicate` DTensor | exact; the local shard is the whole tensor |
+| Shard along the output dimension | exact; each shard copies whole groups |
+| Shard along the quantized dimension, width a multiple of 32 | exact |
+| Shard along the quantized dimension, width not a multiple of 32 | `ValueError` |
 
-BF16 parameters with FP32 gradient reduction is the validated precision, and the
-example config pins it. Nothing else about the parallel topology is changed by
-this recipe.
+The last row is the only unsupported case, and it fails rather than rounding
+wrongly: a partial group has no defined scale. It is caught by the operand's own
+length, not by inspecting the placement, because the placement is not what
+determines correctness.
+
+Nothing here is specific to a parallelism degree, so FSDP2, HSDP, sequence or
+context parallel, tensor parallel and expert parallel are all permitted. **What
+has not been measured is convergence under them** — the numerical validation is
+single-device. Treat multi-rank QAT as untested, not as unsupported.
+
+BF16 parameters with FP32 gradient reduction is what the example config pins and
+what was validated. `torch.compile` is the one combination refused outright, at
+config time, per the next subsection.
+
+### `torch.compile` is rejected
+
+The MXFP4 row materializes `float8_e8m0fnu` scale tensors, and Inductor has no
+lowering for that dtype — the failure is
+`AssertionError: torch.float8_e8m0fnu missing from torch._inductor.codegen.cpp.DTYPE_TO_CPP`,
+raised from inside a fused kernel. `compile_decoder_blocks()` therefore rejects
+`linear_implementation: torchao_mxfp4` and `swiglu_mlp_implementation: torchao_mxfp4`
+before compiling, so the error names the config field instead of the assertion.
+
+Offloading is not restricted: CPU offload moves the shard to host and the op sees
+an ordinary tensor, so the fake quantization is unaffected.
 
 ## Checkpoints and export
 
