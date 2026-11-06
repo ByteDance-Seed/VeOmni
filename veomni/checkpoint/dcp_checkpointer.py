@@ -3239,11 +3239,12 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
-        if file_optimizers is not None and save_async:
-            raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
         planner, error = None, None
+        file_optimizers = None
         try:
+            file_optimizers = getattr(storage_writer, "_veomni_file_optimizers", None)
+            if file_optimizers is not None and save_async:
+                raise RuntimeError("File-backed optimizer state requires synchronous DCP save")
             optimizer_adapter = save_state.get("optimizer")
             planner_kwargs = dict(
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
