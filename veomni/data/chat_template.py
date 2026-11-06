@@ -286,6 +286,8 @@ class Llama2Template(ChatTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
     supports_loss_weights = True
+    dpo_unpadded_output_contract = True
+    dpo_unpadded_output_contract_id = "veomni.chatml.v1"
 
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         """Tokenize ChatML turns and retain optional per-token supervision weights."""
