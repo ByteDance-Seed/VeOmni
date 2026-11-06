@@ -199,7 +199,8 @@ per-item work happens*:
 
 Measured on one A100-SXM4-80GB against the real
 `/mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct` (28 layers, hidden 2048), each
-sample 4 images of 144 merged rows plus two ~400-token text turns:
+sample 4 images of 144 merged rows plus two ~400-token text turns — timing the two
+`batch_to_device` shapes directly, not a full training run:
 
 | Samples / micro-batch | items | rows | per-item placement (conversation) | one-shot (packed) | backbone forward | saved |
 |---|---|---|---|---|---|---|
@@ -216,8 +217,6 @@ VRAM-saturating batch and −0.44% at mbs=2, against `fsdp_scope: model` alone
 recovering 0.47% / 0.21% of that gap, and 0.18% (inside its own jitter) in the
 speech round. See [Adding a model §4.1](../usage/adding_a_model.md#41-packing-is-optional)
 for those numbers.
-
-Reproduce: `python scripts/seed_omni/bench_packed_qwen3vl.py`.
 
 Note the packed launcher reports no per-sample sequence lengths to the metric
 meter, so per-module token accounting and multi-source token counts read zero on
