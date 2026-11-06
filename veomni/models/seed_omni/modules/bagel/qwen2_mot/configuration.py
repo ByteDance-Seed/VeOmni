@@ -35,6 +35,11 @@ class BagelQwen2MoTConfig(OmniModuleConfig, Qwen2Config):
         freeze_und: bool = False,
         **kwargs,
     ):
+        ops_impl = kwargs.get("ops_implementation")
+        if "attn_implementation" not in kwargs and not (
+            isinstance(ops_impl, dict) and ops_impl.get("attn_implementation") is not None
+        ):
+            kwargs["attn_implementation"] = "flex_attention"
         super().__init__(
             vocab_size=vocab_size,
             hidden_size=hidden_size,

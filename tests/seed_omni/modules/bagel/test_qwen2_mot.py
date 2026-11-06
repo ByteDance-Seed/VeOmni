@@ -611,3 +611,22 @@ def test_bagel_qwen2_rotary_embedding_to_empty_from_meta_rebuilds_fp32_table() -
     assert rotary.inv_freq.data_ptr() != rotary.original_inv_freq.data_ptr()
     torch.testing.assert_close(rotary.inv_freq, ref_rotary.inv_freq)
     torch.testing.assert_close(rotary.original_inv_freq, ref_rotary.original_inv_freq)
+
+
+def test_bagel_qwen2_mot_config_defaults_to_flex_attention() -> None:
+    """Verify ``BagelQwen2MoTConfig`` defaults to ``veomni_flex_attention`` when no attention backend is specified."""
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
+
+    cfg = BagelQwen2MoTConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        max_position_embeddings=64,
+    )
+    assert cfg._attn_implementation == "veomni_flex_attention"
+    model = BagelQwen2MoT(cfg).eval()
+    assert model.model.layers[0].self_attn.veomni_attn is not None
+    assert model.model.layers[0].self_attn.veomni_attn.impl == "veomni_flex_attention"
