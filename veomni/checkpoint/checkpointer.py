@@ -93,6 +93,7 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
         trainable_only: bool = False,
         parallel_state=None,
+        evict_source_cache: bool = False,
     ):
         return
 

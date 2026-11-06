@@ -1091,6 +1091,7 @@ class DistributedCheckpointer(CheckpointerBase):
         module: str = "",
         trainable_only: bool = False,
         parallel_state=None,
+        evict_source_cache: bool = False,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -1133,6 +1134,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=True,
             )
 
+        def _reader(directory):
+            if evict_source_cache:
+                from .cache_aware_reader import CacheAwareFileSystemReader
+
+                return CacheAwareFileSystemReader(directory)
+            return cls._create_storage_reader(directory)
+
         wants_optimizer = state.get("optimizer") is not None
 
         fused_dir = cls._legacy_fused_dir(path, module)
@@ -1142,7 +1150,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 load_state["optimizer"] = _optimizer_state()
             dcp.load(
                 state_dict=load_state,
-                storage_reader=cls._create_storage_reader(fused_dir),
+                storage_reader=_reader(fused_dir),
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
             )
@@ -1153,14 +1161,14 @@ class DistributedCheckpointer(CheckpointerBase):
         model_root = model_dir(path, module)
         dcp.load(
             state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
+            storage_reader=_reader(weights_dir(path, module)),
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
         if wants_optimizer:
             dcp.load(
                 state_dict={"optimizer": _optimizer_state()},
-                storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
+                storage_reader=_reader(optimizer_dir(path, module)),
                 process_group=process_group,
                 # The strict check looks for missing ``model`` keys; there are none
                 # in an optimizer-only load, so strictness has nothing to say here.

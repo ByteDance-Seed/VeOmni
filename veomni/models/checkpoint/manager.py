@@ -207,11 +207,10 @@ class ModelCheckpointManager:
             "optimizer": self.runtime.optimizer,
             "extra_state": {},
         }
-        self.checkpointer.load(
-            load_dir,
-            state,
-            **self._checkpointer_kwargs(),
-        )
+        load_kwargs = self._checkpointer_kwargs()
+        if getattr(self.config, "dcp_evict_source_cache", False):
+            load_kwargs["evict_source_cache"] = True
+        self.checkpointer.load(load_dir, state, **load_kwargs)
         self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
