@@ -174,8 +174,6 @@ _BUILTIN_ENTRIES = (
     ("moe_experts_lora", "independent", "fused_npu", "npu", _NPU, ()),
     ("kv_round", "fp8", "eager", "any", _ANY, ()),
     ("kv_round", "fp8", "triton", "cuda", _GPU, ("triton",)),
-    ("kv_round", "fp4", "eager", "any", _ANY, ()),
-    ("kv_round", "fp4", "triton", "cuda", _GPU, ("triton",)),
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("linear", "standard", "eager", "any", _ANY, ()),
@@ -299,7 +297,6 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
     ("swiglu_mlp", "geglu", "liger_kernel", "mlu"),
     ("kv_round", "fp8", "triton", "cuda"),
-    ("kv_round", "fp4", "triton", "cuda"),
 }
 
 
