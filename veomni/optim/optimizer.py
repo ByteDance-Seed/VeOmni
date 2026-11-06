@@ -635,10 +635,6 @@ class MultiOptimizer(Optimizer, Stateful):
         by a scheduler even when no parameter has received a gradient.
         """
         merged: Dict[str, Any] = {}
-        if coordinate:
-            from ..checkpoint.optimizer_resume_layout import _validate_multi_leaf_order
-
-            _validate_multi_leaf_order(self, group=group)
         for name in self.key_names:
             error, sd = None, None
             try:
@@ -676,9 +672,6 @@ class MultiOptimizer(Optimizer, Stateful):
         )
 
     def _dcp_load_state_dict(self, state_dict: Dict[str, Any], *, group=None) -> None:
-        from ..checkpoint.optimizer_resume_layout import _validate_multi_leaf_order
-
-        _validate_multi_leaf_order(self, group=group)
         for name in self.key_names:
             error = None
             try:
