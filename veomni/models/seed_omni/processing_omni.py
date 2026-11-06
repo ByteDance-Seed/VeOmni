@@ -154,12 +154,7 @@ class OmniProcessor:
             if preprocessor is not None:
                 preprocessors[name] = preprocessor
                 logger.info_rank0(f"OmniProcessor: module '{name}' contributes {type(preprocessor).__name__}.")
-        infer_type = (
-            config.infer_type
-            if config.infer_type is not None
-            else (next(iter(config.generation_graphs)) if config.generation_graphs else None)
-        )
-        return cls(preprocessors, infer_type=infer_type)
+        return cls(preprocessors, infer_type=config.infer_type)
 
     @classmethod
     def from_pretrained(
@@ -253,8 +248,8 @@ class OmniProcessor:
         Training uses ``inference=False`` (default); single-request inference
         uses :meth:`__call__` with ``inference=True``.
         """
-        if inference and self.infer_type is not None:
-            generation_kwargs.setdefault("infer_type", self.infer_type)
+        if inference and self.infer_type is not None and generation_kwargs.get("infer_type") is None:
+            generation_kwargs["infer_type"] = self.infer_type
         for preprocessor in self._preprocessors.values():
             preprocessor(
                 batch,

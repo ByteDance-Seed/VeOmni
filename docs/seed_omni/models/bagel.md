@@ -25,7 +25,7 @@ inference block maps each scenario to a separate generation graph.
 
 | File | Role |
 |------|------|
-| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and `infer` block. |
+| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, and train blocks. |
 | `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
 | `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses FlexAttention. |
 | `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
