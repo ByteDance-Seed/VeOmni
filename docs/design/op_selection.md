@@ -70,8 +70,10 @@ Its row on `swiglu_mlp` reaches only models that run the fused SwiGLU; a model
 that owns its projections reads `linear_implementation` instead. Both require the
 optional `torchao` package and are unavailable without it.
 
-**The eight general-purpose op fields default per host.** They default to
+**The nine general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
+`kv_round_implementation` is the exception: `None` there means *off*, not
+"use the host default", so an unset field never turns storage rounding on.
 On Ascend NPU, unset fields resolve to `torch_npu` for RMSNorm, rotary embedding and
 its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
 for MoE; and to `eager` for SwiGLU, dense projection and load-balancing loss. Explicit

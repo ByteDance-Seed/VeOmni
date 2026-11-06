@@ -131,6 +131,7 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
+from veomni.models.utils.linear_utils import project_through_op
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
@@ -162,6 +163,33 @@ def _storage_round_op(config: "DeepseekV4Config", variant: str) -> "VeomniOp | N
     if impl is None:
         return None
     return VeomniOp("kv_round", variant, impl)
+
+
+def round_expert_operands(
+    impl: str, hidden_states: torch.Tensor, gate_up_proj: torch.Tensor, down_proj: torch.Tensor, expert_dtype: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a quantizing ``moe_experts`` row's rounding outside the fused GEMM.
+
+    The non-SwiGLU expert loop cannot call the family row, so it asks the row
+    which recipe is selected and reproduces that rounding directly. A reference
+    row leaves all three operands untouched.
+    """
+    # The only quantizing ``moe_experts`` row today. Kept inline rather than as a
+    # module constant because codegen copies only the helper, not the module.
+    if impl != "qat":
+        return hidden_states, gate_up_proj, down_proj
+    from veomni.ops.qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
+
+    def _weight(weight: torch.Tensor) -> torch.Tensor:
+        if expert_dtype == "fp4":
+            return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
+        return fp8_fake_quant_stacked_weight(weight)
+
+    return (
+        fp8_fake_quant_act(hidden_states) if hidden_states.numel() > 0 else hidden_states,
+        _weight(gate_up_proj),
+        _weight(down_proj),
+    )
 
 
 def round_stored_kv(kv: torch.Tensor, rope_features: int, op: "VeomniOp | None") -> torch.Tensor:
@@ -926,7 +954,7 @@ class DeepseekV4Indexer(nn.Module):
 
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = (
-            self.veomni_q_b_proj(q_residual, self.q_b_proj.weight, self.q_b_proj.weight.new_empty(0))
+            project_through_op(self.veomni_q_b_proj, self.q_b_proj, q_residual)
             .view(batch, seq_len, -1, self.head_dim)
             .transpose(1, 2)
         )
@@ -1409,19 +1437,13 @@ class DeepseekV4Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
 
-        q_residual = self.q_a_norm(
-            self.veomni_q_a_proj(hidden_states, self.q_a_proj.weight, self.q_a_proj.weight.new_empty(0))
-        )
-        q = self.q_b_norm(
-            self.veomni_q_b_proj(q_residual, self.q_b_proj.weight, self.q_b_proj.weight.new_empty(0)).view(
-                *hidden_shape
-            )
-        )
+        q_residual = self.q_a_norm(project_through_op(self.veomni_q_a_proj, self.q_a_proj, hidden_states))
+        q = self.q_b_norm(project_through_op(self.veomni_q_b_proj, self.q_b_proj, q_residual).view(*hidden_shape))
         q = q.transpose(1, 2)
         q = self.veomni_rope(q, cos, sin)
 
         kv = (
-            self.kv_norm(self.veomni_kv_proj(hidden_states, self.kv_proj.weight, self.kv_proj.weight.new_empty(0)))
+            self.kv_norm(project_through_op(self.veomni_kv_proj, self.kv_proj, hidden_states))
             .view(*hidden_shape)
             .transpose(1, 2)
         )
@@ -1574,10 +1596,10 @@ class DeepseekV4Attention(nn.Module):
 
         attn_output = self.veomni_rope(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
-        grouped = self.veomni_o_a_proj(
-            grouped, self.o_a_proj.weight, self.o_a_proj.weight.new_empty(0), n_groups=self.config.o_groups
+        grouped = project_through_op(
+            self.veomni_o_a_proj, self.o_a_proj, grouped, n_groups=self.config.o_groups
         ).flatten(2)
-        output = self.veomni_o_b_proj(grouped, self.o_b_proj.weight, self.o_b_proj.weight.new_empty(0))
+        output = project_through_op(self.veomni_o_b_proj, self.o_b_proj, grouped)
         if build_indexer_loss:
             return output, attn_weights, indexer_kl, indexer_uniform
         return output, attn_weights
@@ -1765,7 +1787,8 @@ class DeepseekV4Experts(nn.Module):
         # Absent from `DeepseekV4Config`; a published checkpoint carries it as an
         # extra config key, and only V4-Flash sets it to "fp4".
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
-        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
+        self.moe_implementation = config.ops_config.moe_implementation
+        self.veomni_moe = VeomniOp("moe_experts", "standard", self.moe_implementation)
 
     def forward(
         self,
@@ -1780,7 +1803,12 @@ class DeepseekV4Experts(nn.Module):
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
         if not self.use_swiglu_mlp:
-            # The act_fn loop does not use grouped-GEMM ``max_M``.
+            # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
+            # through the family row. Apply that row's own rounding here instead:
+            # skipping it would train a recipe the deployment kernel never runs.
+            hidden_states, gate_up_proj, down_proj = round_expert_operands(
+                self.moe_implementation, hidden_states, gate_up_proj, down_proj, self.expert_dtype
+            )
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

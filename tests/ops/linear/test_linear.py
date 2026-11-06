@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.utils.linear_utils import QUANTIZING_LINEAR_IMPLS
 from veomni.ops import OP_REGISTRY, VeomniOp
 from veomni.utils.import_utils import is_package_available
 
@@ -313,3 +314,55 @@ def test_linear_torchao_mxfp4_rejects_sharded_dtensor_parameter(single_rank_dist
 
     with pytest.raises(TypeError, match="replicated DTensor"):
         VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))
+
+
+def test_project_through_op_falls_back_to_a_wrapped_module():
+    """A wrapped projection keeps its base layer at ``base_layer`` and owns no ``weight``."""
+    from torch import nn
+
+    from veomni.models.utils.linear_utils import project_through_op
+
+    class Wrapped(nn.Module):
+        """Stand-in for ``LoraLinear``: no ``weight`` attribute, own forward."""
+
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(8, 4, bias=False)
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            return self.base_layer(x)
+
+    module = Wrapped()
+    x = torch.randn(2, 8)
+    handle = VeomniOp("linear", "standard", "eager")
+
+    out = project_through_op(handle, module, x)
+
+    assert module.calls == 1
+    torch.testing.assert_close(out, module.base_layer(x))
+    # The fallback is a real forward, not a reimplementation.
+    torch.testing.assert_close(out, F.linear(x, module.base_layer.weight, None))
+
+
+@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_LINEAR_IMPLS))
+def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantizing_impl):
+    """Running the unquantized base layer would leave the config claiming QAT."""
+    from torch import nn
+
+    from veomni.models.utils.linear_utils import project_through_op
+
+    class Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(8, 4, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    class FakeOp:
+        impl = quantizing_impl
+
+    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
+        project_through_op(FakeOp(), Wrapped(), torch.randn(2, 8))

@@ -32,6 +32,7 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs
+from veomni.models.utils.linear_utils import project_through_op
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
@@ -267,7 +268,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         attn = self.self_attn
         hidden_shape = (*hidden_states.shape[:-1], 1, attn.head_dim)
         kv = (
-            attn.kv_norm(attn.veomni_kv_proj(hidden_states, attn.kv_proj.weight, attn.kv_proj.weight.new_empty(0)))
+            attn.kv_norm(project_through_op(attn.veomni_kv_proj, attn.kv_proj, hidden_states))
             .view(*hidden_shape)
             .transpose(1, 2)
         )
@@ -303,13 +304,9 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         batch, seq_len, _ = hidden_states.shape
         hidden_shape = (batch, seq_len, -1, attn.head_dim)
 
-        q_residual = attn.q_a_norm(
-            attn.veomni_q_a_proj(hidden_states, attn.q_a_proj.weight, attn.q_a_proj.weight.new_empty(0))
-        )
+        q_residual = attn.q_a_norm(project_through_op(attn.veomni_q_a_proj, attn.q_a_proj, hidden_states))
         q = attn.q_b_norm(
-            attn.veomni_q_b_proj(q_residual, attn.q_b_proj.weight, attn.q_b_proj.weight.new_empty(0)).view(
-                *hidden_shape
-            )
+            project_through_op(attn.veomni_q_b_proj, attn.q_b_proj, q_residual).view(*hidden_shape)
         ).transpose(1, 2)
         q = attn.veomni_rope(q, cos, sin)
         query = q.transpose(1, 2)
@@ -361,10 +358,10 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
 
         output = attn.veomni_rope(output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = output.reshape(batch, seq_len, attn.config.o_groups, -1)
-        grouped = attn.veomni_o_a_proj(
-            grouped, attn.o_a_proj.weight, attn.o_a_proj.weight.new_empty(0), n_groups=attn.config.o_groups
+        grouped = project_through_op(
+            attn.veomni_o_a_proj, attn.o_a_proj, grouped, n_groups=attn.config.o_groups
         ).flatten(2)
-        return attn.veomni_o_b_proj(grouped, attn.o_b_proj.weight, attn.o_b_proj.weight.new_empty(0))
+        return project_through_op(attn.veomni_o_b_proj, attn.o_b_proj, grouped)
 
     def collapse_draft(self, hidden_streams: torch.Tensor) -> torch.Tensor:
         """Last-stage ``norm(hc_head(hidden_streams))`` -- the tensor the shared LM head reads."""
