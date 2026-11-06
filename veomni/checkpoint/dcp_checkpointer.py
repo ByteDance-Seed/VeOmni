@@ -19,7 +19,6 @@ import os
 import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Dict, Optional, Set, Union
 
@@ -32,7 +31,6 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -60,6 +58,8 @@ from .layout import (
     step_dir,
     weights_dir,
 )
+from .ple_planner import _EXPERT_LAYOUTS_KEY as _EXPERT_LAYOUTS_KEY
+from .ple_planner import PleLoadPlanner, PleSavePlanner, _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
 
 
 logger = logging.get_logger(__name__)
@@ -69,128 +69,11 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
-_EXPERT_LAYOUTS_KEY = "__veomni_expert_layouts__"
-
-
-def _expert_layout(tensor):
-    """Describe the source EP/FSDP layout, independently of the load target."""
-    if not isinstance(tensor, DTensor):
-        return None
-    mesh = tensor.device_mesh
-    names = mesh.mesh_dim_names or ()
-    if "ep" not in names:
-        return None
-    ep_axis = names.index("ep")
-    ep = tensor.placements[ep_axis]
-    if not isinstance(ep, Shard):
-        return None
-    fsdp_axis = names.index("ep_fsdp") if "ep_fsdp" in names else None
-    fsdp = tensor.placements[fsdp_axis] if fsdp_axis is not None else Replicate()
-    fsdp_dim = fsdp.dim if isinstance(fsdp, (Shard, _StridedShard)) else None
-    fsdp_size = mesh.size(fsdp_axis) if fsdp_axis is not None else 1
-    same_axis = ep.dim == fsdp_dim and mesh.size(ep_axis) > 1 and fsdp_size > 1
-    canonical = not same_axis or isinstance(fsdp, _StridedShard)
-    return {
-        "ep_shard_dim": ep.dim,
-        "fsdp_shard_dim": fsdp_dim,
-        "ep_size": mesh.size(ep_axis),
-        "fsdp_size": fsdp_size,
-        "expert_order": "canonical" if canonical else "legacy_fsdp_first",
-    }
-
-
-class _ExtraParallelSavePlanner(DefaultSavePlanner):
-    """Record per-tensor source layouts in DCP metadata, including optimizer state."""
-
-    def create_local_plan(self):
-        plan = super().create_local_plan()
-        layouts = {key: layout for key, value in self.state_dict.items() if (layout := _expert_layout(value))}
-        return replace(plan, planner_data={**(plan.planner_data or {}), _EXPERT_LAYOUTS_KEY: layouts})
-
-    def create_global_plan(self, all_plans):
-        plans, metadata = super().create_global_plan(all_plans)
-        # Reuse DCP's plan exchange; sparse optimizer states may appear on only
-        # some ranks. Keep the ordinary FQN -> state-dict path mappings intact.
-        layouts = {}
-        for plan in all_plans:
-            layouts.update(plan.planner_data[_EXPERT_LAYOUTS_KEY])
-        metadata.planner_data = {
-            **(metadata.planner_data or {}),
-            _EXPERT_LAYOUTS_KEY: {"version": 1, "tensors": layouts},
-        }
-        return plans, metadata
-
-
-class _ModelStrictLoadPlanner(DefaultLoadPlanner):
-    """Allow partial optimizer state while requiring a complete full-model DCP."""
-
-    def __init__(self, strict_model: bool):
-        super().__init__(allow_partial_load=True)
-        self.strict_model = strict_model
-
-    def create_local_plan(self):
-        self._validate_expert_layouts()
-        plan = super().create_local_plan()
-        if not self.strict_model:
-            return plan
-
-        assert self.metadata is not None
-        missing_model_keys = sorted(
-            key
-            for key, path in self.mappings.items()
-            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
-        )
-        if missing_model_keys:
-            preview = ", ".join(missing_model_keys[:10])
-            suffix = " ..." if len(missing_model_keys) > 10 else ""
-            raise RuntimeError(
-                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
-                f"{preview}{suffix}"
-            )
-
-        return plan
-
-    def _validate_expert_layouts(self):
-        planner_data = self.metadata.planner_data or {}
-        source = planner_data.get(_EXPERT_LAYOUTS_KEY)
-        if source is not None:
-            if source["version"] != 1:
-                raise RuntimeError(f"Unsupported checkpoint expert layout version: {source['version']}")
-            for key in self.state_dict.keys() & source["tensors"].keys():
-                if source["tensors"][key]["expert_order"] != "canonical":
-                    raise RuntimeError(
-                        f"Checkpoint tensor {key!r} has noncanonical expert order: {source['tensors'][key]}. "
-                        "Migrate model and optimizer state using the original training layout before loading."
-                    )
-            return
-
-        # Checkpoints produced by the earlier version of this feature already
-        # used canonical coordinates, but did not record individual layouts.
-        if planner_data.get("__veomni_ep_first_layout__") == 1:
-            return
-
-        for key, value in self.state_dict.items():
-            layout = _expert_layout(value)
-            saved = self.metadata.state_dict_metadata.get(key)
-            if layout is None or saved is None:
-                continue
-            # For legacy VeOmni EP weights, the faulty same-axis layout only
-            # split the expert dimension. A source chunk that splits matrix
-            # rows (old dim-1 FSDP), or spans all experts, cannot have that
-            # permutation. This uses saved chunks, never the target FSDP dim.
-            ep_dim = layout["ep_shard_dim"]
-            if all(
-                chunk.sizes[ep_dim] == saved.size[ep_dim]
-                or any(size < saved.size[dim] for dim, size in enumerate(chunk.sizes) if dim != ep_dim)
-                for chunk in saved.chunks
-            ):
-                continue
-            raise RuntimeError(
-                f"Cannot determine source expert order for {key!r} in this unversioned checkpoint. "
-                "Expert-only chunks may come from legacy Muon dim-0 saves with permuted expert IDs. "
-                "Migrate model and optimizer state using the original training layout before loading; "
-                "changing the target expert_fsdp_shard_dim does not resolve the ambiguity."
-            )
+def _model_load_planner(*, strict_model: bool, ple_rows_by_name):
+    """Select the PLE planner only when model weights have PLE row metadata."""
+    if ple_rows_by_name:
+        return PleLoadPlanner(strict_model=strict_model, ple_rows_by_name=ple_rows_by_name)
+    return _ModelStrictLoadPlanner(strict_model=strict_model)
 
 
 def _validate_extra_parallel_meshes(parallel_state) -> None:
@@ -316,11 +199,26 @@ class ModelState(Stateful):
             This is the LoRA / PEFT path: frozen base weights are skipped on save and
             ``set_model_state_dict`` runs in ``strict=False`` mode on load so the
             (already populated from ``model_path``) base params are left untouched.
+        crop_ple: when ``True``, Qwen4-Exp PLE weights are stored at their logical
+            row count. Load then pads the zero tail back onto the runtime parameter.
+            Old checkpoints that still contain the padded shape are loaded with
+            ``crop_ple=False``.
+        load_target: allocate empty logical PLE shards for DCP to fill, avoiding
+            communication of runtime weights while preparing a load.
     """
 
-    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
+    def __init__(
+        self,
+        model,
+        trainable_only: bool = False,
+        parallel_state=None,
+        crop_ple: bool = True,
+        load_target: bool = False,
+    ):
         self.model = model
         self.trainable_only = trainable_only
+        self.crop_ple = crop_ple
+        self.load_target = load_target
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
@@ -332,6 +230,7 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
+        """Extract model weights with their checkpoint sharding and optional PLE projection."""
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
@@ -341,6 +240,11 @@ class ModelState(Stateful):
             # As fsdp+extra parallel and pure extra parallel have different placements, e.g. [Shard(0), Shard(1)] and [Shard(0)],
             # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
+
+        if self.crop_ple:
+            from .ple_rows import crop_ple_state_dict_for_dcp
+
+            model_state_dict = crop_ple_state_dict_for_dcp(self.model, model_state_dict, empty=self.load_target)
 
         return model_state_dict
 
@@ -354,6 +258,11 @@ class ModelState(Stateful):
         model_state_dict = state_dict
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
+
+        if self.crop_ple:
+            from .ple_rows import pad_ple_state_dict_from_dcp
+
+            model_state_dict = pad_ple_state_dict_from_dcp(self.model, model_state_dict)
 
         options = StateDictOptions(strict=False) if self.trainable_only else None
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
@@ -1010,7 +919,9 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             cls.execute_save(
                 save_state={
-                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+                    "model": ModelState(
+                        state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
+                    )
                 },
                 storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
                 save_async=save_async,
@@ -1122,8 +1033,15 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
+        from .ple_rows import ple_row_counts
+
+        ple_counts = {f"model.{name}": counts for name, counts in ple_row_counts(state["model"]).items()}
+
         def _model_state() -> "ModelState":
-            return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+            """Build the model load target using its padded runtime shapes."""
+            return ModelState(
+                state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
+            )
 
         def _optimizer_state() -> "OptimizerState":
             return OptimizerState(
@@ -1144,18 +1062,19 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+                planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
 
         model_root = model_dir(path, module)
+        weights_path = weights_dir(path, module)
         dcp.load(
             state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
+            storage_reader=cls._create_storage_reader(weights_path),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
         )
         if wants_optimizer:
             dcp.load(
@@ -1301,7 +1220,18 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        planner = _ExtraParallelSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        from .ple_rows import ple_row_counts
+
+        model_state = save_state.get("model")
+        counts = ple_row_counts(model_state.model) if isinstance(model_state, ModelState) else {}
+        planner = (
+            PleSavePlanner(
+                {f"model.{name}": rows for name, rows in counts.items()},
+                dedup_save_to_lowest_rank=save_to_lowest_rank,
+            )
+            if counts
+            else _ExtraParallelSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        )
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save

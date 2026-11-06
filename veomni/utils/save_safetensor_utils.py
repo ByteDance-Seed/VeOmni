@@ -33,6 +33,18 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+def crop_state_dict_for_hf_export(model, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Project PLE weights to checkpoint rows before a Hugging Face write.
+
+    Dense tensors use ``crop_hf_export_tensor``. Row-sharded DTensors retain
+    standard logical-shape partitioning and column sharding without gathering
+    a full PLE table. DCP uses a separate storage planner.
+    """
+    from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
+
+    return project_state_dict_to_checkpoint(model, state_dict)
+
+
 @torch.no_grad()
 def get_model_save_state(
     model: torch.nn.Module,
@@ -126,7 +138,11 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
+
+    # Stage each cropped PLE table before projecting the next to bound device copies.
+    save_state = ModelState(model, parallel_state=parallel_state, crop_ple=False).state_dict()
+    save_state = project_state_dict_to_checkpoint(model, save_state, cpu_offload=True)
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
@@ -224,6 +240,9 @@ def _save_hf_safetensor_distributed(
     helper.empty_cache()
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
+    # PLE rows were already projected to the checkpoint shape in
+    # ``get_model_save_state`` via ``ModelState``. The writer therefore emits
+    # logical rows directly; there is no second crop of the safetensors files.
 
     # Save model assets (config, tokenizer, etc.) on rank 0
     if model_assets and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -238,6 +257,7 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
+    model: Optional[torch.nn.Module] = None,
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -245,6 +265,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
+    model_state_dict = crop_state_dict_for_hf_export(model, model_state_dict)
     save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
@@ -330,6 +351,7 @@ def save_hf_safetensor(
                 model_assets,
                 ckpt_manager,
                 output_dir,
+                model=model,
             )
 
     # Ensure all ranks finish saving before anyone proceeds
