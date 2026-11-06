@@ -29,7 +29,7 @@ from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _cursor_failure_worker(rank, root, endpoint):
+def _cursor_failure_worker(rank, root, failure, endpoint):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -43,6 +43,10 @@ def _cursor_failure_worker(rank, root, endpoint):
 
         def snapshot(_state):
             if rank == 0:
+                if failure == "invalid":
+                    return None
+                if failure == "fatal":
+                    raise SystemExit("data cursor aborted")
                 raise RuntimeError("data cursor unavailable")
             return {"train_dataloader": {}}
 
@@ -50,7 +54,7 @@ def _cursor_failure_worker(rank, root, endpoint):
         failed = False
         try:
             callback.save_global_state(TrainerState(global_step=10))
-        except RuntimeError:
+        except BaseException:
             failed = True
         outcomes = [None, None]
         dist.all_gather_object(outcomes, failed)
@@ -60,13 +64,14 @@ def _cursor_failure_worker(rank, root, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_rank_local_cursor_failure_stops_all_ranks(tmp_path):
+@pytest.mark.parametrize("failure", ["error", "fatal", "invalid"])
+def test_rank_local_cursor_failure_stops_all_ranks(tmp_path, failure):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     step_root = str(tmp_path / "global_step_10")
     layout.write_manifest(step_root, global_step=10, world_size=2, model_state=False)
     assert layout.checkpoint_is_complete(step_root)
-    spawn_with_rendezvous(_cursor_failure_worker, args=(str(tmp_path),), nprocs=2)
+    spawn_with_rendezvous(_cursor_failure_worker, args=(str(tmp_path), failure), nprocs=2)
     assert not layout.checkpoint_is_complete(step_root)
 
 
