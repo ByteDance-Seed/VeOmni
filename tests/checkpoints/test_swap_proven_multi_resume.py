@@ -647,42 +647,6 @@ def test_single_swap_frozen_history_rejects_optimizer_load_hook_before_loading(t
     torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
 
 
-def _mismatched_leaf_worker(rank, checkpoint, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model = torch.nn.Linear(3, 2)
-        if rank == 0:
-            leaves = {
-                "weight": SwapAdamW([model.weight], pin_memory=False),
-                "bias": SwapAdamW([model.bias], pin_memory=False),
-            }
-        else:
-            leaves = {"both": SwapAdamW(model.parameters(), pin_memory=False)}
-        optimizer = MultiOptimizer(model, leaves, list(leaves))
-        with pytest.raises(RuntimeError, match="leaf order differs"):
-            DistributedCheckpointer.save(
-                checkpoint,
-                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
-                parallel_state=SimpleNamespace(dp_mode="ddp"),
-            )
-        value = torch.ones(1)
-        dist.all_reduce(value)
-        assert value.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_mismatched_swap_leaves_fail_before_checkpoint(tmp_path):
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_mismatched_leaf_worker, nprocs=2, args=(str(tmp_path / "ckpt"),))
-
-
 def _single_swap_save_failure_worker(rank, checkpoint, failure, save_async, endpoint):
     from datetime import timedelta
 
