@@ -62,7 +62,7 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L177)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L171)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
