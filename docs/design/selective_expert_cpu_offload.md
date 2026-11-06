@@ -21,8 +21,12 @@ model:
 The exclusion list keeps complete matching expert modules resident on the
 accelerator. Patterns match complete module FQNs using the parallel plan's `*`
 wildcard rules; every exclusion must match a selected expert module. An empty
-list offloads all selected experts. Keeping 8 or 16 layers resident changes this
-list, not the implementation or checkpoint layout.
+list offloads all selected experts. The list changes placement, while model
+tensor shapes and parallel shard geometry stay unchanged. With an owner-aware
+MultiOptimizer checkpoint, each optimizer-owned parameter's device type is part
+of the optimizer identity: preserve its CPU/accelerator placement when resuming.
+The remaining owner, mesh, dtype and scheduler checks still apply. This feature
+does not provide a validated optimizer-state migration across placements.
 
 ## Placement and update lifecycle
 
