@@ -424,6 +424,8 @@ def test_epoch_resume_coordinates_ranks_without_a_local_loader(tmp_path, multi, 
 
 
 def _save_failure_worker(rank, tmp_path, mode, endpoint):
+    from contextlib import nullcontext
+
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.trainer.callbacks.base import TrainerState
 
@@ -444,9 +446,19 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
             expected = (RuntimeError, "(collecting|preparing) trainer checkpoint state failed on another rank")
         elif mode == "cursor":
             expected = (ValueError, "injected cursor failure")
+        elif mode == "generation_fatal":
+            expected = (SystemExit, "injected generation failure")
         else:
             expected = (RuntimeError, "matching MultiOptimizer checkpoint generation")
-        with pytest.raises(expected[0], match=expected[1]):
+        inject = (
+            patch(
+                "veomni.trainer.callbacks.global_state_callback._saved_multi_optimizer_generations",
+                side_effect=SystemExit("injected generation failure"),
+            )
+            if mode == "generation_fatal" and rank == 1
+            else nullcontext()
+        )
+        with inject, pytest.raises(expected[0], match=expected[1]):
             callback.save_global_state(TrainerState(global_step=3))
         dist.barrier()
         assert not (tmp_path / "global_step_3").exists()
@@ -456,6 +468,6 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("mode", ["cursor", "generation"])
+@pytest.mark.parametrize("mode", ["cursor", "generation", "generation_fatal"])
 def test_trainer_save_failure_is_coordinated_before_write(tmp_path, mode):
     spawn_with_rendezvous(_save_failure_worker, args=(tmp_path, mode), nprocs=2)
