@@ -48,6 +48,35 @@ def test_inline_data_uri_and_text_only():
     assert images == []
 
 
+def test_masked_fractional_weight_does_not_change_labels():
+    """Masked message weights do not require the weighted renderer."""
+    from types import SimpleNamespace
+
+    from veomni.data.multimodal.openai_messages import OpenAIChatMLVisionTemplate
+
+    vision = SimpleNamespace(
+        tokenizer=_ToyTokenizer(), image_token_id=1000, video_token_id=1001, image_pattern=lambda count: "I" * count
+    )
+    template = OpenAIChatMLVisionTemplate(vision, 8192)
+    message = {"role": "assistant", "content": "hidden", "loss_mask": 0, "loss_weight": 0.5}
+    normalized, _ = normalize_openai_messages({"messages": [message]})
+    assert normalized[0]["loss_weight"] == 0.5
+    actual = template.encode_messages(normalized)
+    baseline, _ = normalize_openai_messages({"messages": [{**message, "loss_weight": 0}]})
+    expected = template.encode_messages(baseline)
+    assert (actual["input_ids"] == expected["input_ids"]).all()
+    assert (actual["labels"] == expected["labels"]).all()
+    assert (actual["labels"] == -100).all()
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.1, float("nan"), float("inf")])
+def test_masked_weights_must_still_be_valid(weight):
+    with pytest.raises(ValueError, match="loss_weight"):
+        normalize_openai_messages(
+            {"messages": [{"role": "assistant", "content": "hidden", "loss_mask": 0, "loss_weight": weight}]}
+        )
+
+
 @pytest.mark.parametrize(
     "sample",
     [
@@ -330,6 +359,36 @@ def test_fractional_weight_is_not_silently_dropped():
     sample["messages"][0]["loss_weight"] = 0
     messages, _ = normalize_openai_messages(sample)
     assert (template.encode_messages(messages)["labels"] == -100).all()
+
+
+def test_masked_and_active_fractional_weights_with_weighted_renderer():
+    """Masked weights stay excluded alongside a real fractional target."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.data.multimodal.openai_messages import OpenAIChatMLVisionTemplate
+
+    tokenizer = _ToyTokenizer()
+    sample = {
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "masked", "loss_mask": 0, "loss_weight": 0.5},
+            {"role": "assistant", "content": "trained", "loss_mask": 1, "loss_weight": 0.25},
+        ]
+    }
+    expected = ChatmlTemplate(tokenizer).encode_messages(sample["messages"])
+    if "loss_weights" not in expected:
+        pytest.skip("requires the independent weighted-loss feature")
+    vision = SimpleNamespace(
+        tokenizer=tokenizer, image_token_id=1000, video_token_id=1001, image_pattern=lambda count: "I" * count
+    )
+    normalized, _ = normalize_openai_messages(sample)
+    actual = OpenAIChatMLVisionTemplate(vision, 8192).encode_messages(normalized)
+    assert torch.equal(actual["input_ids"], torch.tensor(expected["input_ids"]))
+    assert torch.equal(actual["labels"], torch.tensor(expected["labels"]))
+    assert torch.equal(actual["loss_weights"], torch.tensor(expected["loss_weights"]))
 
 
 def test_weighted_text_image_mixed_packing(monkeypatch):

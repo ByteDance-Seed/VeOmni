@@ -136,7 +136,6 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
             or not math.isfinite(float(weight))
             or not 0 <= weight <= 1
             or (0 < weight < np.finfo(np.float32).tiny)
-            or (mask == 0 and weight not in (0, 1))
         ):
             raise ValueError("loss_weight must be finite and in [0, 1]")
         content = message.get("content")
@@ -241,7 +240,7 @@ class OpenAIChatMLVisionTemplate:
                 "content": "".join(content),
                 "loss_mask": int(bool(message["loss_mask"]) and weight != 0),
             }
-            if 0 < weight < 1:
+            if rendered_message["loss_mask"] and 0 < weight < 1:
                 rendered_message["loss_weight"] = weight
             rendered.append(rendered_message)
         if next(counts, None) is not None:
