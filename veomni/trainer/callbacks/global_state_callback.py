@@ -315,7 +315,7 @@ class GlobalStateCallback(Callback):
         generations, generation_error = {}, None
         try:
             generations = _saved_multi_optimizer_generations(self.trainer, state.global_step)
-        except Exception as exc:  # noqa: BLE001 - all ranks must fail before writing
+        except BaseException as exc:  # noqa: BLE001 - all ranks must fail before writing
             generation_error = exc
         raise_if_any_rank_failed(generation_error, "preparing trainer checkpoint state")
         if generations:
