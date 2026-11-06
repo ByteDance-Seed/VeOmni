@@ -117,7 +117,6 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
-design/qwen4_frozen_prefix.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md
@@ -125,6 +124,7 @@ design/local_parallel_state.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md
+design/qwen4_frozen_prefix.md
 design/deepseek_v4_context_parallel.md
 design/deepseek_v4_indexer_loss.md
 ```
