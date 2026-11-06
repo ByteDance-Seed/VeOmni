@@ -112,12 +112,6 @@ def _scheduler_functions(scheduler):
                 "BUILD_SET",
                 "SET_ADD",
                 "SET_UPDATE",
-                # Formatting arbitrary objects can include process-local ids.
-                "FORMAT_VALUE",
-                "FORMAT_SIMPLE",
-                "FORMAT_WITH_SPEC",
-                "CONVERT_VALUE",
-                "BUILD_STRING",
             ):
                 raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
             if opcode in ("LOAD_ATTR", "LOAD_METHOD"):
