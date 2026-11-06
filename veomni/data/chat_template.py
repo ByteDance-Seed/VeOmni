@@ -294,6 +294,7 @@ class Llama2Template(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
+    supports_loss_weights = False
     dpo_unpadded_output_contract = True
     dpo_unpadded_output_contract_id = "veomni.chatml.v1"
 
