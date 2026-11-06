@@ -14,15 +14,50 @@ import numpy as np
 
 
 OPENAI_CHATML_VLM_JINJA = """\
+{%- if tools is defined and tools %}
+    {{- raise_exception('Pass serialized tool definitions in the system message, not the tools argument') }}
+{%- endif %}
 {%- for message in messages %}
-    {%- set rendered = namespace(content='') %}
+    {%- if message['role'] not in ['system', 'user', 'assistant', 'tool'] %}
+        {{- raise_exception('Unsupported message role') }}
+    {%- endif %}
+    {%- if message.get('loss_mask') is not none and message.get('loss_mask') not in [0, 1] %}
+        {{- raise_exception('loss_mask must be binary') }}
+    {%- endif %}
+    {%- if message.get('tool_calls') or message.get('function_call') or message.get('tool_call_id') or message.get('name') %}
+        {{- raise_exception('Structured tool message metadata is unsupported') }}
+    {%- endif %}
+    {%- if message.get('image') or message.get('images') or message.get('image_url') or message.get('audio') or message.get('audios') or message.get('video') or message.get('videos') or message.get('pixel_values') or message.get('pixel_values_videos') or message.get('image_grid_thw') or message.get('video_grid_thw') or message.get('image_mask') or message.get('video_mask') %}
+        {{- raise_exception('Unsupported message media field') }}
+    {%- endif %}
+    {%- set rendered = namespace(content='', adjacent_text='') %}
     {%- if message['content'] is string %}
+        {%- if '<|image_pad|>' in message['content'] or '<|video_pad|>' in message['content'] or '<|vision_start|>' in message['content'] or '<|vision_end|>' in message['content'] %}
+            {{- raise_exception('Text contains reserved vision tokens') }}
+        {%- endif %}
         {%- set rendered.content = message['content'] %}
     {%- else %}
         {%- for block in message['content'] %}
+            {%- if block.get('audio') or block.get('audios') or block.get('video') or block.get('videos') or block.get('images') or block.get('image_url') or block.get('pixel_values') or block.get('pixel_values_videos') or block.get('image_grid_thw') or block.get('video_grid_thw') or block.get('image_mask') or block.get('video_mask') %}
+                {{- raise_exception('Unsupported block media field') }}
+            {%- endif %}
             {%- if block['type'] == 'text' %}
+                {%- if block.get('image') is not none or block.get('url') is not none %}
+                    {{- raise_exception('Text block contains a media value') }}
+                {%- endif %}
+                {%- set rendered.adjacent_text = rendered.adjacent_text + block['text'] %}
+                {%- if '<|image_pad|>' in rendered.adjacent_text or '<|video_pad|>' in rendered.adjacent_text or '<|vision_start|>' in rendered.adjacent_text or '<|vision_end|>' in rendered.adjacent_text %}
+                    {{- raise_exception('Text contains reserved vision tokens') }}
+                {%- endif %}
                 {%- set rendered.content = rendered.content + block['text'] %}
             {%- elif block['type'] == 'image' %}
+                {%- if message['role'] != 'user' or message.get('loss_mask') %}
+                    {{- raise_exception('Image inputs require an unsupervised user message') }}
+                {%- endif %}
+                {%- if block.get('text') not in [none, ''] or (block.get('image') is not none and block.get('url') is not none) %}
+                    {{- raise_exception('Ambiguous image block') }}
+                {%- endif %}
+                {%- set rendered.adjacent_text = '' %}
                 {%- set rendered.content = rendered.content + '<|vision_start|><|image_pad|><|vision_end|>' %}
             {%- else %}
                 {{- raise_exception('Unsupported multimodal ChatML content type') }}
@@ -77,6 +112,13 @@ def _image_value(value):
     return result
 
 
+def _reject_media_fields(container, fields):
+    for field in fields:
+        value = container.get(field)
+        if value is not None and (not hasattr(value, "__len__") or len(value)):
+            raise ValueError(f"unsupported media field: {field}")
+
+
 def normalize_openai_messages(sample, *, tools_in_system=False):
     """Return ordered messages and image values from an OpenAI-style sample.
 
@@ -93,8 +135,9 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
         tools = _sequence(tools, "tools")
     if tools and not tools_in_system:
         raise ValueError("nonempty tools require tools_in_system")
-    for field in (
+    unsupported_media = (
         "image",
+        "image_url",
         "video",
         "videos",
         "audio",
@@ -105,10 +148,8 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
         "video_grid_thw",
         "image_mask",
         "video_mask",
-    ):
-        value = sample.get(field)
-        if value is not None and (not hasattr(value, "__len__") or len(value)):
-            raise ValueError(f"unsupported media field: {field}")
+    )
+    _reject_media_fields(sample, unsupported_media)
     messages = sample.get("messages")
     if isinstance(messages, str):
         messages = json.loads(messages)
@@ -122,12 +163,15 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
     for message in messages:
         if not isinstance(message, Mapping):
             raise ValueError("each message must be a mapping")
-        if message.get("tool_calls") or message.get("function_call"):
-            raise ValueError("structured tool calls must be serialized in content")
+        _reject_media_fields(message, (*unsupported_media, "images"))
+        if any(message.get(key) for key in ("tool_calls", "function_call", "tool_call_id", "name")):
+            raise ValueError("structured tool message metadata must be serialized in content")
         role = message.get("role")
         if role not in ("system", "user", "assistant", "tool"):
             raise ValueError("unsupported message role")
-        mask = message.get("loss_mask", int(role == "assistant"))
+        mask = message.get("loss_mask")
+        if mask is None:
+            mask = int(role == "assistant")
         if not isinstance(mask, numbers.Real) or mask not in (0, 1):
             raise ValueError("loss_mask must be binary")
         weight = message.get("loss_weight")
@@ -145,6 +189,7 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
         for block in blocks:
             if not isinstance(block, Mapping):
                 raise ValueError("content block must be a mapping")
+            _reject_media_fields(block, (*(field for field in unsupported_media if field != "image"), "images"))
             kind = block.get("type")
             if kind == "text":
                 if not isinstance(block.get("text"), str) or any(

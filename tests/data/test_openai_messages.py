@@ -48,6 +48,18 @@ def test_inline_data_uri_and_text_only():
     assert images == []
 
 
+def test_nullable_mask_uses_role_defaults_for_mixed_messages():
+    sample = {
+        "messages": [
+            {"role": "user", "content": [{"type": "image", "image": b"img"}], "loss_mask": None},
+            {"role": "assistant", "content": "answer", "loss_mask": None, "loss_weight": None},
+        ]
+    }
+    messages, images = normalize_openai_messages(sample)
+    assert [message["loss_mask"] for message in messages] == [0, 1]
+    assert images == [b"img"]
+
+
 def test_masked_fractional_weight_does_not_change_labels():
     """Masked message weights do not require the weighted renderer."""
     from types import SimpleNamespace
@@ -86,8 +98,13 @@ def test_masked_weights_must_still_be_valid(weight):
         {"messages": [{"role": "user", "content": "hi"}], "images": [b"extra"]},
         {"messages": [{"role": "assistant", "content": "hi", "loss_mask": 0.5}]},
         {"messages": [{"role": "assistant", "content": "", "tool_calls": [{"id": "call"}]}]},
+        {"messages": [{"role": "tool", "content": "result", "tool_call_id": "call-id"}]},
+        {"messages": [{"role": "tool", "content": "result", "name": "tool-name"}]},
         {"messages": [{"role": "user", "content": "hello"}], "image": b"hidden image"},
         {"messages": [{"role": "user", "content": "hello"}], "pixel_values": [1]},
+        {"messages": [{"role": "user", "content": "hello", "audio": b"hidden audio"}]},
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "hello", "video": [1]}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "image", "image": b"x", "audio": b"y"}]}]},
     ],
 )
 def test_rejects_ambiguous_or_unsupported_inputs(sample):
@@ -301,6 +318,32 @@ def test_chat_template_persisted_with_processor(tmp_path):
     for modality in ("video", "audio"):
         with pytest.raises(TemplateError, match="Unsupported multimodal ChatML content type"):
             restored.apply_chat_template([{"role": "user", "content": [{"type": modality}]}], tokenize=False)
+    with pytest.raises(TemplateError, match="Structured tool message metadata"):
+        restored.apply_chat_template([{"role": "tool", "content": "result", "tool_call_id": "call-1"}], tokenize=False)
+    with pytest.raises(TemplateError, match="Unsupported block media field"):
+        restored.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "hello", "audio": "audio"}]}], tokenize=False
+        )
+    invalid_messages = [
+        {"role": "assistant", "content": [{"type": "image", "image": "x"}]},
+        {"role": "user", "content": [{"type": "image", "image": "x", "text": "lost"}]},
+        {"role": "user", "content": [{"type": "image", "image": "x", "url": "y"}]},
+        {"role": "user", "content": [{"type": "text", "text": "<|image_"}, {"type": "text", "text": "pad|>"}]},
+    ]
+    for message in invalid_messages:
+        with pytest.raises(TemplateError):
+            restored.apply_chat_template([message], tokenize=False)
+    from jinja2 import Environment
+
+    from veomni.data.multimodal.openai_messages import OPENAI_CHATML_VLM_JINJA
+
+    def fail_render(message):
+        raise TemplateError(message)
+
+    with pytest.raises(TemplateError, match="tools argument"):
+        Environment().from_string(OPENAI_CHATML_VLM_JINJA).render(
+            messages=[], tools=[{"name": "tool"}], raise_exception=fail_render
+        )
 
 
 def test_legacy_template_keeps_source_name_precedence(monkeypatch):
@@ -351,7 +394,8 @@ def test_fractional_weight_is_not_silently_dropped():
     sample = {"messages": [{"role": "assistant", "content": "answer", "loss_weight": 0.25}]}
     messages, _ = normalize_openai_messages(sample)
     weighted = template.text_template.encode_messages(sample["messages"])
-    if "loss_weights" in weighted:
+    if getattr(template.text_template, "supports_loss_weights", False):
+        assert "loss_weights" in weighted
         assert (template.encode_messages(messages)["loss_weights"] == 0.25).all()
     else:
         with pytest.raises(ValueError, match="weighted ChatML"):
@@ -378,9 +422,10 @@ def test_masked_and_active_fractional_weights_with_weighted_renderer():
             {"role": "assistant", "content": "trained", "loss_mask": 1, "loss_weight": 0.25},
         ]
     }
-    expected = ChatmlTemplate(tokenizer).encode_messages(sample["messages"])
-    if "loss_weights" not in expected:
+    if not getattr(ChatmlTemplate, "supports_loss_weights", False):
         pytest.skip("requires the independent weighted-loss feature")
+    expected = ChatmlTemplate(tokenizer).encode_messages(sample["messages"])
+    assert "loss_weights" in expected
     vision = SimpleNamespace(
         tokenizer=tokenizer, image_token_id=1000, video_token_id=1001, image_pattern=lambda count: "I" * count
     )
@@ -392,6 +437,7 @@ def test_masked_and_active_fractional_weights_with_weighted_renderer():
 
 
 def test_weighted_text_image_mixed_packing(monkeypatch):
+    import copy
     from types import SimpleNamespace
 
     import torch
@@ -403,8 +449,9 @@ def test_weighted_text_image_mixed_packing(monkeypatch):
 
     tokenizer = _ToyTokenizer()
     assistant = {"role": "assistant", "content": "answer", "loss_weight": 0.25}
-    if "loss_weights" not in ChatmlTemplate(tokenizer).encode_messages([assistant]):
+    if not getattr(ChatmlTemplate, "supports_loss_weights", False):
         pytest.skip("requires the independent weighted-loss feature")
+    assert "loss_weights" in ChatmlTemplate(tokenizer).encode_messages([assistant])
 
     class ImageProcessor:
         merge_size = 2
@@ -433,6 +480,7 @@ def test_weighted_text_image_mixed_packing(monkeypatch):
     first_labels, second_labels = first["labels"].clone(), second["labels"].clone()
     first_ids, second_ids = first["input_ids"].clone(), second["input_ids"].clone()
     first_image_mask, second_image_mask = first["image_mask"].clone(), second["image_mask"].clone()
+    first_types, second_types = first["mm_token_type_ids"].clone(), second["mm_token_type_ids"].clone()
     offset = first_ids.numel()
     expected_second_labels = second_labels.clone()
     expected_second_labels[0] = -100
@@ -446,7 +494,20 @@ def test_weighted_text_image_mixed_packing(monkeypatch):
     assert torch.all(packed["loss_weights"][0, offset:][second_valid] == 0.25)
     assert packed["image_mask"].sum() == 1
     assert torch.equal(packed["image_mask"][0], torch.cat([first_image_mask, second_image_mask]))
+    expected_types = torch.cat([first_types, second_types])
+    assert torch.equal(packed["mm_token_type_ids"][0], expected_types)
     assert torch.all(packed["loss_weights"][packed["image_mask"].bool()] == 0)
+    for rank in range(4):
+        monkeypatch.setattr(
+            data_collator,
+            "get_parallel_state",
+            lambda rank=rank: SimpleNamespace(sp_enabled=True, sp_size=4, sp_rank=rank),
+        )
+        split = data_collator.MainCollator()([copy.deepcopy(first), copy.deepcopy(second)])
+        pad = (-expected_types.numel()) % 4
+        padded_types = torch.nn.functional.pad(expected_types, (0, pad))
+        assert torch.equal(split["mm_token_type_ids"][0], padded_types)
+        assert torch.equal(split["mm_token_type_ids"] == 1, split["image_mask"].bool())
 
 
 def test_openai_image_supervision_reaches_hf_qwen3_vl_vision(monkeypatch):
@@ -539,7 +600,8 @@ def test_openai_image_supervision_reaches_hf_qwen3_vl_vision(monkeypatch):
     assert any(torch.count_nonzero(grad).item() for grad in vision_gradients)
 
 
-def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(monkeypatch):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(monkeypatch, weighted):
     """A tiny actual VeOmni model sees the same supervision packed or separately."""
     import copy
     from types import SimpleNamespace
@@ -549,12 +611,20 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.data import data_collator
+    from veomni.data.chat_template import ChatmlTemplate
     from veomni.data.data_transform import process_sample_qwen_vl
     from veomni.data.multimodal import image_utils
     from veomni.models.configuration_base import as_veomni_config
     from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
         Qwen4ExpForConditionalGeneration,
     )
+
+    if weighted and not getattr(ChatmlTemplate, "supports_loss_weights", False):
+        pytest.skip("requires the independent weighted-loss feature")
+    if weighted:
+        assert "loss_weights" in ChatmlTemplate(_ToyTokenizer()).encode_messages(
+            [{"role": "assistant", "content": "answer", "loss_mask": 1, "loss_weight": 0.25}]
+        )
 
     class ImageProcessor:
         merge_size = 2
@@ -563,7 +633,10 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
             return {"pixel_values": torch.ones(4, 3 * 2 * 4 * 4), "image_grid_thw": torch.tensor([[1, 2, 2]])}
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json")
-    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
+    ops = (
+        make_eager_ops_config(cross_entropy_loss_implementation="chunk_loss") if weighted else make_eager_ops_config()
+    )
+    as_veomni_config(config, validate=False)._set_ops_implementation(ops)
     torch.manual_seed(42)
     model = Qwen4ExpForConditionalGeneration(config).float().train()
     monkeypatch.setattr(image_utils, "fetch_images", lambda images, **kwargs: images)
@@ -588,6 +661,8 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
             {"role": "assistant", "content": "A picture."},
         ]
     }
+    if weighted:
+        image["messages"][1]["loss_weight"] = 0.25
     first = process_sample_qwen_vl(text, processor, template, positions)[0]
     second = process_sample_qwen_vl(image, processor, template, positions)[0]
     lengths = [first["input_ids"].numel(), second["input_ids"].numel()]
@@ -598,6 +673,9 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
     assert torch.equal(packed["input_ids"][0], torch.cat([first["input_ids"], second["input_ids"]]))
     assert torch.equal(packed["labels"][0], torch.cat([first["labels"], second["labels"]]))
     assert torch.equal(packed["image_mask"][0], torch.cat([first["image_mask"], second["image_mask"]]))
+    assert torch.equal(
+        packed["mm_token_type_ids"][0], torch.cat([first["mm_token_type_ids"], second["mm_token_type_ids"]])
+    )
     assert (first["labels"][1:] != -100).any() and (second["labels"][1:] != -100).any()
 
     def forward(feature, *, is_packed):
@@ -620,6 +698,8 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
         }
         if "pixel_values" in feature:
             kwargs.update(pixel_values=feature["pixel_values"], image_grid_thw=feature["image_grid_thw"])
+        if "loss_weights" in feature:
+            kwargs["loss_weights"] = feature["loss_weights"] if is_packed else feature["loss_weights"].unsqueeze(0)
         return model(**kwargs).loss
 
     actual = forward(packed, is_packed=True)
@@ -634,6 +714,8 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
     first_loss, second_loss = forward(first, is_packed=False), forward(second, is_packed=False)
     first_count = (first["labels"][1:] != -100).sum()
     second_count = (second["labels"][1:] != -100).sum()
+    if weighted:
+        second_count = (second["loss_weights"][1:] * (second["labels"][1:] != -100)).sum()
     expected = (first_loss * first_count + second_loss * second_count) / (first_count + second_count)
     expected.backward()
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -643,3 +725,37 @@ def test_qwen4_patched_model_mixed_packing_matches_separate_loss_and_gradients(m
         assert (actual_grad is None) == (param.grad is None), name
         if actual_grad is not None:
             torch.testing.assert_close(actual_grad, param.grad, rtol=3e-4, atol=3e-5, msg=name)
+
+
+def test_mm_token_types_follow_mixed_packing_and_sp_padding(monkeypatch):
+    import copy
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn.functional as F
+
+    from veomni.data import data_collator
+
+    features = []
+    for ids, types in (([1, 2], [0, 0]), ([3, 0, 4], [0, 1, 0])):
+        features.append(
+            {
+                "input_ids": torch.tensor(ids),
+                "labels": torch.tensor(ids),
+                "attention_mask": torch.ones(len(ids), dtype=torch.long),
+                "position_ids": torch.arange(len(ids)),
+                "image_mask": torch.tensor(types, dtype=torch.bool),
+                "mm_token_type_ids": torch.tensor(types),
+            }
+        )
+    expected = torch.tensor([0, 0, 0, 1, 0])
+    for rank in range(4):
+        monkeypatch.setattr(
+            data_collator,
+            "get_parallel_state",
+            lambda rank=rank: SimpleNamespace(sp_enabled=True, sp_size=4, sp_rank=rank),
+        )
+        batch = data_collator.MainCollator()(copy.deepcopy(features))
+        assert torch.equal(batch["mm_token_type_ids"][0], F.pad(expected, (0, 3)))
+        assert torch.equal(batch["mm_token_type_ids"] == 1, batch["image_mask"].bool())
+        assert batch["input_ids"].shape == (1, 2)

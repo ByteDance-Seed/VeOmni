@@ -258,9 +258,15 @@ uses the same ChatML label and truncation convention as VeOmni's text path;
 overlength image conversations are rejected rather than partially truncating
 an image. Nonempty `tools` metadata requires `data.mm_configs.tools_in_system`
 to be `true`, and every tool name must already occur in the system message.
+The caller must ensure complete tool definitions are already in that message;
+only names are checked and `tools` is not rendered separately. At inference the
+exported Jinja rejects a nonempty `tools` argument. Standard nested `image_url`
+blocks are not supported; use the `type: image` forms described above.
 Fractional `loss_weight` requires the complete weighted-loss feature (renderer, collator, model loss, and
 trainer normalization) and is rejected if the weighted renderer is not
 installed. MTP, video/audio blocks and structured tool calls are outside this contract.
+Tool-call IDs and message names must be serialized in text content; nonempty
+structured tool message fields are rejected rather than discarded.
 When this template is selected, exported processor and tokenizer assets retain
 its ChatML Jinja rather than the checkpoint's original template. That exported
 Jinja rejects video and audio content blocks as well.
