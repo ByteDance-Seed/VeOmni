@@ -1164,3 +1164,46 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
     torch.testing.assert_close(compiled_out, eager_out, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(x_compiled.grad, x_eager.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(compiled_norm.weight.grad, eager_norm.weight.grad, rtol=1e-5, atol=1e-5)
+
+
+# --- Op selections that Inductor cannot lower -------------------------------------
+
+
+def _model_with_ops(**ops_fields) -> nn.Module:
+    """A minimal model whose config carries the ops selections the check reads."""
+    defaults = dict.fromkeys(("linear_implementation", "swiglu_mlp_implementation"), None)
+    defaults.update(ops_fields)
+    model = nn.Linear(4, 4)
+    model.config = SimpleNamespace(ops_config=SimpleNamespace(**defaults))
+    return model
+
+
+@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+def test_compile_rejects_torchao_mxfp4(field):
+    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    with pytest.raises(RuntimeError, match=f"{field}='torchao_mxfp4'"):
+        _reject_incompatible_ops(_model_with_ops(**{field: "torchao_mxfp4"}))
+
+
+@pytest.mark.parametrize(
+    "ops_fields",
+    [
+        {},
+        {"linear_implementation": "eager"},
+        {"linear_implementation": "qat"},
+        {"swiglu_mlp_implementation": "liger_kernel"},
+    ],
+)
+def test_compile_allows_other_rows(ops_fields):
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    _reject_incompatible_ops(_model_with_ops(**ops_fields))
+
+
+def test_compile_rejection_is_skipped_without_an_ops_config():
+    """A model with no ops config has nothing to reject and must not crash the build."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    _reject_incompatible_ops(nn.Linear(4, 4))

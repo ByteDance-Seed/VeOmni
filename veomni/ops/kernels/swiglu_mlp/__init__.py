@@ -21,25 +21,55 @@ Empty biases are unused.
 
 from torch import nn
 
-from ...platform import GpuKernelRequirement, MluKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
+from .standard import qat as standard_qat
+from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 
 
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
+_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+
+#: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
+#: Only these need a projection's own ``weight``; every other row is a plain
+#: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
+QUANTIZING_IMPLS = frozenset({"qat", "torchao_mxfp4"})
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
     A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead.
+    its own forward, so the MLP has to call the projection modules instead. The
+    fused rows that only read the tensors still work that way, because their own
+    ``forward`` accepts the modules' inputs.
+
+    Raises:
+        ValueError: when the projections are wrapped while ``mlp``'s own
+            ``swiglu_mlp`` selection is a fake-quantizing row. Such a row cannot
+            read a weight it is not handed, and falling back would run the base
+            layers at full precision while the config still claims
+            quantization-aware training -- a silent correctness bug, not a
+            graceful degradation. Every non-quantizing row keeps the fallback.
     """
-    return all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    if plain:
+        return True
+
+    handle = getattr(mlp, "veomni_swiglu_mlp", None)
+    impl = getattr(handle, "impl", None)
+    if impl in QUANTIZING_IMPLS:
+        raise ValueError(
+            f"swiglu_mlp_implementation={impl!r} cannot run on a wrapped projection: the row fake-quantizes "
+            "the projection weights it is handed, and a layer substituted after construction (LoRA) keeps "
+            "them at `base_layer`. Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down."
+        )
+    return False
 
 
 register_op(
@@ -73,6 +103,25 @@ register_op(
     requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
+)
+
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "qat",
+    description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    wrapper=standard_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang",),
+)
+
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "torchao_mxfp4",
+    description="MXFP4 (E2M1 with E8M0 block scales) fake-quantized SwiGLU MLP with optional activation clamping",
+    wrapper=standard_torchao_mxfp4.wrapper,
+    requires=("torchao",),
 )
 
 register_op(

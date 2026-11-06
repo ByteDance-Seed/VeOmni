@@ -36,6 +36,7 @@ from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
+from .standard import qat as standard_qat
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
 
@@ -111,6 +112,16 @@ register_op(
     wrapper=standard_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+register_op(
+    "moe_experts",
+    "standard",
+    "qat",
+    description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
+    wrapper=standard_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang", "triton"),
 )
 
 register_op(

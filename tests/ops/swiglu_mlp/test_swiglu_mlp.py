@@ -42,6 +42,7 @@ from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
 from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.import_utils import is_package_available
 
 
 def _empty_bias(weight: Tensor) -> Tensor:
@@ -595,3 +596,111 @@ def test_geglu_liger_matches_eager(hidden: int, intermediate: int):
     assert torch.allclose(x_e.grad, x_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
     for param_e, param_o in zip(mlp_e.parameters(), mlp_o.parameters(), strict=True):
         assert torch.allclose(param_e.grad, param_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
+
+
+def _mxfp4_roundtrip(x: Tensor) -> Tensor:
+    """Fake-quantize ``x`` through the shared MXFP4 primitive."""
+    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
+
+    return mxfp4_fake_quant(x)
+
+
+@pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_mxfp4 row needs torchao")
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+def test_torchao_mxfp4_matches_manual_round_trip(swiglu_limit: float | None):
+    """The fused row must equal the same math with operands quantized by hand."""
+    import torch.nn.functional as F
+
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_mxfp4").wrapper
+    torch.manual_seed(0)
+    hidden, intermediate = 64, 128
+    mlp = _tiny_qwen3_mlp(hidden, intermediate).to(dtype=torch.bfloat16)
+    x = torch.randn(2, 16, hidden, dtype=torch.bfloat16)
+
+    out = impl(*_mlp_args(mlp, x), swiglu_limit=swiglu_limit)
+
+    gate = F.linear(_mxfp4_roundtrip(x), _mxfp4_roundtrip(mlp.gate_proj.weight), None)
+    up = F.linear(_mxfp4_roundtrip(x), _mxfp4_roundtrip(mlp.up_proj.weight), None)
+    if swiglu_limit is not None:
+        gate, up = gate.float(), up.float()
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    hidden_states = (F.silu(gate) * up).to(dtype=x.dtype)
+    expected = F.linear(_mxfp4_roundtrip(hidden_states), _mxfp4_roundtrip(mlp.down_proj.weight), None)
+
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_mxfp4 row needs torchao")
+def test_torchao_mxfp4_backward_produces_finite_gradients():
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_mxfp4").wrapper
+    torch.manual_seed(0)
+    mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
+    x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+
+    impl(*_mlp_args(mlp, x)).sum().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for parameter in mlp.parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        assert torch.count_nonzero(parameter.grad) > 0
+
+
+@pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_mxfp4 row needs torchao")
+def test_torchao_mxfp4_empty_input_falls_back_to_eager():
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_mxfp4").wrapper
+    mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
+    x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+
+    out = impl(*_mlp_args(mlp, x))
+
+    assert out.shape == (0, 8, mlp.down_proj.weight.shape[0])
+    # A zero-token micro-batch must still reach the weights with zero gradients,
+    # which is what the eager and liger rows do through their raw backward.
+    out.sum().backward()
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        grad = getattr(mlp, name).weight.grad
+        assert grad is not None, name
+        torch.testing.assert_close(grad, torch.zeros_like(grad))
+
+
+def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
+    """A deployment fused kernel clamps BF16 projection outputs, not FP32 ones.
+
+    Widening the clamp to FP32 (what ``eager`` does) changes the trained function
+    for values around ``swiglu_limit``, so the QAT row must not inherit that. The
+    quantizers are stubbed to identity here so the assertion isolates the clamp;
+    the real ones need an SM90 GPU.
+    """
+    import veomni.ops.kernels.swiglu_mlp.standard.qat as qat_impl
+
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_act", lambda t, block_size=128: t)
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_weight", lambda t, block_size=128: t)
+
+    limit = 10.0
+    torch.manual_seed(0)
+    # Identity gate/up weights make the projection a known, invertible passthrough
+    # of the input, so the expected value is computable without the op.
+    hidden_dim = 64
+    eye = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    down = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    x = torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 40
+
+    actual = qat_impl.wrapper(
+        x,
+        eye,
+        eye.new_empty(0),
+        eye,
+        eye.new_empty(0),
+        down,
+        down.new_empty(0),
+        swiglu_limit=limit,
+    )
+
+    clamped = x.clamp(max=limit)
+    expected = F.silu(clamped) * x.clamp(min=-limit, max=limit)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # The FP32 clamp disagrees, so the assertion above is not vacuous.
+    widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
+    assert not torch.equal(expected, widened)

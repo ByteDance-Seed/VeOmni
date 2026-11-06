@@ -185,5 +185,7 @@ def test_make_eager_ops_config_covers_every_kernel_field():
 
     selection = training_utils.make_eager_ops_config()
     for field in fields(OpsImplementationConfig):
-        expected = "none" if field.name == "qat_implementation" else "eager"
+        # `kv_round_implementation` is the one field whose off state is not a row:
+        # `eager` there actively rounds, so an eager config leaves it unset.
+        expected = None if field.name == "kv_round_implementation" else "eager"
         assert getattr(selection, field.name) == expected, field.name
