@@ -21,22 +21,24 @@ Empty biases are unused.
 
 from torch import nn
 
-from ...platform import GpuKernelRequirement, MluKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
+from .standard import qat as standard_qat
 from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 
 
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
+_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 #: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
 #: Only these need a projection's own ``weight``; every other row is a plain
 #: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
-QUANTIZING_IMPLS = frozenset({"torchao_mxfp4"})
+QUANTIZING_IMPLS = frozenset({"qat", "torchao_mxfp4"})
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
@@ -101,6 +103,16 @@ register_op(
     requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
+)
+
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "qat",
+    description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    wrapper=standard_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang",),
 )
 
 register_op(

@@ -39,6 +39,7 @@ _FIELD_TO_OP = {
     "dsa_indexer_implementation": "dsa_indexer",
     "load_balancing_loss_implementation": "load_balancing_loss",
     "linear_implementation": "linear",
+    "kv_round_implementation": "kv_round",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
     "qsa_attention_implementation": "qsa_attention",
@@ -49,7 +50,7 @@ _FIELD_TO_OP = {
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
 
-_FUNCTIONAL_IMPLEMENTATION_FIELDS = {"qat_implementation"}
+_FUNCTIONAL_IMPLEMENTATION_FIELDS: set[str] = set()
 
 
 def _registered_implementations(op: str) -> set[str]:

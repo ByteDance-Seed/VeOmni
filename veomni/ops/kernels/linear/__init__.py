@@ -14,14 +14,28 @@
 
 """Linear projection kernel family.
 
-Variant ``standard`` is a 2D linear projection ``x @ weight.T + bias``. An empty
-bias tensor denotes an unused bias, so a caller without one does not have to
-branch on ``None``.
+Variant ``standard`` is a 2D linear projection ``x @ weight.T + bias``. Variant
+``grouped`` is a block-diagonal grouped projection over ``n_groups`` head
+groups. An empty bias tensor denotes an unused bias, so a caller without one
+does not have to branch on ``None``.
+
+Two quantization-aware-training rows sit next to the eager reference: ``qat``
+fake-quantizes both GEMM operands with the DeepSeek-V4 TileLang quantizers, and
+``torchao_mxfp4`` fake-quantizes them to MXFP4 through torchao. Both keep the
+multiply in the model dtype, which is what an emulated low-precision deployment
+GEMM computes.
 """
 
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
 from ...registry import register_op
+from .grouped import eager as grouped_eager
+from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
+from .standard import qat as standard_qat
 from .standard import torchao_mxfp4 as standard_torchao_mxfp4
+
+
+_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 
 register_op(
@@ -30,6 +44,34 @@ register_op(
     "eager",
     description="PyTorch dense linear projection",
     wrapper=standard_eager.wrapper,
+)
+
+register_op(
+    "linear",
+    "standard",
+    "qat",
+    description="TileLang blockwise FP8 fake-quantized dense linear projection",
+    wrapper=standard_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang",),
+)
+
+register_op(
+    "linear",
+    "grouped",
+    "eager",
+    description="PyTorch block-diagonal grouped linear projection",
+    wrapper=grouped_eager.wrapper,
+)
+
+register_op(
+    "linear",
+    "grouped",
+    "qat",
+    description="TileLang blockwise FP8 fake-quantized grouped linear projection",
+    wrapper=grouped_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang",),
 )
 
 register_op(

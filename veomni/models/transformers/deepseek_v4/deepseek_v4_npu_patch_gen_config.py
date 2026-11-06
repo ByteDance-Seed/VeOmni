@@ -265,7 +265,7 @@ def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.qat_implementation = config.ops_config.qat_implementation
+    self.veomni_kv_round = _storage_round_op(config, "fp8")
 
 
 @config.override_method("DeepseekV4Indexer.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -280,6 +280,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+    self.veomni_q_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.scorer = DeepseekV4IndexerScorer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
@@ -289,7 +290,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         config.ops_config.dsa_indexer_implementation,
     )
     self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.qat_implementation = config.ops_config.qat_implementation
+    self.veomni_kv_round = _storage_round_op(config, "fp8")
 
 
 @config.override_method("DeepseekV4CSACompressor.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -305,7 +306,7 @@ def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.indexer = DeepseekV4Indexer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.qat_implementation = config.ops_config.qat_implementation
+    self.veomni_kv_round = _storage_round_op(config, "fp8")
 
 
 # ================================================================
@@ -399,9 +400,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             compressed = compressed + anchor.to(compressed.dtype)
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(
-            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
-        )
+        compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
         return compressed.unsqueeze(1), CompressedCandidates(
             range_starts=rate_metadata["range_starts"],
             range_ends=rate_metadata["range_ends"],
@@ -443,9 +442,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(
-        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
-    )
+    compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
     compressed_kv = compressed.unsqueeze(1)
 
     if compressed_kv.shape[2] == 0:
@@ -542,9 +539,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             compressed = compressed + anchor.to(compressed.dtype)
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(
-            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
-        )
+        compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
         compressed_kv = compressed.unsqueeze(1)
         top_k_indices = self.indexer(
             hidden_states,
@@ -610,9 +605,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(
-        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
-    )
+    compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
     compressed_kv = compressed.unsqueeze(1)
     top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
     return compressed_kv, CompressedCandidates(topk_indices=top_k_indices)

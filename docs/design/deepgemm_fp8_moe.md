@@ -13,7 +13,6 @@ For a model using the standard SwiGLU expert contract:
 model:
   ops_implementation:
     moe_implementation: deepgemm_fp8
-    qat_implementation: none
 ```
 
 The model's existing `VeomniOp` handle resolves the backend at construction.
@@ -22,10 +21,11 @@ is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
 mixed precision with FP32 master weights. A packed inference checkpoint must
 first pass through its model's existing dequantization/weight-loading path.
 
-`OpsImplementationConfig` rejects `deepgemm_fp8` combined with any
-`qat_implementation` other than `none` at config-parse time. DeepGEMM already
-quantizes its GEMM operands; model-side QAT would add a fake-quantization pass
-before dispatch. This setting is independent of rollout/export quantization.
+`OpsImplementationConfig` rejects `deepgemm_fp8` combined with a `qat` row on
+`linear_implementation` or `swiglu_mlp_implementation` at config-parse time.
+DeepGEMM already quantizes its GEMM operands; model-side QAT would add a
+fake-quantization pass before dispatch. This is independent of rollout/export
+quantization.
 
 MoE-LoRA on routed expert weights is unsupported with `deepgemm_fp8`. Both
 shared and independent LoRA wrappers raise before moving the base parameters,
@@ -73,7 +73,6 @@ This is operator integration, not full-model convergence validation.
 model:
   ops_implementation:
     moe_implementation: deepgemm_fp8
-    qat_implementation: none
   accelerator:
     fsdp_config:
       expert_weight_fp8_all_gather: true
