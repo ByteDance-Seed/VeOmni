@@ -38,6 +38,8 @@ default to the binary mask. Fractional weights are currently supported only by t
 the `chunk_loss` cross entropy implementation. Other models reject weighted batches. Batches containing MTP labels are not supported. Other
 multimodal preprocessors reject a supplied weight rather than discarding it.
 Router auxiliary loss with fractional loss weights is not supported and is rejected.
+Uncollated list-valued micro-batches, including the RL trainer path, reject
+weighted loss; ordinary unweighted RL batches continue to use their normal path.
 Channel loss remains an unweighted per-source CE metric; it does not represent
 the weighted optimization objective.
 

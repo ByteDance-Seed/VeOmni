@@ -674,6 +674,14 @@ def _check_weighted_router_agreement(rank, path):
         ]
         with pytest.raises(ValueError, match="MTP labels"):
             loss_utils.prepare_loss_token_counts(batches)
+        uncollated = [{"labels": torch.tensor([1, 2])}]
+        if rank == 0:
+            uncollated[0]["loss_weights"] = torch.tensor([0.5, 0.5])
+        with pytest.raises(ValueError, match="uncollated list-valued micro-batches"):
+            loss_utils.prepare_loss_token_counts([uncollated])
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
         from veomni.data import data_collator
 
         data_collator.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
@@ -713,15 +721,6 @@ def _check_weighted_router_agreement(rank, path):
         batch = {"labels": torch.tensor([[1, 2]]), "loss_weights": torch.tensor([[0.5, 0.5]])}
         weighted, _, _ = loss_utils.prepare_loss_token_counts([batch], real_runtime)
         assert weighted
-        runtime = SimpleNamespace(
-            model_config=SimpleNamespace(model_type="qwen4_exp"),
-            unwrapped_module=SimpleNamespace(veomni_ce=SimpleNamespace(impl="chunk_loss" if rank == 0 else "eager")),
-        )
-        batch = {"labels": torch.tensor([[1, 2]])}
-        if rank == 0:
-            batch["loss_weights"] = torch.tensor([[0.5, 0.5]])
-        with pytest.raises(ValueError, match="chunk_loss on every rank"):
-            loss_utils.prepare_loss_token_counts([batch], runtime)
     finally:
         dist.destroy_process_group()
 
@@ -751,3 +750,46 @@ def test_prepare_counts_uses_one_collective_for_unweighted(monkeypatch):
     assert not weighted
     assert local["foundation_tokens"].item() == global_counts["foundation_tokens"] == 2
     assert len(calls) == 1
+
+
+def test_prepare_counts_handles_uncollated_rl_micro_batches(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.utils import loss_utils
+
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    batches = [[{"labels": torch.tensor([-100, 2, 3])}, {"labels": torch.tensor([-100, 4])}]]
+    weighted, local, global_counts = loss_utils.prepare_loss_token_counts(batches)
+    assert not weighted
+    assert local["foundation_tokens"].item() == global_counts["foundation_tokens"] == 3
+    assert not loss_utils.has_weighted_loss_in_step(batches)
+
+
+def test_prepare_counts_rejects_weighted_uncollated_micro_batches(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.utils import loss_utils
+
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    batches = [[{"labels": torch.tensor([-100, 2]), "loss_weights": torch.tensor([0.0, 0.5])}]]
+    assert loss_utils.has_weighted_loss_in_step(batches)
+    with pytest.raises(ValueError, match="uncollated list-valued micro-batches"):
+        loss_utils.prepare_loss_token_counts(batches)
+
+
+def test_prepare_counts_checks_weighted_model_locally(monkeypatch):
+    from types import SimpleNamespace
+
+    from veomni.utils import loss_utils
+
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    batch = {"labels": torch.tensor([1, 2]), "loss_weights": torch.tensor([1.0, 0.5])}
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(model_type="qwen4_exp"),
+        unwrapped_module=SimpleNamespace(veomni_ce=SimpleNamespace(impl="eager")),
+    )
+    with pytest.raises(ValueError, match="qwen4_exp backend with chunk_loss"):
+        loss_utils.prepare_loss_token_counts([batch], runtime)

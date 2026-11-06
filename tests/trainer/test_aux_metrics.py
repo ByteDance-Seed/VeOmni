@@ -235,10 +235,14 @@ def run_train_step(request, monkeypatch):
     module, wrapper_cls = _TRAIN_STEP_OWNERS[request.param]
     monkeypatch.setattr(module, "synchronize", lambda: None)
     monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
+
     # Single process: the all-reduce over the step's token denominators is the identity.
-    monkeypatch.setattr(
-        module, "reduce_global_loss_token", lambda token_len: {key: value.item() for key, value in token_len.items()}
-    )
+    def prepare_counts(batches, model):
+        del model
+        local = module.count_loss_token(batches)
+        return False, local, {key: value.item() for key, value in local.items()}
+
+    monkeypatch.setattr(module, "prepare_loss_token_counts", prepare_counts)
     # VLMTrainer's loop does not mark compile steps.
     monkeypatch.setattr(module, "mark_compile_step_begin", lambda *args, **kwargs: None, raising=False)
 
@@ -250,6 +254,33 @@ def run_train_step(request, monkeypatch):
         type(driver).train_step(driver, iter([micro_batches]))
 
     return run
+
+
+def test_rl_train_step_accepts_uncollated_feature_lists(monkeypatch):
+    from veomni.trainer.base_rl_trainer import BaseRLTrainer
+    from veomni.utils import loss_utils
+
+    monkeypatch.setattr(base_trainer_module, "synchronize", lambda: None)
+    monkeypatch.setattr(base_trainer_module, "mark_compile_step_begin", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(loss_utils, "all_reduce", lambda value, op: value)
+    recorded = {}
+    trainer = object.__new__(BaseRLTrainer)
+    trainer.__dict__.update(_accumulating_trainer([], recorded).__dict__)
+    seen = []
+
+    def forward_backward(features):
+        assert isinstance(features, list)
+        seen.append(features)
+        loss = torch.tensor(1.0)
+        return loss, {"foundation_loss": loss}, {}
+
+    trainer.forward_backward_step = forward_backward
+    batches = [[{"labels": torch.tensor([-100, 2])}, {"labels": torch.tensor([-100, 3, 4])}]]
+    trainer.train_step(iter([batches]))
+    assert seen == batches
+    assert trainer.micro_batches_token_len["foundation_tokens"].item() == 3
+    assert recorded["loss"] == pytest.approx(1.0)
 
 
 def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(run_train_step, identity_loss):

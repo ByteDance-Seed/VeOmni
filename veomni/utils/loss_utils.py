@@ -113,9 +113,20 @@ def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
 
 
+def _iter_feature_dicts(value):
+    """Walk collated batches and uncollated RL micro-batches alike."""
+    if isinstance(value, dict):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_feature_dicts(item)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(value)}")
+
+
 def has_weighted_loss_in_step(batches: list[dict[str, torch.Tensor]]) -> bool:
     """Synchronize opt-in across DP ranks before counting non-SP causal targets."""
-    local_has_weights = any("loss_weights" in batch for batch in batches)
+    local_has_weights = any("loss_weights" in batch for batch in _iter_feature_dicts(batches))
     if get_parallel_state().sp_enabled or not torch.distributed.is_initialized():
         return local_has_weights
     return bool(all_reduce(int(local_has_weights), op="max"))
@@ -128,19 +139,15 @@ def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runt
     Reduce both denominator variants and the opt-in flag together so that all
     ranks choose the same normalization without an additional collective.
     """
-    local_weighted = any("loss_weights" in batch for batch in batches)
-    local_mtp = any("mtp_labels" in batch for batch in batches)
-    local_unsupported = False
-    if model_runtime is not None:
-        try:
-            local_unsupported = (
-                model_runtime.model_config.model_type != "qwen4_exp"
-                or get_env("MODELING_BACKEND") == "hf"
-                or model_runtime.unwrapped_module.veomni_ce.impl != "chunk_loss"
-            )
-        except (AttributeError, TypeError):
-            local_unsupported = True
-    router_flags = [batch.get("output_router_logits", False) for batch in batches]
+    features = list(_iter_feature_dicts(batches))
+    local_weighted = any("loss_weights" in batch for batch in features)
+    local_mtp = any("mtp_labels" in batch for batch in features)
+    # BaseRLTrainer packs list-valued micro-batches inside preforward and
+    # computes its own unweighted loss; weighted SFT cannot use that path.
+    local_uncollated = isinstance(batches, (list, tuple)) and any(
+        isinstance(batch, (list, tuple)) for batch in batches
+    )
+    router_flags = [batch.get("output_router_logits", False) for batch in features]
     local_router = any(value is True for value in router_flags)
     invalid_router = any(type(value) is not bool for value in router_flags)
     legacy = count_loss_token(batches)
@@ -153,7 +160,7 @@ def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runt
             int(local_router),
             int(invalid_router),
             int(local_mtp),
-            int(local_unsupported),
+            int(local_uncollated),
         ],
         op="sum",
     )
@@ -165,7 +172,18 @@ def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runt
     if weighted and reduced[5]:
         raise ValueError("loss_weights cannot be combined with MTP labels in the same step")
     if weighted and reduced[6]:
-        raise ValueError("loss_weights require the VeOmni qwen4_exp backend with chunk_loss on every rank")
+        raise ValueError("loss_weights are not supported for uncollated list-valued micro-batches")
+    if weighted and model_runtime is not None:
+        try:
+            supported = (
+                model_runtime.model_config.model_type == "qwen4_exp"
+                and get_env("MODELING_BACKEND") != "hf"
+                and model_runtime.unwrapped_module.veomni_ce.impl == "chunk_loss"
+            )
+        except (AttributeError, TypeError):
+            supported = False
+        if not supported:
+            raise ValueError("loss_weights require the VeOmni qwen4_exp backend with chunk_loss")
     counts = shifted if weighted else legacy
     global_counts = {"foundation_tokens": reduced[1] if weighted else reduced[0]}
     global_counts.update(

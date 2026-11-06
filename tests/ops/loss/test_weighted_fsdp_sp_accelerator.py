@@ -15,11 +15,12 @@ from torch.distributed.device_mesh import init_device_mesh
 if os.environ.get("VEOMNI_TEST_REQUIRE_NPU") == "1":
     importlib.import_module("torch_npu")
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec  # noqa: E402
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities  # noqa: E402
 from veomni.utils.device import get_device_type  # noqa: E402
 
 
 _ACCELERATOR_16 = LaunchSpec(nproc=16, device="accelerator")
+_CAPABILITIES = runner_capabilities()
 
 
 def _check_fsdp_sp(dtype, all_zero):
@@ -88,6 +89,11 @@ def _check_fsdp_sp(dtype, all_zero):
     )
 
 
+@pytest.mark.skipif(
+    os.environ.get("VEOMNI_TEST_REQUIRE_NPU") != "1"
+    and (_CAPABILITIES.backend == "cpu" or len(_CAPABILITIES.devices) < 16),
+    reason="requires 16 accelerators",
+)
 @pytest.mark.launch_plan(provider=_ACCELERATOR_16)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("all_zero", [False, True], ids=["mixed", "zero"])
