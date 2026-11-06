@@ -162,12 +162,51 @@ Two readings matter here:
   at a time regardless (the talker), or the micro-batch holds few samples, there
   is little left to win.
 
+#### Where packing does not apply
+
+Packing needs **one shared token axis**. The packer emits a single
+`packed_features` tensor of shape `(1, T, D)`, and each module in the graph writes
+its own embeddings into it with `masked_scatter_embeds` over a boolean mask:
+
+```python
+real_tokens = visual_row_mask(grid, merge, is_real)   # (T,) where this module owns a row
+packed = masked_scatter_embeds(packed, mask, real_tokens)
+```
+
+Every participant therefore has to agree on both `T` (what one row means) and `D`
+(the embedding width), and every row must be owned by exactly one module. That
+holds for a family whose modules are different *views of the same sequence* — the
+text encoder owns tokens, the vision tower owns visual rows, the backbone reads
+the whole thing — which is what the packed graphs of Qwen3-VL and Janus are.
+
+It does **not** hold for an arbitrary assembly of modules:
+
+- **Different sequence lengths or tokenisations.** A talker consuming one
+  utterance at a time, an audio codec producing a different frame rate, a module
+  with its own resampler — each would need its own `T`, and one shared tensor
+  cannot carry two.
+- **Different hidden sizes.** A module whose output width differs from the
+  backbone's input needs a projection between them, which is a node that reads one
+  sequence and writes another — not a `masked_scatter` into the same buffer.
+- **Two modules owning the same rows**, or a module whose rows depend on another
+  module's *output* rather than on the CPU-packed input. Packing is decided on the
+  CPU before any module runs, so the ownership split has to be known statically.
+- **A graph composed across families** (say a ViT from one checkpoint with a
+  backbone from another). The packer's token layout is family-specific — Qwen3-VL
+  builds M-RoPE and a `visual_pos_mask`; another family would build different
+  metadata — so a mixed graph has no single layout to pack.
+
+When the composition does not fit, keep the conversation graph: it moves each
+modality's own tensors on the carrier, and each module reads what it needs at its
+own length. A heterogeneous graph is a legitimate design; it just cannot be
+collapsed onto one row axis.
+
 So add a packed graph when profiling shows `pre_forward` bookkeeping is a
-measurable slice of the step. It is extra surface: a second train graph, `pack_*`
-hooks on every module in it, its own collation contract in `SeedOmniCollator`, and
-a parity test against the conversation path
-(`tests/seed_omni/modules/<family>/test_*_packing.py`). None of that is on the
-critical path for "support model X".
+measurable slice of the step **and** the modules are one family over one sequence.
+It is extra surface: a second train graph, `pack_*` hooks on every module in it,
+its own collation contract in `SeedOmniCollator`, and a parity test against the
+conversation path (`tests/seed_omni/modules/<family>/test_*_packing.py`). None of
+that is on the critical path for "support model X".
 
 ## 5. Honour the contracts
 

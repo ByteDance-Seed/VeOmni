@@ -172,6 +172,13 @@ M-RoPE positions and the visual mask — so each node only mask-selects its own
 embeddings and `masked_scatter`s them back, instead of walking the conversation
 carrier item by item.
 
+It works because these three modules are one family over one sequence: the text
+encoder owns the text rows, the vision tower owns the visual rows, and the backbone
+reads all of them at a shared width. A graph that composes modules with different
+sequence lengths, tokenisations or hidden sizes cannot be packed — see
+[Adding a model §4.1](../usage/adding_a_model.md#41-packing-optional) for the
+conditions.
+
 ```bash
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/base.yaml
 ```
