@@ -298,7 +298,9 @@ class GlobalStateCallback(Callback):
         payload, state_error = None, None
         try:
             payload = self.state_dict(state)
-        except Exception as exc:  # noqa: BLE001 - synchronize a rank-local cursor failure
+            if not isinstance(payload, dict):
+                raise TypeError("Trainer checkpoint state must be a dictionary")
+        except BaseException as exc:  # noqa: BLE001 - synchronize a rank-local cursor failure
             state_error = exc
         raise_if_any_rank_failed(state_error, "collecting trainer checkpoint state")
         assert payload is not None
