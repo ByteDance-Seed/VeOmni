@@ -47,6 +47,7 @@ class StagingConfig:
     pipeline_transfers: bool = False
 
     def __post_init__(self):
+        """Validate fixed staging capacity, prefetch depth, and transfer deadline."""
         if self.buffer_bytes <= 0 or self.pageable_limit_bytes < self.buffer_bytes:
             raise ValueError("Staging and pageable budgets must be positive and fit one buffer")
         if self.slots_per_direction != 2 or self.prefetch_depth not in (0, 1):
@@ -80,6 +81,7 @@ class _NativeTransfers:
         self.api.set_device(self.device)
 
     def pinned(self, size):
+        """Allocate a pinned staging buffer or fail rather than fall back to pageable memory."""
         # Fail closed: silently falling back to pageable storage would invalidate
         # both the overlap hypothesis and the fixed native pinned allocation set.
         value = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
@@ -88,6 +90,7 @@ class _NativeTransfers:
         return value
 
     def snapshot(self, value):
+        """Snapshot a tensor and record an event on its producing stream."""
         # Preserve save-on-CPU snapshot semantics even if the caller mutates a
         # view later. The clone precedes later writes on the producer stream.
         value = value.detach().clone(memory_format=torch.contiguous_format)
@@ -96,6 +99,7 @@ class _NativeTransfers:
         return value, producer
 
     def d2h(self, source, target, producer):
+        """Submit a device-to-host copy and retain payloads if completion is uncertain."""
         submitted, event = False, None
         try:
             with self.api.stream(self.d2h_stream):
@@ -112,6 +116,7 @@ class _NativeTransfers:
             raise
 
     def h2d(self, source, device):
+        """Submit a host-to-device copy and retain payloads if completion is uncertain."""
         submitted, value, event = False, None, None
         try:
             with self.api.stream(self.h2d_stream):
@@ -127,6 +132,7 @@ class _NativeTransfers:
             raise
 
     def consume(self, value, event):
+        """Make the consumer stream wait for restoration and own the restored tensor."""
         stream = self.api.current_stream()
         stream.wait_event(event)
         value.record_stream(stream)
@@ -201,9 +207,11 @@ class BoundedActivationManager:
 
     @property
     def pinned_capacity_bytes(self):
+        """Return the fixed total capacity of both staging rings in bytes."""
         return 2 * self.config.slots_per_direction * self.config.buffer_bytes
 
     def _healthy(self):
+        """Reject work after a transfer failure or manager closure."""
         with self.lock:
             failure, closed = self.failure, self.closed
         if failure is not None:
@@ -212,6 +220,7 @@ class BoundedActivationManager:
             raise RuntimeError("Bounded activation manager is closed")
 
     def _fail(self, error):
+        """Record the first failure and schedule cleanup if the model owner was released."""
         with self.lock:
             if self.failure is None:
                 # Traceback frames can retain the failed ticket, source and
@@ -222,6 +231,7 @@ class BoundedActivationManager:
             self._schedule_close()
 
     def _wait(self, operation):
+        """Poll an operation until it succeeds, the manager fails, or its deadline expires."""
         deadline = time.monotonic() + self.config.wait_timeout_seconds
         while True:
             self._healthy()
@@ -235,7 +245,10 @@ class BoundedActivationManager:
                 raise error
 
     def _get(self, work):
+        """Obtain a queue item while checking manager health and the deadline."""
+
         def get(timeout):
+            """Poll a queue and use None to represent a timeout."""
             try:
                 return work.get(timeout=timeout)
             except queue.Empty:
@@ -244,12 +257,15 @@ class BoundedActivationManager:
         return self._wait(get)
 
     def _event(self, event):
+        """Wait for an event with the manager health and deadline checks."""
         self._wait(lambda timeout: True if event.wait(timeout) else None)
 
     def _credit(self):
+        """Wait for a restore credit with the manager health and deadline checks."""
         self._wait(lambda timeout: True if self.restore_credits.acquire(timeout=timeout) else None)
 
     def _start(self):
+        """Allocate complete fixed staging rings and start transfer workers once."""
         if self.transfers is None:
             self.transfers = _NativeTransfers()
         if self.workers:
@@ -279,9 +295,11 @@ class BoundedActivationManager:
 
     @staticmethod
     def _view(buffer, ticket):
+        """Interpret the occupied bytes of a staging slot using the ticket layout."""
         return buffer[: ticket.nbytes].view(ticket.dtype).view(ticket.shape)
 
     def _worker_loop(self, work, operation):
+        """Execute queued transfer work until shutdown or a sticky worker failure."""
         try:
             self.transfers.worker_setup()
             while True:
@@ -301,7 +319,10 @@ class BoundedActivationManager:
             self._fail(error)
 
     def _d2h_worker(self):
+        """Run device-to-host submissions and signal when no more will be published."""
+
         def transfer(item):
+            """Submit one snapshot copy and quarantine any possibly in-flight payload on failure."""
             ticket, slot = item
             posted, event = False, None
             try:
@@ -326,6 +347,7 @@ class BoundedActivationManager:
             self.d2h_submission_done.set()
 
     def _complete_d2h(self, item):
+        """Wait for a snapshot copy, populate pageable backing, and return the staging slot."""
         ticket, slot, event = item
         started = time.perf_counter()
         event.synchronize()
@@ -343,7 +365,10 @@ class BoundedActivationManager:
         self.d2h_free.put_nowait(slot)
 
     def _h2d_worker(self):
+        """Run host-to-device submissions and signal when no more will be published."""
+
         def transfer(item):
+            """Restore one snapshot and retain its pinned source until transfer completion."""
             _priority, _ordinal, ticket = item
             self._event(ticket.host_ready)
             slot = self._get(self.h2d_free)
@@ -381,6 +406,7 @@ class BoundedActivationManager:
             self.h2d_submission_done.set()
 
     def _complete_h2d(self, item):
+        """Wait for a restore transfer before returning its pinned staging slot."""
         _ticket, slot, _value, event = item
         started = time.perf_counter()
         event.synchronize()
@@ -391,6 +417,7 @@ class BoundedActivationManager:
         self.h2d_free.put_nowait(slot)
 
     def _completion_loop(self, pending, submission_done, complete):
+        """Drain published DMA completions and quarantine payloads with uncertain completion."""
         # Shutdown cannot let a reaper exit before its submitter publishes its
         # last event. Drain already-posted DMA even after a different worker
         # failed, so pinned storage is never released while still in use.
@@ -444,6 +471,7 @@ class BoundedActivationManager:
             self.live_tickets -= 1
 
     def _release_ticket(self, lease):
+        """Release a dead ticket's pageable budget and any outstanding restore credits."""
         # Abandoned graphs can discard a completed, unconsumed prefetch. Its
         # credits must not strand the next microbatch. Workers retain tickets
         # until all source/pinned accesses have completed.
@@ -465,6 +493,7 @@ class BoundedActivationManager:
             self._schedule_close()
 
     def release_owner(self):
+        """Schedule cleanup after tickets are released, or immediately after failure."""
         # A root can disappear while autograd still owns checkpoint closures
         # and saved tickets. Keep the backend alive until those tickets die.
         with self.lock:
@@ -474,6 +503,7 @@ class BoundedActivationManager:
             self._schedule_close()
 
     def _schedule_close(self):
+        """Schedule a cleanup thread without joining a transfer worker from itself."""
         with self.lock:
             if self.cleanup_scheduled or self.closed:
                 return
@@ -483,6 +513,7 @@ class BoundedActivationManager:
         threading.Thread(target=self.close, name="activation-cleanup", daemon=True).start()
 
     def pack(self, value, block):
+        """Admit and snapshot one checkpoint input within fixed staging and pageable budgets."""
         self._healthy()
         nbytes = value.numel() * value.element_size()
         if not nbytes:
@@ -524,6 +555,7 @@ class BoundedActivationManager:
             raise
 
     def _request_restore(self, ticket, *, prefetch):
+        """Queue a demand or prefetched restore while enforcing separate credit limits."""
         with ticket.lock:
             if ticket.restore_requested:
                 return True
@@ -556,6 +588,7 @@ class BoundedActivationManager:
         return True
 
     def unpack(self, ticket):
+        """Restore a saved input and transfer its lifetime to the autograd consumer."""
         if isinstance(ticket, torch.Tensor):
             return ticket
         self._healthy()
@@ -600,6 +633,7 @@ class BoundedActivationManager:
         return value
 
     def reset(self):
+        """Check health without invalidating snapshots owned by retained autograd graphs."""
         self._healthy()
         # Autograd, not a model-global list, owns packed snapshots. Do not clear
         # live tickets or reuse their CPU data when a graph is retained.
@@ -609,6 +643,7 @@ class BoundedActivationManager:
         queues = (self.d2h_work, self.h2d_work, self.d2h_pending, self.h2d_pending)
 
         def completed(timeout):
+            """Poll until transfer and completion queues have no unfinished tasks."""
             if all(work.unfinished_tasks == 0 for work in queues):
                 return True
             time.sleep(min(timeout, 0.001))
@@ -617,6 +652,7 @@ class BoundedActivationManager:
         self._wait(completed)
 
     def snapshot_stats(self):
+        """Return a lock-consistent snapshot of capacity, activity, and failure counters."""
         with self.lock:
             result = dict(
                 self.stats,
@@ -631,6 +667,7 @@ class BoundedActivationManager:
         return result
 
     def close(self):
+        """Join workers and release staging buffers only after safe transfer completion."""
         with self.lock:
             self.closed = True
         for worker in self.workers:
@@ -652,6 +689,7 @@ class BoundedActivationManager:
 
 
 def _uses_supported_full_checkpoint(module):
+    """Accept only supported full, nonreentrant checkpoint bindings."""
     from torch.utils.checkpoint import checkpoint
 
     from ..utils import recompute_utils
@@ -696,6 +734,7 @@ def apply_bounded_activation_offload(model, patterns, config):
         original_call = original_class.__call__
 
         def wrapped(self, *args, _original=original_call, _block=block, **kwargs):
+            """Capture the selected checkpoint input while preserving the original module call."""
             if not self.training or not torch.is_grad_enabled():
                 return _original(self, *args, **kwargs)
             if not getattr(self, "gradient_checkpointing", False):
@@ -717,6 +756,7 @@ def apply_bounded_activation_offload(model, patterns, config):
             packed = 0
 
             def pack(value):
+                """Offload the matching checkpoint input and leave unrelated saved tensors unchanged."""
                 nonlocal packed
                 if value.data_ptr() == hidden_ptr and manager.transfers.accepts(value):
                     if not value.is_contiguous():

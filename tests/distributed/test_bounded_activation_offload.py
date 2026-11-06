@@ -36,6 +36,7 @@ class CompletedEvent:
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 @pytest.mark.parametrize("failure", ["copy", "event_create", "event_record"])
 def test_native_partial_submission_exception_retains_unpublished_payload(monkeypatch, direction, failure):
+    """Keep copy payloads alive when a submission may have reached the device."""
     references, copied = [], []
 
     class CopyTarget:
@@ -50,6 +51,7 @@ def test_native_partial_submission_exception_retains_unpublished_payload(monkeyp
                 raise RuntimeError("completion record failed")
 
     def make_event():
+        """Inject an event-allocation failure or return the test completion event."""
         if failure == "event_create":
             raise RuntimeError("completion allocation failed")
         return Event()
@@ -65,6 +67,7 @@ def test_native_partial_submission_exception_retains_unpublished_payload(monkeyp
     transfers.d2h_stream = transfers.h2d_stream = SimpleNamespace(wait_event=lambda event: None)
 
     def submit():
+        """Submit the selected copy and capture an uncertain-transfer failure."""
         source = CopyTarget()
         references.append(weakref.ref(source))
         try:
@@ -90,6 +93,8 @@ def test_native_partial_submission_exception_retains_unpublished_payload(monkeyp
 
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 def test_native_failure_before_copy_does_not_claim_pending_dma(monkeypatch, direction):
+    """Distinguish failure before any copy from an uncertain in-flight transfer."""
+
     def fail(*args, **kwargs):
         raise RuntimeError("failed before any copy")
 
@@ -106,6 +111,7 @@ def test_native_failure_before_copy_does_not_claim_pending_dma(monkeypatch, dire
 
 
 def test_bounded_config_requires_explicit_capacity_and_checkpoint_targets():
+    """Reject invalid budgets, prefetch options, and missing checkpoint targets."""
     from veomni.arguments.arguments_types import OffloadConfig
 
     valid = dict(
@@ -135,6 +141,7 @@ def test_bounded_config_requires_explicit_capacity_and_checkpoint_targets():
 @pytest.mark.parametrize("backend", ["direct", "bounded"])
 @pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
 def test_pipeline_transfers_requires_boolean(backend, value):
+    """Reject non-boolean pipeline flags for either activation offload backend."""
     from veomni.arguments.arguments_types import OffloadConfig
 
     with pytest.raises(ValueError, match="activation_offload_pipeline_transfers must be a boolean"):
@@ -147,6 +154,7 @@ def test_pipeline_transfers_requires_boolean(backend, value):
 
 
 def test_pipeline_transfer_booleans_keep_existing_backend_policy():
+    """Allow pipeline transfers only for the bounded backend."""
     from veomni.arguments.arguments_types import OffloadConfig
 
     assert OffloadConfig(activation_offload_pipeline_transfers=False).activation_offload_pipeline_transfers is False
@@ -184,6 +192,7 @@ class CPUTransfers:
         return value.detach().clone(memory_format=torch.contiguous_format), CompletedEvent()
 
     def d2h(self, source, target, producer):
+        """Model a host copy with injectable failure and a controllable wait."""
         if self.fail_d2h:
             raise RuntimeError("injected D2H failure")
         if self.wait_copy is not None and not self.wait_copy.wait(2):
@@ -201,6 +210,7 @@ class CPUTransfers:
 
 
 def manager(*, prefetch=0, budget=8192, pipeline=False, transfers=None):
+    """Build a bounded manager with configurable CPU transfer test doubles."""
     return BoundedActivationManager(
         StagingConfig(
             buffer_bytes=1024,
@@ -214,6 +224,7 @@ def manager(*, prefetch=0, budget=8192, pipeline=False, transfers=None):
 
 
 def settle(predicate):
+    """Wait for a CPU worker condition with a bounded test timeout."""
     deadline = time.monotonic() + 3
     while not predicate():
         if time.monotonic() > deadline:
@@ -223,6 +234,7 @@ def settle(predicate):
 
 @pytest.mark.parametrize("failure", ["snapshot", "backing"])
 def test_snapshot_admission_counter_rolls_back_failed_pack(monkeypatch, failure):
+    """Return the admitted pageable budget when snapshot creation fails."""
     m = manager()
     try:
         with monkeypatch.context() as patcher:
@@ -250,12 +262,14 @@ def test_snapshot_admission_counter_rolls_back_failed_pack(monkeypatch, failure)
 
 
 def test_live_counter_includes_ticket_whose_finalizer_is_waiting():
+    """Count a ticket until its blocked finalizer releases its lease."""
     m = manager()
     waiting, proceed = threading.Event(), threading.Event()
     release = m._release_ticket
     failures = []
 
     def delayed(lease):
+        """Pause ticket release until signalled or the test timeout expires."""
         waiting.set()
         if not proceed.wait(2):
             failures.append("test finalizer was not released")
@@ -293,6 +307,7 @@ def test_live_counter_includes_ticket_whose_finalizer_is_waiting():
 
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_alias_snapshot_and_repeated_unpack_are_exact(pipeline):
+    """Preserve snapshot values despite alias mutation and repeated unpack."""
     m = manager(pipeline=pipeline)
     try:
         source = torch.arange(128, dtype=torch.bfloat16).reshape(8, 16)
@@ -313,6 +328,7 @@ def test_alias_snapshot_and_repeated_unpack_are_exact(pipeline):
 
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_fixed_d2h_slots_apply_backpressure_before_more_snapshots(pipeline):
+    """Block further snapshots while both device-to-host slots are occupied."""
     transfers = CPUTransfers()
     transfers.wait_copy = threading.Event()
     m = manager(transfers=transfers, pipeline=pipeline)
@@ -321,6 +337,7 @@ def test_fixed_d2h_slots_apply_backpressure_before_more_snapshots(pipeline):
         tickets.extend([m.pack(torch.ones(256), 0), m.pack(torch.ones(256), 1)])
 
         def third():
+            """Attempt another pack while the two staging slots are occupied."""
             try:
                 tickets.append(m.pack(torch.ones(256), 2))
             except BaseException as error:
@@ -343,6 +360,7 @@ def test_fixed_d2h_slots_apply_backpressure_before_more_snapshots(pipeline):
 
 
 def test_pageable_budget_fails_instead_of_waiting_for_backward():
+    """Reject pageable budget exhaustion instead of deadlocking before backward."""
     m = manager(budget=2048)
     try:
         first, second = m.pack(torch.ones(256), 0), m.pack(torch.ones(256), 1)
@@ -358,6 +376,7 @@ def test_pageable_budget_fails_instead_of_waiting_for_backward():
 
 
 def test_oversize_input_fails_before_allocating_pinned_buffers():
+    """Reject an oversized input before allocating pinned staging rings."""
     m = manager()
     with pytest.raises(RuntimeError, match="exceeds"):
         m.pack(torch.ones(1025, dtype=torch.uint8), 0)
@@ -367,6 +386,7 @@ def test_oversize_input_fails_before_allocating_pinned_buffers():
 
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_worker_exception_is_sticky_and_unblocks_consumer(pipeline):
+    """Propagate a recorded worker failure to later pack and unpack operations."""
     transfers = CPUTransfers()
     transfers.fail_d2h = True
     m = manager(transfers=transfers, pipeline=pipeline)
@@ -384,6 +404,7 @@ def test_worker_exception_is_sticky_and_unblocks_consumer(pipeline):
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 def test_unpublished_dma_payload_is_quarantined_after_partial_submission(direction, pipeline):
+    """Quarantine payloads when a failed submission may already have queued DMA."""
     transfers = CPUTransfers()
     references = []
 
@@ -418,6 +439,7 @@ def test_unpublished_dma_payload_is_quarantined_after_partial_submission(directi
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 def test_posted_dma_cannot_report_clean_after_completion_or_publication_failure(direction, pipeline):
+    """Reject clean shutdown if a posted transfer cannot prove completion."""
     import queue
 
     class FailedEvent:
@@ -449,6 +471,7 @@ def test_posted_dma_cannot_report_clean_after_completion_or_publication_failure(
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 def test_close_racing_partial_submission_keeps_payload_quarantined(direction, pipeline):
+    """Retain an uncertain transfer payload even when close races its submission."""
     submitted, release = threading.Event(), threading.Event()
     references, failures = [], []
     transfers = CPUTransfers()
@@ -475,6 +498,7 @@ def test_close_racing_partial_submission_keeps_payload_quarantined(direction, pi
     assert submitted.wait(2)
 
     def close():
+        """Attempt cleanup during submission and capture any resulting error."""
         try:
             m.close()
         except RuntimeError as error:
@@ -493,6 +517,7 @@ def test_close_racing_partial_submission_keeps_payload_quarantined(direction, pi
 
 
 def test_pipeline_posts_second_dma_before_first_completion_and_keeps_slots_owned():
+    """Allow pipelined submissions while preserving each pending DMA slot."""
     release = threading.Event()
     posted = []
 
@@ -528,6 +553,7 @@ def test_pipeline_posts_second_dma_before_first_completion_and_keeps_slots_owned
 
 
 def test_pipeline_publishes_restore_event_without_reusing_its_pinned_source():
+    """Publish restore readiness without recycling a pinned source before completion."""
     release = threading.Event()
     posted = []
     transfers = CPUTransfers()
@@ -566,6 +592,7 @@ def test_pipeline_publishes_restore_event_without_reusing_its_pinned_source():
 
 
 def test_pipeline_completion_failure_poisoning_quarantines_payload():
+    """Poison the manager and retain payloads when DMA completion fails."""
     transfers = CPUTransfers()
 
     class FailedEvent:
@@ -588,6 +615,7 @@ def test_pipeline_completion_failure_poisoning_quarantines_payload():
 
 
 def test_pipeline_completion_setup_failure_retains_already_posted_dma():
+    """Retain posted DMA payloads when the completion worker cannot initialize."""
     transfers = CPUTransfers()
     submitted = threading.Event()
     snapshots, slots = [], []
@@ -599,6 +627,7 @@ def test_pipeline_completion_setup_failure_retains_already_posted_dma():
         return value
 
     def setup():
+        """Fail device setup on the completion worker after a copy is submitted."""
         if threading.current_thread().name == "activation-d2h-complete":
             assert submitted.wait(2)
             raise RuntimeError("injected completion device setup failure")
@@ -625,6 +654,7 @@ def test_pipeline_completion_setup_failure_retains_already_posted_dma():
 
 
 def test_completion_rechecks_pending_after_final_publication_races_with_timeout():
+    """Drain a final published completion even when it races a queue timeout."""
     import queue
 
     m = manager(pipeline=True)
@@ -635,6 +665,7 @@ def test_completion_rechecks_pending_after_final_publication_races_with_timeout(
         published = False
 
         def get(self, block=True, timeout=None):
+            """Publish the final item immediately before reporting a timed-out read."""
             if timeout is not None and not self.published:
                 self.published = True
                 self.put_nowait("last DMA")
@@ -649,10 +680,12 @@ def test_completion_rechecks_pending_after_final_publication_races_with_timeout(
 
 
 def test_partial_pinned_allocation_failure_is_sticky_without_publishing_a_ring():
+    """Fail without publishing an incomplete staging ring after allocation failure."""
     transfers = CPUTransfers()
     allocate = transfers.pinned
 
     def fail_third(size):
+        """Inject a failure on the third pinned staging allocation."""
         if transfers.allocations == 2:
             raise RuntimeError("injected pin allocation failure")
         return allocate(size)
@@ -672,6 +705,7 @@ def test_partial_pinned_allocation_failure_is_sticky_without_publishing_a_ring()
 
 
 def test_consumer_failure_preserves_lease_until_ticket_is_released():
+    """Keep the restore credit owned when consuming the restored value fails."""
     transfers = CPUTransfers()
 
     def fail_consume(value, event):
@@ -690,6 +724,7 @@ def test_consumer_failure_preserves_lease_until_ticket_is_released():
 
 
 def test_failed_owner_teardown_does_not_retain_traceback_payloads():
+    """Avoid retaining activation tensors through a stored worker traceback."""
     transfers = CPUTransfers()
     transfers.fail_d2h = True
     allocate = transfers.pinned
@@ -713,6 +748,7 @@ def test_failed_owner_teardown_does_not_retain_traceback_payloads():
 
 
 def test_one_prefetch_leaves_demand_credit_and_abandoned_graph_releases_it():
+    """Reserve demand capacity and release credits from abandoned prefetches."""
     m = manager(prefetch=1)
     try:
         first, second, third = [m.pack(torch.full((32,), float(i)), i) for i in range(3)]
@@ -736,6 +772,7 @@ def test_one_prefetch_leaves_demand_credit_and_abandoned_graph_releases_it():
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("prefetch", [0, 1])
 def test_ring_and_pageable_capacity_do_not_grow_across_microbatches(prefetch, pipeline):
+    """Keep fixed ring and pageable limits across repeated microbatches."""
     m = manager(prefetch=prefetch, pipeline=pipeline)
     try:
         for _ in range(12):
@@ -760,6 +797,7 @@ def test_ring_and_pageable_capacity_do_not_grow_across_microbatches(prefetch, pi
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("prefetch", [0, 1])
 def test_checkpoint_hook_values_and_gradients_on_cpu(monkeypatch, prefetch, pipeline):
+    """Match checkpoint input values and gradients using the CPU transfer backend."""
     from torch.utils.checkpoint import checkpoint
     from transformers.modeling_layers import GradientCheckpointingLayer
 
@@ -818,6 +856,7 @@ def test_checkpoint_hook_values_and_gradients_on_cpu(monkeypatch, prefetch, pipe
 
 
 def test_root_collection_does_not_close_live_checkpoint_graph(monkeypatch):
+    """Keep the manager alive while autograd still owns checkpoint tickets."""
     from torch.utils.checkpoint import checkpoint
     from transformers.modeling_layers import GradientCheckpointingLayer
 
@@ -859,6 +898,7 @@ def test_root_collection_does_not_close_live_checkpoint_graph(monkeypatch):
 @pytest.mark.skipif(not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE), reason="Requires native accelerator streams")
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator", nproc=1))
 def test_native_checkpoint_gradients_and_streams(prefetch, nondefault_stream, pipeline):
+    """Check native checkpoint gradients and stream lifetimes across pipeline options."""
     native_checkpoint_case(prefetch, nondefault_stream, pipeline=pipeline)
 
 
@@ -952,6 +992,7 @@ def native_checkpoint_case(prefetch, nondefault_stream, *, pipeline=False):
 
 @pytest.mark.parametrize("layers", [0, 12])
 def test_bounded_runtime_rejects_partial_or_disabled_recomputation(layers):
+    """Reject unsupported partial or disabled checkpoint recomputation."""
     from veomni.models.model_runtime import VeOmniModelRuntime
 
     offload = SimpleNamespace(enable_async_activation=True, activation_offload_backend="bounded")
@@ -964,6 +1005,7 @@ def test_bounded_runtime_rejects_partial_or_disabled_recomputation(layers):
 
 
 def test_bounded_runtime_accepts_full_nonreentrant_recomputation(monkeypatch):
+    """Allow supported full nonreentrant recomputation with bounded offload."""
     import veomni.distributed.bounded_activation_offload as staging
     from veomni.models.model_runtime import VeOmniModelRuntime
 
@@ -988,6 +1030,7 @@ def test_bounded_runtime_accepts_full_nonreentrant_recomputation(monkeypatch):
 
 
 def test_bounded_offload_rejects_each_unmatched_pattern():
+    """Reject each offload pattern that selects no module."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     from veomni.distributed.bounded_activation_offload import StagingConfig, apply_bounded_activation_offload
@@ -998,6 +1041,7 @@ def test_bounded_offload_rejects_each_unmatched_pattern():
 
 
 def test_bounded_offload_rejects_non_checkpoint_container():
+    """Reject selected containers that are not checkpoint boundaries."""
     from veomni.distributed.bounded_activation_offload import StagingConfig, apply_bounded_activation_offload
 
     model = torch.nn.Sequential(torch.nn.Identity())
@@ -1007,6 +1051,7 @@ def test_bounded_offload_rejects_non_checkpoint_container():
 
 
 def test_bounded_offload_rejects_repeated_wildcard_target():
+    """Reject patterns that select the same checkpoint boundary twice."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     from veomni.distributed.bounded_activation_offload import StagingConfig, apply_bounded_activation_offload
@@ -1019,6 +1064,7 @@ def test_bounded_offload_rejects_repeated_wildcard_target():
 
 @pytest.mark.parametrize("pattern", ["layers.{*}.does_not_exist", "layers.{*}.{*}", "layers..{*}", ".{*}"])
 def test_bounded_offload_rejects_nonterminal_wildcard(pattern):
+    """Reject malformed patterns and wildcards outside the supported terminal position."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     from veomni.distributed.bounded_activation_offload import StagingConfig, apply_bounded_activation_offload
@@ -1030,6 +1076,7 @@ def test_bounded_offload_rejects_nonterminal_wildcard(pattern):
 
 
 def test_bounded_offload_rejects_noncontiguous_checkpoint_input(monkeypatch):
+    """Reject checkpoint inputs whose layout cannot be preserved by staging."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     import veomni.distributed.bounded_activation_offload as staging
@@ -1053,6 +1100,7 @@ def test_bounded_offload_rejects_noncontiguous_checkpoint_input(monkeypatch):
 
 
 def test_bounded_offload_rejects_keyword_only_checkpoint_input(monkeypatch):
+    """Require the hidden state as the first positional checkpoint input."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     import veomni.distributed.bounded_activation_offload as staging
@@ -1074,6 +1122,7 @@ def test_bounded_offload_rejects_keyword_only_checkpoint_input(monkeypatch):
 
 
 def test_bounded_offload_rejects_checkpoint_boundary_that_does_not_capture_input(monkeypatch):
+    """Reject a checkpoint layer that overrides the supported call boundary."""
     from transformers.modeling_layers import GradientCheckpointingLayer
 
     import veomni.distributed.bounded_activation_offload as staging

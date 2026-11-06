@@ -846,6 +846,7 @@ class OffloadConfig:
     )
 
     def __post_init__(self):
+        """Validate backend, module selection, staging budgets, and pipeline options."""
         if self.activation_offload_backend not in ("direct", "bounded"):
             raise ValueError("activation_offload_backend must be direct or bounded")
         if not isinstance(self.activation_offload_pipeline_transfers, bool):
