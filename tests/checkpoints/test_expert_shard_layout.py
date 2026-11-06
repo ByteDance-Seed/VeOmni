@@ -1300,6 +1300,7 @@ def test_raw_multi_optimizer_is_rejected_on_all_ranks(world):
 
 
 def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
+    import veomni.checkpoint.dcp_checkpointer as checkpoint_module
     from veomni.checkpoint.dcp_checkpointer import OptimizerState
     from veomni.distributed.parallel_plan import SpecInfo
 
@@ -1328,6 +1329,14 @@ def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
 
         leaf = SparseOptimizer()
         state = OptimizerState(model, leaf, parallel_state=parallel)
+        coordinator = checkpoint_module.raise_if_any_rank_failed
+        coordinated = []
+
+        def record_coordination(error, what, group=None):
+            coordinated.append(what)
+            return coordinator(error, what, group=group)
+
+        checkpoint_module.raise_if_any_rank_failed = record_coordination
         expected_type = ValueError if case == "type_property_error" and rank == 0 else RuntimeError
         expected_message = (
             "injected optimizer type lookup error"
@@ -1338,6 +1347,7 @@ def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
         )
         with pytest.raises(expected_type, match=expected_message):
             state.state_dict()
+        assert coordinated == ["validating ExtraParallel optimizer checkpoint"]
         assert not leaf.called
         completed = torch.tensor(1)
         dist.all_reduce(completed)
