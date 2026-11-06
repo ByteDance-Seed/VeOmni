@@ -310,12 +310,33 @@ def _process_sample_qwen_vl_base(
     from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
+    from .multimodal.preprocess import PREPROCESSOR_REGISTRY
 
-    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+    if getattr(chat_template, "_openai_chatml_vlm", False):
+        explicit_source = sample.get("source")
+        if explicit_source is not None:
+            if explicit_source != "openai_chatml" and explicit_source not in PREPROCESSOR_REGISTRY.valid_keys():
+                raise ValueError(f"Unknown explicit multimodal source: {explicit_source}")
+            source = explicit_source
+        if explicit_source is None and sample.get("messages") is not None:
+            source = "openai_chatml"
+        if source != "openai_chatml":
+            raise ValueError("openai_chatml_qwenvl only supports OpenAI message sources")
+
+    if source == "openai_chatml":
+        from .multimodal.openai_messages import OpenAIChatMLVisionTemplate, normalize_openai_messages
+
+        if not getattr(chat_template, "_openai_chatml_vlm", False):
+            raise ValueError("OpenAI image conversations require chat_template=openai_chatml_qwenvl")
+        conversations, images = normalize_openai_messages(sample, tools_in_system=kwargs.get("tools_in_system", False))
+        sample = {**sample, "images": images}
+        chat_template = OpenAIChatMLVisionTemplate(chat_template, kwargs.get("max_seq_len", 8192))
+    elif "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
         conversations = sample["conversations"]
     else:
         conversations = sample
-    conversations = conv_preprocess(source, conversations, **kwargs)
+    if source != "openai_chatml":
+        conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
