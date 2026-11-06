@@ -251,6 +251,11 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     main_input_name = "pixel_values"
     _no_split_modules = ["Qwen3VLVisionBlock"]
     supports_gradient_checkpointing = True
+    # This wrapper owns no attention — the tower inside `self.visual` does, and
+    # `Qwen3VLVisionModel` supports both SDPA and eager. Without this the base
+    # `_supports_sdpa = False` rejects `sdpa` / `veomni_sdpa` at construction,
+    # before the nested model gets a say.
+    _supports_sdpa = True
 
     def __init__(self, config: Qwen3VLVisionEncoderConfig):
         super().__init__(config)

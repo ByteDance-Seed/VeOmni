@@ -18,6 +18,7 @@ from typing import Any, Dict, Sequence
 import torch
 from torch.utils.data._utils.collate import default_collate
 
+from ...utils.constants import IGNORE_INDEX
 from ..data_collator import DataCollator
 
 
@@ -157,6 +158,14 @@ def _collate_packed(features: Sequence[Dict[str, Any]], keys: set[str]) -> Dict[
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
+    # Mask each sample boundary in the joined label row. `shift_packed_labels`
+    # shifts globally, so without this sample k's first label becomes the target of
+    # sample k-1's last position — a pair that `packed_cu_seqlens` cut attention
+    # between. Relying on the chat template to emit a masked leading marker is not
+    # enough: a supervised first item would train across the boundary.
+    if "packed_labels" in batch:
+        for start in cu[1:-1]:
+            batch["packed_labels"][..., start] = IGNORE_INDEX
     batch["packed_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32)
     batch["packed_max_length"] = max(lengths)
     return batch

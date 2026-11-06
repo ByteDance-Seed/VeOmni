@@ -379,3 +379,28 @@ def test_packed_collation_keeps_each_samples_visual_flags():
 
     # The flag drives the count, and it agrees with the grids it points at.
     assert visual_token_count(batch[IMAGE_GRID_THW], 2, batch[VISUAL_IS_REAL]) == (16 + 64) // 4
+
+
+def test_packed_collation_masks_each_sample_boundary_label():
+    """`shift_packed_labels` shifts globally, so sample k's first label would become
+    the target of sample k-1's last position — a pair `packed_cu_seqlens` cut
+    attention between. The collator masks those positions itself instead of relying
+    on the chat template happening to emit a masked leading marker."""
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+
+    def _packed(first_label: int) -> dict:
+        labels = torch.full((1, 4), IGNORE_INDEX, dtype=torch.long)
+        labels[0, 0] = first_label  # a supervised first item, the risky case
+        labels[0, 2] = 7
+        return {
+            PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
+            PACKED_LABELS: labels,
+            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
+        }
+
+    batch = SeedOmniCollator()([_packed(5), _packed(9), _packed(11)])
+    assert batch[PACKED_CU_SEQLENS].tolist() == [0, 4, 8, 12]
+    # Every interior boundary is masked; the very first label is untouched.
+    assert batch[PACKED_LABELS][0, 0].item() == 5
+    for start in (4, 8):
+        assert batch[PACKED_LABELS][0, start].item() == IGNORE_INDEX

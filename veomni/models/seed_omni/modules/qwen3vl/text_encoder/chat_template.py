@@ -22,8 +22,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
+from ......data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY
 from ....utils.conversation import ConversationItem
 from ...text_encoder.chat_template import TextEncoderChatTemplate
+from ..vision.processing import _OMNI_GRID
+
+
+def _frame_timestamps(item: ConversationItem, num_frames: int) -> list[float]:
+    """Seconds into the clip for each temporal patch, as HF computes them.
+
+    ``Qwen3VLProcessor._calculate_timestamps`` takes each kept frame's index over
+    the source fps and averages over the temporal patch, so a chunk is labelled
+    with its midpoint. When the item carries no metadata, fall back to one second
+    per frame — the sequence still has the right *shape*, which is what the M-RoPE
+    layout depends on.
+    """
+    metadata = (item.meta or {}).get(VIDEO_METADATA_KEY)
+    fps = getattr(metadata, "fps", None) if metadata is not None else None
+    indices = getattr(metadata, "frames_indices", None) if metadata is not None else None
+    if fps and indices is not None and len(indices) >= num_frames:
+        times = [idx / float(fps) for idx in list(indices)[:num_frames]]
+        return times
+    return [float(frame) for frame in range(num_frames)]
 
 
 @dataclass(frozen=True)
@@ -76,11 +98,15 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
 
             if item.type == "text":
                 out.append(self._build_conversation_item("text", str(item.value), role))
-            elif item.type in ("image", "video"):
-                # Image and video both wrap in <|vision_start|> … <|vision_end|>
-                # (the model uses <|image_pad|> / <|video_pad|> inside). Qwen3-VL has
-                # no audio modality — audio-in-video is an Omni feature (design-only,
-                # see docs/seed_omni/design/media.md).
+            elif item.type == "video":
+                # HF emits one ``<t seconds><|vision_start|>…<|vision_end|>`` block per
+                # temporal patch, not one per clip, so the timestamps line up with the
+                # per-frame M-RoPE the backbone rebuilds. A video item already carries
+                # the merged vision rows for *every* frame, so split its row count into
+                # per-frame segments here.
+                out.extend(self._video_segments(item, role))
+            elif item.type == "image":
+                # One block for the whole image (``T == 1``), as upstream.
                 out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
                 out.append(item)  # media row passed through verbatim (keeps value/source/meta)
                 out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
@@ -90,6 +116,55 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
         if prev_role is not None:
             close_turn(prev_role)
         out.extend(dummy_parts)
+        return out
+
+    def _video_segments(self, item: ConversationItem, role: str) -> list[ConversationItem]:
+        """One ``<t seconds><|vision_start|>rows<|vision_end|>`` block per frame.
+
+        HF's ``Qwen3VLProcessor.replace_video_token`` builds the prompt that way, and
+        the backbone's M-RoPE restarts per frame to match (see
+        ``qwen3vl_vision_position_ids``). Emitting a single block for the whole clip
+        would hand the model a different token sequence — and a different position
+        layout — than the checkpoint was trained on.
+
+        A video item holds the merged vision rows for every frame in one tensor, so
+        the per-frame row count comes from its declared grid: ``prod(grid[1:]) /
+        merge²`` rows each.
+        """
+        markers = self.chat_markers
+        grid = (item.meta or {}).get(_OMNI_GRID) or (item.meta or {}).get("grid_thw")
+        value = item.value
+        num_frames = None
+        if isinstance(value, torch.Tensor) and value.dim() == 2 and grid is not None:
+            t, h, w = (int(x) for x in torch.as_tensor(grid).reshape(-1).tolist())
+            merge = int(getattr(self, "spatial_merge_size", 2) or 2)
+            per_frame = (h // merge) * (w // merge)
+            if per_frame > 0 and value.size(0) == t * per_frame:
+                num_frames = t
+        if num_frames is None:
+            # No usable grid: keep the single-block shape rather than guessing a
+            # split that would silently misalign rows.
+            return [
+                self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0),
+                item,
+                self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0),
+            ]
+
+        timestamps = _frame_timestamps(item, num_frames)
+        per_frame = value.size(0) // num_frames
+        out: list[ConversationItem] = []
+        for frame in range(num_frames):
+            out.append(self._build_conversation_item("text", f"<{timestamps[frame]:.1f} seconds>", role, loss_mask=0))
+            out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
+            out.append(
+                ConversationItem(
+                    type=item.type,
+                    value=value[frame * per_frame : (frame + 1) * per_frame],
+                    role=item.role,
+                    meta=dict(item.meta or {}),
+                )
+            )
+            out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
         return out
 
     def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:

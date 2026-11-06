@@ -57,7 +57,12 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; this hook owns only the carrier.
+        # Swallowing the rest keeps framework metadata (`ds_idx`, …) and any
+        # sibling module's keys from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))

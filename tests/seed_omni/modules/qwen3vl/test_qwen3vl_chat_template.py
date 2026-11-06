@@ -109,3 +109,26 @@ def test_dummy_rows_are_moved_to_tail():
     parts = _template().apply_chat_template(sample)
     assert parts[-1] is dummy
     assert [p for p in parts if p.is_dummy] == [dummy]
+
+
+def test_chat_template_splits_a_video_into_one_timestamped_block_per_frame():
+    """HF emits ``<t seconds><|vision_start|>…<|vision_end|>`` per temporal patch, and
+    the backbone's M-RoPE restarts per frame to match. A single block for the whole
+    clip would hand the model a different token sequence than the checkpoint saw."""
+    import torch
+
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
+
+    tmpl = _template()
+    tmpl.spatial_merge_size = 2
+    # 3 frames x 4x4 patches -> 4 merged rows each, so 12 rows in one item.
+    video = ConversationItem(type="video", value=torch.zeros(12, 8), role="user", meta={_OMNI_GRID: [3, 4, 4]})
+    parts = tmpl.apply_chat_template([video])
+    rows = [(p.type, p.value if p.type == "text" else tuple(p.value.shape)) for p in parts]
+
+    timestamps = [value for kind, value in rows if kind == "text" and value.endswith("seconds>")]
+    assert timestamps == ["<0.0 seconds>", "<1.0 seconds>", "<2.0 seconds>"]
+    # One block per frame, each carrying that frame's merged rows only.
+    video_rows = [value for kind, value in rows if kind == "video"]
+    assert video_rows == [(4, 8)] * 3
+    assert sum(kind == "text" and value == "<|vision_start|>" for kind, value in rows) == 3
