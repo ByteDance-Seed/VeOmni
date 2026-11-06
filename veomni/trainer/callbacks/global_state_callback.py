@@ -271,18 +271,13 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        step_root, payload, generations, error = None, None, {}, None
+        step_root, path_error = None, None
         try:
             step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-            payload = self.state_dict(state)
-            generations = _saved_multi_optimizer_generations(self.trainer, state.global_step)
-        except Exception as exc:  # noqa: BLE001 - all ranks must fail before writing
-            error = exc
-        raise_if_any_rank_failed(error, "preparing trainer checkpoint state")
-        if generations:
-            payload["_veomni_optimizer_generations"] = generations
-        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
-        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+        except Exception as exc:  # noqa: BLE001 - all ranks must agree before invalidating a manifest
+            path_error = exc
+        raise_if_any_rank_failed(path_error, "preparing the trainer checkpoint path")
+        assert step_root is not None
 
         # A restarted run reaching this step again overwrites the cursor files, so
         # the manifest an earlier attempt left has to go before the first of them
@@ -300,11 +295,29 @@ class GlobalStateCallback(Callback):
                 remove_error = e
         raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
 
+        payload, state_error = None, None
+        try:
+            payload = self.state_dict(state)
+        except Exception as exc:  # noqa: BLE001 - synchronize a rank-local cursor failure
+            state_error = exc
+        raise_if_any_rank_failed(state_error, "collecting trainer checkpoint state")
+        assert payload is not None
+        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
+        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+
         # Each rank writes its own files, so a full disk or a bad pickle starts out
         # visible to that rank alone. Reduce before the manifest: the manifest
         # claims every rank's cursor is down, and rank 0 only knows about its own.
         # A rank that raised here would otherwise leave its peers recording a step
         # whose state is incomplete, or waiting in a collective it never reaches.
+        generations, generation_error = {}, None
+        try:
+            generations = _saved_multi_optimizer_generations(self.trainer, state.global_step)
+        except Exception as exc:  # noqa: BLE001 - all ranks must fail before writing
+            generation_error = exc
+        raise_if_any_rank_failed(generation_error, "preparing trainer checkpoint state")
+        if generations:
+            extra_payload["_veomni_optimizer_generations"] = generations
         write_error: Optional[Exception] = None
         try:
             for path, blob in (
@@ -506,8 +519,12 @@ class GlobalStateCallback(Callback):
             set_device_rng_state(global_state.get("device_rng_state"))
 
         restore_local(restore_rng, "restoring training RNG")
-        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
-            restore_local(lambda: iter(self.trainer.train_dataloader), "initializing the restored data iterator")
+        restore_local(
+            lambda: iter(self.trainer.train_dataloader)
+            if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None
+            else None,
+            "initializing the restored data iterator",
+        )
 
         if reuse_owners:
             for checkpoint in reuse_owners:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -310,6 +311,23 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
         trainer = _trainer(tmp_path, optimizer_step=step)
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
+        if mode in ("asymmetric_loader", "asymmetric_loader_error"):
+            trainer.args.train_steps = 3
+
+            class Loader:
+                def __init__(self):
+                    self.iterations = 0
+
+                def load_state_dict(self, state):
+                    assert state == {"cursor": 2}
+
+                def __iter__(self):
+                    self.iterations += 1
+                    if mode == "asymmetric_loader_error":
+                        raise ValueError("injected iterator failure")
+                    return iter(())
+
+            trainer.train_dataloader = Loader() if rank == 0 else None
         callback = GlobalStateCallback(trainer)
         state = (
             None
@@ -319,6 +337,7 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 "_veomni_optimizer_generations": {
                     "model": "older" if mode == "trainer_generation" and rank == 1 else "generation"
                 },
+                "train_dataloader": {"cursor": 2},
             }
         )
         with (
@@ -326,9 +345,12 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
             patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None),
             patch("veomni.trainer.callbacks.global_state_callback.set_device_rng_state"),
         ):
-            if mode == "matching":
+            if mode in ("matching", "asymmetric_loader"):
                 callback.load_global_state()
                 assert trainer.state.global_step == 3
+            elif mode == "asymmetric_loader_error":
+                with pytest.raises((ValueError, RuntimeError), match="iterator failure|restored data iterator"):
+                    callback.load_global_state()
             else:
                 with pytest.raises(
                     RuntimeError,
@@ -337,13 +359,30 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 ):
                     callback.load_global_state()
                 assert trainer.state.global_step == 0
+        if mode in ("asymmetric_loader", "asymmetric_loader_error"):
+            if rank == 0:
+                assert trainer.train_dataloader.iterations == 1
+            value = torch.ones(1)
+            dist.all_reduce(value)
+            assert value.item() == 2
     finally:
         clear_parallel_state()
         dist.destroy_process_group()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("mode", ["missing", "optimizer_step", "trainer_step", "trainer_generation", "matching"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing",
+        "optimizer_step",
+        "trainer_step",
+        "trainer_generation",
+        "matching",
+        "asymmetric_loader",
+        "asymmetric_loader_error",
+    ],
+)
 def test_multi_optimizer_trainer_resume_is_rank_coordinated(tmp_path, mode):
     spawn_with_rendezvous(_resume_worker, args=(str(tmp_path), mode), nprocs=2)
 
