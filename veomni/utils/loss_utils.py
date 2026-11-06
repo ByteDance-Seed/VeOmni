@@ -27,36 +27,33 @@ def is_padding_microbatch(batch) -> bool:
     return isinstance(batch, dict) and bool(batch.get("padding_flag", False))
 
 
-def contains_padding(value):
-    if isinstance(value, (list, tuple)):
-        return any(contains_padding(item) for item in value)
-    return is_padding_microbatch(value)
+def contains_padding(batch) -> bool:
+    if isinstance(batch, (list, tuple)):
+        return any(contains_padding(item) for item in batch)
+    return is_padding_microbatch(batch)
 
 
 def contains_loss_weights(value):
     if isinstance(value, (list, tuple)):
         return any(contains_loss_weights(item) for item in value)
-    return isinstance(value, dict) and value.get("loss_weights") is not None
+    return isinstance(value, dict) and (value.get("loss_weight") is not None or value.get("loss_weights") is not None)
 
 
-def step_batch_structure(batch):
-    if isinstance(batch, (list, tuple)):
-        return (type(batch), tuple(step_batch_structure(item) for item in batch))
-    if isinstance(batch, dict):
-        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
-        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
-    return (type(batch), id(batch))
-
-
-def fetch_training_micro_batches(data_iterator):
+def fetch_training_micro_batches(data_iterator, *, objective=None, on_fetched=None):
     """Coordinate input errors and uneven exhaustion before any model collective."""
     error = None
     try:
         batches = next(data_iterator)
+        if on_fetched is not None:
+            on_fetched()
         if not isinstance(batches, (list, tuple)) or not batches:
             raise ValueError("Training loader must return a nonempty list of micro-batches")
         if contains_padding(batches):
-            raise ValueError("Synthetic padding requires the padding-safe trainer")
+            raise ValueError(
+                f"{objective} does not support padded micro-batches"
+                if objective
+                else "Synthetic padding requires the padding-safe trainer"
+            )
     except Exception as exc:  # noqa: BLE001 - all ranks must agree before forward
         batches, error = None, exc
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
@@ -102,7 +99,116 @@ def synchronize_training_error(error, objective, *, microbatch_count=None):
         if microbatch_count is not None and values[1] != -values[2]:
             raise RuntimeError(f"{objective} ranks must execute the same number of micro-batches")
     elif error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"{objective} step-begin callback raised StopIteration") from error
         raise error
+
+
+def step_batch_structure(batch):
+    """Record callback-invariant microbatch identities and reduction structure."""
+    if isinstance(batch, (list, tuple)):
+        return (type(batch), tuple(step_batch_structure(item) for item in batch))
+    if isinstance(batch, dict):
+        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
+        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
+    return (type(batch), id(batch))
+
+
+def _distributed_batch_status(
+    batch, invalid: bool, has_auxiliary_targets: bool = False, *, check_fetch=False, fetch_error=None
+):
+    count = len(batch) if isinstance(batch, (list, tuple)) else 1
+    device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+    values = [int(invalid), int(has_auxiliary_targets), count, -count]
+    if check_fetch:
+        values.extend(
+            [
+                int(fetch_error is None),
+                int(isinstance(fetch_error, StopIteration)),
+                int(fetch_error is not None and not isinstance(fetch_error, StopIteration)),
+            ]
+        )
+    flags = torch.tensor(values, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+    values = flags.tolist()
+    if check_fetch:
+        any_loaded, any_eof, any_error = values[4:]
+        if any_error:
+            raise RuntimeError("SFT data loading failed on a rank") from fetch_error
+        if any_eof:
+            if not any_loaded:
+                raise StopIteration
+            raise RuntimeError("SFT ranks reached the end of the data at different times") from fetch_error
+    return bool(values[0]) or values[2] != -values[3], bool(values[1])
+
+
+def reject_objective_padding(batch, objective: str) -> None:
+    validation_error = None
+    try:
+        found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
+    except Exception as exc:  # noqa: BLE001 - coordinate invalid metadata before objective collectives
+        found, validation_error = True, exc
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        found, _ = _distributed_batch_status(batch, found)
+    if found:
+        raise ValueError(
+            f"{objective} does not support padded micro-batches, an empty step, or unequal microbatch counts across ranks"
+        ) from validation_error
+
+
+def synchronize_step_begin_error(error: Exception | None, objective: str) -> None:
+    """Propagate real callback errors before distributed model collectives."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError(f"{objective} step-begin callback failed on a rank") from error
+    elif error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"{objective} step-begin callback raised StopIteration") from error
+        raise error
+
+
+def _has_auxiliary_labels(batch) -> bool:
+    if isinstance(batch, dict):
+        return any(key.endswith("_labels") for key in batch)
+    if isinstance(batch, (list, tuple)):
+        return any(_has_auxiliary_labels(item) for item in batch)
+    return False
+
+
+def reject_distributed_padding(batch, *, check_fetch=False, fetch_error=None) -> bool:
+    """Reject unequal/padded steps and return whether any rank has auxiliary labels."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        validation_error = None
+        try:
+            invalid = (
+                contains_padding(batch)
+                or (isinstance(batch, (list, tuple)) and not batch)
+                or (check_fetch and fetch_error is None and not isinstance(batch, (list, tuple)))
+            )
+            has_auxiliary_targets = _has_auxiliary_labels(batch)
+        except Exception as exc:  # noqa: BLE001 - peers must reach the same status collective
+            invalid, has_auxiliary_targets, validation_error = True, False, exc
+        found, has_auxiliary_targets = _distributed_batch_status(
+            batch,
+            invalid,
+            has_auxiliary_targets=has_auxiliary_targets,
+            check_fetch=check_fetch,
+            fetch_error=fetch_error,
+        )
+        if found:
+            raise RuntimeError(
+                "Distributed training does not support padded micro-batches, an empty step, "
+                "unequal microbatch counts across ranks, or malformed batch metadata"
+            ) from validation_error
+        return has_auxiliary_targets
+    if check_fetch and fetch_error is not None:
+        raise fetch_error
+    if check_fetch and not isinstance(batch, (list, tuple)):
+        raise ValueError("SFT data loader must return a list of micro-batches")
+    return False
 
 
 def count_loss_token(
@@ -206,8 +312,37 @@ def mean_global_loss(
     return loss_dict
 
 
-def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
+def reduce_global_loss_token(
+    micro_batches_token_len: dict[str, torch.Tensor], *, error: Exception | None = None, sync_auxiliary: bool = False
+) -> dict[str, float]:
     """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # Reuse the existing foundation-token reduction to propagate a
+        # rank-local callback/counting error without another collective.
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        local = torch.tensor(
+            [micro_batches_token_len["foundation_tokens"].item(), int(error is not None)],
+            dtype=torch.float,
+            device=device,
+        )
+        foundation, failures = all_reduce(local, op="sum")
+        if failures:
+            raise RuntimeError("Step-begin callback or loss-token counting failed on a rank") from error
+        if sync_auxiliary:
+            synchronize_auxiliary_loss_tokens(micro_batches_token_len)
+        reduced = {"foundation_tokens": foundation}
+        reduced.update(
+            {
+                key: all_reduce(value.item(), op="sum")
+                for key, value in sorted(micro_batches_token_len.items())
+                if key != "foundation_tokens"
+            }
+        )
+        return reduced
+    if error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError("Step-begin callback raised StopIteration") from error
+        raise error
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
 
 

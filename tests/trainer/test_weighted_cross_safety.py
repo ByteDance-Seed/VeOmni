@@ -37,7 +37,7 @@ def _worker(rank, endpoint):
         packer = data_collator.PackingCollator()
         loader = DataLoader([feature], batch_size=1, collate_fn=lambda samples: [packer(samples)])
         with pytest.raises(RuntimeError, match="data loading failed"):
-            base._weighted_sft_preflight(iter(loader), base)
+            base._fetch_sft_micro_batches(iter(loader))
         assert base.state.global_step == 3
         with pytest.raises(RuntimeError, match="end of data at different times"):
             loss_utils.fetch_training_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
@@ -56,7 +56,7 @@ def _worker(rank, endpoint):
 
         base.on_step_begin = mutate
         with pytest.raises(RuntimeError, match="callback or loss-token"):
-            base._weighted_sft_preflight(iter([batches]), base)
+            base._sft_step_preflight(batches, base)
         assert base.state.global_step == 3
 
         def add_padding(micro_batches):
@@ -66,7 +66,7 @@ def _worker(rank, endpoint):
         base.on_step_begin = add_padding
         batches = [{"labels": torch.tensor([1, 2]), "loss_weights": torch.tensor([0.5, 0.5])}]
         with pytest.raises(RuntimeError, match="callback or loss-token"):
-            base._weighted_sft_preflight(iter([batches]), base)
+            base._sft_step_preflight(batches, base)
         assert base.state.global_step == 3
 
         trainer = object.__new__(TextDPOTrainer)

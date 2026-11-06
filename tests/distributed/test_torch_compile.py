@@ -595,8 +595,11 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     trainer.base._reset_async_activation_offload_if_enabled = lambda model: (
         BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
     )
-    trainer.base._weighted_sft_preflight = lambda data_iterator, owner: BaseTrainer._weighted_sft_preflight(
-        trainer.base, data_iterator, owner
+    trainer.base._fetch_sft_micro_batches = lambda iterator: BaseTrainer._fetch_sft_micro_batches(
+        trainer.base, iterator
+    )
+    trainer.base._sft_step_preflight = lambda batches, on_step_begin, **kwargs: BaseTrainer._sft_step_preflight(
+        trainer.base, batches, on_step_begin, **kwargs
     )
 
     trainer.train_step(iter([[{}, {}]]))

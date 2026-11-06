@@ -140,3 +140,25 @@ def test_dpo_rejects_weights_returned_by_template():
 
     with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
         process_dpo_example({"chosen": [10, 20], "rejected": [30, 40]}, chat_template=WeightedTemplate())
+
+
+@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+def test_dpo_rejects_weighted_input_without_silently_dropping_it(key):
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example({"chosen": "a", "rejected": "b", key: 0.5}, tokenizer=_FakeTokenizer())
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example(
+            {"chosen": [{"role": "assistant", key: 0.5}], "rejected": []}, chat_template=_FakeChatTemplate()
+        )
+
+
+@pytest.mark.parametrize("key", ["loss_weight", "loss_weights"])
+def test_dpo_rejects_template_produced_weights(key):
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            result = super().encode_messages(messages, max_seq_len=max_seq_len)
+            result[key] = [0.5] * len(messages)
+            return result
+
+    with pytest.raises(ValueError, match="does not support token loss_weights"):
+        process_dpo_example({"chosen": [1, 2], "rejected": [3, 4]}, chat_template=WeightedTemplate())

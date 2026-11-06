@@ -178,7 +178,9 @@ def process_dpo_example(
         assert chat_template is not None, "chat_template is required for conversation-format DPO data"
         chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
         rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
-        if chosen_tok.get("loss_weights") is not None or rejected_tok.get("loss_weights") is not None:
+        if any(
+            tok.get(key) is not None for tok in (chosen_tok, rejected_tok) for key in ("loss_weight", "loss_weights")
+        ):
             raise ValueError("DPO does not support token loss_weights")
     else:
         assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -391,6 +392,8 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if contains_padding(micro_batch):
+            raise ValueError("DPO does not support padded micro-batches")
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -452,12 +455,16 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        micro_batches = fetch_training_micro_batches(data_iterator)
-        had_loss_weights = contains_loss_weights(micro_batches)
+        micro_batches = fetch_training_micro_batches(
+            data_iterator,
+            objective="DPO",
+            on_fetched=lambda: setattr(self.base, "_step_preflight_start_time", time.time()),
+        )
         previous_step = self.state.global_step
         self.state.global_step += 1
         error = None
         try:
+            had_loss_weights = contains_loss_weights(micro_batches)
             self.base._reset_async_activation_offload_if_enabled(self.policy_model)
             self.on_step_begin(micro_batches=micro_batches)
             if not micro_batches:
@@ -468,7 +475,7 @@ class TextDPOTrainer:
             ):
                 raise ValueError("DPO microbatches must have tensor labels")
             if contains_padding(micro_batches):
-                raise ValueError("DPO does not support synthetic padding")
+                raise ValueError("DPO does not support padded micro-batches")
             if had_loss_weights or contains_loss_weights(micro_batches):
                 raise ValueError("DPO does not support token loss_weights")
         except Exception as exc:  # noqa: BLE001 - synchronize before model collectives

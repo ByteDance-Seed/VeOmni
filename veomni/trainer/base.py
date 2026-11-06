@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import threading
+import time
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -70,10 +71,12 @@ from ..utils.device import (
     synchronize,
 )
 from ..utils.loss_utils import (
+    contains_padding,
     count_loss_token,
-    fetch_training_micro_batches,
+    is_padding_microbatch,
     mean_global_loss,
     prepare_loss_token_counts,
+    reject_distributed_padding,
     step_batch_structure,
 )
 from .callbacks import (
@@ -676,18 +679,28 @@ class BaseTrainer(Stateful, ABC):
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        is_padding = is_padding_microbatch(micro_batch)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
             else nullcontext()
         )
         with micro_step_context:
+            if is_padding and (not dist.is_initialized() or dist.get_world_size() == 1):
+                # Native distributed tail padding is rejected during loader
+                # construction. Avoid RNG consumption and zero-gradient AdamW
+                # updates for parameters touched only by a synthetic batch.
+                return torch.tensor(0.0), {}, {}
+            if isinstance(micro_batch, dict) and "padding_flag" in micro_batch:
+                micro_batch = {key: value for key, value in micro_batch.items() if key != "padding_flag"}
             micro_batch = self.preforward(micro_batch)
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
             channel_forward_context = (
-                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
+                channel_loss_callback.model_forward_context()
+                if channel_loss_callback is not None and not is_padding
+                else nullcontext()
             )
             with (
                 use_parallel_state(self.model.parallel_state),
@@ -699,6 +712,8 @@ class BaseTrainer(Stateful, ABC):
 
             with use_parallel_state(self.model.parallel_state):
                 loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
+            if is_padding:
+                aux_metrics = {name: torch.zeros_like(value) for name, value in aux_metrics.items()}
 
             with (
                 use_parallel_state(self.model.parallel_state),
@@ -745,34 +760,55 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
-    def _weighted_sft_preflight(self, data_iterator, callback_owner):
-        micro_batches = fetch_training_micro_batches(data_iterator)
-        previous_step = self.state.global_step
-        self.state.global_step += 1
-        structure = step_batch_structure(micro_batches)
+    def _fetch_sft_micro_batches(self, data_iterator):
         error = None
         try:
-            self._reset_async_activation_offload_if_enabled(self.model)
-            callback_owner.on_step_begin(micro_batches=micro_batches)
-            if structure != step_batch_structure(micro_batches):
-                raise ValueError("SFT step-begin callback changed microbatch structure or loss weights")
-        except Exception as exc:  # noqa: BLE001 - propagate on the denominator reduction
-            error = exc
+            micro_batches = next(data_iterator)
+            self._step_preflight_start_time = time.time()
+        except Exception as exc:  # noqa: BLE001 - coordinate before peers enter model collectives
+            micro_batches, error = None, exc
+        has_auxiliary_targets = reject_distributed_padding(micro_batches, check_fetch=True, fetch_error=error)
+        return micro_batches, has_auxiliary_targets
+
+    def _sft_step_preflight(self, micro_batches, callback_owner, *, has_auxiliary_targets=None):
+        if has_auxiliary_targets is None:
+            self._step_preflight_start_time = time.time()
+            has_auxiliary_targets = reject_distributed_padding(micro_batches)
+        if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
+            raise ValueError("Padding inside an unpacked micro-batch is unsupported")
+        real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
+        if not real_micro_steps:
+            raise ValueError("A training step must contain at least one real micro-batch")
+        original_structure = step_batch_structure(micro_batches)
+        previous_step = self.state.global_step
+        self.state.global_step += 1
         try:
-            weighted, self.micro_batches_token_len, self.global_micro_batches_token_len = prepare_loss_token_counts(
-                micro_batches, self.model, error=error
-            )
+            error = None
+            try:
+                self._reset_async_activation_offload_if_enabled(self.model)
+                callback_owner.on_step_begin(micro_batches=micro_batches)
+                if step_batch_structure(micro_batches) != original_structure:
+                    raise ValueError("SFT step-begin callback changed microbatch structure or padding")
+            except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
+                error = exc
+            # Callbacks may adjust labels; normalize the inputs actually consumed.
+            (
+                self._weighted_loss_normalization,
+                self.micro_batches_token_len,
+                self.global_micro_batches_token_len,
+            ) = prepare_loss_token_counts(micro_batches, self.model, error=error, sync_auxiliary=has_auxiliary_targets)
         except BaseException:
             self.state.global_step = previous_step
             raise
-        return micro_batches, weighted
+
+        return real_micro_steps
 
     def train_step(
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        """Accumulate one step using globally normalized micro-batch losses."""
-        micro_batches, weighted_normalization = self._weighted_sft_preflight(data_iterator, self)
+        micro_batches, has_auxiliary_targets = self._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self._sft_step_preflight(micro_batches, self, has_auxiliary_targets=has_auxiliary_targets)
 
         # Forward and backward for each micro batch
         self.sync_before_train_step()
@@ -781,18 +817,21 @@ class BaseTrainer(Stateful, ABC):
         total_loss_dict = defaultdict(int)
         total_aux_metrics = defaultdict(float)
 
-        # token num for fixed_ce_loss in postforward
-        num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
-        for micro_step, micro_batch in enumerate(micro_batches):
-            mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
-            self.model_reshard(micro_step, num_micro_steps)
-            self._configure_hsdp_allreduce(micro_step, num_micro_steps)
+        real_micro_step = 0
+        for micro_batch in micro_batches:
+            if not is_padding_microbatch(micro_batch):
+                mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
+                self.model_reshard(real_micro_step, real_micro_steps)
+                self._configure_hsdp_allreduce(real_micro_step, real_micro_steps)
+                real_micro_step += 1
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch, weighted_normalization=weighted_normalization)
+            self.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -813,7 +852,7 @@ class BaseTrainer(Stateful, ABC):
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm,
-            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+            aux_metrics=mean_aux_metrics(total_aux_metrics, max(real_micro_steps, 1)),
         )
 
     def train(self):
