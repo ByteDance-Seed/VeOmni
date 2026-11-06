@@ -118,6 +118,7 @@ seed_omni/mixins/offline_encoding.md
 :caption: SeedOmni Models
 
 seed_omni/models/qwen3.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}

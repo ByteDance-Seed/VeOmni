@@ -78,8 +78,14 @@ def _as_list(media: MediaInput | None) -> list[Any]:
 class OmniProcessor:
     """Composed SeedOmni request preprocessor (HF ``AutoProcessor``-style API)."""
 
-    def __init__(self, preprocessors: dict[str, ModulePreprocessorBase]) -> None:
+    def __init__(
+        self,
+        preprocessors: dict[str, ModulePreprocessorBase],
+        *,
+        infer_type: str | None = None,
+    ) -> None:
         self._preprocessors: dict[str, ModulePreprocessorBase] = dict(preprocessors)
+        self.infer_type: str | None = infer_type
 
     def __len__(self) -> int:
         """Number of worker-side preprocessors contributed by active graph modules."""
@@ -148,7 +154,7 @@ class OmniProcessor:
             if preprocessor is not None:
                 preprocessors[name] = preprocessor
                 logger.info_rank0(f"OmniProcessor: module '{name}' contributes {type(preprocessor).__name__}.")
-        return cls(preprocessors)
+        return cls(preprocessors, infer_type=config.infer_type)
 
     @classmethod
     def from_pretrained(
@@ -242,6 +248,8 @@ class OmniProcessor:
         Training uses ``inference=False`` (default); single-request inference
         uses :meth:`__call__` with ``inference=True``.
         """
+        if inference and self.infer_type is not None and generation_kwargs.get("infer_type") is None:
+            generation_kwargs["infer_type"] = self.infer_type
         for preprocessor in self._preprocessors.values():
             preprocessor(
                 batch,

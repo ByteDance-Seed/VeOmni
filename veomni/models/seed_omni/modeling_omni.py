@@ -716,6 +716,8 @@ class OmniModel(PreTrainedModel):
         """Merge :attr:`~OmniConfig.generation_kwargs` defaults with per-request overrides."""
         resolved = dict(self.config.generation_kwargs or {})
         resolved.update(generation_kwargs or {})
+        if resolved.get("infer_type") is None and self.config.infer_type is not None:
+            resolved["infer_type"] = self.config.infer_type
         return resolved
 
     def collect_assets(self) -> list[Any]:

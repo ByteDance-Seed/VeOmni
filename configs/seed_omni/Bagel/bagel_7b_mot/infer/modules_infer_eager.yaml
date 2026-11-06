@@ -1,0 +1,42 @@
+# Per-module INFERENCE overrides for BAGEL-7B-MoT — all eager.
+#
+# Single-process load (`python tasks/omni/infer_omni.py ...`): every module
+# loads via `from_pretrained(device_map='auto')`, spread across visible GPUs.
+
+bagel_vae:
+  model_path: bagel_vae
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager
+
+bagel_siglip_navit:
+  model_path: bagel_siglip_navit
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+bagel_text_encoder:
+  model_path: bagel_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+bagel_flow_connector:
+  model_path: bagel_flow_connector
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+bagel_qwen2_mot:
+  model_path: bagel_qwen2_mot
+  ops_implementation:
+    attn_implementation: flex_attention
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
