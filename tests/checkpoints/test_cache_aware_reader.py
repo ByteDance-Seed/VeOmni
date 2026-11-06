@@ -11,6 +11,7 @@ from veomni.checkpoint.cache_aware_reader import CacheAwareFileSystemReader
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_TWO_RANK = LaunchSpec(nproc=2, device="cpu")
 
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
@@ -76,9 +77,13 @@ def _two_rank_worker(rank, rendezvous, checkpoint):
 
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+@pytest.mark.launch_plan(provider=_TWO_RANK)
 def test_two_rank_dcp_cache_advice(tmp_path):
     torch.multiprocessing.spawn(
-        _two_rank_worker, args=(str(tmp_path / "rdzv"), str(tmp_path / "checkpoint")), nprocs=2, join=True
+        _two_rank_worker,
+        args=(str(tmp_path / "rdzv"), str(tmp_path / "checkpoint")),
+        nprocs=_TWO_RANK.nproc,
+        join=True,
     )
 
 
