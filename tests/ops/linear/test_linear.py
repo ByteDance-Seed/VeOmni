@@ -38,8 +38,10 @@ def _empty_bias(weight: torch.Tensor) -> torch.Tensor:
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "torchao_mxfp4"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao_mxfp4"]
+    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
+    assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
 
 
 def test_linear_eager_matches_f_linear():
@@ -105,6 +107,15 @@ def test_linear_torchao_mxfp4_actually_rounds():
     x = torch.randn(4, 64, dtype=torch.bfloat16)
     w = torch.randn(32, 64, dtype=torch.bfloat16)
     assert not torch.equal(op(x, w, _empty_bias(w)), F.linear(x, w, None))
+
+
+def test_linear_qat_rows_require_tilelang_on_sm90():
+    """The TileLang rows are declared with the hardware and package they need."""
+    entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
+    assert ("qat", ("tilelang",)) in entries
+    assert ("qat", ("tilelang",)) in {
+        (entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "grouped")
+    }
 
 
 @_requires_torchao

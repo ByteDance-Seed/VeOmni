@@ -55,19 +55,21 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("parse_config", [False, True], ids=["dataclass", "parser"])
-def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_config):
+@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+def test_deepgemm_rejects_a_quantizing_family_before_hardware_validation(monkeypatch, parse_config, field):
+    """DeepGEMM quantizes its own operands, so a fake-quantizing family would round them twice."""
     from veomni.arguments import OpsImplementationConfig
     from veomni.arguments.parser import _instantiate_recursive
 
     # An invalid combination must report the config conflict even without CUDA.
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
-    values = {"moe_implementation": "deepgemm_fp8", "qat_implementation": "fp8_blockwise"}
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise") as error:
+    values = {"moe_implementation": "deepgemm_fp8", field: "qat"}
+    with pytest.raises(ValueError, match=f"deepgemm_fp8.*cannot be combined.*{field}") as error:
         if parse_config:
             _instantiate_recursive(OpsImplementationConfig, values)
         else:
             OpsImplementationConfig(**values)
-    assert "Set qat_implementation='none'" in str(error.value)
+    assert "set those families to" in str(error.value).lower()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -75,11 +77,13 @@ def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_conf
     "values",
     [
         {"moe_implementation": "deepgemm_fp8"},
-        {"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
-        {"moe_implementation": None, "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "eager", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_quack", "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "eager"},
+        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "torchao_mxfp4"},
+        {"moe_implementation": None, "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_quack", "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "swiglu_mlp_implementation": "qat"},
     ],
 )
 def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
@@ -95,7 +99,8 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
 
     config = OpsImplementationConfig(**values)
     assert config.moe_implementation == values["moe_implementation"]
-    assert config.qat_implementation == values.get("qat_implementation", "none")
+    expected = values.get("linear_implementation")
+    assert config.linear_implementation == expected
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
@@ -550,21 +555,21 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
     )
     cfg.save_pretrained(llama_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*linear_implementation"):
+        cfg._set_ops_implementation({"linear_implementation": "qat"})
     assert cfg.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*linear_implementation"):
+        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"linear_implementation": "qat"})
 
     # Overriding moe_implementation away from deepgemm_fp8 at the same time is valid.
     reloaded = LlamaConfig.from_pretrained(
         llama_dir,
-        ops_implementation={"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
+        ops_implementation={"moe_implementation": "fused_triton", "linear_implementation": "qat"},
     )
     assert reloaded.ops_implementation == {
         "moe_implementation": "fused_triton",
-        "qat_implementation": "fp8_blockwise",
+        "linear_implementation": "qat",
     }
 
     # Sub-config cross-field conflicts must also be rejected atomically.
@@ -574,13 +579,13 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
     )
     vl_cfg.save_pretrained(vl_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        vl_cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*linear_implementation"):
+        vl_cfg._set_ops_implementation({"linear_implementation": "qat"})
     assert vl_cfg.ops_implementation == {}
     assert vl_cfg.text_config.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*linear_implementation"):
+        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"linear_implementation": "qat"})
 
 
 def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path, monkeypatch):

@@ -17,11 +17,13 @@ native FP4 training kernels and no Blackwell requirement.
 | `linear_implementation` | `linear` / `standard` | A model that owns its projections individually (Qwen3 attention `q/k/v/o`) |
 | `swiglu_mlp_implementation` | `swiglu_mlp` / `standard` | A model that runs the fused SwiGLU row (Qwen3 MLP `gate/up/down`) |
 
-They are independent, mirroring the DeepSeek-V4 `fp8_blockwise` recipe, where the
-recipe field says how much rounding to simulate and each GEMM family names the
-kernel that applies it. A model that fuses its MLP reads only the second field; a
-model with per-projection control reads the first. Set both to quantize every
-projection.
+They are independent, and they are two of the four selections that make up a
+quantization-aware training recipe — the others being `moe_implementation` and
+`kv_round_implementation` for models that have experts or a KV cache. A model
+that fuses its MLP reads only the second field; a model with per-projection
+control reads the first. Set both to quantize every projection. There is no
+global recipe switch: each family owns its own row. See
+[op selection](../design/op_selection.md).
 
 ## Recipe
 

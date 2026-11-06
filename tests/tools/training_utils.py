@@ -171,6 +171,8 @@ def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
         cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
         rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
         swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
+        linear_implementation=overrides.pop("linear_implementation", "eager"),
+        kv_round_implementation=overrides.pop("kv_round_implementation", "eager"),
         rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
         rotary_pos_emb_vision_implementation=overrides.pop("rotary_pos_emb_vision_implementation", "eager"),
         load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),

@@ -35,7 +35,6 @@ from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
-from veomni.ops.qat import fp8_fake_quant_act_prefix, qat_linear
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -230,7 +229,6 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         self.attn_hc = hyper_connection_cls(config)
         self.ffn_hc = hyper_connection_cls(config)
         self.veomni_mhc_post = VeomniOp("mhc", "post", config.ops_config.mhc_implementation)
-        self.qat_implementation = config.ops_config.qat_implementation
 
         if stage_id == 0:
             target_ids = getattr(config, "dspark_target_layer_ids", None)
@@ -242,6 +240,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
                 bias=False,
             )
             self.main_norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
+            self.veomni_main_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
         if stage_id == config.num_nextn_predict_layers - 1:
             self.hc_head = hyper_head_cls(config)
             self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps, config=config)
@@ -255,7 +254,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         if self.stage_id != 0:
             raise RuntimeError("only the first DSpark stage owns main_proj")
         concatenated = torch.cat(draft_hiddens, dim=-1) if isinstance(draft_hiddens, list) else draft_hiddens
-        projected = qat_linear(self.main_proj, concatenated, enabled=self.qat_implementation == "fp8_blockwise")
+        projected = self.veomni_main_proj(concatenated, self.main_proj.weight, self.main_proj.weight.new_empty(0))
         return self.main_norm(projected)
 
     def _window_kv(
@@ -266,16 +265,17 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         """Rotated window KV ``[B, S, head_dim]`` for ``hidden_states``."""
         attn = self.self_attn
-        qat_enabled = attn.qat_implementation == "fp8_blockwise"
         hidden_shape = (*hidden_states.shape[:-1], 1, attn.head_dim)
         kv = (
-            attn.kv_norm(qat_linear(attn.kv_proj, hidden_states, enabled=qat_enabled))
+            attn.kv_norm(attn.veomni_kv_proj(hidden_states, attn.kv_proj.weight, attn.kv_proj.weight.new_empty(0)))
             .view(*hidden_shape)
             .transpose(1, 2)
         )
         kv = attn.veomni_rope(kv, cos, sin)
-        if qat_enabled and kv.numel() > 0:
-            kv = fp8_fake_quant_act_prefix(kv, kv.shape[-1] - attn.config.qk_rope_head_dim, block_size=64)
+        # Same storage recipe as the main attention: the NoPE channels are
+        # stored FP8 in 64-wide groups and the RoPE tail stays in the model dtype.
+        if attn.veomni_kv_round is not None and kv.numel() > 0:
+            kv = attn.veomni_kv_round(kv, block_size=64, quant_features=kv.shape[-1] - attn.config.qk_rope_head_dim)
         return kv.squeeze(1)
 
     def _packed_draft_attention(
@@ -300,14 +300,17 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
                 f"packed DSpark expected main_x shape {tuple(hidden_states.shape[:2])}, got {tuple(main_x.shape[:2])}"
             )
         attn = self.self_attn
-        qat_enabled = attn.qat_implementation == "fp8_blockwise"
         batch, seq_len, _ = hidden_states.shape
         hidden_shape = (batch, seq_len, -1, attn.head_dim)
 
-        q_residual = attn.q_a_norm(qat_linear(attn.q_a_proj, hidden_states, enabled=qat_enabled))
-        q = attn.q_b_norm(qat_linear(attn.q_b_proj, q_residual, enabled=qat_enabled).view(*hidden_shape)).transpose(
-            1, 2
+        q_residual = attn.q_a_norm(
+            attn.veomni_q_a_proj(hidden_states, attn.q_a_proj.weight, attn.q_a_proj.weight.new_empty(0))
         )
+        q = attn.q_b_norm(
+            attn.veomni_q_b_proj(q_residual, attn.q_b_proj.weight, attn.q_b_proj.weight.new_empty(0)).view(
+                *hidden_shape
+            )
+        ).transpose(1, 2)
         q = attn.veomni_rope(q, cos, sin)
         query = q.transpose(1, 2)
 
@@ -358,8 +361,10 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
 
         output = attn.veomni_rope(output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = output.reshape(batch, seq_len, attn.config.o_groups, -1)
-        grouped = qat_linear(attn.o_a_proj, grouped, enabled=qat_enabled).flatten(2)
-        return qat_linear(attn.o_b_proj, grouped, enabled=qat_enabled)
+        grouped = attn.veomni_o_a_proj(
+            grouped, attn.o_a_proj.weight, attn.o_a_proj.weight.new_empty(0), n_groups=attn.config.o_groups
+        ).flatten(2)
+        return attn.veomni_o_b_proj(grouped, attn.o_b_proj.weight, attn.o_b_proj.weight.new_empty(0))
 
     def collapse_draft(self, hidden_streams: torch.Tensor) -> torch.Tensor:
         """Last-stage ``norm(hc_head(hidden_streams))`` -- the tensor the shared LM head reads."""

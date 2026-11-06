@@ -185,5 +185,5 @@ def test_make_eager_ops_config_covers_every_kernel_field():
 
     selection = training_utils.make_eager_ops_config()
     for field in fields(OpsImplementationConfig):
-        expected = "none" if field.name == "qat_implementation" else "eager"
+        expected = "eager"
         assert getattr(selection, field.name) == expected, field.name
