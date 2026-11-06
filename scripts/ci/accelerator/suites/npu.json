@@ -1,15 +1,5 @@
 [
   {
-    "name": "npu-bounded-activation-offload-unit",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/distributed/test_bounded_activation_offload.py"
-    ]
-  },
-  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -118,6 +108,16 @@
       "-s",
       "-x",
       "tests/arguments"
+    ]
+  },
+  {
+    "name": "npu-bounded-activation-offload-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_bounded_activation_offload.py"
     ]
   },
   {
