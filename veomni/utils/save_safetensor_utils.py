@@ -369,6 +369,8 @@ def save_lora_adapter_with_dcp(
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict
 
+    from .dist_utils import raise_if_any_rank_failed
+
     if not is_veomni_lora_model(model):
         raise TypeError(
             f"save_lora_adapter_with_dcp expects a VeOmniLoraModel, got {type(model).__name__}. "
@@ -442,8 +444,6 @@ def save_lora_adapter_with_dcp(
         dist.barrier()
 
     is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-    from .dist_utils import raise_if_any_rank_failed
-
     error = None
     try:
         if is_rank_0:
@@ -459,7 +459,9 @@ def save_lora_adapter_with_dcp(
                 consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
             )
 
-            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json.
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+            # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+            # separate sidecar).
             model.get_lora_config().save_pretrained(save_path)
 
             shutil.rmtree(dcp_save_path, ignore_errors=True)
