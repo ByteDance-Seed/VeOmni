@@ -30,22 +30,26 @@ from ...text_encoder.chat_template import TextEncoderChatTemplate
 from ..vision.processing import _OMNI_GRID
 
 
-def _frame_timestamps(item: ConversationItem, num_frames: int) -> list[float]:
-    """Seconds into the clip for each temporal patch, as HF computes them.
+def _frame_timestamps(item: ConversationItem, num_patches: int, temporal_patch_size: int) -> list[float]:
+    """When each temporal patch happens, in seconds on the source clip.
 
-    ``Qwen3VLProcessor._calculate_timestamps`` takes each kept frame's index over
-    the source fps and averages over the temporal patch, so a chunk is labelled
-    with its midpoint. When the item carries no metadata, fall back to one second
-    per frame — the sequence still has the right *shape*, which is what the M-RoPE
-    layout depends on.
+    Delegates to :meth:`VideoMetadata.frame_timestamps`, which folds frames into
+    patches exactly as ``Qwen3VLProcessor._calculate_timestamps`` does — pad to a
+    whole number of patches by repeating the last frame, then take each patch's
+    mid-time. Dividing ``frames_indices`` by the *source* fps is the trap that
+    helper exists to encapsulate.
+
+    Without decode metadata there are no real times to report. The sequence then
+    keeps the right *shape* (one stamp per patch, which is what the M-RoPE layout
+    depends on) but the values are synthetic.
     """
     metadata = (item.meta or {}).get(VIDEO_METADATA_KEY)
-    fps = getattr(metadata, "fps", None) if metadata is not None else None
-    indices = getattr(metadata, "frames_indices", None) if metadata is not None else None
-    if fps and indices is not None and len(indices) >= num_frames:
-        times = [idx / float(fps) for idx in list(indices)[:num_frames]]
-        return times
-    return [float(frame) for frame in range(num_frames)]
+    if metadata is not None:
+        stamps = metadata.frame_timestamps(int(temporal_patch_size))
+        if len(stamps) >= num_patches:
+            return stamps[:num_patches]
+    patch = max(1, int(temporal_patch_size))
+    return [float(patch * i) for i in range(num_patches)]
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,11 @@ class Qwen3VLChatMarkers:
 
 class Qwen3VLChatTemplate(TextEncoderChatTemplate):
     chat_markers: Qwen3VLChatMarkers
+    # Which frames one temporal patch merges. Set by
+    # `Qwen3VLTextEncoderPreprocessor.build_chat_template` from the module config;
+    # the default matches the shipped checkpoints.
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
 
     def __init__(self, tokenizer: Any):
         super().__init__(tokenizer)  # resolves bos / eos markers + ids
@@ -127,9 +136,10 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
         would hand the model a different token sequence — and a different position
         layout — than the checkpoint was trained on.
 
-        A video item holds the merged vision rows for every frame in one tensor, so
-        the per-frame row count comes from its declared grid: ``prod(grid[1:]) /
-        merge²`` rows each.
+        A video item holds **raw patch rows** for every frame in one tensor (the
+        vision preprocessor splits the flat ViT output by ``t*h*w``), so one frame
+        contributes ``h*w`` rows of that tensor; the merge happens when the vision
+        module encodes them, not here.
         """
         markers = self.chat_markers
         grid = (item.meta or {}).get(_OMNI_GRID) or (item.meta or {}).get("grid_thw")
@@ -137,9 +147,8 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
         num_frames = None
         if isinstance(value, torch.Tensor) and value.dim() == 2 and grid is not None:
             t, h, w = (int(x) for x in torch.as_tensor(grid).reshape(-1).tolist())
-            merge = int(getattr(self, "spatial_merge_size", 2) or 2)
-            per_frame = (h // merge) * (w // merge)
-            if per_frame > 0 and value.size(0) == t * per_frame:
+            patch_rows_per_frame = h * w
+            if patch_rows_per_frame > 0 and value.size(0) == t * patch_rows_per_frame:
                 num_frames = t
         if num_frames is None:
             # No usable grid: keep the single-block shape rather than guessing a
@@ -150,7 +159,7 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
                 self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0),
             ]
 
-        timestamps = _frame_timestamps(item, num_frames)
+        timestamps = _frame_timestamps(item, num_frames, self.temporal_patch_size)
         per_frame = value.size(0) // num_frames
         out: list[ConversationItem] = []
         for frame in range(num_frames):

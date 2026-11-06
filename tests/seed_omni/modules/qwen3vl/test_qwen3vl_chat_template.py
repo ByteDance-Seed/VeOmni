@@ -120,15 +120,39 @@ def test_chat_template_splits_a_video_into_one_timestamped_block_per_frame():
     from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
 
     tmpl = _template()
-    tmpl.spatial_merge_size = 2
-    # 3 frames x 4x4 patches -> 4 merged rows each, so 12 rows in one item.
-    video = ConversationItem(type="video", value=torch.zeros(12, 8), role="user", meta={_OMNI_GRID: [3, 4, 4]})
+    # A video item holds *raw patch rows*: 3 frames x (4x4) = 48 rows.
+    video = ConversationItem(type="video", value=torch.zeros(48, 8), role="user", meta={_OMNI_GRID: [3, 4, 4]})
     parts = tmpl.apply_chat_template([video])
     rows = [(p.type, p.value if p.type == "text" else tuple(p.value.shape)) for p in parts]
 
     timestamps = [value for kind, value in rows if kind == "text" and value.endswith("seconds>")]
-    assert timestamps == ["<0.0 seconds>", "<1.0 seconds>", "<2.0 seconds>"]
-    # One block per frame, each carrying that frame's merged rows only.
+    # No decode metadata, so the stamps are synthetic (one patch apart) -- the
+    # layout is what this asserts; real timestamps need `VideoMetadata`.
+    assert timestamps == ["<0.0 seconds>", "<2.0 seconds>", "<4.0 seconds>"]
+    # One block per frame, each carrying that frame's own raw patch rows.
     video_rows = [value for kind, value in rows if kind == "video"]
-    assert video_rows == [(4, 8)] * 3
+    assert video_rows == [(16, 8)] * 3, "each frame keeps its own raw patch rows"
     assert sum(kind == "text" and value == "<|vision_start|>" for kind, value in rows) == 3
+
+
+def test_chat_template_uses_real_timestamps_when_the_item_has_decode_metadata():
+    """The `<t seconds>` stamps have to be the clip's real ones — frame index over
+    source fps, then the temporal patch's mid-time, as
+    `Qwen3VLProcessor._calculate_timestamps` computes them."""
+    import torch
+
+    from veomni.data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY, VideoMetadata
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
+
+    # 8 source frames at 2 fps -> 4 temporal patches of 2 frames, mid-times
+    # 0.25 / 1.25 / 2.25 / 3.25. 4 frames per 4x4 grid = 64 raw patch rows.
+    metadata = VideoMetadata(fps=2.0, total_num_frames=8, frames_indices=list(range(8)), requested_fps=2.0)
+    video = ConversationItem(
+        type="video",
+        value=torch.zeros(4 * 4 * 4, 8),
+        role="user",
+        meta={_OMNI_GRID: [4, 4, 4], VIDEO_METADATA_KEY: metadata},
+    )
+    parts = _template().apply_chat_template([video])
+    stamps = [p.value for p in parts if p.type == "text" and p.value.endswith("seconds>")]
+    assert stamps == ["<0.2 seconds>", "<1.2 seconds>", "<2.2 seconds>", "<3.2 seconds>"]

@@ -122,6 +122,26 @@ Video decoding is driven by `data.mm_configs` in `base.yaml`
 no audio modality. The on-disk row schema is documented in
 [Data Format](../usage/data_format.md).
 
+### Video prompts and timestamps
+
+Qwen3-VL does not just drop a clip's frames into one vision block: upstream emits
+`<t seconds><|vision_start|>…<|vision_end|>` **per temporal patch**, and the
+backbone's M-RoPE restarts at each one. `Qwen3VLChatTemplate` does the same,
+taking each stamp from the item's `VideoMetadata` via `frame_timestamps()` — frame
+index over source fps, then the patch's mid-time.
+
+> **Limitation: a real clip only matches the pretrained format when its decode
+> metadata reaches the template.** The stamps are real only if the item still
+> carries `meta["video_metadata"]` at templating time. The decoder
+> (`fetch_videos` → `VideoMetadata`) always writes it, and the vision preprocessor
+> preserves it, so the shipped `data.yaml` path is fine. A source that supplies
+> pre-sampled frames with no `fps` — or any caller that builds
+> `ConversationItem(type="video", …)` without that metadata — falls back to
+> synthetic stamps (`0, patch, 2·patch, …`). The token *layout* is then still
+> correct, so training runs and the M-RoPE positions stay consistent, but the
+> prompt describes a different clip than the model was trained on. Check
+> `item.meta["video_metadata"]` when a video sample's loss looks off.
+
 ---
 
 ## 3. Train

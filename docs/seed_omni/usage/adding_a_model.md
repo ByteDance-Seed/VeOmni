@@ -169,9 +169,18 @@ Packing needs **one shared token axis**. The packer emits a single
 its own embeddings into it with `masked_scatter_embeds` over a boolean mask:
 
 ```python
-real_tokens = visual_row_mask(grid, merge, is_real)   # (T,) where this module owns a row
-packed = masked_scatter_embeds(packed, mask, real_tokens)
+# Two different masks, both (T,):
+#   `owned` — which encoded rows belong to this module (derived from the flag)
+#   `mask`  — where those rows sit in the packed sequence (`visual_pos_mask`)
+owned = visual_row_mask(grid, merge, is_real)
+real_embeds = image_embeds[owned]
+packed = masked_scatter_embeds(packed, mask, real_embeds)
 ```
+
+`masked_scatter_embeds(packed, mask, embeds)` writes `embeds` — one vector per
+`mask`-selected position — into `packed` wherever `mask` is true. The third
+argument is therefore the module's encoded output, not the selector.
+
 
 Every participant therefore has to agree on **what it writes**: `T` (what one row
 of the shared tensor means) and `D` (the width it is written at), with each row
