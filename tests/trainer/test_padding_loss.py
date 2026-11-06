@@ -774,3 +774,85 @@ def test_malformed_padding_metadata_fails_collectively():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_malformed_padding_metadata_worker, nprocs=2)
+
+
+def _dpo_weight_guard_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        trainer = object.__new__(TextDPOTrainer)
+        trainer.base = SimpleNamespace(
+            state=SimpleNamespace(global_step=3),
+            _reset_async_activation_offload_if_enabled=lambda _model: None,
+            on_step_begin=lambda micro_batches, **_kwargs: micro_batches[0].pop("loss_weights", None),
+        )
+        trainer.policy_model = SimpleNamespace()
+        for key in ("loss_weight", "loss_weights"):
+            batch = {"labels": torch.tensor([1, 2])}
+            if rank == 1:
+                batch[key] = torch.tensor([0.5, 0.5])
+            with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
+                trainer.train_step(iter([[batch]]))
+            assert trainer.state.global_step == 3
+        with pytest.raises(RuntimeError, match="end of data at different times"):
+            loss_utils.fetch_training_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
+        with pytest.raises(StopIteration):
+            loss_utils.fetch_training_micro_batches(iter([]))
+        with pytest.raises(RuntimeError, match="same number of micro-batches"):
+            loss_utils.fetch_training_micro_batches(iter([[{"labels": torch.tensor([1])}] * (rank + 1)]))
+
+        def fail_fetched():
+            if rank == 1:
+                raise RuntimeError("rank-local timer error")
+
+        with pytest.raises(RuntimeError, match="data loading failed"):
+            loss_utils.fetch_training_micro_batches(iter([[{"labels": torch.tensor([1])}]]), on_fetched=fail_fetched)
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_dpo_asymmetric_weights_fail_before_forward_on_all_ranks():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_dpo_weight_guard_worker, args=(), nprocs=2)
+
+
+def test_dpo_step_begin_stop_iteration_is_not_loader_eof():
+    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+
+    def stop(**_kwargs):
+        raise StopIteration("callback")
+
+    trainer = object.__new__(TextDPOTrainer)
+    trainer.base = SimpleNamespace(
+        state=SimpleNamespace(global_step=3),
+        _reset_async_activation_offload_if_enabled=lambda _model: None,
+        on_step_begin=stop,
+    )
+    trainer.policy_model = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="step-begin callback raised StopIteration"):
+        trainer.train_step(iter([[{"labels": torch.tensor([1, 2])}]]))
+    assert trainer.state.global_step == 3
+
+
+def test_dpo_preflight_timer_includes_padding_validation(monkeypatch):
+    import veomni.trainer.text_dpo_trainer as dpo_module
+
+    events = []
+    monkeypatch.setattr(dpo_module, "time", SimpleNamespace(time=lambda: events.append("timer") or 123))
+    monkeypatch.setattr(loss_utils, "contains_padding", lambda _batch: events.append("padding") or True)
+    trainer = object.__new__(dpo_module.TextDPOTrainer)
+    trainer.base = SimpleNamespace()
+    with pytest.raises(ValueError, match="does not support padded micro-batches"):
+        trainer.train_step(iter([[{"padding_flag": True}]]))
+    assert trainer.base._step_preflight_start_time == 123
+    assert events == ["timer", "padding"]

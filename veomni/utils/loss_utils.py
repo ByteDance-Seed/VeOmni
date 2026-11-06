@@ -32,6 +32,77 @@ def contains_padding(batch) -> bool:
     return is_padding_microbatch(batch)
 
 
+def contains_loss_weights(value):
+    if isinstance(value, (list, tuple)):
+        return any(contains_loss_weights(item) for item in value)
+    return isinstance(value, dict) and (value.get("loss_weight") is not None or value.get("loss_weights") is not None)
+
+
+def fetch_training_micro_batches(data_iterator, *, objective=None, on_fetched=None):
+    """Coordinate input errors and uneven exhaustion before any model collective."""
+    error = None
+    try:
+        batches = next(data_iterator)
+        if on_fetched is not None:
+            on_fetched()
+        if not isinstance(batches, (list, tuple)) or not batches:
+            raise ValueError("Training loader must return a nonempty list of micro-batches")
+        if contains_padding(batches):
+            raise ValueError(
+                f"{objective} does not support padded micro-batches"
+                if objective
+                else "Synthetic padding requires the padding-safe trainer"
+            )
+    except Exception as exc:  # noqa: BLE001 - all ranks must agree before forward
+        batches, error = None, exc
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        count = len(batches) if batches is not None else 0
+        flags = torch.tensor(
+            [
+                int(error is None),
+                int(isinstance(error, StopIteration)),
+                int(error is not None and not isinstance(error, StopIteration)),
+                count,
+                -count,
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+        success, eof, failed, max_count, neg_min_count = flags.tolist()
+        if failed:
+            raise RuntimeError("Training data loading failed on a rank") from error
+        if eof:
+            if not success:
+                raise StopIteration
+            raise RuntimeError("Training ranks reached the end of data at different times") from error
+        if max_count != -neg_min_count:
+            raise RuntimeError("Training ranks must execute the same number of micro-batches")
+    elif error is not None:
+        raise error
+    return batches
+
+
+def synchronize_training_error(error, objective, *, microbatch_count=None):
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        values = [int(error is not None)]
+        if microbatch_count is not None:
+            values.extend([microbatch_count, -microbatch_count])
+        flags = torch.tensor(values, dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+        values = flags.tolist()
+        if values[0]:
+            raise RuntimeError(f"{objective} preforward validation failed on a rank") from error
+        if microbatch_count is not None and values[1] != -values[2]:
+            raise RuntimeError(f"{objective} ranks must execute the same number of micro-batches")
+    elif error is not None:
+        if isinstance(error, StopIteration):
+            raise RuntimeError(f"{objective} step-begin callback raised StopIteration") from error
+        raise error
+
+
 def _distributed_batch_status(batch, invalid: bool, has_auxiliary_targets: bool = False):
     count = len(batch) if isinstance(batch, (list, tuple)) else 1
     device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
