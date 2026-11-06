@@ -29,6 +29,7 @@ class ReduceLoss(torch.autograd.Function):
         num_valid_tokens: torch.Tensor,
         group=None,
     ) -> torch.Tensor:
+        """Reduce a local loss by its valid-token mass over the selected SP group."""
         # ``group`` defaults to the comm-global unified SP group (single-model
         # path). SeedOmni V2 passes each module's OWN SP group so heterogeneous
         # per-module SP reduces over the right ranks (the comm-global unified

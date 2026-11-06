@@ -238,6 +238,7 @@ def run_train_step(request, monkeypatch):
 
     # Single process: the all-reduce over the step's token denominators is the identity.
     def prepare_counts(batches, model):
+        """Replace distributed token counting with the single-process result."""
         del model
         local = module.count_loss_token(batches)
         return False, local, {key: value.item() for key, value in local.items()}

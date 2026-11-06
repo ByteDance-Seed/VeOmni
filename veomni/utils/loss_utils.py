@@ -33,6 +33,7 @@ def count_loss_token(
     }
 
     def _count(obj):
+        """Accumulate valid labels or weighted target mass in nested batches."""
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
             valid = obj["labels"] != IGNORE_INDEX
             weights = obj.get("loss_weights")

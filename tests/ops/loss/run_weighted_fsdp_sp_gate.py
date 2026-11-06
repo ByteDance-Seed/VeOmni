@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 def validate_report(report: Path) -> None:
+    """Require all four expected native cases to pass without skips."""
     cases = ET.parse(report).getroot().findall(".//testcase")
     names = [case.get("name") for case in cases]
     if (
@@ -25,6 +26,7 @@ def validate_report(report: Path) -> None:
 
 
 def main() -> None:
+    """Run the exact-source weighted loss gate on sixteen available NPUs."""
     os.environ["VEOMNI_TEST_REQUIRE_NPU"] = "1"
     import pytest
     import torch

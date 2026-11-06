@@ -33,10 +33,13 @@ PREPROCESSOR_REGISTRY = Registry("preprocessor")
 
 
 def conv_preprocess(source: str, conversations, **kwargs):
+    """Dispatch multimodal preprocessing without silently dropping loss weights."""
+
     # These preprocessors construct new modality records and do not preserve
     # per-message supervision metadata. Fail explicitly rather than silently
     # training with unit weights when a dataset supplies loss_weight.
     def has_weight(record):
+        """Find explicit weights in nested conversation records."""
         if isinstance(record, dict):
             if record.get("loss_weight") is not None:
                 return True
@@ -83,6 +86,7 @@ def sharegpt4v_pretrain_preprocess(conversations, generation_ratio=0.0, **kwargs
 @PREPROCESSOR_REGISTRY.register("sharegpt4v_captioner_sft")
 @PREPROCESSOR_REGISTRY.register("sharegpt4v_sft")
 def sharegpt4v_sft_preprocess(conversations, **kwargs):
+    """Convert ShareGPT4V turns and optionally preserve supervision metadata."""
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []
     if conversations[0]["from"] != "human":  # Skip the first one if it is not from human

@@ -747,6 +747,7 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
+        """Accumulate one step using globally normalized micro-batch losses."""
         self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)

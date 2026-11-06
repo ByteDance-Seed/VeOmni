@@ -281,6 +281,7 @@ class PackingCollator(DataCollator):
         return batch
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Pack features while keeping labels, weights and sequence boundaries aligned."""
         batch = defaultdict(list)
         weighted = any("loss_weights" in feature for feature in features)
         mtp_example = next((feature["mtp_labels"] for feature in features if "mtp_labels" in feature), None)
@@ -401,6 +402,7 @@ class SequenceParallelCollator(DataCollator):
             return torch.cat((feature, pad), dim=dim)
 
     def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        """Shift and slice sequence fields consistently for sequence parallelism."""
         if not self.seq_classification:
             # shift labels
             labels = batch["labels"][..., 1:].contiguous()

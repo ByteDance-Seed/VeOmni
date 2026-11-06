@@ -12,6 +12,7 @@ from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_g
 
 
 def test_qwen4_toy_weighted_loss_and_parameter_gradients_match_dense():
+    """Compare weighted model loss and parameter gradients with dense CE."""
     torch.manual_seed(123)
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json")
     as_veomni_config(config, validate=False)._set_ops_implementation(

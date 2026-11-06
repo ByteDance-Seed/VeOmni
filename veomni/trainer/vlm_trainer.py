@@ -307,6 +307,7 @@ class VLMTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
+        """Run multimodal micro-batches and report step losses and metrics."""
         self.base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)

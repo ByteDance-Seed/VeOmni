@@ -305,6 +305,7 @@ def _process_sample_qwen_vl_base(
     position_id_func: "Callable",
     **kwargs,
 ):
+    """Prepare Qwen-VL media and conversations while preserving supervision."""
     from .multimodal import conv_preprocess
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos_metadata

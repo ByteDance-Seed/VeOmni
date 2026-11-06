@@ -13,6 +13,7 @@ spec.loader.exec_module(runner)
 
 
 def test_gate_accepts_four_distinct_passes(tmp_path):
+    """Accept a complete report with all four expected passing cases."""
     report = tmp_path / "test.xml"
     cases = "".join(
         f'<testcase name="test_weighted_loss_fsdp2_sequence_parallel_on_accelerator[{i}]"/>'
@@ -32,6 +33,7 @@ def test_gate_accepts_four_distinct_passes(tmp_path):
     ],
 )
 def test_gate_rejects_partial_or_skipped_results(tmp_path, case):
+    """Reject reports with a missing, skipped, failed or unknown case."""
     report = tmp_path / "test.xml"
     valid = "".join(
         f'<testcase name="test_weighted_loss_fsdp2_sequence_parallel_on_accelerator[{i}]"/>'

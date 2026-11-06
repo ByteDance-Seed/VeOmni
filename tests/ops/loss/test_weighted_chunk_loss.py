@@ -10,6 +10,7 @@ from veomni.ops import resolve_op
 @pytest.mark.parametrize("weights", [[0.0, 0.5, 1.0, 0.2, 1.0], [0.0] * 5, [0.01] * 5])
 @pytest.mark.parametrize("chunk_size", [1, 2, 8])
 def test_weighted_chunk_loss_and_grads(weights, chunk_size):
+    """Match weighted chunk loss and gradients to dense cross-entropy."""
     torch.manual_seed(12)
     hidden = torch.randn(5, 4, requires_grad=True)
     weight = torch.randn(7, 4, requires_grad=True)
@@ -31,6 +32,7 @@ def test_weighted_chunk_loss_and_grads(weights, chunk_size):
 
 
 def test_causal_weighting_shifts_with_targets_and_matches_dense():
+    """Shift token weights with causal targets and compare the dense loss."""
     from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
     from veomni.ops import VeomniOp
 
@@ -61,6 +63,7 @@ def test_causal_weighting_shifts_with_targets_and_matches_dense():
 
 
 def test_chatml_message_weights_and_legacy_binary():
+    """Preserve binary masks while emitting fractional message weights."""
     from types import SimpleNamespace
 
     from veomni.data.chat_template import ChatmlTemplate
@@ -121,6 +124,7 @@ def test_collator_packs_mixed_weighted_and_unweighted_samples(monkeypatch):
 
 
 def _check_sp_weighted_reduce(rank, path):
+    """Check SP reduction against weighted and zero-mass references."""
     import torch.distributed as dist
 
     from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
@@ -200,6 +204,7 @@ def test_sp_causal_weighted_loss_and_gradients_match_unsharded(tmp_path):
 
 
 def test_gradient_accumulation_uses_weight_mass_not_microbatch_count(monkeypatch):
+    """Normalize accumulated loss by supervised weight, not batch count."""
     from types import SimpleNamespace
 
     from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
@@ -249,6 +254,7 @@ def test_gradient_accumulation_uses_weight_mass_not_microbatch_count(monkeypatch
 
 
 def test_sp_packing_shifts_and_slices_weights_with_labels(monkeypatch):
+    """Keep packed weights aligned with shifted and sharded targets."""
     from types import SimpleNamespace
 
     from veomni.data import data_collator as m
@@ -282,6 +288,7 @@ def test_sp_packing_shifts_and_slices_weights_with_labels(monkeypatch):
 
 
 def test_chatml_binary_explicit_weights_keep_legacy_output_shape():
+    """Keep the legacy ChatML output layout for binary supervision."""
     from types import SimpleNamespace
 
     from veomni.data.chat_template import ChatmlTemplate
@@ -334,6 +341,7 @@ def test_mixed_nonsp_microbatches_exclude_unsupervised_first_causal_target(monke
 
 
 def _check_dp_mixed_weighted(rank, path):
+    """Compare mixed weighted and unweighted DP gradients to dense CE."""
     from types import SimpleNamespace
 
     import torch.distributed as dist
@@ -449,6 +457,7 @@ def test_multimodal_preprocess_nested_numpy_and_nullable_weights():
 
 
 def test_weighted_chunk_with_projected_logit_bias_and_gradients():
+    """Match dense loss and gradients when the output projection has bias."""
     torch.manual_seed(7)
     hidden = torch.randn(5, 4, requires_grad=True)
     head = torch.randn(7, 4, requires_grad=True)
@@ -495,6 +504,7 @@ def test_chunk_weights_use_fp32_sum_on_long_sequence(dtype):
 
 
 def test_collator_keeps_weights_and_mtp_labels_for_trainer_rejection(monkeypatch):
+    """Retain both fields so the trainer can reject the unsupported pair."""
     from types import SimpleNamespace
 
     from veomni.data import data_collator as m
@@ -604,6 +614,7 @@ def test_weighted_loss_rejects_unsupported_models(monkeypatch):
 
 
 def test_weighted_router_aux_rejected_consistently_before_forward(monkeypatch):
+    """Reject weighted router loss before executing the model."""
     from types import SimpleNamespace
 
     from veomni.utils import loss_utils
@@ -635,6 +646,7 @@ def test_weighted_qwen4_direct_forward_rejects_router_aux_before_model_execution
 
 
 def _check_weighted_router_agreement(rank, path):
+    """Check coordinated rejection of incompatible per-rank batch metadata."""
     from datetime import timedelta
     from types import SimpleNamespace
 

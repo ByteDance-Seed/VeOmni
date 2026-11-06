@@ -24,6 +24,7 @@ _CAPABILITIES = runner_capabilities()
 
 
 def _check_fsdp_sp(dtype, all_zero):
+    """Compare sharded accelerator loss and gradients with a dense reference."""
     from veomni.models.loss_utils import cross_entropy_loss as causal
     from veomni.ops import VeomniOp
 
@@ -98,6 +99,7 @@ def _check_fsdp_sp(dtype, all_zero):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("all_zero", [False, True], ids=["mixed", "zero"])
 def test_weighted_loss_fsdp2_sequence_parallel_on_accelerator(dtype, all_zero):
+    """Exercise mixed and zero supervision masses through FSDP2 plus SP."""
     from tests.tools.launch_utils import torchrun
 
     if os.environ.get("VEOMNI_TEST_REQUIRE_NPU") == "1":

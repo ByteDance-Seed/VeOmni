@@ -284,6 +284,7 @@ class Llama2Template(ChatTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        """Tokenize ChatML turns and retain optional per-token supervision weights."""
         input_ids, attention_mask, labels = [], [], []
         has_weights = any(message.get("loss_weight") not in (None, 0, 1) for message in messages)
         loss_weights = []
@@ -495,6 +496,7 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
     def encode_messages(
         self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        """Render Qwen2-VL media placeholders and preserve turn supervision."""
         if num_tokens is None:
             num_tokens = defaultdict(list)
         sys_msg = self._get_system_message()
@@ -563,6 +565,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
     def encode_messages(
         self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        """Render Qwen3-VL conversations with media timing and turn supervision."""
         if num_tokens is None:
             num_tokens = defaultdict(list)
         messages = []
