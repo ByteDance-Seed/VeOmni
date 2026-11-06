@@ -302,20 +302,6 @@ def test_linear_torchao_mxfp4_accepts_replicated_dtensor_with_empty_input(single
     assert VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, bias).shape == (0, 32)
 
 
-@_requires_torchao
-def test_linear_torchao_mxfp4_rejects_sharded_dtensor_parameter(single_rank_dist):
-    """A sharded placement would split a 32-wide group across shards."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Shard, distribute_tensor
-
-    mesh = init_device_mesh("cpu", (1,))
-    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Shard(1)])
-    x = torch.randn(2, 64, dtype=torch.bfloat16)
-
-    with pytest.raises(TypeError, match="replicated DTensor"):
-        VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))
-
-
 def test_project_through_op_falls_back_to_a_wrapped_module():
     """A wrapped projection keeps its base layer at ``base_layer`` and owns no ``weight``."""
     from torch import nn
@@ -366,3 +352,54 @@ def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantiz
 
     with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
         project_through_op(FakeOp(), Wrapped(), torch.randn(2, 8))
+
+
+@_requires_torchao
+@pytest.mark.parametrize("placement", ["replicate", "shard0", "shard1_aligned"])
+def test_linear_torchao_mxfp4_accepts_safe_dtensor_placements(single_rank_dist, placement):
+    """Quantization runs on the local shard, which is exact whenever no group is split.
+
+    MX groups run along the last dimension. A ``Replicate`` placement holds the
+    whole tensor; a shard along the output dimension copies whole groups; a shard
+    along the quantized dimension is exact while its width stays a multiple of the
+    group size. All three quantify the same values they would unsharded.
+    """
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+    mesh = init_device_mesh("cpu", (1,))
+    weight = torch.randn(32, 64, dtype=torch.bfloat16)
+    placements = {"replicate": [Replicate()], "shard0": [Shard(0)], "shard1_aligned": [Shard(1)]}[placement]
+    dtensor = distribute_tensor(weight, mesh, placements)
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    out = VeomniOp("linear", "standard", "torchao_mxfp4")(x, dtensor, dtensor.new_empty(0))
+    expected = VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))
+
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == (2, 32)
+    torch.testing.assert_close(out, expected)
+
+
+@_requires_torchao
+def test_mxfp4_quantization_of_a_row_shard_equals_the_full_tensor():
+    """Sharding the output dimension is a lossless split, which is what lets the row run sharded."""
+    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
+
+    torch.manual_seed(0)
+    weight = torch.randn(64, 128, dtype=torch.bfloat16)
+    full = mxfp4_fake_quant(weight)
+    for shards in (2, 4):
+        recomputed = torch.cat([mxfp4_fake_quant(s) for s in weight.chunk(shards, dim=0)], dim=0)
+        torch.testing.assert_close(recomputed, full, rtol=0, atol=0)
+
+
+@_requires_torchao
+def test_mxfp4_rejects_a_group_split_that_cannot_be_padded():
+    """A shard that splits a group has no defined scale, so it must fail rather than round wrongly."""
+    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
+
+    # in=96 splits into 48-wide halves, not a multiple of the 32-wide group.
+    weight = torch.randn(64, 96, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="divisible by block_size"):
+        mxfp4_fake_quant(weight.chunk(2, dim=1)[0])

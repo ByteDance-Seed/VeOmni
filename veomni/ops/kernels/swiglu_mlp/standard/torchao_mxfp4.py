@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ....qat.torchao_mxfp4 import MXFP4_BLOCK_SIZE, mxfp4_fake_quant, replicated_local
+from ....qat.torchao_mxfp4 import MXFP4_BLOCK_SIZE, local_shard, mxfp4_fake_quant
 from . import eager as _eager
 
 
@@ -34,7 +34,7 @@ def _linear(x: Tensor, weight: Tensor, bias: Tensor, block_size: int) -> Tensor:
     return torch.nn.functional.linear(
         mxfp4_fake_quant(x, block_size),
         mxfp4_fake_quant(weight, block_size),
-        None if bias.numel() == 0 else replicated_local(bias, "bias"),
+        None if bias.numel() == 0 else local_shard(bias),
     )
 
 
