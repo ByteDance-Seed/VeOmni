@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from abc import ABC, abstractmethod
+from functools import wraps
 from typing import Any, Dict, Optional, Union
 
 from ..utils.logging import get_logger
@@ -25,6 +27,35 @@ logger = get_logger(__name__)
 
 CHECKPOINTER_REGISTRY = Registry("checkpointer")
 CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
+
+
+def cache_aware_load(load):
+    """Select the source reader per call without mutating the shared class."""
+
+    @wraps(load)
+    def wrapped(cls, *args, evict_source_cache=False, **kwargs):
+        if evict_source_cache:
+            from .cache_aware_reader import CacheAwareFileSystemReader
+
+            class CacheAwareLoad(cls):
+                @classmethod
+                def _create_storage_reader(cls, checkpoint_dir):
+                    return CacheAwareFileSystemReader(checkpoint_dir)
+
+            cls = CacheAwareLoad
+        return load(cls, *args, **kwargs)
+
+    signature = inspect.signature(load)
+    parameters = list(signature.parameters.values())
+    before_kwargs = next(
+        (index for index, value in enumerate(parameters) if value.kind == value.VAR_KEYWORD), len(parameters)
+    )
+    parameters.insert(
+        before_kwargs,
+        inspect.Parameter("evict_source_cache", inspect.Parameter.KEYWORD_ONLY, default=False, annotation=bool),
+    )
+    wrapped.__signature__ = signature.replace(parameters=parameters)
+    return wrapped
 
 
 def build_checkpointer(ckpt_manager: str, dist_backend: str):
@@ -52,6 +83,8 @@ def ckpt_to_state_dict(
 
 class CheckpointerBase(ABC):
     """Base class for checkpointer"""
+
+    _cache_aware_load = staticmethod(cache_aware_load)
 
     @abstractmethod
     def save(

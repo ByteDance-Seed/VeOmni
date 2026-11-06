@@ -7,14 +7,73 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.checkpoint.cache_aware_reader import CacheAwareFileSystemReader
+from veomni.checkpoint.cache_aware_reader import CacheAwareFileSystemReader, cache_aware_checkpointer
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 _TWO_RANK = LaunchSpec(nproc=2, device="cpu")
+_NO_CACHE_ADVICE = not hasattr(os, "posix_fadvise") or not hasattr(os, "O_NOFOLLOW")
 
 
-@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+def test_cache_advice_keeps_save_and_async_drain_on_original_checkpointer(monkeypatch):
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    calls = []
+    monkeypatch.setattr(DistributedCheckpointer, "save", classmethod(lambda cls: calls.append(("save", cls))))
+    monkeypatch.setattr(
+        DistributedCheckpointer, "wait_for_pending_save", classmethod(lambda cls: calls.append(("wait", cls)))
+    )
+    wrapped = cache_aware_checkpointer(DistributedCheckpointer)
+    wrapped.save()
+    wrapped.wait_for_pending_save()
+    assert calls == [("save", DistributedCheckpointer), ("wait", DistributedCheckpointer)]
+    assert DistributedCheckpointer._create_storage_reader.__self__ is DistributedCheckpointer
+
+
+def _async_save_cache_resume_worker(rank, checkpoint, endpoint):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=1, timeout=timedelta(seconds=45))
+    try:
+        source = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(source.parameters(), lr=0.01)
+        source(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        parallel = SimpleNamespace(dp_mode="ddp")
+        wrapped = cache_aware_checkpointer(DistributedCheckpointer)
+        wrapped.save(checkpoint, {"model": source, "optimizer": optimizer}, save_async=True, parallel_state=parallel)
+        assert DistributedCheckpointer._save_futures
+        wrapped.wait_for_pending_save()
+        assert not DistributedCheckpointer._save_futures
+        target = torch.nn.Linear(4, 4)
+        restored = torch.optim.AdamW(target.parameters(), lr=0.01)
+        wrapped.load(checkpoint, {"model": target, "optimizer": restored}, parallel_state=parallel)
+        for before, after in zip(source.parameters(), target.parameters(), strict=True):
+            assert before.dtype == after.dtype
+            torch.testing.assert_close(before, after, rtol=0, atol=0)
+        for original, loaded in zip(optimizer.state.values(), restored.state.values(), strict=True):
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                assert original[key].dtype == loaded[key].dtype
+                torch.testing.assert_close(original[key], loaded[key], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1, device="cpu"))
+def test_async_save_cache_resume_uses_original_pending_state(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_async_save_cache_resume_worker, args=(str(tmp_path / "checkpoint"),), nprocs=1)
+
+
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 def test_dcp_read_advises_only_after_copy_and_preserves_values(tmp_path, monkeypatch):
     source = {"weight": torch.arange(8192, dtype=torch.float32), "step": torch.tensor(7)}
     dcp.save(source, checkpoint_id=tmp_path)
@@ -33,7 +92,7 @@ def test_dcp_read_advises_only_after_copy_and_preserves_values(tmp_path, monkeyp
     assert all(torch.equal(source[key], target[key]) for key in source)
 
 
-@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 def test_dcp_advice_error_propagates(tmp_path, monkeypatch):
     dcp.save({"weight": torch.ones(8)}, checkpoint_id=tmp_path)
 
@@ -76,7 +135,7 @@ def _two_rank_worker(rank, rendezvous, checkpoint):
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 @pytest.mark.launch_plan(provider=_TWO_RANK)
 def test_two_rank_dcp_cache_advice(tmp_path):
     torch.multiprocessing.spawn(
@@ -87,6 +146,7 @@ def test_two_rank_dcp_cache_advice(tmp_path):
     )
 
 
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 def test_checkpointer_split_resume_restores_model_optimizer_and_sidecar(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -138,6 +198,41 @@ def test_checkpointer_split_resume_restores_model_optimizer_and_sidecar(tmp_path
     assert torch.equal(old_moment, new_moment)
 
 
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
+def test_cache_advice_preserves_default_mixed_dtype_resume(tmp_path):
+    from types import SimpleNamespace
+
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    model = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    model(torch.ones(2, 4, dtype=torch.bfloat16)).float().sum().backward()
+    optimizer.step()
+    for state in optimizer.state.values():
+        state["exp_avg"] = state["exp_avg"].float().add_(0.0001)
+        state["exp_avg_sq"] = state["exp_avg_sq"].float().add_(0.0001)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer}, parallel_state=parallel)
+    snapshots = []
+    for enabled in (False, True):
+        target = torch.nn.Linear(4, 4).to(torch.bfloat16)
+        restored = torch.optim.AdamW(target.parameters(), lr=0.001)
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored},
+            parallel_state=parallel,
+            evict_source_cache=enabled,
+        )
+        snapshots.append(
+            [(state["exp_avg"].clone(), state["exp_avg_sq"].clone()) for state in restored.state.values()]
+        )
+    for baseline, advised in zip(*snapshots, strict=True):
+        for left, right in zip(baseline, advised, strict=True):
+            assert left.dtype == right.dtype
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 def test_symlink_shard_still_loads_and_skips_advice(tmp_path):
     import warnings
     from pathlib import Path
@@ -156,6 +251,7 @@ def test_symlink_shard_still_loads_and_skips_advice(tmp_path):
 
 
 @pytest.mark.parametrize("layout", ["fused", "module", "trainable_only"])
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 def test_enabled_reader_for_legacy_module_and_partial_model(tmp_path, monkeypatch, layout):
     from types import SimpleNamespace
 

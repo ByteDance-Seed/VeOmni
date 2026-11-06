@@ -89,6 +89,10 @@ class ModelCheckpointManager:
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
+        if getattr(self.config, "dcp_evict_source_cache", False):
+            from ...checkpoint.cache_aware_reader import cache_aware_checkpointer
+
+            self.checkpointer = cache_aware_checkpointer(self.checkpointer)
         if getattr(self.config, "save_hf_weights", False) and not bool(
             getattr(self.runtime.args, "lora_config", None)
         ):
@@ -207,10 +211,11 @@ class ModelCheckpointManager:
             "optimizer": self.runtime.optimizer,
             "extra_state": {},
         }
-        load_kwargs = self._checkpointer_kwargs()
-        if getattr(self.config, "dcp_evict_source_cache", False):
-            load_kwargs["evict_source_cache"] = True
-        self.checkpointer.load(load_dir, state, **load_kwargs)
+        self.checkpointer.load(
+            load_dir,
+            state,
+            **self._checkpointer_kwargs(),
+        )
         self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")

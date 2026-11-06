@@ -49,3 +49,23 @@ class CacheAwareFileSystemReader(FileSystemReader):
             return None
 
         return future.then(advise_completed)
+
+
+def cache_aware_checkpointer(checkpointer):
+    """Enable cache advice on a manager without changing save ownership."""
+    from .dcp_checkpointer import DistributedCheckpointer
+
+    if not isinstance(checkpointer, type) or not issubclass(checkpointer, DistributedCheckpointer):
+        raise ValueError("DCP source cache advice requires the distributed checkpointer")
+
+    class CheckpointerWithCacheAdvice:
+        def load(self, *args, **kwargs):
+            kwargs.setdefault("evict_source_cache", True)
+            return checkpointer.load(*args, **kwargs)
+
+        def __getattr__(self, name):
+            # In particular, save and pending-save ownership remain on the
+            # original class rather than a new per-manager subclass.
+            return getattr(checkpointer, name)
+
+    return CheckpointerWithCacheAdvice()
