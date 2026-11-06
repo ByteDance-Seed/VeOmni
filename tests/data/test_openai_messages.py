@@ -405,6 +405,31 @@ def test_fractional_weight_is_not_silently_dropped():
     assert (template.encode_messages(messages)["labels"] == -100).all()
 
 
+def test_truncated_fractional_turn_is_not_misreported_as_dropped():
+    from types import SimpleNamespace
+
+    import torch
+
+    from veomni.data.chat_template import ChatmlTemplate
+    from veomni.data.multimodal.openai_messages import OpenAIChatMLVisionTemplate
+
+    if not getattr(ChatmlTemplate, "supports_loss_weights", False):
+        pytest.skip("requires the independent weighted-loss feature")
+    tokenizer = _ToyTokenizer()
+    tail = {"role": "assistant", "content": "tail"}
+    expected = ChatmlTemplate(tokenizer).encode_messages([tail])
+    vision = SimpleNamespace(
+        tokenizer=tokenizer, image_token_id=1000, video_token_id=1001, image_pattern=lambda count: "I" * count
+    )
+    messages, _ = normalize_openai_messages(
+        {"messages": [{"role": "assistant", "content": "removed", "loss_weight": 0.25}, tail]}
+    )
+    for extra in (0, 1):
+        result = OpenAIChatMLVisionTemplate(vision, len(expected["input_ids"]) + extra).encode_messages(messages)
+        assert "loss_weights" not in result
+        assert torch.equal(result["input_ids"][-len(expected["input_ids"]) :], torch.tensor(expected["input_ids"]))
+
+
 def test_masked_and_active_fractional_weights_with_weighted_renderer():
     """Masked weights stay excluded alongside a real fractional target."""
     from types import SimpleNamespace

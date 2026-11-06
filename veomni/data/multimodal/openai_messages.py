@@ -262,7 +262,7 @@ class OpenAIChatMLVisionTemplate:
     def encode_messages(self, messages, num_tokens=None, **kwargs):
         import torch
 
-        from ...utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+        from ...utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
         counts = iter((num_tokens or {}).get("image", []))
         rendered = []
@@ -296,7 +296,19 @@ class OpenAIChatMLVisionTemplate:
         if any(message["loss_mask"] and 0 < message.get("loss_weight", 1) < 1 for message in rendered) and (
             "loss_weights" not in encoded
         ):
-            raise ValueError("non-default loss_weight requires a weighted ChatML renderer")
+            if not getattr(self.text_template, "supports_loss_weights", False):
+                raise ValueError("non-default loss_weight requires a weighted ChatML renderer")
+            full = self.text_template.encode_messages(rendered, max_seq_len=sys.maxsize)
+            full_weights = full.get("loss_weights")
+            size = len(encoded["labels"])
+            if full_weights is None or (
+                size
+                and any(
+                    label != IGNORE_INDEX and 0 < weight < 1
+                    for label, weight in zip(full["labels"][-size:][1:], full_weights[-size:][1:])
+                )
+            ):
+                raise ValueError("weighted ChatML renderer lost a retained loss_weight")
         if has_image and len(encoded["input_ids"]) > self.max_seq_len:
             raise ValueError("image conversation exceeds max_seq_len; refusing to truncate image tokens")
         encoded = {
