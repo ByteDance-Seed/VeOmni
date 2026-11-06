@@ -293,6 +293,11 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        """Update the progress bar postfix with training metrics and MFU.
+
+        Reads ``step_train_metrics`` for loss/grad_norm/lr and ``step_env_metrics``
+        for MFU, then formats each value by type using ``_format_spec``.
+        """
         # ``step_env_metrics`` is populated by the meter callback dispatched just
         # before this one; surface ``mfu`` here so the progress bar shows training
         # efficiency without waiting for a wandb round-trip.
