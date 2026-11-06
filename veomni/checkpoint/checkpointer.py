@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from abc import ABC, abstractmethod
+from functools import wraps
 from typing import Any, Dict, Optional, Union
 
 from ..utils.logging import get_logger
@@ -25,6 +27,65 @@ logger = get_logger(__name__)
 
 CHECKPOINTER_REGISTRY = Registry("checkpointer")
 CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
+
+
+def _normalize_legacy_cache_arguments(signature, args, kwargs):
+    """Preserve the older positional cache flag when a layout option is also present."""
+    positional = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    try:
+        index = positional.index("legacy_expert_source_layout")
+    except ValueError:
+        return args, kwargs
+    if (
+        positional[index + 1 : index + 2] != ["evict_source_cache"]
+        or len(args) <= index
+        or type(args[index]) is not bool
+    ):
+        return args, kwargs
+    if len(args) > index + 1 or "evict_source_cache" in kwargs:
+        raise TypeError("multiple values for argument 'evict_source_cache'")
+    args, kwargs = list(args), dict(kwargs)
+    evict = args[index]
+    args[index] = kwargs.pop("legacy_expert_source_layout", None)
+    kwargs["evict_source_cache"] = evict
+    return tuple(args), kwargs
+
+
+def cache_aware_load(load):
+    """Select the source reader per call without mutating the shared class."""
+    signature = inspect.signature(load)
+    parameters = list(signature.parameters.values())
+    has_varargs = any(value.kind == value.VAR_POSITIONAL for value in parameters)
+    insertion = next(
+        (index for index, value in enumerate(parameters) if value.kind in (value.KEYWORD_ONLY, value.VAR_KEYWORD)),
+        len(parameters),
+    )
+    kind = inspect.Parameter.KEYWORD_ONLY if has_varargs else inspect.Parameter.POSITIONAL_OR_KEYWORD
+    parameters.insert(insertion, inspect.Parameter("evict_source_cache", kind, default=False, annotation=bool))
+    exposed_signature = signature.replace(parameters=parameters)
+    class_name = next(iter(signature.parameters))
+
+    @wraps(load)
+    def wrapped(cls, *args, **kwargs):
+        normalized, kwargs = _normalize_legacy_cache_arguments(exposed_signature, (cls, *args), kwargs)
+        bound = exposed_signature.bind(*normalized, **kwargs)
+        if bound.arguments.pop("evict_source_cache", False):
+            from .cache_aware_reader import CacheAwareFileSystemReader
+
+            class CacheAwareLoad(cls):
+                @classmethod
+                def _create_storage_reader(cls, checkpoint_dir):
+                    return CacheAwareFileSystemReader(checkpoint_dir)
+
+            bound.arguments[class_name] = CacheAwareLoad
+        return load(*bound.args, **bound.kwargs)
+
+    wrapped.__signature__ = exposed_signature
+    return wrapped
 
 
 def build_checkpointer(ckpt_manager: str, dist_backend: str):
@@ -52,6 +113,8 @@ def ckpt_to_state_dict(
 
 class CheckpointerBase(ABC):
     """Base class for checkpointer"""
+
+    _cache_aware_load = staticmethod(cache_aware_load)
 
     @abstractmethod
     def save(
@@ -93,6 +156,7 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
         trainable_only: bool = False,
         parallel_state=None,
+        evict_source_cache: bool = False,
     ):
         return
 

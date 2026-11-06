@@ -89,6 +89,10 @@ class ModelCheckpointManager:
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
+        if getattr(self.config, "dcp_evict_source_cache", False):
+            from ...checkpoint.cache_aware_reader import cache_aware_checkpointer
+
+            self.checkpointer = cache_aware_checkpointer(self.checkpointer)
         if getattr(self.config, "save_hf_weights", False) and not bool(
             getattr(self.runtime.args, "lora_config", None)
         ):

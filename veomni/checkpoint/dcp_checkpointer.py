@@ -1083,6 +1083,7 @@ class DistributedCheckpointer(CheckpointerBase):
         raise_if_any_rank_failed(error, f"removing the old DCP markers under {checkpoint_dir}")
 
     @classmethod
+    @CheckpointerBase._cache_aware_load
     def load(
         cls,
         path: str,
