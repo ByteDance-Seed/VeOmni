@@ -532,9 +532,9 @@ class TestAllowPartialLoad:
         mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        model = MagicMock()
+        model = torch.nn.Linear(2, 2)
         model._fqn2spec_info = None
-        optimizer = MagicMock()
+        optimizer = torch.optim.AdamW(model.parameters())
 
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}
 
@@ -2488,6 +2488,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.checkpoint.dcp_checkpointer._checkpoint_optimizer_policy", return_value=(None, False)),
             patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
