@@ -258,7 +258,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets, legacy_fuse_fallback=True)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -310,7 +310,8 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 reads and converts the checkpoint. Every rank must call
+            this function to participate in distributed failure coordination.
             Required by non-dcp checkpoint managers (e.g., omnistore).
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
@@ -544,7 +545,9 @@ def save_lora_adapter_with_dcp(
             # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
             consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
             adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-            _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+            _save_state_dict(
+                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
+            )
 
             # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
             # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
