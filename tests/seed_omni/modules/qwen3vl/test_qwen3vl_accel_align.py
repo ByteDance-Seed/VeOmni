@@ -37,7 +37,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from veomni.models.seed_omni.modules.qwen3vl.text_encoder.processing import Qwen3VLTextEncoderPreprocessor
-from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
+from veomni.models.seed_omni.modules.qwen3vl.vision.processing import Qwen3VLVisionPreprocessor
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.device import (
@@ -54,10 +54,6 @@ _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 VOCAB = 64
 HIDDEN = 16
-# in_channels * temporal_patch_size * patch_size**2 — one ViT patch row.
-PATCH_ROW = 3 * 2 * 16 * 16
-# One 4x4 image grid -> 16 patch rows -> 4 merged tokens at merge size 2.
-_GRID = [1, 4, 4]
 
 _TEXT_CONFIG = {
     "vocab_size": VOCAB,
@@ -70,7 +66,9 @@ _TEXT_CONFIG = {
     "max_position_embeddings": 64,
 }
 _VISION_CONFIG = {
-    "depth": 1,
+    # Two layers so `deepstack_visual_indexes` can point at a real interior layer
+    # (index 0), which is what makes the DeepStack path run at all.
+    "depth": 2,
     "hidden_size": HIDDEN,
     "intermediate_size": 32,
     "num_heads": 2,
@@ -80,7 +78,7 @@ _VISION_CONFIG = {
     "spatial_merge_size": 2,
     "out_hidden_size": HIDDEN,
     "num_position_embeddings": 256,  # 16 per side; the grid must fit inside
-    "deepstack_visual_indexes": [],
+    "deepstack_visual_indexes": [0],
 }
 
 _CONVERSATION_EDGES = [
@@ -137,28 +135,82 @@ class _SmallTokenizer:
         return ""
 
 
-def _samples(n: int = 2) -> list[list[ConversationItem]]:
-    """`n` conversations, each one image plus a supervised assistant turn.
+def _vision_preprocessor():
+    """The real vision preprocessor, so media are patchified by the same code as
+    production rather than by hand-built tensors."""
+    from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
 
-    Deliberately uneven text so the packed length is not a power of two, which is
-    what makes an SP=2 slice need padding.
+    image_processor = Qwen2VLImageProcessor(
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
+        min_pixels=16 * 16 * 4,
+        max_pixels=16 * 16 * 256,
+        size={"shortest_edge": 64, "longest_edge": 256},
+    )
+    video_processor = Qwen3VLVideoProcessor(
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
+        min_pixels=16 * 16 * 4,
+        max_pixels=16 * 16 * 256,
+    )
+    preprocessor = Qwen3VLVisionPreprocessor(
+        image_processor, video_processor, dtype=torch.float32, spatial_merge_size=2
+    )
+    preprocessor.bind_dummy_inputs(
+        OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()(vision_config=dict(_VISION_CONFIG)), dtype=torch.float32
+    )
+    return preprocessor
+
+
+def _samples() -> list[list[ConversationItem]]:
+    """One batch covering every modality the tower must handle in a single step:
+
+    * sample 0 — text + **image**
+    * sample 1 — text + **video** (4 frames -> 2 temporal patches)
+    * sample 2 — **text only**, so the vision preprocessor injects an ``is_dummy``
+      FSDP-anchor placeholder for it
+
+    The dummy matters beyond FSDP alignment: it is the only path where the packed
+    and conversation graphs disagree about *where* the visual rows sit, and where
+    `visual_is_real` has to be right for the scatter.
+
+    Text lengths are deliberately uneven and the packed total is not a power of
+    two, so an SP=2 slice has to pad and the gather has to unpad.
     """
-    texts = ["hi", "hello there"][:n]
-    out = []
-    for text in texts:
-        out.append(
-            [
-                ConversationItem(type="text", value=text, role="user"),
-                ConversationItem(
-                    type="image",
-                    value=torch.rand(16, PATCH_ROW),
-                    role="user",
-                    meta={_OMNI_GRID: list(_GRID)},
-                ),
-                ConversationItem(type="text", value="ok", role="assistant"),
-            ]
-        )
-    return out
+    from veomni.data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY, VideoMetadata
+    from veomni.data.seed_omni.utils.video import VideoInputs
+
+    video_metadata = VideoMetadata(fps=2.0, total_num_frames=4, frames_indices=list(range(4)), requested_fps=2.0)
+    samples: list[list[ConversationItem]] = [
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(
+                type="image",
+                value=torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8),
+                role="user",
+            ),
+            ConversationItem(type="text", value="ok", role="assistant"),
+        ],
+        [
+            ConversationItem(type="text", value="hello there", role="user"),
+            ConversationItem(
+                type="video",
+                value=VideoInputs(video=torch.randint(0, 255, (4, 3, 32, 32), dtype=torch.uint8)),
+                role="user",
+                meta={VIDEO_METADATA_KEY: video_metadata},
+            ),
+            ConversationItem(type="text", value="sure", role="assistant"),
+        ],
+        [
+            ConversationItem(type="text", value="just text", role="user"),
+            ConversationItem(type="text", value="ok then", role="assistant"),
+        ],
+    ]
+    # Patchify + inject the per-sample dummy, exactly as the dataset transform does.
+    _vision_preprocessor()({"conversation_list": samples}, inference=False)
+    return samples
 
 
 def _build_modules(*, attn_implementation: str, device: torch.device, dtype: torch.dtype):
@@ -217,18 +269,59 @@ def _packed_batch(samples: list[list[ConversationItem]]) -> dict:
     return SeedOmniCollator()([processor.preprocess(sample) for sample in samples])
 
 
-def _graph_loss(modules: dict[str, torch.nn.Module], edges: list[dict[str, str]], batch: dict) -> torch.Tensor:
-    model = _omni(modules, edges)
-    first = next(iter(modules.values()))
-    device, dtype = first.device, first.dtype
-    moved = {
-        key: (value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device))
-        if isinstance(value, torch.Tensor)
-        else value
-        for key, value in batch.items()
-    }
-    out = model.forward(moved, node_runner=TrainNodeRunner())
-    return out["loss"]
+def _graph_loss(
+    modules: dict[str, torch.nn.Module], edges: list[dict[str, str]], batch: dict, *, count_sp: bool = False
+):
+    """One forward over the graph; optionally also report how often it sliced for SP.
+
+    The counter is what keeps the SP test honest: a loss that matches because
+    neither run took the SP branch proves nothing, and that is exactly what a
+    regression in the parallelism guards would look like.
+    """
+    calls = {"slice": 0, "pad": 0}
+    restores = []
+    if count_sp:
+        # Every module that slices imports the helper by name, so the counter has
+        # to wrap each of those bindings — patching one module would miss the
+        # others and report "no SP" for a path that did slice.
+        from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
+        from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
+        from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
+        from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import packed as vision_packed
+
+        targets = [llm_acc, llm_packed, te_packed, vision_packed]
+        for module in targets:
+            for attr, key in (
+                ("slice_input_tensor", "slice"),
+                ("sp_pad", "pad"),
+                ("sp_pad_and_slice", "pad"),
+            ):
+                original = getattr(module, attr, None)
+                if original is None:
+                    continue
+
+                def wrapper(*args, _original=original, _key=key, **kwargs):
+                    calls[_key] += 1
+                    return _original(*args, **kwargs)
+
+                restores.append((module, attr, original))
+                setattr(module, attr, wrapper)
+
+    try:
+        model = _omni(modules, edges)
+        first = next(iter(modules.values()))
+        device, dtype = first.device, first.dtype
+        moved = {
+            key: (value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device))
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in batch.items()
+        }
+        out = model.forward(moved, node_runner=TrainNodeRunner())
+    finally:
+        for target, attr, original in restores:
+            setattr(target, attr, original)
+    return (out["loss"], dict(calls)) if count_sp else out["loss"]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -246,12 +339,12 @@ def test_conversation_and_packed_graphs_agree_on_cpu():
     conversation_loss = _graph_loss(
         _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32),
         _CONVERSATION_EDGES,
-        _conversation_batch(_samples(2)),
+        _conversation_batch(_samples()),
     )
     packed_loss = _graph_loss(
         _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32),
         _PACKED_EDGES,
-        _packed_batch(_samples(2)),
+        _packed_batch(_samples()),
     )
 
     assert torch.allclose(conversation_loss.float(), packed_loss.float(), atol=1e-6, rtol=1e-6), (
@@ -295,11 +388,14 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
 
                         for module in modules.values():
                             fully_shard(module, mesh=ps.fsdp_mesh)
-                    samples = _samples(2)
-                    # dp=2 takes one conversation per rank; sp=2 replicates the batch.
-                    batch = build_batch([samples[rank]] if sp_size == 1 else samples)
-                    loss = _graph_loss(modules, edges, batch)
+                    samples = _samples()
+                    # Both settings get the same batch: at dp=2 every rank must see
+                    # identical data for the mean to be comparable, and at sp=2 the
+                    # ranks are slices of one replicated batch.
+                    batch = build_batch(samples)
+                    loss, sp_calls = _graph_loss(modules, edges, batch, count_sp=True)
                     reports[f"{name}_sp{sp_size}"] = float(loss.detach().float())
+                    reports[f"{name}_sp{sp_size}_sp_calls"] = sp_calls
                 clear_parallel_state()
         Path(out_dir, f"rank{rank}.json").write_text(json.dumps(reports), encoding="utf-8")
     finally:
@@ -320,8 +416,12 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
     )
     for rank in range(2):
         reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert set(reports) == {"conversation_sp1", "conversation_sp2", "packed_sp1", "packed_sp2"}
         for name in ("conversation", "packed"):
+            # The SP=2 run must have actually sliced; otherwise "same loss" only
+            # proves the same code path ran twice.
+            calls = reports[f"{name}_sp2_sp_calls"]
+            assert calls["slice"] and calls["pad"], (rank, name, calls)
+            assert not reports[f"{name}_sp1_sp_calls"]["slice"], (rank, name, "SP=1 must not slice")
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], abs=1e-5), (rank, name, reports)
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
 
