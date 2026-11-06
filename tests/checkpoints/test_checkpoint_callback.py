@@ -29,6 +29,90 @@ from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+def _cursor_failure_worker(rank, root, failure, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        trainer = _make_mock_trainer(save_path=root)
+        trainer.args.train.global_rank = rank
+        with patch("veomni.trainer.callbacks.base.get_parallel_state", return_value=SimpleNamespace()):
+            callback = GlobalStateCallback(trainer)
+
+        def snapshot(_state):
+            if rank == 0:
+                if failure == "invalid":
+                    return None
+                if failure == "fatal":
+                    raise SystemExit("data cursor aborted")
+                raise RuntimeError("data cursor unavailable")
+            return {"train_dataloader": {}}
+
+        callback.state_dict = snapshot
+        failed = False
+        try:
+            callback.save_global_state(TrainerState(global_step=10))
+        except BaseException:
+            failed = True
+        outcomes = [None, None]
+        dist.all_gather_object(outcomes, failed)
+        assert outcomes == [True, True]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("failure", ["error", "fatal", "invalid"])
+def test_rank_local_cursor_failure_stops_all_ranks(tmp_path, failure):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    step_root = str(tmp_path / "global_step_10")
+    layout.write_manifest(step_root, global_step=10, world_size=2, model_state=False)
+    assert layout.checkpoint_is_complete(step_root)
+    spawn_with_rendezvous(_cursor_failure_worker, args=(str(tmp_path), failure), nprocs=2)
+    assert not layout.checkpoint_is_complete(step_root)
+
+
+def _checkpoint_path_failure_worker(rank, root, endpoint):
+    from contextlib import nullcontext
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        trainer = _make_mock_trainer(save_path=root)
+        trainer.args.train.global_rank = rank
+        with patch("veomni.trainer.callbacks.base.get_parallel_state", return_value=SimpleNamespace()):
+            callback = GlobalStateCallback(trainer)
+        callback.state_dict = MagicMock()
+        failure = (
+            patch("veomni.trainer.callbacks.global_state_callback.layout.step_dir", side_effect=ValueError("bad path"))
+            if rank == 0
+            else nullcontext()
+        )
+        with failure, pytest.raises((ValueError, RuntimeError), match="bad path|checkpoint path"):
+            callback.save_global_state(TrainerState(global_step=10))
+        callback.state_dict.assert_not_called()
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_rank_local_path_failure_preserves_manifest_and_group(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    step_root = str(tmp_path / "global_step_10")
+    layout.write_manifest(step_root, global_step=10, world_size=2, model_state=False)
+    spawn_with_rendezvous(_checkpoint_path_failure_worker, args=(str(tmp_path),), nprocs=2)
+    assert layout.checkpoint_is_complete(step_root)
+
+
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     """Build a minimal mock trainer for CheckpointCallback / manager tests."""
     checkpoint_cfg = SimpleNamespace(
