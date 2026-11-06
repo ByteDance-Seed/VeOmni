@@ -228,8 +228,11 @@ def test_qwen38_vlm_groups_resolve_ple_decay_before_planning(monkeypatch, extra_
     monkeypatch.setattr(factory, "_should_build_extra_parallel_aware", lambda _: extra_parallel)
     if extra_parallel:
         # Exercise the exact factory hand-off without needing a device mesh.
-        def build_extra(model, lr, betas, eps, decay, fused, kind, groups, *args, cpu_offload_kwargs):
+        def build_extra(
+            model, lr, betas, eps, decay, fused, kind, groups, *args, cpu_offload_kwargs, optimizer_config=None
+        ):
             assert kind == "qwen38_muon"
+            assert optimizer_config is None
             return factory.Qwen38MuonAdamW(groups, lr, betas, eps, decay, **cpu_offload_kwargs)
 
         monkeypatch.setattr(factory, "build_extra_parallel_fsdp2_optimizer", build_extra)

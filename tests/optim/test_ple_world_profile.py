@@ -123,7 +123,7 @@ def _ordinary_single_rank_worker(rank, rendezvous):
     try:
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
         if rank == 0:
-            config = SimpleNamespace(type="adamw")
+            config = SimpleNamespace(type="adamw", state_offload="none")
             profile.validate_before_build(config, SimpleNamespace(), SimpleNamespace(), None)
             model = torch.nn.Linear(4, 2)
             optimizer = build_optimizer(model, lr=0.001, optimizer_type="adamw", optimizer_config=config)
@@ -190,6 +190,7 @@ def _factory_worker(rank, world_size, rendezvous, root, mode):
         )
         opt = SimpleNamespace(
             type="qwen38_muon",
+            state_offload="none",
             qwen38_ple_moments_world_profile=True,
             qwen38_ple_moments_scratch_dir=root,
             cpu_offload_param_patterns=[".+"],
@@ -278,6 +279,7 @@ def _file_step_worker(rank, rendezvous, root, mode):
         )
         opt_cfg = SimpleNamespace(
             type="qwen38_muon",
+            state_offload="none",
             qwen38_ple_moments_world_profile=True,
             qwen38_ple_moments_scratch_dir=root,
             cpu_offload_param_patterns=[".+"],
@@ -341,7 +343,7 @@ def test_file_optimizer_step_coordinates_before_muon_collectives(tmp_path, mode)
     )
 
 
-def _file_dcp_fsdp_worker(rank, rendezvous, root):
+def _file_dcp_fsdp_worker(rank, rendezvous, root, failure=None, rows=8):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
 
@@ -363,6 +365,7 @@ def _file_dcp_fsdp_worker(rank, rendezvous, root):
         )
         opt_cfg = SimpleNamespace(
             type="qwen38_muon",
+            state_offload="none",
             qwen38_ple_moments_world_profile=True,
             qwen38_ple_moments_scratch_dir=root,
             cpu_offload_param_patterns=[".+"],
@@ -375,11 +378,11 @@ def _file_dcp_fsdp_worker(rank, rendezvous, root):
         class Tiny(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.ngram_embedding = torch.nn.Embedding(8, 4)
+                self.ngram_embedding = torch.nn.Embedding(rows, 4)
                 torch.nn.init.constant_(self.ngram_embedding.weight, 0.125)
 
             def forward(self):
-                return self.ngram_embedding(torch.tensor([rank, rank + 2])).sum()
+                return self.ngram_embedding(torch.tensor([rank, rank + 2]) % rows).sum()
 
         def build():
             model = fully_shard(Tiny(), mesh=mesh)
@@ -400,7 +403,37 @@ def _file_dcp_fsdp_worker(rank, rendezvous, root):
 
         source, source_opt = build()
         step(source, source_opt)
+        if rows == 1:
+            assert source.ngram_embedding.weight.to_local().numel() == (4 if rank == 0 else 0)
+            assert any(getattr(leaf, "_ple_file_mode_enabled", False) for leaf in source_opt.optimizers_dict.values())
         path = os.path.join(root, "checkpoint-fsdp")
+        if failure is not None:
+            from unittest.mock import patch
+
+            import veomni.checkpoint.dcp_checkpointer as checkpoint_module
+
+            if failure == "mode_mismatch" and rank == 1:
+                leaf = next(leaf for leaf in source_opt.optimizers_dict.values() if leaf._ple_file_mode_enabled)
+                leaf._ple_file_mode_enabled = False
+            original = checkpoint_module._iter_optimizer_leaves
+
+            def inspect_leaves(optimizer):
+                if failure == "inspect_error" and rank == 1:
+                    raise OSError("injected file-backed optimizer inspection failure")
+                return original(optimizer)
+
+            with patch.object(checkpoint_module, "_iter_optimizer_leaves", inspect_leaves):
+                with pytest.raises((RuntimeError, OSError), match="file-backed optimizer|injected"):
+                    DistributedCheckpointer.save(
+                        path,
+                        {"model": source, "optimizer": source_opt, "_veomni_scheduler_object": None},
+                        parallel_state=parallel,
+                    )
+            assert not os.path.exists(path)
+            completed = torch.tensor(1)
+            dist.all_reduce(completed)
+            assert completed.item() == 2
+            return
         DistributedCheckpointer.save(
             path, {"model": source, "optimizer": source_opt, "_veomni_scheduler_object": None}, parallel_state=parallel
         )
@@ -424,10 +457,23 @@ def _file_dcp_fsdp_worker(rank, rendezvous, root):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_file_optimizer_fsdp2_save_restore_and_next_update(tmp_path):
+@pytest.mark.parametrize("rows", [8, 1])
+def test_file_optimizer_fsdp2_save_restore_and_next_update(tmp_path, rows):
     mp.start_processes(
         _file_dcp_fsdp_worker,
-        args=(str(tmp_path / "fsdp-rendezvous"), str(tmp_path)),
+        args=(str(tmp_path / "fsdp-rendezvous"), str(tmp_path), None, rows),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("failure", ["mode_mismatch", "inspect_error"])
+def test_file_optimizer_policy_failure_is_coordinated_before_save(tmp_path, failure):
+    mp.start_processes(
+        _file_dcp_fsdp_worker,
+        args=(str(tmp_path / "fsdp-rendezvous"), str(tmp_path), failure),
         nprocs=2,
         join=True,
         start_method="fork",
@@ -477,6 +523,7 @@ def _file_owner_worker(rank, rendezvous, root):
         )
         cfg = SimpleNamespace(
             type="qwen38_muon",
+            state_offload="none",
             qwen38_ple_moments_world_profile=True,
             qwen38_ple_moments_scratch_dir=root,
             cpu_offload_param_patterns=[".+"],
