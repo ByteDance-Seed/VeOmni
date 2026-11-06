@@ -942,6 +942,8 @@ class ChannelLossCallback(Callback):
         if not self.enabled:
             self._collect_step = False
             return
+        if "loss_weights" in self._strip_keys:
+            raise ValueError("Channel loss metadata keys must not strip loss_weights from model inputs")
         if source_repeat < 1:
             raise ValueError(f"Channel loss source_repeat must be >= 1, got {source_repeat}.")
         self.computer.source_repeat = source_repeat

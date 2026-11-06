@@ -92,6 +92,8 @@ class ChatTemplate(ABC):
     Abstract class for chat template.
     """
 
+    supports_loss_weights = False
+
     def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
         self.tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
 
@@ -283,13 +285,18 @@ class Llama2Template(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
+    supports_loss_weights = True
+
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         """Tokenize ChatML turns and retain optional per-token supervision weights."""
         input_ids, attention_mask, labels = [], [], []
+
+        def message_mask(message):
+            mask = message.get("loss_mask")
+            return int(message["role"] == "assistant") if mask is None else mask
+
         has_weights = any(
-            message.get("loss_mask", int(message["role"] == "assistant")) == 1
-            and message.get("loss_weight") not in (None, 0, 1)
-            for message in messages
+            message_mask(message) == 1 and message.get("loss_weight") not in (None, 0, 1) for message in messages
         )
         loss_weights = []
         for message in messages:
@@ -298,10 +305,7 @@ class ChatmlTemplate(ChatTemplate):
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
 
-            if "loss_mask" in message:
-                loss_mask = message["loss_mask"]
-            else:
-                loss_mask = 1 if message["role"] == "assistant" else 0
+            loss_mask = message_mask(message)
             if loss_mask not in (0, 1):
                 raise ValueError("loss_mask must be binary; use loss_weight for fractional weights")
             token_weight = message.get("loss_weight")
@@ -326,6 +330,11 @@ class ChatmlTemplate(ChatTemplate):
         if has_weights:
             model_inputs["loss_weights"] = loss_weights
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+        if "loss_weights" in model_inputs and not any(
+            label != IGNORE_INDEX and 0 < weight < 1
+            for label, weight in zip(model_inputs["labels"][1:], model_inputs["loss_weights"][1:])
+        ):
+            del model_inputs["loss_weights"]
         return model_inputs
 
     def get_jinja_template(self) -> str:

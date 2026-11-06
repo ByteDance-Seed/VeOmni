@@ -18,8 +18,91 @@ import torch
 
 from ..distributed.parallel_state import get_parallel_state
 from .constants import IGNORE_INDEX
+from .device import get_device_type
 from .dist_utils import all_reduce
 from .env import get_env
+
+
+def is_padding_microbatch(batch) -> bool:
+    return isinstance(batch, dict) and bool(batch.get("padding_flag", False))
+
+
+def contains_padding(value):
+    if isinstance(value, (list, tuple)):
+        return any(contains_padding(item) for item in value)
+    return is_padding_microbatch(value)
+
+
+def contains_loss_weights(value):
+    if isinstance(value, (list, tuple)):
+        return any(contains_loss_weights(item) for item in value)
+    return isinstance(value, dict) and value.get("loss_weights") is not None
+
+
+def step_batch_structure(batch):
+    if isinstance(batch, (list, tuple)):
+        return (type(batch), tuple(step_batch_structure(item) for item in batch))
+    if isinstance(batch, dict):
+        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
+        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
+    return (type(batch), id(batch))
+
+
+def fetch_training_micro_batches(data_iterator):
+    """Coordinate input errors and uneven exhaustion before any model collective."""
+    error = None
+    try:
+        batches = next(data_iterator)
+        if not isinstance(batches, (list, tuple)) or not batches:
+            raise ValueError("Training loader must return a nonempty list of micro-batches")
+        if contains_padding(batches):
+            raise ValueError("Synthetic padding requires the padding-safe trainer")
+    except Exception as exc:  # noqa: BLE001 - all ranks must agree before forward
+        batches, error = None, exc
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        count = len(batches) if batches is not None else 0
+        flags = torch.tensor(
+            [
+                int(error is None),
+                int(isinstance(error, StopIteration)),
+                int(error is not None and not isinstance(error, StopIteration)),
+                count,
+                -count,
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+        success, eof, failed, max_count, neg_min_count = flags.tolist()
+        if failed:
+            raise RuntimeError("Training data loading failed on a rank") from error
+        if eof:
+            if not success:
+                raise StopIteration
+            raise RuntimeError("Training ranks reached the end of data at different times") from error
+        if max_count != -neg_min_count:
+            raise RuntimeError("Training ranks must execute the same number of micro-batches")
+    elif error is not None:
+        raise error
+    return batches
+
+
+def synchronize_training_error(error, objective, *, microbatch_count=None):
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        device = "cpu" if torch.distributed.get_backend() == "gloo" else get_device_type()
+        values = [int(error is not None)]
+        if microbatch_count is not None:
+            values.extend([microbatch_count, -microbatch_count])
+        flags = torch.tensor(values, dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX)
+        values = flags.tolist()
+        if values[0]:
+            raise RuntimeError(f"{objective} preforward validation failed on a rank") from error
+        if microbatch_count is not None and values[1] != -values[2]:
+            raise RuntimeError(f"{objective} ranks must execute the same number of micro-batches")
+    elif error is not None:
+        raise error
 
 
 def count_loss_token(
@@ -33,22 +116,27 @@ def count_loss_token(
     }
 
     def _count(obj):
-        """Accumulate valid labels or weighted target mass in nested batches."""
-        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+        if isinstance(obj, dict):
+            if is_padding_microbatch(obj):
+                for key in obj:
+                    if key.endswith("_labels"):
+                        token_len.setdefault(f"{key.split('_labels')[0]}_tokens", torch.tensor(0))
+                return
             valid = obj["labels"] != IGNORE_INDEX
             weights = obj.get("loss_weights")
             if weights is None:
-                if weighted_normalization and not get_parallel_state().sp_enabled:
+                if weighted_normalization and not get_parallel_state().sp_enabled and valid.ndim:
                     valid = valid[..., 1:]
                 token_len["foundation_tokens"] = token_len["foundation_tokens"] + valid.sum()
             else:
                 if weights.shape != valid.shape:
                     raise ValueError("loss_weights must match labels")
-                # SP collators already shift labels and weights; without SP the
-                # causal loss shifts in the model, so the first target is unused.
+                if not valid.ndim:
+                    raise ValueError("loss_weights require sequence labels")
+                # SP inputs are already shifted; otherwise causal CE discards the first target.
                 if not get_parallel_state().sp_enabled:
                     weights, valid = weights[..., 1:], valid[..., 1:]
-                token_len["foundation_tokens"] = token_len["foundation_tokens"] + (weights * valid).sum()
+                token_len["foundation_tokens"] = token_len["foundation_tokens"] + (weights.float() * valid).sum()
 
             for key in obj.keys():
                 if key.endswith("_labels"):
@@ -63,6 +151,15 @@ def count_loss_token(
             raise TypeError(f"Unsupported batch type: {type(obj)}")
 
     _count(batches)
+    return token_len
+
+
+def synchronize_auxiliary_loss_tokens(token_len):
+    """Reduce the same ordered token keys when different ranks see different modalities."""
+    key_lists = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(key_lists, sorted(token_len))
+    for key in sorted({key for keys in key_lists for key in keys}):
+        token_len.setdefault(key, torch.tensor(0))
     return token_len
 
 
@@ -127,32 +224,76 @@ def _iter_feature_dicts(value):
 
 def has_weighted_loss_in_step(batches: list[dict[str, torch.Tensor]]) -> bool:
     """Synchronize opt-in across DP ranks before counting non-SP causal targets."""
-    local_has_weights = any("loss_weights" in batch for batch in _iter_feature_dicts(batches))
+    local_has_weights = any(batch.get("loss_weights") is not None for batch in _iter_feature_dicts(batches))
     if get_parallel_state().sp_enabled or not torch.distributed.is_initialized():
         return local_has_weights
     return bool(all_reduce(int(local_has_weights), op="max"))
 
 
-def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runtime=None):
+def prepare_loss_token_counts(
+    batches: list[dict[str, torch.Tensor]], model_runtime=None, *, error: Exception | None = None, sync_auxiliary=False
+):
     """Reuse the denominator reduction to agree on weighted causal normalization.
 
     For non-SP training a weighted rank can coexist with an unweighted rank.
     Reduce both denominator variants and the opt-in flag together so that all
     ranks choose the same normalization without an additional collective.
     """
-    features = list(_iter_feature_dicts(batches))
-    local_weighted = any("loss_weights" in batch for batch in features)
-    local_mtp = any("mtp_labels" in batch for batch in features)
-    # BaseRLTrainer packs list-valued micro-batches inside preforward and
-    # computes its own unweighted loss; weighted SFT cannot use that path.
-    local_uncollated = isinstance(batches, (list, tuple)) and any(
-        isinstance(batch, (list, tuple)) for batch in batches
-    )
-    router_flags = [batch.get("output_router_logits", False) for batch in features]
-    local_router = any(value is True for value in router_flags)
-    invalid_router = any(type(value) is not bool for value in router_flags)
-    legacy = count_loss_token(batches)
-    shifted = legacy if get_parallel_state().sp_enabled else count_loss_token(batches, weighted_normalization=True)
+    legacy = shifted = {"foundation_tokens": torch.tensor(0)}
+    local_weighted = local_mtp = local_uncollated = local_router = invalid_router = False
+    unsupported_model = explicit_shift = explicit_count = scalar_labels = local_auxiliary = False
+    if error is None:
+        try:
+            features = [batch for batch in _iter_feature_dicts(batches) if not is_padding_microbatch(batch)]
+            local_weighted = any(batch.get("loss_weights") is not None for batch in features)
+            for batch in features:
+                if batch.get("loss_weights") is None:
+                    continue
+                weights = batch["loss_weights"]
+                if not isinstance(weights, torch.Tensor) or weights.is_complex():
+                    raise TypeError("loss_weights must be a real tensor")
+                valid = (
+                    torch.isfinite(weights)
+                    & (weights >= 0)
+                    & (weights <= 1)
+                    & ((weights == 0) | (weights >= torch.finfo(torch.float32).tiny))
+                )
+                if not bool(valid.all()):
+                    raise ValueError("loss_weights must be in [0, 1] and positive weights must be normal float32")
+            local_mtp = any("mtp_labels" in batch for batch in features)
+            local_auxiliary = any(any(key.endswith("_labels") for key in batch) for batch in features)
+            scalar_labels = any(
+                isinstance(batch.get("labels"), torch.Tensor) and batch["labels"].ndim == 0 for batch in features
+            )
+            explicit_shift = any(batch.get("shift_labels") is not None for batch in features)
+            explicit_count = any(batch.get("num_items_in_batch") is not None for batch in features)
+            # RL packs list-valued micro-batches inside preforward and computes
+            # its own unweighted loss; weighted SFT cannot use that path.
+            local_uncollated = isinstance(batches, (list, tuple)) and any(
+                isinstance(batch, (list, tuple)) for batch in batches
+            )
+            router_flags = [batch.get("output_router_logits", False) for batch in features]
+            local_router = any(value is True for value in router_flags)
+            invalid_router = any(type(value) is not bool for value in router_flags)
+            legacy = count_loss_token(batches)
+            shifted = (
+                legacy if get_parallel_state().sp_enabled else count_loss_token(batches, weighted_normalization=True)
+            )
+            if model_runtime is not None:
+                try:
+                    unsupported_model = not (
+                        model_runtime.model_config.model_type == "qwen4_exp"
+                        and get_env("MODELING_BACKEND") != "hf"
+                        and model_runtime.unwrapped_module.veomni_ce.impl == "chunk_loss"
+                    )
+                except (AttributeError, TypeError):
+                    unsupported_model = True
+        except Exception as exc:  # noqa: BLE001 - all ranks must leave before forward
+            error = exc
+    if error is not None and not torch.distributed.is_initialized():
+        if isinstance(error, StopIteration):
+            raise RuntimeError("Step-begin callback raised StopIteration") from error
+        raise error
     reduced = all_reduce(
         [
             legacy["foundation_tokens"].item(),
@@ -162,9 +303,17 @@ def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runt
             int(invalid_router),
             int(local_mtp),
             int(local_uncollated),
+            int(unsupported_model),
+            int(explicit_shift),
+            int(explicit_count),
+            int(scalar_labels),
+            int(local_auxiliary),
+            int(error is not None),
         ],
         op="sum",
     )
+    if reduced[12]:
+        raise RuntimeError("Step-begin callback or loss-token counting failed on a rank") from error
     weighted = bool(reduced[2])
     if weighted and reduced[4]:
         raise ValueError("output_router_logits must be boolean when using loss_weights")
@@ -174,22 +323,27 @@ def prepare_loss_token_counts(batches: list[dict[str, torch.Tensor]], model_runt
         raise ValueError("loss_weights cannot be combined with MTP labels in the same step")
     if weighted and reduced[6]:
         raise ValueError("loss_weights are not supported for uncollated list-valued micro-batches")
-    if weighted and model_runtime is not None:
-        try:
-            supported = (
-                model_runtime.model_config.model_type == "qwen4_exp"
-                and get_env("MODELING_BACKEND") != "hf"
-                and model_runtime.unwrapped_module.veomni_ce.impl == "chunk_loss"
-            )
-        except (AttributeError, TypeError):
-            supported = False
-        if not supported:
-            raise ValueError("loss_weights require the VeOmni qwen4_exp backend with chunk_loss")
+    if weighted and reduced[7]:
+        raise ValueError("loss_weights require the VeOmni qwen4_exp backend with chunk_loss")
+    if weighted and reduced[8]:
+        raise ValueError("loss_weights cannot be combined with explicit shift_labels")
+    if weighted and reduced[9]:
+        raise ValueError("loss_weights cannot be combined with num_items_in_batch")
+    if weighted and reduced[10]:
+        raise ValueError("loss_weights require sequence labels on every rank")
     counts = shifted if weighted else legacy
+    if (sync_auxiliary or reduced[11]) and torch.distributed.is_initialized():
+        synchronize_auxiliary_loss_tokens(counts)
     global_counts = {"foundation_tokens": reduced[1] if weighted else reduced[0]}
     global_counts.update(
-        {key: all_reduce(value.item(), op="sum") for key, value in counts.items() if key != "foundation_tokens"}
+        {
+            key: all_reduce(value.item(), op="sum")
+            for key, value in sorted(counts.items())
+            if key != "foundation_tokens"
+        }
     )
+    if not any(value > 0 for value in global_counts.values()):
+        raise ValueError("Training step has no supervised target mass")
     return weighted, counts, global_counts
 
 

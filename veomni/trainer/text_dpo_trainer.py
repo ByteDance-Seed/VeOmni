@@ -33,6 +33,12 @@ from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
+from ..utils.loss_utils import (
+    contains_loss_weights,
+    contains_padding,
+    fetch_training_micro_batches,
+    synchronize_training_error,
+)
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -446,12 +452,32 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        micro_batches = fetch_training_micro_batches(data_iterator)
+        had_loss_weights = contains_loss_weights(micro_batches)
+        previous_step = self.state.global_step
         self.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self.base._reset_async_activation_offload_if_enabled(self.policy_model)
-        self.on_step_begin(micro_batches=micro_batches)
+        error = None
+        try:
+            self.base._reset_async_activation_offload_if_enabled(self.policy_model)
+            self.on_step_begin(micro_batches=micro_batches)
+            if not micro_batches:
+                raise ValueError("DPO optimizer step requires a nonempty microbatch list")
+            if any(
+                not isinstance(batch, dict) or not isinstance(batch.get("labels"), torch.Tensor)
+                for batch in micro_batches
+            ):
+                raise ValueError("DPO microbatches must have tensor labels")
+            if contains_padding(micro_batches):
+                raise ValueError("DPO does not support synthetic padding")
+            if had_loss_weights or contains_loss_weights(micro_batches):
+                raise ValueError("DPO does not support token loss_weights")
+        except Exception as exc:  # noqa: BLE001 - synchronize before model collectives
+            error = exc
+        try:
+            synchronize_training_error(error, "DPO", microbatch_count=len(micro_batches))
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
 
         self.base.sync_before_train_step()
 

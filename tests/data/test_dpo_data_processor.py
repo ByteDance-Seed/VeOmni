@@ -53,6 +53,19 @@ def test_dpo_plaintext_prompt_masking():
     assert sample["labels"][chosen_len : chosen_len + 2].tolist() == [IGNORE_INDEX, IGNORE_INDEX]
 
 
+def test_dpo_nullable_weights_are_treated_as_absent():
+    sample = {"chosen": "cd", "rejected": "ef", "loss_weight": None, "loss_weights": None}
+    assert process_dpo_example(sample, tokenizer=_FakeTokenizer())[0]["input_ids"].numel() == 4
+
+    class NullableTemplate:
+        def encode_messages(self, messages, max_seq_len=None):
+            return {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2], "loss_weights": None}
+
+    message = {"role": "assistant", "content": "answer", "loss_weight": None}
+    result = process_dpo_example({"chosen": [message], "rejected": [message]}, chat_template=NullableTemplate())
+    assert result[0]["input_ids"].numel() == 4
+
+
 def test_dpo_plaintext_truncation():
     """max_seq_len truncates each sequence independently before concatenation."""
     sample = process_dpo_example({"chosen": "abcdefgh", "rejected": "xyz"}, tokenizer=_FakeTokenizer(), max_seq_len=4)[
@@ -105,3 +118,25 @@ def test_dpo_main_collator_sp_enabled(monkeypatch):
 
     batch = m.MainCollator()([_make_flat_dpo_sample([1, 2, 3, 4], [5, 6, 7, 8])])
     assert batch["input_ids"].view(-1).shape[0] == 4  # 8 tokens / sp_size=2
+
+
+@pytest.mark.parametrize("provenance", [False, True])
+def test_dpo_rejects_explicit_loss_weight_before_rendering(provenance):
+    messages = [{"role": "assistant", "content": "answer", "loss_weight": 0.25}]
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example(
+            {"chosen": messages, "rejected": [{"role": "assistant", "content": "other"}]},
+            chat_template=_FakeChatTemplate(),
+            record_segment_provenance=provenance,
+        )
+
+
+def test_dpo_rejects_weights_returned_by_template():
+    class WeightedTemplate(_FakeChatTemplate):
+        def encode_messages(self, messages, max_seq_len=None):
+            result = super().encode_messages(messages, max_seq_len)
+            result["loss_weights"] = [0.25] * len(messages)
+            return result
+
+    with pytest.raises(ValueError, match="DPO does not support token loss_weights"):
+        process_dpo_example({"chosen": [10, 20], "rejected": [30, 40]}, chat_template=WeightedTemplate())

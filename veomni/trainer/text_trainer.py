@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import torch
 
@@ -25,7 +25,7 @@ from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..utils import helper
 from ..utils.device import synchronize
-from ..utils.loss_utils import count_loss_token, prepare_loss_token_counts
+from ..utils.loss_utils import count_loss_token
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
 
@@ -87,12 +87,7 @@ class TextTrainer:
         data_iterator: Any,
     ) -> Dict[str, float]:
         """Run text micro-batches and report step losses and metrics."""
-        self.base.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self.base._reset_async_activation_offload_if_enabled(self.base.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        micro_batches, weighted_normalization = self.base._weighted_sft_preflight(data_iterator, self)
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()
@@ -102,9 +97,6 @@ class TextTrainer:
         total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
-        weighted_normalization, self.base.micro_batches_token_len, self.base.global_micro_batches_token_len = (
-            prepare_loss_token_counts(micro_batches, self.base.model)
-        )
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

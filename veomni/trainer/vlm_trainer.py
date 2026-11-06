@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -31,7 +31,7 @@ from ..models import build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
-from ..utils.loss_utils import count_loss_token, prepare_loss_token_counts
+from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
@@ -308,12 +308,7 @@ class VLMTrainer:
         data_iterator: Any,
     ) -> Dict[str, float]:
         """Run multimodal micro-batches and report step losses and metrics."""
-        self.base.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self.base._reset_async_activation_offload_if_enabled(self.base.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        micro_batches, weighted_normalization = self.base._weighted_sft_preflight(data_iterator, self)
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()
@@ -323,9 +318,6 @@ class VLMTrainer:
         total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
-        weighted_normalization, self.base.micro_batches_token_len, self.base.global_micro_batches_token_len = (
-            prepare_loss_token_counts(micro_batches, self.base.model)
-        )
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

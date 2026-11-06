@@ -283,11 +283,16 @@ class PackingCollator(DataCollator):
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Pack features while keeping labels, weights and sequence boundaries aligned."""
         batch = defaultdict(list)
-        weighted = any("loss_weights" in feature for feature in features)
+        weighted = any(feature.get("loss_weights") is not None for feature in features)
         mtp_example = next((feature["mtp_labels"] for feature in features if "mtp_labels" in feature), None)
         for feature in features:
-            if "loss_weights" in feature:
-                weights = feature["loss_weights"]
+            weights = feature.get("loss_weights")
+            if weights is not None:
+                labels = feature.get("labels")
+                if not isinstance(weights, torch.Tensor) or not isinstance(labels, torch.Tensor):
+                    raise TypeError("loss_weights and labels must be tensors before packing")
+                if weights.shape != labels.shape:
+                    raise ValueError("loss_weights must match the corresponding labels before packing")
                 if (
                     not torch.isfinite(weights).all()
                     or (weights < 0).any()
@@ -296,8 +301,10 @@ class PackingCollator(DataCollator):
                 ):
                     raise ValueError("loss_weights must be in [0, 1] and positive weights must be normal float32")
             for key in feature.keys():
+                if key == "loss_weights" and weights is None:
+                    continue
                 batch[key].append(feature[key])
-            if weighted and "loss_weights" not in feature:
+            if weighted and weights is None:
                 batch["loss_weights"].append((feature["labels"] != IGNORE_INDEX).to(torch.float32))
             if weighted and mtp_example is not None and "mtp_labels" not in feature:
                 shape = (*mtp_example.shape[:-1], feature["labels"].shape[-1])

@@ -71,8 +71,10 @@ from ..utils.device import (
 )
 from ..utils.loss_utils import (
     count_loss_token,
+    fetch_training_micro_batches,
     mean_global_loss,
     prepare_loss_token_counts,
+    step_batch_structure,
 )
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
@@ -743,17 +745,34 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
+    def _weighted_sft_preflight(self, data_iterator, callback_owner):
+        micro_batches = fetch_training_micro_batches(data_iterator)
+        previous_step = self.state.global_step
+        self.state.global_step += 1
+        structure = step_batch_structure(micro_batches)
+        error = None
+        try:
+            self._reset_async_activation_offload_if_enabled(self.model)
+            callback_owner.on_step_begin(micro_batches=micro_batches)
+            if structure != step_batch_structure(micro_batches):
+                raise ValueError("SFT step-begin callback changed microbatch structure or loss weights")
+        except Exception as exc:  # noqa: BLE001 - propagate on the denominator reduction
+            error = exc
+        try:
+            weighted, self.micro_batches_token_len, self.global_micro_batches_token_len = prepare_loss_token_counts(
+                micro_batches, self.model, error=error
+            )
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
+        return micro_batches, weighted
+
     def train_step(
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
         """Accumulate one step using globally normalized micro-batch losses."""
-        self.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self._reset_async_activation_offload_if_enabled(self.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        micro_batches, weighted_normalization = self._weighted_sft_preflight(data_iterator, self)
 
         # Forward and backward for each micro batch
         self.sync_before_train_step()
@@ -763,9 +782,6 @@ class BaseTrainer(Stateful, ABC):
         total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
-        weighted_normalization, self.micro_batches_token_len, self.global_micro_batches_token_len = (
-            prepare_loss_token_counts(micro_batches, self.model)
-        )
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

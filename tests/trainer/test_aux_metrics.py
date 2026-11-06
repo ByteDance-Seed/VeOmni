@@ -237,13 +237,15 @@ def run_train_step(request, monkeypatch):
     monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
 
     # Single process: the all-reduce over the step's token denominators is the identity.
-    def prepare_counts(batches, model):
+    def prepare_counts(batches, model, *, error=None, **kwargs):
         """Replace distributed token counting with the single-process result."""
-        del model
-        local = module.count_loss_token(batches)
+        del model, kwargs
+        if error is not None:
+            raise error
+        local = base_trainer_module.count_loss_token(batches)
         return False, local, {key: value.item() for key, value in local.items()}
 
-    monkeypatch.setattr(module, "prepare_loss_token_counts", prepare_counts)
+    monkeypatch.setattr(base_trainer_module, "prepare_loss_token_counts", prepare_counts)
     # VLMTrainer's loop does not mark compile steps.
     monkeypatch.setattr(module, "mark_compile_step_begin", lambda *args, **kwargs: None, raising=False)
 

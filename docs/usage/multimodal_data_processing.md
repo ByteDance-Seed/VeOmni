@@ -42,6 +42,14 @@ Uncollated list-valued micro-batches, including the RL trainer path, reject
 weighted loss; ordinary unweighted RL batches continue to use their normal path.
 Channel loss remains an unweighted per-source CE metric; it does not represent
 the weighted optimization objective.
+An entire step with no supervised target mass is rejected before the optimizer
+runs, avoiding momentum or weight decay without data supervision. Weighted DPO
+is not supported and is rejected.
+Distributed training also coordinates loader and validation failures before
+forward: this standalone path adds one small world all-reduce per SFT step and
+two per DPO step. Measure the effect on the target interconnect; the stacked
+padding-safe path can reuse its existing preflight instead. Until the
+padding-safe trainer is combined, synthetic padding is rejected before forward.
 
 ## Image Resolution Control
 
