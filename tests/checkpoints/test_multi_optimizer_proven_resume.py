@@ -98,6 +98,100 @@ def test_corrupt_optimizer_inventory_fails_on_all_ranks():
     spawn_with_rendezvous(_corrupt_inventory_worker, nprocs=2)
 
 
+def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, endpoint):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    import veomni.checkpoint.dcp_checkpointer as checkpoint_module
+    from veomni.optim.swap_adamw import SwapAdamW
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=6))
+    try:
+        model = torch.nn.Linear(2, 2)
+
+        class FaultAdamW(torch.optim.AdamW):
+            @property
+            def _is_multi_optimizer(self):
+                if failure == "type_property" and rank == 0:
+                    raise OSError("injected optimizer type failure")
+                return False
+
+        leaf = FaultAdamW(model.parameters())
+        optimizer = leaf
+        if failure == "multi_mismatch" and rank == 0:
+            optimizer = MultiOptimizer(model, {"all": leaf}, ["all"])
+        if failure == "presence_mismatch" and rank == 0:
+            optimizer = None
+        if failure == "swap_mismatch" and rank == 0:
+            optimizer = SwapAdamW(model.parameters(), pin_memory=False)
+        if failure == "previous_async_failure" and rank == 0:
+            DistributedCheckpointer._async_save_failed = True
+        state = {
+            "model": model,
+            "optimizer": optimizer,
+            "_veomni_scheduler_object": None,
+            "_veomni_optimizer_identity_verified": True,
+            "_veomni_optimizer_checkpoint_generation": "stale",
+        }
+        original = checkpoint_module._requires_rank_local_optimizer_checkpoint
+
+        def inspect_optimizer(value):
+            if failure == "rank_local_check" and rank == 0:
+                raise OSError("injected optimizer precision policy failure")
+            return original(value)
+
+        with patch.object(checkpoint_module, "_requires_rank_local_optimizer_checkpoint", inspect_optimizer):
+            with pytest.raises(
+                (OSError, RuntimeError),
+                match="injected|failed on another rank|optimizer.*differ|previous asynchronous",
+            ):
+                getattr(DistributedCheckpointer, operation)(
+                    checkpoint, state, parallel_state=SimpleNamespace(dp_mode="ddp")
+                )
+        if operation == "load":
+            assert "_veomni_optimizer_identity_verified" not in state
+            assert "_veomni_optimizer_checkpoint_generation" not in state
+        if failure == "previous_async_failure":
+            assert DistributedCheckpointer._async_save_failed is True
+            with pytest.raises(RuntimeError, match="previous asynchronous DCP save failed"):
+                DistributedCheckpointer.wait_for_pending_save()
+        assert not Path(checkpoint).exists()
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        DistributedCheckpointer._async_save_failed = False
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("operation", ["save", "load"])
+@pytest.mark.parametrize(
+    "failure", ["rank_local_check", "type_property", "multi_mismatch", "presence_mismatch", "swap_mismatch"]
+)
+def test_asymmetric_optimizer_policy_fails_before_checkpoint_io(tmp_path, operation, failure):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
+        _asymmetric_optimizer_policy_worker,
+        args=(str(tmp_path / "checkpoint"), operation, failure),
+        nprocs=2,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_asymmetric_previous_async_failure_stops_save_on_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
+        _asymmetric_optimizer_policy_worker,
+        args=(str(tmp_path / "checkpoint"), "save", "previous_async_failure"),
+        nprocs=2,
+    )
+
+
 def _load_preflight_failure_worker(rank, checkpoint, failure, endpoint):
     from datetime import timedelta
     from unittest.mock import patch
