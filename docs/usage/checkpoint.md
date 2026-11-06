@@ -45,6 +45,32 @@ nothing else. The two exports are inference artifacts that resume never reads.
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
 
+When main-process dynamic batching emits padded micro-batches in single-process
+SFT, padding is excluded from loss token counts, channel loss and auxiliary
+metrics, and its model forward/backward is skipped. Distributed main-process
+dynamic batching must use `drop_last=True` until tail step counts can be
+coordinated across ranks. All distributed loaders, including finite native
+worker-based loaders, must coordinate fetch failures and EOF before entering
+the trainer and avoid injecting padded micro-batches. DPO and Omni reject padded
+micro-batches; custom data loaders must not inject padding into those objectives.
+DiT also rejects marked padding.
+The distributed padding guard adds one small collective before step-begin
+callbacks. SFT propagates callback errors in its existing loss-token reduction;
+DPO, Omni and DiT use a separate small error synchronization after callbacks.
+SFT still counts valid loss tokens after step-begin callbacks, so callbacks can
+adjust labels before the loss denominator is computed. Distributed training
+rejects unequal microbatch counts across ranks. Step-begin callbacks must not
+replace or reorder microbatches, or change the microbatch count, target-key
+structure or padding flags. Callback-internal collectives must coordinate their
+own failures; a failure before such a collective can still strand another rank.
+If any rank has auxiliary target keys, their union is synchronized once per
+step; missing targets contribute zero and keys are reduced in sorted order.
+This includes MTP inputs; object-gather overhead on accelerators is unmeasured.
+Environment-meter token and FLOP estimates likewise count useful batches only.
+The main dynamic loader's configured `train_steps` limit is unchanged: a
+normal trainer does not consume extra flush batches beyond that limit, and a
+restartable source can be replayed to fill the requested number of steps.
+
 Three splits in the tree above are deliberate:
 
 - **`loader/` and `extra_state/` are per rank** because their contents are.
