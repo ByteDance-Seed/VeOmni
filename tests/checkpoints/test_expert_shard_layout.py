@@ -1030,9 +1030,15 @@ def _ple_ep1_lora_worker(rank, root, unproven, endpoint):
         base = model.base_model.model
         base.experts.bias = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
         base.ple = torch.nn.Embedding(8, 4)
+        # This adapter-only export exercises PLE layout, but does not export PLE weights.
+        base.ple.weight.requires_grad_(False)
         base.get_parallel_plan = lambda: ParallelPlan({"ple": {"ple.weight": Shard(0)}})
         plan = get_runtime_parallel_plan(model)
         model._fqn2spec_info = plan.apply(model, parallel.extra_parallel_fsdp_device_mesh)
+        assert not base.ple.weight.requires_grad
+        assert base.ple.weight.shape == (4, 4)
+        assert base.ple.weight.spec_info.para_name == "ple"
+        assert base.ple.weight.spec_info.placement == Shard(0)
         selected = get_lora_state_dict(model, config=model.get_lora_config())
         assert any("experts.bias" in name for name in selected)
         for name, param in list(model.named_parameters()):
