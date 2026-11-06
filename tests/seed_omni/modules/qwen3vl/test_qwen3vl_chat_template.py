@@ -156,3 +156,63 @@ def test_chat_template_uses_real_timestamps_when_the_item_has_decode_metadata():
     parts = _template().apply_chat_template([video])
     stamps = [p.value for p in parts if p.type == "text" and p.value.endswith("seconds>")]
     assert stamps == ["<0.2 seconds>", "<1.2 seconds>", "<2.2 seconds>", "<3.2 seconds>"]
+
+
+def test_video_split_rewrites_each_segments_grid_and_token_len():
+    """Each segment is a complete visual item, so its metadata must describe that
+    segment alone: grid `[1, h, w]`, and its own share of the merged-token count.
+
+    Copying the clip's `[t, h, w]` makes every downstream consumer build `t`
+    frames' worth of M-RoPE/positions for one frame's rows — a shape error in
+    training and in inference alike. The row counts a split produces are asserted
+    against the grid the split *writes*, not the one it was given, which is what
+    the earlier test missed."""
+    import torch
+
+    from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import qwen3vl_vision_position_ids
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN
+
+    # 3 frames x (4x4 patches) = 48 raw rows; the clip contributes 12 merged tokens.
+    video = ConversationItem(
+        type="video",
+        value=torch.zeros(48, 8),
+        role="user",
+        meta={_OMNI_GRID: [3, 4, 4], _OMNI_TOKEN_LEN: 12},
+    )
+    segments = [p for p in _template().apply_chat_template([video]) if p.type == "video"]
+    assert len(segments) == 3
+
+    for segment in segments:
+        grid = segment.meta[_OMNI_GRID]
+        assert grid == [1, 4, 4], "a segment declares one frame, not the whole clip"
+        # The row count this segment carries must be what its grid implies.
+        assert segment.value.shape[0] == grid[0] * grid[1] * grid[2]
+        # And the merged-token count must match the positions the backbone rebuilds.
+        positions = qwen3vl_vision_position_ids(0, torch.tensor(grid), merge=2)
+        assert positions.shape[1] == segment.meta[_OMNI_TOKEN_LEN] == 4
+
+    # Splitting neither duplicates nor loses tokens.
+    assert sum(s.meta[_OMNI_TOKEN_LEN] for s in segments) == 12
+
+
+def test_video_split_feeds_the_packer_one_frame_per_visual():
+    """The packed preprocessor must receive per-frame grids that match each
+    segment's row count, so the packer's `t*h*w` split sees one frame per item."""
+    import torch
+
+    from veomni.models.seed_omni.modules.qwen3vl.text_encoder.processing import Qwen3VLTextEncoderPreprocessor
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
+    from veomni.models.seed_omni.processing_omni import OmniProcessor
+
+    preprocessor = Qwen3VLTextEncoderPreprocessor(_template(), packed_preprocess=True, spatial_merge_size=2)
+    processor = OmniProcessor({"qwen3vl_text_encoder": preprocessor})
+    sample = [
+        ConversationItem(type="text", value="describe", role="user"),
+        ConversationItem(type="video", value=torch.zeros(48, 8), role="user", meta={_OMNI_GRID: [3, 4, 4]}),
+        ConversationItem(type="text", value="ok", role="assistant"),
+    ]
+    packed = processor.preprocess(sample)
+    assert packed["image_grid_thw"].tolist() == [[1, 4, 4]] * 3
+    # One merged visual token per frame lands in the packed sequence.
+    assert int(packed["visual_pos_mask"].sum()) == 12

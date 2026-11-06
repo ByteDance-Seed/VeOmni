@@ -25,7 +25,7 @@ from typing import Any
 import torch
 
 from ......data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY
-from ....utils.conversation import ConversationItem
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...text_encoder.chat_template import TextEncoderChatTemplate
 from ..vision.processing import _OMNI_GRID
 
@@ -140,11 +140,18 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
         vision preprocessor splits the flat ViT output by ``t*h*w``), so one frame
         contributes ``h*w`` rows of that tensor; the merge happens when the vision
         module encodes them, not here.
+
+        Each segment is a *complete* visual item in its own right, so its metadata
+        must describe that segment alone: the grid becomes ``[1, h, w]`` and the
+        merged-token count is divided by the clip length. Copying the clip's
+        ``[t, h, w]`` would have every downstream consumer build ``t`` frames' worth
+        of positions and M-RoPE for a single frame's rows.
         """
         markers = self.chat_markers
         grid = (item.meta or {}).get(_OMNI_GRID) or (item.meta or {}).get("grid_thw")
         value = item.value
         num_frames = None
+        h = w = 0
         if isinstance(value, torch.Tensor) and value.dim() == 2 and grid is not None:
             t, h, w = (int(x) for x in torch.as_tensor(grid).reshape(-1).tolist())
             patch_rows_per_frame = h * w
@@ -161,6 +168,11 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
 
         timestamps = _frame_timestamps(item, num_frames, self.temporal_patch_size)
         per_frame = value.size(0) // num_frames
+        meta = dict(item.meta or {})
+        # A single frame's grid, and the tokens it alone contributes.
+        meta[_OMNI_GRID] = [1, h, w]
+        if _OMNI_TOKEN_LEN in meta:
+            meta[_OMNI_TOKEN_LEN] = int(meta[_OMNI_TOKEN_LEN]) // num_frames
         out: list[ConversationItem] = []
         for frame in range(num_frames):
             out.append(self._build_conversation_item("text", f"<{timestamps[frame]:.1f} seconds>", role, loss_mask=0))
@@ -170,7 +182,7 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
                     type=item.type,
                     value=value[frame * per_frame : (frame + 1) * per_frame],
                     role=item.role,
-                    meta=dict(item.meta or {}),
+                    meta=dict(meta),
                 )
             )
             out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
