@@ -4,6 +4,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -14,7 +15,7 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
 from veomni.arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from veomni.arguments.parser import _instantiate_recursive, parse_args
@@ -26,9 +27,10 @@ from veomni.distributed.fsdp2.reduce_scatter import (
     register_fp32_reduce_scatter_with_low_precision_transport,
 )
 from veomni.distributed.parallel_plan import SpecInfo
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import _configure_fsdp_gradient_reduction
 from veomni.utils import device as device_utils
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
@@ -1026,3 +1028,93 @@ def test_reduce_scatter_fp32_accumulation_nccl():
     from ..tools.launch_utils import torchrun
 
     torchrun(_run_reduce_scatter_nccl_and_fsdp2_step, world_size=_CI_ACCELERATOR_4.nproc)
+
+
+def _run_fsdp2_hccl_optimizer_step():
+    class Linear(nn.Linear):
+        @torch.no_grad()
+        def init_weights(self):
+            self.weight.to_local().fill_(0.125)
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    _init_parallel_state(dp_size=world_size, dp_shard_size=world_size, device_type="npu")
+    precision = MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32")
+
+    def build(enabled):
+        return torch_parallelize.build_parallelize_model(
+            Linear(32, 16, bias=False, device="meta"),
+            mixed_precision=precision,
+            enable_gradient_checkpointing=False,
+            low_precision_reduce_scatter_comm=enabled,
+            init_device="meta",
+        )
+
+    baseline = build(False)
+    candidate = build(True)
+    inputs = torch.full((8, 32), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{rank}")
+    baseline(inputs).sum().backward()
+    with mock.patch.object(dist, "all_to_all_single", wraps=dist.all_to_all_single) as exchange:
+        candidate(inputs).sum().backward()
+    exchange.assert_called_once()
+    assert exchange.call_args.args[1].dtype == torch.bfloat16
+
+    torch.testing.assert_close(candidate.weight.grad.to_local(), baseline.weight.grad.to_local(), rtol=0, atol=0)
+    expected = baseline.weight.to_local().detach().clone()
+    for model in (baseline, candidate):
+        torch.optim.SGD(model.parameters(), lr=0.125).step()
+    torch.testing.assert_close(candidate.weight.to_local(), baseline.weight.to_local(), rtol=0, atol=0)
+    assert not torch.equal(candidate.weight.to_local(), expected)
+
+
+def _run_fsdp2_hccl_expert_optimizer_step():
+    from ..utils.test_extra_parallel_clip_grad_norm import ToyMoeAndEmbedModel
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        device_type="npu",
+        extra_parallel_sizes=(2, 1),
+        extra_parallel_names=("ep", "emb"),
+        extra_parallel_placement_innermost=(False, False),
+    )
+    precision = MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32")
+
+    def build(enabled):
+        return torch_parallelize.build_parallelize_model(
+            ToyMoeAndEmbedModel(),
+            mixed_precision=precision,
+            enable_gradient_checkpointing=False,
+            low_precision_reduce_scatter_comm=enabled,
+            init_device="meta",
+        )
+
+    baseline, candidate = build(False), build(True)
+    inputs = torch.full((16,), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{rank}")
+    factor = (rank + 1) / world_size
+    (baseline(inputs).float() * factor).backward()
+    with mock.patch.object(dist, "all_to_all_single", wraps=dist.all_to_all_single) as exchange:
+        (candidate(inputs).float() * factor).backward()
+    group_sizes = {dist.get_world_size(call.kwargs["group"]) for call in exchange.call_args_list}
+    assert group_sizes == {world_size, world_size // 2}
+    assert all(call.args[1].dtype == torch.bfloat16 for call in exchange.call_args_list)
+    for actual, expected in zip(candidate.parameters(), baseline.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad.to_local(), expected.grad.to_local(), rtol=0, atol=0)
+    for model in (baseline, candidate):
+        torch.optim.SGD(model.parameters(), lr=0.125).step()
+    for actual, expected in zip(candidate.parameters(), baseline.parameters(), strict=True):
+        torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world_size"))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires Ascend NPU devices")
+@pytest.mark.parametrize("world_size", [pytest.param(2, id="dense"), pytest.param(4, id="ep2")])
+def test_reduce_scatter_fp32_accumulation_hccl(world_size):
+    from ..tools.launch_utils import torchrun
+
+    if device_utils.get_torch_device().device_count() < world_size:
+        pytest.skip(f"requires {world_size} Ascend NPU devices")
+    case = _run_fsdp2_hccl_optimizer_step if world_size == 2 else _run_fsdp2_hccl_expert_optimizer_step
+    torchrun(case, world_size=world_size)

@@ -737,15 +737,17 @@ model:
 
 #### Which training layouts use it?
 
-The following assumes a valid custom configuration on CUDA. A node means a physical machine, not a worker
-process. VeOmni checks the actual ReduceScatter (RS) group, not the FSDP/HSDP strategy name.
+CUDA/NCCL supports BF16 or FP16 transport. Ascend/HCCL supports BF16 transport with a one-dimensional
+FSDP mesh. A node means a physical machine. VeOmni checks the actual placement of the ReduceScatter
+(RS) group.
 
 | Training layout | RS behavior | Warning or error? |
 | --- | --- | --- |
-| Single-node FSDP with multiple GPUs | Communicate in `param_dtype`; sum in FP32 | No fallback warning |
+| Single-node FSDP with multiple devices | Communicate in `param_dtype`; sum in FP32 | No fallback warning |
 | Multi-node FSDP whose RS group spans machines | Keep native PyTorch RS | Warning; training continues |
-| HSDP with RS inside each node and AllReduce between nodes | Communicate RS in `param_dtype`; replica AllReduce stays FP32 | No fallback warning |
-| HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| CUDA HSDP with RS inside each node and AllReduce between nodes | Communicate RS in `param_dtype`; replica AllReduce stays FP32 | No fallback warning |
+| CUDA HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| Ascend HSDP with BF16 transport requested | Custom transport unavailable | Configuration error |
 | Node identity cannot be determined | Keep native communication for all replica-linked shard groups | Warning; training continues |
 | RS group contains only one rank | Keep native communication and scaling | No fallback warning |
 | Option disabled, or supported parameter/reduction dtypes are equal | Keep native communication without topology checks | No fallback warning |
@@ -775,10 +777,10 @@ only when every member reports the same valid Linux kernel boot ID (`/proc/sys/k
 Container hostnames, local rank numbers and configured shard sizes are not used as evidence of node locality.
 Isolated container boot IDs may conservatively cause a fallback even on one physical node.
 
-HSDP replica-linked shard groups must all qualify, preventing replicas from mixing the custom force-SUM
+CUDA HSDP replica-linked shard groups must all qualify, preventing replicas from mixing the custom force-SUM
 scaling contract with native reduction scaling. Unrelated module meshes may choose different paths.
 Decisions are cached by process group within one model initialization; no detection runs during backward.
-Only named 1D shard meshes and 2D replica/shard meshes are supported; other dimensionalities are rejected
+The policy supports named 1D shard meshes and, on CUDA, 2D replica/shard meshes. Other dimensionalities are rejected
 before process-group lookup rather than skipping replica consensus.
 
 This is a conservative performance guard, not a guarantee of acceleration on every node-local interconnect
@@ -812,10 +814,10 @@ The supported combinations are intentionally narrow:
 | `false` | Any otherwise valid configuration | Any otherwise valid configuration | Native path; no topology checks |
 | `true` | Same supported dtype as reduction | Same supported dtype as parameters | Native path; no topology checks |
 | `true` | `bfloat16` | `float32` | BF16 communication and FP32 accumulation on eligible groups |
-| `true` | `float16` | `float32` | FP16 communication and FP32 accumulation on eligible groups |
+| `true` | `float16` | `float32` | FP16 communication and FP32 accumulation on eligible CUDA groups |
 | `true` | Other combinations | Other combinations | Configuration error, not silent compression |
 
-The custom rows additionally require enabled mixed precision and CUDA FSDP2. Equal-dtype native bypass
+The custom rows additionally require enabled mixed precision and a supported FSDP2 backend. Equal-dtype native bypass
 does not enable this custom path, even if mixed precision is disabled. Two unset dtypes are not a supported
 equal-dtype configuration for an enabled flag.
 
