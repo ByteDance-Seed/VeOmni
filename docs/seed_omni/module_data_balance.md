@@ -49,7 +49,6 @@ immutable routing plan owns that exact group's forward/backward exchanges,
 independently of whichever module's state is ambient during backward.
 All owners call the inverse even when their original batch was empty. Packed
 and carrier consumers must preserve dummy/empty gradient anchors downstream.
-Schemas and metadata errors are checked collectively before payload exchange.
 
 ## Qwen3-VL ordering
 
@@ -97,7 +96,6 @@ Bagel SP inverse permutation and skewed per-rank wall-time/MFU remain PR3,
 after mixin-contract review. V1 migration/deletion remains PR4; this change does
 not claim that legacy retirement or the whole issue is complete.
 
-Tensor fields must agree on trailing shape, dtype and `requires_grad` across
-the DP group, including empty owners. Rank-asymmetric autograd would omit
-backward collectives and is rejected before payload routing. Malformed
-field names, split conversions and scalar tensors also fail collectively.
+All DP ranks run the same module, so tensor fields agree on trailing shape,
+dtype and `requires_grad` across the DP group, including empty owners. The
+balancer relies on that contract and gathers only item lengths and costs.

@@ -124,22 +124,15 @@ class DataBalanceMixin:
             return tensors, False
         if ps.dp_group is None:
             raise RuntimeError("A non-singleton DP dimension requires a module-local group.")
-        # Let the core share local cost errors before any tensor collective, so
-        # a malformed callback on one owner cannot leave its peers hanging.
-        try:
-            lengths = torch.tensor(metadata[spec.cost_lengths_key], dtype=torch.float64)
-            costs = spec.cost_fn(lengths) if spec.cost_fn is not None else lengths.pow(spec.cost_exponent)
-            costs = costs.tolist() if isinstance(costs, torch.Tensor) else (() if costs is None else costs)
-        except Exception:
-            # A nonfinite sentinel fails even for an owner with zero items.
-            costs = [float("nan")]
         if method in self._data_balance_plans:
             raise RuntimeError("An invocation already owns a routing plan.")
+        lengths = torch.tensor(metadata[spec.cost_lengths_key], dtype=torch.float64)
+        costs = spec.cost_fn(lengths) if spec.cost_fn is not None else lengths.pow(spec.cost_exponent)
         balanced, plan = ModuleDataBalancer(ps.dp_group).balance(
-            {field.name: tensors.get(field.name) for field in spec.fields},
-            {field.name: metadata.get(field.lengths_key) for field in spec.fields},
-            metadata.get(spec.output_lengths_key),
-            costs=costs,
+            {field.name: tensors[field.name] for field in spec.fields},
+            {field.name: metadata[field.lengths_key] for field in spec.fields},
+            metadata[spec.output_lengths_key],
+            costs=costs.tolist(),
         )
         self._data_balance_plans[method] = plan
         return {**tensors, **balanced}, True
