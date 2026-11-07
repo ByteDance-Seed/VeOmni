@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1071),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1063),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 
@@ -323,7 +323,7 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L627),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L636),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot
@@ -371,7 +371,7 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2667).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2749).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):

@@ -85,10 +85,20 @@ def _optimizer_state(optimizer, param):
     return owners[0].state[param]
 
 
+def _assert_selective_placement(model, optimizer, resident):
+    expected = "npu" if resident else "cpu"
+    for param in model.layer.experts.parameters():
+        assert _local(param).device.type == expected
+        state = _optimizer_state(optimizer, param)
+        assert all(_local(state[key]).device.type == expected for key in ("exp_avg", "exp_avg_sq"))
+
+
 def _snapshot(model, optimizer):
     result = {}
     for name, param in model.named_parameters():
         state = _optimizer_state(optimizer, param)
+        parameter_device = _local(param).device.type
+        assert all(_local(state[part]).device.type == parameter_device for part in ("exp_avg", "exp_avg_sq"))
         result[name] = {
             "param": _local(param.detach()).cpu().clone(),
             "m": _local(state["exp_avg"]).detach().cpu().clone(),
@@ -111,6 +121,7 @@ def _step(model, optimizer, rank, ep, step):
     grads = {}
     for name, param in model.named_parameters():
         assert param.grad is not None and param.grad.dtype == torch.float32
+        assert _local(param.grad).device.type == _local(param).device.type
         grads[name] = _local(param.grad).detach().cpu().clone()
         assert torch.isfinite(grads[name]).all()
         assert grads[name].shape[0] == 2
@@ -128,7 +139,7 @@ def _step(model, optimizer, rank, ep, step):
     }
 
 
-def run(rank, phase, output_dir, ep, endpoint=None):
+def run(rank, phase, output_dir, ep, endpoint=None, *, selective=False, resident=False):
     import torch_npu  # noqa: F401
 
     torch.npu.set_device(rank)
@@ -155,8 +166,13 @@ def run(rank, phase, output_dir, ep, endpoint=None):
             enable_gradient_checkpointing=False,
             init_device="meta",
             enable_forward_prefetch=False,
+            cpu_offload_extra_parallel_names=["ep"] if selective else [],
+            cpu_offload_exclude_module_patterns=["layer.experts"] if resident else [],
         )
         assert model.layer.experts._veomni_fp32_expert_wgrad
+        if selective:
+            expected = "npu" if resident else "cpu"
+            assert all(_local(param).device.type == expected for param in model.layer.experts.parameters())
         optimizer = build_optimizer(model, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.0, fused=False)
         ckpt = str(Path(output_dir) / f"ep{ep}-dcp")
         if phase == "fresh":
@@ -189,8 +205,12 @@ def run(rank, phase, output_dir, ep, endpoint=None):
                 {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
                 parallel_state=get_parallel_state(),
             )
+        if selective:
+            _assert_selective_placement(model, optimizer, resident)
         before = _snapshot(model, optimizer)
         after = _step(model, optimizer, rank, ep, 2)
+        if selective:
+            _assert_selective_placement(model, optimizer, resident)
         for name in before:
             assert not torch.equal(before[name]["param"], after["state"][name]["param"])
         torch.save({"before": before, "after": after}, Path(output_dir) / f"ep{ep}-{phase}-rank{rank}.pt")
@@ -198,6 +218,10 @@ def run(rank, phase, output_dir, ep, endpoint=None):
     finally:
         clear_parallel_state()
         dist.destroy_process_group()
+
+
+def run_selective(rank, phase, output_dir, resident, endpoint):
+    run(rank, phase, output_dir, 2, endpoint, selective=True, resident=resident)
 
 
 if __name__ == "__main__":
