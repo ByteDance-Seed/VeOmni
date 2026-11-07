@@ -129,6 +129,16 @@
     ]
   },
   {
+    "name": "module-balance-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_module_balance.py"
+    ]
+  },
+  {
     "name": "11-unit",
     "suite": "unit",
     "conditional": false,
