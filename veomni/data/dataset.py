@@ -1569,6 +1569,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self._just_resumed = True
 
     def prepare_resume_epoch(self, epoch: int) -> None:
+        """Forward a resume-only epoch hint to the upstream dataset when supported."""
         prepare = getattr(self.dataset, "prepare_resume_epoch", None)
         if callable(prepare):
             prepare(epoch)

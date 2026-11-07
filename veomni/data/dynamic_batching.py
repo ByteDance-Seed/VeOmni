@@ -411,6 +411,7 @@ class DynamicBatchSizeDataLoader:
         self._batch_data_iter = self.batch_data_generator()
 
     def prepare_resume_epoch(self, epoch: int) -> None:
+        """Forward a resume-only epoch hint to the wrapped loader when supported."""
         prepare = getattr(self._dataloader, "prepare_resume_epoch", None)
         if callable(prepare):
             prepare(epoch)
