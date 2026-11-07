@@ -217,6 +217,38 @@ def test_extra_parallel_custom_group_keeps_legacy_decay_boundaries(monkeypatch):
     assert [group["weight_decay"] for group in leaf.param_groups] == [0.01, 0.0]
 
 
+@pytest.mark.parametrize(
+    "optimizer_type, expected_decay",
+    [("adamw", 0.01), ("cpu_offload_adamw", 0.2), ("full_fp32_adamw", 0.2), ("master_fp32_adamw", 0.2)],
+)
+def test_extra_parallel_explicit_decay_does_not_override_no_decay(monkeypatch, optimizer_type, expected_decay):
+    import veomni.optim.optimizer as optimizer_module
+
+    parallel = SimpleNamespace(dp_mode="fsdp2", any_extra_parallel_enabled=True, extra_parallel_names=("ep",))
+    monkeypatch.setattr(optimizer_module, "get_parallel_state", lambda: parallel)
+    model = torch.nn.Linear(2, 2)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+        model.bias.fill_(1.0)
+    options = {"cpu_offload_param_patterns": [".*"]} if optimizer_type == "cpu_offload_adamw" else {}
+    optimizer = build_optimizer(
+        model,
+        lr=0.1,
+        optimizer_type=optimizer_type,
+        weight_decay=0.01,
+        no_decay_params=["bias"],
+        param_groups=[{"params": list(model.parameters()), "weight_decay": 0.2}],
+        **options,
+    )
+    leaf = optimizer.optimizers_dict["non_extra_parallel"]
+    assert [group["weight_decay"] for group in leaf.param_groups] == [expected_decay, 0.0]
+    model.weight.grad = torch.zeros_like(model.weight)
+    model.bias.grad = torch.zeros_like(model.bias)
+    optimizer.step()
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 1.0 - 0.1 * expected_decay))
+    torch.testing.assert_close(model.bias, torch.ones_like(model.bias))
+
+
 def test_staging_wait_uses_recorded_device_event(monkeypatch):
     calls = []
 

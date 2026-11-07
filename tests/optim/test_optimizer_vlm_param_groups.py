@@ -308,7 +308,7 @@ def test_qwen38_extra_parallel_does_not_override_explicit_nonzero_ple_decay(monk
         )
 
 
-def test_extra_parallel_respects_explicit_and_default_decay(monkeypatch):
+def test_extra_parallel_adamw_preserves_legacy_decay_and_no_decay(monkeypatch):
     import veomni.optim.optimizer as factory
 
     model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False), torch.nn.LayerNorm(4))
@@ -328,9 +328,45 @@ def test_extra_parallel_respects_explicit_and_default_decay(monkeypatch):
         for group in leaf.param_groups
         for param in group["params"]
     }
-    assert groups[id(model[0].weight)]["weight_decay"] == 0.3
-    assert groups[id(model[1].weight)]["weight_decay"] == 0.3
+    assert groups[id(model[0].weight)]["weight_decay"] == 0.1
+    assert groups[id(model[1].weight)]["weight_decay"] == 0.0
     assert groups[id(model[1].bias)]["weight_decay"] == 0.0
+
+
+@pytest.mark.parametrize("no_decay_head", [False, True])
+def test_qwen38_extra_parallel_preserves_ple_and_head_decay(monkeypatch, no_decay_head):
+    import veomni.optim.optimizer as factory
+
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4)
+    model.lm_head = torch.nn.Linear(4, 7, bias=False)
+    with torch.no_grad():
+        model.ngram_embedding.weight.fill_(1.0)
+        model.lm_head.weight.fill_(1.0)
+    monkeypatch.setattr(
+        factory,
+        "get_parallel_state",
+        lambda: SimpleNamespace(dp_mode="fsdp2", any_extra_parallel_enabled=True, extra_parallel_names=("ep",)),
+    )
+    optimizer = build_optimizer(
+        model,
+        optimizer_type="qwen38_muon",
+        lr=0.1,
+        weight_decay=0.01,
+        no_decay_params=["lm_head"] if no_decay_head else [],
+        param_groups=[
+            {"params": [model.ngram_embedding.weight], "weight_decay": 0.0},
+            {"params": [model.lm_head.weight], "weight_decay": 0.2},
+        ],
+    )
+    leaf = optimizer.optimizers_dict["non_extra_parallel"]
+    expected_decay = 0.0 if no_decay_head else 0.2
+    assert [group["weight_decay"] for group in leaf.param_groups] == [0.0, expected_decay]
+    model.ngram_embedding.weight.grad = torch.zeros_like(model.ngram_embedding.weight)
+    model.lm_head.weight.grad = torch.zeros_like(model.lm_head.weight)
+    optimizer.step()
+    torch.testing.assert_close(model.ngram_embedding.weight, torch.ones_like(model.ngram_embedding.weight))
+    torch.testing.assert_close(model.lm_head.weight, torch.full_like(model.lm_head.weight, 1.0 - 0.1 * expected_decay))
 
 
 def test_extra_parallel_rejects_unproven_legacy_dcp_groups(tmp_path):
