@@ -120,6 +120,11 @@ For answers to frequently asked questions about using VeOmni with Ascend NPUs, i
 
 [FAQ: Common Issues and Solutions for Ascend NPU](FAQ.md)
 
+## Chunk cross entropy
+
+For chunk CE fast-path conditions, parameter handling and validation commands,
+see [NPU chunk cross entropy](npu_chunk_loss.md).
+
 ## Declarations
 
 The Ascend support code, Dockerfile and image provided in the documentation are for reference only. If you intend to use them in a production environment, please contact the official channels. Thank you.

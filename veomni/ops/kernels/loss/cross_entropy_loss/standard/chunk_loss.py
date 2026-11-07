@@ -27,6 +27,7 @@ from torch import Tensor
 from .....registry import SavedState
 from . import eager as _eager
 from .eager import _grad_and_value, _Meta, _needs_input_grad
+from .npu import can_use_fused_ce, fused_linear_ce
 
 
 # Channel-loss capture is opt-in and scoped by the trainer. Keeping this state
@@ -47,6 +48,13 @@ def _ce_loss_func(
     """Per-chunk projection and CE, optionally recording detached token losses."""
     labels_flat = labels.reshape(-1)
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
+    if (
+        logits_bias is None
+        and logits_bias_weight is None
+        and observe is None
+        and can_use_fused_ce(hidden_flat, weight, labels_flat)
+    ):
+        return fused_linear_ce(hidden_flat, weight, labels_flat, num_items_in_batch, ignore_index)
     logits = F.linear(hidden_flat, weight).float()
     if logits_bias is not None:
         bias_flat = logits_bias.reshape(-1, logits_bias.size(-1))
@@ -70,14 +78,15 @@ def forward(
     logits_bias_weight: Tensor | None = None,
     *,
     ignore_index: int = -100,
-    num_items_in_batch: int | None = None,
+    num_items_in_batch: int | Tensor | None = None,
     chunk_size: int = 1024,
     grad_enabled: bool | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Chunked fused linear + CE. ``weight`` must be present.
 
     Split the sequence, run ``torch.func.grad_and_value`` on ``F.linear``
-    plus eager CE, and accumulate. Does not shift labels or reduce across
+    plus CE (native fused CE on supported NPU inputs), and accumulate.
+    Does not shift labels or reduce across
     SP. When ``num_items_in_batch`` is omitted, the shared denominator is
     the valid-token count. Unused ``V×H`` grads require both
     ``requires_grad`` and the caller's ``is_grad_enabled()``.
