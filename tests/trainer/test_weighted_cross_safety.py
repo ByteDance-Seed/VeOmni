@@ -12,6 +12,9 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _worker(rank, endpoint):
     from veomni.data import data_collator
     from veomni.trainer.base import BaseTrainer

@@ -1,14 +1,19 @@
 """Weighted-loss parity through the actual patched Qwen4-Exp model."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 from transformers import Qwen4ExpConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
 from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
     Qwen4ExpForConditionalGeneration,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_qwen4_toy_weighted_loss_and_parameter_gradients_match_dense():

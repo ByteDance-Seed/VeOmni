@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 path = Path(__file__).with_name("run_weighted_fsdp_sp_gate.py")
 spec = importlib.util.spec_from_file_location("weighted_gate_runner", path)

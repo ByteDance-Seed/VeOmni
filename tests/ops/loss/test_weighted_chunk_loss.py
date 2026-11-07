@@ -4,7 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import resolve_op
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_TWO_CPU = pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 
 
 @pytest.mark.parametrize("weights", [[0.0, 0.5, 1.0, 0.2, 1.0], [0.0] * 5, [0.01] * 5])
@@ -287,6 +292,7 @@ def _check_sp_weighted_reduce(rank, path):
         dist.destroy_process_group()
 
 
+@_TWO_CPU
 def test_sp_weighted_reduce_handles_mass_below_one_and_all_zero(tmp_path):
     import torch.multiprocessing as mp
 
@@ -339,6 +345,7 @@ def _check_sp_causal(rank, path):
         dist.destroy_process_group()
 
 
+@_TWO_CPU
 def test_sp_causal_weighted_loss_and_gradients_match_unsharded(tmp_path):
     import torch.multiprocessing as mp
 
@@ -541,6 +548,7 @@ def _check_dp_mixed_weighted(rank, path):
         dist.destroy_process_group()
 
 
+@_TWO_CPU
 def test_dp_mixed_weighted_and_unweighted_matches_dense_gradient(tmp_path):
     import torch.multiprocessing as mp
 
@@ -929,6 +937,7 @@ def _check_weighted_router_agreement(rank, path):
         dist.destroy_process_group()
 
 
+@_TWO_CPU
 def test_weighted_router_aux_error_is_agreed_across_ranks(tmp_path):
     import torch.multiprocessing as mp
 
