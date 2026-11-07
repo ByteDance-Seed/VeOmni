@@ -317,6 +317,8 @@ class OmniModelRuntime:
                 enable_forward_prefetch=acc.fsdp_config.forward_prefetch,
                 enable_fsdp_offload=acc.fsdp_config.offload,
                 fsdp_offload_pin_memory=acc.fsdp_config.offload_pin_memory,
+                cpu_offload_extra_parallel_names=acc.fsdp_config.cpu_offload_extra_parallel_names,
+                cpu_offload_exclude_module_patterns=acc.fsdp_config.cpu_offload_exclude_module_patterns,
                 broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
                 ep_sharded_stream_load=args.ep_sharded_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
