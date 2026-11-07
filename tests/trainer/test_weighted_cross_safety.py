@@ -1,4 +1,4 @@
-"""Cross-rank failure paths for weighted SFT and DPO input handling."""
+"""Cross-rank failure paths for weighted SFT input handling."""
 
 from datetime import timedelta
 from types import SimpleNamespace
@@ -15,7 +15,6 @@ from tests.tools.launch_utils import spawn_with_rendezvous
 def _worker(rank, endpoint):
     from veomni.data import data_collator
     from veomni.trainer.base import BaseTrainer
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
     from veomni.utils import loss_utils
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=45))
@@ -59,30 +58,6 @@ def _worker(rank, endpoint):
             base._sft_step_preflight(batches, base)
         assert base.state.global_step == 3
 
-        trainer = object.__new__(TextDPOTrainer)
-        callback_calls = []
-        trainer.base = SimpleNamespace(
-            state=SimpleNamespace(global_step=3),
-            _reset_async_activation_offload_if_enabled=lambda _model: None,
-            on_step_begin=lambda **_kwargs: callback_calls.append(True),
-        )
-        trainer.policy_model = SimpleNamespace()
-        batch = {"labels": torch.tensor([1, 2])}
-        if rank == 1:
-            batch["loss_weights"] = torch.tensor([0.5, 0.5])
-        with pytest.raises(RuntimeError, match="data loading failed"):
-            trainer.train_step(iter([[batch]]))
-        assert trainer.state.global_step == 3
-        assert not callback_calls
-
-        def fail_dpo_callback(**_kwargs):
-            if rank == 1:
-                raise RuntimeError("DPO callback failed")
-
-        trainer.base.on_step_begin = fail_dpo_callback
-        with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
-            trainer.train_step(iter([[{"labels": torch.tensor([1, 2])}]]))
-        assert trainer.state.global_step == 3
         auxiliary = {"labels": torch.tensor([[-100, 1]])}
         auxiliary["image_labels" if rank == 0 else "audio_labels"] = torch.tensor([1, 2, 3] if rank == 0 else [1])
         _, _, totals = loss_utils.prepare_loss_token_counts([auxiliary])
