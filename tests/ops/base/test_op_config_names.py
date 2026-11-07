@@ -34,6 +34,7 @@ _FIELD_TO_OP = {
     "attn_implementation": "attention",
     "causal_conv1d_implementation": "causal_conv1d",
     "chunk_gated_delta_rule_implementation": "chunk_gated_delta_rule",
+    "chunk_kda_implementation": "chunk_kda",
     "cross_entropy_loss_implementation": "cross_entropy_loss",
     "dsa_attention_implementation": "dsa_attention",
     "dsa_indexer_implementation": "dsa_indexer",
@@ -45,6 +46,7 @@ _FIELD_TO_OP = {
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",
     "rotary_pos_emb_vision_implementation": "rope",
+    "situ_and_mul_implementation": "situ_and_mul",
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
 
