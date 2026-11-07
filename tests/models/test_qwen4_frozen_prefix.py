@@ -10,6 +10,11 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 _fix = runpy.run_path(str(Path(__file__).parents[2] / "veomni/models/transformers/qwen4_exp/frozen_prefix.py"))[
     "remove_frozen_prefix_input_grads"
