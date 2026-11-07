@@ -251,6 +251,6 @@ by other ranks at the same time, causing additional I/O or longer loading.
 Symbolic-link shards remain readable, but their cache advice is skipped with
 a warning. Advice follows each completed DCP read plan rather than each tensor;
 partial pages may remain cached and the read's peak usage may not decrease.
-The Python `DistributedCheckpointer.load` option may also be supplied by keyword.
+For Python calls, pass `evict_source_cache=True` to `DistributedCheckpointer.load`.
 Benchmark the actual filesystem and topology before enabling this option.
 This flag does not change checkpoint contents or optimizer precision.

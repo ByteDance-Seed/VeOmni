@@ -130,13 +130,13 @@ def test_dcp_advice_error_propagates(tmp_path, monkeypatch):
         dcp.load({"weight": torch.empty(8)}, storage_reader=CacheAwareFileSystemReader(tmp_path))
 
 
-def _two_rank_worker(rank, rendezvous, checkpoint):
+def _two_rank_worker(rank, checkpoint, endpoint):
     import datetime
 
     import torch.distributed as dist
 
     dist.init_process_group(
-        "gloo", init_method="file://" + rendezvous, rank=rank, world_size=2, timeout=datetime.timedelta(seconds=60)
+        "gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=datetime.timedelta(seconds=60)
     )
     try:
         source = {
@@ -164,11 +164,12 @@ def _two_rank_worker(rank, rendezvous, checkpoint):
 @pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
 @pytest.mark.launch_plan(provider=_TWO_RANK)
 def test_two_rank_dcp_cache_advice(tmp_path):
-    torch.multiprocessing.spawn(
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(
         _two_rank_worker,
-        args=(str(tmp_path / "rdzv"), str(tmp_path / "checkpoint")),
+        args=(str(tmp_path / "checkpoint"),),
         nprocs=_TWO_RANK.nproc,
-        join=True,
     )
 
 
