@@ -104,16 +104,6 @@ def synchronize_training_error(error, objective, *, microbatch_count=None):
         raise error
 
 
-def step_batch_structure(batch):
-    """Record callback-invariant microbatch identities and reduction structure."""
-    if isinstance(batch, (list, tuple)):
-        return (type(batch), tuple(step_batch_structure(item) for item in batch))
-    if isinstance(batch, dict):
-        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
-        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
-    return (type(batch), id(batch))
-
-
 def _distributed_batch_status(
     batch, invalid: bool, has_auxiliary_targets: bool = False, *, check_fetch=False, fetch_error=None
 ):

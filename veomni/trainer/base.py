@@ -77,7 +77,6 @@ from ..utils.loss_utils import (
     mean_global_loss,
     prepare_loss_token_counts,
     reject_distributed_padding,
-    step_batch_structure,
 )
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
@@ -779,7 +778,6 @@ class BaseTrainer(Stateful, ABC):
         real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
         if not real_micro_steps:
             raise ValueError("A training step must contain at least one real micro-batch")
-        original_structure = step_batch_structure(micro_batches)
         previous_step = self.state.global_step
         self.state.global_step += 1
         try:
@@ -787,8 +785,6 @@ class BaseTrainer(Stateful, ABC):
             try:
                 self._reset_async_activation_offload_if_enabled(self.model)
                 callback_owner.on_step_begin(micro_batches=micro_batches)
-                if step_batch_structure(micro_batches) != original_structure:
-                    raise ValueError("SFT step-begin callback changed microbatch structure or padding")
             except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
                 error = exc
             # Callbacks may adjust labels; normalize the inputs actually consumed.

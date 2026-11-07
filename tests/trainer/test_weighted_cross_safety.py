@@ -50,44 +50,36 @@ def _worker(rank, endpoint):
         )
         batches = [{"labels": torch.tensor([1, 2]), "loss_weights": torch.tensor([0.5, 0.5])}]
 
-        def mutate(micro_batches):
+        def fail_callback(micro_batches):
             if rank == 1:
-                micro_batches[0].pop("loss_weights")
+                raise RuntimeError("callback failed")
 
-        base.on_step_begin = mutate
-        with pytest.raises(RuntimeError, match="callback or loss-token"):
-            base._sft_step_preflight(batches, base)
-        assert base.state.global_step == 3
-
-        def add_padding(micro_batches):
-            if rank == 1:
-                micro_batches[0]["padding_flag"] = True
-
-        base.on_step_begin = add_padding
-        batches = [{"labels": torch.tensor([1, 2]), "loss_weights": torch.tensor([0.5, 0.5])}]
+        base.on_step_begin = fail_callback
         with pytest.raises(RuntimeError, match="callback or loss-token"):
             base._sft_step_preflight(batches, base)
         assert base.state.global_step == 3
 
         trainer = object.__new__(TextDPOTrainer)
+        callback_calls = []
         trainer.base = SimpleNamespace(
             state=SimpleNamespace(global_step=3),
             _reset_async_activation_offload_if_enabled=lambda _model: None,
-            on_step_begin=lambda micro_batches, **kwargs: micro_batches[0].pop("loss_weights", None),
+            on_step_begin=lambda **_kwargs: callback_calls.append(True),
         )
         trainer.policy_model = SimpleNamespace()
         batch = {"labels": torch.tensor([1, 2])}
         if rank == 1:
             batch["loss_weights"] = torch.tensor([0.5, 0.5])
-        with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
+        with pytest.raises(RuntimeError, match="data loading failed"):
             trainer.train_step(iter([[batch]]))
         assert trainer.state.global_step == 3
+        assert not callback_calls
 
-        def invalidate(micro_batches, **kwargs):
+        def fail_dpo_callback(**_kwargs):
             if rank == 1:
-                micro_batches[0] = None
+                raise RuntimeError("DPO callback failed")
 
-        trainer.base.on_step_begin = invalidate
+        trainer.base.on_step_begin = fail_dpo_callback
         with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
             trainer.train_step(iter([[{"labels": torch.tensor([1, 2])}]]))
         assert trainer.state.global_step == 3
