@@ -3086,10 +3086,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         return partial(get_position_id, Qwen3_5Model.get_rope_index, fake_model)  # noqa: F821
 
     def get_metadata_collate_func(self):
-        # collate_multimodal_metadata is a module-level helper (added via
-        # add_helper) — a bare function reference is picklable for the DataLoader
-        # workers; the Qwen3.5-VL ViT formula needs no model config.
-        return collate_multimodal_metadata  # noqa: F821 defined via add_helper
+        # The helper derives metadata from the batch without RNG or model state.
+        from veomni.data.data_collator import SerializablePureCollatorHook
+
+        return SerializablePureCollatorHook(collate_multimodal_metadata, "veomni:qwen3.5-metadata-v1")  # noqa: F821
 
 
 class Qwen3_5TextForSequenceClassification(GenericForSequenceClassification, Qwen3_5PreTrainedModel):
