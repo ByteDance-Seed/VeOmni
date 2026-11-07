@@ -97,6 +97,22 @@ def _external_data_contract(trainer):
     return contract
 
 
+def _loader_requests_exact_resume(loader):
+    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+    seen = set()
+    while loader is not None:
+        if id(loader) in seen:
+            raise RuntimeError("Cycle in dynamic data-loader wrappers")
+        seen.add(id(loader))
+        if getattr(loader, "_veomni_exact_resume_requested", False) is True:
+            return True
+        if type(loader) is not DynamicBatchSizeDataLoader:
+            return False
+        loader = loader._dataloader
+    return False
+
+
 def prepare_external_data_contract(trainer, state=None, *, install=False):
     """Coordinate rank-local provider errors before model checkpoint I/O.
 
@@ -113,6 +129,8 @@ def prepare_external_data_contract(trainer, state=None, *, install=False):
     contract, error = None, None
     try:
         contract = _external_data_contract(trainer)
+        if contract is None and _loader_requests_exact_resume(getattr(trainer, "train_dataloader", None)):
+            raise RuntimeError("The requested exact-data loader requires an exact-resume trainer integration")
         if contract is not None:
             checkpoints = _multi_optimizer_checkpoints(trainer)
             legacy, unknown = _legacy_optimizer_checkpoints(trainer)

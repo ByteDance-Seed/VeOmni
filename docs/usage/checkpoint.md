@@ -105,6 +105,11 @@ completed-step count as a live loader attribute before checkpoint callbacks.
 The integrating trainer must stop at its configured step limit before entering
 the next epoch, and treat a shared EOF before the planned epoch boundary as
 an error. Enabling the provider alone does not change a trainer's loop.
+If a loader explicitly requests exact resume without such a trainer integration,
+startup fails instead of silently using an ordinary data cursor.
+The request marker is `_veomni_exact_resume_requested is True`. The built-in
+dynamic wrapper is inspected for it; third-party wrappers must forward the
+request and provider attributes to the trainer.
 The provider must itself establish which sources,
 worker geometry, prefetch states and epoch boundaries it supports; enabling the
 protocol alone does not qualify an arbitrary external loader.
