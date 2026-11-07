@@ -131,6 +131,7 @@ design/rank_local_adamw_checkpoint_adapter.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/selective_expert_cpu_offload.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md

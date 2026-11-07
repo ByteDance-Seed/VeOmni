@@ -494,6 +494,8 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
+            if args.accelerator.fsdp_config.mixed_precision.npu_expert_fp32_wgrad:
+                raise ValueError("NPU expert FP32 wgrad is unsupported with custom model parallelization")
             parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
@@ -552,6 +554,8 @@ class VeOmniModelRuntime:
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
+            cpu_offload_extra_parallel_names=args.accelerator.fsdp_config.cpu_offload_extra_parallel_names,
+            cpu_offload_exclude_module_patterns=args.accelerator.fsdp_config.cpu_offload_exclude_module_patterns,
             broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
