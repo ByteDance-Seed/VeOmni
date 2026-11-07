@@ -34,11 +34,21 @@ Design notes, in case they are not obvious:
 * **Counts are accumulated in a forward hook and consumed once per optimizer
   step**, not once per micro-batch, so gradient accumulation sees the load of
   the whole step. This is the same placement torchtitan uses.
-* **The counts all-reduce over the group that holds distinct tokens.** Every
-  rank's router scores its own token slice, and the bias must stay identical
-  on all of them or they would route differently. Expert parallelism is not in
-  that group: EP shards the experts, not the tokens, so EP peers already see
-  the same routing decisions and summing over them would multiply the counts.
+* **The counts all-reduce over every rank holding a distinct token slice**,
+  which is ``fsdp_group``, the flattened ``dp_sp``
+  (``dp_replicate x dp_shard x cp x ulysses``). Sequence-parallel ranks belong
+  in it because ``slice_input_tensor`` gives each one a different slice of the
+  sequence, so their routers score different tokens. **Expert-parallel ranks
+  belong in it too**: the EP mesh is carved out of ``dp_shard_sp``, so EP peers
+  are already inside this group, and each of them holds its own micro-batch.
+  Tensor and pipeline parallelism are outside it, because TP peers score
+  identical tokens and PP stages hold disjoint routers.
+
+  Narrowing this group would be a silent correctness bug rather than a
+  performance tweak. FSDP2 synchronises no buffers at all, so the bias is kept
+  identical across ranks only by this reduce being global; a partial sum would
+  leave ranks with divergent biases, routing differently, forever, with
+  nothing raising.
 * **Update is sign-based**, as in the paper and in Megatron-LM and torchtitan:
   the bias moves by a fixed rate, not in proportion to the imbalance, which
   keeps it from reacting violently to one unusual step.
@@ -91,36 +101,57 @@ class ExpertBiasUpdater:
         if update_rate <= 0.0:
             raise ValueError(f"update_rate must be positive, got {update_rate}")
         self.update_rate = update_rate
-        self._counts: dict[int, torch.Tensor] = {}
-        self._routers: dict[int, nn.Module] = {}
+        self._routers: list[nn.Module] = []
+        self._seen: set[int] = set()
+        self._counts: Optional[torch.Tensor] = None
         self._handles: list[Any] = []
         self._enabled = True
 
     def attach(self, model: nn.Module) -> int:
-        """Hook every router that carries the bias buffer. Returns how many."""
+        """Hook every router that carries the bias buffer. Returns how many.
+
+        ``model.modules()`` yields a deterministic order that is the same on
+        every rank, since every rank builds the same model from the same
+        config, so the row each router owns in the counts tensor needs no
+        cross-rank agreement. Calling this twice is a no-op for routers already
+        hooked, so a second call cannot silently double-count.
+        """
         for module in model.modules():
             bias = getattr(module, BIAS_ATTR, None)
-            if not isinstance(bias, torch.Tensor):
+            if not isinstance(bias, torch.Tensor) or id(module) in self._seen:
                 continue
-            key = id(module)
-            self._routers[key] = module
-            self._handles.append(module.register_forward_hook(self._make_hook(key)))
+            index = len(self._routers)
+            self._seen.add(id(module))
+            self._routers.append(module)
+            self._handles.append(module.register_forward_hook(self._make_hook(index)))
+
+        if self._routers:
+            bias = getattr(self._routers[0], BIAS_ATTR)
+            # One row per router, allocated up front rather than on first use:
+            # a lazily built set of rows would differ between ranks whose
+            # micro-batches reached different layers, and step() issues one
+            # collective over the whole tensor.
+            self._counts = torch.zeros((len(self._routers), bias.numel()), dtype=torch.long, device=bias.device)
         return len(self._routers)
 
-    def _make_hook(self, key: int):
+    def _make_hook(self, index: int):
         def _hook(module: nn.Module, inputs, output):  # noqa: ANN001
-            if not self._enabled:
+            if not self._enabled or self._counts is None:
                 return
             indices = _topk_indices_from_output(output)
             if indices is None:
-                return
-            bias = getattr(module, BIAS_ATTR)
-            counts = self._counts.get(key)
-            if counts is None:
-                counts = torch.zeros(bias.numel(), dtype=torch.long, device=bias.device)
-                self._counts[key] = counts
-            flat = indices.detach().reshape(-1).to(counts.device)
-            counts.scatter_add_(0, flat, torch.ones_like(flat))
+                raise RuntimeError(
+                    f"{type(module).__name__} carries '{BIAS_ATTR}' but its forward did not return "
+                    "the (logits, weights, indices) tuple the bias update reads load from. "
+                    "Failing loudly rather than silently freezing the bias: a router that stops "
+                    "reporting its selection would leave load balancing switched off for the rest "
+                    "of the run with nothing to show for it. Update _topk_indices_from_output in "
+                    "veomni/utils/expert_bias.py for the new contract."
+                )
+            # scatter_add_ wants an int64 index and a src of the tensor's own
+            # dtype; a router returning int32 indices would otherwise raise.
+            flat = indices.detach().reshape(-1).to(device=self._counts.device, dtype=torch.long)
+            self._counts[index].scatter_add_(0, flat, torch.ones_like(flat))
 
         return _hook
 
@@ -128,25 +159,28 @@ class ExpertBiasUpdater:
     def step(self, group: Optional["ProcessGroup"] = None) -> None:
         """Update every router's bias from the load seen since the last call.
 
-        Must be called on every rank, because of the all-reduce. Routers that
-        saw no tokens this step are skipped rather than driven by an empty
-        count, which is what happens on a rank whose micro-batches did not
-        reach a given layer.
+        Every rank must call this, and each one issues exactly one collective
+        over the whole counts tensor however its own traffic fell out. A
+        per-router reduce skipped on empty counts would make the number of
+        collectives depend on local data, which deadlocks rather than erroring
+        as soon as any rank disagrees. A router that genuinely saw no tokens
+        contributes an all-zero row, whose sign is zero, so it is a no-op.
         """
-        for key, counts in self._counts.items():
-            if counts.sum() == 0:
-                continue
-            load = counts.to(torch.float32)
-            if group is not None and dist.is_initialized():
-                dist.all_reduce(load, op=dist.ReduceOp.SUM, group=group)
+        if self._counts is None:
+            return
 
-            bias = getattr(self._routers[key], BIAS_ATTR)
-            # Underloaded experts (below the mean) get a nudge up, overloaded
-            # ones a nudge down, by a fixed step. torch.sign gives 0 for an
-            # exactly-average expert, which correctly leaves it alone.
-            direction = torch.sign(load.mean() - load)
-            bias.add_(self.update_rate * direction.to(bias.dtype))
-            counts.zero_()
+        load = self._counts.to(torch.float32)
+        if group is not None and dist.is_initialized():
+            dist.all_reduce(load, op=dist.ReduceOp.SUM, group=group)
+
+        # Underloaded experts (below their layer's mean) get a nudge up,
+        # overloaded ones a nudge down, by a fixed step. torch.sign gives 0 for
+        # an exactly-average expert, which correctly leaves it alone.
+        direction = torch.sign(load.mean(dim=1, keepdim=True) - load)
+        for index, module in enumerate(self._routers):
+            bias = getattr(module, BIAS_ATTR)
+            bias.add_(self.update_rate * direction[index].to(bias.dtype))
+        self._counts.zero_()
 
     def disable(self) -> None:
         """Stop accumulating and release the hooks."""
@@ -154,5 +188,6 @@ class ExpertBiasUpdater:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        self._counts.clear()
         self._routers.clear()
+        self._seen.clear()
+        self._counts = None

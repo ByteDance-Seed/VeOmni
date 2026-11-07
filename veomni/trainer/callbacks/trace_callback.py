@@ -77,11 +77,17 @@ class ExpertBiasCallback(Callback):
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         if self.updater is None:
             return
-        # fsdp_group is the set of ranks holding distinct token slices, which is
-        # the sum the load has to be taken over. EP is deliberately excluded:
-        # it shards experts rather than tokens, so EP peers route identically
-        # and adding them would just scale every count by ep_size.
+        # fsdp_group is dp_sp: every rank holding a distinct token slice,
+        # sequence-parallel and expert-parallel ranks included. Both hold their
+        # own slice, so both belong in the sum. Narrowing it would leave ranks
+        # with divergent biases and divergent routing, since FSDP2 syncs no
+        # buffers; see the module docstring in veomni/utils/expert_bias.py.
         self.updater.step(group=self.parallel_state.fsdp_group)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is not None:
+            self.updater.disable()
+            self.updater = None
 
 
 class MoERouterMonitorCallback(Callback):

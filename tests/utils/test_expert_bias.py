@@ -14,12 +14,17 @@
 
 """Auxiliary-loss-free expert bias update. CPU only, no distributed setup."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.expert_bias import BIAS_ATTR, ExpertBiasUpdater
 
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 NUM_EXPERTS = 8
 TOP_K = 2
@@ -96,8 +101,8 @@ def test_bias_is_untouched_when_load_is_already_even():
     assert torch.all(getattr(model.routers[0], BIAS_ATTR) == 0)
 
 
-def test_repeated_steps_reduce_the_gap_between_experts():
-    """The point of the mechanism: a persistent imbalance is pushed back."""
+def test_updates_accumulate_in_one_direction():
+    """A persistent imbalance keeps pushing the bias the same way."""
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.05)
     updater.attach(model)
@@ -145,8 +150,13 @@ def test_step_without_traffic_is_a_noop():
     assert torch.all(getattr(model.routers[0], BIAS_ATTR) == 0)
 
 
-def test_unrecognised_router_output_is_ignored():
-    """An unknown output shape must not be guessed at."""
+def test_unrecognised_router_output_raises():
+    """A router carrying the buffer but breaking the output contract must fail loudly.
+
+    Silently skipping it would leave balancing switched off for the whole run
+    while training looked healthy, which is the failure this feature exists to
+    end rather than reproduce.
+    """
 
     class OddRouter(ToyRouter):
         def forward(self, hidden_states):
@@ -157,11 +167,8 @@ def test_unrecognised_router_output_is_ignored():
     updater = ExpertBiasUpdater(update_rate=0.1)
     assert updater.attach(model) == 1
 
-    model.gate.next_indices = torch.zeros(4, 1, dtype=torch.long)
-    model.gate(torch.zeros(4, 4))
-    updater.step()
-
-    assert torch.all(getattr(model.gate, BIAS_ATTR) == 0)
+    with pytest.raises(RuntimeError, match="did not return"):
+        model.gate(torch.zeros(4, 4))
 
 
 def test_disable_removes_hooks():
@@ -179,3 +186,54 @@ def test_disable_removes_hooks():
 def test_rejects_a_nonpositive_rate():
     with pytest.raises(ValueError):
         ExpertBiasUpdater(update_rate=0.0)
+
+
+def test_attach_is_idempotent():
+    """A second attach must not double-count through two hooks."""
+    model = ModelWithRouter()
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    assert updater.attach(model) == 1
+    assert updater.attach(model) == 1
+
+    indices = torch.zeros(8, 1, dtype=torch.long)
+    model.route(indices)
+    updater.step()
+
+    bias = getattr(model.routers[0], BIAS_ATTR)
+    assert bias[0] == pytest.approx(-0.1)
+
+
+def test_real_deepseek_router_satisfies_the_output_contract():
+    """Pin the assumption the whole module rests on, against the real router.
+
+    Every other test here uses a toy that returns the contract by construction,
+    so none of them would notice if DeepseekV3TopkRouter stopped returning
+    (logits, weights, indices) and balancing quietly stopped.
+    """
+    from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
+        DeepseekV3TopkRouter,
+    )
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2,
+        num_local_experts=NUM_EXPERTS,
+        hidden_size=16,
+        routed_scaling_factor=1.0,
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+    )
+    router = DeepseekV3TopkRouter(cfg)
+    torch.nn.init.normal_(router.weight, std=0.5)
+
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    assert updater.attach(router) == 1, "attach must find the real router by its buffer"
+
+    torch.manual_seed(0)
+    router(torch.randn(32, cfg.hidden_size))
+    updater.step()
+
+    bias = getattr(router, BIAS_ATTR)
+    assert torch.any(bias != 0), "the real router's output must drive the update"
+    # Sign-based, so every expert moved by exactly the rate or not at all.
+    assert torch.all((bias.abs() == pytest.approx(0.1)) | (bias == 0))

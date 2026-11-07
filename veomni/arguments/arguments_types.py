@@ -1274,6 +1274,15 @@ class TrainingArguments:
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
 
+        if self.moe_router_bias_update_rate < 0.0:
+            # Caught here rather than in the callback, which treats anything
+            # non-positive as "disabled": a typo would otherwise switch
+            # balancing off silently on every rank.
+            raise ValueError(
+                f"moe_router_bias_update_rate must be >= 0, got {self.moe_router_bias_update_rate}. "
+                "Use 0 to disable the auxiliary-loss-free bias update."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
