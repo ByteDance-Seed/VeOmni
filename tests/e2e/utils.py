@@ -124,13 +124,13 @@ def parallel_launches(
     min_sp_size: int | None = None,
 ):
     full_8gpu = bool(is_moe and model_name in _FULL_8GPU_MOE_MODELS)
-    # Non-EP Quack and EP grouped GEMM use distinct autograd implementations.
-    full_matrix = full_8gpu or model_name == "gpt_oss"
-    modes = (
-        _moe_model_modes(full_matrix=full_matrix, max_sp_size=max_sp_size, max_ep_size=max_ep_size)
-        if is_moe
-        else _base_model_modes()
-    )
+    if is_moe and model_name == "gpt_oss":
+        # Keep a baseline and change SP, then EP, for the dedicated Quack variant.
+        modes = [ParallelMode(1, 1), ParallelMode(2, 1), ParallelMode(2, 2)]
+    elif is_moe:
+        modes = _moe_model_modes(full_matrix=full_8gpu, max_sp_size=max_sp_size, max_ep_size=max_ep_size)
+    else:
+        modes = _base_model_modes()
     return [
         (mode, LaunchSpec(nproc=(mode.sp_size * 4) if full_8gpu else 4))
         for mode in modes

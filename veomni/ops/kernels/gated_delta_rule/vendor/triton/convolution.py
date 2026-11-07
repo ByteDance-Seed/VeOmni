@@ -541,6 +541,11 @@ def causal_conv1d_fwd_impl(
     else:
         BD = 256
         BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+    # Headwise sequence parallelism can yield 640 channels (Qwen4-Exp
+    # U8CP2: (2 * 16 + 48) * 128 / 16). Retain full channel tiles while
+    # shrinking within the existing UB budget and 32-channel alignment.
+    while BD > 32 and D % BD != 0:
+        BD //= 2
     if D % BD != 0:
         raise ValueError("D must be divisible by BD.")
     NUM_BLKS_D = triton.cdiv(D, BD)

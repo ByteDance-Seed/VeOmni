@@ -8,6 +8,7 @@ from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from tests.seed_omni.modules.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
+from veomni.arguments import OpsImplementationConfig
 from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.checkpoint_conversion import (
@@ -206,7 +207,7 @@ def test_bagel_siglip_navit_selects_module_level_ops_and_forwards() -> None:
     )
     model = BagelSiglipNavit(cfg).eval()
     attn = model.vision_model.encoder.layers[0].self_attn
-    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_attn.impl == OpsImplementationConfig.normalize_attention_backend("sdpa")
     assert attn.veomni_rope.impl == "eager"
 
     packed_patches = torch.randn(4, 3 * 14 * 14)

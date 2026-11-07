@@ -131,6 +131,7 @@ seed_omni/models/bagel.md
 
 design/ci_case_scheduling.md
 design/op_selection.md
+design/module_config.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md

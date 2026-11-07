@@ -27,9 +27,9 @@ import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.configuration_base import get_veomni_config_class
 from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 from veomni.ops import resolve_op
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.import_utils import is_package_available
 
 
@@ -180,7 +180,8 @@ def bench_layer(
         causal_conv1d_implementation="fla",
         chunk_gated_delta_rule_implementation="flash_qla",
     )
-    config = Qwen3_5TextConfig(
+    config_class = get_veomni_config_class(Qwen3_5TextConfig)
+    config = config_class(
         hidden_size=hidden_size,
         intermediate_size=hidden_size * 2,
         num_hidden_layers=1,
@@ -190,13 +191,9 @@ def bench_layer(
         linear_key_head_dim=head_dim,
         linear_value_head_dim=head_dim,
         linear_conv_kernel_dim=4,
+        ops_implementation=ops_cfg,
     )
-    prev_cfg = get_ops_config()
-    set_ops_config(ops_cfg)
-    try:
-        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device="cuda", dtype=torch.bfloat16)
-    finally:
-        set_ops_config(prev_cfg)
+    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device="cuda", dtype=torch.bfloat16)
 
     seq_len = total_tokens // num_seqs
     cu_seqlens = torch.arange(0, (num_seqs + 1) * seq_len, seq_len, device="cuda", dtype=torch.int32)

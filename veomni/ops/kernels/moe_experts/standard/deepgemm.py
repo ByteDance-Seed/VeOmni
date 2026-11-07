@@ -4,8 +4,8 @@
 """Hopper/Blackwell DeepGEMM FP8 routed experts, including training backward.
 
 The public tensor contract is the standard BF16 MoE interface. EP communication,
-routing and activations retain their existing precision. No FP8 parameter
-all-gather, persistent quantized parameters or Transformer Engine is involved.
+routing and activations retain their existing precision. FSDP may supply
+block-quantized expert weights directly through its optional FP8 all-gather.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
 def _ep_forward(
     x, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit, recompute_weights=(True, True)
 ):
+    """Dispatch tokens across EP ranks, run FP8 local experts, and combine outputs."""
     from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 
     ep_group = get_parallel_state().ep_group
@@ -49,7 +50,7 @@ def _ep_forward(
     # The expert autograd nodes own their compact saved operands. Dispatch
     # inputs need not overlap the combine's permutation and FP32 accumulation.
     del tokens
-    combined = tokens_post_all2all(
+    return tokens_post_all2all(
         outputs,
         routing_weights,
         selected_experts,
@@ -62,9 +63,6 @@ def _ep_forward(
         original_shape,
         ep_group,
     )
-    # FP32 router weights promote the shared combine's accumulator. The public
-    # expert contract still returns the hidden dtype, on EP as well as non-EP.
-    return combined.to(x.dtype)
 
 
 def wrapper(

@@ -803,13 +803,15 @@ def test_quack_split_and_merged_match_eager(swiglu_limit: float | None):
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="gpt_oss quack needs SM90+")
-def test_gpt_oss_quack_matches_eager():
+@pytest.mark.parametrize("routing_dtype", (torch.bfloat16, torch.float32))
+def test_gpt_oss_quack_matches_eager(routing_dtype: torch.dtype):
+    """GPT-OSS Quack fused MoE matches eager forward and backward across routing dtypes."""
     torch.manual_seed(3)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = 16, 4, 32, 16, 2
     hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-    routing, selected = _route(num_tokens, num_experts, top_k, device, dtype)
+    routing, selected = _route(num_tokens, num_experts, top_k, device, routing_dtype)
     gate_up = 0.1 * torch.randn(num_experts, hidden_dim, 2 * ffn_dim, device=device, dtype=dtype)
     gate_up_b = 0.1 * torch.randn(num_experts, 2 * ffn_dim, device=device, dtype=dtype)
     down = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.seed_omni.modules import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
@@ -75,7 +76,7 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
         temporal_patch_size=2,
         in_channels=3,
     )
-    enc = Enc(Cfg(vision_config=vc)).eval()
+    enc = Enc(Cfg(vision_config=vc, ops_implementation=make_eager_ops_config())).eval()
 
     g = [1, 4, 4]  # two dummy placeholders
     pixel_values = torch.zeros(2 * 1 * 4 * 4, 3 * 2 * 16 * 16)

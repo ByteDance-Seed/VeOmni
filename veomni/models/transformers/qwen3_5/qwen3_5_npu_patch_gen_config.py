@@ -42,7 +42,9 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     compute_mtp_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_attention_bind_ops,
     qwen3_5_attention_forward_patched,
+    qwen3_5_decoder_layer_init_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forcausallm_init_patched,
     qwen3_5_forconditional_generation_forward_patched,
@@ -59,6 +61,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_init_patched,
     qwen3_5_rmsnorm_forward_patched,
     qwen3_5_rmsnorm_init_patched,
+    qwen3_5_text_model_init_patched,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -80,6 +83,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
@@ -109,10 +116,6 @@ config.add_import(
 )  # noqa: F401
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.attention_utils",
     names=["prepare_dense_attention_inputs"],
@@ -193,6 +196,16 @@ config.override_method(
     "Qwen3_5MLP.forward",
     replacement=qwen3_5_mlp_forward_patched,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.override_method(
+    "Qwen3_5DecoderLayer.__init__",
+    replacement=qwen3_5_decoder_layer_init_patched,
+    description="Pass config to Qwen3_5RMSNorm instances",
+)
+config.override_method(
+    "Qwen3_5TextModel.__init__",
+    replacement=qwen3_5_text_model_init_patched,
+    description="Pass config to final Qwen3_5RMSNorm",
 )
 
 
@@ -932,6 +945,11 @@ config.override_method(
         "the per-block host sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D device tensors."
     ),
+)
+config.override_method(
+    "Qwen3_5Attention.__init__",
+    replacement=qwen3_5_attention_bind_ops,
+    description="Pass config to Qwen3_5RMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3_5Attention.forward",

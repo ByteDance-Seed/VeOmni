@@ -21,6 +21,12 @@ class Qwen3TextEncoderPreprocessor(TextEncoderPreprocessor):
         *,
         config_overrides: dict[str, Any] | None = None,
     ) -> TextEncoderChatTemplate:
+        """Pick the image-aware template when the module config says so.
+
+        ``config_overrides`` mirrors the module's YAML ``model_config:`` block, so
+        a worker built independently of the live model still selects the template
+        that model was configured with.
+        """
         config = Qwen3TextEncoderConfig.from_pretrained(module_path, **(config_overrides or {}))
         tokenizer = build_tokenizer(module_path)
         return Qwen3VLChatTemplate(tokenizer) if config.enable_image else Qwen3ChatTemplate(tokenizer)

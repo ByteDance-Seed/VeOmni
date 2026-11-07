@@ -275,14 +275,11 @@ def _materialize_toy_dit_weights(target_dir: str) -> None:
     entirely: the weights are loaded instead of randomly initialized. Building
     the same model directly (no meta device, no FSDP) does not hit the issue.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.auto import build_foundation_model
 
-    # Wan's ``rope_apply`` has a non-standard signature, so its device patch
-    # explicitly disables the liger RoPE backend. The framework default for
-    # ``rotary_pos_emb_implementation`` is ``liger_kernel``, which would raise
-    # here; every Wan YAML pins ``eager`` for the same reason.
-    ops = OpsImplementationConfig(rotary_pos_emb_implementation="eager")
+    # This asset is materialized in FP32 on CPU before the accelerator trainer starts.
+    ops = make_eager_ops_config(attn_implementation="sdpa")
     model = build_foundation_model(
         config_path="tests/toy_config/wan_t2v_toy/config.json",
         weights_path=None,
@@ -426,3 +423,25 @@ def test_dit_resume_continues_noise_and_timestep_stream():
 
 if __name__ == "__main__":
     main()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_materialize_toy_dit_weights_uses_portable_ops(tmp_path, monkeypatch):
+    from safetensors.torch import load_file
+
+    from veomni.models import build_config
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("CPU checkpoint preparation must not preload FlashAttention")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    _materialize_toy_dit_weights(str(tmp_path))
+    config = build_config(str(tmp_path))
+    assert config.ops_config.attn_implementation == "veomni_sdpa"
+    shards = list(tmp_path.glob("*.safetensors"))
+    assert shards
+    for shard in shards:
+        weights = load_file(shard)
+        assert weights
+        assert all(tensor.device.type == "cpu" and torch.isfinite(tensor).all() for tensor in weights.values())

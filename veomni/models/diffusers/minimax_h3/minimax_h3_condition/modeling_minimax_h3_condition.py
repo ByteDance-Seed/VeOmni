@@ -17,7 +17,8 @@ from collections import OrderedDict
 from typing import Any
 
 import torch
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .....utils import logging
 from ..minimax_h3_core.cfg_conditioning import (
@@ -43,6 +44,10 @@ _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
 
     def __init__(self, config: MiniMaxH3ConditionModelConfig, **kwargs):
         super().__init__(config)
@@ -70,8 +75,10 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         from ._module_utils import init_empty_weights
 
         with init_empty_weights():
-            self._text_encoder = MiniMaxH3TextEncoder(num_retained_layers=config.text_encoder_num_retained_layers)
-            self._video_vae = MiniMaxH3VideoVAE()
+            self._text_encoder = MiniMaxH3TextEncoder(
+                num_retained_layers=config.text_encoder_num_retained_layers, config=config
+            )
+            self._video_vae = MiniMaxH3VideoVAE(config=config)
             self._audio_vae = MiniMaxH3AudioVAE()
 
         # Processor / tokenizer

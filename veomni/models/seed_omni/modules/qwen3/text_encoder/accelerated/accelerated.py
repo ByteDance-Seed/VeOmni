@@ -1,9 +1,9 @@
 """VeOmni-accelerated Qwen3TextEncoder — training graph hooks.
 
-FSM ``generate`` now lives natively on :class:`~.modeling.Qwen3TextEncoder`;
-this file only owns the SP-aware training pre/forward/post hooks plus the
-image-mode vision-token freeze and its row-wise weight decay (all genuinely
-accelerated-only).
+FSM ``generate`` lives natively on :class:`~.modeling.Qwen3TextEncoder`;
+this file owns the SP-aware training pre/forward/post hooks, the ChatML
+template binding, and the image-mode vision-token freeze with its row-wise
+weight decay.
 """
 
 from typing import Any, Dict, Optional
@@ -33,6 +33,7 @@ class TrainingMixin(BaseTrainingMixin):
     device: torch.device
     dtype: torch.dtype
     _tokenizer: Any
+    _chat_template: Any
     embed_tokens: ShardedEmbedding
     _trainable_row_mask: Optional[torch.Tensor]
 
@@ -65,6 +66,7 @@ class TrainingMixin(BaseTrainingMixin):
         return super().decode_post(**outputs)
 
     def freeze_model(self) -> None:
+        """In image mode, train only the vision special-token embedding rows."""
         if not self._enable_image:
             return  # fully trainable (default text-only behaviour)
         # The user can't know the vision special-token ids, but the module can:
@@ -136,7 +138,9 @@ class TrainingMixin(BaseTrainingMixin):
             local_rows = local_shape[0]
         rows = self._trainable_row_mask[start : start + local_rows].nonzero().flatten()
         self._decayed_rows = rows.to(weight.device)
-        self._decayed_weight = weight
+        # Plain attribute assignment would register the Parameter again and leak
+        # a duplicate ``_decayed_weight`` key into ``state_dict()``.
+        self.__dict__["_decayed_weight"] = weight
         optimizer.register_step_pre_hook(self._decay_trainable_rows)
 
     def _decay_trainable_rows(self, optimizer: torch.optim.Optimizer, args: tuple, kwargs: dict) -> None:

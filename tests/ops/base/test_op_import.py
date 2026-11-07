@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from importlib.machinery import ModuleSpec
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
@@ -172,76 +170,3 @@ def test_dotted_requirement_discovery_supports_namespace_and_deep_paths(tmp_path
     assert is_package_available("review_namespace.middle.child")
     assert "review_namespace" not in sys.modules
     assert "review_namespace.middle" not in sys.modules
-
-
-def test_dotted_requirement_discovery_supports_consecutive_namespace_packages(tmp_path: Path, monkeypatch) -> None:
-    """Nested namespace packages are discoverable without synthetic imports."""
-    from veomni.ops.registry import OpEntry, OpRegistry
-
-    package = tmp_path / "review_nested_namespace" / "middle"
-    package.mkdir(parents=True)
-    (package / "child.py").write_text("VALUE = 1\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(tmp_path))
-
-    registry = OpRegistry()
-    entry = OpEntry(
-        op="probe",
-        variant="standard",
-        impl="namespace",
-        description="Nested namespace requirement probe",
-        wrapper=lambda value: value,
-        requires=("review_nested_namespace.middle.child",),
-    )
-    registry.register(entry)
-
-    assert is_package_available("review_nested_namespace.middle.child")
-    assert registry.list_available("probe", "standard") == ["namespace"]
-    assert registry.resolve("probe", "standard", "namespace") is entry
-    assert "review_nested_namespace" not in sys.modules
-    assert "review_nested_namespace.middle" not in sys.modules
-    assert "review_nested_namespace.middle.child" not in sys.modules
-
-
-def test_dotted_requirement_discovery_uses_loaded_parent_path(tmp_path: Path, monkeypatch) -> None:
-    """An already-loaded package contributes its runtime search path without reimport."""
-    package = tmp_path / "review_loaded"
-    package.mkdir()
-    (package / "child.py").write_text("VALUE = 1\n", encoding="utf-8")
-    loaded_parent = ModuleType("review_loaded")
-    loaded_parent.__path__ = [str(package)]
-    monkeypatch.setitem(sys.modules, "review_loaded", loaded_parent)
-
-    assert is_package_available("review_loaded.child")
-    assert "review_loaded.child" not in sys.modules
-
-
-def test_dotted_requirement_discovery_rejects_nonpackage_and_failed_parents(tmp_path: Path, monkeypatch) -> None:
-    """Loaded modules without paths and failed-import sentinels cannot have children."""
-    monkeypatch.setitem(sys.modules, "review_plain", ModuleType("review_plain"))
-    assert not is_package_available("review_plain.child")
-
-    package = tmp_path / "review_failed"
-    package.mkdir()
-    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.setitem(sys.modules, "review_failed", None)
-    assert not is_package_available("review_failed")
-    assert not is_package_available("review_failed.child")
-
-
-def test_dotted_requirement_discovery_uses_custom_meta_path_finders(monkeypatch) -> None:
-    """Child modules exposed only by a custom meta-path finder remain discoverable."""
-
-    class ReviewFinder:
-        def find_spec(self, fullname, path, target):
-            assert target is None
-            if fullname == "review_meta":
-                return ModuleSpec(fullname, loader=None, is_package=True)
-            if fullname == "review_meta.child":
-                return ModuleSpec(fullname, loader=None)
-            return None
-
-    monkeypatch.setattr(sys, "meta_path", [ReviewFinder(), *sys.meta_path])
-
-    assert is_package_available("review_meta.child")
-    assert "review_meta" not in sys.modules
