@@ -841,7 +841,15 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    allow_hybrid_cp: bool = field(
+        default=False,
+        metadata={"help": "Opt in to model-qualified combined Ulysses/CP; currently Qwen4-Exp only."},
+    )
+
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
+
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
@@ -886,7 +894,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
