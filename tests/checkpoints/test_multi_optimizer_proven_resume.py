@@ -612,7 +612,7 @@ def _inventory_reader_failure_worker(rank, checkpoint, rank_local, endpoint):
             if rank == 1
             else (
                 RuntimeError,
-                "reading MultiOptimizer scheduler checkpoint failed on another rank",
+                "constructing optimizer inventory reader failed on another rank",
             )
         )
         with pytest.raises(expected[0], match=expected[1]):
