@@ -634,6 +634,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._just_resumed = False
         self._sampling_initialized = False
         self._resume_epoch_unknown = False
+        self._pending_epoch = None
 
     @property
     def output_index_for_resume(self) -> bool:
@@ -711,6 +712,13 @@ class WeightedMultiSourceDataset(IterableDataset):
             set_epoch_fn = getattr(dataset, "set_epoch", None)
             if callable(set_epoch_fn):
                 set_epoch_fn(epoch)
+        # StatefulDataLoader may restore the dataset only when its iterator is
+        # constructed, after the trainer has supplied the current epoch.
+        self._pending_epoch = epoch
+
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        """Supply a legacy checkpoint's missing epoch without resetting any source."""
+        self._pending_epoch = epoch
 
     def __iter__(self):
         """Iterate and yield samples from multiple sources.
@@ -720,6 +728,7 @@ class WeightedMultiSourceDataset(IterableDataset):
             If ``output_index_for_resume`` is True, yields
             ``(sample, (source_id, output_index))``.
         """
+        self._pending_epoch = None
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         if not self._just_resumed:
@@ -978,10 +987,13 @@ class WeightedMultiSourceDataset(IterableDataset):
         else:
             self._exhausted = [False for _ in range(self._ds_num)]
 
-        self._epoch = runtime.get("epoch", self._epoch)
+        epoch_supplied = self._pending_epoch is not None
+        fallback_epoch = self._pending_epoch if epoch_supplied else self._epoch
+        self._epoch = runtime.get("epoch", fallback_epoch)
         self._sampling_initialized = initialized
         self._just_resumed = initialized
-        self._resume_epoch_unknown = "epoch" not in runtime
+        self._resume_epoch_unknown = "epoch" not in runtime and not epoch_supplied
+        self._pending_epoch = None
 
 
 class _MapStyleSamplerWrapper(IterableDataset):
@@ -1555,6 +1567,11 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
 
         self._just_resumed = True
+
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        prepare = getattr(self.dataset, "prepare_resume_epoch", None)
+        if callable(prepare):
+            prepare(epoch)
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the upstream dataset.

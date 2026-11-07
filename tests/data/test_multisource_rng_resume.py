@@ -9,7 +9,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_loader import DistributedDataloader
-from veomni.data.dataset import WeightedMultiSourceDataset
+from veomni.data.dataset import DynamicBatchingSizeDataset, WeightedMultiSourceDataset
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 from veomni.trainer.base import VeOmniIter
 
@@ -151,6 +151,127 @@ def test_legacy_checkpoint_keeps_existing_started_iterator_behavior():
     assert (actual["id"], actual["ds_idx"]) == (expected["id"], expected["ds_idx"])
 
 
+@pytest.mark.parametrize("worker_batching", [False, True])
+@pytest.mark.parametrize("epoch", [0, 2])
+def test_legacy_loader_resume_after_epoch_set_survives_next_epoch(worker_batching, epoch):
+    def make_loader():
+        dataset = make_dataset(seed=5)
+        if worker_batching:
+            dataset = DynamicBatchingSizeDataset(
+                dataset,
+                micro_batch_seq_length=1,
+                ready_for_micro_batch_threshold=1,
+                dynamic_batching_collate_fn=list,
+                save_by_idx=False,
+                get_length_fn=sample_length,
+                get_physical_length_fn=sample_length,
+            )
+        return DistributedDataloader(dataset, batch_size=None, num_workers=0)
+
+    original = make_loader()
+    original.set_epoch(epoch)
+    active = iter(original)
+    for _ in range(4):
+        next(active)
+    state = copy.deepcopy(original.state_dict())
+    dataset_state = state["dataset_state"]
+    if worker_batching:
+        dataset_state = dataset_state["dynamic_batch_upstream_dataset_state"]
+    dataset_state["runtime"].pop("epoch")
+    dataset_state["runtime"].pop("sampling_initialized")
+    expected = [next(active) for _ in range(4)]
+
+    resumed = make_loader()
+    resumed.load_state_dict(state)
+    resumed.set_epoch(epoch)
+    restored = iter(resumed)
+    assert [next(restored) for _ in range(4)] == expected
+    saved_again = copy.deepcopy(resumed.state_dict())["dataset_state"]
+    if worker_batching:
+        saved_again = saved_again["dynamic_batch_upstream_dataset_state"]
+    assert saved_again["runtime"]["epoch"] == epoch
+
+    resumed.set_epoch(epoch + 1)
+    fresh = make_loader()
+    fresh.set_epoch(epoch + 1)
+    next_epoch, expected_epoch = iter(resumed), iter(fresh)
+    assert [next(next_epoch) for _ in range(8)] == [next(expected_epoch) for _ in range(8)]
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, monkeypatch, tmp_path):
+    from veomni.trainer.callbacks import base as callback_base
+    from veomni.trainer.callbacks import global_state_callback as callback_module
+
+    def make_loader():
+        source = DistributedDataloader(make_dataset(seed=5), batch_size=None, num_workers=workers)
+        strategy = TextBatchingStrategy(token_micro_bsz=1, buffer_size=1, get_length_fn=sample_length)
+        return DynamicBatchSizeDataLoader(source, strategy, length=40)
+
+    def sampling_states(value):
+        if isinstance(value, dict):
+            if "topology" in value and "runtime" in value and "dataset_states" in value["runtime"]:
+                yield value["runtime"]
+            for item in value.values():
+                yield from sampling_states(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                yield from sampling_states(item)
+
+    original, resumed, fresh = make_loader(), make_loader(), make_loader()
+    try:
+        original.set_epoch(2)
+        active = iter(original)
+        rows(active, 6)
+        state = copy.deepcopy(original.state_dict())
+        legacy_states = list(sampling_states(state["dataloader_state"]))
+        assert len(legacy_states) == max(workers, 1)
+        for runtime in legacy_states:
+            runtime.pop("epoch")
+            runtime.pop("sampling_initialized")
+        expected = rows(active, 4)
+        saved_rng = torch.get_rng_state().clone()
+
+        checkpoint = SimpleNamespace(
+            save_steps=0,
+            save_epochs=0,
+            save_hf_weights=False,
+            hf_save_steps=0,
+            hf_save_epochs=0,
+            load_path=str(tmp_path),
+        )
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(train=SimpleNamespace(checkpoint=checkpoint, global_rank=0), train_steps=40),
+            train_dataloader=resumed,
+            state=SimpleNamespace(global_step=0),
+        )
+        monkeypatch.setattr(callback_base, "get_parallel_state", lambda: SimpleNamespace())
+        monkeypatch.setattr(callback_module, "set_device_rng_state", lambda _state: None)
+        callback = callback_module.GlobalStateCallback(trainer)
+        callback._read_current = lambda _path: {
+            "global_step": 86,
+            "train_dataloader": state,
+            "torch_rng_state": saved_rng,
+        }
+        callback.load_global_state()
+        assert trainer.start_epoch == 2 and trainer.start_step == 6
+        assert torch.equal(torch.get_rng_state(), saved_rng)
+        resumed.set_epoch(2)
+        assert rows(iter(resumed), 4) == expected
+        resaved = list(sampling_states(resumed.state_dict()["dataloader_state"]))
+        assert len(resaved) == len(legacy_states)
+        assert all(runtime["epoch"] == 2 for runtime in resaved)
+
+        resumed.set_epoch(3)
+        fresh.set_epoch(3)
+        assert rows(iter(resumed), 8) == rows(iter(fresh), 8)
+    finally:
+        for loader in (original, resumed, fresh):
+            iterator = getattr(loader._dataloader, "_iterator", None)
+            if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+                iterator._shutdown_workers()
+
+
 def direct_rows(iterator, count):
     return [(sample["id"], sample["ds_idx"]) for sample in (next(iterator) for _ in range(count))]
 
@@ -245,6 +366,19 @@ def test_legacy_consumption_without_epoch_remains_resumable_but_rejects_late_epo
     resumed.load_state_dict(saved_again)
     resumed.set_epoch(2)
     assert direct_rows(iter(resumed), 8) == direct_rows(iterator, 8)
+
+
+def test_legacy_restore_does_not_reuse_an_epoch_from_before_sampling():
+    source = make_dataset(seed=5)
+    source.set_epoch(2)
+    direct_rows(iter(source), 4)
+    state = copy.deepcopy(source.state_dict())
+    state["runtime"].pop("epoch")
+    state["runtime"].pop("sampling_initialized")
+    source.load_state_dict(state)
+    direct_rows(iter(source), 1)
+    with pytest.raises(ValueError, match="needs its epoch before sampling"):
+        source.set_epoch(3)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 5, 29])

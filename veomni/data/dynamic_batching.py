@@ -668,6 +668,11 @@ class DynamicBatchSizeDataLoader:
         self._data_iter = iter(self._dataloader)
         self._batch_data_iter = self.batch_data_generator()
 
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        prepare = getattr(self._dataloader, "prepare_resume_epoch", None)
+        if callable(prepare):
+            prepare(epoch)
+
     def set_epoch(self, epoch: int) -> None:
         if hasattr(self._dataloader, "set_epoch"):
             self._dataloader.set_epoch(epoch)

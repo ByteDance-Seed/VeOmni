@@ -812,6 +812,9 @@ class GlobalStateCallback(Callback):
                 if sft_next_epoch:
                     self.trainer.train_dataloader.load_sft_next_epoch_buffer(prepared_sft_buffer)
                 else:
+                    prepare_epoch = getattr(self.trainer.train_dataloader, "prepare_resume_epoch", None)
+                    if self.trainer.start_step != 0 and callable(prepare_epoch):
+                        prepare_epoch(self.trainer.start_epoch)
                     self.trainer.train_dataloader.load_state_dict(cursor)
         except BaseException as exc:
             if not coordinated_resume:
@@ -819,7 +822,6 @@ class GlobalStateCallback(Callback):
             restore_error = exc
         if coordinated_resume:
             raise_if_any_rank_failed(restore_error, "restoring the training data cursor", group=default_group)
-
         # OmniTrainer checkpoints written before it had a meter store None here.
         restore_local(
             lambda: self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
