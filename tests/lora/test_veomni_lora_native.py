@@ -73,6 +73,15 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
                     lin.weight.normal_(0.0, 0.02)
 
 
+def test_adapter_export_rejects_trainable_base_before_writing(tmp_path):
+    model = VeOmniLoraModel(Toy(), _base_config())
+    model.get_base_model().lin3.weight.requires_grad_(True)
+    path = tmp_path / "adapter"
+    with pytest.raises(ValueError, match="Adapter-only export would omit trainable parameters.*lin3"):
+        model.save_pretrained(str(path))
+    assert not path.exists()
+
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
