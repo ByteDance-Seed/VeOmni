@@ -48,8 +48,12 @@ is not supported and is rejected.
 Distributed training also coordinates loader and validation failures before
 forward: this standalone path adds one small world all-reduce per SFT step and
 two per DPO step. Measure the effect on the target interconnect; the stacked
-padding-safe path can reuse its existing preflight instead. Until the
-padding-safe trainer is combined, synthetic padding is rejected before forward.
+padding-safe path can reuse its existing preflight instead. In single-process
+SFT, marked padding is excluded from the loss and metrics, and its model
+forward/backward is skipped. Distributed loaders must not inject padded
+micro-batches. Distributed main-process dynamic batching requires
+`drop_last=True` until tail step counts can be coordinated. DPO, Omni and DiT
+reject marked padding.
 
 ## Image Resolution Control
 
