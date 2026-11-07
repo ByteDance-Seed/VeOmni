@@ -160,7 +160,13 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        step_root, path_error = None, None
+        try:
+            step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        except BaseException as exc:
+            path_error = exc
+        raise_if_any_rank_failed(path_error, "preparing the trainer checkpoint path")
+        assert step_root is not None
 
         # A restarted run reaching this step again overwrites the cursor files, so
         # the manifest an earlier attempt left has to go before the first of them
