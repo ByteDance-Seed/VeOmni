@@ -467,6 +467,8 @@ class BaseTrainer(Stateful, ABC):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
+        if dataloader_type == "native":
+            dataloader_kwargs["resume_replay_timeout_seconds"] = args.data.resume_replay_timeout_seconds
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,

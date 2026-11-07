@@ -415,7 +415,7 @@ def test_state_dict_structure():
         source_ids=["id_a", "id_b"],
     )
     state = dataset.state_dict()
-    assert state["version"] == 0
+    assert state["version"] == 1
     assert state["topology"]["source_ids"] == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_sum"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_count"].keys()) == ["id_a", "id_b"]
@@ -448,7 +448,9 @@ def test_exhausted_state_save_restore_and_elastic():
         stopping_strategy="all_exhausted",
         source_ids=["id_a", "id_b"],
     )
-    dataset_new.load_state_dict(state)
+    # The mock does not attest source identity; this tests explicit non-exact
+    # migration rather than the strict continuation contract.
+    dataset_new.load_state_dict(state, reconcile_policy="allow_add_remove")
     assert dataset_new._exhausted == [True, False]
 
     # Scenario 2: Add a new source - new source should default to False
@@ -499,7 +501,8 @@ def test_exhausted_state_backward_compatible():
         },
     }
 
-    dataset.load_state_dict(old_state)
+    # A caller may explicitly migrate old metadata without claiming exact order.
+    dataset.load_state_dict(old_state, reconcile_policy="allow_add_remove")
     assert dataset._exhausted == [False, False]
 
 

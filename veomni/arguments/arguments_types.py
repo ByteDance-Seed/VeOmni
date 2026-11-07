@@ -2182,8 +2182,19 @@ class DataArguments:
         default=False,
         metadata={
             "help": (
-                "Attest that input decoding, preprocessing and collation are deterministic and do not consume "
-                "untracked worker RNG state."
+                "Attest that input decoding, preprocessing, tokenization and collation are deterministic and "
+                "semantically stateless: they neither depend on untracked mutable state nor consume untracked "
+                "worker RNG state. The input contract must identify the immutable data snapshot."
+            )
+        },
+    )
+    resume_replay_timeout_seconds: int = field(
+        default=7200,
+        metadata={
+            "help": (
+                "Timeout in seconds for each worker response during exact streaming replay. Rank coordination "
+                "uses (num_workers + 1) times this value plus 30 seconds. Replay can reread all source rows "
+                "consumed in the saved epoch."
             )
         },
     )
@@ -2231,6 +2242,8 @@ class DataArguments:
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
 
     def __post_init__(self):
+        if type(self.resume_replay_timeout_seconds) is not int or self.resume_replay_timeout_seconds <= 0:
+            raise ValueError("resume_replay_timeout_seconds must be a positive integer")
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:

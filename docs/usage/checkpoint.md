@@ -51,15 +51,17 @@ or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
 
 For main-process dynamic batching in the text and VLM trainers, exact resume
-requires a native mapping dataset with an unchanged dataset fingerprint, the
-native stateful and batch samplers, snapshots at every source step, no custom
-data-loader generator, in-order workers and disabled background prefetch.
+requires either a native mapping dataset with an unchanged dataset fingerprint
+and native stateful and batch samplers, or an attested replayable weighted
+multi-source dataset as described below. Both require snapshots at every source
+step, no custom data-loader generator, in-order workers and disabled background prefetch.
 The checkpoint records the data/worker geometry, epoch length, source settings
 and input-parallel settings. A changed or missing cursor, geometry, source
-fingerprint or RNG state is rejected. Worker-mode batching and custom or
+fingerprint or RNG state is rejected. Worker-mode batching and custom or other
 iterable sources use separate paths and are not qualified by this contract.
-Fixed-batch, worker-mode, custom and iterable sources retain their legacy cursor
-behavior, which does not establish exact continuation. MultiOptimizer recovery
+Fixed-batch, worker-mode, custom and other iterable sources do not establish an
+exact continuation guarantee; weighted loaders still enforce their provenance
+and compatibility checks when restoring a cursor. MultiOptimizer recovery
 continues to validate the optimizer generation and warns when the loader has no
 verified exact data-resume contract. A cursor saved under the strict dynamic
 contract cannot be restored through a different data path.
@@ -80,14 +82,40 @@ hash that VeOmni independently computes from those inputs. It must identify a
 trusted manifest covering those components and their code/configuration. The
 same digest and settings are required on resume. A missing contract emits a
 startup warning; training and export can proceed, but dynamic SFT trainer-state
-resume is rejected because its cursor cannot be proven exact. To start a new
+resume is rejected because its cursor cannot be proven exact. This also applies
+to weighted multi-source SFT: set the attestations before training if its
+trainer-state checkpoint must be exactly resumable. To start a new
 data stream, load the model weights as a new run instead of resuming its trainer
 state. Other trainer paths keep their existing resume contracts, including
 their own strict optimizer and data-codec checks where applicable.
 
-At a completed SFT epoch, nonpersistent in-order workers preserve the buffered
-samples and start the next epoch with a fresh sampler. Persistent workers at an
-epoch boundary, stochastic transforms or independent worker RNG state are not
+For the attested weighted multi-source streaming path, each worker reconstructs
+the original Hugging Face stream and rereads the rows that its source consumed
+in the saved epoch. This reconstructs the shuffle buffer, which the Hugging Face
+streaming cursor does not persist. It can substantially increase restart time
+and source I/O; it does not add a source replay to each training step. The source
+files and all transforms must be immutable and semantically stateless, including
+no untracked RNG or mutable worker state. The fingerprint cannot independently
+prove file contents: a caller-supplied manifest must identify the actual snapshot.
+Saved source order, weights, seed, worker and DP geometry must match. Version-0
+multi-source cursors lack that provenance and are rejected for exact resume; use
+weights-only initialization or a separately verified producer-specific migration.
+
+Distributed replay requires at least one worker per rank, in-order delivery and
+a working Gloo control group. `data.resume_replay_timeout_seconds` limits each
+worker response; rank coordination uses `(num_workers + 1)` times that value
+plus 30 seconds, so the total wait can be much longer than the per-worker timeout.
+The cold-resume and networking behavior must be validated for the exact data,
+torchdata, hardware and multi-node configuration used for training. This SFT
+contract does not establish DPO exact recovery for weighted streaming sources.
+For fresh training, persistent workers support the built-in file-backed HF
+sources. A custom source must explicitly provide the epoch-restart contract;
+otherwise construction fails rather than risk reusing the previous epoch.
+
+At a completed SFT epoch, in-order workers preserve the buffered samples and
+start the next epoch with a fresh sampler. Persistent workers are supported at
+this boundary only for the attested weighted replayable stream; persistent
+mapping workers, stochastic transforms and independent worker RNG state are not
 qualified. Legacy cursors without the saved geometry, source contract and phase
 are rejected. No legacy migration tool is provided here: old releases differed
 in step accounting and batching behavior, so migration requires a separately
