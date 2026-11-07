@@ -32,6 +32,58 @@ if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
 
 
+class ExpertBiasCallback(Callback):
+    """Updates the auxiliary-loss-free router bias once per optimizer step.
+
+    Gated by ``moe_router_bias_update_rate > 0``, and off by default: with the
+    rate at 0 the ``e_score_correction_bias`` buffer keeps the behaviour it has
+    had until now, frozen at whatever it was initialised or loaded with.
+
+    Separate from :class:`MoERouterMonitorCallback` on purpose. That one
+    samples load every N steps to draw a heatmap and may be paused; this one
+    affects what the model routes and has to run on every step, on every rank.
+    """
+
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        super().__init__(trainer)
+        self.updater = None
+
+        args: "VeOmniArguments" = self.trainer.args
+        rate = args.train.moe_router_bias_update_rate
+        if rate <= 0.0:
+            return
+
+        from ...utils.expert_bias import ExpertBiasUpdater
+
+        self.updater = ExpertBiasUpdater(update_rate=rate)
+        logger.info_rank0(f"Expert bias update enabled: rate={rate}")
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is None:
+            return
+
+        attached = self.updater.attach(self.trainer.model)
+        if attached == 0:
+            logger.warning_rank0(
+                "moe_router_bias_update_rate > 0 but no router carrying "
+                "'e_score_correction_bias' was found in the model. The auxiliary-loss-free "
+                "bias update does not apply to this architecture; disabling it."
+            )
+            self.updater.disable()
+            self.updater = None
+        else:
+            logger.info_rank0(f"Expert bias update: attached to {attached} router module(s).")
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is None:
+            return
+        # fsdp_group is the set of ranks holding distinct token slices, which is
+        # the sum the load has to be taken over. EP is deliberately excluded:
+        # it shards experts rather than tokens, so EP peers route identically
+        # and adding them would just scale every count by ep_size.
+        self.updater.step(group=self.parallel_state.fsdp_group)
+
+
 class MoERouterMonitorCallback(Callback):
     """Monitors MoE expert load distribution and logs heatmaps to wandb.
 

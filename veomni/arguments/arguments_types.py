@@ -1247,6 +1247,20 @@ class TrainingArguments:
             )
         },
     )
+    moe_router_bias_update_rate: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Step size for the auxiliary-loss-free router bias update "
+                "(https://arxiv.org/abs/2408.15664). 0 = disabled, which leaves the "
+                "e_score_correction_bias buffer frozen at whatever it was initialised "
+                "or loaded with. Applies to routers that carry that buffer "
+                "(DeepSeek-V3/V4, GLM-MoE). Once per optimizer step, each expert's "
+                "bias moves by this rate against its share of the step's tokens. "
+                "DeepSeek-V3 used 1e-3, dropped to 0 for the final phase."
+            )
+        },
+    )
 
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)

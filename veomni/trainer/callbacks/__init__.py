@@ -26,6 +26,7 @@ from .global_state_callback import GlobalStateCallback
 from .trace_callback import (
     RESERVED_TRAINING_METRIC_NAMES,
     EnvironMeterCallback,
+    ExpertBiasCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
@@ -44,6 +45,7 @@ __all__ = [
     "WandbTraceCallback",
     "ProfileTraceCallback",
     "EnvironMeterCallback",
+    "ExpertBiasCallback",
     "MoERouterMonitorCallback",
     "TqdmCallback",
     "RESERVED_TRAINING_METRIC_NAMES",

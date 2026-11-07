@@ -615,6 +615,15 @@
     ]
   },
   {
+    "name": "expert-bias-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_expert_bias.py"
+    ]
+  },
+  {
     "name": "59-e2e",
     "suite": "e2e",
     "conditional": false,
