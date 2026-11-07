@@ -242,7 +242,6 @@ class GlobalStateCallback(Callback):
         return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
-        """Restore rank-local trainer state after coordinating checkpoint reads across ranks."""
         args: "VeOmniArguments" = self.trainer.args
         load_path = args.train.checkpoint.load_path
         if load_path is None:

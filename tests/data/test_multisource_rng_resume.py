@@ -65,6 +65,7 @@ def make_dataset(seed):
 
 
 def rows(iterator, count):
+    """Read sample IDs and source indices from nested batches."""
     samples = (next(iterator)[0][0] for _ in range(count))
     return [(item["id"], item["ds_idx"]) for item in samples]
 
@@ -206,7 +207,6 @@ def test_legacy_loader_resume_after_epoch_set_survives_next_epoch(worker_batchin
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, monkeypatch, tmp_path):
-    """Restore legacy dataset cursors through the callback with main-process batching."""
     from veomni.trainer.callbacks import base as callback_base
     from veomni.trainer.callbacks import global_state_callback as callback_module
 
@@ -281,6 +281,7 @@ def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, mon
 
 
 def direct_rows(iterator, count):
+    """Read unbatched sample IDs and their source indices."""
     return [(sample["id"], sample["ds_idx"]) for sample in (next(iterator) for _ in range(count))]
 
 
@@ -353,6 +354,7 @@ def test_legacy_resaved_before_epoch_is_supplied_retains_unknown_epoch(epoch):
 
 
 def test_legacy_consumption_without_epoch_remains_resumable_but_rejects_late_epoch():
+    """Reject setting an unknown legacy epoch after sampling has already resumed."""
     source = make_dataset(seed=5)
     source.set_epoch(2)
     iterator = iter(source)
@@ -378,6 +380,7 @@ def test_legacy_consumption_without_epoch_remains_resumable_but_rejects_late_epo
 
 
 def test_legacy_restore_does_not_reuse_an_epoch_from_before_sampling():
+    """Do not reuse an epoch observed before restoring a legacy cursor."""
     source = make_dataset(seed=5)
     source.set_epoch(2)
     direct_rows(iter(source), 4)
@@ -408,6 +411,7 @@ def test_uninterrupted_epoch_sampling_matches_independent_seed_reference(seed):
 
 
 def test_invalid_initialization_marker_fails_before_mutating_sources():
+    """Reject an invalid initialization marker without modifying upstream cursors."""
     source = make_dataset(seed=5)
     state = copy.deepcopy(source.state_dict())
     state["runtime"]["sampling_initialized"] = 1
