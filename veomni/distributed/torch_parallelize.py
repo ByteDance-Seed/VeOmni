@@ -432,6 +432,14 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     return False
 
 
+def _fsdp_target_classes(model, basic_modules, expert_fp32_wgrad):
+    classes = set(getattr(model, "_no_split_modules", None) or []) | set(basic_modules or [])
+    if expert_fp32_wgrad:
+        # The VLM root may not expose the text model's own no-split modules.
+        classes.add("Qwen4ExpTextDecoderLayer")
+    return classes
+
+
 def _configure_fsdp_gradient_reduction(
     module: FSDPModule,
     *,
@@ -484,6 +492,32 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    compile_config = compile_config or CompileConfig()
+    if mixed_precision.npu_expert_fp32_wgrad:
+        from .npu_moe_precision import validate_expert_precision_config
+
+        validate_expert_precision_config(
+            mixed_precision,
+            parallel_state.dp_mode,
+            low_precision_reduce_scatter_comm,
+            parallel_state.tp_size,
+            parallel_state.pp_size,
+            compile_config.enable,
+        )
+        if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
+            raise ValueError("FP32 expert weight gradients require FSDP2")
+
+    expert_fp32_wgrad = mixed_precision.npu_expert_fp32_wgrad
+    if expert_fp32_wgrad:
+        if not IS_NPU_AVAILABLE or get_device_type() != "npu":
+            raise ValueError("FP32 expert weight gradients require an NPU")
+        from .npu_moe_precision import validate_qwen4_experts
+
+        expert_ids = validate_qwen4_experts(model)
+        basic_modules = list(_fsdp_target_classes(model, basic_modules, True))
+    else:
+        expert_ids = set()
+    wrapped_expert_ids = set()
 
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -539,7 +573,6 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
     model._veomni_compile_enabled = False
-    compile_config = compile_config or CompileConfig()
     if expert_weight_fp8_all_gather and compile_config.enable:
         raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
 
@@ -701,9 +734,34 @@ def parallelize_model_fsdp2(
             cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
+
+    if expert_fp32_wgrad:
+        expert_mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32, reduce_dtype=torch.float32, cast_forward_inputs=False
+        )
+
+        def configure_fp32_expert(expert):
+            expert._veomni_fp32_expert_wgrad = True
+            wrapped_expert_ids.add(id(expert))
+
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
     offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
+    cpu_offload_axes = kwargs.pop("cpu_offload_extra_parallel_names", [])
+    resident_patterns = kwargs.pop("cpu_offload_exclude_module_patterns", [])
+    if resident_patterns and not cpu_offload_axes:
+        raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+    matched_resident_patterns = set()
+    resident_module_fqns = []
+    module_fqns = {id(module): name for name, module in model.named_modules()} if resident_patterns else {}
+    if cpu_offload_axes:
+        if cpu_offload_axes != ["ep"] or enable_fsdp_cpu_offload:
+            raise ValueError("Selective CPU offload supports ep only, without global CPU offload")
+        if not parallel_state.extra_parallel_enabled("ep"):
+            raise ValueError("Selective expert CPU offload requires expert parallelism")
+        if compile_config.enable:
+            raise ValueError("Selective expert CPU offload is not qualified with torch.compile")
+    cpu_offloaded_modules = []
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         if persistent_extra_parallel_params:
@@ -753,6 +811,10 @@ def parallelize_model_fsdp2(
             para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
+            if para in cpu_offload_axes:
+                if para_fsdp_mesh.size() != 1:
+                    raise ValueError("Selective expert CPU offload currently requires ep_fsdp_size=1")
+                para_fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding. A para this model's plan does not
@@ -851,7 +913,24 @@ def parallelize_model_fsdp2(
                     # decoder/root FSDP group through the normal bottom-up walk.
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
+                para_kwargs = dict(extra_parallel_fsdp_kwargs[para])
+                resident_matches = (
+                    [pattern for pattern in resident_patterns if check_fqn_match(pattern, module_fqns[id(_para_mod)])]
+                    if para in cpu_offload_axes
+                    else []
+                )
+                if resident_matches:
+                    para_kwargs.pop("offload_policy")
+                    matched_resident_patterns.update(resident_matches)
+                    resident_module_fqns.append(module_fqns[id(_para_mod)])
+                if expert_fp32_wgrad and id(_para_mod) in expert_ids:
+                    if para != "ep" or id(_para_mod) in wrapped_expert_ids:
+                        raise RuntimeError("Unexpected or duplicate expert FSDP wrap")
+                    configure_fp32_expert(_para_mod)
+                    para_kwargs["mp_policy"] = expert_mp_policy
+                fully_shard(_para_mod, **para_kwargs)
+                if para in cpu_offload_axes and not resident_matches:
+                    cpu_offloaded_modules.append(_para_mod)
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -871,6 +950,14 @@ def parallelize_model_fsdp2(
                         transport_reduction_scales=transport_reduction_scales,
                     )
                 layer_mod._fsdp_modules.append(_para_mod)
+
+        if expert_fp32_wgrad and not parallel_state.extra_parallel_enabled("ep"):
+            for expert in layer_mod.modules():
+                if id(expert) not in expert_ids or id(expert) in wrapped_expert_ids:
+                    continue
+                configure_fp32_expert(expert)
+                fully_shard(expert, **{**fsdp_kwargs, "mp_policy": expert_mp_policy})
+                layer_mod._fsdp_modules.append(expert)
 
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
@@ -914,6 +1001,11 @@ def parallelize_model_fsdp2(
 
     if wrapped_gdn_ids != expected_gdn_ids:
         raise RuntimeError("Not every Qwen4 GDN was assigned to an FP32 FSDP group")
+    unmatched_resident_patterns = set(resident_patterns) - matched_resident_patterns
+    if unmatched_resident_patterns:
+        raise ValueError(
+            f"Resident patterns did not match selected CPU-offload modules: {sorted(unmatched_resident_patterns)}"
+        )
 
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
     # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
@@ -924,6 +1016,8 @@ def parallelize_model_fsdp2(
     # `setStorage … storage of size 0` when the saved reference points
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
+    if expert_fp32_wgrad and wrapped_expert_ids != expert_ids:
+        raise RuntimeError("Not every Qwen4-Exp expert was wrapped for FP32 weight gradients")
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
@@ -1000,13 +1094,22 @@ def parallelize_model_fsdp2(
             module_adapter_path=kwargs.pop("module_adapter_path", None),
         )
 
+    # FSDP stages the selected expert shards and their reduced gradients on CPU.
+    # Move them before optimizer construction so its parameter references agree.
+    for module in cpu_offloaded_modules:
+        module.cpu()
+        for parameter in module.parameters():
+            parameter._veomni_optimizer_compute_device = get_device_type()
+    model._cpu_offloaded_extra_parallel_names = tuple(cpu_offload_axes)
+    model._cpu_offload_resident_module_fqns = tuple(sorted(resident_module_fqns))
+
     if expert_weight_fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
         count = register_deepgemm_fp8_all_gather(model)
         logger.info_rank0(f"Enabled DeepGEMM FP8 all-gather for {count} expert parameters.")
 
-    if materialize_device == "cpu":
+    if materialize_device == "cpu" or cpu_offloaded_modules:
         _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2
@@ -1135,6 +1238,20 @@ def build_parallelize_model(
             Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
+    compile_config = compile_config or CompileConfig()
+    if mixed_precision.npu_expert_fp32_wgrad:
+        from .npu_moe_precision import validate_expert_precision_config
+
+        validate_expert_precision_config(
+            mixed_precision,
+            parallel_state.dp_mode,
+            low_precision_reduce_scatter_comm,
+            parallel_state.tp_size,
+            parallel_state.pp_size,
+            compile_config.enable,
+        )
+        if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
+            raise ValueError("FP32 expert weight gradients require FSDP2")
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -1151,7 +1268,6 @@ def build_parallelize_model(
         validate_low_precision_reduce_scatter_comm(
             low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
         )
-    compile_config = compile_config or CompileConfig()
     if expert_weight_fp8_all_gather and compile_config.enable:
         raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
 

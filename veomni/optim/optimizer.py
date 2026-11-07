@@ -1072,6 +1072,11 @@ def build_optimizer(
     if isinstance(betas, list):
         betas = tuple(betas)
     if optimizer_type == "muon":
+        if any(
+            parameter.requires_grad and getattr(parameter, "_veomni_optimizer_compute_device", None) is not None
+            for parameter in model.parameters()
+        ):
+            raise ValueError("DistributedMuon does not support selectively CPU-offloaded parameters")
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
         if param_groups is not None:
@@ -1537,9 +1542,22 @@ def build_extra_parallel_fsdp2_optimizer(
                     group_non_extra_parallel_params.append(p)
 
             def split_weight_decay(params, group_config=group_config):
-                groups = _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+                # Existing optimizers historically use the top-level decay
+                # when splitting an explicit group. New FP32/offload optimizers
+                # honour a group override for decayed parameters, while the
+                # no-decay rules still take precedence for the other subgroup.
+                group_weight_decay = (
+                    group_config.get("weight_decay", weight_decay)
+                    if optimizer_type in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "qwen38_muon")
+                    else weight_decay
+                )
+                groups = _make_param_groups_for_subset(
+                    model, params, group_weight_decay, no_decay_modules, no_decay_params
+                )
                 for subgroup in groups:
-                    subgroup.update({key: value for key, value in group_config.items() if key != "params"})
+                    subgroup.update(
+                        {key: value for key, value in group_config.items() if key not in ("params", "weight_decay")}
+                    )
                 return groups
 
             # Keep legacy EP decay subgroup boundaries and explicit group options.

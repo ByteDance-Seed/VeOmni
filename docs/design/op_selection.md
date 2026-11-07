@@ -599,6 +599,43 @@ path instead. VeOmni's product-based Ascend images install and verify
 `triton-ascend`; other environments can install a release compatible with their
 CANN and `torch_npu` stack to enable the fused activation.
 
+#### FP32 expert weight gradients on NPU
+
+Qwen4-Exp SFT can opt into FP32 expert weight gradients with:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      low_precision_reduce_scatter_comm: false
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        npu_expert_fp32_wgrad: true
+```
+
+The default is `false`. With the option enabled, expert master weights and their
+FSDP unsharded representation stay FP32; the fused NPU MoE casts weights to
+BF16 inside the custom autograd function for the forward and input gradient,
+while its grouped weight-gradient GEMM and gradient reduction use FP32. This
+avoids rounding each local expert gradient to BF16 before reduction; it does
+not make the rest of the model's BF16 computation equivalent to FP32.
+
+The current integration requires Qwen4-Exp SiLU `fused_npu`, FSDP2, TP=PP=1,
+FP32 reduction, native communication, and `torch.compile` disabled. Each rank
+validates its local precision settings and constructed expert modules before
+FSDP wrapping. As with the rest of the trainer configuration, all ranks must
+use the same settings. Composed Omni wraps and custom model parallelization
+reject the opt-in. MoE LoRA expert wrappers also reject the opt-in because
+their separate kernel is not covered. DPO reference-model isolation and resume
+configuration checks are not wired by this option yet. Keep the setting fixed
+across checkpoint save and resume when comparing training trajectories.
+
+FP32 expert all-gathers and temporary FP32 GEMM operands can increase memory,
+communication and compute time. Measure them on the target model and topology
+before adopting this experimental option in a production configuration.
+
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`

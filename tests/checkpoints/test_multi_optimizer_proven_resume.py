@@ -2181,6 +2181,22 @@ def test_scheduler_recipe_accepts_deterministic_format_and_records_its_identity(
     assert two != three
 
 
+def test_scheduler_recipe_rejects_tuple_subclass_closure():
+    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
+
+    class StatefulTuple(tuple):
+        def __getitem__(self, index):
+            return 0.5
+
+    factor = StatefulTuple((1.0,))
+
+    def schedule(step):
+        return step * factor[0]
+
+    with pytest.raises(RuntimeError, match="unsupported mutable state"):
+        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
+
+
 def test_scheduler_recipe_rejects_nonlocal_mutation():
     from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
 
@@ -2193,6 +2209,32 @@ def test_scheduler_recipe_rejects_nonlocal_mutation():
 
     with pytest.raises(RuntimeError, match="unsupported dynamic state"):
         _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
+
+
+@pytest.mark.parametrize("builtin_name", ["eval", "globals", "getattr", "__import__"])
+def test_scheduler_recipe_rejects_dynamic_builtin_in_nested_function(builtin_name):
+    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
+
+    def schedule_eval(step):
+        return lambda: eval("step")  # noqa: S307
+
+    def schedule_globals(step):
+        return lambda: globals()
+
+    def schedule_getattr(step):
+        return lambda: getattr(step, str(step))
+
+    def schedule_import(step):
+        return lambda: __import__("math")
+
+    schedules = {
+        "eval": schedule_eval,
+        "globals": schedule_globals,
+        "getattr": schedule_getattr,
+        "__import__": schedule_import,
+    }
+    with pytest.raises(RuntimeError, match="unsupported.*state|unsupported.*builtin"):
+        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedules[builtin_name]]))
 
 
 def test_nested_global_scheduler_is_rejected_before_checkpoint_load(tmp_path, monkeypatch):
