@@ -23,6 +23,79 @@ video clip as a single quadratic sequence would overestimate its cost by `t`.
 Its meter likewise stashes full frame lengths, while output restoration uses
 the clip's total merged-token length.
 
+## Integrating a module
+
+Declaring a spec does not route anything. The executor only opens the scope, so
+a module must call `data_balance_pre` and `data_balance_post` from its own hooks.
+The module owns the spec, its per-item metadata and these two calls. The mixin
+owns the routing plan, the DP exchanges and their inverse.
+
+| Function | Called by | Takes | Returns |
+|----------|-----------|-------|---------|
+| [`data_balance_scope()`](../../veomni/models/seed_omni/mixins/data_balance_mixin.py#L98) | Framework: [`execute_train_node`](../../veomni/models/seed_omni/accelerated/utils/executor.py#L61), once per training node. Do not call it from a module. | Nothing. | A context manager. It raises on reentry, or on exit if a routed call-site was not restored. |
+| [`data_balance_pre(method, tensors, metadata)`](../../veomni/models/seed_omni/mixins/data_balance_mixin.py#L111) | Module: the `@pre_forward` hook, before SP padding or slicing. | `tensors` must hold every `fields` name of the spec. `metadata` must hold each field's `lengths_key`, plus `output_lengths_key` and `cost_lengths_key`, with one entry per local item. | `(tensors, moved)`. Declared fields are routed and other keys pass through. If `moved` is false the inputs are unchanged: no spec for `method`, no open scope, not training, or the strategy does not balance DP. |
+| [`data_balance_post(method, outputs)`](../../veomni/models/seed_omni/mixins/data_balance_mixin.py#L140) | Module: the `@post_forward` hook, after SP gather and de-padding, before scattering results to their items. | `outputs` must hold every `output_names` entry of the spec, as a packed tensor or a list of packed tensors. Their leading dimension must equal the routed items' total output length. | A copy of `outputs` with those entries back in the original owner and item order. If `pre` did not route `method`, `outputs` comes back as is. |
+
+Every DP rank must make both calls, including a rank with no items, because the
+exchanges and their backward are collectives. Do not skip the model on a rank
+whose own batch was empty: use `moved` to clear its dummy flag, since it can
+receive another rank's items.
+
+Qwen3-VL is the reference integration:
+
+- Spec: [`_vision_balance_spec`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L174)
+- Metadata and `data_balance_pre`: [`_balance_vision_inputs`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L184)
+- Pre hooks: [`forward_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L85) and [`pack_encode_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L56)
+- Post hooks: [`forward_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L147) and [`pack_encode_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L114)
+
+A minimal module with one output token per input token:
+
+```python
+from typing import Any
+
+import torch
+
+from veomni.models.seed_omni.mixins import (
+    BaseMixin,
+    DataBalanceMixin,
+    DataBalanceSpec,
+    ItemTensorField,
+    ModuleStructure,
+    TrainingModuleMixin,
+    post_forward,
+    pre_forward,
+)
+
+
+class BalanceMixin(DataBalanceMixin):
+    data_balance_specs = {
+        "forward": DataBalanceSpec(
+            fields=(ItemTensorField("pixel_values", "lengths"),),
+            output_names=("embeds",),
+            output_lengths_key="lengths",
+            cost_lengths_key="lengths",
+            structure=ModuleStructure(global_attention=True, non_overlapping_patchify=True),
+        )
+    }
+
+
+class TrainingMixin(TrainingModuleMixin):
+    @pre_forward("forward")
+    def forward_pre(self, pixel_values: torch.Tensor, lengths: list[int]) -> dict[str, Any]:
+        inputs, _ = self.data_balance_pre("forward", {"pixel_values": pixel_values}, {"lengths": lengths})
+        # SP padding and slicing would go here, on the routed tensors.
+        return {"pixel_values": inputs["pixel_values"]}
+
+    @post_forward("forward")
+    def forward_post(self, embeds: torch.Tensor) -> dict[str, Any]:
+        # SP gather and de-padding would go here, before the inverse.
+        return self.data_balance_post("forward", {"embeds": embeds})
+
+
+class VeOmniMixin(BaseMixin, TrainingMixin, BalanceMixin):
+    pass
+```
+
 ## Strategy and scope
 
 `resolve_balance_strategy` chooses `sp_slice`, `dp_balance` or `replicate` from
