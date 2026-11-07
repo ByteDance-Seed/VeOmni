@@ -35,7 +35,6 @@ from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
 from ..utils.loss_utils import (
-    contains_loss_weights,
     contains_padding,
     fetch_training_micro_batches,
     synchronize_training_error,
@@ -459,12 +458,12 @@ class TextDPOTrainer:
             data_iterator,
             objective="DPO",
             on_fetched=lambda: setattr(self.base, "_step_preflight_start_time", time.time()),
+            reject_loss_weights=True,
         )
         previous_step = self.state.global_step
         self.state.global_step += 1
         error = None
         try:
-            had_loss_weights = contains_loss_weights(micro_batches)
             self.base._reset_async_activation_offload_if_enabled(self.policy_model)
             self.on_step_begin(micro_batches=micro_batches)
             if not micro_batches:
@@ -476,8 +475,6 @@ class TextDPOTrainer:
                 raise ValueError("DPO microbatches must have tensor labels")
             if contains_padding(micro_batches):
                 raise ValueError("DPO does not support padded micro-batches")
-            if had_loss_weights or contains_loss_weights(micro_batches):
-                raise ValueError("DPO does not support token loss_weights")
         except Exception as exc:  # noqa: BLE001 - synchronize before model collectives
             error = exc
         try:

@@ -39,7 +39,7 @@ def contains_loss_weights(value):
     return isinstance(value, dict) and (value.get("loss_weight") is not None or value.get("loss_weights") is not None)
 
 
-def fetch_training_micro_batches(data_iterator, *, objective=None, on_fetched=None):
+def fetch_training_micro_batches(data_iterator, *, objective=None, on_fetched=None, reject_loss_weights=False):
     """Coordinate input errors and uneven exhaustion before any model collective."""
     error = None
     try:
@@ -54,6 +54,8 @@ def fetch_training_micro_batches(data_iterator, *, objective=None, on_fetched=No
                 if objective
                 else "Synthetic padding requires the padding-safe trainer"
             )
+        if reject_loss_weights and contains_loss_weights(batches):
+            raise ValueError(f"{objective} does not support token loss_weights")
     except Exception as exc:  # noqa: BLE001 - all ranks must agree before forward
         batches, error = None, exc
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
@@ -133,17 +135,13 @@ def _distributed_batch_status(
 
 
 def reject_objective_padding(batch, objective: str) -> None:
-    validation_error = None
-    try:
-        found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
-    except Exception as exc:  # noqa: BLE001 - coordinate invalid metadata before objective collectives
-        found, validation_error = True, exc
+    found = contains_padding(batch) or (isinstance(batch, (list, tuple)) and not batch)
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         found, _ = _distributed_batch_status(batch, found)
     if found:
         raise ValueError(
             f"{objective} does not support padded micro-batches, an empty step, or unequal microbatch counts across ranks"
-        ) from validation_error
+        )
 
 
 def synchronize_step_begin_error(error: Exception | None, objective: str) -> None:
@@ -171,16 +169,12 @@ def _has_auxiliary_labels(batch) -> bool:
 def reject_distributed_padding(batch, *, check_fetch=False, fetch_error=None) -> bool:
     """Reject unequal/padded steps and return whether any rank has auxiliary labels."""
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        validation_error = None
-        try:
-            invalid = (
-                contains_padding(batch)
-                or (isinstance(batch, (list, tuple)) and not batch)
-                or (check_fetch and fetch_error is None and not isinstance(batch, (list, tuple)))
-            )
-            has_auxiliary_targets = _has_auxiliary_labels(batch)
-        except Exception as exc:  # noqa: BLE001 - peers must reach the same status collective
-            invalid, has_auxiliary_targets, validation_error = True, False, exc
+        invalid = (
+            contains_padding(batch)
+            or (isinstance(batch, (list, tuple)) and not batch)
+            or (check_fetch and fetch_error is None and not isinstance(batch, (list, tuple)))
+        )
+        has_auxiliary_targets = _has_auxiliary_labels(batch)
         found, has_auxiliary_targets = _distributed_batch_status(
             batch,
             invalid,
@@ -191,8 +185,8 @@ def reject_distributed_padding(batch, *, check_fetch=False, fetch_error=None) ->
         if found:
             raise RuntimeError(
                 "Distributed training does not support padded micro-batches, an empty step, "
-                "unequal microbatch counts across ranks, or malformed batch metadata"
-            ) from validation_error
+                "or unequal microbatch counts across ranks"
+            )
         return has_auxiliary_targets
     if check_fetch and fetch_error is not None:
         raise fetch_error
