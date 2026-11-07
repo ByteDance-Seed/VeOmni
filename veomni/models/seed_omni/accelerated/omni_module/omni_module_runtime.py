@@ -138,6 +138,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
 
+        if args.accelerator.fsdp_config.mixed_precision.npu_expert_fp32_wgrad:
+            raise ValueError("NPU expert FP32 wgrad is unsupported by SeedOmni module runtime")
+
         if for_inference:
             if self.is_eager:
                 self._init_eager_inference()
