@@ -277,6 +277,7 @@ def test_failed_final_load_barrier_does_not_certify_multi_optimizer():
     leaf = next(iter(optimizer.optimizers_dict.values()))
     leaf.checkpoint_abort_file_backed_state = MagicMock()
     manager = object.__new__(ModelCheckpointManager)
+    manager.config = SimpleNamespace(dcp_evict_source_cache=False)
     manager.runtime = SimpleNamespace(
         model=model, optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None
     )
