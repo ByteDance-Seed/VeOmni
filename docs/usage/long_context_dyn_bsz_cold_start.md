@@ -134,7 +134,15 @@ train:
 ```
 
 `build_dataloader` resolves the policy before registry dispatch so a registered
-external builder receives the concrete per-rank minimum of 24.
+external builder receives the concrete per-rank minimum of 24. For this opt-in
+policy, external builders must declare defaults for `dyn_bsz`,
+`dyn_bsz_runtime`, `dyn_bsz_count_mode`, and `data_modality`, or callers must
+provide the corresponding values explicitly. `max_seq_len` and
+`micro_batch_size` must always be explicit. This lets dispatch validate the
+configuration the builder actually receives. Context-aware builders must have
+an inspectable signature; a builder that opts in by default must expose that
+policy in its signature. Calls to opaque builders that do not explicitly opt in
+continue to use the builder's existing behavior without policy validation.
 
 The experiments cover first-micro-batch preparation only. Whole-step
 pre-materialization and periodic forward-only stalls are separate problems.

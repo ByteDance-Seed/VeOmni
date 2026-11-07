@@ -224,6 +224,161 @@ def test_build_dataloader_resolves_context_aware_buffer_before_registry_dispatch
     assert captured_kwargs["dyn_bsz_buffer_policy"] == "context_aware"
 
 
+@pytest.fixture
+def context_builder(monkeypatch):
+    def register(builder):
+        name = "external_context_regression"
+        monkeypatch.setitem(DATALOADER_REGISTRY._local_mapping, name, builder)
+        return name
+
+    return register
+
+
+def _external_context_kwargs():
+    return dict(
+        dyn_bsz_buffer_policy="context_aware",
+        max_seq_len=1024 * 1024,
+        micro_batch_size=1,
+        dyn_bsz_runtime="main",
+        dyn_bsz_count_mode="total",
+        data_modality="text",
+    )
+
+
+@pytest.mark.parametrize("default_dyn_bsz", [True, False])
+def test_external_builder_default_dyn_bsz_is_used(default_dyn_bsz, context_builder):
+    def builder(dyn_bsz=default_dyn_bsz, **kwargs):
+        return dyn_bsz, kwargs["dyn_bsz_buffer_size"]
+
+    name = context_builder(builder)
+    if default_dyn_bsz:
+        assert build_dataloader(name, **_external_context_kwargs()) == (True, 24)
+    else:
+        with pytest.raises(ValueError, match="requires dyn_bsz=True"):
+            build_dataloader(name, **_external_context_kwargs())
+
+
+@pytest.mark.parametrize(
+    ("builder", "message"),
+    [
+        (lambda **kwargs: kwargs, "explicit.*dyn_bsz"),
+        (lambda dyn_bsz=True, **kwargs: kwargs, "explicit.*dyn_bsz_runtime"),
+    ],
+)
+def test_context_aware_external_builder_requires_known_options(builder, message, context_builder):
+    with pytest.raises(ValueError, match=message):
+        build_dataloader(
+            context_builder(builder), dyn_bsz_buffer_policy="context_aware", max_seq_len=1048576, micro_batch_size=1
+        )
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dyn_bsz_runtime", "worker", "only supported with dyn_bsz_runtime='main'"),
+        ("dyn_bsz_count_mode", "effective", "only supported with dyn_bsz_count_mode='total'"),
+        ("data_modality", "multimodal", "only supported for text data"),
+    ],
+)
+def test_context_aware_validates_external_defaults(option, value, message, context_builder):
+    defaults = dict(dyn_bsz_runtime="main", dyn_bsz_count_mode="total", data_modality="text")
+    defaults[option] = value
+
+    def builder(
+        dyn_bsz=True,
+        dyn_bsz_runtime=defaults["dyn_bsz_runtime"],
+        dyn_bsz_count_mode=defaults["dyn_bsz_count_mode"],
+        data_modality=defaults["data_modality"],
+        **kwargs,
+    ):
+        raise AssertionError("unsupported settings must be rejected before dispatch")
+
+    with pytest.raises(ValueError, match=message):
+        build_dataloader(
+            context_builder(builder), dyn_bsz_buffer_policy="context_aware", max_seq_len=1048576, micro_batch_size=1
+        )
+
+
+@pytest.mark.parametrize("error", [ValueError, RuntimeError])
+def test_fixed_policy_keeps_builder_when_signature_is_unavailable(monkeypatch, error, context_builder):
+    import veomni.data.data_loader as m_dl
+
+    def unavailable(_builder):
+        raise error("signature unavailable")
+
+    name = context_builder(lambda **kwargs: kwargs)
+    monkeypatch.setattr(m_dl.inspect, "signature", unavailable)
+    assert build_dataloader(name, dyn_bsz_buffer_size=37) == {"dyn_bsz_buffer_size": 37}
+
+
+@pytest.mark.parametrize("runtime", ["main", "worker"])
+def test_context_aware_default_policy_is_validated(runtime, context_builder):
+    def builder(
+        dyn_bsz_buffer_policy="context_aware",
+        dyn_bsz=True,
+        dyn_bsz_runtime=runtime,
+        dyn_bsz_count_mode="total",
+        data_modality="text",
+        **kwargs,
+    ):
+        return kwargs["dyn_bsz_buffer_size"]
+
+    name = context_builder(builder)
+    if runtime == "main":
+        assert build_dataloader(name, max_seq_len=1048576, micro_batch_size=1) == 24
+    else:
+        with pytest.raises(ValueError, match="only supported with dyn_bsz_runtime='main'"):
+            build_dataloader(name, max_seq_len=1048576, micro_batch_size=1)
+
+
+def test_context_aware_policy_rejects_uninspectable_builder(context_builder):
+    class OpaqueBuilder:
+        __signature__ = "invalid"
+
+        def __call__(self, dyn_bsz=False, /, **kwargs):
+            raise AssertionError("unknown arguments must be rejected before dispatch")
+
+    with pytest.raises(ValueError, match="requires an inspectable builder signature"):
+        build_dataloader(context_builder(OpaqueBuilder()), **_external_context_kwargs())
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "dyn_bsz_buffer_policy",
+        "dyn_bsz_buffer_size",
+        "dyn_bsz",
+        "dyn_bsz_runtime",
+        "dyn_bsz_count_mode",
+        "data_modality",
+        "max_seq_len",
+        "micro_batch_size",
+    ],
+)
+def test_context_aware_policy_rejects_positional_only_overrides(option, context_builder):
+    def policy(dyn_bsz_buffer_policy="fixed", /, **kwargs): ...
+    def size(dyn_bsz_buffer_size=200, /, **kwargs): ...
+    def enabled(dyn_bsz=False, /, **kwargs): ...
+    def runtime(dyn_bsz_runtime="worker", /, **kwargs): ...
+    def count(dyn_bsz_count_mode="effective", /, **kwargs): ...
+    def modality(data_modality="multimodal", /, **kwargs): ...
+    def length(max_seq_len=1, /, **kwargs): ...
+    def batch(micro_batch_size=2, /, **kwargs): ...
+
+    builders = dict(
+        dyn_bsz_buffer_policy=policy,
+        dyn_bsz_buffer_size=size,
+        dyn_bsz=enabled,
+        dyn_bsz_runtime=runtime,
+        dyn_bsz_count_mode=count,
+        data_modality=modality,
+        max_seq_len=length,
+        micro_batch_size=batch,
+    )
+    with pytest.raises(ValueError, match=f"positional-only parameter {option}"):
+        build_dataloader(context_builder(builders[option]), dyn_bsz=True, **_external_context_kwargs())
+
+
 def test_build_dataloader_resolves_context_aware_native_buffer_once(monkeypatch):
     import veomni.data.data_loader as m_dl
 

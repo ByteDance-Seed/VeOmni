@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import inspect
 import math
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -94,11 +95,58 @@ def resolve_dyn_bsz_buffer_size(
 
 def build_dataloader(dataloader_type: str, **kwargs):
     builder = DATALOADER_REGISTRY[dataloader_type]
-    # Native owns default dyn_bsz=True. Reject an explicit disable here so
-    # trainers such as DiT cannot silently ignore an opt-in policy.
-    if kwargs.get("dyn_bsz") is False:
-        _require_dyn_bsz_for_context_aware_policy(False, kwargs.get("dyn_bsz_buffer_policy", "fixed"))
-    if kwargs.get("dyn_bsz", False) and kwargs.get("dyn_bsz_buffer_policy", "fixed") == "context_aware":
+    try:
+        parameters = inspect.signature(builder).parameters
+        inspectable = True
+    except Exception:  # noqa: BLE001 - opaque external builders may not expose a usable signature
+        parameters = {}
+        inspectable = False
+    policy_parameter = parameters.get("dyn_bsz_buffer_policy")
+    policy_default = (
+        policy_parameter.default
+        if policy_parameter is not None and policy_parameter.default is not inspect.Parameter.empty
+        else "fixed"
+    )
+    policy = kwargs.get("dyn_bsz_buffer_policy", policy_default)
+    if (
+        policy_parameter is not None
+        and policy_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+        and "dyn_bsz_buffer_policy" in kwargs
+        and (policy == "context_aware" or policy_default == "context_aware")
+    ):
+        raise ValueError("context_aware policy cannot set positional-only parameter dyn_bsz_buffer_policy.")
+    if policy == "context_aware":
+        if not inspectable:
+            raise ValueError("dyn_bsz_buffer_policy='context_aware' requires an inspectable builder signature.")
+
+        for name in (
+            "dyn_bsz_buffer_policy",
+            "dyn_bsz_buffer_size",
+            "dyn_bsz",
+            "dyn_bsz_runtime",
+            "dyn_bsz_count_mode",
+            "data_modality",
+            "max_seq_len",
+            "micro_batch_size",
+        ):
+            parameter = parameters.get(name)
+            if (
+                parameter is not None
+                and parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+                and (name in kwargs or name == "dyn_bsz_buffer_size")
+            ):
+                raise ValueError(f"context_aware policy cannot set positional-only parameter {name}.")
+
+        def effective_option(name):
+            if name in kwargs:
+                return kwargs[name]
+            parameter = parameters.get(name)
+            if parameter is None or parameter.default is inspect.Parameter.empty:
+                raise ValueError(f"dyn_bsz_buffer_policy='context_aware' requires explicit {name} for this builder.")
+            return parameter.default
+
+        dyn_bsz = effective_option("dyn_bsz")
+        _require_dyn_bsz_for_context_aware_policy(bool(dyn_bsz), policy)
         required_arguments = ("max_seq_len", "micro_batch_size")
         missing_arguments = [argument for argument in required_arguments if argument not in kwargs]
         if missing_arguments:
@@ -114,12 +162,12 @@ def build_dataloader(dataloader_type: str, **kwargs):
         if builder is not build_native_dataloader:
             kwargs["dyn_bsz_buffer_size"] = resolve_dyn_bsz_buffer_size(
                 buffer_size=kwargs.get("dyn_bsz_buffer_size", 200),
-                buffer_policy=kwargs.get("dyn_bsz_buffer_policy", "fixed"),
+                buffer_policy=policy,
                 max_seq_len=kwargs["max_seq_len"],
                 micro_batch_size=kwargs["micro_batch_size"],
-                runtime=kwargs.get("dyn_bsz_runtime", "main"),
-                count_mode=kwargs.get("dyn_bsz_count_mode", "total"),
-                data_modality=kwargs.get("data_modality", "text"),
+                runtime=effective_option("dyn_bsz_runtime"),
+                count_mode=effective_option("dyn_bsz_count_mode"),
+                data_modality=effective_option("data_modality"),
             )
     return builder(**kwargs)
 
