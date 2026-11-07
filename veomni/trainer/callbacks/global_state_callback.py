@@ -294,6 +294,9 @@ class GlobalStateCallback(Callback):
             offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
+            prepare_epoch = getattr(self.trainer.train_dataloader, "prepare_resume_epoch", None)
+            if self.trainer.start_step != 0 and callable(prepare_epoch):
+                prepare_epoch(self.trainer.start_epoch)
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
         # OmniTrainer checkpoints written before it had a meter store None here.
