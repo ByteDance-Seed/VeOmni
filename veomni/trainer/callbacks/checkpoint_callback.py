@@ -120,6 +120,9 @@ class CheckpointCallback(Callback):
             raise
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        from .global_state_callback import prepare_external_data_contract
+
+        prepare_external_data_contract(self.trainer, install=True)
         self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
@@ -176,6 +179,9 @@ class CheckpointCallback(Callback):
 
     def _save_dcp(self, state: TrainerState):
         try:
+            from .global_state_callback import prepare_external_data_contract
+
+            prepare_external_data_contract(self.trainer, state)
             _check_multi_destination(self.trainer, state.global_step)
             self.trainer.save_dcp(state)
         except BaseException:
@@ -187,6 +193,9 @@ class CheckpointCallback(Callback):
 
     def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         try:
+            from .global_state_callback import prepare_external_data_contract
+
+            prepare_external_data_contract(self.trainer, state)
             if _has_multi_optimizer(self.trainer) and self._last_dcp_step != state.global_step:
                 self._save_dcp(state)
             self.trainer.save_hf_or_lora(state, stage=stage)
