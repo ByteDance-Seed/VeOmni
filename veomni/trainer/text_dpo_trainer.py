@@ -584,6 +584,10 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args = copy.deepcopy(args)
         args.lora_config = {}
         args.accelerator.fsdp_config.mixed_precision.enable = False
+        # The frozen reference never computes expert weight gradients; the
+        # policy's FP32-wgrad option requires mixed precision and must not be
+        # passed to this separate, non-AMP reference build.
+        args.accelerator.fsdp_config.mixed_precision.npu_expert_fp32_wgrad = False
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.

@@ -72,6 +72,16 @@
     ]
   },
   {
+    "name": "npu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
+    ]
+  },
+  {
     "name": "npu-unit-04",
     "suite": "unit",
     "args": [
