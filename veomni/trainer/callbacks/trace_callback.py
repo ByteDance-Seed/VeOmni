@@ -62,6 +62,8 @@ class ExpertBiasCallback(Callback):
         if self.updater is None:
             return
 
+        from ...utils.expert_bias import ensure_lora_can_carry_the_bias
+
         attached = self.updater.attach(self.trainer.model)
         if attached == 0:
             logger.warning_rank0(
@@ -72,6 +74,11 @@ class ExpertBiasCallback(Callback):
             self.updater.disable()
             self.updater = None
         else:
+            # Only once routers are known: a LoRA adapter cannot carry these
+            # buffers, so the pair is rejected here rather than at config time,
+            # where a dense model would be rejected for a knob that does not
+            # apply to it.
+            ensure_lora_can_carry_the_bias(self.trainer.args.model.lora_config, attached)
             logger.info_rank0(f"Expert bias update: attached to {attached} router module(s).")
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:

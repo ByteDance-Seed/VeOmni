@@ -223,17 +223,75 @@ def test_real_deepseek_router_satisfies_the_output_contract():
         topk_group=1,
         norm_topk_prob=True,
     )
+    # Seed before the weight init, not after: the init draws from the global
+    # RNG, so seeding later leaves the routing this test asserts on random.
+    torch.manual_seed(0)
     router = DeepseekV3TopkRouter(cfg)
     torch.nn.init.normal_(router.weight, std=0.5)
 
     updater = ExpertBiasUpdater(update_rate=0.1)
     assert updater.attach(router) == 1, "attach must find the real router by its buffer"
 
-    torch.manual_seed(0)
     router(torch.randn(32, cfg.hidden_size))
     updater.step()
 
     bias = getattr(router, BIAS_ATTR)
     assert torch.any(bias != 0), "the real router's output must drive the update"
-    # Sign-based, so every expert moved by exactly the rate or not at all.
-    assert torch.all((bias.abs() == pytest.approx(0.1)) | (bias == 0))
+    # Sign-based, so every expert moved by exactly the rate, or by nothing at
+    # all if it sat at exactly the average load. Compare elementwise:
+    # pytest.approx against a tensor collapses to a single Boolean that is true
+    # only when every element matches, so the previous form rejected the valid
+    # mixed case where one expert was at average load and the rest had moved.
+    moved_by_rate = torch.isclose(bias.abs(), torch.full_like(bias, 0.1))
+    assert torch.all(moved_by_rate | (bias == 0))
+
+
+def test_the_bias_update_is_rejected_together_with_lora():
+    """LoRA plus attached routers must fail loudly, not silently lose routing.
+
+    The update writes ``e_score_correction_bias``, a registered buffer, while
+    the adapter export collects ``named_parameters()`` only, so the exported
+    adapter cannot carry what the run trained.
+
+    Driven through a real ``attach`` rather than a bare call, because the
+    decision the callback makes is the pair of them: reject only once routers
+    were actually found, so a dense model keeps warning and disabling.
+    """
+    from veomni.utils.expert_bias import ensure_lora_can_carry_the_bias
+
+    lora = {"lora_rank": 8}
+
+    moe = ModelWithRouter()
+    moe_updater = ExpertBiasUpdater(update_rate=0.1)
+    attached = moe_updater.attach(moe)
+    assert attached > 0, "the fixture must attach, or this asserts nothing"
+    with pytest.raises(ValueError, match="cannot be combined with LoRA"):
+        ensure_lora_can_carry_the_bias(lora, attached)
+
+    # A model with no such router attaches nothing, so the knob does not apply
+    # and the caller disables it with a warning. Rejecting that would fail a
+    # LoRA run over a setting with no effect on it.
+    dense = nn.Sequential(nn.Linear(4, 4))
+    dense_updater = ExpertBiasUpdater(update_rate=0.1)
+    assert dense_updater.attach(dense) == 0
+    ensure_lora_can_carry_the_bias(lora, 0)
+
+    # And without LoRA the update is free to run.
+    ensure_lora_can_carry_the_bias({}, attached)
+    ensure_lora_can_carry_the_bias(None, attached)
+
+
+def test_routers_of_different_widths_are_rejected_at_attach():
+    """The counts tensor is rectangular, so every router must agree on width.
+
+    Caught at attach, where the module can be named, rather than as an
+    out-of-range ``scatter_add_`` inside a forward hook, which on an
+    accelerator surfaces as an async assert far from the cause.
+    """
+    model = nn.Module()
+    model.a = ToyRouter(NUM_EXPERTS)
+    model.b = ToyRouter(NUM_EXPERTS + 2)
+
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    with pytest.raises(ValueError, match="uniform expert count"):
+        updater.attach(model)
