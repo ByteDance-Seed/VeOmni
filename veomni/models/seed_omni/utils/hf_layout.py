@@ -703,8 +703,13 @@ def save_hf_source_checkpoint(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    from ....checkpoint.dcp_checkpointer import ModelState
+    from ....checkpoint.dcp_checkpointer import (
+        ModelState,
+        _export_extra_parallel_layout_key,
+        _reject_unproven_extra_parallel_optimizer,
+    )
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    from ....utils.dist_utils import raise_if_any_rank_failed
 
     apply_dcp_consolidation_patch()
     layout = source.layout
@@ -713,31 +718,38 @@ def save_hf_source_checkpoint(
 
     save_state: dict[str, torch.Tensor] = {}
     for name, (model, parallel_state) in modules.items():
-        module_state = ModelState(model, parallel_state=parallel_state).state_dict()
-        tied = _tied_parameter_names(model)
-        unmapped, reshaped = [], []
-        for key, tensor in module_state.items():
-            source_key = layout.source_key(name, key)
-            if source_key is None or source_key not in weight_files:
-                # A tied alias the source does not store (``tie_word_embeddings``
-                # checkpoints omit ``lm_head.weight``) is written through its original.
-                if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
-                    unmapped.append(key)
-                continue
-            if source_key in save_state:
-                raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
-            dtype, shape = source_specs[source_key]
-            if tuple(tensor.shape) != shape:
-                reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
-                continue
-            save_state[source_key] = tensor if tensor.dtype == dtype else tensor.to(dtype)
-        if unmapped or reshaped:
-            raise ValueError(
-                f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
-                f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
-                f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
-                "to its upstream layout; disable train.checkpoint.save_hf_weights, or train from a split checkpoint."
-            )
+        _reject_unproven_extra_parallel_optimizer({"model": model}, parallel_state)
+        error = None
+        try:
+            module_state = ModelState(model, parallel_state=parallel_state).state_dict()
+            tied = _tied_parameter_names(model)
+            unmapped, reshaped = [], []
+            for key, tensor in module_state.items():
+                key = _export_extra_parallel_layout_key(key)
+                if key is None:
+                    continue
+                source_key = layout.source_key(name, key)
+                if source_key is None or source_key not in weight_files:
+                    if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
+                        unmapped.append(key)
+                    continue
+                if source_key in save_state:
+                    raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
+                dtype, shape = source_specs[source_key]
+                if tuple(tensor.shape) != shape:
+                    reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
+                    continue
+                save_state[source_key] = tensor if tensor.dtype == dtype else tensor.to(dtype)
+            if unmapped or reshaped:
+                raise ValueError(
+                    f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
+                    f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
+                    f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
+                    "to its upstream layout; disable train.checkpoint.save_hf_weights, or train from a split checkpoint."
+                )
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, f"preparing SeedOmni HF module {name}")
 
     for key, original in layout.tied_source_keys.items():
         if key in weight_files and key not in save_state and original in save_state:

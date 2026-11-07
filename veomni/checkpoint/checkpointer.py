@@ -118,7 +118,9 @@ def dcp_checkpointer(dist_backend: str):
 
 
 @CHECKPOINT_TO_STATE_DICT_REGISTRY.register("dcp")
-def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], **kwargs):
+def dcp_ckpt_to_state_dict(
+    save_checkpoint_path: Union[str, os.PathLike], *, legacy_expert_source_layout=None, **kwargs
+):
     from .dcp_checkpointer import dcp_to_torch_state_dict
 
-    return dcp_to_torch_state_dict(save_checkpoint_path)
+    return dcp_to_torch_state_dict(save_checkpoint_path, legacy_expert_source_layout=legacy_expert_source_layout)

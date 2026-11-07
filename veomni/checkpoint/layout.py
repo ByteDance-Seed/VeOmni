@@ -33,9 +33,36 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 from typing import Any, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
+
+
+def same_checkpoint_path(left, right) -> bool:
+    """Compare logical URIs or existing local directories, including symlinks."""
+
+    def normalize(path):
+        raw = os.fspath(path)
+        if not isinstance(raw, str):
+            raise TypeError("Checkpoint paths must be strings")
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.netloc:
+            return urlunsplit(
+                (parsed.scheme.lower(), parsed.netloc, posixpath.normpath(parsed.path), parsed.query, parsed.fragment)
+            )
+        return os.path.realpath(raw)
+
+    left_normalized, right_normalized = normalize(left), normalize(right)
+    if left_normalized == right_normalized:
+        return True
+    left_uri, right_uri = urlsplit(os.fspath(left)), urlsplit(os.fspath(right))
+    if (left_uri.scheme and left_uri.netloc) or (right_uri.scheme and right_uri.netloc):
+        return False
+    if os.path.exists(left_normalized) and os.path.exists(right_normalized):
+        return os.path.samefile(left_normalized, right_normalized)
+    return False
 
 
 # Resume tree. Everything needed to continue training, and nothing else.
