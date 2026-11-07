@@ -219,6 +219,8 @@ def _provider_failure_worker(rank, store):
             "owners",
             "order",
             "dpo",
+            "unbound",
+            "wrapped_unbound",
         ):
             trainer, provider = _trainer()
             if scenario == "mode":
@@ -253,6 +255,16 @@ def _provider_failure_worker(rank, store):
                 }
             elif scenario == "dpo" and rank == 0:
                 trainer = DPOTrainer(**vars(trainer))
+            elif scenario == "unbound":
+                trainer._veomni_require_exact_data_resume = False
+                trainer.train_dataloader._veomni_exact_resume_requested = rank == 0
+            elif scenario == "wrapped_unbound":
+                from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader
+
+                trainer._veomni_require_exact_data_resume = False
+                inner = SimpleNamespace(_veomni_exact_resume_requested=rank == 0)
+                trainer.train_dataloader = object.__new__(DynamicBatchSizeDataLoader)
+                trainer.train_dataloader._dataloader = inner
             with pytest.raises((RuntimeError, ValueError, TypeError, SystemExit)):
                 prepare_external_data_contract(trainer, install=True)
             marker = torch.tensor([1], dtype=torch.int32)
