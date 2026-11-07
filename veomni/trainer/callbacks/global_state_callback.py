@@ -530,16 +530,11 @@ class GlobalStateCallback(Callback):
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
         if dist.is_initialized():
-            local_policy = (
-                strict_sft,
-                tuple(name for name, _ in legacy_checkpoints),
-                tuple(unknown_checkpoints),
-                tuple(sorted(generations.items())),
-            )
-            policies = [None] * dist.get_world_size()
-            dist.all_gather_object(policies, local_policy)
-            if any(policy != local_policy for policy in policies):
-                raise RuntimeError("Checkpoint data and optimizer resume policy differs across ranks")
+            local_generations = tuple(sorted(generations.items()))
+            restored_generations = [None] * dist.get_world_size()
+            dist.all_gather_object(restored_generations, local_generations)
+            if any(value != local_generations for value in restored_generations):
+                raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
         coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
 
         if strict_optimizer:
