@@ -915,6 +915,13 @@ class GlobalStateCallback(Callback):
                 and self.trainer.start_step == 0
                 and not sft_next_epoch
                 and self.trainer.train_dataloader is not None
+                # A stateful loader may already have started its restored
+                # iterator in load_state_dict. The training loop will call
+                # iter(loader); priming it here as well can discard its queue.
+                and (
+                    cursor is None
+                    or getattr(self.trainer.train_dataloader, "_veomni_resume_iterator_prepared", False) is not True
+                )
             )
             else None,
             "initializing the restored data iterator",

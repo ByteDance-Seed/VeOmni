@@ -585,6 +585,63 @@ def test_trainer_allows_new_data_without_cursor_at_epoch_boundary(monkeypatch, c
     assert trainer.start_step == 0
 
 
+@pytest.mark.parametrize("has_cursor", [False, True])
+def test_restored_prepared_iterator_is_not_primed_twice(monkeypatch, has_cursor):
+    from types import SimpleNamespace
+
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    class PreparedLoader:
+        _veomni_resume_iterator_prepared = True
+
+        def __init__(self):
+            self.buffer = []
+            self.resume = False
+            self.iterations = 0
+
+        def load_state_dict(self, cursor):
+            self.buffer = list(cursor["pending"])
+            self.resume = True
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.resume:
+                self.resume = False
+            else:
+                self.buffer.clear()
+            return self
+
+        def __next__(self):
+            if not self.buffer:
+                raise StopIteration
+            return self.buffer.pop(0)
+
+    loader = PreparedLoader()
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")), train_steps=6
+        ),
+        state=SimpleNamespace(global_step=0, epoch=0),
+        train_dataloader=loader,
+        channel_loss_callback=None,
+        offline_cache_writer=None,
+        environ_meter=None,
+    )
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 18,
+        "train_dataloader": {"pending": [123]} if has_cursor else None,
+    }
+    monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.set_device_rng_state", lambda _: None)
+
+    callback.load_global_state()
+    assert loader.iterations == (0 if has_cursor else 1)
+    if has_cursor:
+        assert next(iter(loader)) == 123
+    assert loader.iterations == 1
+
+
 def _epoch_boundary_guard_worker(rank, endpoint):
     from datetime import timedelta
     from types import SimpleNamespace
