@@ -29,32 +29,6 @@ CHECKPOINTER_REGISTRY = Registry("checkpointer")
 CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
 
 
-def _normalize_legacy_cache_arguments(signature, args, kwargs):
-    """Preserve the older positional cache flag when a layout option is also present."""
-    positional = [
-        name
-        for name, parameter in signature.parameters.items()
-        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    try:
-        index = positional.index("legacy_expert_source_layout")
-    except ValueError:
-        return args, kwargs
-    if (
-        positional[index + 1 : index + 2] != ["evict_source_cache"]
-        or len(args) <= index
-        or type(args[index]) is not bool
-    ):
-        return args, kwargs
-    if len(args) > index + 1 or "evict_source_cache" in kwargs:
-        raise TypeError("multiple values for argument 'evict_source_cache'")
-    args, kwargs = list(args), dict(kwargs)
-    evict = args[index]
-    args[index] = kwargs.pop("legacy_expert_source_layout", None)
-    kwargs["evict_source_cache"] = evict
-    return tuple(args), kwargs
-
-
 def cache_aware_load(load):
     """Select the source reader per call without mutating the shared class."""
     signature = inspect.signature(load)
@@ -71,8 +45,7 @@ def cache_aware_load(load):
 
     @wraps(load)
     def wrapped(cls, *args, **kwargs):
-        normalized, kwargs = _normalize_legacy_cache_arguments(exposed_signature, (cls, *args), kwargs)
-        bound = exposed_signature.bind(*normalized, **kwargs)
+        bound = exposed_signature.bind(cls, *args, **kwargs)
         if bound.arguments.pop("evict_source_cache", False):
             from .cache_aware_reader import CacheAwareFileSystemReader
 
