@@ -67,10 +67,9 @@ different data-parallel samples to those ranks.
 
 - General `tp_size > 1` support.
 - Tensor-parallel attention, MLP, PLE projections, or LM head.
-- Hybrid `ulysses_size > 1` and `cp_size > 1`; either Ulysses or GPU context
-  parallelism is supported through sequence-local lookup requests and cross-rank
-  token/convolution halos, while PLE table routing continues to use the independent
-  `ple_fsdp × ple` mesh.
+- Independently enabling hybrid sequence/context parallelism in the PLE table
+  layer. Combined Ulysses/CP requires the model-level Qwen4-Exp opt-in described
+  below; PLE table routing remains on the independent `ple_fsdp × ple` mesh.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
 - Hugging Face export of the complete 95 GiB PLE table.
@@ -112,11 +111,21 @@ dp_replicate_size == 1
 ep_size divides world_size
 ```
 
-Either `ulysses_size > 1` or GPU `cp_size > 1` may be enabled (not both
-simultaneously). Sequence/context parallelism changes only the sequence-local
-PLE token/convolution halo group (`ulysses_group` or `cp_group`); the persistent
+Ulysses, context parallelism, or combined execution may be enabled for Qwen4-Exp
+on compatible GPU/NPU backends. The combined topology requires the explicit
+`model.accelerator.allow_hybrid_cp=true` opt-in (default `false`), and its degree
+`ulysses_size * cp_size` must divide both GDN key and value head counts. GDN uses
+sequence-to-head exchange, not recurrent-state context sharding. Other model
+families retain their capability guards, and configuration acceptance does not
+establish hardware numerical or checkpoint-resume qualification.
+
+Sequence/context parallelism changes only the sequence-local PLE
+token/convolution halo group: `ulysses_group` or `cp_group` for a single axis,
+or the flattened CP×Ulysses `sp_group` for combined execution. The persistent
 PLE table ownership and two-dimensional lookup routing still span the full
-`ple_fsdp × ple` mesh.
+`ple_fsdp × ple` mesh. See the
+[model integration status](../../veomni/models/transformers/qwen4_exp/README.md#combined-ulyssescp-opt-in)
+for attention, vision, and backend limitations.
 
 Each rank has a coordinate `(col_rank, row_rank)` in the `[F, P]` mesh.
 Code must derive group-local ranks and destination ranks from `DeviceMesh`; it
