@@ -52,6 +52,11 @@ class DistributedDataloader(StatefulDataLoader):
     dataset: "Dataset"
     sampler: "StatefulDistributedSampler"
 
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        prepare = getattr(self.dataset, "prepare_resume_epoch", None)
+        if callable(prepare):
+            prepare(epoch)
+
     def set_epoch(self, epoch: int) -> None:
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)

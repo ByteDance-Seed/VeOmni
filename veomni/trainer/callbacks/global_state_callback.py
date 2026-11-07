@@ -1039,11 +1039,19 @@ class GlobalStateCallback(Callback):
             if sft_next_epoch:
                 loader.load_sft_next_epoch_buffer(prepared_sft_buffer)
             else:
+
+                def prepare_resume_epoch():
+                    prepare = getattr(loader, "prepare_resume_epoch", None)
+                    if self.trainer.start_step != 0 and callable(prepare):
+                        prepare(self.trainer.start_epoch)
+
+                prepare_resume_epoch()
                 needs_copy = dpo_recovery and not isinstance(loader, DynamicBatchSizeDataLoader)
                 loader.load_state_dict(copy.deepcopy(cursor) if needs_copy else cursor)
                 if dpo_recovery:
                     # Validate deferred source errors without consuming a training sample.
                     iter(loader)
+                    prepare_resume_epoch()
                     loader.load_state_dict(cursor)
 
         restore_local(restore_loader, "restoring the training data cursor")

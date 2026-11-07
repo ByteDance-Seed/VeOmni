@@ -795,6 +795,11 @@ class DynamicBatchSizeDataLoader:
         self._checkpoint_flush_micro_batch = None
         self._dpo_flushed_source_state = None
 
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        prepare = getattr(self._dataloader, "prepare_resume_epoch", None)
+        if callable(prepare):
+            prepare(epoch)
+
     def set_epoch(self, epoch: int) -> None:
         if hasattr(self._dataloader, "set_epoch"):
             self._dataloader.set_epoch(epoch)
