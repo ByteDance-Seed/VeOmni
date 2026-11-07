@@ -4,10 +4,6 @@ The registered `cross_entropy_loss / standard / chunk_loss` implementation
 uses native Ascend cross entropy for supported NPU inputs. No model patch or
 new implementation name is needed. Label shifting and sequence-parallel
 reduction remain in the model loss adapter.
-The model adapter also preserves an explicit shared `num_items_in_batch`
-denominator during SP or explicit-group reduction: it aggregates local
-`sum / count` with equal rank weights instead of applying token weighting
-again. Without an explicit count it retains token-weighted mean reduction.
 
 The fast path removes `labels == ignore_index` rows before the vocabulary
 projection, then computes FP32 summed CE from FP16, BF16 or FP32 projection
@@ -37,8 +33,7 @@ supported NPU stack:
 
 ```bash
 python -m pytest tests/ops/loss/test_npu_chunk_loss.py \
-  tests/ops/loss/test_chunk_loss_offload.py \
-  tests/ops/loss/test_causal_loss_reduction.py
+  tests/ops/loss/test_chunk_loss_offload.py
 make quality
 ```
 
