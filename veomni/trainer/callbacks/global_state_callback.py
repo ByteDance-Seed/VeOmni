@@ -79,6 +79,117 @@ def _has_exact_sft_dynamic_resume(trainer):
     return not isinstance(dataset, torch.utils.data.IterableDataset) or type(dataset) is WeightedMultiSourceDataset
 
 
+def _external_data_contract(trainer):
+    """Return an explicitly requested external exact-data provider."""
+    if getattr(trainer, "_veomni_require_exact_data_resume", False) is not True:
+        return None
+    loader = getattr(trainer, "train_dataloader", None)
+    contract = getattr(loader, "_veomni_exact_checkpoint_contract", None)
+    required = (
+        "install",
+        "checkpoint_identity",
+        "checkpoint_global_identity",
+        "validate_before_checkpoint",
+        "validate_cursor",
+    )
+    if not all(callable(getattr(contract, name, None)) for name in required):
+        raise RuntimeError("Exact data continuation requires an installed checkpoint provider")
+    return contract
+
+
+def prepare_external_data_contract(trainer, state=None, *, install=False):
+    """Coordinate rank-local provider errors before model checkpoint I/O.
+
+    Provider methods must not call distributed collectives: every invocation
+    is followed by its own error agreement before the next stage.
+    """
+    enabled = getattr(trainer, "_veomni_require_exact_data_resume", False) is True
+    if dist.is_initialized():
+        device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+        flags = torch.tensor([int(enabled), int(not enabled)], dtype=torch.int32, device=device)
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+        if flags.tolist() == [1, 1]:
+            raise RuntimeError("Ranks disagree on the exact external-data checkpoint mode")
+    contract, error = None, None
+    try:
+        contract = _external_data_contract(trainer)
+        if contract is not None:
+            checkpoints = _multi_optimizer_checkpoints(trainer)
+            legacy, unknown = _legacy_optimizer_checkpoints(trainer)
+            if not checkpoints or legacy or unknown:
+                raise RuntimeError("Exact external-data resume requires proven MultiOptimizer owners")
+            if getattr(trainer.args.train.checkpoint, "save_async", False) is not False:
+                raise RuntimeError("Exact external-data resume requires synchronous checkpoints")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking exact external-data providers")
+    if contract is None:
+        return
+    if install:
+        error = None
+        try:
+            contract.install()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "installing exact external-data provider")
+    error, replay_signature = None, None
+    try:
+        global_callback = getattr(trainer, "global_state_callback", None)
+        pending = getattr(global_callback, "_unadvanced_boundary_state", None)
+        reuse_boundary = (
+            state is not None
+            and isinstance(pending, dict)
+            and pending.get("global_step") == state.global_step
+            and pending.get("_veomni_external_data") is not None
+        )
+        contract.validate_before_checkpoint(trainer, None if reuse_boundary else state)
+        common_identity = contract.checkpoint_global_identity()
+        if not isinstance(common_identity, str) or not common_identity or len(common_identity) > 256:
+            raise RuntimeError("Exact data checkpoint provider has an invalid global identity")
+        if contract is not None:
+            identity = contract.checkpoint_identity()
+            if not isinstance(identity, str) or not identity or len(identity) > 256:
+                raise RuntimeError("Exact data checkpoint provider has an invalid identity")
+            if state is not None:
+                position = getattr(trainer, "_veomni_exact_epoch_position", None)
+                _validate_external_position(trainer, position, state.global_step)
+                if state.epoch != position["epoch"]:
+                    raise ValueError("Exact external-data loader and trainer positions differ")
+                if reuse_boundary:
+                    _validate_external_data_state(
+                        trainer,
+                        contract,
+                        pending["_veomni_external_data"],
+                        pending.get("train_dataloader"),
+                        state.global_step,
+                    )
+                elif getattr(trainer.train_dataloader, "_veomni_consumed_in_epoch", None) != position["step_in_epoch"]:
+                    raise ValueError("Exact external-data loader and trainer positions differ")
+        # Construct the digest before the coordinated error reduction. A
+        # rank-local non-serializable setting must not strand peers in the
+        # following collective.
+        replay_signature = _json_signature(
+            {
+                "source": common_identity,
+                "context": _dynamic_resume_context(trainer.args, None),
+                "optimizer_owners": sorted(name for name, _ in checkpoints),
+                # Composite runtimes save module owners in insertion order.
+                # Equal sets with different order can enter different DCP
+                # collectives on different ranks.
+                "module_order": list(getattr(trainer.model, "module_runtimes", {}) or {}),
+            }
+        ).hex()
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "validating exact external data before checkpoint")
+    _agree_restored_position(
+        getattr(state, "global_step", None),
+        getattr(state, "epoch", None),
+        dist.group.WORLD if dist.is_initialized() else None,
+        replay_contract=replay_signature,
+    )
+
+
 def _multi_optimizer_checkpoints(trainer):
     """Find every MultiOptimizer owner without silently dropping one."""
     root = getattr(trainer, "model", None)
@@ -196,6 +307,43 @@ def _json_signature(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).digest()
 
 
+def _validate_external_position(trainer, position, global_step):
+    steps = trainer.args.train_steps
+    epochs = getattr(trainer.args.train, "num_train_epochs", None)
+    if (
+        not isinstance(position, dict)
+        or set(position) != {"epoch", "step_in_epoch"}
+        or type(position["epoch"]) is not int
+        or type(position["step_in_epoch"]) is not int
+        or type(steps) is not int
+        or steps <= 0
+        or type(epochs) is not int
+        or type(global_step) is not int
+        or not 0 <= position["epoch"] < epochs
+        or not 0 < position["step_in_epoch"] <= steps
+        or global_step != position["epoch"] * steps + position["step_in_epoch"]
+    ):
+        raise ValueError("Exact external-data checkpoint epoch position is invalid")
+
+
+def _validate_external_data_state(trainer, contract, external, cursor, global_step):
+    if not isinstance(external, dict) or external.get("version") != 1:
+        raise ValueError("Exact external-data checkpoint metadata is missing")
+    position = external.get("position")
+    _validate_external_position(trainer, position, global_step)
+    if (
+        external.get("identity") != contract.checkpoint_identity()
+        or external.get("global_identity") != contract.checkpoint_global_identity()
+        or _json_signature(external.get("context"))
+        != _json_signature(_dynamic_resume_context(trainer.args, position["epoch"]))
+    ):
+        raise ValueError("Exact external-data checkpoint source or configuration differs")
+    contract.validate_cursor(trainer, cursor, require_cursor=True)
+    if cursor.get("_veomni_consumed_in_epoch") != position["step_in_epoch"]:
+        raise ValueError("Exact external-data cursor and trainer position differ")
+    return position["epoch"]
+
+
 def _agree_restored_position(global_step, saved_epoch, group, replay_contract=None):
     """Check loaded state, not the job configuration replicated by the launcher."""
     if not dist.is_initialized():
@@ -297,6 +445,9 @@ class GlobalStateCallback(Callback):
             return pending.copy()
         self._unadvanced_boundary_state = None
         loader = self.trainer.train_dataloader
+        contract = _external_data_contract(self.trainer)
+        if contract is not None:
+            contract.validate_before_checkpoint(self.trainer, state)
         if _has_exact_sft_dynamic_resume(self.trainer):
             loader._strict_resume_contract = True
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
@@ -322,6 +473,18 @@ class GlobalStateCallback(Callback):
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
+        if contract is not None:
+            position = getattr(self.trainer, "_veomni_exact_epoch_position", None)
+            result["_veomni_external_data"] = {
+                "version": 1,
+                "identity": contract.checkpoint_identity(),
+                "global_identity": contract.checkpoint_global_identity(),
+                "position": dict(position),
+                "context": _dynamic_resume_context(self.trainer.args, state.epoch),
+            }
+            _validate_external_data_state(
+                self.trainer, contract, result["_veomni_external_data"], train_dataloader_state, state.global_step
+            )
         if _has_exact_sft_dynamic_resume(self.trainer):
             result["_veomni_dynamic_context"] = _dynamic_resume_context(
                 self.trainer.args, getattr(state, "epoch", None)
@@ -481,7 +644,8 @@ class GlobalStateCallback(Callback):
         optimizer_step = steps[0] if steps else None
         _agree_restored_position(optimizer_step, None, dist.group.WORLD if dist.is_initialized() else None)
         strict_optimizer = type(optimizer_step) is int
-        strict_resume = strict_sft or strict_optimizer
+        external_enabled = getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True
+        strict_resume = strict_sft or strict_optimizer or external_enabled
         legacy_checkpoints, unknown_checkpoints, error = [], [], None
         try:
             legacy_checkpoints, unknown_checkpoints = _legacy_optimizer_checkpoints(self.trainer)
@@ -590,6 +754,14 @@ class GlobalStateCallback(Callback):
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
             loader = self.trainer.train_dataloader
+            contract = _external_data_contract(self.trainer)
+            external = global_state.get("_veomni_external_data")
+            if contract is not None:
+                if not strict_optimizer:
+                    raise ValueError("Exact external-data resume requires a verified optimizer generation")
+                saved_epoch = _validate_external_data_state(self.trainer, contract, external, cursor, global_step)
+            elif external is not None:
+                raise ValueError("Exact external-data checkpoint requires its original provider")
             saved_sft_context = "_veomni_dynamic_context" in global_state
             saved_geometry = isinstance(cursor, dict) and "_veomni_resume_geometry" in cursor
             is_dpo = getattr(self.trainer, "_dpo_resume_proven", False) is True
@@ -604,7 +776,7 @@ class GlobalStateCallback(Callback):
                 if global_state.get("_veomni_optimizer_generations") != generations:
                     raise ValueError("Trainer cursor and optimizer checkpoint generations differ")
                 dpo_proven = getattr(self.trainer, "_dpo_resume_proven", False) is True
-                if loader is not None and not strict_sft and not dpo_proven:
+                if loader is not None and not strict_sft and not dpo_proven and contract is None:
                     logger.warning_rank0(
                         "Resuming the existing loader cursor without a verified exact data-resume contract; "
                         "the optimizer state is validated, but the subsequent data sequence may differ."
@@ -903,6 +1075,14 @@ class GlobalStateCallback(Callback):
             set_device_rng_state(global_state.get("device_rng_state"))
 
         restore_local(restore_rng, "restoring training RNG")
+        if external_enabled:
+            position = global_state["_veomni_external_data"]["position"]
+            self.trainer._veomni_exact_epoch_position = dict(position)
+            self.trainer.state.epoch = position["epoch"]
+            if position["step_in_epoch"] == args.train_steps:
+                # The loader has entered the next epoch already. An immediate
+                # export must reuse the validated, unadvanced boundary cursor.
+                self._unadvanced_boundary_state = global_state
         if sft_next_epoch:
             # The live loader now points at the next epoch. If train_end exports
             # immediately without a step, serialize the original boundary

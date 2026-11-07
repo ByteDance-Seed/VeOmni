@@ -89,6 +89,26 @@ data stream, load the model weights as a new run instead of resuming its trainer
 state. Other trainer paths keep their existing resume contracts, including
 their own strict optimizer and data-codec checks where applicable.
 
+An integration can explicitly enable an external exact-data provider by setting
+`trainer._veomni_require_exact_data_resume = True` and attaching a compatible
+`_veomni_exact_checkpoint_contract` to its loader. The provider must install
+before training, validate its cursor and immutable source identity, and check
+the trainer's completed epoch position before checkpoint I/O. The trainer
+sidecar records its rank-local identity, position and input contract. Provider
+methods must be rank-local, and the separately declared global identity must
+agree across ranks. Recovery rejects a missing or changed provider, cursor or
+configuration and requires a matching MultiOptimizer generation. Exact mode
+requires synchronous saves and MultiOptimizer checkpoint owners at startup,
+so it cannot create a checkpoint its resume path would reject. Providers must
+include `_veomni_consumed_in_epoch` in their cursor and expose the same
+completed-step count as a live loader attribute before checkpoint callbacks.
+The integrating trainer must stop at its configured step limit before entering
+the next epoch, and treat a shared EOF before the planned epoch boundary as
+an error. Enabling the provider alone does not change a trainer's loop.
+The provider must itself establish which sources,
+worker geometry, prefetch states and epoch boundaries it supports; enabling the
+protocol alone does not qualify an arbitrary external loader.
+
 For the attested weighted multi-source streaming path, each worker reconstructs
 the original Hugging Face stream and rereads the rows that its source consumed
 in the saved epoch. This reconstructs the shuffle buffer, which the Hugging Face
