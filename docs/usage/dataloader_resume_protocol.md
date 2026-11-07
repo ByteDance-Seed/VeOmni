@@ -64,12 +64,12 @@ using a possibly wrong epoch. The temporary value is not itself a checkpoint or
 a replacement for the source's `state_dict()` / `load_state_dict()`.
 
 Regression coverage is in `tests/data/test_multisource_rng_resume.py`: the
-[main-process batching](../../tests/data/test_multisource_rng_resume.py#L202)
+[main-process batching](../../tests/data/test_multisource_rng_resume.py#L209)
 case exercises hook forwarding through the trainer callback, while the
-[loader resume](../../tests/data/test_multisource_rng_resume.py#L156) case
+[loader resume](../../tests/data/test_multisource_rng_resume.py#L160) case
 checks delayed `set_epoch()` with and without worker-side batching. The
-[second snapshot](../../tests/data/test_multisource_rng_resume.py#L304) and
-[unknown epoch](../../tests/data/test_multisource_rng_resume.py#L346) cases cover
+[second snapshot](../../tests/data/test_multisource_rng_resume.py#L313) and
+[unknown epoch](../../tests/data/test_multisource_rng_resume.py#L356) cases cover
 continued sampling after legacy restoration. Run them with
 `pytest -q tests/data/test_multisource_rng_resume.py`.
 
