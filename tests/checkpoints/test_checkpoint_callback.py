@@ -269,6 +269,32 @@ class TestCheckpointCallbackTrainEndWait:
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             cb.on_train_end(TrainerState(global_step=60))
 
+    def test_failed_async_epoch_wait_cannot_be_retried_as_success(self, mock_helper, monkeypatch):
+        from concurrent.futures import Future
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        failed = Future()
+        failed.set_exception(RuntimeError("HDFS write failed"))
+        monkeypatch.setattr(DistributedCheckpointer, "_async_save_failed", False)
+        monkeypatch.setattr(DistributedCheckpointer, "_save_futures", {"weights": failed})
+        monkeypatch.setattr(DistributedCheckpointer, "_async_process_groups", {})
+        trainer = _make_mock_trainer(save_async=True)
+        trainer.wait_for_pending_save.side_effect = DistributedCheckpointer.wait_for_pending_save
+        callback = CheckpointCallback(trainer)
+        callback._last_dcp_step = 5
+        state = TrainerState(global_step=5, epoch=0)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            callback.on_epoch_end(state)
+        assert not DistributedCheckpointer._save_futures
+        assert DistributedCheckpointer._async_save_failed is True
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            callback.on_epoch_end(state)
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            DistributedCheckpointer.wait_for_pending_save()
+        trainer.save_dcp.assert_not_called()
+
     def test_train_end_waits_even_without_async(self, mock_helper):
         """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
         trainer = _make_mock_trainer(save_async=False)
@@ -356,6 +382,7 @@ class TestModelCheckpointManagerSaveContract:
         assert saved["optimizer"] is runtime.optimizer
 
     def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        mock_dist.is_initialized.return_value = False
         runtime = _make_mock_runtime()
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
@@ -446,6 +473,16 @@ class TestModelCheckpointManagerSaveContract:
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
 class TestGlobalStateCallbackJobState:
     """Job-level state — dataloader, rng, meters, channel-loss — is not in the DCP sidecar."""
+
+    def test_fresh_run_does_not_coordinate_resume(self, mock_dist):
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = None
+        mock_dist.is_initialized.return_value = True
+        with patch("veomni.trainer.callbacks.global_state_callback.raise_if_any_rank_failed") as coordinate:
+            assert GlobalStateCallback(trainer).load_global_state() is None
+        coordinate.assert_not_called()
+        mock_dist.all_reduce.assert_not_called()
+        mock_dist.all_gather_object.assert_not_called()
 
     def test_state_dict_includes_channel_loss_callback_state(self, mock_dist):
         trainer = _make_mock_trainer()
@@ -555,8 +592,8 @@ class TestGlobalStateCallbackJobState:
         trainer.environ_meter.state_dict.return_value = {}
         cb = GlobalStateCallback(trainer)
 
-        def fail_the_write(_error, context):
-            if "trainer state" in context:
+        def fail_the_write(_error, context, group=None):
+            if context == "writing the trainer state":
                 raise RuntimeError("writing the trainer state failed on another rank")
 
         with patch(
@@ -672,8 +709,9 @@ class TestGlobalStateCallbackJobState:
         """A missing cursor on one rank must not leave the others at a different step."""
         mock_dist.is_initialized.return_value = True
 
-        def drop_presence(flag, op=None):
-            flag.zero_()
+        def drop_presence(flag, op=None, group=None):
+            if flag.numel() == 1:
+                flag.zero_()
 
         mock_dist.all_reduce.side_effect = drop_presence
         trainer = _make_mock_trainer()
@@ -695,7 +733,7 @@ class TestGlobalStateCallbackJobState:
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
+        assert mock_dist.all_reduce.call_count == 3
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
 
     def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):

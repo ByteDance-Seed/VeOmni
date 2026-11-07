@@ -149,15 +149,15 @@ Training from an upstream root:
   (skipped for `train.training_task: offline_embedding`, which exports nothing).
 - [`OmniConfig.load_checkpoint_sidecars`](../../../veomni/models/seed_omni/configuration_omni.py#L426) records the `HFSource`, which each `ModuleRuntime` receives.
 - `ModuleRuntime._build_model` builds the module on meta and
-  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L347);
-  [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L233) is the upstream root.
+  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L368);
+  [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L254) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
   - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1208) skip keys the converter declares, without reading them;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L331) renames the module's own keys and hands them to the module's converter.
 
-HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L619)):
+HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L633)):
 
-- [`_save_hf_source_layout`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L632) exports LoRA modules' adapters per module, skips frozen modules, and makes sure each trained module's DCP exists;
+- [`_save_hf_source_layout`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L644) exports LoRA modules' adapters per module, skips frozen modules, and makes sure each trained module's DCP exists;
 - [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L683) renames keys back (raising on a key with no source key or a different shape), casts to the source dtypes, fills tied duplicates, copies every other source tensor on rank 0, and writes `global_step_N/hf_ckpt/` with the source's shard files and non-weight files.
 
 Bare `OmniModel.from_pretrained` and eager inference:
