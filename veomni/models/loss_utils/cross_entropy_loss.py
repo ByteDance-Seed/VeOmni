@@ -25,10 +25,15 @@ from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
 
+import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
+from veomni.distributed.sequence_parallel import (
+    get_unified_sequence_parallel_group,
+    reduce_sequence_parallel_loss,
+)
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import FusedLinearAuxOutput
 
@@ -98,6 +103,7 @@ def _maybe_reduce_loss(
     ignore_index: int,
     sp_enabled: bool,
     loss_reduction_group: Any,
+    num_items_in_batch: int | Tensor | None = None,
 ) -> Tensor:
     """Reduce on an explicit group, or on the default SP group when SP is on.
 
@@ -106,15 +112,25 @@ def _maybe_reduce_loss(
     """
     if loss_reduction_group is None and not sp_enabled:
         return loss
+    group = loss_reduction_group
+    if group is None:
+        group = get_unified_sequence_parallel_group()
+    if num_items_in_batch is not None:
+        # The token op already computed local sum / the shared explicit count.
+        # Token weighting would normalize it a second time. Instead aggregate
+        # equal rank weights and convert the reducer's rank mean to a sum.
+        rank_weight = torch.ones((), device=loss.device, dtype=torch.long)
+        loss = reduce_sequence_parallel_loss(loss, rank_weight, group=group)
+        return loss * dist.get_world_size(group)
     num_valid_tokens = (target != ignore_index).sum()
-    return reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
+    return reduce_sequence_parallel_loss(loss, num_valid_tokens, group=group)
 
 
 def ForCausalLMLoss(
     logits: Tensor | None = None,
     labels: Tensor | None = None,
     vocab_size: int | None = None,
-    num_items_in_batch: int | None = None,
+    num_items_in_batch: int | Tensor | None = None,
     ignore_index: int = -100,
     shift_labels: Tensor | None = None,
     *,
@@ -127,6 +143,8 @@ def ForCausalLMLoss(
     ``op`` is a token-level ``cross_entropy_loss`` handle. A provided
     ``shift_labels`` is the final target. ``loss_reduction_group`` stays here
     and must not reach the op.
+    Explicit ``num_items_in_batch`` must be shared across the reduction group;
+    local CE sums are aggregated without a second token normalization.
     """
     del vocab_size
     hidden_states = kwargs.pop("hidden_states", None)
@@ -253,6 +271,7 @@ def ForCausalLMLoss(
         ignore_index=ignore_index,
         sp_enabled=sp_enabled,
         loss_reduction_group=loss_reduction_group,
+        num_items_in_batch=num_items_in_batch,
     )
     return loss, out_logits, None
 
