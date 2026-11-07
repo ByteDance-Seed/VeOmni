@@ -21,6 +21,7 @@ from torch.distributed.fsdp import fully_shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
+from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -39,9 +40,91 @@ _CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
+def _offloaded_extra_parallel_checkpoint_worker(rank, world_size, directory, phase, fused, endpoint):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
+    try:
+        singleton_groups = [dist.new_group([i]) for i in range(world_size)]
+        # An accelerator mesh can describe CPU-resident offloaded shards. Gloo
+        # supplies the real checkpoint collectives without requiring a GPU.
+        local_mesh = DeviceMesh.from_group(singleton_groups[rank], "xpu", mesh_dim_names=("ep_fsdp",))
+        full_mesh = DeviceMesh.from_group(
+            [singleton_groups[rank], dist.group.WORLD],
+            "xpu",
+            mesh=torch.arange(world_size).reshape(1, world_size),
+            mesh_dim_names=("ep_fsdp", "ep"),
+        )
+        spec = DTensor.from_local(torch.empty(2, 4, device="meta"), local_mesh, [Shard(1)])._spec
+        weight = nn.Parameter((torch.arange(8, dtype=torch.float32).reshape(2, 4) + rank * 8) / 100)
+        optimizer = torch.optim.AdamW([weight], lr=0.01, fused=fused)
+
+        def update(step):
+            weight.grad = torch.full_like(weight, rank + step + 0.25)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        def snapshot():
+            return {"weight": weight.detach().clone(), **{k: v.clone() for k, v in optimizer.state[weight].items()}}
+
+        def checkpoint_view(value):
+            origin = DTensor(value.detach(), spec, requires_grad=False)
+            result = restore_extra_parallel_dim(origin, full_mesh, local_mesh)
+            assert result.to_local().device.type == "cpu"
+            assert result.to_local().data_ptr() == value.data_ptr()
+            assert result.dtype == torch.float32
+            return result
+
+        update(1)
+        state = optimizer.state[weight]
+        if phase == "resume":
+            with torch.no_grad():
+                weight.add_(100)
+                for value in state.values():
+                    value.add_(100)
+        tensors = {
+            "weight": checkpoint_view(weight),
+            "m": checkpoint_view(state["exp_avg"]),
+            "v": checkpoint_view(state["exp_avg_sq"]),
+            "step": state["step"],
+        }
+        directory = Path(directory)
+        if phase == "save":
+            dcp.save(tensors, checkpoint_id=str(directory / "dcp"))
+            before = snapshot()
+            update(2)
+            torch.save({"before": before, "after": snapshot()}, directory / f"rank-{rank}.pt")
+        else:
+            dcp.load(tensors, checkpoint_id=str(directory / "dcp"))
+            for key in ("weight", "m", "v"):
+                restored = drop_extra_parallel_dim(tensors[key], local_mesh)
+                assert restored.to_local().device.type == "cpu"
+                assert restored.dtype == torch.float32
+            expected = torch.load(directory / f"rank-{rank}.pt", weights_only=True)
+            for key, value in snapshot().items():
+                torch.testing.assert_close(value, expected["before"][key], rtol=0, atol=0)
+            update(2)
+            for key, value in snapshot().items():
+                torch.testing.assert_close(value, expected["after"][key], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("fused", [False, True])
+def test_offloaded_extra_parallel_checkpoint_preserves_cpu_storage_and_update(tmp_path, fused):
+    for phase in ("save", "resume"):
+        spawn_with_rendezvous(
+            _offloaded_extra_parallel_checkpoint_worker, args=(2, str(tmp_path), phase, fused), nprocs=2
+        )
+
+
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
-    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -75,25 +158,23 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, en
         x = torch.randn(2, 4, device=device)
         source_model(x).sum().backward()
         source_optimizer.step()
-        expected = source_optimizer.state_dict()
+        source_optimizer.zero_grad()
+        expected = source_optimizer._sparse_state_dict()
 
         checkpoint_dir = tmp_path / "ckpt"
-        dcp.save(
-            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
-            checkpoint_id=str(checkpoint_dir),
+        DistributedCheckpointer.save(
+            str(checkpoint_dir),
+            {"model": source_model, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
         )
         dist.barrier()
 
         target_model, target_optimizer = build_model_and_optimizer()
-        dcp.load(
-            {
-                "model": ModelState(target_model),
-                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
-            },
-            checkpoint_id=str(checkpoint_dir),
+        DistributedCheckpointer.load(
+            str(checkpoint_dir),
+            {"model": target_model, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
         )
 
-        actual = target_optimizer.state_dict()
+        actual = target_optimizer._sparse_state_dict()
         assert expected.keys() == actual.keys()
         for key in expected:
             expected_value = expected[key]
@@ -164,7 +245,7 @@ class TestMultiOptimizerState:
     """Non-ExtraParallel MultiOptimizer must use its own DCP protocol."""
 
     def test_single_process_dcp_roundtrip(self, tmp_path):
-        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
         from veomni.optim.optimizer import MultiOptimizer
 
         def build_model_and_optimizer():
@@ -184,21 +265,24 @@ class TestMultiOptimizerState:
         for param in source_model.parameters():
             param.grad = torch.randn_like(param)
         source_optimizer.step()
-        expected = source_optimizer.state_dict()
+        source_optimizer.zero_grad()
+        expected = source_optimizer._sparse_state_dict()
         assert any("exp_avg" in key for key in expected)
         assert any("step" in key for key in expected)
 
         target_model, target_optimizer = build_model_and_optimizer()
-        dcp.save(
-            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": source_model, "optimizer": source_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
-        dcp.load(
-            {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target_model, "optimizer": target_optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
 
-        actual = target_optimizer.state_dict()
+        actual = target_optimizer._sparse_state_dict()
         assert expected.keys() == actual.keys()
         for key, expected_value in expected.items():
             actual_value = actual[key]
@@ -219,7 +303,7 @@ class TestMultiOptimizerState:
         from torch.distributed.checkpoint import FileSystemReader
         from torch.distributed.checkpoint.metadata import Metadata
 
-        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
         from veomni.optim.optimizer import MultiOptimizer
 
         model = nn.Linear(4, 4)
@@ -234,16 +318,18 @@ class TestMultiOptimizerState:
         # Only bias gets a gradient; the adamw_w sub-optimizer remains empty.
         model.bias.grad = torch.randn_like(model.bias)
         optimizer.step()
+        optimizer.zero_grad()
         assert optimizer.optimizers_dict["adamw_b"].state
         assert not optimizer.optimizers_dict["adamw_w"].state
 
         parallel_state = SimpleNamespace(dp_mode="fsdp2")
-        dcp.save(
-            {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
-            checkpoint_id=tmp_path,
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel_state,
         )
 
-        reader = FileSystemReader(tmp_path)
+        reader = FileSystemReader(tmp_path / "model" / "optimizer")
         metadata = reader.read_metadata()
         assert isinstance(metadata, Metadata)
         keys = list(metadata.state_dict_metadata.keys())
@@ -529,9 +615,9 @@ class TestAllowPartialLoad:
         mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        model = MagicMock()
+        model = nn.Linear(2, 2)
         model._fqn2spec_info = None
-        optimizer = MagicMock()
+        optimizer = torch.optim.AdamW(model.parameters())
 
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}
 
@@ -612,7 +698,7 @@ class TestSkipHfWeightLoadOnResume:
 
         result = build_parallelize_model(
             model,
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
         )
@@ -654,7 +740,7 @@ class TestSkipHfWeightLoadOnResume:
         resumed = parallelize_model_fsdp2(
             resumed,
             weights_path="unused-hf-path",
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             should_skip_hf_weight_load=True,
             init_device="meta",
         )
@@ -723,7 +809,7 @@ class TestMaterializeAndLoadDispatch:
         parallelize_model_fsdp2(
             nn.Linear(2, 2),
             weights_path="hf-path",
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             init_device="meta",
             broadcast_model_weights_from_rank0=True,
         )
@@ -963,7 +1049,7 @@ class TestDdpMetaInit:
 
         build_parallelize_model(
             MagicMock(),
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
             init_device="meta",
@@ -1026,6 +1112,7 @@ class TestWaitForPendingSave:
 
         DistributedCheckpointer._save_futures = {}
         DistributedCheckpointer._async_process_groups = {}
+        DistributedCheckpointer._async_save_failed = False
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -1225,7 +1312,7 @@ class TestWaitForPendingSave:
         for slot in ("ckpt", "optimizer"):
             DistributedCheckpointer.execute_save(
                 save_state={},
-                storage_writer=MagicMock(),
+                storage_writer=MagicMock(spec=dcp.FileSystemWriter),
                 save_async=True,
                 slot=slot,
             )
@@ -1253,7 +1340,11 @@ class TestWaitForPendingSave:
         DistributedCheckpointer._async_process_groups = {}
         try:
             DistributedCheckpointer.execute_save(
-                save_state={}, storage_writer=MagicMock(), save_async=True, slot="ckpt", timeout_seconds=1800
+                save_state={},
+                storage_writer=MagicMock(spec=dcp.FileSystemWriter),
+                save_async=True,
+                slot="ckpt",
+                timeout_seconds=1800,
             )
             assert mock_dist.new_group.call_args.kwargs == {"backend": "gloo", "timeout": timedelta(seconds=1800)}
         finally:
@@ -1586,7 +1677,10 @@ class TestPromoteStagedCheckpoint:
         means; cases about *another* rank failing patch `any_rank_failed`
         directly.
         """
-        with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+        with (
+            patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"),
+            patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+        ):
             with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None, group=None: None):
                 yield
 
@@ -2482,6 +2576,8 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.checkpoint.dcp_checkpointer._checkpoint_optimizer_policy", return_value=(None, False)),
+            patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
@@ -2916,3 +3012,29 @@ class TestShardingPlanDropHfKeys:
 
         assert set(plan) == set(expected)
         assert size == expected_size
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_split_dcp_prepares_lazy_adam_only_after_loading_model(tmp_path):
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class Pair(nn.Module):
+        def __init__(self, unused):
+            super().__init__()
+            self.used = nn.Parameter(torch.tensor([2.0]))
+            self.unused = nn.Parameter(torch.tensor([unused]))
+
+    original = Pair(4.0)
+    optimizer = torch.optim.Adam(original.parameters(), lr=0.1, weight_decay=0.5, foreach=False)
+    original.used.grad = torch.ones_like(original.used)
+    optimizer.step()
+    assert original.unused not in optimizer.state
+    DistributedCheckpointer.save(str(tmp_path), {"model": original, "optimizer": optimizer})
+
+    restored = Pair(100.0)
+    resumed_optimizer = torch.optim.Adam(restored.parameters(), lr=0.1, weight_decay=0.5, foreach=False)
+    DistributedCheckpointer.load(str(tmp_path), {"model": restored, "optimizer": resumed_optimizer})
+    torch.testing.assert_close(restored.unused, original.unused, rtol=0, atol=0)
+    # PyTorch's legacy synthetic state initialization for missing entries is
+    # still approximate; this checks it sees the restored value, not 100.0.
+    torch.testing.assert_close(resumed_optimizer.state[restored.unused]["exp_avg"], torch.tensor([0.2]))

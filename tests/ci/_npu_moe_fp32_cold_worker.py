@@ -1,0 +1,233 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Two-rank native FSDP2/EP expert-gradient and fresh-process DCP probe."""
+
+import os
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.distributed._tensor import DTensor, Shard
+
+from veomni.arguments.arguments_types import MixedPrecisionConfig
+from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
+from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import Qwen4ExpTextExperts
+from veomni.optim.optimizer import build_optimizer
+
+
+class ToyDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        config = SimpleNamespace(
+            num_experts=4,
+            hidden_size=256,
+            moe_intermediate_size=32,
+            hidden_act="silu",
+            ops_config=SimpleNamespace(moe_implementation="fused_npu"),
+        )
+        self.experts = Qwen4ExpTextExperts(config)
+
+    def forward(self, x, indices, weights):
+        return self.experts(x, indices, weights)
+
+
+class ToyQwen4(nn.Module):
+    _no_split_modules = ["ToyDecoder"]
+
+    def __init__(self):
+        super().__init__()
+        # This expert-only fixture deliberately has no GDN layers.
+        self.config = SimpleNamespace(model_type="qwen4_exp", layer_types=["full_attention"])
+        self.layer = ToyDecoder()
+
+    def forward(self, x, indices, weights):
+        return self.layer(x, indices, weights)
+
+    def init_weights(self):
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                param.fill_(0.01 if "gate" in name else 0.02)
+
+    def get_parallel_plan(self):
+        plan = ParallelPlan(
+            extra_parallel_plan={"ep": {"layer.experts.gate_up_proj": Shard(0), "layer.experts.down_proj": Shard(0)}}
+        )
+        plan.extra_parallel_fsdp_no_shard_module = {"ep": {"layer.experts"}}
+        return plan
+
+
+def _local(tensor):
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _optimizer_state(optimizer, param):
+    leaves = getattr(optimizer, "optimizers_dict", None)
+    owners = [leaf for leaf in leaves.values() if param in leaf.state] if leaves is not None else [optimizer]
+    assert len(owners) == 1 and param in owners[0].state
+    return owners[0].state[param]
+
+
+def _assert_selective_placement(model, optimizer, resident):
+    expected = "npu" if resident else "cpu"
+    for param in model.layer.experts.parameters():
+        assert _local(param).device.type == expected
+        state = _optimizer_state(optimizer, param)
+        assert all(_local(state[key]).device.type == expected for key in ("exp_avg", "exp_avg_sq"))
+
+
+def _snapshot(model, optimizer):
+    result = {}
+    for name, param in model.named_parameters():
+        state = _optimizer_state(optimizer, param)
+        parameter_device = _local(param).device.type
+        assert all(_local(state[part]).device.type == parameter_device for part in ("exp_avg", "exp_avg_sq"))
+        result[name] = {
+            "param": _local(param.detach()).cpu().clone(),
+            "m": _local(state["exp_avg"]).detach().cpu().clone(),
+            "v": _local(state["exp_avg_sq"]).detach().cpu().clone(),
+            "step": _local(state["step"]).detach().cpu().clone(),
+        }
+        assert all(result[name][part].dtype == torch.float32 for part in ("param", "m", "v"))
+    return result
+
+
+def _step(model, optimizer, rank, ep, step):
+    generator = torch.Generator().manual_seed(9900 + rank * 10 + step)
+    x = torch.randn(8, 256, generator=generator).to(device="npu", dtype=torch.bfloat16)
+    # Each EP rank owns a zero-token expert while experts 0 and 2 receive tokens.
+    indices = torch.tensor([[0, 2]] * 8, device="npu", dtype=torch.int64)
+    weights = torch.full((8, 2), 0.5, device="npu", dtype=torch.float32)
+    optimizer.zero_grad()
+    loss = model(x, indices, weights).float().square().mean()
+    loss.backward()
+    grads = {}
+    for name, param in model.named_parameters():
+        assert param.grad is not None and param.grad.dtype == torch.float32
+        assert _local(param.grad).device.type == _local(param).device.type
+        grads[name] = _local(param.grad).detach().cpu().clone()
+        assert torch.isfinite(grads[name]).all()
+        assert grads[name].shape[0] == 2
+        assert torch.count_nonzero(grads[name][0]).item() > 0
+        assert torch.count_nonzero(grads[name][1]).item() == 0
+        assert torch.any(grads[name][0] != grads[name][0].bfloat16().float()).item()
+    optimizer.step()
+    return {
+        "input": x.cpu(),
+        "indices": indices.cpu(),
+        "weights": weights.cpu(),
+        "loss": loss.detach().cpu(),
+        "grads": grads,
+        "state": _snapshot(model, optimizer),
+    }
+
+
+def run(rank, phase, output_dir, ep, endpoint=None, *, selective=False, resident=False):
+    import torch_npu  # noqa: F401
+
+    torch.npu.set_device(rank)
+    kwargs = {"backend": "hccl", "rank": rank, "world_size": 2, "timeout": timedelta(seconds=180)}
+    if endpoint is not None:
+        kwargs["store"] = endpoint.connect()
+    dist.init_process_group(**kwargs)
+    try:
+        mixed = MixedPrecisionConfig(npu_expert_fp32_wgrad=True)
+        _init_parallel_state(
+            dp_size=2,
+            dp_shard_size=2,
+            device_type="npu",
+            name="npu-fp32-experts",
+            extra_parallel_sizes=(ep,),
+            extra_parallel_names=("ep",),
+            extra_parallel_placement_innermost=(False,),
+        )
+        with torch.device("meta"):
+            model = ToyQwen4()
+        model = build_parallelize_model(
+            model,
+            mixed_precision=mixed,
+            enable_gradient_checkpointing=False,
+            init_device="meta",
+            enable_forward_prefetch=False,
+            cpu_offload_extra_parallel_names=["ep"] if selective else [],
+            cpu_offload_exclude_module_patterns=["layer.experts"] if resident else [],
+        )
+        assert model.layer.experts._veomni_fp32_expert_wgrad
+        if selective:
+            expected = "npu" if resident else "cpu"
+            assert all(_local(param).device.type == expected for param in model.layer.experts.parameters())
+        optimizer = build_optimizer(model, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.0, fused=False)
+        ckpt = str(Path(output_dir) / f"ep{ep}-dcp")
+        if phase == "fresh":
+            # The locally unused expert is different on each EP owner, so a
+            # duplicated or swapped shard cannot pass the resume comparison.
+            with torch.no_grad():
+                for param in model.parameters():
+                    _local(param)[0].add_(rank / 2048)
+                    _local(param)[1].add_(rank / 1024)
+            _step(model, optimizer, rank, ep, 1)
+            # An expert can have historical moments even when this batch gave
+            # it no tokens. Make those moments distinct across EP owners too.
+            with torch.no_grad():
+                for param in model.parameters():
+                    state = _optimizer_state(optimizer, param)
+                    _local(state["exp_avg"])[1].fill_((rank + 1) / 1024)
+                    _local(state["exp_avg_sq"])[1].fill_((rank + 1) / 2048)
+            optimizer.zero_grad()
+            DistributedCheckpointer.save(
+                ckpt,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=get_parallel_state(),
+            )
+        else:
+            with torch.no_grad():
+                for param in model.parameters():
+                    _local(param).fill_(-0.05 - rank * 0.01)
+            DistributedCheckpointer.load(
+                ckpt,
+                {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=get_parallel_state(),
+            )
+        if selective:
+            _assert_selective_placement(model, optimizer, resident)
+        before = _snapshot(model, optimizer)
+        after = _step(model, optimizer, rank, ep, 2)
+        if selective:
+            _assert_selective_placement(model, optimizer, resident)
+        for name in before:
+            assert not torch.equal(before[name]["param"], after["state"][name]["param"])
+        torch.save({"before": before, "after": after}, Path(output_dir) / f"ep{ep}-{phase}-rank{rank}.pt")
+        dist.barrier()
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+def run_selective(rank, phase, output_dir, resident, endpoint):
+    run(rank, phase, output_dir, 2, endpoint, selective=True, resident=resident)
+
+
+if __name__ == "__main__":
+    run(
+        int(os.environ["RANK"]),
+        os.environ["FP32_EXPERT_PHASE"],
+        os.environ["FP32_EXPERT_OUTPUT"],
+        int(os.environ["FP32_EXPERT_EP"]),
+    )

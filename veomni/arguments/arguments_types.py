@@ -96,7 +96,8 @@ class OptimizerConfig:
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
                 "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
                 "in host buffers and streams them to the device in batches, lowering peak device "
-                "memory (type='adamw' only)."
+                "memory (type='adamw' only). This cannot be combined with selective ExtraParallel "
+                "CPU offload."
             )
         },
     )
@@ -281,6 +282,10 @@ class OptimizerConfig:
     )
 
     def __post_init__(self):
+        # YAML sequences arrive as lists; the declared tuple also prevents
+        # optimizer defaults and groups from sharing mutable beta options.
+        if isinstance(self.betas, list):
+            self.betas = tuple(self.betas)
         # Annotations are not enforced for YAML values (see constraints), so the
         # literal is validated explicitly; otherwise a typo would silently fall
         # back to the stock path in the builder.
@@ -621,8 +626,21 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    npu_expert_fp32_wgrad: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Compute NPU fused MoE expert weight gradients in FP32 while keeping BF16 forward and "
+                "input gradients. Currently supports Qwen4-Exp with FSDP2, BF16 parameters, FP32 "
+                "reduction, and native communication; increases expert gather and temporary memory."
+            )
+        },
+    )
 
     def __post_init__(self):
+        if not isinstance(self.npu_expert_fp32_wgrad, bool):
+            raise ValueError("npu_expert_fp32_wgrad must be a boolean (true or false).")
+
         def _check_dtype(dtype: str):
             if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
                 raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
@@ -726,6 +744,14 @@ class FSDPConfig:
             )
         },
     )
+    cpu_offload_extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "CPU-offload selected ExtraParallel parameter/gradient groups (currently ep only)."},
+    )
+    cpu_offload_exclude_module_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Keep matching selected expert modules resident on the accelerator; complete FQN patterns."},
+    )
     expert_fsdp_shard_dim: Optional[int] = field(
         default=None,
         metadata={
@@ -761,6 +787,13 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
+        if self.cpu_offload_exclude_module_patterns and not self.cpu_offload_extra_parallel_names:
+            raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+        if self.cpu_offload_extra_parallel_names:
+            if self.fsdp_mode != "fsdp2" or self.offload:
+                raise ValueError("Selective ExtraParallel CPU offload requires FSDP2 and global offload=False")
+            if self.cpu_offload_extra_parallel_names != ["ep"]:
+                raise ValueError("Only the ep ExtraParallel axis supports selective CPU offload")
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
@@ -1093,6 +1126,12 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+    extra_parallel_canonical_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
+        },
+    )
 
     def __post_init__(self):
         """Reject a save configuration that cannot do what it says.
@@ -1101,6 +1140,12 @@ class CheckpointConfig:
         ``save_async`` too, but not until the first checkpoint is due -- a
         ``save_steps``-long wait to be told the configuration was never valid.
         """
+        if not isinstance(self.extra_parallel_canonical_layout, bool):
+            raise ValueError(
+                "extra_parallel_canonical_layout must be a boolean; use unquoted true or false in YAML, "
+                f"got {self.extra_parallel_canonical_layout!r}."
+            )
+
         if self.stage_dir and self.save_async:
             raise ValueError(
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
@@ -2013,6 +2058,10 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
+        if self.optimizer.state_offload == "cpu" and self.accelerator.fsdp_config.cpu_offload_extra_parallel_names:
+            raise ValueError(
+                "model.optimizer.state_offload='cpu' cannot be combined with selective ExtraParallel CPU offload."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
@@ -2117,6 +2166,25 @@ class DataArguments:
         default=10_000,
         metadata={
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
+        },
+    )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Caller-attested SHA256 identity of the immutable input snapshot, tokenizer, collator and "
+                "deterministic data transforms. "
+                "Required to resume a main-process dynamic batching cursor exactly."
+            )
+        },
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Attest that input decoding, preprocessing and collation are deterministic and do not consume "
+                "untracked worker RNG state."
+            )
         },
     )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(

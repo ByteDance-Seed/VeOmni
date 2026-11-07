@@ -1,0 +1,249 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Opt-in DPO-specific evidence around the ordinary packing collator."""
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from ..utils.constants import IGNORE_INDEX
+from ..utils.dpo_provenance import (
+    DPO_FEATURE_KEY,
+    DPO_PROOF_KEY,
+    DPOFeatureSegments,
+    DPOInvalidProof,
+    DPOPackedProof,
+)
+from . import data_collator as collator_module
+from .data_collator import DEFAULT_DATA_COLLATE_INFO, MainCollator
+from .dataset import get_length_fn
+
+
+@dataclass
+class DPOMicroBatchCollator:
+    """Split a fixed DPO batch, retaining an incomplete final batch."""
+
+    num_micro_batch: int
+    internal_data_collator: Any
+
+    def __call__(self, features):
+        if not features or self.num_micro_batch <= 0:
+            raise ValueError("DPO microbatching requires samples and a positive microbatch count")
+        unwrapped = [item[0] for item in features]
+        count = min(len(unwrapped), self.num_micro_batch)
+        size, remainder = divmod(len(unwrapped), count)
+        result = []
+        start = 0
+        for index in range(count):
+            end = start + size + (index < remainder)
+            result.append(self.internal_data_collator(unwrapped[start:end]))
+            start = end
+        return result
+
+
+def _source_metadata_valid(feature: dict[str, Any], extra_keys: tuple[str, ...]) -> bool:
+    for key in dict.fromkeys(("ds_idx", "source_name", *extra_keys)):
+        if key not in feature:
+            continue
+        value = feature[key]
+        if isinstance(value, torch.Tensor) and value.device.type == "cpu" and value.numel() == 1:
+            value = value.item()
+        if type(value) not in (int, str):
+            return False
+    return True
+
+
+def _supported_provenance_features(features: list[dict[str, Any]], source_keys: tuple[str, ...]) -> bool:
+    """Reject unsupported feature values before producing local segment evidence."""
+
+    def supported(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.device.type == "cpu"
+        if isinstance(value, dict):
+            return all(type(key) is str and supported(item) for key, item in value.items())
+        if isinstance(value, (list, tuple)):
+            return all(supported(item) for item in value)
+        return value is None or type(value) in (bool, int, float, str)
+
+    allowed = {"input_ids", "labels", "position_ids", "attention_mask", "cur_token_num", *source_keys}
+    for feature in features:
+        if any(key not in allowed for key in feature):
+            return False
+        for key in ("input_ids", "labels", "position_ids", "attention_mask"):
+            tensor = feature.get(key)
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.ndim != 1:
+                return False
+        if any(not supported(value) for value in feature.values()):
+            return False
+    return True
+
+
+@dataclass
+class DPOProvenanceCollator:
+    """Carry producer-proven segment lengths without modifying model inputs.
+
+    Mixed legacy or unsupported layouts are marked invalid for coordinated
+    rejection; we never infer padding from token IDs or masks.
+    """
+
+    collator: Any
+    require_ds_idx: bool = False
+    source_keys: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        state = collator_module.get_parallel_state()
+        self.sp_size = state.sp_size if state.sp_enabled else 1
+        self.sp_rank = state.sp_rank if state.sp_enabled else 0
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        sp_size, sp_rank = self.sp_size, self.sp_rank
+        metadata = [feature.get(DPO_FEATURE_KEY) for feature in features]
+        known = [isinstance(item, DPOFeatureSegments) for item in metadata]
+        # Never remove a same-named field belonging to an external producer.
+        clean = []
+        for feature, is_known in zip(features, known):
+            sample = {k: v for k, v in feature.items() if not (is_known and k == DPO_FEATURE_KEY)}
+            if isinstance(sample.get("labels"), torch.Tensor):
+                sample["labels"] = sample["labels"].clone()
+            clean.append(sample)
+        if not any(known):
+            batch = self.collator(clean)
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("DPO feature provenance is missing")
+            return batch
+        can_prove = all(known)
+        source_keys = tuple(dict.fromkeys(("ds_idx", "source_name", *self.source_keys)))
+        model_keys = {
+            "input_ids",
+            "labels",
+            "position_ids",
+            "attention_mask",
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "linear_attn_cu_seq_lens_q",
+            "packed_sequence_slices",
+            "max_length_q",
+            "max_length_k",
+            "attention_mask_is_all_ones",
+            "tail_padding_length",
+            "use_cache",
+            "return_log_probs",
+        }
+        if model_keys.intersection(source_keys):
+            raise ValueError("DPO source metadata keys must not overlap model inputs")
+        can_prove = can_prove and not any(
+            any(key in feature for feature in clean) and not all(key in feature for feature in clean)
+            for key in source_keys
+        )
+        has_ds_idx = all("ds_idx" in feature for feature in clean)
+        can_prove = can_prove and (has_ds_idx or not self.require_ds_idx)
+        ds_indices: list[int] = []
+        if can_prove and has_ds_idx:
+            for feature in clean:
+                value = feature["ds_idx"]
+                if isinstance(value, torch.Tensor) and value.device.type == "cpu" and value.numel() == 1:
+                    value = value.item()
+                if type(value) is not int or value < 0:
+                    can_prove = False
+                    break
+                ds_indices.append(value)
+        can_prove = can_prove and _supported_provenance_features(clean, source_keys)
+        segment_lengths: list[int] = []
+        counts: list[int] = []
+        if can_prove:
+            for feature, item in zip(clean, metadata):
+                ids = feature.get("input_ids")
+                if (
+                    not isinstance(ids, torch.Tensor)
+                    or ids.ndim != 1
+                    or type(item.producer_contract_version) is not int
+                    or item.producer_contract_version != 1
+                    or type(item.chosen) is not int
+                    or type(item.rejected) is not int
+                    or item.chosen <= 0
+                    or item.rejected <= 0
+                    or item.chosen + item.rejected != ids.numel()
+                    or any(
+                        feature[key].dtype not in (torch.int32, torch.int64)
+                        for key in ("input_ids", "labels", "position_ids")
+                    )
+                    or any(feature[key].shape != ids.shape for key in ("labels", "position_ids", "attention_mask"))
+                    or not bool(feature["attention_mask"].eq(1).all())
+                    or not bool((feature["input_ids"] >= 0).all())
+                    or not bool(((feature["labels"] >= 0) | (feature["labels"] == IGNORE_INDEX)).all())
+                    or not bool(
+                        ((feature["labels"] == IGNORE_INDEX) | (feature["labels"] == feature["input_ids"])).all()
+                    )
+                    or not bool((feature["labels"][: item.chosen] != IGNORE_INDEX).any())
+                    or not bool((feature["labels"][item.chosen :] != IGNORE_INDEX).any())
+                    or (item.chosen > 1 and not bool((feature["labels"][1 : item.chosen] != IGNORE_INDEX).any()))
+                    or (item.rejected > 1 and not bool((feature["labels"][item.chosen + 1 :] != IGNORE_INDEX).any()))
+                    or not bool((feature["position_ids"] >= 0).all())
+                    or not _source_metadata_valid(feature, self.source_keys)
+                ):
+                    can_prove = False
+                    break
+                segment_lengths.extend((item.chosen, item.rejected))
+                counts.append(get_length_fn(feature))
+
+        batch = self.collator(clean)
+        if not can_prove:
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("missing or invalid feature segments")
+            return batch
+        if has_ds_idx:
+            packed_ds = batch.get("ds_idx")
+            if isinstance(packed_ds, torch.Tensor) and packed_ds.device.type == "cpu" and packed_ds.ndim == 1:
+                packed_ds = packed_ds.tolist()
+            if not isinstance(packed_ds, list) or packed_ds != ds_indices:
+                batch[DPO_PROOF_KEY] = DPOInvalidProof("packed source IDs do not match feature order")
+                return batch
+        if (
+            type(self.collator) is not MainCollator
+            or self.collator.metadata_collate_func is not None
+            or self.collator.seq_classification
+        ):
+            batch[DPO_PROOF_KEY] = DPOInvalidProof(
+                "custom collator, metadata hook, or classification layout is not proven"
+            )
+            return batch
+        infos = self.collator.collate_infos
+        if any(
+            infos[name] != DEFAULT_DATA_COLLATE_INFO[name]
+            for name in ("input_ids", "labels", "position_ids", "attention_mask")
+        ):
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("custom token packing or label padding is not proven")
+            return batch
+        if any(infos.get(name) != DEFAULT_DATA_COLLATE_INFO.get(name) for name in ("cur_token_num", *source_keys)):
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("custom source metadata collation is not proven")
+            return batch
+        cu = batch.get("cu_seq_lens_q")
+        if not isinstance(cu, torch.Tensor) or cu.device.type != "cpu" or cu.ndim != 1:
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("packed CU is unavailable on CPU")
+            return batch
+        actual = cu.tolist()
+        expected = [0]
+        for length in segment_lengths:
+            expected.append(expected[-1] + length)
+        tail = batch.get("tail_padding_length")
+        tail = int(tail) if tail is not None else 0
+        expected_full = expected + [expected[-1] + tail] if tail > 0 else expected
+        if tail < 0 or actual != expected_full:
+            batch[DPO_PROOF_KEY] = DPOInvalidProof("packed CU does not match producer segments and collator tail")
+            return batch
+        batch[DPO_PROOF_KEY] = DPOPackedProof(
+            tuple(segment_lengths),
+            tuple(counts),
+            tail,
+            tuple(ds_indices),
+            source_keys,
+            sp_size,
+            sp_rank,
+            producer_contract_version=1,
+        )
+        return batch
