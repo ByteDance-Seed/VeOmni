@@ -469,6 +469,8 @@ class BaseTrainer(Stateful, ABC):
         dataloader_kwargs.pop("use_background_prefetcher", None)
         if dpo_no_synthetic_padding and dataloader_type == "native":
             dataloader_kwargs["_dpo_no_synthetic_padding"] = True
+        if dataloader_type == "native":
+            dataloader_kwargs["resume_replay_timeout_seconds"] = args.data.resume_replay_timeout_seconds
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,

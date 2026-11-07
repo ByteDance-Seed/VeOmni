@@ -42,6 +42,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -78,7 +79,8 @@ def _agree_dpo_output_checkpoint(value, group=None):
 
 
 def _has_exact_sft_dynamic_resume(trainer):
-    """Keep iterable sources on their legacy cursor path, without relaxing mapping validation."""
+    """Enable the strict SFT cursor contract for mapping and supported multi-source loaders."""
+    from ...data.dataset import WeightedMultiSourceDataset
     from ...data.dynamic_batching import DynamicBatchSizeDataLoader
 
     loader = getattr(trainer, "train_dataloader", None)
@@ -88,7 +90,7 @@ def _has_exact_sft_dynamic_resume(trainer):
     ):
         return False
     dataset = getattr(loader._dataloader, "dataset", None)
-    return not isinstance(dataset, torch.utils.data.IterableDataset)
+    return not isinstance(dataset, torch.utils.data.IterableDataset) or type(dataset) is WeightedMultiSourceDataset
 
 
 def _multi_optimizer_checkpoints(trainer):
@@ -129,7 +131,7 @@ def _saved_multi_optimizer_generations(trainer, step):
     for name, checkpoint in _multi_optimizer_checkpoints(trainer):
         generation = getattr(checkpoint, "_last_saved_optimizer_generation", None)
         if getattr(checkpoint, "_last_saved_step", None) != step or not isinstance(generation, str) or not generation:
-            raise RuntimeError("Trainer state has no matching MultiOptimizer checkpoint generation")
+            raise RuntimeError("Trainer state has no matching same-step MultiOptimizer checkpoint generation")
         generations[name] = generation
     return generations
 
@@ -208,18 +210,20 @@ def _json_signature(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).digest()
 
 
-def _agree_restored_position(global_step, saved_epoch, group):
+def _agree_restored_position(global_step, saved_epoch, group, replay_contract=None):
     """Check loaded state, not the job configuration replicated by the launcher."""
     if not dist.is_initialized():
         return
-    signature = _json_signature({"global_step": global_step, "saved_epoch": saved_epoch})
+    signature = _json_signature(
+        {"global_step": global_step, "saved_epoch": saved_epoch, "replay_contract": replay_contract}
+    )
     device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
     low = torch.tensor(list(signature), dtype=torch.int32, device=device)
     high = low.clone()
     dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
     dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
     if not torch.equal(low, high):
-        raise RuntimeError("Restored training position differs across ranks")
+        raise RuntimeError("Restored training position differs across ranks, including its data-replay contract")
 
 
 class GlobalStateCallback(Callback):
@@ -754,6 +758,9 @@ class GlobalStateCallback(Callback):
         sft_next_epoch = False
         prepared_sft_buffer = None
         saved_epoch = None
+        weighted_replay = False
+        replay_timeout = None
+        replay_workers = None
         try:
             cursor = global_state.get("train_dataloader")
             global_step = global_state["global_step"]
@@ -837,25 +844,44 @@ class GlobalStateCallback(Callback):
                 source = loader._dataloader
                 if getattr(source, "num_workers", 0) and getattr(source, "in_order", True) is not True:
                     raise ValueError("exact dynamic loader resume requires in-order data workers")
+                from torch.utils.data.dataloader import _InfiniteConstantSampler
                 from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
 
                 from ...data.data_loader import DistributedDataloader
-                from ...data.dataset import InterleavedMappingDataset, MappingDataset
+                from ...data.dataset import InterleavedMappingDataset, MappingDataset, WeightedMultiSourceDataset
 
+                dataset = getattr(source, "dataset", None)
+                sampler = getattr(source, "sampler", None)
+                batch_sampler = getattr(source, "batch_sampler", None)
+                batch_size = getattr(source, "batch_size", None)
+                batch_layout = (batch_size is None and batch_sampler is None) or (
+                    type(batch_sampler) is BatchSampler
+                    and batch_sampler.sampler is sampler
+                    and batch_sampler.batch_size == batch_size
+                    and batch_sampler.drop_last == getattr(source, "drop_last", None)
+                )
+                mapping_source = (
+                    type(dataset) in (MappingDataset, InterleavedMappingDataset)
+                    and type(sampler) is StatefulDistributedSampler
+                    and type(batch_sampler) is BatchSampler
+                )
+                weighted_source = (
+                    type(dataset) is WeightedMultiSourceDataset
+                    and type(sampler) is _InfiniteConstantSampler
+                    and bool(dataset._fingerprint)
+                )
                 if (
                     type(source) is not DistributedDataloader
-                    or type(getattr(source, "sampler", None)) is not StatefulDistributedSampler
-                    or type(getattr(source, "dataset", None)) not in (MappingDataset, InterleavedMappingDataset)
-                    or type(getattr(source, "batch_sampler", None)) is not BatchSampler
-                    or source.batch_sampler.sampler is not source.sampler
-                    or source.batch_sampler.batch_size != source.batch_size
-                    or source.batch_sampler.drop_last != source.drop_last
+                    or not batch_layout
+                    or not (mapping_source or weighted_source)
                     or source.snapshot_every_n_steps != 1
                     or source.generator is not None
                 ):
                     raise ValueError(
-                        "exact dynamic loader resume requires the standard native mapping source and sampler"
+                        "exact dynamic loader resume requires a standard native mapping or replayable multi-source loader"
                     )
+                if weighted_source:
+                    source.validate_weighted_resume_state(cursor.get("dataloader_state"), expected_epoch=epoch)
                 rng = global_state.get("torch_rng_state")
                 if not isinstance(rng, torch.Tensor):
                     raise ValueError("exact dynamic loader resume requires the saved CPU RNG state")
@@ -883,13 +909,20 @@ class GlobalStateCallback(Callback):
 
                     source = loader._dataloader
                     dataset = getattr(source, "dataset", None)
+                    mapping_epoch_source = (
+                        type(getattr(source, "sampler", None)) is StatefulDistributedSampler
+                        and type(dataset) in (MappingDataset, InterleavedMappingDataset)
+                        and type(dataset._data) in (list, tuple, HFDataset)
+                    )
+                    weighted_epoch_source = type(dataset) is WeightedMultiSourceDataset and bool(dataset._fingerprint)
                     sft_next_epoch = (
                         strict_sft
                         and type(source) is DistributedDataloader
-                        and type(getattr(source, "sampler", None)) is StatefulDistributedSampler
-                        and type(dataset) in (MappingDataset, InterleavedMappingDataset)
-                        and type(dataset._data) in (list, tuple, HFDataset)
-                        and not source.persistent_workers
+                        and (mapping_epoch_source or weighted_epoch_source)
+                        and (
+                            not source.persistent_workers
+                            or (weighted_epoch_source and dataset.supports_persistent_epoch_cold_resume)
+                        )
                         and (source.num_workers == 0 or source.in_order is True)
                         and isinstance(cursor.get("dataloader_state"), dict)
                         and bool(cursor["dataloader_state"])
@@ -917,6 +950,35 @@ class GlobalStateCallback(Callback):
 
                 if isinstance(self.trainer.train_dataloader, DynamicBatchSizeDataLoader):
                     _check_legacy_exhausted_cursor(cursor)
+            from ...data.data_loader import DistributedDataloader
+
+            raw_loader = loader._dataloader if type(loader) is DynamicBatchSizeDataLoader else loader
+            if (
+                isinstance(raw_loader, DistributedDataloader)
+                and type(raw_loader) is not DistributedDataloader
+                and raw_loader._weighted_resume_dataset is not None
+            ):
+                raise ValueError("exact multi-source recovery requires the native DistributedDataloader")
+            weighted_loader = (
+                type(raw_loader) is DistributedDataloader and raw_loader._weighted_resume_dataset is not None
+            )
+            if weighted_loader and global_step > 0 and not cursor:
+                raise ValueError("multi-source trainer checkpoint is missing its data cursor")
+            weighted_replay = weighted_loader and cursor is not None
+            if weighted_replay:
+                if dpo_recovery:
+                    raise ValueError("DPO recovery does not support replayable multi-source streams")
+                replay_timeout = raw_loader.resume_replay_timeout_seconds
+                replay_workers = raw_loader.num_workers
+                if not strict_sft:
+                    raw_cursor = (
+                        cursor.get("dataloader_state") if type(loader) is DynamicBatchSizeDataLoader else cursor
+                    )
+                    raw_loader.validate_weighted_resume_state(raw_cursor)
+                if dist.is_initialized() and raw_loader.num_workers == 0:
+                    raise ValueError("distributed exact streaming replay requires at least one data worker")
+                if dist.is_initialized() and not dist.is_gloo_available():
+                    raise RuntimeError("distributed exact streaming replay requires a Gloo control group")
             if strict_sft:
                 context = global_state.get("_veomni_dynamic_context")
                 saved_epoch = context.get("saved_epoch") if isinstance(context, dict) else None
@@ -924,7 +986,12 @@ class GlobalStateCallback(Callback):
             cursor_error = exc
         default_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
-        _agree_restored_position(global_step, saved_epoch, default_group)
+        _agree_restored_position(
+            global_step,
+            saved_epoch,
+            default_group,
+            replay_contract={"weighted": weighted_replay, "timeout": replay_timeout, "workers": replay_workers},
+        )
 
         if dpo_recovery and dist.is_initialized():
             steps = [None] * dist.get_world_size()
@@ -963,8 +1030,8 @@ class GlobalStateCallback(Callback):
             raise_if_any_rank_failed(path_error, "checking DPO output checkpoint path", group=default_group)
             same_output_checkpoint = _agree_dpo_output_checkpoint(same_output_checkpoint, group=default_group)
 
-        def restore_local(action, description):
-            if not (coordinated_resume or dpo_recovery):
+        def restore_local(action, description, group=default_group):
+            if not (coordinated_resume or dpo_recovery or weighted_replay):
                 action()
                 return
             error = None
@@ -972,7 +1039,7 @@ class GlobalStateCallback(Callback):
                 action()
             except BaseException as exc:
                 error = exc
-            raise_if_any_rank_failed(error, description, group=default_group)
+            raise_if_any_rank_failed(error, description, group=group)
 
         def restore_position():
             self.trainer.state.global_step = global_step
@@ -1033,6 +1100,12 @@ class GlobalStateCallback(Callback):
                     loader.set_epoch(self.trainer.start_epoch)
             if sft_next_epoch:
                 loader.load_sft_next_epoch_buffer(prepared_sft_buffer)
+                if weighted_replay and raw_loader.persistent_workers:
+                    # An uninterrupted persistent loader reuses its workers at
+                    # the next epoch and does not draw a new base seed. Prime
+                    # replacement workers before restoring the trainer RNG.
+                    loader.set_epoch(self.trainer.start_epoch)
+                    raw_loader.prime_persistent_epoch_for_resume()
             else:
 
                 def prepare_resume_epoch():
@@ -1049,7 +1122,21 @@ class GlobalStateCallback(Callback):
                     prepare_resume_epoch()
                     loader.load_state_dict(cursor)
 
-        restore_local(restore_loader, "restoring the training data cursor")
+        replay_group = None
+        try:
+            if weighted_replay and dist.is_initialized():
+                # Each worker startup can wait up to the loader timeout. Leave
+                # time for every worker timeout plus rank error coordination.
+                group_timeout = replay_timeout * (replay_workers + 1) + 30
+                replay_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=group_timeout))
+            restore_local(
+                restore_loader,
+                "restoring the training data cursor",
+                group=replay_group if replay_group is not None else default_group,
+            )
+        finally:
+            if replay_group is not None:
+                dist.destroy_process_group(replay_group)
         restore_local(
             lambda: self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
             if global_state.get("environ_meter") is not None

@@ -18,6 +18,9 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class Source(torch.utils.data.IterableDataset):
+    supports_exact_epoch_restart = True
+    exact_resume_fingerprint = "synthetic-source-v1"
+
     def __init__(self):
         self.epoch = 0
         self.cursor = 0
@@ -25,6 +28,9 @@ class Source(torch.utils.data.IterableDataset):
     def set_epoch(self, epoch):
         if epoch != self.epoch:
             self.epoch, self.cursor = epoch, 0
+
+    def reset_for_epoch(self, epoch):
+        self.epoch, self.cursor = epoch, 0
 
     def __iter__(self):
         worker = torch.utils.data.get_worker_info()
@@ -38,6 +44,12 @@ class Source(torch.utils.data.IterableDataset):
 
     def load_state_dict(self, state):
         self.epoch, self.cursor = state["epoch"], state["cursor"]
+
+    def validate_exact_resume_state(self, state, worker_geometry=None, epoch=None):
+        if not isinstance(state, dict) or type(state.get("cursor")) is not int:
+            raise ValueError("invalid synthetic source state")
+        if epoch is not None and state.get("epoch") != epoch:
+            raise ValueError("synthetic source epoch mismatch")
 
 
 def sample_length(_sample):
@@ -93,6 +105,7 @@ def test_worker_sampling_resume_before_each_worker_starts(workers, persistent, e
         rng = torch.get_rng_state().clone()
         expected = rows(iterator, 2)
         resumed = make_loader()
+        resumed.prepare_resume_epoch(epoch)
         resumed.load_state_dict(state)
         torch.set_rng_state(rng)
         resumed.set_epoch(epoch)
@@ -182,6 +195,7 @@ def test_legacy_loader_resume_after_epoch_set_survives_next_epoch(worker_batchin
     expected = [next(active) for _ in range(4)]
 
     resumed = make_loader()
+    resumed.prepare_resume_epoch(epoch)
     resumed.load_state_dict(state)
     resumed.set_epoch(epoch)
     restored = iter(resumed)
@@ -199,7 +213,7 @@ def test_legacy_loader_resume_after_epoch_set_survives_next_epoch(worker_batchin
 
 
 @pytest.mark.parametrize("workers", [0, 2])
-def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, monkeypatch, tmp_path):
+def test_legacy_main_process_batching_rejects_unproven_epoch(workers, monkeypatch, tmp_path):
     from veomni.trainer.callbacks import base as callback_base
     from veomni.trainer.callbacks import global_state_callback as callback_module
 
@@ -229,7 +243,6 @@ def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, mon
         for runtime in legacy_states:
             runtime.pop("epoch")
             runtime.pop("sampling_initialized")
-        expected = rows(active, 4)
         saved_rng = torch.get_rng_state().clone()
 
         checkpoint = SimpleNamespace(
@@ -253,18 +266,10 @@ def test_legacy_main_process_batching_preserves_epoch_across_resume(workers, mon
             "train_dataloader": state,
             "torch_rng_state": saved_rng,
         }
-        callback.load_global_state()
-        assert trainer.start_epoch == 2 and trainer.start_step == 6
+        with pytest.raises(ValueError, match="worker epochs differ or are missing"):
+            callback.load_global_state()
+        assert trainer.state.global_step == 0
         assert torch.equal(torch.get_rng_state(), saved_rng)
-        resumed.set_epoch(2)
-        assert rows(iter(resumed), 4) == expected
-        resaved = list(sampling_states(resumed.state_dict()["dataloader_state"]))
-        assert len(resaved) == len(legacy_states)
-        assert all(runtime["epoch"] == 2 for runtime in resaved)
-
-        resumed.set_epoch(3)
-        fresh.set_epoch(3)
-        assert rows(iter(resumed), 8) == rows(iter(fresh), 8)
     finally:
         for loader in (original, resumed, fresh):
             iterator = getattr(loader._dataloader, "_iterator", None)
@@ -408,7 +413,10 @@ def test_invalid_initialization_marker_fails_before_mutating_sources():
 
 
 def make_prefetch_loader():
-    source = DistributedDataloader(make_dataset(seed=0), batch_size=None, num_workers=2)
+    # The parent and spawned cold-resume process must use the same worker start method.
+    source = DistributedDataloader(
+        make_dataset(seed=0), batch_size=None, num_workers=2, multiprocessing_context="spawn"
+    )
     return DynamicBatchSizeDataLoader(
         source, TextBatchingStrategy(token_micro_bsz=1, buffer_size=1, get_length_fn=sample_length), length=3
     )
