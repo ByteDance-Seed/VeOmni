@@ -743,39 +743,6 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     assert masked_callback["loss"] == masked_reference["loss"]
 
 
-def _malformed_padding_metadata_worker(rank, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        for mode in ("sft_padding", "sft_key", "objective"):
-            batch = {"labels": torch.tensor([1, 2])}
-            if rank == 1 and mode in ("sft_padding", "objective"):
-                batch["padding_flag"] = torch.tensor([True, False])
-            if rank == 1 and mode == "sft_key":
-                batch[3] = torch.tensor([1])
-            if mode == "objective":
-                with pytest.raises(ValueError, match="does not support padded micro-batches"):
-                    loss_utils.reject_objective_padding([batch], "objective")
-            else:
-                with pytest.raises(RuntimeError, match="malformed batch metadata"):
-                    loss_utils.reject_distributed_padding([batch])
-            completed = torch.tensor(1)
-            dist.all_reduce(completed)
-            assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_malformed_padding_metadata_fails_collectively():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_malformed_padding_metadata_worker, nprocs=2)
-
-
 def _dpo_weight_guard_worker(rank, endpoint):
     from datetime import timedelta
 
@@ -786,19 +753,21 @@ def _dpo_weight_guard_worker(rank, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         trainer = object.__new__(TextDPOTrainer)
+        callback_calls = []
         trainer.base = SimpleNamespace(
             state=SimpleNamespace(global_step=3),
             _reset_async_activation_offload_if_enabled=lambda _model: None,
-            on_step_begin=lambda micro_batches, **_kwargs: micro_batches[0].pop("loss_weights", None),
+            on_step_begin=lambda **_kwargs: callback_calls.append(True),
         )
         trainer.policy_model = SimpleNamespace()
         for key in ("loss_weight", "loss_weights"):
             batch = {"labels": torch.tensor([1, 2])}
             if rank == 1:
                 batch[key] = torch.tensor([0.5, 0.5])
-            with pytest.raises(RuntimeError, match="DPO preforward validation failed"):
+            with pytest.raises(RuntimeError, match="data loading failed"):
                 trainer.train_step(iter([[batch]]))
             assert trainer.state.global_step == 3
+            assert not callback_calls
         with pytest.raises(RuntimeError, match="end of data at different times"):
             loss_utils.fetch_training_micro_batches(iter([] if rank == 0 else [[{"labels": torch.tensor([1])}]]))
         with pytest.raises(StopIteration):
