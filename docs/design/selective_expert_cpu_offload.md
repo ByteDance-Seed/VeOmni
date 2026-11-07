@@ -22,17 +22,15 @@ The exclusion list keeps complete matching expert modules resident on the
 accelerator. Patterns match complete module FQNs using the parallel plan's `*`
 wildcard rules; every exclusion must match a selected expert module. An empty
 list offloads all selected experts. The list changes placement, while model
-tensor shapes and parallel shard geometry stay unchanged. With an owner-aware
-MultiOptimizer checkpoint, each optimizer-owned parameter's device type is part
-of the optimizer identity: preserve its CPU/accelerator placement when resuming.
-The remaining owner, mesh, dtype and scheduler checks still apply. This feature
-does not provide a validated optimizer-state migration across placements.
+tensor shapes and parallel shard geometry stay unchanged. Preserve each
+optimizer-owned parameter's CPU/accelerator placement when resuming. This
+feature does not provide a validated optimizer-state migration across placements.
 
 ## Placement and update lifecycle
 
 [`VeOmniModelRuntime._build_parallelized_model()`](../../veomni/models/model_runtime.py#L401)
 forwards these settings to
-[`parallelize_model_fsdp2()`](../../veomni/distributed/torch_parallelize.py#L432).
+[`parallelize_model_fsdp2()`](../../veomni/distributed/torch_parallelize.py#L427).
 The latter applies CPU offload only to non-excluded
 EP FSDP groups, loads the model, and moves those groups to CPU before optimizer
 construction. FSDP stages their weights for forward/backward and accumulates
