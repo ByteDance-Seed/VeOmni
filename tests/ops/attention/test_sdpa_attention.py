@@ -41,7 +41,7 @@ from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
 from veomni.ops.kernels.attention.standard import sdpa as sdpa_backend
 from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import get_device_type
 
 
 class _FakeAttentionModule(nn.Module):
@@ -684,9 +684,9 @@ def test_sdpa_attention_matches_math_reference(mask_case, entrypoint):
         )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA SDPA numerical comparison")
+@pytest.mark.skipif(get_device_type() not in ("cuda", "npu"), reason="SDPA numerical comparison requires CUDA or NPU")
 @pytest.mark.parametrize("mask_case", ("causal", "2d_mask"))
-def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
+def test_sdpa_attention_matches_math_reference_on_accelerator(mask_case):
     device = torch.device(get_device_type())
     dtype = torch.bfloat16
     sequence_length = 64
