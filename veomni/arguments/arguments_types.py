@@ -1599,6 +1599,7 @@ class OpsImplementationConfig:
             "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
+            "'fla_npu_reuse' retains forward intermediates for backward, using more memory to reduce recomputation. "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )

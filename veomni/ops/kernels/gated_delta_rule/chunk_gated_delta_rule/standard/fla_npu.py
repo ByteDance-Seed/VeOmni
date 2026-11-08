@@ -47,6 +47,7 @@ class _Meta:
     cu_seqlens_list: list[int] | None
     chunk_indices: dict[str, Tensor | None] | None
     chunk_indices_list: dict[str, list[int] | None] | None
+    reuse_intermediates: bool
 
 
 def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
@@ -264,7 +265,7 @@ def _chunk_fwd(
     chunk_indices: dict[str, Tensor | None] | None,
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor, Tensor, Tensor]:
     """Run the AscendC forward stages and return backward intermediates."""
     _ensure_fla_npu_registered()
 
@@ -343,7 +344,7 @@ def _chunk_fwd(
     )
     g = g.transpose(1, 2).contiguous()
     output = output.transpose(1, 2).contiguous()
-    return g, output, a, final_state
+    return g, output, a, final_state, w, h, v_new
 
 
 def _chunk_bwd(
@@ -361,6 +362,9 @@ def _chunk_bwd(
     chunk_indices: dict[str, Tensor | None] | None,
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
+    w: Tensor | None = None,
+    h: Tensor | None = None,
+    v_new: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run the AscendC backward stages for the chunked recurrence."""
     _ensure_fla_npu_registered()
@@ -369,33 +373,36 @@ def _chunk_bwd(
 
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
-        k,
-        v,
-        beta,
-        a,
-        chunk_size,
-        g=g,
-        gk=None,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
+    if not (w is None and h is None and v_new is None) and (w is None or h is None or v_new is None):
+        raise ValueError("W, H, and new-value intermediates must be supplied together")
+    if w is None:
+        w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+            k,
+            v,
+            beta,
+            a,
+            chunk_size,
+            g=g,
+            gk=None,
+            cu_seqlens=cu_seqlens_list,
+            chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+        )
+        h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
+            k,
+            w,
+            u,
+            g=g,
+            gk=None,
+            initial_state=initial_state,
+            output_final_state=False,
+            chunk_size=chunk_size,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens_list,
+            chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+            use_exp2=False,
+            transpose_state_layout=False,
+        )
     grad_output = grad_output.transpose(1, 2).contiguous()
-    h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
-        k,
-        w,
-        u,
-        g=g,
-        gk=None,
-        initial_state=initial_state,
-        output_final_state=False,
-        chunk_size=chunk_size,
-        save_new_value=True,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
     grad_v = torch.ops.npu.npu_chunk_bwd_dv_local(
         q,
         k,
@@ -501,6 +508,7 @@ def forward(
     chunk_indices: object = None,
     chunk_indices_list: object = None,
     scale: float | None = None,
+    _reuse_intermediates: bool = False,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """AscendC fused chunk gated delta rule. Layout is FLA ``[B, T, H, D]``.
 
@@ -590,7 +598,7 @@ def forward(
     if scale is None:
         scale = key_h.shape[-1] ** -0.5
     guarded_fwd = input_guard(_chunk_fwd)
-    g_cum, output, a, final_state = guarded_fwd(
+    g_cum, output, a, final_state, w, h, v_new = guarded_fwd(
         query_h,
         key_h,
         value_h,
@@ -607,6 +615,8 @@ def forward(
     )
     if final_state is None:
         final_state = output.new_empty(0)
+    if not _reuse_intermediates:
+        w = h = v_new = unused_like(query_h)
     saved_cu_seqlens = cu_opt if cu_opt is not None else cu_seqlens
     return (output.to(query_h.dtype), final_state), SavedState(
         (
@@ -620,6 +630,9 @@ def forward(
             saved_cu_seqlens,
             query_inv_norm,
             key_inv_norm,
+            w,
+            h,
+            v_new,
         ),
         _Meta(
             scale,
@@ -631,6 +644,7 @@ def forward(
             cu_seqlens_list,
             chunk_indices,
             chunk_indices_list,
+            _reuse_intermediates,
         ),
     )
 
@@ -656,6 +670,9 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         cu_seqlens,
         query_inv_norm,
         key_inv_norm,
+        w,
+        h,
+        v_new,
     ) = saved.tensors
     do, _dht = grad_output
     initial_opt = initial_state if meta.has_initial_state else None
@@ -677,6 +694,9 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         meta.chunk_indices,
         meta.chunk_indices_list,
         meta.chunk_size,
+        w if meta.reuse_intermediates else None,
+        h if meta.reuse_intermediates else None,
+        v_new if meta.reuse_intermediates else None,
     )
     if meta.use_qk_l2norm:
         grad_q_h = _l2norm_bwd(query_h, query_inv_norm, grad_q_h)

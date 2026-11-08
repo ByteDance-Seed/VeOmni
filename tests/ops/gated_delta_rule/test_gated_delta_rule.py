@@ -563,6 +563,7 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
         output = query + 2 * key
         if head_first:
             output = output.transpose(1, 2).contiguous()
+            return g, output, query.new_empty(0), None, query, key, value
         return g, output, query.new_empty(0), None
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
@@ -632,7 +633,7 @@ def test_fla_npu_packed_backward_reuses_normalized_cu_seqlens(
     def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
         del key, value, beta, scale, initial_state, output_final_state, args
         observed["forward"] = cu_seqlens
-        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
+        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None, query, query, query
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
         del a, scale, initial_state, args
@@ -1033,6 +1034,120 @@ def test_fla_npu_rejects_final_state_when_inputs_require_grad(
     )
     with pytest.raises(NotImplementedError, match="cannot differentiate the final state"):
         entry.wrapper(query, key, value, g, beta, output_final_state=True)
+
+
+@pytest.mark.parametrize("reuse", (False, True))
+def test_fla_npu_saved_intermediates_policy(reuse, monkeypatch, _stub_npu_input_guard):
+    """Both rows share FP arithmetic but only the opt-in row retains W/H/value tensors."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+    cached = tuple(torch.full((2,), i + 1.0) for i in range(3))
+
+    def fwd(q, k, v, g, *args):
+        return g, q.transpose(1, 2), q.new_empty(0), None, *cached
+
+    def bwd(q, k, v, g, beta, *args):
+        assert all(actual is expected for actual, expected in zip(args[-3:], cached if reuse else (None,) * 3))
+        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.zeros_like(beta), torch.zeros_like(g)
+
+    monkeypatch.setattr(m, "_chunk_fwd", fwd)
+    monkeypatch.setattr(m, "_chunk_bwd", bwd)
+    outputs, saved = m.forward(*values, gate, gate, _reuse_intermediates=reuse)
+    if reuse:
+        assert all(a is b for a, b in zip(saved.tensors[-3:], cached))
+    else:
+        assert all(t.numel() == 0 for t in saved.tensors[-3:])
+    grads = m.backward((torch.ones_like(outputs[0]), outputs[1]), saved)
+    assert all(torch.equal(g, torch.ones_like(v)) for g, v in zip(grads[:3], values))
+
+
+def test_fla_npu_backward_reuse_skips_recompute(monkeypatch):
+    """The opt-in backward consumes forward state instead of invoking the two forward stages."""
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    q = torch.ones(1, 2, 4, 8, dtype=torch.bfloat16)
+    k, v = q.clone(), q.clone()
+    gate = torch.ones(1, 4, 2, dtype=torch.float32)
+    beta = torch.ones_like(gate, dtype=torch.bfloat16)
+    calls = []
+
+    def recompute(*args, **kwargs):
+        calls.append("w")
+        return q.clone(), q.clone()
+
+    def fwd_h(*args, **kwargs):
+        calls.append("h")
+        return q.clone(), q.clone(), None
+
+    ops = SimpleNamespace(
+        npu_recompute_w_u_fwd=recompute,
+        npu_chunk_gated_delta_rule_fwd_h=fwd_h,
+        npu_chunk_bwd_dv_local=lambda *a, **kw: v.clone(),
+        npu_chunk_gated_delta_rule_bwd_dhu=lambda *a, **kw: (q.clone(), None, v.clone()),
+        npu_chunk_bwd_dqkwg=lambda *a, **kw: (q.clone(), k.clone(), q.clone(), gate.transpose(1, 2).clone()),
+        npu_prepare_wy_repr_bwd_da=lambda *a, **kw: q.clone(),
+        npu_prepare_wy_repr_bwd_full=lambda *a, **kw: (
+            torch.zeros_like(k),
+            v.clone(),
+            beta.transpose(1, 2).clone(),
+            torch.zeros_like(gate.transpose(1, 2)),
+        ),
+    )
+    monkeypatch.setattr(torch.ops, "npu", ops, raising=False)
+    monkeypatch.setattr(m, "_ensure_fla_npu_registered", lambda: None)
+    cumsum = ModuleType("veomni.ops.kernels.gated_delta_rule.vendor.triton.cumsum")
+    cumsum.chunk_local_cumsum = lambda value, **kwargs: value
+    monkeypatch.setitem(sys.modules, cumsum.__name__, cumsum)
+    args = (q, k, v, gate, beta, q, 1.0, None, q.transpose(1, 2), None, None, None, None, 64)
+
+    reference = m._chunk_bwd(*args)
+    assert calls == ["w", "h"]
+    calls.clear()
+    actual = m._chunk_bwd(*args, q.clone(), q.clone(), q.clone())
+    assert calls == []
+    for got, expected in zip(actual, reference, strict=True):
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("checkpointed", (False, True))
+@pytest.mark.parametrize("boundaries", ([0, 17, 64], [0, 17, 148]))
+def test_fla_npu_reuse_packed_checkpoint_parity(checkpointed, boundaries):
+    """Compare retained states with recomputation under non-reentrant checkpointing."""
+    from torch.utils.checkpoint import checkpoint
+
+    _require_npu_gdr_dependencies(ascendc=True)
+    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
+    torch.manual_seed(43)
+    # Native RecomputeWUFwd supports value widths 128/256.
+    length = boundaries[-1]
+    q, k, v = [torch.randn(1, length, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(1, length, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, length, 2, device="npu", dtype=torch.bfloat16)
+    cu = torch.tensor(boundaries, dtype=torch.int64)
+    gradient = torch.randn_like(q)
+    results = []
+    for operation in (reference, reference, candidate):
+        leaves = make_grad_leaves(q, k, v, g, beta)
+
+        def forward(*values, operation=operation):
+            """Bind this graph to one op even if checkpoint replay is delayed."""
+            return operation(*values, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]
+
+        output = checkpoint(forward, *leaves, use_reentrant=False) if checkpointed else forward(*leaves)
+        output.backward(gradient)
+        results.append((output.detach(), [x.grad.detach().clone() for x in leaves]))
+    # Check reference repeatability as well as reuse; neither comparison may
+    # hide a small-gradient discrepancy behind cross-implementation tolerance.
+    for output, grads in results[1:]:
+        torch.testing.assert_close(output, results[0][0], atol=0, rtol=0)
+        for actual, expected in zip(grads, results[0][1], strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_fla_npu_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
