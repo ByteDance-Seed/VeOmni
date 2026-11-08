@@ -90,6 +90,32 @@ def _check_multi_destination(trainer, step):
     raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")
 
 
+def _reject_retired_external_data_provider(trainer):
+    """Do not silently run a request for the removed external data protocol."""
+    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+    error = None
+    try:
+        requested = getattr(trainer, "_veomni_require_exact_data_resume", False) is True
+        loader = getattr(trainer, "train_dataloader", None)
+        seen = set()
+        while loader is not None:
+            if id(loader) in seen:
+                raise ValueError("Data loader wrapper cycle prevents resume validation")
+            seen.add(id(loader))
+            requested = requested or getattr(loader, "_veomni_exact_resume_requested", False) is True
+            if type(loader) is not DynamicBatchSizeDataLoader:
+                break
+            loader = loader._dataloader
+        if requested:
+            raise ValueError(
+                "External exact-data providers are unsupported; use a native loader or a verified migration"
+            )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking the data resume protocol")
+
+
 class CheckpointCallback(Callback):
     """Schedule DCP / HF / LoRA I/O and the one-shot tokenizer/config export."""
 
@@ -105,9 +131,6 @@ class CheckpointCallback(Callback):
         self._last_dcp_step: int = -1
         self._last_hf_step: int = -1
         self._async_save_failed = False
-        self._external_pending_dcp = False
-        self._external_pending_hf = False
-        self._external_checkpoint_event = None
 
     def _check_async_save(self):
         if self._async_save_failed:
@@ -123,26 +146,13 @@ class CheckpointCallback(Callback):
             raise
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        from .global_state_callback import prepare_external_data_contract
-
-        prepare_external_data_contract(self.trainer, install=True)
+        _reject_retired_external_data_provider(self.trainer)
         self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         self._check_async_save()
-        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
-            self._external_checkpoint_event = None
-            hf_due = self.save_hf_weights and state.global_step != self._last_hf_step
-            if self._external_pending_dcp or self._external_pending_hf or hf_due:
-                self._save_exact_external_event(state, "train_end", False, bool(hf_due))
-                if self._external_pending_dcp or self._external_pending_hf:
-                    raise RuntimeError("Training ended before the exact data checkpoint became ready")
-            else:
-                self._wait_for_pending_save()
-                self._external_checkpoint_event = ("train_end", state.global_step, "none", False)
-            return
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")
@@ -159,13 +169,6 @@ class CheckpointCallback(Callback):
         self._check_async_save()
         dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
         hf_due = self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0
-        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
-            self._external_checkpoint_event = None
-            if dcp_due or hf_due or self._external_pending_dcp or self._external_pending_hf:
-                self._save_exact_external_event(state, "step_end", bool(dcp_due), bool(hf_due))
-            else:
-                self._external_checkpoint_event = ("step_end", state.global_step, "none", False)
-            return
         if dcp_due and state.global_step != self._last_dcp_step:
             self._save_dcp(state)
         if hf_due:
@@ -179,17 +182,6 @@ class CheckpointCallback(Callback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         self._check_async_save()
-        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
-            self._external_checkpoint_event = None
-            dcp_due = self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0
-            hf_due = (
-                self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
-            )
-            if dcp_due or hf_due:
-                self._save_exact_external_event(state, "epoch_end", bool(dcp_due), bool(hf_due))
-            else:
-                self._external_checkpoint_event = ("epoch_end", state.global_step, "none", False)
-            return
         if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
             if state.global_step != self._last_dcp_step:
                 self._save_dcp(state)
@@ -209,36 +201,8 @@ class CheckpointCallback(Callback):
                     f"already saved at step_end)."
                 )
 
-    def _save_exact_external_event(self, state, event, dcp_due, hf_due):
-        """Defer all pieces together until every data provider is ready."""
-        from .global_state_callback import external_data_checkpoint_ready
-
-        dcp_due = (dcp_due or self._external_pending_dcp) and state.global_step != self._last_dcp_step
-        hf_due = (hf_due or self._external_pending_hf) and state.global_step != self._last_hf_step
-        if not dcp_due and not hf_due:
-            self._external_pending_dcp = False
-            self._external_pending_hf = False
-            self._external_checkpoint_event = (event, state.global_step, "none", False)
-            return
-        if not external_data_checkpoint_ready(self.trainer, state):
-            self._external_pending_dcp = dcp_due
-            self._external_pending_hf = hf_due
-            self._external_checkpoint_event = (event, state.global_step, "deferred", False)
-            logger.warning_rank0(f"Deferring exact-data checkpoint at step {state.global_step} until replay drains.")
-            return
-        if dcp_due and state.global_step != self._last_dcp_step:
-            self._save_dcp(state)
-        if hf_due and state.global_step != self._last_hf_step:
-            self._save_hf(state, stage=event)
-        self._external_pending_dcp = False
-        self._external_pending_hf = False
-        self._external_checkpoint_event = (event, state.global_step, "saved", self._last_dcp_step == state.global_step)
-
     def _save_dcp(self, state: TrainerState):
         try:
-            from .global_state_callback import prepare_external_data_contract
-
-            prepare_external_data_contract(self.trainer, state)
             _check_multi_destination(self.trainer, state.global_step)
             self.trainer.save_dcp(state)
         except BaseException:
@@ -250,9 +214,6 @@ class CheckpointCallback(Callback):
 
     def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         try:
-            from .global_state_callback import prepare_external_data_contract
-
-            prepare_external_data_contract(self.trainer, state)
             if _has_multi_optimizer(self.trainer) and self._last_dcp_step != state.global_step:
                 self._save_dcp(state)
             self.trainer.save_hf_or_lora(state, stage=stage)
