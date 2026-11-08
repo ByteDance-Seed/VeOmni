@@ -28,6 +28,7 @@ class MutableDataset(torch.utils.data.IterableDataset):
         self.history = []
 
     def __iter__(self):
+        """Advance mutable history as each sample is produced."""
         for item in range(len(self.history), 3):
             self.history.append(item)
             yield item
@@ -52,6 +53,7 @@ class DeferredState:
         return self.cursor
 
     def state_dict(self):
+        """Model a cursor that may become available only after consumption."""
         if self.always_fail or self.cursor == 0:
             raise ValueError("cursor unavailable")
         return {"cursor": self.cursor}
@@ -97,6 +99,8 @@ def test_snapshot_after_consumption_cannot_be_mutated_by_prefetch():
 
 @pytest.mark.parametrize("context", [None, "spawn"])
 def test_consumed_snapshot_restores_with_persistent_data_workers(context):
+    """Restore the consumed position across worker processes and start modes."""
+
     def loader():
         return StatefulDataLoader(
             MutableDataset(), batch_size=None, num_workers=2, persistent_workers=True, multiprocessing_context=context
@@ -122,6 +126,7 @@ def test_consumed_snapshot_restores_with_persistent_data_workers(context):
 
 @pytest.mark.parametrize("always_fail", [False, True])
 def test_unavailable_snapshot_only_prevents_checkpoint(always_fail):
+    """A missing cursor blocks saving without blocking batch consumption."""
     prefetcher = BackgroundPrefetcher(DeferredState(always_fail))
     try:
         with pytest.raises(RuntimeError, match="recoverable data cursor"):

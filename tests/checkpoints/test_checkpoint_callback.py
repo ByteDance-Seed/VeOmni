@@ -30,6 +30,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _cursor_failure_worker(rank, root, failure, endpoint):
+    """Verify every rank rejects a cursor failure before publishing a manifest."""
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -42,6 +43,7 @@ def _cursor_failure_worker(rank, root, failure, endpoint):
             callback = GlobalStateCallback(trainer)
 
         def snapshot(_state):
+            """Inject one rank's cursor error, fatal exception, or invalid state."""
             if rank == 0:
                 if failure == "invalid":
                     return None
