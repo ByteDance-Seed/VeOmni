@@ -303,8 +303,6 @@ def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
 @_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
-    if get_device_type() == "npu":
-        pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_run_ple_halo_equivalence, _CI_ACCELERATOR_2.nproc, False, "cp")
 
 
@@ -1233,8 +1231,6 @@ def _run_vision_real_image_cp_non_fa_rejection() -> None:
 @_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention():
-    if get_device_type() == "npu":
-        pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_run_vision_real_image_cp_non_fa_rejection, world_size=_CI_ACCELERATOR_2.nproc)
 
 
