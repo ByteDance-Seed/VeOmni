@@ -49,11 +49,13 @@ class _NPUCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(logits: Tensor, labels: Tensor):
+        """Return summed native CE and the log probabilities needed for backward."""
         loss, log_prob, _, _ = torch_npu.npu_cross_entropy_loss(logits, labels, None, "sum", -100, 0.0, 0.0, False)
         return loss.squeeze(), log_prob
 
     @staticmethod
     def setup_context(ctx, inputs, output):
+        """Save labels and native log probabilities without differentiating the latter."""
         _, labels = inputs
         _, log_prob = output
         ctx.save_for_backward(log_prob, labels)
@@ -61,6 +63,7 @@ class _NPUCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss, _grad_log_prob):
+        """Return logits gradients scaled by the incoming scalar loss gradient."""
         log_prob, labels = ctx.saved_tensors
         grad_logits = torch_npu.npu_cross_entropy_loss_backward(
             grad_loss.reshape(1), log_prob, labels, None, None, None, "sum", -100, 0.0, 0.0

@@ -17,6 +17,7 @@ from veomni.ops.kernels.loss.cross_entropy_loss.standard.npu import _NPUCrossEnt
 
 
 def main():
+    """Measure chunk loss and gradients, then export timings, memory and parity."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=int, default=4097)
     parser.add_argument("--hidden", type=int, default=512)
@@ -46,6 +47,7 @@ def main():
         denominator = (labels != -100).sum().clamp_min(1)
 
         def loss_func(x, w, targets, mode, denominator=denominator):
+            """Evaluate one chunk with the selected path and shared denominator."""
             x = x.reshape(-1, x.shape[-1])
             targets = targets.reshape(-1)
             if mode == "compact_native":
@@ -63,6 +65,7 @@ def main():
             )
 
         def run(mode, labels=labels, loss_func=loss_func):
+            """Compute batch loss and hidden/weight gradients across all chunks."""
             total = torch.zeros((), device="npu")
             grad_hidden, grad_weight = torch.empty_like(hidden), torch.zeros_like(weight)
             chunks = zip(

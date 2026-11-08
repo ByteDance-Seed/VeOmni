@@ -17,6 +17,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 @pytest.mark.parametrize("frozen", [None, "hidden", "weight", "both"])
 @pytest.mark.parametrize("ignore_index", [-100, 2, 999])
 def test_npu_chunk_parity(dtype, shape, frozen, ignore_index):
+    """Compare eager loss and gradients across dtypes, shapes and frozen inputs."""
     torch.manual_seed(127)
     hidden = torch.randn(shape, device="npu", dtype=dtype).requires_grad_(frozen not in ("hidden", "both"))
     weight = torch.randn(19, 8, device="npu", dtype=dtype).requires_grad_(frozen not in ("weight", "both"))
@@ -41,6 +42,7 @@ def test_npu_chunk_parity(dtype, shape, frozen, ignore_index):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 @pytest.mark.parametrize("count", [None, 0, 37, torch.tensor(0), torch.tensor(37)])
 def test_npu_all_ignore_compacts_before_projection(monkeypatch, count):
+    """Verify ignored chunks project zero rows and produce zero loss and gradients."""
     hidden = torch.randn(2, 9, 7, device="npu", requires_grad=True)
     weight = torch.randn(19, 7, device="npu", requires_grad=True)
     labels = torch.full((2, 9), -100, device="npu")
@@ -48,6 +50,7 @@ def test_npu_all_ignore_compacts_before_projection(monkeypatch, count):
     rows = []
 
     def record(input, weight, bias=None):
+        """Record the compacted row count before forwarding to the real Linear."""
         rows.append(input.shape[0])
         return original(input, weight, bias)
 
@@ -64,11 +67,13 @@ def test_npu_all_ignore_compacts_before_projection(monkeypatch, count):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("mode", ["bias", "factored_bias", "observer"])
 def test_special_arguments_bypass_native_ce(monkeypatch, mode):
+    """Keep full/factored bias and token observation on the eager CE path."""
     hidden, weight = torch.randn(3, 4), torch.randn(7, 4)
     labels = torch.tensor([0, 1, 2])
     monkeypatch.setattr(chunk_loss, "can_use_fused_ce", lambda *args: True)
 
     def fail(*args):
+        """Fail if a special-argument call reaches native CE."""
         raise AssertionError("native CE must not consume bias or observer calls")
 
     monkeypatch.setattr(chunk_loss, "fused_linear_ce", fail)
@@ -88,12 +93,14 @@ def test_special_arguments_bypass_native_ce(monkeypatch, mode):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_native_guard_rejects_cpu():
+    """Reject CPU tensors even when the optional native NPU backend is installed."""
     assert not npu.can_use_fused_ce(torch.randn(3, 4), torch.randn(7, 4), torch.tensor([0, 1, 2]))
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("ignore_index", [2, 999, -1])
 def test_custom_ignore_rejects_remaining_native_sentinel(ignore_index):
+    """Reject an unmasked native sentinel when the caller selects another ignore index."""
     with pytest.raises(IndexError, match="out of bounds"):
         npu.fused_linear_ce(
             torch.randn(3, 4), torch.randn(7, 4), torch.tensor([0, -100, ignore_index]), 2, ignore_index
@@ -103,6 +110,7 @@ def test_custom_ignore_rejects_remaining_native_sentinel(ignore_index):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU")
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 def test_native_guard_rejects_unsupported_inputs(monkeypatch):
+    """Reject unsupported labels, devices, dtypes, row counts and compilation."""
     hidden = torch.randn(3, 4, device="npu")
     weight = torch.randn(7, 4, device="npu")
     labels = torch.tensor([0, 1, 2], device="npu")
