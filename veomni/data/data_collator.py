@@ -351,7 +351,29 @@ class SequenceParallelCollator(DataCollator):
         else:
             seq_length = feature.size(dim)
             sp_chunk_size = seq_length // self.sp_size
-            return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+            shard = feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+            if key in ("pixel_values", "pixel_values_videos") and shard.device.type == "cpu":
+                # A narrow view keeps the entire packed image storage alive
+                # while the loader buffers micro-batches. Preserve the view
+                # for pinned, quantized, and gradient-carrying inputs.
+                try:
+                    compact = (
+                        shard.layout == torch.strided
+                        and not shard.is_quantized
+                        and not shard.requires_grad
+                        and not shard.is_pinned()
+                        and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
+                    )
+                except (NotImplementedError, RuntimeError):
+                    # Some tensor subclasses, such as vmap's BatchedTensor,
+                    # do not expose storage. Preserve the original view path.
+                    compact = False
+                if compact:
+                    try:
+                        shard = shard.clone(memory_format=torch.contiguous_format)
+                    except NotImplementedError:
+                        pass  # Keep the view for tensor types without clone support.
+            return shard
 
     def sp_padding(
         self,
