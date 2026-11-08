@@ -114,6 +114,19 @@ The provider must itself establish which sources,
 worker geometry, prefetch states and epoch boundaries it supports; enabling the
 protocol alone does not qualify an arbitrary external loader.
 
+On normal exact-provider training completion, the data-state callback invokes
+an optional rank-local `provider.close()` after the final model and data-state
+checkpoint work. All ranks coordinate any close failure before continuing.
+The process-group timeout must exceed the slowest provider's bounded cleanup
+time, including its worker and prefetch timeouts, so that faster ranks can wait
+for slower ranks during this final coordination.
+Providers without a close method retain the previous behavior. An earlier
+training or checkpoint exception can bypass this normal completion callback;
+custom entry points that catch such an exception must close their provider
+explicitly and report close failures without replacing the original error.
+Do not initiate a distributed collective from a rank-local exception handler
+unless the caller has established that all ranks can participate.
+
 For the attested weighted multi-source streaming path, each worker reconstructs
 the original Hugging Face stream and rereads the rows that its source consumed
 in the saved epoch. This reconstructs the shuffle buffer, which the Hugging Face

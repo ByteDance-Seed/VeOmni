@@ -131,18 +131,47 @@ class CheckpointCallback(Callback):
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        self._check_async_save()
         if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
-            self._external_checkpoint_event = None
-            hf_due = self.save_hf_weights and state.global_step != self._last_hf_step
-            if self._external_pending_dcp or self._external_pending_hf or hf_due:
-                self._save_exact_external_event(state, "train_end", False, bool(hf_due))
-                if self._external_pending_dcp or self._external_pending_hf:
-                    raise RuntimeError("Training ended before the exact data checkpoint became ready")
-            else:
-                self._wait_for_pending_save()
-                self._external_checkpoint_event = ("train_end", state.global_step, "none", False)
+            try:
+                async_error = None
+                try:
+                    self._check_async_save()
+                except BaseException as exc:
+                    async_error = exc
+                raise_if_any_rank_failed(async_error, "checking the final external-data save")
+                self._external_checkpoint_event = None
+                hf_due = self.save_hf_weights and state.global_step != self._last_hf_step
+                from .global_state_callback import agree_external_train_end_decision
+
+                agree_external_train_end_decision(
+                    (
+                        self._external_pending_dcp,
+                        self._external_pending_hf,
+                        bool(hf_due),
+                        state.global_step,
+                        self._last_dcp_step == state.global_step,
+                        self._last_hf_step == state.global_step,
+                    )
+                )
+                if self._external_pending_dcp or self._external_pending_hf or hf_due:
+                    self._save_exact_external_event(state, "train_end", False, bool(hf_due))
+                    if self._external_pending_dcp or self._external_pending_hf:
+                        raise RuntimeError("Training ended before the exact data checkpoint became ready")
+                else:
+                    wait_error = None
+                    try:
+                        self._wait_for_pending_save()
+                    except BaseException as exc:
+                        wait_error = exc
+                    raise_if_any_rank_failed(wait_error, "waiting for the final external-data save")
+                    self._external_checkpoint_event = ("train_end", state.global_step, "none", False)
+            except BaseException as exc:
+                from .global_state_callback import close_external_data_contract_after_failure
+
+                close_external_data_contract_after_failure(self.trainer, exc)
+                raise
             return
+        self._check_async_save()
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")

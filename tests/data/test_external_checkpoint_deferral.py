@@ -1,5 +1,6 @@
 """Exact-data save scheduling and incomplete-checkpoint recovery safeguards."""
 
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -126,6 +127,51 @@ def test_pending_save_at_train_end_fails_without_writing():
     assert events == []
 
 
+def test_train_end_closes_provider_after_its_final_cursor():
+    provider, checkpoint, global_state, events = callbacks(step_frequency=0, hf_frequency=3)
+    provider.close = lambda: events.append(("close", 3))
+    event(checkpoint, global_state, "train_end", 3)
+    assert events == [("dcp", 3), ("hf", 3), ("cursor", 3, True), ("close", 3)]
+
+
+def test_train_end_propagates_provider_close_failure():
+    provider, checkpoint, global_state, _ = callbacks()
+
+    def fail():
+        raise OSError("close failed")
+
+    provider.close = fail
+    with pytest.raises((OSError, RuntimeError), match="close|failed"):
+        event(checkpoint, global_state, "train_end", 1)
+
+
+def test_train_end_pending_checkpoint_closes_locally_and_preserves_both_errors():
+    provider, checkpoint, global_state, _ = callbacks()
+    provider.ready = False
+    event(checkpoint, global_state, "step_end", 2)
+
+    def fail_close():
+        raise OSError("injected cleanup failure")
+
+    provider.close = fail_close
+    with pytest.raises(RuntimeError, match="ended before") as caught:
+        event(checkpoint, global_state, "train_end", 2)
+    assert any("injected cleanup failure" in note for note in caught.value.__notes__)
+
+
+def test_train_end_failed_cursor_closes_provider_locally():
+    provider, checkpoint, global_state, events = callbacks(step_frequency=0, hf_frequency=3)
+    provider.close = lambda: events.append(("close", 3))
+
+    def fail_cursor(*args, **kwargs):
+        raise OSError("cursor failed")
+
+    global_state.save_global_state = fail_cursor
+    with pytest.raises(OSError, match="cursor failed"):
+        event(checkpoint, global_state, "train_end", 3)
+    assert events == [("dcp", 3), ("hf", 3), ("close", 3)]
+
+
 def test_epoch_save_deferred_into_next_epoch_uses_new_completed_step():
     provider, checkpoint, global_state, events = callbacks(step_frequency=0, epoch_frequency=1)
     provider.ready = False
@@ -237,6 +283,74 @@ def _distributed_deferral(rank, store):
         provider.error = ValueError("one-rank-error") if rank == 0 else None
         with pytest.raises((RuntimeError, ValueError)):
             event(checkpoint, global_state, "step_end", 4)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        provider, checkpoint, global_state, _ = callbacks()
+        if rank == 0:
+
+            def fail_close():
+                raise OSError("one-rank close failure")
+
+            provider.close = fail_close
+        with pytest.raises((OSError, RuntimeError)):
+            event(checkpoint, global_state, "train_end", 1)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        # A peer can fail before the data callback is reached. Closing must
+        # not enter a new collective that the failing peer cannot join.
+        provider, checkpoint, global_state, _ = callbacks()
+        if rank == 0:
+
+            def fail_pending():
+                raise OSError("one-rank pending-save failure")
+
+            checkpoint.trainer.wait_for_pending_save = fail_pending
+        with pytest.raises((OSError, RuntimeError)):
+            event(checkpoint, global_state, "train_end", 1)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        provider, checkpoint, global_state, _ = callbacks()
+        state = SimpleNamespace(global_step=1, epoch=0)
+        checkpoint.on_train_end(state)
+        if rank == 0:
+            checkpoint._external_checkpoint_event = None
+        with pytest.raises(RuntimeError):
+            global_state.on_train_end(state)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        # Both decisions can be individually valid while demanding different
+        # collective sequences. Reject before saving either cursor.
+        provider, checkpoint, global_state, _ = callbacks()
+        state = SimpleNamespace(global_step=1, epoch=0)
+        checkpoint.on_train_end(state)
+        if rank == 0:
+            checkpoint._external_checkpoint_event = ("train_end", 1, "saved", True)
+        with pytest.raises(RuntimeError, match="decision differs"):
+            global_state.on_train_end(state)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        provider, checkpoint, global_state, _ = callbacks()
+        checkpoint._external_pending_hf = rank == 0
+        with pytest.raises(RuntimeError, match="decision differs"):
+            event(checkpoint, global_state, "train_end", 1)
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+
+        provider, checkpoint, global_state, _ = callbacks()
+        if rank == 0:
+            provider.close = lambda: time.sleep(0.2)
+        event(checkpoint, global_state, "train_end", 1)
         alive = torch.ones(1)
         dist.all_reduce(alive)
         assert alive.item() == 2

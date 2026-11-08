@@ -242,6 +242,43 @@ def external_data_checkpoint_ready(trainer, state):
     return ready
 
 
+def _close_external_data_contract_locally(trainer):
+    contract = _external_data_contract(trainer)
+    close = getattr(contract, "close", None)
+    if close is not None:
+        if not callable(close):
+            raise TypeError("External data provider close must be callable")
+        close()
+
+
+def close_external_data_contract_after_failure(trainer, original_error):
+    """Attempt local cleanup without another collective after a failure."""
+    try:
+        _close_external_data_contract_locally(trainer)
+    except BaseException as cleanup_error:
+        original_error.add_note(f"External data provider cleanup also failed: {cleanup_error!r}")
+
+
+def agree_external_train_end_decision(decision):
+    """Agree before choosing which final checkpoint collectives to enter."""
+    if dist.is_initialized():
+        decisions = [None] * dist.get_world_size()
+        dist.all_gather_object(decisions, decision)
+        if any(item != decision for item in decisions):
+            raise RuntimeError("Final external-data checkpoint decision differs across ranks")
+
+
+def close_external_data_contract(trainer):
+    """Close an optional provider after final checkpointing on every rank."""
+    error = None
+    try:
+        _close_external_data_contract_locally(trainer)
+    except BaseException as exc:
+        error = exc
+    # Every rank participates, including ranks whose provider has no close.
+    raise_if_any_rank_failed(error, "closing the external data provider")
+
+
 def _multi_optimizer_checkpoints(trainer):
     """Find every MultiOptimizer owner without silently dropping one."""
     root = getattr(trainer, "model", None)
@@ -463,9 +500,9 @@ class GlobalStateCallback(Callback):
     def on_step_begin(self, state: TrainerState, **kwargs) -> None:
         self._unadvanced_boundary_state = None
 
-    def _handle_exact_external_event(self, state, event):
+    def _exact_external_event(self, state, event):
         if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is not True:
-            return False
+            return None
         from .checkpoint_callback import CheckpointCallback
 
         checkpoint = getattr(self.trainer, "checkpoint_callback", None)
@@ -477,6 +514,13 @@ class GlobalStateCallback(Callback):
         event_name, step, status, dcp = decision
         if event_name != event or step != state.global_step or status not in ("none", "deferred", "saved"):
             raise RuntimeError("Exact external-data checkpoint callbacks disagree on their event")
+        return decision
+
+    def _handle_exact_external_event(self, state, event):
+        decision = self._exact_external_event(state, event)
+        if decision is None:
+            return False
+        _, _, status, dcp = decision
         if status == "saved" and state.global_step != self._last_saved_step:
             self.save_global_state(state, require_optimizer_checkpoint=dcp)
         return True
@@ -504,7 +548,25 @@ class GlobalStateCallback(Callback):
                 )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        if self._handle_exact_external_event(state, "train_end"):
+        try:
+            # Validate local callback state before a peer can enter cursor
+            # saving or the provider-close collective.
+            if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
+                error = None
+                decision = None
+                try:
+                    decision = self._exact_external_event(state, "train_end")
+                except BaseException as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "checking the final external-data event")
+                agree_external_train_end_decision((decision, state.global_step != self._last_saved_step))
+            handled = self._handle_exact_external_event(state, "train_end")
+        except BaseException as exc:
+            if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
+                close_external_data_contract_after_failure(self.trainer, exc)
+            raise
+        if handled:
+            close_external_data_contract(self.trainer)
             return
         if self.save_hf_weights:
             if state.global_step != self._last_saved_step:
