@@ -329,7 +329,7 @@ class BaseTrainer(Stateful, ABC):
             self._build_dataset()
             self._build_collate_fn()
             if type(self) is BaseTrainer:
-                self._build_dataloader(allow_cyclic=True)
+                self._build_sft_dataloader()
             else:
                 # Subclasses may override the legacy no-argument builder.
                 self._build_dataloader()
@@ -459,7 +459,33 @@ class BaseTrainer(Stateful, ABC):
             seq_classification=seq_classification,
         )
 
-    def _build_dataloader(self, *, allow_cyclic: bool = False):
+    def _build_dataloader(self):
+        args: VeOmniArguments = self.args
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
+        dataloader_kwargs.pop("use_background_prefetcher", None)
+        self.train_dataloader = build_dataloader(
+            dataloader_type=dataloader_type,
+            dataset=self.train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train_steps,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+            dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
+            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            seed=args.train.seed,
+            collate_fn=self.collate_fn,
+            save_steps=args.train.checkpoint.save_steps,
+            **dataloader_kwargs,
+        )
+
+    def _build_sft_dataloader(self):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
@@ -483,11 +509,11 @@ class BaseTrainer(Stateful, ABC):
             try:
                 from ..data.cyclic_packing import CyclicPackedLoader, _StatelessMainCollator
                 from ..data.dataset import MappingDataset
+                from .callbacks import global_state_callback
 
                 state = get_parallel_state()
                 if (
-                    allow_cyclic is not True
-                    or args.data.data_type not in ("conversation", "plaintext")
+                    args.data.data_type not in ("conversation", "plaintext")
                     or args.data.datasets_type != "mapping"
                     or args.data.enable_multisource
                     or args.train.micro_batch_size != 1
@@ -516,6 +542,8 @@ class BaseTrainer(Stateful, ABC):
                     checkpoint, "_last_saved_optimizer_generation"
                 ):
                     raise ValueError("cyclic_packed requires a generation-aware MultiOptimizer checkpoint")
+                if not callable(getattr(global_state_callback, "_saved_multi_optimizer_generations", None)):
+                    raise ValueError("cyclic_packed requires generation-aware trainer checkpoint coordination")
                 source_fingerprint = getattr(self.train_dataset._data, "_fingerprint", None)
                 self.train_dataloader = CyclicPackedLoader(
                     self.train_dataset,
@@ -541,26 +569,24 @@ class BaseTrainer(Stateful, ABC):
             return
         if cyclic_contract is not None or cyclic_deterministic:
             raise ValueError("cyclic input attestation requires data.dataloader.type='cyclic_packed'")
-        self.train_dataloader = build_dataloader(
-            dataloader_type=dataloader_type,
-            dataset=self.train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train_steps,
-            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-            dyn_bsz=args.train.dyn_bsz,
-            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
-            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
-            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-            seed=args.train.seed,
-            collate_fn=self.collate_fn,
-            save_steps=args.train.checkpoint.save_steps,
-            **dataloader_kwargs,
-        )
+        self._build_dataloader()
+
+    def _complete_optimizer_step(self):
+        """Synchronize cyclic-loader optimizer failures before committing data."""
+        cyclic = getattr(getattr(self, "train_dataloader", None), "_veomni_requires_optimizer_commit", False)
+        error = None
+        try:
+            self.model.optimizer.step()
+            self.model.lr_scheduler.step()
+            self.model.optimizer.zero_grad()
+        except Exception as exc:
+            if not cyclic:
+                raise
+            error = exc
+        if cyclic:
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            raise_if_any_rank_failed(error, "completing the cyclic packing optimizer step")
 
     def _build_training_context(self, model) -> None:
         """Build fwd/bwd contexts from this model's offload config.
@@ -836,23 +862,6 @@ class BaseTrainer(Stateful, ABC):
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:
             synchronize()
-
-    def _complete_optimizer_step(self):
-        """Synchronize cyclic-loader optimizer failures before committing data."""
-        cyclic = getattr(getattr(self, "train_dataloader", None), "_veomni_requires_optimizer_commit", False)
-        error = None
-        try:
-            self.model.optimizer.step()
-            self.model.lr_scheduler.step()
-            self.model.optimizer.zero_grad()
-        except Exception as exc:
-            if not cyclic:
-                raise
-            error = exc
-        if cyclic:
-            from ..utils.dist_utils import raise_if_any_rank_failed
-
-            raise_if_any_rank_failed(error, "completing the cyclic packing optimizer step")
 
     def train_step(
         self,

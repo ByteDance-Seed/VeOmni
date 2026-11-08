@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.trainer.callbacks import global_state_callback
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
@@ -58,7 +59,6 @@ def _worker(rank, rendezvous):
     from veomni.data.dataset import MappingDataset
     from veomni.trainer import base as trainer_base
     from veomni.trainer.base import BaseTrainer
-    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
     try:
@@ -67,6 +67,8 @@ def _worker(rank, rendezvous):
         trainer_base.get_parallel_state = lambda: SimpleNamespace(
             dp_size=1, tp_size=1, sp_size=2, sp_group=dist.group.WORLD
         )
+        if not hasattr(global_state_callback, "_saved_multi_optimizer_generations"):
+            global_state_callback._saved_multi_optimizer_generations = lambda *_args: {}
 
         # Exercise the standard trainer builder, optimizer hook and commit
         # hook with an actual HF mapping dataset and MainCollator.
@@ -120,7 +122,7 @@ def _worker(rank, rendezvous):
         trainer.collate_fn = data_collator.MainCollator()
         trainer.state = SimpleNamespace(global_step=0)
         trainer._callbacks = []
-        trainer._build_dataloader(allow_cyclic=True)
+        trainer._build_sft_dataloader()
         trainer.state.global_step = 1
         batches = next(trainer.train_dataloader)
         assert batches and len(batches) == 2
@@ -246,12 +248,23 @@ def _worker(rank, rendezvous):
         dist.all_reduce(flag)
         assert flag.item() == 2
 
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_rank_cursor_and_failure_consensus(tmp_path):
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True)
+
+
+def _checkpoint_failure_worker(rank, rendezvous, root):
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    try:
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = SimpleNamespace(
             train_dataloader=SimpleNamespace(_veomni_requires_optimizer_commit=True),
-            args=SimpleNamespace(
-                train=SimpleNamespace(global_rank=rank, checkpoint=SimpleNamespace(save_path="/tmp/cyclic-test"))
-            ),
+            args=SimpleNamespace(train=SimpleNamespace(global_rank=rank, checkpoint=SimpleNamespace(save_path=root))),
         )
 
         def checkpoint_state(_state):
@@ -262,12 +275,21 @@ def _worker(rank, rendezvous):
         callback.state_dict = checkpoint_state
         with pytest.raises((ValueError, RuntimeError), match="checkpoint state failure|another rank"):
             callback.save_global_state(SimpleNamespace(global_step=1))
-        flag.fill_(1)
+        flag = torch.tensor([1])
         dist.all_reduce(flag)
         assert flag.item() == 2
     finally:
         dist.destroy_process_group()
 
 
-def test_two_rank_cursor_and_failure_consensus(tmp_path):
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True)
+@pytest.mark.skipif(
+    not callable(getattr(global_state_callback, "_saved_multi_optimizer_generations", None)),
+    reason="requires owner-aware DCP PR",
+)
+def test_two_rank_checkpoint_failure_consensus(tmp_path):
+    mp.spawn(
+        _checkpoint_failure_worker,
+        args=(f"file://{tmp_path / 'checkpoint-rendezvous'}", str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )

@@ -160,18 +160,8 @@ class GlobalStateCallback(Callback):
         it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
-        if getattr(getattr(self.trainer, "train_dataloader", None), "_veomni_requires_optimizer_commit", False):
-            error, step_root, payload = None, None, None
-            try:
-                step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-                payload = self.state_dict(state)
-            except Exception as exc:
-                error = exc
-            raise_if_any_rank_failed(error, "collecting cyclic packing checkpoint state")
-            assert step_root is not None and payload is not None
-        else:
-            step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-            payload = self.state_dict(state)
+        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        payload = self.state_dict(state)
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 

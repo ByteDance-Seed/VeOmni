@@ -235,7 +235,7 @@ class VLMTrainer:
             self.base._build_dataset()
             # rewrite build_collate_fn to support multimodal collate_fn
             self._build_collate_fn()
-            self.base._build_dataloader(allow_cyclic=True)
+            self.base._build_sft_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context(self.base.model)
         self.base._init_callbacks()

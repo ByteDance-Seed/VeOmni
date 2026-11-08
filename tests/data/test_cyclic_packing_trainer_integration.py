@@ -73,20 +73,22 @@ def _trainer():
 
 def test_sft_explicitly_opts_in_and_dpo_default_conversation_is_rejected(monkeypatch):
     from veomni.data import cyclic_packing
+    from veomni.trainer.callbacks import global_state_callback
 
     monkeypatch.setattr(
         trainer_base, "get_parallel_state", lambda: SimpleNamespace(dp_size=1, tp_size=1, sp_size=2, sp_group="sp")
     )
     monkeypatch.setattr(cyclic_packing, "_StatelessMainCollator", lambda collator: collator)
+    monkeypatch.setattr(global_state_callback, "_saved_multi_optimizer_generations", lambda *_args: {}, raising=False)
     captured = {}
     monkeypatch.setattr(cyclic_packing, "CyclicPackedLoader", lambda *args, **kwargs: captured.update(kwargs))
 
     # DPO also defaults to data_type=conversation; it must not opt in just
     # because that field happens to match the SFT configuration.
-    with pytest.raises(ValueError, match="map-style SFT"):
-        _trainer()._build_dataloader()
+    with pytest.raises(ValueError, match="Unknown dataloader name: cyclic_packed"):
+        trainer_base.build_dataloader("cyclic_packed")
     trainer = _trainer()
-    trainer._build_dataloader(allow_cyclic=True)
+    trainer._build_sft_dataloader()
     assert captured["micro_batches_per_step"] == 64
     assert captured["max_seq_len"] == 262144
     assert captured["train_steps"] == 5 and captured["train_epochs"] == 3
@@ -100,11 +102,34 @@ def test_unproven_optimizer_or_async_save_is_rejected(monkeypatch):
     trainer = _trainer()
     trainer.model.optimizer._is_multi_optimizer = False
     with pytest.raises(ValueError, match="generation-aware MultiOptimizer"):
-        trainer._build_dataloader(allow_cyclic=True)
+        trainer._build_sft_dataloader()
     trainer = _trainer()
     trainer.args.train.checkpoint.save_async = True
     with pytest.raises(ValueError, match="map-style SFT"):
-        trainer._build_dataloader(allow_cyclic=True)
+        trainer._build_sft_dataloader()
+
+
+def test_generation_aware_trainer_checkpoint_is_required(monkeypatch):
+    from veomni.trainer.callbacks import global_state_callback
+
+    monkeypatch.setattr(
+        trainer_base, "get_parallel_state", lambda: SimpleNamespace(dp_size=1, tp_size=1, sp_size=2, sp_group="sp")
+    )
+    monkeypatch.delattr(global_state_callback, "_saved_multi_optimizer_generations", raising=False)
+    with pytest.raises(ValueError, match="trainer checkpoint coordination"):
+        _trainer()._build_sft_dataloader()
+
+
+def test_native_sft_keeps_the_existing_loader_path(monkeypatch):
+    trainer = _trainer()
+    trainer.args.data.dataloader.type = "native"
+    trainer.args.train.cyclic_input_contract = None
+    trainer.args.train.cyclic_input_deterministic = False
+    monkeypatch.setattr(
+        trainer_base.BaseTrainer, "_build_dataloader", lambda self: setattr(self, "native_built", True)
+    )
+    trainer._build_sft_dataloader()
+    assert trainer.native_built
 
 
 def test_legacy_subclass_dataloader_override_remains_compatible(monkeypatch):
