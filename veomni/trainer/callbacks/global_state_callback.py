@@ -195,6 +195,12 @@ def prepare_external_data_contract(trainer, state=None, *, install=False):
                 # Equal sets with different order can enter different DCP
                 # collectives on different ranks.
                 "module_order": list(getattr(trainer.model, "module_runtimes", {}) or {}),
+                # Readiness involves a collective only when a save is due.
+                # Agree the schedule before training so every rank enters it.
+                "checkpoint_schedule": {
+                    key: getattr(trainer.args.train.checkpoint, key, None)
+                    for key in ("save_steps", "save_epochs", "save_hf_weights", "hf_save_steps", "hf_save_epochs")
+                },
             }
         ).hex()
     except BaseException as exc:
@@ -206,6 +212,34 @@ def prepare_external_data_contract(trainer, state=None, *, install=False):
         dist.group.WORLD if dist.is_initialized() else None,
         replay_contract=replay_signature,
     )
+
+
+def external_data_checkpoint_ready(trainer, state):
+    """Agree a non-mutating provider readiness check before any checkpoint I/O.
+
+    A provider without this optional method retains its existing fail-closed
+    validation behavior. A false result only defers a scheduled checkpoint;
+    it never certifies the cursor or suppresses the regular save preflight.
+    """
+    error, ready = None, True
+    try:
+        contract = _external_data_contract(trainer)
+        check = getattr(contract, "checkpoint_ready", None)
+        if check is not None:
+            if not callable(check):
+                raise TypeError("External checkpoint readiness must be callable")
+            ready = check(trainer, state)
+            if type(ready) is not bool:
+                raise TypeError("External checkpoint readiness must return bool")
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking external checkpoint readiness")
+    if dist.is_initialized():
+        device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+        ready_tensor = torch.tensor([int(ready)], dtype=torch.int32, device=device)
+        dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN)
+        ready = bool(ready_tensor.item())
+    return ready
 
 
 def _multi_optimizer_checkpoints(trainer):
@@ -429,13 +463,35 @@ class GlobalStateCallback(Callback):
     def on_step_begin(self, state: TrainerState, **kwargs) -> None:
         self._unadvanced_boundary_state = None
 
+    def _handle_exact_external_event(self, state, event):
+        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is not True:
+            return False
+        from .checkpoint_callback import CheckpointCallback
+
+        checkpoint = getattr(self.trainer, "checkpoint_callback", None)
+        if not isinstance(checkpoint, CheckpointCallback):
+            raise RuntimeError("Exact external-data checkpoint scheduling requires its model callback")
+        decision = checkpoint._external_checkpoint_event
+        if decision is None:
+            raise RuntimeError("Exact external-data model callback did not run before its data callback")
+        event_name, step, status, dcp = decision
+        if event_name != event or step != state.global_step or status not in ("none", "deferred", "saved"):
+            raise RuntimeError("Exact external-data checkpoint callbacks disagree on their event")
+        if status == "saved" and state.global_step != self._last_saved_step:
+            self.save_global_state(state, require_optimizer_checkpoint=dcp)
+        return True
+
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        if self._handle_exact_external_event(state, "step_end"):
+            return
         dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
         hf_due = self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0
         if dcp_due or hf_due:
             self.save_global_state(state, require_optimizer_checkpoint=bool(dcp_due))
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
+        if self._handle_exact_external_event(state, "epoch_end"):
+            return
         dcp_due = self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0
         hf_due = self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
         if dcp_due or hf_due:
@@ -448,6 +504,8 @@ class GlobalStateCallback(Callback):
                 )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self._handle_exact_external_event(state, "train_end"):
+            return
         if self.save_hf_weights:
             if state.global_step != self._last_saved_step:
                 self.save_global_state(state)
