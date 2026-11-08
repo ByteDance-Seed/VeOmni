@@ -185,6 +185,14 @@ Preserve repository launch conventions. Include a hardware preflight for real-de
 coverage, matching the largest launch in that step, bounded execution and JUnit
 artifacts. Do not copy private Python/CANN paths or device IDs into public CI.
 
+For a required real-device selection, fail preflight when its backend or device
+count is unavailable. Check JUnit for actual execution: zero collected cases or
+an entirely skipped selection is not a successful CI gate. If every selected
+case is required, reject any skip; otherwise document the allowed skips by case.
+Upload logs with `if: always()` so a failed test still leaves evidence, and retain
+the test exit status when using pipelines (for example, Bash `pipefail` with
+`tee`). Keep the outer timeout longer than the worker/collective deadlines.
+
 **Output:** test diff and a mapping from each new case to the CI command that
 selects it. Mark proposed but unexecuted CI entries accordingly.
 

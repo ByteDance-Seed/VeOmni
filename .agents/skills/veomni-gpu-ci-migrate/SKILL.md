@@ -228,6 +228,12 @@ unresolved cause instead of continuing speculative edits. Continue independent r
 7. Record whether the command was run locally, in the target image or in public CI.
    A workflow edit alone proves none of those execution outcomes.
 
+Required accelerator selections must fail when hardware preflight fails or no
+case executes. Define any allowed skips explicitly; an all-skipped selection
+cannot pass the coverage gate. Preserve the pytest exit code through pipelines
+(`pipefail` with `tee`) and upload existing logs/JUnit with `if: always()` even
+after failure. Bound workers before the enclosing step deadline.
+
 **Output:** per-unit results and exact CI-selection mapping. Keep successfully
 executed but unwired tests distinct from validated-and-wired migrations.
 
