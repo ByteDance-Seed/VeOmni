@@ -105,6 +105,9 @@ class CheckpointCallback(Callback):
         self._last_dcp_step: int = -1
         self._last_hf_step: int = -1
         self._async_save_failed = False
+        self._external_pending_dcp = False
+        self._external_pending_hf = False
+        self._external_checkpoint_event = None
 
     def _check_async_save(self):
         if self._async_save_failed:
@@ -129,6 +132,17 @@ class CheckpointCallback(Callback):
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         self._check_async_save()
+        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
+            self._external_checkpoint_event = None
+            hf_due = self.save_hf_weights and state.global_step != self._last_hf_step
+            if self._external_pending_dcp or self._external_pending_hf or hf_due:
+                self._save_exact_external_event(state, "train_end", False, bool(hf_due))
+                if self._external_pending_dcp or self._external_pending_hf:
+                    raise RuntimeError("Training ended before the exact data checkpoint became ready")
+            else:
+                self._wait_for_pending_save()
+                self._external_checkpoint_event = ("train_end", state.global_step, "none", False)
+            return
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")
@@ -145,6 +159,13 @@ class CheckpointCallback(Callback):
         self._check_async_save()
         dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
         hf_due = self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0
+        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
+            self._external_checkpoint_event = None
+            if dcp_due or hf_due or self._external_pending_dcp or self._external_pending_hf:
+                self._save_exact_external_event(state, "step_end", bool(dcp_due), bool(hf_due))
+            else:
+                self._external_checkpoint_event = ("step_end", state.global_step, "none", False)
+            return
         if dcp_due and state.global_step != self._last_dcp_step:
             self._save_dcp(state)
         if hf_due:
@@ -158,6 +179,17 @@ class CheckpointCallback(Callback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         self._check_async_save()
+        if getattr(self.trainer, "_veomni_require_exact_data_resume", False) is True:
+            self._external_checkpoint_event = None
+            dcp_due = self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0
+            hf_due = (
+                self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
+            )
+            if dcp_due or hf_due:
+                self._save_exact_external_event(state, "epoch_end", bool(dcp_due), bool(hf_due))
+            else:
+                self._external_checkpoint_event = ("epoch_end", state.global_step, "none", False)
+            return
         if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
             if state.global_step != self._last_dcp_step:
                 self._save_dcp(state)
@@ -176,6 +208,31 @@ class CheckpointCallback(Callback):
                     f"Skipping duplicate HF checkpoint save at epoch_end (global_step {state.global_step} "
                     f"already saved at step_end)."
                 )
+
+    def _save_exact_external_event(self, state, event, dcp_due, hf_due):
+        """Defer all pieces together until every data provider is ready."""
+        from .global_state_callback import external_data_checkpoint_ready
+
+        dcp_due = (dcp_due or self._external_pending_dcp) and state.global_step != self._last_dcp_step
+        hf_due = (hf_due or self._external_pending_hf) and state.global_step != self._last_hf_step
+        if not dcp_due and not hf_due:
+            self._external_pending_dcp = False
+            self._external_pending_hf = False
+            self._external_checkpoint_event = (event, state.global_step, "none", False)
+            return
+        if not external_data_checkpoint_ready(self.trainer, state):
+            self._external_pending_dcp = dcp_due
+            self._external_pending_hf = hf_due
+            self._external_checkpoint_event = (event, state.global_step, "deferred", False)
+            logger.warning_rank0(f"Deferring exact-data checkpoint at step {state.global_step} until replay drains.")
+            return
+        if dcp_due and state.global_step != self._last_dcp_step:
+            self._save_dcp(state)
+        if hf_due and state.global_step != self._last_hf_step:
+            self._save_hf(state, stage=event)
+        self._external_pending_dcp = False
+        self._external_pending_hf = False
+        self._external_checkpoint_event = (event, state.global_step, "saved", self._last_dcp_step == state.global_step)
 
     def _save_dcp(self, state: TrainerState):
         try:

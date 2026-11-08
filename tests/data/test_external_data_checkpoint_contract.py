@@ -219,6 +219,7 @@ def _provider_failure_worker(rank, store):
             "owners",
             "order",
             "dpo",
+            "checkpoint_schedule",
             "unbound",
             "wrapped_unbound",
         ):
@@ -255,6 +256,8 @@ def _provider_failure_worker(rank, store):
                 }
             elif scenario == "dpo" and rank == 0:
                 trainer = DPOTrainer(**vars(trainer))
+            elif scenario == "checkpoint_schedule":
+                trainer.args.train.checkpoint.save_steps = 2 if rank == 0 else 3
             elif scenario == "unbound":
                 trainer._veomni_require_exact_data_resume = False
                 trainer.train_dataloader._veomni_exact_resume_requested = rank == 0
