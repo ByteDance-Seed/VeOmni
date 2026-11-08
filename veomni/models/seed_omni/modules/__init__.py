@@ -40,7 +40,8 @@ Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
 than re-spelling ``<family>_<sub_module>`` per file.  The shared
-word-token embedding + LM head module lives at ``modules/text_encoder/``.
+word-token embedding + LM head module lives at ``modules/text_encoder/``, and
+cross-family packing helpers live under ``modules/base/``.
 """
 
 from transformers import PretrainedConfig
@@ -109,8 +110,8 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under text_encoder/ and fake_model/.
-from . import fake_model, text_encoder  # noqa: F401  E402
+# Side-effect only: attach @register factories under base/, fake_model/, qwen3/, text_encoder/.
+from . import base, fake_model, qwen3, text_encoder  # noqa: F401  E402
 
 
 __all__ = [
