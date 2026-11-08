@@ -1253,6 +1253,21 @@ class TrainingArguments:
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    cyclic_input_contract: Optional[str] = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "SHA256 identity of immutable inputs and deterministic preprocessing for cyclic packing."},
+    )
+    cyclic_input_deterministic: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Attest that cyclic packing inputs and collation are deterministic and stateless."},
+    )
+    cyclic_max_buffer_bytes: int = field(
+        default=512 * 1024 * 1024,
+        kw_only=True,
+        metadata={"help": "Soft decoded-feature storage budget for cyclic packing, plus one lookahead."},
+    )
 
     def __post_init__(self):
         if self.dyn_bsz_physical_overflow_ratio < 1.0:

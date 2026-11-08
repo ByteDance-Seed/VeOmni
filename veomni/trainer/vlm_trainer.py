@@ -235,7 +235,7 @@ class VLMTrainer:
             self.base._build_dataset()
             # rewrite build_collate_fn to support multimodal collate_fn
             self._build_collate_fn()
-            self.base._build_dataloader()
+            self.base._build_dataloader(allow_cyclic=True)
         self.base._build_lr_scheduler()
         self.base._build_training_context(self.base.model)
         self.base._init_callbacks()
@@ -347,9 +347,7 @@ class VLMTrainer:
         grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.base.model.optimizer.step()
-        self.base.model.lr_scheduler.step()
-        self.base.model.optimizer.zero_grad()
+        self.base._complete_optimizer_step()
 
         self.on_step_end(
             loss=total_loss,
