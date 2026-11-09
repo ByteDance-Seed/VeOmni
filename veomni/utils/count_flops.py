@@ -1558,4 +1558,3 @@ class VeomniFlopsCounter:
         estimated_flops = func(tokens_sum, batch_seqlens, delta_time, **kwargs)
         promised_flops = get_device_flops()
         return estimated_flops, promised_flops
-

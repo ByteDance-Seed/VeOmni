@@ -845,4 +845,3 @@ class TestDeepseekV4Flops:
         compressed_flops, _ = VeomniFlopsCounter(compressed_config).estimate_flops(batch_seqlens, delta_time=1.0)
 
         assert compressed_flops < baseline_flops
-

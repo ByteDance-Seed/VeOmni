@@ -652,4 +652,3 @@ records forward loss parity and parameter updates for SP1/SP2, together with
 an unresolved SP2 raw-gradient scaling discrepancy. It is not a full numerical
 equivalence or production-quality validation. Pretrained quality and throughput
 still require dedicated evaluation.
-

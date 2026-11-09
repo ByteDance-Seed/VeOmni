@@ -1027,4 +1027,3 @@ def create_profiler(
 
 if os.getenv("DISABLE_WARNINGS", "0").lower() in ["true", "1"]:
     disable_warning()
-
