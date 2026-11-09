@@ -1,0 +1,59 @@
+name: Build CANN 9.2.1 A3 candidate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Select image tag
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/veomni:cann921-a3-arm64-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3
+          platforms: linux/arm64
+          load: true
+          tags: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            ai.veomni.docker-revision=${{ github.sha }}
+            ai.veomni.fla-revision=a7c608f2e3f828779ceeec1fcf155a6e37ede83c
+            ai.veomni.target=a3
+          build-args: FLA_BUILD_JOBS=4
+      - name: Packaging smoke without NPU
+        run: |
+          mkdir -p reports
+          chmod 777 reports
+          docker image inspect "$IMAGE" > reports/image-inspect.json
+          docker run --rm --entrypoint /bin/bash -v "$PWD/reports:/reports" \
+            -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 -e REVISION="$GITHUB_SHA" "$IMAGE" -c '
+              set -eo pipefail
+              source /usr/local/Ascend/ascend-toolkit/set_env.sh
+              python /app/docker/ascend/tests/ascend_image_smoke.py \
+                --image-inspect /reports/image-inspect.json \
+                --expected-docker-commit "$REVISION" --target a3 --output /reports/smoke.json
+            '
+      - name: Publish candidate
+        run: |
+          docker push "$IMAGE"
+          echo "Candidate image: $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Packaging only; check dependency_consistent in smoke.json before device tests.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cann921-a3-packaging
+          path: reports/

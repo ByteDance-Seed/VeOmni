@@ -145,3 +145,26 @@ Make the GHCR package publicly pullable before using it in upstream PR CI.
 Record the pushed digest and test an anonymous pull before updating A2 CI.
 Device numerical tests remain required. Existing A2 CI still uses its previous
 image until a candidate has been published and verified.
+### Build an A3 candidate in GitHub Actions
+
+The `Build CANN 9.2.1 A3 candidate` workflow in
+[build-cann921-a3.yml](../.github/workflows/build-cann921-a3.yml) is manual-only.
+It builds the A3 Dockerfile on `ubuntu-22.04-arm` for `linux/arm64`, runs the
+packaging smoke without an NPU, and publishes only after that smoke passes:
+`ghcr.io/<owner>/veomni:cann921-a3-arm64-<commit>-<run-id>-<attempt>`.
+The smoke report is retained as the `cann921-a3-packaging` artifact, including
+on failures when a report is available. Dependency consistency is reported
+separately; a successful build is not NPU hardware acceptance.
+
+Register the workflow on the repository's default branch before manual dispatch,
+then select `zpl1n/ascend-cann921-a2-a3` as the run branch. For this fork:
+
+```bash
+gh workflow run build-cann921-a3.yml --repo zpl1n/VeOmni \
+  --ref zpl1n/ascend-cann921-a2-a3
+```
+
+This runner needs ARM64 CPU capacity, not an A3 NPU. If hosted ARM64 runners
+are unavailable, build with the local commands above on an ARM64 host and run
+the device checks on an A3 machine. The builder does not include NPU tests or
+resolve the outstanding VeOmni legacy FLA API incompatibility.
