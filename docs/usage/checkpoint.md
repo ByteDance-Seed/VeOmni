@@ -67,6 +67,45 @@ Three splits in the tree above are deliberate:
   is not what a LoRA run resumes from; see
   [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving).
 
+### Native dataloader resume state
+
+The native builder seeds a CPU generator with `seed + dp_rank`. Iterator
+construction therefore does not advance the global training CPU RNG. Native
+loader snapshots include `_veomni_generator`, containing the generator state
+before iterator construction and at checkpoint time. `DistributedDataloader`
+replays construction from the former, then restores the latter. This uses
+torchdata internal `_get_iterator`; regressions cover torchdata 0.11.0.
+
+`ShardedIterableDataset.state_dict()` records the raw-row index, repeat pass,
+pending rows and upstream source state underneath worker packing.
+`load_state_dict()` reconnects that cursor through the normal torchdata dataset
+state protocol. HF sources are recreated privately for each pass so a restored
+starting cursor cannot leak into later repeat passes; they are not worker-sharded
+twice. Sources without a cursor replay the consumed prefix of the current
+pass; this preserves row order only for deterministic, re-iterable sources.
+Buffered HF shuffled sources also replay the current pass through `rows_read`:
+in datasets 2.21.0 their cursor omits the shuffle buffer and may already point
+to upstream EOF while buffered rows remain. The same pass seed and output
+prefix rebuild that buffer instead of skipping rows or starting a repeat early.
+This replay also ignores incomplete source cursors saved by earlier snapshots.
+It costs a prefix scan on restart; unshuffled HF sources retain cursor restore.
+Detection walks HF internal `_ex_iterable` and its `ex_iterable`/`ex_iterables`
+children for `BufferShuffledExamplesIterable`, beneath supported
+`_data`/`_dataset` wrappers. This covers buffers hidden by map/filter, concat
+or interleave composition even when the outer `_shuffling` is `None`.
+Regressions cover datasets 2.21.0, default iterable/interleave builder shuffle,
+zero/one/two native workers and unshuffled cursor controls.
+`IterativeDataset.state_dict()` returns `None` when its upstream source has no
+cursor, so wrapping a stateless source does not suppress that replay.
+
+Existing native snapshots without generator metadata still load. Earlier
+snapshots that did not save a raw-row cursor cannot recover that missing
+history. No configuration, version or topology eligibility checks are added.
+For exact continuation, source/transform implementations must also own their
+external RNG and other state; this change does not certify worker Python/NumPy
+RNG or GPU arithmetic determinism. The default iterator/worker seeding changes
+for new runs; it no longer depends on random draws performed by model setup.
+
 ## Multi-module jobs (SeedOmni)
 
 A SeedOmni job trains several modules side by side, each with its own weights,
