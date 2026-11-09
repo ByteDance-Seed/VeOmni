@@ -1411,6 +1411,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "qsa_indexer_implementation": frozenset({"npu_ascendc"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1418,6 +1419,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "qsa_indexer_implementation": frozenset({"npu_ascendc"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
@@ -1659,6 +1661,13 @@ class OpsImplementationConfig:
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
+    qsa_indexer_implementation: Literal["eager", "npu_ascendc"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA top-k block selection implementation: 'eager' or 'npu_ascendc'. "
+            "'npu_ascendc' is the Ascend CANN Lightning Indexer (requires cann_ops_transformer, NPU)."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
         metadata={
@@ -1820,6 +1829,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        # ``Literal`` is not enforced at runtime for dataclass fields, so a
+        # typo would silently select the eager path on non-NPU hosts.
+        if self.qsa_indexer_implementation not in (None, "eager", "npu_ascendc"):
+            raise ValueError(
+                f"qsa_indexer_implementation={self.qsa_indexer_implementation!r} is not one of "
+                "'eager', 'npu_ascendc'."
+            )
         # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
         # ``qat`` are two values of the same ``moe_implementation`` field, so they
         # cannot both be selected; ``linear_implementation`` and

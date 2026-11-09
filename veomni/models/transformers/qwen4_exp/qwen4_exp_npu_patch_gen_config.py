@@ -30,14 +30,41 @@ config = deepcopy(gpu_config)
 config.target_file = "patched_modeling_qwen4_exp_npu.py"
 config.description = "Qwen4-Exp NPU VLM-SFT correctness integration with PLE sharding"
 
-# Replace the GPU QSA indexer mask value in-place so NPU masks invisible block
-# scores with -1.0 instead of -inf. ReLU block scores are non-negative, and
-# CANN TopKV2 faults (AICore error 507015) on sparse rows dominated by -inf.
+for _patch in config.patches:
+    if _patch.target == "Qwen4ExpTextQSAIndexer.__init__":
+        _patch.name_map = {
+            "self.veomni_rope = VeomniOp(\"rope\", \"partial\", config.ops_config.rotary_pos_emb_implementation)": (
+                "self.veomni_rope = VeomniOp(\"rope\", \"partial\", config.ops_config.rotary_pos_emb_implementation)\n"
+                "        self.veomni_qsa_indexer = (\n"
+                "            VeomniOp(\"qsa_indexer\", \"standard\", \"npu_ascendc\")\n"
+                "            if config.ops_config.qsa_indexer_implementation == \"npu_ascendc\"\n"
+                "            else None\n"
+                "        )"
+            ),
+        }
+        break
+else:
+    raise RuntimeError("Expected Qwen4ExpTextQSAIndexer.__init__ in qwen4_exp GPU patch config")
+
+# Two forward edits: invisible-block masks become -1.0 (NPU TopKV2 faults on
+# -inf rows), and the eager TopK branch re-arms with the Lightning Indexer.
 for _patch in config.patches:
     if _patch.target == "Qwen4ExpTextQSAIndexer.forward":
         _patch.name_map = {
             'scores = scores.masked_fill(~visible, float("-inf"))': (
                 "scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)"
+            ),
+            "if block_starts.numel():": (
+                "if self.veomni_qsa_indexer is not None and block_starts.numel():\n"
+                "            selected_local = self.veomni_qsa_indexer(\n"
+                "                q,\n"
+                "                pooled_keys,\n"
+                "                cu_seq_lens_q=cu_seq_lens_q,\n"
+                "                packed_seq_lens=packed_seq_lens,\n"
+                "                compress_ratio=self.compress_ratio,\n"
+                "                block_topk=self.block_topk,\n"
+                "            )\n"
+                "        elif block_starts.numel():"
             ),
         }
         break

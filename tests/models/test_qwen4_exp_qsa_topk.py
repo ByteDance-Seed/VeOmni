@@ -36,6 +36,7 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
         q_layernorm=torch.nn.Identity(),
         k_layernorm=torch.nn.Identity(),
         veomni_rope=lambda q, k, cos, sin, **kwargs: (q, k),
+        veomni_qsa_indexer=None,
     )
     positions = (torch.ones(1, 25, 2), torch.zeros(1, 25, 2))
     boundaries = torch.tensor([0, 9, 25], dtype=torch.int32)
@@ -144,6 +145,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
             q_layernorm=torch.nn.Identity(),
             k_layernorm=torch.nn.Identity(),
             veomni_rope=lambda q, k, cos, sin, **kwargs: (q, k),
+            veomni_qsa_indexer=None,
         )
         gather = torch.Tensor.gather
         bool_calls = []

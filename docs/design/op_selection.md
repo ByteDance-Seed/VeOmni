@@ -23,6 +23,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
+| QSA indexer | `qsa_indexer_implementation` | `eager`, `npu_ascendc` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` binds an instance-local `VeomniOp` for non-`eager` values; `eager` stays the in-`forward` reference loop |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -355,6 +356,21 @@ not rebased for head-specific masks. See
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### Qwen4-Exp QSA
+
+`qsa_indexer_implementation` accepts `eager` and `npu_ascendc` for the QSA
+top-k block selection. `eager` is the reference loop in the model's
+`forward`; `npu_ascendc` binds a `VeomniOp` in `__init__` and is the Ascend
+CANN Lightning Indexer (requires `cann_ops_transformer`, FP16/BF16,
+`index_head_dim` 128, and a topk in the LightningIndexerV2 set — 1–2048, or
+1024-multiples up to 8192); it consumes the already-pooled blocks in BSND layout — one call for
+equal-length batches, one per segment for packed varlen batches — and raises
+on shapes outside that contract or under sequence parallelism.
+
+Both implementations return integer token ids, so the indexer projection
+receives no gradient through the selection — the eager loop's `topk` is
+equally non-differentiable. DDP over a trainable indexer projection needs a
+wrapper that tolerates unused parameters; VeOmni does not expose such a
+setting.
 
 `qsa_attention_implementation` accepts `eager`, `tilelang`, and `torch_npu`.
 `eager` expands the compact token selection into the dense reference path and
