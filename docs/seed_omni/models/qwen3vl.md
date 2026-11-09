@@ -247,11 +247,15 @@ recovering 0.47% / 0.21% of that gap, and 0.18% (inside its own jitter) in the
 speech round. See [Adding a model §4.1](../usage/adding_a_model.md#41-packing-optional)
 for those numbers.
 
-Note the packed launcher reports no per-sample sequence lengths to the metric
-meter, so per-module token accounting and multi-source token counts read zero on
-this path. The sample count is correct (`OmniEnvironMeter.add` counts the batch's
-`packed_cu_seqlens` boundaries), and `get_length_fn` now knows the packed keys, so
-`dyn_bsz` can size packed samples too.
+Both training graphs report to the same metric meter, so per-module token counts
+and FLOPs are available on the packed path as well as the per-sample one. Each
+module reads its own boundaries there: vision recovers merged tokens per real
+visual from `image_grid_thw[visual_is_real]`, while the text encoder and the
+backbone take the row lengths from `packed_cu_seqlens` — so the counts align with
+`ds_idx` and multi-source token counts are attributed per source. The sample
+count also comes from `packed_cu_seqlens`, which `OmniEnvironMeter.add` counts
+rather than assuming one sample per row, and `get_length_fn` knows the packed keys
+so `dyn_bsz` can size packed samples too.
 
 ---
 
