@@ -16,6 +16,7 @@
 
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,10 +31,10 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 
 
 class _Rows:
-    def __init__(self, rank=0, changed=False):
+    def __init__(self):
         self.rows = []
         for index, length in enumerate((3, 2, 4, 1, 2, 3, 2)):
-            value = index + 1 + int(changed and rank == 1 and index == 0)
+            value = index + 1
             self.rows.append(
                 {
                     "input_ids": torch.full((length,), value),
@@ -67,8 +68,6 @@ def _worker(rank, rendezvous):
         trainer_base.get_parallel_state = lambda: SimpleNamespace(
             dp_size=1, tp_size=1, sp_size=2, sp_group=dist.group.WORLD
         )
-        if not hasattr(global_state_callback, "_saved_multi_optimizer_generations"):
-            global_state_callback._saved_multi_optimizer_generations = lambda *_args: {}
 
         # Exercise the standard trainer builder, optimizer hook and commit
         # hook with an actual HF mapping dataset and MainCollator.
@@ -77,6 +76,10 @@ def _worker(rank, rendezvous):
             return [{"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}]
 
         trainer = BaseTrainer.__new__(BaseTrainer)
+        from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+        from veomni.models.checkpoint.manager import ModelCheckpointManager
+        from veomni.optim.optimizer import MultiOptimizer
+
         config = DataloaderConfig(
             type="cyclic_packed",
             num_workers=0,
@@ -108,14 +111,15 @@ def _worker(rank, rendezvous):
             ),
             train_steps=4,
         )
-        parameter = torch.nn.Parameter(torch.tensor(1.0))
-        optimizer = torch.optim.SGD([parameter], lr=0.1)
-        optimizer._is_multi_optimizer = True
-        trainer.model = SimpleNamespace(
-            optimizer=optimizer,
-            lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0),
-            checkpoint=SimpleNamespace(_last_saved_optimizer_generation=None),
-        )
+        runtime = _make_mock_runtime()
+        runtime.train_args.checkpoint.save_hf_weights = False
+        runtime.model = torch.nn.Linear(1, 1, bias=False)
+        parameter = runtime.model.weight
+        optimizer = torch.optim.AdamW(runtime.model.parameters(), lr=0.1)
+        runtime.optimizer = MultiOptimizer(runtime.model, {"model": optimizer}, ["model"])
+        runtime.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        runtime.checkpoint = ModelCheckpointManager(runtime)
+        trainer.model = runtime
         trainer.train_dataset = MappingDataset(
             Dataset.from_dict({"ids": [[1, 2], [3, 4, 5], [6, 7, 8, 9]]}), transform
         )
@@ -126,16 +130,17 @@ def _worker(rank, rendezvous):
         trainer.state.global_step = 1
         batches = next(trainer.train_dataloader)
         assert batches and len(batches) == 2
-        (parameter * 2).backward()
+        initial_parameter = parameter.detach().clone()
+        (parameter * 2).sum().backward()
         trainer._complete_optimizer_step()
         trainer.on_step_end()
         assert trainer.train_dataloader.state_dict()["step"] == 1
-        assert parameter.item() < 1.0
+        assert parameter.item() < initial_parameter.item()
 
-        def make_loader(step, changed=False):
+        def make_loader(step):
             collator = _StatelessMainCollator(data_collator.MainCollator())
             return CyclicPackedLoader(
-                _Rows(rank, changed),
+                _Rows(),
                 collator,
                 max_seq_len=5,
                 micro_batches_per_step=2,
@@ -154,12 +159,13 @@ def _worker(rank, rendezvous):
         step = SimpleNamespace(value=0)
         loader = make_loader(step)
         saved = []
-        for _ in range(2):
-            batches = next(loader)
-            assert batches and all(batch["labels"].ndim == 2 for batch in batches)
-            step.value += 1
-            loader.commit_step()
-            saved.append(loader.state_dict())
+        with patch.object(dist, "all_gather_object", side_effect=AssertionError("unexpected per-step hash gather")):
+            for _ in range(2):
+                batches = next(loader)
+                assert batches and all(batch["labels"].ndim == 2 for batch in batches)
+                step.value += 1
+                loader.commit_step()
+                saved.append(loader.state_dict())
 
         partial = make_loader(SimpleNamespace(value=0))
         for row in partial.dataset.rows:
@@ -188,15 +194,6 @@ def _worker(rank, rendezvous):
         dist.all_reduce(flag)
         assert flag.item() == 2
 
-        # Source content diverges on only one rank: both ranks reject the
-        # batch, and the process group remains usable afterwards.
-        changed = make_loader(SimpleNamespace(value=0), changed=True)
-        with pytest.raises(RuntimeError, match="inputs differ"):
-            next(changed)
-        flag.fill_(1)
-        dist.all_reduce(flag)
-        assert flag.item() == 2
-
         class BadRows(_Rows):
             def __getitem__(self, index):
                 if rank == 1:
@@ -211,6 +208,29 @@ def _worker(rank, rendezvous):
         dist.all_reduce(flag)
         assert flag.item() == 2
 
+        # Even with a false matching input attestation, reject incompatible
+        # per-rank sequence geometry before model/SP collectives start.
+        mismatched = make_loader(SimpleNamespace(value=0))
+        if rank == 1:
+            for row in mismatched.dataset.rows:
+                for key in ("input_ids", "labels", "attention_mask"):
+                    row[key] = row[key][:1].clone()
+        with pytest.raises(RuntimeError, match="geometry differs"):
+            next(mismatched)
+        flag.fill_(1)
+        dist.all_reduce(flag)
+        assert flag.item() == 2
+
+        mismatched_media = make_loader(SimpleNamespace(value=0))
+        if rank == 1:
+            for row in mismatched_media.dataset.rows:
+                row["pixel_values"] = torch.ones((1, 4))
+        with pytest.raises(RuntimeError, match="geometry differs"):
+            next(mismatched_media)
+        flag.fill_(1)
+        dist.all_reduce(flag)
+        assert flag.item() == 2
+
         class Optimizer:
             def step(self):
                 if rank == 1:
@@ -221,9 +241,26 @@ def _worker(rank, rendezvous):
 
         trainer = SimpleNamespace(
             model=SimpleNamespace(optimizer=Optimizer(), lr_scheduler=SimpleNamespace(step=lambda: None)),
-            train_dataloader=SimpleNamespace(_veomni_requires_optimizer_commit=True),
+            train_dataloader=SimpleNamespace(
+                _veomni_requires_optimizer_commit=True, validate_pending_step=lambda: None
+            ),
         )
         with pytest.raises((ValueError, RuntimeError), match="optimizer failure|another rank"):
+            BaseTrainer._complete_optimizer_step(trainer)
+        flag.fill_(1)
+        dist.all_reduce(flag)
+        assert flag.item() == 2
+
+        class Cursor:
+            _veomni_requires_optimizer_commit = True
+
+            def validate_pending_step(self):
+                if rank == 1:
+                    raise ValueError("injected pending cursor failure")
+
+        trainer.model.optimizer.step = lambda: None
+        trainer.train_dataloader = Cursor()
+        with pytest.raises((ValueError, RuntimeError), match="pending cursor failure|another rank"):
             BaseTrainer._complete_optimizer_step(trainer)
         flag.fill_(1)
         dist.all_reduce(flag)

@@ -72,6 +72,7 @@ collate.checkpoint_collator_identity = "fixture-collator-v1"
 
 
 def loader(dataset, step, **overrides):
+    collator = overrides.pop("collate_fn", collate)
     config = dict(
         max_seq_len=5,
         micro_batches_per_step=3,
@@ -86,7 +87,7 @@ def loader(dataset, step, **overrides):
         step_getter=lambda: step.value,
     )
     config.update(overrides)
-    return CyclicPackedLoader(dataset, collate, **config)
+    return CyclicPackedLoader(dataset, collator, **config)
 
 
 def advance(data, step):
@@ -122,6 +123,43 @@ def test_multiple_cycles_emit_exact_coverage_and_short_tail():
         assert sorted(seen_cycle) == list(range(len(dataset)))
         assert len(seen_cycle) == len(set(seen_cycle))
     assert all(torch.equal(row["labels"], row["input_ids"]) for row in dataset.rows)
+
+
+def test_packing_budget_is_independent_of_backing_storage_capacity():
+    compact_rows, padded_rows = Samples(), Samples()
+    for row in padded_rows.rows:
+        for key, value in row.items():
+            if isinstance(value, torch.Tensor):
+                backing = torch.empty(value.numel() + 256, dtype=value.dtype)
+                backing[: value.numel()].copy_(value.reshape(-1))
+                row[key] = backing[: value.numel()].reshape(value.shape)
+    compact_step, padded_step = SimpleNamespace(value=0), SimpleNamespace(value=0)
+    compact_loader = loader(compact_rows, compact_step)
+    padded_loader = loader(padded_rows, padded_step)
+    for _ in range(3):
+        assert compact(advance(compact_loader, compact_step)) == compact(advance(padded_loader, padded_step))
+        assert compact_loader.state_dict() == padded_loader.state_dict()
+
+
+def test_cyclic_collator_ragged_fallback_does_not_alias_source(monkeypatch):
+    from veomni.data import data_collator
+    from veomni.data.cyclic_packing import _StatelessMainCollator
+
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    samples = Samples(lengths=(3, 2, 3, 2))
+    backing = torch.arange(10, dtype=torch.float32)
+    for index, row in enumerate(samples.rows):
+        row.pop("loss_weights")
+        row["extra_metadata"] = {"nested": [backing[: index + 2]]}
+    original = backing.clone()
+    data = loader(samples, SimpleNamespace(value=0), collate_fn=_StatelessMainCollator(data_collator.MainCollator()))
+    batches = next(data)
+    first = batches[0]["extra_metadata"][0]["nested"][0]
+    other = batches[1]["extra_metadata"][0]["nested"][0]
+    other_before = other.clone()
+    first.add_(100)
+    assert torch.equal(backing, original)
+    assert torch.equal(other, other_before)
 
 
 def test_uncommitted_or_inconsistent_step_cannot_be_saved_or_advanced():
@@ -193,6 +231,10 @@ def test_unattested_random_or_legacy_inputs_fail_closed():
     legacy = loader(Samples(), SimpleNamespace(value=0), require_resume=True)
     with pytest.raises(ValueError, match="unsupported cyclic"):
         legacy.load_state_dict({"legacy": True})
+    old_kind = loader(Samples(), SimpleNamespace(value=0)).state_dict()
+    old_kind["kind"] = "veomni_cyclic_packing_v1"
+    with pytest.raises(ValueError, match="unsupported cyclic"):
+        loader(Samples(), SimpleNamespace(value=0), require_resume=True).load_state_dict(old_kind)
 
     class RandomSamples(Samples):
         def __getitem__(self, index):

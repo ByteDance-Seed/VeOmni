@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.data.test_cyclic_packing import Samples, loader
@@ -112,3 +114,135 @@ def test_cyclic_cursor_dcp_and_next_optimizer_step(tmp_path):
         )
         for actual_param, expected_param in zip(restored.model.model.parameters(), source.model.model.parameters()):
             torch.testing.assert_close(actual_param, expected_param, rtol=0, atol=0)
+
+
+def _standard_trainer_checkpoint_worker(rank, rendezvous, root):
+    from datetime import timedelta
+
+    from datasets import Dataset
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
+    from veomni.arguments.arguments_types import DataloaderConfig
+    from veomni.checkpoint import layout
+    from veomni.data.data_collator import MainCollator
+    from veomni.data.dataset import MappingDataset
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.models.model_runtime import VeOmniModelRuntime
+    from veomni.optim.lr_scheduler import build_lr_scheduler
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.trainer.base import BaseTrainer, VeOmniIter
+    from veomni.trainer.callbacks.base import TrainerState
+    from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        _init_parallel_state(dp_size=1, ulysses_size=2, dp_mode="ddp", device_type="cpu")
+
+        def transform(row):
+            ids = torch.tensor(row["ids"], dtype=torch.long)
+            return [{"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}]
+
+        def build(load_path=None):
+            fixture = _make_mock_trainer(save_path=root)
+            trainer = BaseTrainer.__new__(BaseTrainer)
+            trainer.args = fixture.args
+            trainer.args.train_steps = 4
+            trainer.args.train.global_rank = rank
+            trainer.args.train.world_size = 2
+            trainer.args.train.num_train_epochs = 1
+            trainer.args.train.micro_batch_size = 1
+            trainer.args.train.global_batch_size = 2
+            trainer.args.train.dyn_bsz = True
+            trainer.args.train.dyn_bsz_runtime = "main"
+            trainer.args.train.dyn_bsz_count_mode = "total"
+            trainer.args.train.bsz_warmup_ratio = 0
+            trainer.args.train.cyclic_input_contract = "sha256:" + "a" * 64
+            trainer.args.train.cyclic_input_deterministic = True
+            checkpoint = trainer.args.train.checkpoint
+            checkpoint.save_steps = 1
+            checkpoint.save_epochs = 0
+            checkpoint.save_hf_weights = False
+            checkpoint.load_path = load_path
+            checkpoint.model_assets_dir = root + "/assets"
+            trainer.args.data = SimpleNamespace(
+                dataloader=DataloaderConfig(type="cyclic_packed", num_workers=0, drop_last=False, shuffle=False),
+                data_type="conversation",
+                datasets_type="mapping",
+                enable_multisource=False,
+                max_seq_len=5,
+                dyn_bsz_buffer_size=3,
+            )
+            runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+            runtime.model_name = "base"
+            runtime.args = trainer.args.model
+            runtime.train_args = trainer.args.train
+            runtime.model_assets = []
+            torch.manual_seed(19)
+            runtime.model = torch.nn.Linear(1, 1)
+            leaf = torch.optim.AdamW(runtime.model.parameters(), lr=0.01)
+            runtime.optimizer = MultiOptimizer(runtime.model, {"model": leaf}, ["model"])
+            runtime.lr_scheduler = build_lr_scheduler(runtime.optimizer, train_steps=4, lr=0.01)
+            runtime.checkpoint = ModelCheckpointManager(runtime)
+            trainer.model = runtime
+            trainer.train_dataset = MappingDataset(
+                Dataset.from_dict({"ids": [[1, 2], [3, 4, 5], [6, 7, 8, 9]]}), transform
+            )
+            trainer.collate_fn = MainCollator()
+            trainer.state = TrainerState()
+            trainer.start_epoch = trainer.start_step = 0
+            trainer.environ_meter = fixture.environ_meter
+            trainer.environ_meter.state_dict.return_value = {}
+            trainer.channel_loss_callback = None
+            trainer.offline_cache_writer = None
+            trainer._build_sft_dataloader()
+            trainer.checkpoint_callback = CheckpointCallback(trainer)
+            trainer.global_state_callback = GlobalStateCallback(trainer)
+            trainer._callbacks = [trainer.checkpoint_callback, trainer.global_state_callback]
+            trainer.on_train_begin()
+            trainer.data_iterator = VeOmniIter(trainer.train_dataloader)
+            return trainer
+
+        def step(trainer):
+            trainer.state.global_step += 1
+            batches = next(trainer.data_iterator)
+            input_value = sum(batch["input_ids"].sum() for batch in batches).float().reshape(1, 1)
+            dist.all_reduce(input_value)
+            loss = trainer.model.model(input_value).square().sum()
+            loss.backward()
+            gradients = [param.grad.detach().clone() for param in trainer.model.model.parameters()]
+            trainer._complete_optimizer_step()
+            trainer.on_step_end()
+            params = [param.detach().clone() for param in trainer.model.model.parameters()]
+            return batches, loss.detach(), gradients, params
+
+        source = build()
+        step(source)
+        checkpoint_path = layout.step_dir(root, 1)
+        assert source.model.checkpoint._last_saved_optimizer_generation
+        source.checkpoint_callback.dcp_every_n_steps = 0
+        source.global_state_callback.dcp_every_n_steps = 0
+        expected = step(source)
+
+        restored = build(checkpoint_path)
+        restored.checkpoint_callback.dcp_every_n_steps = 0
+        restored.global_state_callback.dcp_every_n_steps = 0
+        actual = step(restored)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            restored.model.optimizer.state_dict(), source.model.optimizer.state_dict(), rtol=0, atol=0
+        )
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_standard_sft_trainer_cyclic_dcp_and_next_update(tmp_path):
+    mp.spawn(
+        _standard_trainer_checkpoint_worker,
+        args=(f"file://{tmp_path / 'trainer-rendezvous'}", str(tmp_path / "checkpoint")),
+        nprocs=2,
+        join=True,
+    )

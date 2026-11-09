@@ -20,6 +20,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
+import torch
 from datasets import Dataset
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -32,6 +33,10 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _trainer():
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.optim.optimizer import MultiOptimizer
+
     trainer = trainer_base.BaseTrainer.__new__(trainer_base.BaseTrainer)
     config = DataloaderConfig(
         type="cyclic_packed",
@@ -62,10 +67,13 @@ def _trainer():
         num_train_epochs=3,
     )
     trainer.args = SimpleNamespace(data=data, train=train, train_steps=5)
-    trainer.model = SimpleNamespace(
-        optimizer=SimpleNamespace(_is_multi_optimizer=True),
-        checkpoint=SimpleNamespace(_last_saved_optimizer_generation=None),
-    )
+    runtime = _make_mock_runtime()
+    runtime.train_args.checkpoint.save_hf_weights = False
+    runtime.model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(runtime.model.parameters())
+    runtime.optimizer = MultiOptimizer(runtime.model, {"model": optimizer}, ["model"])
+    runtime.checkpoint = ModelCheckpointManager(runtime)
+    trainer.model = runtime
     trainer.train_dataset = MappingDataset(Dataset.from_dict({"sample": [1, 2]}))
     trainer.collate_fn = object()
     return trainer
@@ -73,15 +81,18 @@ def _trainer():
 
 def test_sft_explicitly_opts_in_and_dpo_default_conversation_is_rejected(monkeypatch):
     from veomni.data import cyclic_packing
-    from veomni.trainer.callbacks import global_state_callback
 
     monkeypatch.setattr(
         trainer_base, "get_parallel_state", lambda: SimpleNamespace(dp_size=1, tp_size=1, sp_size=2, sp_group="sp")
     )
     monkeypatch.setattr(cyclic_packing, "_StatelessMainCollator", lambda collator: collator)
-    monkeypatch.setattr(global_state_callback, "_saved_multi_optimizer_generations", lambda *_args: {}, raising=False)
     captured = {}
-    monkeypatch.setattr(cyclic_packing, "CyclicPackedLoader", lambda *args, **kwargs: captured.update(kwargs))
+
+    def build_loader(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(validate_creation_consensus=lambda: None)
+
+    monkeypatch.setattr(cyclic_packing, "CyclicPackedLoader", build_loader)
 
     # DPO also defaults to data_type=conversation; it must not opt in just
     # because that field happens to match the SFT configuration.

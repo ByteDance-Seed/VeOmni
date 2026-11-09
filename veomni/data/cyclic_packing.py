@@ -33,7 +33,7 @@ from ..utils.device import get_device_type
 from ..utils.dist_utils import raise_if_any_rank_failed
 
 
-_STATE_KIND = "veomni_cyclic_packing_v1"
+_STATE_KIND = "veomni_cyclic_packing_v2"
 
 
 class _StatelessMainCollator:
@@ -53,6 +53,8 @@ class _StatelessMainCollator:
         if hook is not None and not getattr(hook, "checkpoint_collator_identity", ""):
             raise ValueError("cyclic_packed requires a stable metadata hook identity")
         self._collator = collator
+        self._configuration_identity()  # Validate the pipeline before changing its cyclic-only option.
+        self._collator.preforward_pipeline[1].clone_fallback_tensors = True
         self.checkpoint_collator_identity = self._configuration_identity()
 
     def _configuration_identity(self):
@@ -74,6 +76,7 @@ class _StatelessMainCollator:
             {
                 "infos": {key: asdict(value) for key, value in self._collator.collate_infos.items()},
                 "pad_to_length": pipeline[1].pad_to_length,
+                "clone_fallback_tensors": pipeline[1].clone_fallback_tensors,
                 "seq_classification": pipeline[1].seq_classification,
                 "sp_enabled": pipeline[1].sp_enabled,
                 "sp_size": getattr(pipeline[-1], "sp_size", 1),
@@ -83,16 +86,15 @@ class _StatelessMainCollator:
         )
 
     def __call__(self, features):
-        if self._configuration_identity() != self.checkpoint_collator_identity:
-            raise ValueError("cyclic packing collator configuration changed")
         if "loss_weights" not in self._collator.collate_infos and any(
             feature.get("loss_weights") is not None for feature in features
         ):
             raise ValueError("cyclic packing loss_weights require the weighted-loss collator")
-        result = self._collator(features)
+        return self._collator(features)
+
+    def validate_checkpoint_identity(self):
         if self._configuration_identity() != self.checkpoint_collator_identity:
             raise ValueError("cyclic packing collator configuration changed")
-        return result
 
 
 def _hash_part(digest, tag: bytes, value: bytes) -> None:
@@ -142,20 +144,14 @@ def _feature_hash(feature: dict) -> str:
     return digest.hexdigest()
 
 
-def _feature_storage_bytes(feature: Any) -> int:
-    """Count unique tensor backing storage per sample; shared samples may overcount."""
-    seen: set[tuple[int, int]] = set()
+def _feature_logical_bytes(feature: Any) -> int:
+    """Count logical tensor bytes independently of rank-local storage layout."""
 
     def visit(value):
         if isinstance(value, torch.Tensor):
             if value.device.type != "cpu" or value.layout != torch.strided or value.is_quantized:
                 raise ValueError("cyclic packing requires ordinary CPU feature tensors")
-            storage = value.untyped_storage()
-            identity = (storage.data_ptr(), storage.nbytes())
-            if identity in seen:
-                return 0
-            seen.add(identity)
-            return storage.nbytes()
+            return value.numel() * value.element_size()
         if isinstance(value, dict):
             return sum(visit(item) for item in value.values())
         if isinstance(value, (list, tuple)):
@@ -165,26 +161,6 @@ def _feature_storage_bytes(feature: Any) -> int:
         return 0
 
     return visit(feature)
-
-
-def _storage_keys(value: Any) -> set[tuple[int, int]]:
-    """Identify nonempty tensor storages without retaining tensor references."""
-    result: set[tuple[int, int]] = set()
-
-    def visit(item):
-        if isinstance(item, torch.Tensor):
-            storage = item.untyped_storage()
-            if storage.nbytes():
-                result.add((storage.data_ptr(), storage.nbytes()))
-        elif isinstance(item, dict):
-            for child in item.values():
-                visit(child)
-        elif isinstance(item, (list, tuple)):
-            for child in item:
-                visit(child)
-
-    visit(value)
-    return result
 
 
 def _signature(value: Any) -> str:
@@ -365,7 +341,7 @@ class CyclicPackedLoader:
             not isinstance(positions, torch.Tensor) or positions.ndim == 0 or positions.shape[-1] != length
         ):
             raise ValueError("cyclic packing requires position_ids aligned with input_ids")
-        size = _feature_storage_bytes(item)
+        size = _feature_logical_bytes(item)
         digest = _feature_hash(item)
         self._source_index += 1
         return index, item, length, size, digest
@@ -417,15 +393,6 @@ class CyclicPackedLoader:
         rng_before = _rng_snapshot()
         output = self.collate_fn(features)
         _assert_rng_unchanged(rng_before)
-        for _, original, _, _, digest in group:
-            if _feature_hash(original) != digest:
-                raise ValueError("cyclic packing collator mutated a source feature")
-        source_storage = _storage_keys([item[1] for item in group])
-        source_storage.update(_storage_keys([item[1] for item in self._pending]))
-        if self._lookahead is not None:
-            source_storage.update(_storage_keys(self._lookahead[1]))
-        if _storage_keys(output) & source_storage:
-            raise ValueError("cyclic packing collator output aliases a source feature")
         _hash_part(self._output_hash, b"C", _feature_hash(output).encode())
         return output
 
@@ -445,7 +412,6 @@ class CyclicPackedLoader:
     def __next__(self):
         error = None
         batches = []
-        output_storage: set[tuple[int, int]] = set()
         done = False
         local_supervised = False
         try:
@@ -468,10 +434,6 @@ class CyclicPackedLoader:
                     if group is None:
                         break
                     batch = self._collate_group(group)
-                    current_storage = _storage_keys(batch)
-                    if output_storage & current_storage:
-                        raise ValueError("cyclic packing micro-batches share mutable tensor storage")
-                    output_storage.update(current_storage)
                     labels = batch.get("labels")
                     if not isinstance(labels, torch.Tensor):
                         raise ValueError("cyclic packing requires collated tensor labels")
@@ -491,48 +453,69 @@ class CyclicPackedLoader:
                     batches = pin_memory(batches)
         except Exception as exc:  # synchronize errors before peers enter model collectives
             error = exc
-        proof = (
-            self._identity,
-            self._committed_step,
-            done,
-            self._cycle,
-            self._cycle_groups,
-            self._cycle_items,
-            self._layout_hash.hexdigest(),
-            self._frontier(),
-        )
         try:
-            _agree(error, proof, self._group)
+            if dist.is_initialized():
+                device = "cpu" if dist.get_backend(self._group) == "gloo" else get_device_type()
+                # Reuse the required supervision reduction to coordinate
+                # errors and geometry without per-step content gathering.
+                geometry = [len(batches)]
+                for index in range(self._micro_batches_per_step):
+                    if index < len(batches):
+                        batch = batches[index]
+                        geometry.extend(
+                            (
+                                batch["labels"].numel(),
+                                int(batch.get("pixel_values") is not None),
+                                int(batch.get("pixel_values_videos") is not None),
+                            )
+                        )
+                    else:
+                        geometry.extend((-1, -1, -1))
+                status = torch.tensor(
+                    [int(error is not None), int(local_supervised), int(done), int(not done)]
+                    + geometry
+                    + [-value for value in geometry],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                dist.all_reduce(status, op=dist.ReduceOp.MAX, group=self._group)
+                values = status.tolist()
+                failed, supervised, any_done, any_not_done = values[:4]
+                if failed:
+                    raise error or RuntimeError("preparing cyclic packed data failed on another rank")
+                if any_done and any_not_done:
+                    raise RuntimeError("cyclic packing end-of-stream differs across sequence-parallel ranks")
+                count = len(geometry)
+                if any(a != -b for a, b in zip(values[4 : 4 + count], values[4 + count :])):
+                    raise RuntimeError("cyclic packing geometry differs across sequence-parallel ranks")
+                local_supervised = bool(supervised)
+            elif error is not None:
+                raise error
         except Exception:
             self._poisoned = True
             raise
         if done:
             raise StopIteration
-        if dist.is_initialized():
-            device = "cpu" if dist.get_backend(self._group) == "gloo" else get_device_type()
-            supervised = torch.tensor([int(local_supervised)], dtype=torch.int32, device=device)
-            dist.all_reduce(supervised, op=dist.ReduceOp.MAX, group=self._group)
-            local_supervised = bool(supervised.item())
         if not local_supervised:
             self._poisoned = True
             raise ValueError("cyclic packing refuses an optimizer step with no supervised tokens")
         self._pending_step = True
         return batches
 
-    def commit_step(self) -> None:
-        error = None
-        try:
-            if not self._pending_step or self._step_getter() != self._committed_step + 1:
-                raise RuntimeError("cannot commit cyclic data before its optimizer step")
-        except Exception as exc:
-            error = exc
-        try:
-            _agree(error, (self._cycle, self._committed_step + 1, self._layout_hash.hexdigest()), self._group)
-        except Exception:
+    def validate_pending_step(self) -> None:
+        """Check the cursor before the trainer's coordinated step result."""
+        if not self._pending_step or self._step_getter() != self._committed_step + 1:
             self._poisoned = True
-            raise
+            raise RuntimeError("cannot commit cyclic data before its optimizer step")
+
+    def commit_step(self) -> None:
+        self.validate_pending_step()
         self._committed_step += 1
         self._pending_step = False
+
+    def validate_creation_consensus(self) -> None:
+        """Agree on the immutable data contract once, before training."""
+        _agree(None, self._identity, self._group)
 
     def validate_restore_consensus(self) -> None:
         """Agree on restored global data position before any rank can train."""
@@ -555,6 +538,9 @@ class CyclicPackedLoader:
             raise RuntimeError("cannot snapshot an uncommitted cyclic packing step")
         if self._require_resume and not self._restored:
             raise RuntimeError("cyclic packing resume cursor was not restored")
+        validate_identity = getattr(self.collate_fn, "validate_checkpoint_identity", None)
+        if callable(validate_identity):
+            validate_identity()
         return {
             "kind": _STATE_KIND,
             "identity": self._identity,
@@ -572,6 +558,9 @@ class CyclicPackedLoader:
         if self._poisoned or self._pending_step or self._committed_step or self._cycle_groups:
             raise RuntimeError("cyclic loader must be fresh before restoring")
         self._poisoned = True
+        validate_identity = getattr(self.collate_fn, "validate_checkpoint_identity", None)
+        if callable(validate_identity):
+            validate_identity()
         keys = {
             "kind",
             "identity",

@@ -158,7 +158,12 @@ preprocessing and collator versions and settings. Both transforms and the
 metadata hook must be deterministic and free of hidden state or independent
 random generators. The framework checks its dataset fingerprint, collator
 identity, buffered contents and process-global RNGs, but cannot independently
-prove this attestation or hash unread external media.
+prove this attestation or hash unread external media. All SP ranks must use the
+same source snapshot and deterministic preprocessing. Their declared input
+identity is compared at startup and restore; sample content is not compared
+between ranks on every step. An incorrect attestation can silently change the
+training data, and inconsistent execution paths can also cause a distributed
+hang even if the checked sequence geometry happens to match.
 
 The built-in integration is restricted to the standard VeOmni SFT/VLM trainer,
 one sequence-parallel group with DP=1 and TP=1, a native mapping dataset and
@@ -200,10 +205,17 @@ train:
     save_async: false
 ```
 
-The buffer limit is a soft budget for decoded feature tensor storage and string
-bytes. One lookahead, an oversized sample, emitted micro-batches, object
+The buffer limit is a soft budget for logical tensor bytes and string lengths, so
+packing does not depend on rank-local storage capacity or aliasing. Tensor views
+can retain larger backing storage, while shared tensors may be counted more
+than once. One lookahead, an oversized sample, emitted micro-batches, object
 overhead, collator/hash temporaries, pinned copies and allocator caching are
 outside it. It is not an RSS or accelerator-memory limit. Replay rereads the
-current data pass, and full feature/output hashing and per-step rank agreement
-have CPU and communication costs. Measure these costs with the actual data.
+current data pass, and incremental feature/output hashing for recovery has a
+CPU cost. A per-step reduction coordinates data errors, supervised-token
+presence, micro-batch count, label lengths and image/video presence; it does
+not establish content equality. Optimizer failures are also coordinated before
+committing the cursor. Measure these costs with the actual data. Checkpoints
+from the earlier storage-byte budgeting algorithm are rejected because their
+subsequent packing order may differ.
 Same-topology accelerator recovery and throughput must be verified separately.
