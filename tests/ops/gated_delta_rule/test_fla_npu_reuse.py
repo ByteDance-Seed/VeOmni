@@ -25,6 +25,7 @@ import torch
 
 @pytest.fixture
 def adapter(monkeypatch):
+    """Load the adapters with an identity guard for CPU contract tests."""
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu, fla_npu_reuse
 
     name = "veomni.ops.kernels.gated_delta_rule.vendor.triton.utils"
@@ -35,11 +36,13 @@ def adapter(monkeypatch):
 
 
 def test_reuse_preserves_forward_states_and_skips_recomputation(adapter, monkeypatch):
+    """Forward intermediates reach backward without rerunning forward stages."""
     main, reuse = adapter
     calls = []
     cached = {}
 
     def prepare(q, k, v, g, beta, chunk_size, **kwargs):
+        """Capture the packed inputs and synthesize reusable intermediates."""
         calls.append("prepare")
         assert g.dtype == beta.dtype == torch.float32
         assert kwargs["cu_seqlens"] == [0, 2, 4]
@@ -48,27 +51,32 @@ def test_reuse_preserves_forward_states_and_skips_recomputation(adapter, monkeyp
         return None, None, None, None, None, cached["g"], cached["w"], cached["u"], cached["a"]
 
     def fwd_h(k, w, u, **kwargs):
+        """Capture state inputs and synthesize state outputs."""
         calls.append("h")
         assert w is cached["w"] and u is cached["u"] and kwargs["g"] is cached["g"]
         cached.update(h=torch.ones(1), vn=torch.ones_like(u))
         return cached["h"], cached["vn"], None
 
     def fwd_o(q, k, v, h, scale, **kwargs):
+        """Require the retained state and return a head-major output."""
         calls.append("o")
         assert v is cached["vn"] and h is cached["h"] and kwargs["output_layout"] == "BNSD"
         return q.clone()
 
     def dv_local(q, k, do, g, scale, chunk_size, **kwargs):
+        """Check the local value gradient uses the composite API contract."""
         calls.append("dv")
         assert kwargs["A"] is None
         return torch.ones_like(do)
 
     def dhu(q, k, w, do, dv, scale, chunk_size, **kwargs):
+        """Require the retained W tensor during the state backward."""
         calls.append("dhu")
         assert w is cached["w"] and kwargs["h0"] is None
         return torch.ones(1), None, dv
 
     def finalize(q, k, v, vn, do, dv, g, beta, h, dh, a, **kwargs):
+        """Require retained tensors and synthesize distinct gate gradients."""
         calls.append("finalize")
         assert vn is cached["vn"] and h is cached["h"] and a is cached["a"]
         assert torch.equal(g, cached["g"]) and beta.dtype == torch.float32
@@ -98,6 +106,7 @@ def test_reuse_preserves_forward_states_and_skips_recomputation(adapter, monkeyp
 
 
 def test_reuse_rejects_unsupported_devices_boundaries_and_api(adapter, monkeypatch):
+    """Reject unsupported hardware, malformed packing and incomplete APIs."""
     main, reuse = adapter
     q = SimpleNamespace(device=SimpleNamespace(type="npu", index=0), shape=(1, 2, 4, 128))
     npu = SimpleNamespace(get_device_name=lambda index: "Ascend910_9382")
@@ -130,6 +139,7 @@ def test_reuse_rejects_unsupported_devices_boundaries_and_api(adapter, monkeypat
 
 
 def test_standard_backend_keeps_existing_saved_state_contract(adapter, monkeypatch):
+    """The default path continues to store its original tensor state."""
     main, _ = adapter
     values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
     gate = torch.ones(1, 4, 2)
@@ -152,16 +162,19 @@ def test_standard_backend_keeps_existing_saved_state_contract(adapter, monkeypat
 
 
 def test_empty_packed_sequence_falls_back_to_standard_backend(adapter, monkeypatch):
+    """An empty packed segment follows the upstream forward and backward."""
     main, reuse = adapter
     values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
     gate = torch.ones(1, 4, 2)
     calls = []
 
     def standard_forward(q, k, v, g, *args):
+        """Return a minimal upstream-compatible forward result."""
         calls.append("standard")
         return g, q.transpose(1, 2), q.new_empty(0), None
 
     def standard_backward(q, k, v, g, beta, *args):
+        """Return minimal upstream-compatible gradients."""
         calls.append("standard_backward")
         return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.zeros_like(beta), torch.zeros_like(g)
 

@@ -728,6 +728,7 @@ def test_fla_npu_reuse_packed_checkpoint_parity(checkpointed, boundaries):
         leaves = make_grad_leaves(q, k, v, g, beta)
 
         def forward(*values, operation=operation):
+            """Bind a checkpoint recomputation to its original operation."""
             return operation(*values, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]
 
         output = checkpoint(forward, *leaves, use_reentrant=False) if checkpointed else forward(*leaves)
