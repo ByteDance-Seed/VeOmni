@@ -474,13 +474,17 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # which legitimately differs between SP ranks (each holds half
                     # the sequence). The stepped weights are the reduced result.
                     _adamw_step(modules)
-                    probes = sorted(modules.items())[:1]
+                    # Every parameter, not a sample: two fingerprints per tensor
+                    # catch both an offset and a scale difference, so a single
+                    # divergent tensor cannot hide behind the ones not probed.
                     reports[f"{name}_sp{sp_size}_param_probe"] = {
-                        f"{mod_name}.{param_name}": float(
-                            (param.full_tensor() if isinstance(param, DTensor) else param).detach().float().sum()
-                        )
-                        for mod_name, module in probes
-                        for param_name, param in list(module.named_parameters())[:4]
+                        f"{mod_name}.{param_name}": [
+                            float(full.sum()),
+                            float((full * full).sum()),
+                        ]
+                        for mod_name, module in sorted(modules.items())
+                        for param_name, param in sorted(module.named_parameters())
+                        for full in [(param.full_tensor() if isinstance(param, DTensor) else param).detach().float()]
                     }
                 clear_parallel_state()
         Path(out_dir, f"rank{rank}.json").write_text(json.dumps(reports), encoding="utf-8")
@@ -491,7 +495,12 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
 
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
-    """FSDP2 at SP=2 (with SP padding) must reproduce the SP=1 loss for both graphs."""
+    """FSDP2 at SP=2 (with SP padding) must reproduce SP=1 on both graphs.
+
+    Checks the loss and, after one AdamW step, every parameter of every module:
+    the stepped weights are the gradient reduction's output, so a slice that
+    never reached the group would land here as a diverged tensor.
+    """
     out_dir = tmp_path / "sp_align_cpu"
     out_dir.mkdir(parents=True, exist_ok=True)
     mp.spawn(
@@ -511,19 +520,19 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], abs=1e-5), (rank, name, reports)
             # Parameters after one AdamW step: FSDP2 is what reduces `.grad`
             # across the group, so this is the first point where an SP that
-            # failed to reduce shows up. Measured difference is ~6e-8 — the
-            # reduction order differs because SP=2 slices the sequence.
+            # failed to reduce shows up. Both fingerprints agree across the
+            # whole model; the residual is float32 summation order, worst case
+            # ~3e-6 relative on the smallest-magnitude bias.
             probe1 = reports[f"{name}_sp1_param_probe"]
             probe2 = reports[f"{name}_sp2_param_probe"]
+            # Every parameter is probed, so this is a whole-model comparison and
+            # not a spot check.
             assert probe1.keys() == probe2.keys()
-            for param_name, value1 in probe1.items():
-                assert probe2[param_name] == pytest.approx(value1, abs=1e-5), (
-                    rank,
-                    name,
-                    param_name,
-                    probe1,
-                    probe2,
-                )
+            assert len(probe1) > 40, (name, "expected the whole model", len(probe1))
+            for param_name, (sum1, sq1) in probe1.items():
+                sum2, sq2 = probe2[param_name]
+                assert sum2 == pytest.approx(sum1, abs=1e-5), (rank, name, param_name, sum1, sum2)
+                assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, name, param_name, sq1, sq2)
 
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
 
