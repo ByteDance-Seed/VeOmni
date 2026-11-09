@@ -434,6 +434,29 @@ def tiny_minimax_h3_config(architecture: str = "MiniMaxH3DiTModel", **overrides)
     return MiniMaxH3DiTModelConfig(**kwargs)
 
 
+def tiny_cosmos3_config(architecture: str = "Cosmos3MoTTransformer", **overrides) -> PretrainedConfig:
+    from veomni.models.diffusers.cosmos3.cosmos3_transformer.configuration_cosmos3_transformer import (
+        Cosmos3MoTTransformerConfig,
+    )
+
+    kwargs = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "intermediate_size": 96,
+        "patch_latent_dim": 8,
+        "latent_patch_size": 2,
+        "mrope_section": (4, 2, 2),
+        "loss_scale": 1.0,
+        "architectures": [architecture],
+    }
+    kwargs.update(overrides)
+    return Cosmos3MoTTransformerConfig(**kwargs)
+
+
 def tiny_minimax_h3_condition_config(architecture: str = "MiniMaxH3ConditionModel", **overrides) -> PretrainedConfig:
     from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
         MiniMaxH3ConditionModelConfig,

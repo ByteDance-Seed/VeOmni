@@ -27,6 +27,9 @@ from transformers import PretrainedConfig
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, stamp_attn_implementation
 from tests.models.tiny_configs import (
+    tiny_cosmos3_config as _tiny_cosmos3_config,
+)
+from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
 from tests.models.tiny_configs import (
@@ -570,6 +573,21 @@ _MODEL_CASES = (
             ("transformer_blocks.0.attn1.attention_function.veomni_attn", "attention"),
         ),
         isolation_op_path="transformer_blocks.0.attn1.attention_function.veomni_attn",
+        stamps_hf_attn=False,
+    ),
+    _ModelCase(
+        model_type="Cosmos3MoTTransformer",
+        config_factory=_tiny_cosmos3_config,
+        architectures=("Cosmos3MoTTransformer",),
+        has_registered_config=True,
+        registered_config_aliases=("Cosmos3ConditionModel",),
+        registered_model_aliases=("Cosmos3ConditionModel",),
+        eager_ops=(
+            ("layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("layers.0.self_attn.veomni_attn", "attention"),
+            ("layers.0.self_attn.veomni_rope", "rope"),
+        ),
+        isolation_op_path="layers.0.self_attn.veomni_attn",
         stamps_hf_attn=False,
     ),
     _ModelCase(

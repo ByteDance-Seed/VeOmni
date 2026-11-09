@@ -692,6 +692,33 @@ class TestCalculateFrameIndicesRemainder:
         assert pad1 == pad2
 
 
+class TestCalculateFrameIndicesSelection:
+    """Tests for frame_selection in calculate_frame_indices."""
+
+    def test_prefix_takes_a_fixed_stride_and_drops_the_tail(self):
+        # 100 frames at 25 fps sampled to 5 fps -> 20 frames.
+        linspace, _ = calculate_frame_indices(total_frames=100, video_fps=25, fps=5)
+        prefix, pad = calculate_frame_indices(total_frames=100, video_fps=25, fps=5, frame_selection="prefix")
+        assert linspace[-1] == 99
+        assert prefix == list(range(0, 100, 5))
+        assert pad == 0
+
+    def test_prefix_reports_a_short_clip_as_padding(self):
+        # 9 frames sampled to 6 -> stride 2 -> 5 distinct frames, one short.
+        indices, pad = calculate_frame_indices(total_frames=9, video_fps=9, fps=6, frame_selection="prefix")
+        assert indices == [0, 2, 4, 6, 8]
+        assert pad == 1
+
+    def test_unknown_selection_raises(self):
+        with pytest.raises(ValueError, match="frame_selection"):
+            calculate_frame_indices(total_frames=100, video_fps=25, fps=5, frame_selection="Prefix")
+
+    def test_smart_video_nframes_forwards_the_selection(self):
+        video = torch.arange(100).view(100, 1, 1, 1).expand(100, 3, 2, 2)
+        sampled, _ = smart_video_nframes(video, video_fps=25, fps=5, frame_selection="prefix")
+        assert sampled[:, 0, 0, 0].tolist() == list(range(0, 100, 5))
+
+
 @requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 @pytest.mark.benchmark
