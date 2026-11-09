@@ -148,3 +148,8 @@ The A2 unit and e2e workflows now use the published x86 candidate at digest
 After the locked dependency sync, they verify retained wheel checksums and restore
 torch-npu post7, Triton 3.6.0, its Ascend overlay and A2 FLA into the test venv.
 These explicit overrides are candidate validation, not a lockfile migration.
+
+The rebuilt A2 x86 candidate uses Triton-Ascend `3.6.0.post2` over base Triton
+`3.6.0`; the A2 ARM and A3 recipes still use Ascend `3.6.0`. Its Docker build
+asserts the installed post2 version. Device CI remains pinned to the previous
+image until the new build has been published and its digest verified.
