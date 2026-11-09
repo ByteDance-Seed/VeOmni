@@ -343,6 +343,7 @@ class SequenceParallelCollator(DataCollator):
         self.sp_rank = get_parallel_state().sp_rank
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Slice a field for this SP rank, compacting eligible CPU image views."""
         if isinstance(feature, list):
             assert dim == 0, f"Only support dim=0 for {key} as it is a List"
             seq_length = len(feature)

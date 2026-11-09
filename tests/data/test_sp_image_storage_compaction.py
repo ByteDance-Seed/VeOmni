@@ -30,12 +30,14 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _parallel_state(size, rank):
+    """Build the minimal SP state needed by the collator fixtures."""
     return SimpleNamespace(sp_enabled=size > 1, sp_size=size, sp_rank=rank)
 
 
 @pytest.mark.parametrize("key", ("pixel_values", "pixel_values_videos"))
 @pytest.mark.parametrize("rank", (0, 3, 7))
 def test_image_slice_compacts_cpu_storage_without_changing_values(monkeypatch, key, rank):
+    """Ordinary image and video views retain their values in smaller storage."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(8, rank))
     sp_collator = collators.SequenceParallelCollator()
     source = torch.arange(64 * 16, dtype=torch.float32).reshape(64, 16)
@@ -49,6 +51,7 @@ def test_image_slice_compacts_cpu_storage_without_changing_values(monkeypatch, k
 
 
 def test_gradient_carrying_image_slice_preserves_view_and_gradient(monkeypatch):
+    """Gradient-carrying image tensors keep view and autograd behavior."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(8, 3))
     sp_collator = collators.SequenceParallelCollator()
     source = torch.arange(64 * 16, dtype=torch.float32).reshape(64, 16).requires_grad_()
@@ -61,6 +64,7 @@ def test_gradient_carrying_image_slice_preserves_view_and_gradient(monkeypatch):
 
 
 def test_only_oversized_image_views_are_copied(monkeypatch):
+    """Avoid copies for non-image or already compact slices."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(1, 0))
     sp_collator = collators.SequenceParallelCollator()
     source = torch.randn(8, 16)
@@ -77,6 +81,7 @@ def test_only_oversized_image_views_are_copied(monkeypatch):
 
 
 def test_non_grad_image_base_is_released_after_slicing(monkeypatch):
+    """Compaction permits the original image backing allocation to be released."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(8, 2))
     sp_collator = collators.SequenceParallelCollator()
     base = torch.arange(64 * 16, dtype=torch.float32)
@@ -90,6 +95,7 @@ def test_non_grad_image_base_is_released_after_slicing(monkeypatch):
 
 
 def test_pinned_image_slices_preserve_original_view(monkeypatch):
+    """Exercise the pinned-memory guard without an accelerator allocator."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(2, 1))
     sp_collator = collators.SequenceParallelCollator()
     source = torch.randn(8, 4)
@@ -102,6 +108,7 @@ def test_pinned_image_slices_preserve_original_view(monkeypatch):
 @pytest.mark.parametrize("key", ("pixel_values", "pixel_values_videos"))
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 def test_real_pinned_image_slices_preserve_original_view(monkeypatch, key):
+    """Retain the original view for real accelerator-pinned image storage."""
     if not torch.accelerator.is_available():
         pytest.skip("requires an accelerator-backed pinned-memory allocator")
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(2, 1))
@@ -114,10 +121,12 @@ def test_real_pinned_image_slices_preserve_original_view(monkeypatch, key):
 
 
 def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
+    """Compare packed values, boundaries, weights and metadata to view slicing."""
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(4, 2))
 
     class OriginalSequenceParallelCollator(collators.SequenceParallelCollator):
         def sp_slice(self, key, feature, dim=-1):
+            """Reproduce the previous un-compacted slice for comparison."""
             if isinstance(feature, list):
                 chunk = len(feature) // self.sp_size
                 return feature[self.sp_rank * chunk : (self.sp_rank + 1) * chunk]
@@ -125,6 +134,7 @@ def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
             return feature.narrow(dim, self.sp_rank * chunk, chunk)
 
     def metadata(batch, padding):
+        """Record the image padding reported to a multimodal metadata hook."""
         batch["multimodal_metadata"] = {"image_padding": padding["pixel_values"]}
 
     features = [
