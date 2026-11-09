@@ -14,13 +14,9 @@
 
 """Triton DeepSeek-V4 lightning indexer for AMD ROCm.
 
-Same contract as the TileLang indexer: one fused kernel takes each query's
-per-head ``q @ k^T`` against a pool tile with FP32 accumulators, applies ReLU,
-the per-head weight, the head sum and the query's visible ``[ks, ke)`` range,
-and skips pool tiles the query cannot see. Pool-column chunks feed a running
-``torch.topk``, so the full ``[B, S, P]`` row is never materialized. Only the
-selected scores are differentiable, so the backward recomputes their logits.
-Neither direction materializes ``[B, S, H, P]``.
+Same contract as the TileLang indexer. Scores stream over pool-column chunks so
+the full ``[B, S, P]`` row is never materialized; only selected scores are
+differentiable and the backward recomputes their logits.
 """
 
 from __future__ import annotations
@@ -34,19 +30,16 @@ from ..topk import mask_topk_indices_to_query_range
 
 __all__ = ["triton_lighting_indexer"]
 
-# Each scores program reuses one 128-entry pool tile for 16 queries (V4 widths on
-# gfx942, S=4096: 0.61 ms against 1.84 ms for a BF16 GEMM plus a separate tail).
 _SCORES_BLOCK_S = 16
 _SCORES_BLOCK_P = 128
 _SCORES_NUM_WARPS = 4
-# Bound the transient FP32 score chunk. Production through roughly 64K tokens
-# stays one-shot; longer contexts stream pool columns through a running exact
-# top-k. At S=128K, 4 GiB cuts the measured peak from 18 to 11 GiB while keeping
-# fwd+bwd within 9% of one-shot. This matches #1271's backward workspace cap.
+# Bound transient FP32 score workspace. Short sequences stay one-shot; longer
+# contexts stream pool columns through a running exact top-k. Matches the
+# sparse-MLA backward's 4 GiB rank-chunk workspace.
 _SCORES_CHUNK_BYTES = 4 << 30
+# Cap one score chunk even when the byte budget would allow a wider tile
+# (small S), so the scores kernel grid and merge buffers stay bounded.
 _MAX_POOL_CHUNK = 32768
-# One unpipelined wavefront per query with 16-entry tiles hides the dK atomics best on
-# gfx942 (V4 widths, S=4096: 3.0 ms against 6.7 ms for 32-entry tiles on four wavefronts).
 _BWD_BLOCK_K = 16
 _BWD_NUM_WARPS = 1
 _BWD_NUM_STAGES = 1
@@ -411,74 +404,24 @@ def triton_lighting_indexer(
         ``(scores, indices)``, both ``[B, S, K]``: FP32 scores (``-inf`` for
         unusable slots) and int32 indices (``-1`` for unusable slots).
     """
-    if index_q.ndim != 4:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires q [S, B, H, D], got {tuple(index_q.shape)}")
-    if index_k.ndim != 3:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires k [P, B, D], got {tuple(index_k.shape)}")
-    if weights.ndim != 3:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires weights [S, B, H], got {tuple(weights.shape)}")
-
-    seq_len, batch, heads, dim = index_q.shape
-    pool, key_batch, key_dim = index_k.shape
-    if key_batch != batch or key_dim != dim:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires k [P, B={batch}, D={dim}], got {tuple(index_k.shape)}")
-    if weights.shape != (seq_len, batch, heads):
-        raise ValueError(
-            f"DeepSeek V4 Triton indexer requires weights [S={seq_len}, B={batch}, H={heads}], "
-            f"got {tuple(weights.shape)}"
-        )
-    if index_q.device != index_k.device or index_q.device != weights.device:
-        raise ValueError(
-            "DeepSeek V4 Triton indexer requires q, k and weights on one device, got "
-            f"q={index_q.device}, k={index_k.device}, weights={weights.device}"
-        )
-    if not isinstance(compress_ratio, int) or compress_ratio <= 0:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires compress_ratio > 0, got {compress_ratio!r}")
-    if not isinstance(topk, int) or topk < 0:
-        raise ValueError(f"DeepSeek V4 Triton indexer requires topk >= 0, got {topk!r}")
+    seq_len, _, heads, dim = index_q.shape
     if heads > 64:
         raise ValueError(f"DeepSeek V4 Triton indexer supports at most 64 heads, got {heads}")
+    # ``D`` is a Triton constexpr; non-power-of-two dims cannot lower.
     if dim < 16 or dim & (dim - 1):
         raise ValueError(f"DeepSeek V4 Triton indexer requires a power-of-two head dim >= 16, got {dim}")
+    # Callers run under autocast; reject silent promotions instead of feeding
+    # the kernel a dtype it was not compiled for.
     if index_q.dtype is not torch.bfloat16 or index_k.dtype is not torch.bfloat16:
         raise ValueError(f"DeepSeek V4 Triton indexer requires bfloat16 q/k, got q={index_q.dtype}, k={index_k.dtype}")
     if weights.dtype is not torch.float32:
         raise ValueError(f"DeepSeek V4 Triton indexer requires float32 weights, got {weights.dtype}")
-    if topk_indices is not None:
-        if topk_indices.ndim != 3 or topk_indices.shape[:2] != (batch, seq_len):
-            raise ValueError(
-                f"DeepSeek V4 Triton indexer requires topk_indices [B={batch}, S={seq_len}, K], "
-                f"got {tuple(topk_indices.shape)}"
-            )
-        if topk_indices.dtype is not torch.int32:
-            raise ValueError(f"DeepSeek V4 Triton indexer requires int32 topk_indices, got {topk_indices.dtype}")
-        if topk_indices.device != index_q.device:
-            raise ValueError(
-                "DeepSeek V4 Triton indexer requires topk_indices on the q device, got "
-                f"q={index_q.device}, indices={topk_indices.device}"
-            )
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
     if cu_seqlen_ks is None:
         positions = torch.arange(seq_len, device=index_q.device, dtype=torch.int32)
         cu_seqlen_ks = torch.zeros_like(positions)
         cu_seqlen_ke = (positions + 1) // compress_ratio
-    else:
-        if cu_seqlen_ks.shape != (seq_len,) or cu_seqlen_ke.shape != (seq_len,):
-            raise ValueError(
-                "Packed indexer ranges must have shape "
-                f"({seq_len},), got {tuple(cu_seqlen_ks.shape)} and {tuple(cu_seqlen_ke.shape)}"
-            )
-        if cu_seqlen_ks.dtype is not torch.int32 or cu_seqlen_ke.dtype is not torch.int32:
-            raise ValueError(
-                "DeepSeek V4 Triton indexer requires int32 packed ranges, got "
-                f"{cu_seqlen_ks.dtype} and {cu_seqlen_ke.dtype}"
-            )
-        if cu_seqlen_ks.device != index_q.device or cu_seqlen_ke.device != index_q.device:
-            raise ValueError(
-                "DeepSeek V4 Triton indexer requires packed ranges on the q device, got "
-                f"q={index_q.device}, ks={cu_seqlen_ks.device}, ke={cu_seqlen_ke.device}"
-            )
     return _TritonIndexer.apply(
         index_q.transpose(0, 1).contiguous(),
         index_k.transpose(0, 1).contiguous(),

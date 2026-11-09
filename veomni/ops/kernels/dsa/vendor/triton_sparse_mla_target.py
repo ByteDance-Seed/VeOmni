@@ -81,14 +81,8 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None):
     Returns:
         [B, S, C] fp32. L1-normalise in the caller.
     """
-    if q.ndim != 4:
-        raise RuntimeError(f"target kernel requires q [B, S, H, D], got {tuple(q.shape)}")
-    if kv.ndim != 3:
-        raise RuntimeError(f"target kernel requires kv [B, P, D], got {tuple(kv.shape)}")
-    if topk_idxs.ndim != 3:
-        raise RuntimeError(f"target kernel requires topk_idxs [B, S, C], got {tuple(topk_idxs.shape)}")
-    if lse.ndim != 3:
-        raise RuntimeError(f"target kernel requires lse [B, S, H], got {tuple(lse.shape)}")
+    batch, seq_len, heads, dim = q.shape
+    width = topk_idxs.shape[-1]
     if not (q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()):
         raise RuntimeError("target kernel requires q, kv and topk_idxs to be contiguous")
     if not (lse.is_contiguous() and lse.dtype == torch.float32):
@@ -97,25 +91,10 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None):
         raise RuntimeError(f"target kernel is bfloat16-only, got q.dtype={q.dtype}")
     if kv.dtype != torch.bfloat16:
         raise RuntimeError(f"target kernel is bfloat16-only, got kv.dtype={kv.dtype}")
-    batch, seq_len, heads, dim = q.shape
-    if kv.shape[0] != batch or kv.shape[-1] != dim:
-        raise RuntimeError(f"kv must be [B={batch}, P, D={dim}], got {tuple(kv.shape)}")
-    if topk_idxs.shape[:2] != (batch, seq_len):
-        raise RuntimeError(f"topk_idxs must be [B={batch}, S={seq_len}, C], got {tuple(topk_idxs.shape)}")
-    if topk_idxs.dtype is not torch.int32:
-        raise RuntimeError(f"target kernel requires int32 topk_idxs, got {topk_idxs.dtype}")
-    if q.device != kv.device or q.device != topk_idxs.device or q.device != lse.device:
-        raise RuntimeError(
-            "target kernel requires q, kv, topk_idxs and lse on one device, got "
-            f"q={q.device}, kv={kv.device}, topk={topk_idxs.device}, lse={lse.device}"
-        )
     if heads > 64:
         raise RuntimeError(f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}")
     if dim < 16 or dim & (dim - 1):
         raise RuntimeError(f"dim must be a power of 2 and at least 16, got {dim}")
-    if lse.shape != (batch, seq_len, heads):
-        raise RuntimeError(f"lse must be [B, S, H], got {tuple(lse.shape)}")
-    width = topk_idxs.shape[-1]
     target = torch.empty((batch, seq_len, width), dtype=torch.float32, device=q.device)
     if not batch * seq_len or not width:
         return target
@@ -123,9 +102,8 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None):
         raise RuntimeError("target kernel requires kv to have at least one row when candidates are present")
     scale = dim**-0.5 if sm_scale is None else sm_scale
     block_h = max(16, triton.next_power_of_2(heads))
-    # Measured on MI308X: a 64-head q tile amortises a 64-slot kv gather, smaller
-    # head blocks are latency-bound and run fastest on 16-slot tiles with 2 warps.
-    # Software pipelining (num_stages > 1) cost 2.6x at DeepSeek-V4 width.
+    # 64-head tiles pair with a 64-slot gather; smaller head blocks stay on
+    # 16-slot tiles. Extra software pipelines hurt at DeepSeek-V4 width.
     block_c, num_warps = (64, 4) if block_h == 64 else (16, 2)
     _target_kernel[(batch * seq_len,)](
         q,
