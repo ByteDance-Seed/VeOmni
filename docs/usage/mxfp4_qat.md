@@ -119,10 +119,20 @@ wrongly: a partial group has no defined scale. It is caught by the operand's own
 length, not by inspecting the placement, because the placement is not what
 determines correctness.
 
-Nothing here is specific to a parallelism degree, so FSDP2, HSDP, sequence or
-context parallel, tensor parallel and expert parallel are all permitted. **What
-has not been measured is convergence under them** — the numerical validation is
-single-device. Treat multi-rank QAT as untested, not as unsupported.
+That table is a property of the quantizer, not of a parallelism mode, so it
+applies wherever the row runs. What each mode actually supports today:
+
+| Mode | Status |
+| --- | --- |
+| FSDP2 / HSDP sharding | permitted; the per-row split is exact |
+| Sequence / context parallel | permitted |
+| Expert parallel | permitted; expert weights are not sharded on the quantized axis |
+| Tensor parallel | **not available in VeOmni at all** — `AcceleratorConfig` asserts `tp_size == 1`, so a `tp_size > 1` config fails before model construction, independently of QAT |
+
+**Convergence under any multi-rank setting is unmeasured** — the numerical
+validation is single-device. Treat multi-rank QAT as untested, not as validated,
+and do not read the table above as end-to-end support for a mode VeOmni does not
+implement.
 
 BF16 parameters with FP32 gradient reduction is what the example config pins and
 what was validated. `torch.compile` is the one combination refused outright, at

@@ -1207,3 +1207,41 @@ def test_compile_rejection_is_skipped_without_an_ops_config():
     from veomni.distributed.torch_compile import _reject_incompatible_ops
 
     _reject_incompatible_ops(nn.Linear(4, 4))
+
+
+def test_compile_rejection_walks_sub_configs():
+    """A multimodal root carries its text tower's ops one level down.
+
+    Qwen3-VL binds the MLP row from ``config.text_config``, so a child-only
+    selection is real and must be caught; a root-only selection that the child
+    overrides is not, and the walk has to report the path so the level is clear.
+    """
+    from veomni.distributed.torch_compile import _uncompilable_at
+
+    def ops(lin=None):
+        return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
+
+    child_only = SimpleNamespace(
+        ops_config=ops(lin="torchao_mxfp4"),
+        sub_configs={},
+    )
+    root = SimpleNamespace(
+        ops_config=ops(lin="eager"),
+        sub_configs={"text_config": None},
+        text_config=child_only,
+    )
+    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
+
+
+def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row():
+    from veomni.distributed.torch_compile import _uncompilable_at
+
+    def ops(lin=None):
+        return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
+
+    root = SimpleNamespace(
+        ops_config=ops(lin="eager"),
+        sub_configs={"text_config": None},
+        text_config=SimpleNamespace(ops_config=ops(lin="qat"), sub_configs={}),
+    )
+    assert _uncompilable_at(root, prefix="") == []

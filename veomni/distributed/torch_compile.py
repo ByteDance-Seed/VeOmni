@@ -174,32 +174,52 @@ _UNCOMPILABLE_IMPLS = {
 }
 
 
+def _uncompilable_selections(ops) -> list[str]:
+    """Return the offending ``field=impl`` strings on one ops config, if any."""
+    if ops is None:
+        return []
+    return [
+        f"{field}={getattr(ops, field)!r}"
+        for field, impl in _UNCOMPILABLE_IMPLS.items()
+        if getattr(ops, field, None) == impl
+    ]
+
+
 def _reject_incompatible_ops(model: nn.Module) -> None:
-    """Reject op selections ``torch.compile`` cannot lower.
+    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
 
     ``torchao_mxfp4`` materializes ``float8_e8m0fnu`` scale tensors and
     Inductor's codegen has no lowering for that dtype (``missing from
     torch._inductor.codegen.cpp.DTYPE_TO_CPP``). Checking here turns an opaque
     assertion from inside a fused kernel into a statement about the config.
 
-    The check reads the ops selections rather than inspecting the built model,
-    because the failure is a property of the selected row, not of this instance.
+    The walk covers nested configs because that is how the selections bind: a
+    multimodal root carries its text tower's ops under ``sub_configs``, and a
+    module resolves the selection from the config it was built with -- so a
+    child-only selection is real, and a root-only one may be overridden by the
+    child. Both directions are checked; the message names the path so the
+    offending level is unambiguous.
     """
     config = getattr(model, "config", None)
-    ops = getattr(config, "ops_config", None)
-    if ops is None:
-        return
-    offending = [
-        f"{field}={getattr(ops, field)!r}"
-        for field, impl in _UNCOMPILABLE_IMPLS.items()
-        if getattr(ops, field, None) == impl
-    ]
+    offending = _uncompilable_at(config, prefix="")
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
             f"{', '.join(offending)}: those rows emit float8_e8m0fnu scale tensors, which "
             "Inductor cannot lower. Disable compilation or select a different row."
         )
+
+
+def _uncompilable_at(config, *, prefix: str) -> list[str]:
+    """Collect offending selections on ``config`` and every sub-config below it."""
+    if config is None:
+        return []
+    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    for name in getattr(config, "sub_configs", {}) or {}:
+        child = getattr(config, name, None)
+        if child is not None:
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    return found
 
 
 def compile_decoder_blocks(
