@@ -16,7 +16,6 @@ from typing import Any, Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils import logging
 
 from ...module_modeling_base import PretrainedOmniModule
@@ -45,6 +44,20 @@ TRAINABLE_NAME_KEYS = (
     "to_add_out",
     "norm_added_q",
     "norm_added_k",
+)
+
+# Reasoner parameters whose output only reaches the reasoner's own final hidden
+# state, which nothing decodes: the final reasoner ``norm`` and, in the last block,
+# everything past the keys / values the generation pass reads. They stay frozen
+# under ``train_joint_reasoner`` too, so every trainable parameter gets a gradient
+# (what DDP's ``find_unused_parameters=False`` needs) and the freeze table says
+# what actually trains. Freezing them changes no update: they never had a gradient.
+LAST_LAYER_REASONER_ONLY_KEYS = (
+    "self_attn.to_q.",
+    "self_attn.norm_q.",
+    "self_attn.to_out.",
+    "post_attention_layernorm.",
+    "mlp.",
 )
 
 
@@ -77,12 +90,17 @@ class Cosmos3Mot(PretrainedOmniModule):
     def freeze_model(self) -> None:
         """Called by the module runtime before the parallel wrap."""
         train_joint = self.config.train_joint_reasoner
-        if train_joint and get_parallel_state().dp_mode == "ddp":
-            # ``norm`` and the last block's reasoner side never reach the loss, and DDP
-            # runs without ``find_unused_parameters``; FSDP2 tolerates them.
-            raise NotImplementedError("train_joint_reasoner=True requires fsdp_mode='fsdp2', not 'ddp'.")
         for name, parameter in self.named_parameters():
-            parameter.requires_grad_(train_joint or any(key in name for key in TRAINABLE_NAME_KEYS))
+            if train_joint:
+                parameter.requires_grad_(not self._never_reaches_loss(name))
+            else:
+                parameter.requires_grad_(any(key in name for key in TRAINABLE_NAME_KEYS))
+
+    def _never_reaches_loss(self, name: str) -> bool:
+        if name.startswith("norm."):
+            return True
+        last_layer = f"layers.{len(self.layers) - 1}."
+        return name.startswith(last_layer) and name[len(last_layer) :].startswith(LAST_LAYER_REASONER_ONLY_KEYS)
 
     def forward(
         self,
@@ -149,4 +167,4 @@ class Cosmos3Mot(PretrainedOmniModule):
         return fps
 
 
-__all__ = ["TRAINABLE_NAME_KEYS", "Cosmos3Mot"]
+__all__ = ["LAST_LAYER_REASONER_ONLY_KEYS", "TRAINABLE_NAME_KEYS", "Cosmos3Mot"]

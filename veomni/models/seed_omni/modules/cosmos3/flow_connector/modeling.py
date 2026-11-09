@@ -126,12 +126,6 @@ class Cosmos3FlowConnector(PretrainedOmniModule):
         ]
         return {"_loss": torch.stack(losses).mean()}
 
-    def generate(self, generation_kwargs: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
-        del generation_kwargs, kwargs
-        raise NotImplementedError(
-            "Cosmos3 on SeedOmni is training-only: there is no flow sampler yet, so it cannot generate a video."
-        )
-
     @torch.no_grad()
     def sample_flow(
         self, latents: list[torch.Tensor]

@@ -644,6 +644,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
+            if getattr(self.omni_module, "rng_state_dict", None) is not None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: the module keeps its own sampling stream "
+                    "(rng_state_dict), but a fully frozen module has no checkpoint manager, so the stream is "
+                    "never saved and a resumed run restarts it. Keep such a stream on a trainable module."
+                )
             self._has_trainable_parameters = False
             self.checkpoint = None
             return
@@ -660,7 +666,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         The trainer checkpoints the global RNGs; a module that keeps a private
         generator (the Cosmos3 flow connector's sigma / noise stream) exposes it
         as ``rng_state_dict`` / ``load_rng_state_dict``, the same pair a DiT
-        condition model does. Saved per rank beside this module's weights.
+        condition model does. Saved per rank beside this module's weights, by
+        this module's checkpoint manager: a fully frozen module has none (see
+        :meth:`build_checkpoint`), so its stream is never written.
         """
         rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
         return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}

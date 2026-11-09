@@ -8,7 +8,6 @@ model:
   model_config:
     modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_train.yaml
     train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_offline_training.yaml
-    infer_graph: configs/seed_omni/Cosmos3/cosmos3_nano/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
     swiglu_mlp_implementation: eager
@@ -53,8 +52,8 @@ data:
   train_size: 1000000000000
   datasets_type: mapping
   data_type: seedomni_cached
-  # Token budget of one packed micro-batch (the reference recipe's). Measured on 4 cards with recompute off:
-  # 45056 ran out of memory, 16384 peaked at 71 GB and 8192 at 49 GB of 91.75 GB.
+  # Token budget of one packed micro-batch (the reference recipe's). Needs the MoT's recompute,
+  # which the accelerator block turns on.
   max_seq_len: 45056
   dyn_bsz_buffer_size: 1
   dataloader:

@@ -14,9 +14,6 @@ class Cosmos3TextEncoderConfig(TextEncoderConfig):
     ``train_joint_reasoner`` releases ``embed_tokens`` together with the MoT's
     reasoner tower; ``lm_head`` stays frozen either way, since nothing trains an
     autoregressive loss.
-    ``price_prompt_by_chars`` makes ``dyn_bsz`` charge a prompt
-    ``ceil(len(text) / 4)`` tokens instead of its token count: the DiT port's
-    online estimate, kept only to replay that port's batches exactly.
     """
 
     model_type = "cosmos3_text_encoder"
@@ -26,7 +23,6 @@ class Cosmos3TextEncoderConfig(TextEncoderConfig):
         generation_marker_ids: Optional[Sequence[int]] = None,
         max_sequence_length: int = 2048,
         train_joint_reasoner: bool = False,
-        price_prompt_by_chars: bool = False,
         **kwargs,
     ):
         kwargs.setdefault("tie_word_embeddings", False)
@@ -34,4 +30,3 @@ class Cosmos3TextEncoderConfig(TextEncoderConfig):
         self.generation_marker_ids = [int(token_id) for token_id in generation_marker_ids or ()]
         self.max_sequence_length = max_sequence_length
         self.train_joint_reasoner = train_joint_reasoner
-        self.price_prompt_by_chars = price_prompt_by_chars

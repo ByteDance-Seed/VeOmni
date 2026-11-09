@@ -26,7 +26,6 @@ class Cosmos3TextEncoderPreprocessor(TextEncoderPreprocessor):
             build_tokenizer(module_path),
             generation_marker_ids=config.generation_marker_ids,
             max_sequence_length=config.max_sequence_length,
-            price_prompt_by_chars=config.price_prompt_by_chars,
         )
 
     def preprocess_conversations(

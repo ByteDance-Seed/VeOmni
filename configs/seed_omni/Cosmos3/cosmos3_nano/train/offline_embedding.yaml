@@ -9,7 +9,6 @@ model:
     # Only the VAE: the prompts are cached as text and tokenized by the training run.
     modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_offline_embedding.yaml
     train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_offline_embedding.yaml
-    infer_graph: configs/seed_omni/Cosmos3/cosmos3_nano/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
     swiglu_mlp_implementation: eager
@@ -53,8 +52,8 @@ data:
   datasets_type: mapping
   data_type: seedomni
   source_name: cosmos3_sft_jsonl
-  # Token budget of one packed micro-batch (the reference recipe's). Measured on 4 cards with recompute off:
-  # 45056 ran out of memory, 16384 peaked at 71 GB and 8192 at 49 GB of 91.75 GB.
+  # Token budget of one packed micro-batch (the reference recipe's). Needs the MoT's recompute,
+  # which the accelerator block turns on.
   max_seq_len: 45056
   dyn_bsz_buffer_size: 1
   dataloader:
@@ -64,9 +63,13 @@ data:
   mm_configs:
     data_dir: dataset/cosmos3-demo
     # Hand every source frame to the VAE module, which picks them on the source
-    # timeline (sample_fps / max_frames in the modules file).
+    # timeline (sample_fps / max_frames in the modules file). No max_frames here: the
+    # loader would thin the clip by linspace. A worker holds one whole decoded clip.
     fps: null
+    # One prompt in ten is blanked; which ones depends only on the seed and the row,
+    # so a resume or the two-stage recipe drops the same prompts.
     cfg_dropout_rate: 0.1
+    cfg_dropout_seed: 42
 
 train:
   training_task: offline_embedding

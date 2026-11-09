@@ -113,6 +113,7 @@ seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/mixins/configure_optimizer.md
+seed_omni/mixins/module_rng_state.md
 ```
 
 ```{toctree}

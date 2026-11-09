@@ -5,7 +5,7 @@
 #
 # Joint training of both towers: set `train_joint_reasoner: true` on BOTH
 # cosmos3_text_encoder (releases embed_tokens) and cosmos3_mot (releases the
-# reasoner blocks). It needs `fsdp_mode: fsdp2`.
+# reasoner blocks).
 cosmos3_text_encoder:
   model_path: cosmos3_text_encoder
   accelerator:

@@ -614,3 +614,27 @@ def test_omni_module_config_owns_descriptor_conversion():
     assert exported["processor_config"] == {"image_size": 224}
     assert "model_path" not in exported
     assert "ops_implementation" not in exported
+
+
+def test_a_training_run_needs_no_infer_graph():
+    """A training-only model (no sampler yet) declares no generation graph."""
+    args = _omni_args()
+    args.model.model_config.pop("infer_graph")
+    cfg = build_omni_model_runtime_args(args)
+    assert cfg.generation_graphs == {}
+    assert cfg.infer_type is None
+    assert cfg.to_hf_config().generation_graphs == {}
+
+
+def test_inference_still_needs_an_infer_graph():
+    args = _omni_args()
+    args.model.model_config.pop("infer_graph")
+    with pytest.raises(ValueError, match="infer_graph` is required for inference"):
+        build_omni_model_runtime_args(args, for_inference=True)
+
+
+def test_an_infer_type_without_an_infer_graph_is_refused():
+    args = _omni_args(infer_type="infer_gen")
+    args.model.model_config.pop("infer_graph")
+    with pytest.raises(ValueError, match="no `infer_graph` is declared"):
+        build_omni_model_runtime_args(args)

@@ -6,6 +6,7 @@ Maps each multisource ``names`` entry to a conversation layout understood by
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -259,14 +260,29 @@ def seed_edit_p23_multi_turn_preprocess(conversations, example, **kwargs):
     return constructed_conversation, {"image": image_refs}
 
 
+def _per_sample_draw(seed: int, *identity: str) -> float:
+    """A uniform draw in ``[0, 1)`` that depends only on ``seed`` and the sample.
+
+    Python's ``hash`` is salted per process and the global ``random`` is not
+    checkpointed, so neither gives the same answer in a DataLoader worker after a
+    resume; a digest of the sample does.
+    """
+    digest = hashlib.sha256(json.dumps([int(seed), *identity], ensure_ascii=False).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2.0**64
+
+
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("cosmos3_sft_jsonl")
-def cosmos3_sft_jsonl_preprocess(conversations, example, data_dir="", cfg_dropout_rate=0.0, **kwargs):
+def cosmos3_sft_jsonl_preprocess(
+    conversations, example, data_dir="", cfg_dropout_rate=0.0, cfg_dropout_seed=0, **kwargs
+):
     """One row of the Cosmos3 SFT JSONL dump: a prompt and the clip it describes.
 
     The prompt is ``t2w_windows[0]``'s structured ``caption_json`` (serialized
     verbatim), else that window's dense ``caption``, else the row's; a blank value
     falls through. ``cfg_dropout_rate`` blanks the prompt so the unconditional
-    branch trains too, drawn from the global ``random`` like the reference.
+    branch trains too. Whether a row is dropped is a function of
+    ``cfg_dropout_seed``, its clip path and its prompt only, so a resumed run and
+    the two-stage recipe see the same prompts as an uninterrupted online run.
     ``vision_path`` is joined to ``data_dir`` unless it is absolute or a URI.
     """
     del example, kwargs
@@ -284,10 +300,10 @@ def cosmos3_sft_jsonl_preprocess(conversations, example, data_dir="", cfg_dropou
         raise ValueError(f"cosmos3_sft_jsonl needs a 'caption_json' or a 'caption'; window keys are {sorted(window)}.")
 
     prompt = caption_of(conversations["t2w_windows"][0], conversations)
-    rate = float(cfg_dropout_rate or 0.0)
-    if rate >= 1.0 or (rate > 0.0 and random.random() < rate):
-        prompt = ""
     vision_path = conversations["vision_path"]
+    rate = float(cfg_dropout_rate or 0.0)
+    if rate >= 1.0 or (rate > 0.0 and _per_sample_draw(cfg_dropout_seed, vision_path, prompt) < rate):
+        prompt = ""
     if data_dir and "://" not in vision_path and not os.path.isabs(vision_path):
         vision_path = os.path.join(data_dir, vision_path)
     return [["user", ("text", prompt)], ["assistant", ("video", None)]], {"video": [vision_path]}

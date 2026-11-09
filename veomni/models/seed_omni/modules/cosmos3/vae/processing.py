@@ -29,8 +29,10 @@ from ..item_meta import FPS_KEY, LATENT_KEY
 from .configuration import Cosmos3VaeConfig
 
 
-# What a sample costs beyond its latent patches, as the reference's token counter
-# prices it: the prompt's eos (``und``) and the two vision markers (``gen``).
+# What a sample costs beyond its prompt and its latent patches, as the reference's
+# token counter prices it: the prompt's eos (``und``) and the two vision markers
+# (``gen``). The text encoder prices the prompt without its appended
+# ``[eos, <|vision_start|>]``, so they are counted here and only here.
 EXTRA_TOKENS_PER_SAMPLE = 3
 
 

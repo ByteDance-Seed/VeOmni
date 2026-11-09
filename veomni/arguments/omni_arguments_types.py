@@ -238,9 +238,11 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     infer_graph_from_ckpt = not infer_graph and omni_cfg is not None
     if infer_graph_from_ckpt:
         infer_graph = omni_cfg.generation_graphs
-    if not infer_graph:
+    # A training-only model (no sampler yet) declares no generation graph; only
+    # inference needs one, and ``OmniModel.generate`` names what is missing.
+    if not infer_graph and for_inference:
         raise ValueError(
-            "`model.model_config.infer_graph` is required when `model_path` has no omni "
+            "`model.model_config.infer_graph` is required for inference when `model_path` has no omni "
             "`config.json` generation graphs."
         )
 
@@ -255,7 +257,15 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         infer_type = omni_cfg.infer_type
 
     train_type = _resolve_graph_type(args, model_runtime, train_graph, "train_type", train_type)
-    infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
+    if infer_graph:
+        infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
+    elif model_runtime.launcher_config("infer_type") is not None:
+        raise ValueError(
+            f"`model.model_config.infer_type` is {model_runtime.launcher_config('infer_type')!r}, "
+            "but no `infer_graph` is declared."
+        )
+    else:
+        infer_type = None
 
     modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
@@ -272,7 +282,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     _validate_composed_wrap(model_runtime.accelerator, modules)
     _validate_omni_dp_size(model_runtime.accelerator, modules)
     training_graphs = _load_graph_map(train_graph)
-    generation_graphs = _load_graph_map(infer_graph)
+    generation_graphs = _load_graph_map(infer_graph) if infer_graph else {}
     if train_type is not None and train_type not in training_graphs:
         known = ", ".join(training_graphs)
         raise KeyError(f"Unknown train_type {train_type!r}; expected one of: {known}.")

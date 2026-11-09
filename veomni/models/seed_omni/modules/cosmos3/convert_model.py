@@ -35,7 +35,8 @@ TRAINING_GRAPHS = {
     "offline_embedding": "train/graph_offline_embedding.yaml",
     "offline_training": "train/graph_offline_training.yaml",
 }
-GENERATION_GRAPHS = {"default": "infer/graph_infer.yaml"}
+# Training-only: there is no flow sampler yet, so the checkpoint carries no generation graph.
+GENERATION_GRAPHS: dict[str, str] = {}
 
 TEXT_ENCODER = "cosmos3_text_encoder"
 VAE = "cosmos3_vae"
@@ -226,7 +227,7 @@ def convert_cosmos3(
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "train_type": "online_training",
-        "infer_type": "default",
+        "infer_type": next(iter(generation_graphs), None),
     }
 
 

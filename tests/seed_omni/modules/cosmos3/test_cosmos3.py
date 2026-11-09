@@ -30,11 +30,15 @@ from veomni.models.seed_omni.modules.cosmos3.core import (
 from veomni.models.seed_omni.modules.cosmos3.flow_connector.configuration import Cosmos3FlowConnectorConfig
 from veomni.models.seed_omni.modules.cosmos3.item_meta import FPS_KEY, LATENT_KEY
 from veomni.models.seed_omni.modules.cosmos3.mot.configuration import Cosmos3MotConfig
-from veomni.models.seed_omni.modules.cosmos3.mot.modeling import TRAINABLE_NAME_KEYS
+from veomni.models.seed_omni.modules.cosmos3.mot.modeling import LAST_LAYER_REASONER_ONLY_KEYS, TRAINABLE_NAME_KEYS
 from veomni.models.seed_omni.modules.cosmos3.text_encoder.chat_template import Cosmos3ChatTemplate
 from veomni.models.seed_omni.modules.cosmos3.text_encoder.configuration import Cosmos3TextEncoderConfig
 from veomni.models.seed_omni.modules.cosmos3.vae.configuration import Cosmos3VaeConfig
-from veomni.models.seed_omni.modules.cosmos3.vae.processing import Cosmos3VaePreprocessor, prefix_frame_indices
+from veomni.models.seed_omni.modules.cosmos3.vae.processing import (
+    EXTRA_TOKENS_PER_SAMPLE,
+    Cosmos3VaePreprocessor,
+    prefix_frame_indices,
+)
 from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 
 
@@ -263,7 +267,7 @@ def test_freezing_the_reasoner_keeps_only_the_generation_tower_trainable():
     assert all(p.requires_grad for p in modules["cosmos3_flow_connector"].parameters())
 
 
-def test_joint_training_releases_everything_but_lm_head():
+def test_joint_training_releases_every_parameter_that_reaches_the_loss():
     torch.manual_seed(0)
     mot = OMNI_MODEL_REGISTRY["cosmos3_mot"]()(
         Cosmos3MotConfig(**TINY_MOT, train_joint_reasoner=True, ops_implementation=EAGER_OPS)
@@ -273,20 +277,33 @@ def test_joint_training_releases_everything_but_lm_head():
     )
     mot.freeze_model()
     text_encoder.freeze_model()
-    assert all(p.requires_grad for p in mot.parameters())
+    last = f"layers.{TINY_MOT['num_hidden_layers'] - 1}."
+    frozen = {name for name, p in mot.named_parameters() if not p.requires_grad}
+    expected = {"norm.weight"} | {
+        name
+        for name, _ in mot.named_parameters()
+        if name.startswith(last) and name[len(last) :].startswith(LAST_LAYER_REASONER_ONLY_KEYS)
+    }
+    assert frozen == expected, sorted(frozen ^ expected)
+    assert mot.layers[-1].self_attn.to_k.weight.requires_grad and mot.layers[0].mlp.up_proj.weight.requires_grad
     assert text_encoder.embed_tokens.weight.requires_grad
     assert not text_encoder.lm_head.weight.requires_grad
 
 
-def test_joint_training_is_rejected_under_ddp(monkeypatch):
-    from veomni.models.seed_omni.modules.cosmos3.mot import modeling
-
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(dp_mode="ddp"))
-    mot = OMNI_MODEL_REGISTRY["cosmos3_mot"]()(
-        Cosmos3MotConfig(**TINY_MOT, train_joint_reasoner=True, ops_implementation=EAGER_OPS)
-    )
-    with pytest.raises(NotImplementedError, match="fsdp2"):
-        mot.freeze_model()
+@pytest.mark.parametrize("count", [1, 2])
+def test_every_trainable_parameter_gets_a_gradient(count):
+    """What DDP's find_unused_parameters=False needs, in both freeze modes, packed or not."""
+    for joint in (False, True):
+        modules = _modules(train_joint_reasoner=joint)
+        modules["cosmos3_text_encoder"].config.train_joint_reasoner = joint
+        for module in modules.values():
+            module.train()
+            if hasattr(module, "freeze_model"):
+                module.freeze_model()
+        _graph_loss(modules, _samples()[:count]).backward()
+        for module_name, module in modules.items():
+            for name, parameter in module.named_parameters():
+                assert parameter.requires_grad == (parameter.grad is not None), (joint, module_name, name)
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -392,17 +409,23 @@ def test_chat_template_truncates_then_appends_the_markers():
     assert prompt.value.tolist()[:4] == [10, 100 + ord("a") % 20, 100 + ord("b") % 20, 100 + ord("c") % 20]
     assert prompt.value.tolist()[4:] == [1, 2]
     assert (prompt.meta["labels"] == -100).all()
-    assert prompt.meta[_OMNI_TOKEN_LEN] == 6
+    # Priced before the markers, which the clip's EXTRA_TOKENS_PER_SAMPLE already counts.
+    assert prompt.meta[_OMNI_TOKEN_LEN] == 4
     assert parts[1].type == "video"
 
 
-@pytest.mark.parametrize(("prompt", "price"), [("abcdefghi", 3), ("", 1)])
-def test_prompt_priced_by_chars_like_the_dit_port(prompt, price):
-    """The DiT port's online estimate: ceil(chars / 4), at least 1; the ids are unchanged."""
-    template = Cosmos3ChatTemplate(_ChatTokenizer(), generation_marker_ids=[1, 2], price_prompt_by_chars=True)
-    part = template.tokenize_conversation([ConversationItem(type="text", value=prompt, role="user")])[0]
-    assert part.meta[_OMNI_TOKEN_LEN] == price
-    assert part.value.numel() == len(prompt) + 4
+def test_a_sample_is_priced_like_the_reference_token_counter():
+    """und = prompt + 1 (eos), gen = patches + 2 (vision markers): the markers are charged once."""
+    template = Cosmos3ChatTemplate(_ChatTokenizer(), generation_marker_ids=[1, 2])
+    preprocessor = Cosmos3VaePreprocessor(
+        Cosmos3VaeConfig(vae_config={"scale_factor_spatial": 16, "scale_factor_temporal": 4})
+    )
+    sample = [ConversationItem(type="text", value="abcdef", role="user"), _clip_item(11, 70, 90)]
+    template.tokenize(sample)
+    preprocessor.preprocess_conversations([sample])
+    templated, patches = len("abcdef") + 2, 2 * 2 * 3
+    assert EXTRA_TOKENS_PER_SAMPLE == 3
+    assert sum(item.meta[_OMNI_TOKEN_LEN] for item in sample) == (templated + 1) + (patches + 2)
 
 
 def test_text_preprocessor_leaves_cached_prompts_alone():
@@ -512,6 +535,7 @@ def test_sft_jsonl_preprocess():
     constructed, media = cosmos3_sft_jsonl_preprocess(dense, dense, data_dir="/data")
     assert constructed[0][1] == ("text", "a bridge.") and media == {"video": ["/abs/a.mp4"]}
     assert cosmos3_sft_jsonl_preprocess(row, row, cfg_dropout_rate=1.0)[0][0][1] == ("text", "")
+    assert cosmos3_sft_jsonl_preprocess(row, row, cfg_dropout_rate=0.0)[0][0][1][1] != ""
 
     # A blank structured caption falls back to the dense ones; a URI is not joined to data_dir.
     blank = {
@@ -533,3 +557,22 @@ def test_only_the_mot_recomputes(name):
     for module, entry in modules.items():
         enabled = entry.get("accelerator", {}).get("gradient_checkpointing", {}).get("enable", True)
         assert enabled == (module == "cosmos3_mot"), module
+
+
+def test_cfg_dropout_is_a_function_of_the_seed_and_the_row():
+    """The same rows drop in every worker, process and resume; the rate holds over many rows."""
+    from veomni.data.seed_omni.preprocess import cosmos3_sft_jsonl_preprocess
+
+    def dropped(seed):
+        rows = [
+            {"vision_path": f"v/{index}.mp4", "t2w_windows": [{"caption": f"clip {index}"}]} for index in range(2000)
+        ]
+        return [
+            cosmos3_sft_jsonl_preprocess(row, row, cfg_dropout_rate=0.1, cfg_dropout_seed=seed)[0][0][1][1] == ""
+            for row in rows
+        ]
+
+    first = dropped(42)
+    assert first == dropped(42)
+    assert first != dropped(43)
+    assert 150 < sum(first) < 250
