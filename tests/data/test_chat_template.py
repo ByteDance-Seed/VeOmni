@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.chat_template import (
     CHAT_TEMPLATE_REGISTRY,
     GptOssTokenizerTemplate,
@@ -14,6 +15,9 @@ from veomni.data.chat_template import (
     build_chat_template,
 )
 from veomni.utils.constants import IGNORE_INDEX, TYPE2INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _PrefixStableTokenizer:

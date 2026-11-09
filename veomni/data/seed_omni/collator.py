@@ -13,13 +13,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Sequence
+from typing import Any, Dict, Sequence
 
 from ..data_collator import DataCollator
-
-
-if TYPE_CHECKING:
-    from ...models.seed_omni.processing_omni import OmniProcessor
 
 
 @dataclass
@@ -28,7 +24,7 @@ class SeedOmniCollator(DataCollator):
 
     Pairs with ``data_type: seedomni`` (see
     ``veomni/data/seed_omni/seedomni_transform.py``) which emits
-    per-sample ``{"conversation_list": [ConversationItem, ...]}``.
+    preprocessed per-sample ``{"conversation_list": [ConversationItem, ...]}``.
     This collator turns ``N`` such dicts into a single batched dict
     ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
     keys present in the samples (passed through unchanged as a per-sample list).
@@ -36,8 +32,11 @@ class SeedOmniCollator(DataCollator):
     No stacking, no padding, no sequence-parallel slicing — the SeedOmni design
     contract puts all of that inside model modules' ``pre_forward``,
     where each module knows which fields it owns and how to slice them.
-    The data layer's job stops at "list of per-sample dicts → dict of
-    per-sample lists".
+    Per-module CPU input preparation (chat template, tokenization, image/video
+    patchification, per-sample dummy anchors, and ``_omni_token_len`` metadata)
+    runs earlier in ``seedomni_transform`` via :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`,
+    so dynamic batching (``dyn_bsz``) can measure each sample's total and
+    effective token lengths before collation.
 
     The collator is intentionally **agnostic** about the exact set of
     keys present: any sample-level key is gathered into a list of length
@@ -53,23 +52,13 @@ class SeedOmniCollator(DataCollator):
 
     Example::
 
-        collator = SeedOmniCollator(processor=processor)
+        collator = SeedOmniCollator()
         batch = collator([
-            {"conversation_list": [{"type": "text", "value": "hi", ...}]},
-            {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
+            {"conversation_list": [ConversationItem(type="text", value=<Tensor>, ...)]},
+            {"conversation_list": [ConversationItem(type="image", value=<Tensor>, ...)]},
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
-
-    ``processor`` is an :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor` built
-    via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
-    active graph modules' config (see ``OmniTrainer._build_collate_fn``). Its preprocessor
-    chain runs, in order, over the grouped batch (``conversation_list`` plus any extra
-    keys) so the heavy per-module CPU input-prep (tokenize / image normalize)
-    executes inside the DataLoader worker and overlaps with GPU compute via prefetch, instead of
-    blocking the main process inside each module's ``pre_forward``.
     """
-
-    processor: "OmniProcessor"
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if not features:
@@ -92,11 +81,4 @@ class SeedOmniCollator(DataCollator):
                 f"got {first_keys}"
             )
 
-        batch = {key: [f[key] for f in features] for key in first_keys}
-
-        # Worker-side CPU input-prep (tokenize / image normalize) over the grouped
-        # batch. Mutates items in place; the modules' thin pre_forward then only
-        # moves to device. Order is FIXED and SERIAL: ``config.modules:``
-        # declaration order (see :class:`OmniProcessor`).
-        self.processor.preprocess_batch(batch, inference=False)
-        return batch
+        return {key: [f[key] for f in features] for key in first_keys}

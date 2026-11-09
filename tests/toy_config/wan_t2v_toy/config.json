@@ -1,6 +1,7 @@
 {
   "_class_name": "WanTransformer3DModel",
   "_diffusers_version": "0.33.0.dev0",
+  "model_type": "WanTransformer3DModel",
   "added_kv_proj_dim": null,
   "attention_head_dim": 64,
   "cross_attn_norm": true,

@@ -1,13 +1,19 @@
-import copy
+"""Packed-boundary contracts for Qwen4-Exp's internal text submodule.
+
+The modeling registry rejects standalone ``Qwen4ExpTextModel``
+(``qwen4_exp_text``). These tests construct that class directly because QSA,
+GDN, and PLE packing live on the text stack inside the registered
+``Qwen4ExpForConditionalGeneration``.
+"""
+
 import importlib
 
 import torch
 from transformers import Qwen4ExpConfig
 
-from veomni.ops import apply_ops_config
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_NPU_AVAILABLE
-
-from ..tools.training_utils import make_eager_ops_config
 
 
 def _load_text_model_class():
@@ -37,15 +43,25 @@ def _forward_varlen(model, input_ids: torch.Tensor, packed_seq_lens: tuple[int, 
 
 def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
     """QSA, GDN, and PLE must reset state at every explicit packed boundary."""
-    apply_ops_config(make_eager_ops_config())
     torch.manual_seed(0)
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     config.use_cache = False
     text_model_cls = _load_text_model_class()
     packed_model = text_model_cls(config).float().eval()
-    separate_model = copy.deepcopy(packed_model)
+    assert packed_model.layers[0].linear_attn.veomni_rms_norm_gated.op == "rms_norm_gated"
+    assert packed_model.layers[1].self_attn.q_norm.veomni_rms_norm.variant == "offset"
+    assert packed_model.layers[1].self_attn.q_norm.group_size is None
+    grouped_norm = next(
+        module
+        for module in packed_model.modules()
+        if type(module).__name__ == "Qwen4ExpTextRMSNorm" and module.group_size is not None
+    )
+    assert grouped_norm.veomni_rms_norm.variant == "offset"
+    assert grouped_norm.group_size == config.hidden_size
+    separate_model = text_model_cls(config).float().eval()
+    separate_model.load_state_dict(packed_model.state_dict())
 
     packed_seq_lens = (5, 7)
     input_ids = torch.randint(0, config.vocab_size, (1, sum(packed_seq_lens)))
@@ -74,9 +90,8 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
 
 
 def test_qwen4_exp_text_model_accepts_explicit_packing_metadata():
-    apply_ops_config(make_eager_ops_config())
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
     config.use_cache = False
     model = _load_text_model_class()(config).float().eval()
     input_ids = torch.randint(0, config.vocab_size, (1, 4))

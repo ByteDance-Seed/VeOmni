@@ -1,0 +1,16 @@
+# Single-process eager inference module overrides.
+# Omit accelerator blocks unless a module intentionally needs distributed load.
+
+vision_encoder:
+  model_path: vision_encoder
+
+text_encoder:
+  model_path: text_encoder
+
+backbone:
+  model_path: backbone
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+decoder:
+  model_path: decoder

@@ -63,7 +63,7 @@ model:
 
   # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager
@@ -73,8 +73,14 @@ model:
   optimizer:
     # NOTE: "adamw8bit" is not a supported OptimizerConfig.type in VeOmni.
     # VeOmni supports: "adamw", "anyprecision_adamw", "muon".
-    # For memory-efficient training, consider "anyprecision_adamw" or reduce
-    # global_batch_size / use gradient checkpointing.
+    # For memory-efficient training, consider "anyprecision_adamw",
+    # model.optimizer.state_offload: cpu, or reduce global_batch_size / use
+    # gradient checkpointing.
+    # NOTE: state_offload: cpu requires model.accelerator.fsdp_config.offload:
+    # false, and THIS config enables that offload below, so the two cannot be
+    # combined here (the combination is rejected at config parse time because
+    # both move training state to host). Set fsdp_config.offload: false first if
+    # you want to try state_offload: cpu.
     type: adamw
     lr: 1.0e-4
     lr_decay_style: linear

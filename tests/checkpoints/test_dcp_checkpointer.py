@@ -16,10 +16,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -27,25 +28,29 @@ from veomni.distributed.torch_parallelize import (
     parallelize_model_ddp,
     parallelize_model_fsdp2,
 )
-from veomni.models.module_utils import init_empty_weights
+from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
-def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
+_CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
+
+
+def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
     device_type = get_device_type()
     backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
     device = torch.device("cpu" if device_type == "cpu" else f"{device_type}:{rank}")
     if device_type != "cpu":
         get_torch_device().set_device(device)
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=world_size)
 
     try:
         _init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
@@ -202,12 +207,12 @@ class TestMultiOptimizerState:
             else:
                 assert expected_value == actual_value
 
+    @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
     def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
         """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
-        from tests.tools.launch_utils import find_free_port
-
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+        spawn_with_rendezvous(
+            _fsdp2_multi_optimizer_worker, args=(_CI_ACCELERATOR_2.nproc, tmp_path), nprocs=_CI_ACCELERATOR_2.nproc
+        )
 
     def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
         """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
@@ -247,6 +252,121 @@ class TestMultiOptimizerState:
         assert not any(k.startswith("optimizer.state.weight.") for k in state_keys), (
             f"synthetic weight state must not be saved: {keys}"
         )
+
+
+class TestSwapOptimizerState:
+    """DCP save/load for ``SwapAdamW`` (host-resident state), plus stock<->swap
+    interop, both through the flattened FQN-keyed optimizer state dict."""
+
+    # CPU-only: plain modules and DCP round-trips on tmp_path, no accelerator.
+    pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+    @staticmethod
+    def _build_swap(seed: int):
+        from veomni.optim.swap_adamw import SwapAdamW
+
+        torch.manual_seed(seed)
+        model = nn.Linear(4, 4)
+        optimizer = SwapAdamW(
+            [{"params": list(model.parameters()), "weight_decay": 0.0}],
+            lr=1e-2,
+            pin_memory=False,
+        )
+        return model, optimizer
+
+    @staticmethod
+    def _step(model, optimizer, seed: int):
+        torch.manual_seed(seed)
+        for param in model.parameters():
+            param.grad = torch.randn_like(param)
+        optimizer.step()
+
+    def test_swap_optimizer_dcp_roundtrip(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        src_model, src_opt = self._build_swap(seed=0)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        dst_model, dst_opt = self._build_swap(seed=1)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        for src_p, dst_p in zip(src_model.parameters(), dst_model.parameters()):
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    dst_opt._host_states[dst_p][key], src_opt._host_states[src_p][key], atol=0.0, rtol=0.0
+                )
+            assert int(dst_opt.state[dst_p]["step"]) == int(src_opt.state[src_p]["step"])
+
+    def test_swap_loads_stock_adamw_checkpoint(self, tmp_path):
+        """A checkpoint written by stock ``torch.optim.AdamW`` loads into
+        ``SwapAdamW`` (same flattened FQN layout)."""
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        torch.manual_seed(0)
+        src_model = nn.Linear(4, 4)
+        src_opt = torch.optim.AdamW(src_model.parameters(), lr=1e-2)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        dst_model, dst_opt = self._build_swap(seed=1)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        src_params = dict(src_model.named_parameters())
+        for name, param in dst_model.named_parameters():
+            src_state = src_opt.state[src_params[name]]
+            dst_state = dst_opt._host_states[param]
+            torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
+            torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+
+    def test_stock_loads_swap_checkpoint(self, tmp_path):
+        """A checkpoint written by ``SwapAdamW`` loads into stock
+        ``torch.optim.AdamW`` (same flattened FQN layout and param-group keys)."""
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        src_model, src_opt = self._build_swap(seed=0)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        torch.manual_seed(1)
+        dst_model = nn.Linear(4, 4)
+        dst_opt = torch.optim.AdamW(dst_model.parameters(), lr=1e-2)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        src_params = dict(src_model.named_parameters())
+        for name, param in dst_model.named_parameters():
+            src_state = src_opt._host_states[src_params[name]]
+            dst_state = dst_opt.state[param]
+            torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
+            torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+            assert int(dst_state["step"].item()) == int(src_opt.state[src_params[name]]["step"])
 
 
 @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
@@ -772,6 +892,21 @@ class TestDdpMetaInit:
         monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
 
         assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
+
+    def test_loads_a_fully_frozen_model_without_a_ddp_wrap(self, wrap_ddp, monkeypatch):
+        """DDP rejects a module whose parameters all have ``requires_grad=False``."""
+        materialize = lambda model, *args, **kwargs: model.to_empty(device="cpu")  # noqa: E731
+        loader = MagicMock(side_effect=materialize)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+        model.requires_grad_(False)
+
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        assert wrapped is model
+        assert loader.call_args.args[1] == "hf-path"
+        assert not model.weight.is_meta
 
     def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
         # A loader that fills nothing would otherwise fail inside DDP's
@@ -2527,6 +2662,17 @@ class TestResumeDiscovery:
 
         assert self._validate(step) == 10
 
+    @pytest.mark.parametrize(("model_state", "accepted"), [(False, True), (True, False)])
+    def test_a_cursor_only_step_is_accepted_only_when_its_manifest_says_so(self, tmp_path, model_state, accepted):
+        """An ``offline_embedding`` step has no ``model/`` at all, because every module is frozen.
+        Without the manifest's word, the same tree is a step whose shards never started."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        layout.write_manifest(str(step), global_step=10, world_size=1, model_state=model_state)
+
+        assert self._validate(step) == (10 if accepted else None)
+
     def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
         from veomni.checkpoint.legacy_v0_1_12 import marker_path
 
@@ -2552,17 +2698,15 @@ class TestResumeDiscovery:
         assert self._validate(step) is None
 
 
-def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
+def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str, endpoint) -> None:
     """One rank of the real promotion check; see ``TestPromotionAcrossRanks``."""
     import shutil
     import time
 
     from veomni.checkpoint import dcp_checkpointer as module
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = os.environ["_TEST_MASTER_PORT"]
     os.environ["LOCAL_RANK"] = str(rank)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
 
     stage, final = os.path.join(base, "stage"), os.path.join(base, "final")
     if rank == 0:
@@ -2601,6 +2745,7 @@ def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: st
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_PROMOTION)
 class TestPromotionAcrossRanks:
     """The promotion, run for real on four ranks over its own gloo group.
 
@@ -2612,12 +2757,13 @@ class TestPromotionAcrossRanks:
     @staticmethod
     def _run(tmp_path, scenario):
         """Spawn four ranks for ``scenario`` and return each rank's outcome."""
-        from tests.tools.launch_utils import find_free_port
-
         base = str(tmp_path / scenario)
         os.makedirs(base, exist_ok=True)
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_staged_promotion_worker, args=(4, base, scenario), nprocs=4, join=True)
+        spawn_with_rendezvous(
+            _staged_promotion_worker,
+            args=(_CI_CPU_PROMOTION.nproc, base, scenario),
+            nprocs=_CI_CPU_PROMOTION.nproc,
+        )
         return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
 
     def test_promotion_completes_on_every_rank(self, tmp_path):

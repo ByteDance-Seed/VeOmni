@@ -33,11 +33,8 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
-from ..models import build_foundation_model
-from ..models.auto import build_config
-from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops import apply_ops_config
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -190,12 +187,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
     def _build_model(self):
         logger.info_rank0("Build model")
         args: DiTModelArguments = self.args
-        # Apply ops config eagerly so the condition model (built below via
-        # ``model_class._from_config``, not ``build_foundation_model``) sees a
-        # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
-        # below will re-apply the same config — that call is idempotent.
-        apply_ops_config(args.ops_implementation)
-        dit_config = build_config(args.config_path, **args.model_config)
+        dit_config = build_config(args.config_path, ops_implementation=args.ops_implementation, **args.model_config)
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
         self._build_condition_model(dit_config.condition_model_type)
@@ -220,6 +212,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
         condition_cfg = config_class.from_pretrained(
             args.condition_model_path,
             seed=self.train_args.seed,  # seed for randn noise and scheduler
+            ops_implementation=args.ops_implementation,
             **args.condition_model_cfg,
         )
         model_class = MODELING_REGISTRY[condition_model_type]()
@@ -367,7 +360,7 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
-            args.data.drop_last = False
+            args.data.dataloader.drop_last = False
             args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
@@ -376,7 +369,7 @@ class DiTTrainer:
             args.train.dataloader_batch_size = args.train.micro_batch_size
             args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
-                f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.dataloader.shuffle}"
+                f"Task offline_embedding. Drop last: {args.data.dataloader.drop_last}, shuffle: {args.data.dataloader.shuffle}"
             )
             args.train.num_train_epochs = 1
 

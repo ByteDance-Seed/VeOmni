@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 from veomni.arguments.parser import _instantiate_recursive
 from veomni.trainer.omni.omni_inferencer import (
@@ -18,6 +19,9 @@ from veomni.trainer.omni.omni_inferencer import (
     _extract_generated_text,
     _module_needs_distributed,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _inferencer_with(infer_type: str, generation_kwargs: dict) -> OmniInferencer:

@@ -2,6 +2,8 @@ import os
 import re
 import sys
 
+from pygments.lexers.special import TextLexer
+
 
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -92,3 +94,5 @@ def _link_sources_to_github(app, docname, source):
 
 def setup(app):
     app.connect("source-read", _link_sources_to_github)
+    # GitHub renders ```mermaid fences as diagrams; Sphinx has no mermaid extension here, so show the source.
+    app.add_lexer("mermaid", TextLexer)

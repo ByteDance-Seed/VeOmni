@@ -1,3 +1,5 @@
+"""Adapted from https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core"""
+
 from __future__ import annotations
 
 import copy
@@ -6,6 +8,14 @@ import os
 from dataclasses import dataclass, replace
 
 import torch
+from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+
+
+# isort: off
+# Bind this tree before any ``import ltx_core``.
+import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.attention import Attention
@@ -14,10 +24,7 @@ from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
 from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-from transformers import PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
-
-import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
+# isort: on
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -36,14 +43,6 @@ VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors(time=8, height=32, width=32)
 AUDIO_MEL_BINS = 16
 AUDIO_CHANNELS = 8
 DEFAULT_FPS = 24
-
-_VEOMNI_SP_ATTN_IMPLS = frozenset(
-    {
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-        "veomni_flash_attention_4_with_sp",
-    }
-)
 
 
 def LTXSPAttention_forward(
@@ -158,6 +157,11 @@ def LTXVideoModel_forward(
     audio: Modality | None,
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not self.model_type.is_video_enabled() and video is not None:
+        raise ValueError("Video is not enabled for this model")
+    if not self.model_type.is_audio_enabled() and audio is not None:
+        raise ValueError("Audio is not enabled for this model")
+
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
 
@@ -224,15 +228,19 @@ class _LTXModelInitShim(LTXModel):
 class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     config_class = LTXVideoTransformerModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
+    _supports_flash_attn = True
     _no_split_modules = ["BasicAVTransformerBlock"]
     _checkpoint_conversion_mapping = {
         "^model\\.diffusion_model\\.": "",
     }
 
     def __init__(self, config: LTXVideoTransformerModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -280,6 +288,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.cross_attention_adaln,
+            config=config,
         )
         self.config: LTXVideoTransformerModelConfig = config
         self.config.tie_word_embeddings = False
@@ -470,7 +479,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
 
-        config_dict = self.config.to_diffuser_dict()
+        config_dict = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
         config_dict["_class_name"] = "LTXVideoTransformerModel"
         config_dict["_diffusers_version"] = diffusers_version
 
@@ -485,12 +494,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        from ....loader import get_model_config
-
-        kwargs.pop("trust_remote_code", None)
-        config = get_model_config(path, **kwargs)
-        model = cls._from_config(config)
-        return model
+        raise NotImplementedError("LTXVideoTransformerModel.from_pretrained is not supported on this wrapper.")
 
 
 def compute_ltx2_loss(

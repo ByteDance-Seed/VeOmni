@@ -83,7 +83,6 @@ def veomni_clip_grad_norm(
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
 
-    grad_norm = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
     return grad_norm
 
 

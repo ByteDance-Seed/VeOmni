@@ -21,7 +21,7 @@ save/load/resume) end-to-end with ``--model.accelerator.ep_size=2``:
    engages the right plumbing (plan-bridges fire, slicing log emits the
    right FQNs at the right ratio, DCP consolidates EP shards before HF
    save). These are the integration claims that the kernel-level test
-   (``test_moe_lora_fused.py``) cannot make about the trainer.
+   (``tests/ops/moe_experts_lora/test_moe_experts_lora.py``) cannot make about the trainer.
 
 2. ``test_moe_lora_ep_save_load_parallel_align[mode]`` -- asserts that
    the **EP=2 save formats** are loadable across configs and that
@@ -90,9 +90,13 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+
 from .test_moe_lora_trainer import (
     LOG_DICT,
     SNAPSHOT_POST,
+    SNAPSHOT_PRE,
+    _assert_writer_artifacts_exist,
     _compare_snapshots_bit_exact,
     _gpu_count_or_skip,
     _model_path_overrides,
@@ -102,11 +106,13 @@ from .test_moe_lora_trainer import (
 )
 
 
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
+
+
 # Silence "imported but unused" for the fixture -- pytest discovers
 # fixtures by symbol presence in the test module, not by call sites.
 __all__ = [
     "toy_base_dir",
-    "test_ep2_trainer_integration",
     "test_moe_lora_ep_save_load_parallel_align",
     "test_independent_reset_lora_parameters_under_ep_shard",
 ]
@@ -150,19 +156,14 @@ def _torchrun_capture(yaml_path: str, output_dir: str, extra_overrides: list[str
     EP slicing log lines (rank 0 only -- they're emitted by
     ``logger.info_rank0`` so duplicate-rank noise is already filtered).
     """
-    from ..tools.launch_utils import find_free_port
 
-    # ``find_free_port`` per-call (not a PID-derived constant) avoids
-    # "address in use" between back-to-back ``torchrun`` launches.
-    # ``test_moe_lora_ep_save_load_parallel_align`` alone fires four subprocesses
-    # per parametrise variant, and Linux's ``TIME_WAIT`` keeps the c10d
-    # store port held for ~60s after each one exits -- a stable PID port
-    # collides on the second launch.
+    # The agent binds its own rendezvous server rather than probing and
+    # releasing a port before the workers start.
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "test_moe_lora_trainer.py")),
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
@@ -379,72 +380,31 @@ def _assert_metric_close(
 # ──────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("mode", ["shared", "independent"])
-def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
-    """End-to-end EP=2 trainer run: assert plan-bridge + slice + DCP-consolidate.
+def _expected_qwen3_moe_toy_adapter_shapes(mode: str) -> dict[str, tuple[int, ...]]:
+    """Complete expected adapter key -> shape mapping for Qwen3-MoE toy (4 layers, E=16, r=8, H=256)."""
+    expected: dict[str, tuple[int, ...]] = {}
+    for layer in range(4):
+        prefix = f"base_model.model.model.layers.{layer}"
+        expected[f"{prefix}.self_attn.q_proj.lora_A.weight"] = (8, 256)
+        expected[f"{prefix}.self_attn.q_proj.lora_B.weight"] = (512, 8)
+        expected[f"{prefix}.self_attn.v_proj.lora_A.weight"] = (8, 256)
+        expected[f"{prefix}.self_attn.v_proj.lora_B.weight"] = (256, 8)
+        for spec in ("gate_proj", "up_proj", "down_proj"):
+            if mode == "independent":
+                expected[f"{prefix}.mlp.experts.{spec}.lora_A.weight"] = (16, 8, 256)
+                expected[f"{prefix}.mlp.experts.{spec}.lora_B.weight"] = (16, 256, 8)
+            else:
+                expected[f"{prefix}.mlp.experts.{spec}.lora_A.weight"] = (8, 256)
+                expected[f"{prefix}.mlp.experts.{spec}.lora_B.weight"] = (256, 8)
+    return expected
 
-    Runs the merged trainer twice on the same toy yaml + base + seed --
-    once at ``ep_size=1`` to provide reference adapter shapes, once at
-    ``ep_size=2`` to exercise the production EP path -- and asserts:
 
-    * ep2 trainer completes the same 4 steps without error;
-    * ep2 ``parallel_plan.shard_tensor`` log shows every layer's
-      ``mlp.experts.gate_up_proj`` and ``mlp.experts.down_proj`` got
-      sliced 16 -> 8 (= ``ep_size=2``);
-    * for ``mode="independent"``, every per-expert LoRA tensor
-      (``gate_proj.lora_A`` / ``gate_proj.lora_B`` /
-      ``up_proj.lora_A`` / ``up_proj.lora_B`` /
-      ``down_proj.lora_A`` / ``down_proj.lora_B``) at every layer also
-      got sliced 16 -> 8 (proves
-      :func:`_rewrite_plan_for_moe_lora_wrappers` worked);
-    * for ``mode="shared"``, NO LoRA tensor shows up in the EP slice
-      log (proves the per-expert extension is correctly gated to
-      Independent mode and shared LoRA stays replicated);
-    * the saved ``adapter_model.safetensors`` has the same key set and the
-      same per-tensor shapes as the EP=1 reference (proves DCP
-      gathered the EP shards before the PEFT save helper consumed
-      them; per-expert tensors come back as ``[16, ...]`` not
-      ``[8, ...]``).
-
-    Value alignment is intentionally not asserted -- see module
-    docstring for why per-rank meta-init makes that ill-defined.
-    """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
-    yaml_path = _yaml_for_mode(mode)
-    base_overrides = _model_path_overrides(toy_base_dir) + [_FUSED_OPS_OVERRIDE]
-
-    # ── EP=1 reference (no slicing happens; just produces shapes/keys) ──
-    ep1_dir = str(tmp_path / "ep1")
-    _torchrun_capture(
-        yaml_path,
-        ep1_dir,
-        extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
-        nproc=nproc,
-    )
-    ep1_adapter = _load_adapter(_writer_adapter_path(ep1_dir, save_step=4))
-
-    # ── EP=2 path under test ───────────────────────────────────────────
-    ep2_dir = str(tmp_path / "ep2")
-    ep2_stdout = _torchrun_capture(
-        yaml_path,
-        ep2_dir,
-        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
-        nproc=nproc,
-    )
-
-    # ── Assertion 1: every base experts param got sliced 16 -> 8 ──────
-    # Pull from the load-slice log: rank0_load_and_broadcast_weights
-    # invokes ``parallel_plan.shard_tensor`` and emits a record with the
-    # full and local dim-0 sizes -- the only place we get to verify the
-    # EP shard arithmetic from log alone.
+def _assert_ep_slicing_and_adapter_shapes(ep2_stdout: str, seeder_dir: str, mode: str, *, final_step: int) -> None:
+    """Verify EP=2 slicing logs, Independent vs Shared LoRA sharding, and full adapter key/shape consolidation."""
     plan_apply_fqns, load_slices = _parse_ep_slices(ep2_stdout)
-    # PEFT-aligned wrapper layout: base params live under
-    # ``<spec>.base_layer.weight``, and ``_rewrite_plan_for_moe_lora_wrappers``
-    # rewrites the bare-Param plan patterns to the wrapped FQN before
-    # the load-slice path emits its records.
     base_targets = {
         f"base_model.model.model.layers.{layer}.mlp.experts.{name}.base_layer.weight"
-        for layer in range(4)  # toy config has 4 MoE layers
+        for layer in range(4)
         for name in ("gate_up_proj", "down_proj")
     }
     missing_base = base_targets - set(load_slices)
@@ -457,38 +417,27 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
         full, local, ep = load_slices[name]
         assert full == 16 and local == 8 and ep == 2, f"{mode}/{name}: bad slice {full=} {local=} {ep=}"
 
-    # ── Assertion 2: per-expert LoRA tensors slice iff Independent ─────
-    # LoRA tensors are missing from the toy base safetensors (they're
-    # freshly initialised by ``_init_lora_parameter``), so they don't
-    # hit the load-slice path; ``ParallelPlan.apply`` is the only EP
-    # entry point that touches them. Use ``plan_apply_fqns`` here.
-    # PEFT-aligned layout: per-expert LoRA lives at
-    # ``...experts.<spec>.lora_A.<adapter>.weight``, so a contains check
-    # on ``.lora_A.`` / ``.lora_B.`` (with surrounding dots) catches them
-    # without false-positive matches against attribute names that happen
-    # to contain ``lora_A`` as a substring.
     lora_per_expert_apply = {n for n in plan_apply_fqns if ".lora_A." in n or ".lora_B." in n}
     if mode == "independent":
-        # 4 layers x 6 specs (lora_{A,B} x {gate_proj, up_proj, down_proj}) = 24
         assert len(lora_per_expert_apply) == 24, (
             f"independent: expected 24 per-expert LoRA tensors EP-sliced by plan.apply, got {len(lora_per_expert_apply)}"
         )
-    else:  # shared
+    else:
         assert not lora_per_expert_apply, (
             f"shared: shared LoRA must stay replicated, but plan.apply sliced these: {sorted(lora_per_expert_apply)!r}"
         )
 
-    # ── Assertion 3: DCP-consolidated adapter matches EP=1 shapes/keys ─
-    ep2_adapter = _load_adapter(_writer_adapter_path(ep2_dir, save_step=4))
-    assert set(ep1_adapter) == set(ep2_adapter), (
-        f"{mode}: ep1 vs ep2 adapter key sets differ:\n"
-        f"  only in ep1: {sorted(set(ep1_adapter) - set(ep2_adapter))[:5]!r}\n"
-        f"  only in ep2: {sorted(set(ep2_adapter) - set(ep1_adapter))[:5]!r}"
+    expected_shapes = _expected_qwen3_moe_toy_adapter_shapes(mode)
+    ep2_adapter = _load_adapter(_writer_adapter_path(seeder_dir, save_step=final_step))
+    assert set(ep2_adapter) == set(expected_shapes), (
+        f"{mode}: adapter key set mismatch:\n"
+        f"  missing:    {sorted(set(expected_shapes) - set(ep2_adapter))[:5]!r}\n"
+        f"  unexpected: {sorted(set(ep2_adapter) - set(expected_shapes))[:5]!r}"
     )
     shape_mismatches = [
-        f"{n}: ep1 {tuple(ep1_adapter[n].shape)} != ep2 {tuple(ep2_adapter[n].shape)}"
-        for n in ep1_adapter
-        if ep1_adapter[n].shape != ep2_adapter[n].shape
+        f"{n}: expected {expected_shapes[n]} != got {tuple(ep2_adapter[n].shape)}"
+        for n in expected_shapes
+        if tuple(ep2_adapter[n].shape) != expected_shapes[n]
     ]
     assert not shape_mismatches, (
         f"{mode}: DCP did not consolidate EP shards before HF save -- {len(shape_mismatches)} shape mismatches:\n  "
@@ -496,36 +445,6 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Test 2: EP=2 save + (cross-EP adapter resume parity) + (EP=2 DCP
-# round-trip parity). All four subprocesses driven by the same
-# trainer entry point used in test_moe_lora_trainer.py; only the
-# yamls + ``--model.accelerator.ep_size`` differ.
-# ──────────────────────────────────────────────────────────────────────
-
-
-# Reuse the e2e tolerance: SP/EP across DP layouts only matches at
-# ~1e-1 at toy-config scale even after we DP-average the per-step loss
-# in ``_LogDictSaveCallback._dp_avg`` (so EP=1 (dp=2) and EP=2 (dp=1)
-# both record the same global-mean loss -- otherwise it'd be rank-0's
-# local scaled-loss on different sample subsets, an apples-to-oranges
-# comparison the 0.1 tolerance could swallow even with a broken EP
-# autograd path). The remaining ~1e-1 envelope absorbs reduction-order
-# noise (4 sequential micros vs 2 + 2 all-reduced) plus bf16 mixed-
-# precision drift; tighter rtol/atol flakes here for the same reason
-# ``tests/e2e/test_e2e_parallel.py`` lands at the same number.
-# ``grad_norm`` is already global (``veomni_clip_grad_norm`` operates
-# on the gathered DTensor grads so FSDP's reduce-scatter has already
-# happened) but we keep the same envelope so a single regression mode
-# covers both metrics.
-#
-# The DCP round-trip comparison (assertion B below) could use a much
-# tighter envelope -- DCP saves model + optimizer + RNG + dataloader
-# bytes, so a correct round-trip would be bit-exact modulo bf16
-# storage. We deliberately use the same 1e-1 envelope as assertion A
-# to keep one tolerance knob for the whole test; tightening B alone
-# would just turn flakes into mode-specific debugging without
-# catching a different class of regression.
 _ALIGN_RTOL = 1e-1
 _ALIGN_ATOL = 1e-1
 
@@ -533,124 +452,34 @@ _ALIGN_ATOL = 1e-1
 # so the DCP resumer has at least one optimizer step to take after
 # load (otherwise the round-trip degenerates to a no-op load + final
 # barrier and DCP correctness can't be observed).
-_ALIGN_MAX_STEPS = 4
-_DCP_SAVE_STEP = 2
+_ALIGN_MAX_STEPS = 2
+_DCP_SAVE_STEP = 1
+
+_ALIGN_CASES = [
+    pytest.param(
+        "shared",
+        2,
+        id="shared-2gpu",
+        marks=pytest.mark.skipif(runner_device_count() < 2, reason="Requires >= 2 devices"),
+    ),
+    pytest.param(
+        "independent",
+        4,
+        id="independent-4gpu",
+        marks=pytest.mark.skipif(runner_device_count() < 4, reason="Requires >= 4 devices"),
+    ),
+]
 
 
-@pytest.mark.parametrize("mode", ["shared", "independent"])
-def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
-    """EP=2 save + cross-EP adapter resume parity + EP=2 DCP round-trip parity.
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
+@pytest.mark.parametrize("mode,nproc", _ALIGN_CASES)
+def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode: str, nproc: int):
+    """EP=2 integration + cross-EP adapter resume parity + EP=2 DCP round-trip parity.
 
-    Validates the **two save formats** an EP=2 MoE-LoRA trainer
-    emits -- the consolidated HF adapter (full ``[E, r, H]``) and the
-    sharded DCP checkpoint -- with a single seeder and three resumer
-    subprocesses, all driven by the same trainer entry point used in
-    ``test_moe_lora_trainer.py``.
-
-    Subprocesses (per mode):
-
-    1. **Seeder** (EP=2, ``max_steps=_ALIGN_MAX_STEPS``,
-       ``save_steps=_DCP_SAVE_STEP``, ``hf_save_steps=_ALIGN_MAX_STEPS``).
-       Real EP=2 trainer -- LoRA tensors are EP-sliced
-       ``[E_local, r, H]`` per ``_extend_plan_for_moe_lora_independent``
-       (or replicated for Shared mode), forward/backward go through
-       the fused EP-aware kernel, and ``CheckpointCallback`` fires:
-
-         * at step ``_ALIGN_MAX_STEPS`` it calls
-           ``save_lora_adapter_with_dcp`` which uses DCP to gather
-           the EP shards back into the full ``[E, r, H]`` tensor on
-           rank 0 before writing ``adapter_model.safetensors``.
-         * at steps ``_DCP_SAVE_STEP`` (intermediate) and
-           ``_ALIGN_MAX_STEPS`` it writes sharded DCP shards
-           (model + optimizer). ``GlobalStateCallback`` writes the
-           job cursor (RNG + dataloader) beside them.
-
-       Per-step ``log_dict.json`` records DP-averaged loss + global
-       grad_norm for the full ``_ALIGN_MAX_STEPS`` trajectory.
-
-    2. **Adapter resumer (EP=1)**. Loads the seeder's HF adapter
-       (full ``[E, r, H]``) via ``model.lora_config.lora_adapter``
-       -> ``veomni_peft_model_from_pretrained`` ->
-       ``PeftModel.from_pretrained`` -> the FSDP2 adapter-load path
-       inside ``build_parallelize_model``. At ep=1 the
-       ``parallel_plan.shard_tensor`` step is a no-op, so the LoRA
-       weights land in the model exactly as written. Runs
-       ``_ALIGN_MAX_STEPS`` steps from a freshly-zeroed optimizer.
-
-    3. **Adapter resumer (EP=2)**. Same as (2) but with
-       ``--model.accelerator.ep_size=2``. The adapter-load path
-       EP-slices the LoRA on read (Independent) or leaves it
-       replicated (Shared). Runs ``_ALIGN_MAX_STEPS`` steps from a
-       freshly-zeroed optimizer.
-
-    4. **DCP resumer (EP=2)**. Loads the seeder's intermediate DCP
-       shard at step ``_DCP_SAVE_STEP`` via
-       ``train.checkpoint.load_path`` ->
-       ``BaseTrainer.load`` / ``GlobalStateCallback.load_global_state``
-       (which restore model + optimizer + RNG + dataloader cursor and bump
-       ``global_step``). Continues to ``_ALIGN_MAX_STEPS`` -- so it
-       takes ``_ALIGN_MAX_STEPS - _DCP_SAVE_STEP`` more optimizer
-       steps that should retrace the seeder's tail-end trajectory
-       exactly (modulo bf16 + reduction-order noise).
-
-    Assertions:
-
-    A. **Cross-EP adapter parity** -- adapter resumer EP=1 vs EP=2
-       per-step loss + grad_norm match within ``rtol=atol=0.1``.
-       Proves that the EP-slice on adapter-read is the inverse of
-       the EP-gather on adapter-save, so the same on-disk adapter
-       drives the same training trajectory regardless of how the
-       model parallel layout decomposes it at load time. A
-       regression in either:
-
-         * the EP-gather path inside
-           :func:`save_lora_adapter_with_dcp` (e.g. forgetting to
-           use DCP for the LoRA-only state), or
-         * ``_dispatch_parameter`` + ``parallel_plan.shard_tensor``
-           on adapter read (e.g. mismatched dim-0 size between the
-           on-disk full ``[E, r, H]`` and the model's local
-           ``[E_local, r, H]``)
-
-       breaks this without touching the integration test's plumbing
-       claims.
-
-    B. **EP=2 DCP round-trip** -- two complementary checks of the
-       same property:
-
-         B1. DCP resumer EP=2 per-step loss + grad_norm match the
-             seeder's tail ``log[_DCP_SAVE_STEP:]`` within
-             ``rtol=atol=0.1`` (fast-readable failure signal).
-         B2. ``ep2_dcp/lora_snapshot_post.pt`` is **bit-equal** (in
-             bf16, via ``_compare_snapshots_bit_exact``) to
-             ``seeder/lora_snapshot_post.pt`` -- both are rank-0
-             gathered LoRA-weight dumps at end-of-step-``_ALIGN_MAX_STEPS``,
-             so a correct DCP round-trip MUST land on the same
-             bytes. This is the EP=2 analogue of the EP=1 bit-exact
-             DCP round-trip already covered by
-             ``test_moe_lora_trainer.py``; assertion A's same check
-             is impossible because the two adapter resumers run with
-             different DP layouts (EP=1 -> dp=2, EP=2 -> dp=1), so
-             reduction order differs and per-step loss/grad_norm
-             close is the strongest possible parity.
-
-       Together (B1 + B2) catch a regression that drops e.g.
-       optimizer-momentum bytes from the DCP shard: B1 might tolerate
-       the resulting 2-step drift if it's small, but B2 always
-       breaks.
-
-    Why this is not redundant with the integration test
-    ---------------------------------------------------
-    The integration test asserts the EP plumbing *engages* (slicing
-    happens at the right FQNs, DCP consolidates the right shapes).
-    This test asserts the math is *right* after that plumbing -- a
-    regression in the kernel's EP autograd classes (e.g. wrong
-    reduction order in
-    ``EPMergedFc1IndependentLoRAGroupGemm.backward``), a regression
-    in the adapter EP-slice on read, or a regression in DCP state
-    coverage would fail this while passing the integration test, and
-    vice versa.
+    Covers both 2-GPU (``ep_fsdp=1, ep=2`` degenerate FSDP axis on ``shared``)
+    and 4-GPU (``ep_fsdp=2, ep=2`` non-degenerate EP + FSDP axes on ``independent``).
     """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
+    _gpu_count_or_skip(min_count=nproc, max_count=nproc)
     yaml_path = _yaml_for_mode(mode)
     base_overrides = _model_path_overrides(toy_base_dir) + [_FUSED_OPS_OVERRIDE]
 
@@ -662,18 +491,17 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
         max_steps=_ALIGN_MAX_STEPS,
         dcp_save_steps=_DCP_SAVE_STEP,
     )
-    _torchrun_capture(
+    seeder_stdout = _torchrun_capture(
         seeder_yaml,
         seeder_dir,
         extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
+    _assert_writer_artifacts_exist(seeder_dir, mode, final_step=_ALIGN_MAX_STEPS)
+    _assert_ep_slicing_and_adapter_shapes(seeder_stdout, seeder_dir, mode, final_step=_ALIGN_MAX_STEPS)
+
     seeder_adapter = _writer_adapter_path(seeder_dir, save_step=_ALIGN_MAX_STEPS)
     seeder_dcp = os.path.join(seeder_dir, "checkpoints", f"global_step_{_DCP_SAVE_STEP}")
-    assert os.path.isfile(os.path.join(seeder_adapter, "adapter_model.safetensors")), (
-        f"{mode}: seeder failed to write adapter at {seeder_adapter}"
-    )
-    assert os.path.isdir(seeder_dcp), f"{mode}: seeder failed to write DCP at {seeder_dcp}"
 
     seeder_log = _load_log_dict(seeder_dir)
     assert seeder_log.get("loss") and len(seeder_log["loss"]) == _ALIGN_MAX_STEPS, (
@@ -703,6 +531,11 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
         extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
         nproc=nproc,
     )
+    _compare_snapshots_bit_exact(
+        actual_path=os.path.join(ep1_adapter_dir, SNAPSHOT_PRE),
+        ref_path=os.path.join(seeder_dir, SNAPSHOT_POST),
+        label=f"{mode}/A0.ep1_adapter.snapshot_pre",
+    )
 
     # ── 3. Adapter resumer (EP=2) ──────────────────────────────────────
     ep2_adapter_dir = str(tmp_path / "ep2_adapter")
@@ -711,6 +544,11 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
         ep2_adapter_dir,
         extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
+    )
+    _compare_snapshots_bit_exact(
+        actual_path=os.path.join(ep2_adapter_dir, SNAPSHOT_PRE),
+        ref_path=os.path.join(seeder_dir, SNAPSHOT_POST),
+        label=f"{mode}/A0.ep2_adapter.snapshot_pre",
     )
 
     # ── 4. DCP resumer (EP=2) ──────────────────────────────────────────
@@ -725,9 +563,6 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     # ── 5. Assertion A: cross-EP adapter parity ────────────────────────
     ep1_adapter_log = _load_log_dict(ep1_adapter_dir)
     ep2_adapter_log = _load_log_dict(ep2_adapter_dir)
-    # Truthy-on-non-empty guard: ``np.isclose([], [])`` is vacuously
-    # True, so an empty log_dict (trainer crashed before on_step_end)
-    # would silently pass the comparator.
     assert ep1_adapter_log.get("loss") and ep2_adapter_log.get("loss"), (
         f"{mode}: empty adapter-resume log_dict: ep1={list(ep1_adapter_log)} ep2={list(ep2_adapter_log)}"
     )
@@ -752,13 +587,6 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     )
 
     # ── 6. Assertion B: EP=2 DCP round-trip ────────────────────────────
-    # Two complementary checks of the same property -- a regression
-    # that drops e.g. optimizer-momentum bytes from the DCP shard
-    # would not necessarily move the loss outside the 1e-1 envelope
-    # in 2 optimizer steps, but would always break the bit-exact
-    # snapshot equality. The metric-close check stays as a fast
-    # readable failure signal; the snapshot check is the strong
-    # guarantee.
     ep2_dcp_log = _load_log_dict(ep2_dcp_dir)
     assert ep2_dcp_log.get("loss"), f"{mode}: empty DCP-resume log_dict: {list(ep2_dcp_log)}"
     seeder_tail_loss = seeder_log["loss"][_DCP_SAVE_STEP:]
@@ -786,24 +614,12 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
         lhs_label="seeder_tail",
         rhs_label="ep2_dcp",
     )
-    # Bit-exact (in bf16) end-state weight equality. ``_SnapshotCallback``
-    # in the trainer subprocess gathers the full LoRA tensors on rank 0
-    # at ``on_train_end``, so seeder/lora_snapshot_post.pt and
-    # ep2_dcp/lora_snapshot_post.pt are both rank-0 dumps of the same
-    # logical end-of-step-N model -- they MUST be bit-equal modulo bf16
-    # storage. This is the EP=2 analogue of the EP=1 DCP round-trip
-    # assertion in ``test_moe_lora_trainer.py``; assertion A's same-
-    # check is impossible by construction (different DP layouts).
     _compare_snapshots_bit_exact(
         actual_path=os.path.join(ep2_dcp_dir, SNAPSHOT_POST),
         ref_path=os.path.join(seeder_dir, SNAPSHOT_POST),
         label=f"{mode}/B2.dcp.snapshot_post",
     )
 
-    # Cleanup the four sizable run dirs once compared (seeder DCP and
-    # adapter dirs kept implicit via tmp_path -- pytest's tmp_path
-    # caches the last 3 invocations, useful for inspecting the on-disk
-    # state when a parametrise variant fails halfway).
     for d in (ep1_adapter_dir, ep2_adapter_dir, ep2_dcp_dir):
         shutil.rmtree(d, ignore_errors=True)
 
@@ -891,10 +707,11 @@ def _reset_lora_under_ep_worker():
     )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_independent_reset_lora_parameters_under_ep_shard():
     """Regression: ``LoraIndependentExperts.reset_lora_parameters`` must
     populate local storage when the LoRA-A weight is an EP-sharded
     ``DTensor[Shard(0)]``. See module docstring for context."""
     from ..tools.launch_utils import torchrun
 
-    torchrun(_reset_lora_under_ep_worker, world_size=2)
+    torchrun(_reset_lora_under_ep_worker, world_size=_CI_ACCELERATOR_2.nproc)
