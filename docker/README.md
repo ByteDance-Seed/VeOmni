@@ -132,3 +132,16 @@ These additions do not change the existing automatic Quay publishing workflows.
 The source fork's private GHCR candidate workflows and A5 diagnostics are not
 included. Full image builds, packaging smoke and target-device numerical tests
 must pass before these candidates are treated as validated runtime images.
+
+### Build an A2 x86 candidate in GitHub Actions
+
+The `Build CANN 9.2.1 A2 candidate` workflow builds the A3-derived A2 x86
+Dockerfile on a hosted runner without an NPU. It runs the packaging smoke before
+pushing `ghcr.io/<owner>/veomni:cann921-a2-x86-<commit>` and uploads the smoke
+report. Inspect `dependency_consistent` separately from packaging status.
+Pushing Docker changes to zpl1n/ascend-cann921-a2-a3 triggers the build.
+Manual dispatch also works once the workflow exists on the default branch.
+Make the GHCR package publicly pullable before using it in upstream PR CI.
+Record the pushed digest and test an anonymous pull before updating A2 CI.
+Device numerical tests remain required. Existing A2 CI still uses its previous
+image until a candidate has been published and verified.
