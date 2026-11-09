@@ -93,9 +93,9 @@ and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L85)
 inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L428)
 before FSDP2 wraps transformer blocks.
 
-## Recipe selection and `torch.compile` fusion
+## Recipe selection
 
-- **`tensorwise`**: Fastest throughput (`~1.29x–1.32x` faster than BF16 when compiled on Blackwell SM120) using per-tensor dynamic scaling.
-- **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for forward and activation-gradient (`dX`) GEMMs while keeping weight-gradient (`dW`) accumulation in BF16, cutting `dX`/`dW` quantization error by ~25–35% vs `tensorwise` while retaining `~1.13x–1.17x` compiled speedup.
+- **`tensorwise`**: Uses per-tensor dynamic scaling across all three GEMMs (`output`, `dX`, `dW`).
+- **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for forward and activation-gradient (`dX`) GEMMs while keeping weight-gradient (`dW`) accumulation in BF16, cutting `dX`/`dW` quantization error by ~25–35% vs `tensorwise`.
 - **`rowwise`**: Uses rowwise scaling across all three GEMMs (`output`, `dX`, `dW`).
-- **Why compilation matters for `Float8Linear`**: In eager mode, `torchao`'s dynamic quantization (`amax`, scale division, clamp, cast to `float8_e4m3fn`/`float8_e5m2`, and `.t().contiguous()` layout conversion) launches multiple memory-bound elementwise kernels per linear layer. Wrapping transformer blocks with `torch.compile(..., fullgraph=False)` fuses dynamic scaling and transpose into a single Triton kernel before `aten::_scaled_mm`.
+- **`torch.compile` status**: `model.accelerator.torch_compile.enable=True` is currently rejected by `validate_float8_training()` (`ValueError: float8 training with torch.compile is not yet validated.`), so supported FSDP2 float8 training runs in eager mode (`torch_compile.enable=False`). In standalone block microbenchmarks outside `validate_float8_training()`, wrapping `Float8Linear` blocks with `torch.compile` fuses torchao's dynamic scaling and transpose into a single Triton kernel before `aten::_scaled_mm`.

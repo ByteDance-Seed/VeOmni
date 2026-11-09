@@ -21,6 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 import torch.nn as nn
+from packaging.version import Version
 
 from ..arguments import Float8TrainingConfig, MixedPrecisionConfig
 from ..utils import device, logging
@@ -133,7 +134,7 @@ def convert_float8_linears(model: nn.Module, config: Float8TrainingConfig) -> li
         raise ImportError(
             "float8 training requires the GPU dependency torchao==0.18.0: uv sync --extra gpu --dev"
         ) from exc
-    if installed_version != "0.18.0":
+    if Version(installed_version).public != "0.18.0":
         raise ImportError(f"float8 training requires torchao==0.18.0; found {installed_version}.")
 
     from torchao.float8 import Float8LinearConfig, convert_to_float8_training

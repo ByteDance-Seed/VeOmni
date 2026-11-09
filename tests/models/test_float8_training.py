@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import AcceleratorConfig, Float8TrainingConfig, MixedPrecisionConfig
 from veomni.arguments.parser import parse_args, save_args
 from veomni.distributed.float8 import convert_float8_linears, validate_float8_training
@@ -441,7 +441,7 @@ def _two_rank_gloo_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, re
     from veomni.models.checkpoint.weights import init_empty_weights
     from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 
-    device.get_torch_device().set_device(0)
+    device.get_torch_device().set_device(rank)
     dist.init_process_group(backend="gloo", store=endpoint.connect(), rank=rank, world_size=2)
     try:
         _init_parallel_state(dp_size=2, dp_mode="fsdp2")
@@ -507,14 +507,12 @@ def _two_rank_gloo_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, re
 
 
 @pytest.mark.parametrize("recipe", ["tensorwise", "rowwise"])
-def test_float8_two_rank_sharded_fsdp2_and_additional_dit_families(tmp_path, recipe):
-    """Verify QwenImage, LTXVideo, and MiniMaxH3 DiT float8 projections and 2-rank FSDP2 sharding."""
+def test_float8_additional_dit_families(recipe):
+    """Verify QwenImage, LTXVideo, and MiniMaxH3 DiT float8 projections dispatch native scaled GEMMs."""
     _require_native_float8()
     from torch.profiler import ProfilerActivity, profile
     from torchao.float8.float8_linear import Float8Linear
-    from transformers import LlamaConfig
 
-    from tests.tools.launch_utils import spawn_with_rendezvous
     from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
         LTXVideoTransformerModelConfig,
     )
@@ -531,7 +529,6 @@ def test_float8_two_rank_sharded_fsdp2_and_additional_dit_families(tmp_path, rec
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
         QwenImageTransformer2DModel,
     )
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 
     for model, pattern in (
         (
@@ -542,7 +539,6 @@ def test_float8_two_rank_sharded_fsdp2_and_additional_dit_families(tmp_path, rec
                     attention_head_dim=32,
                     axes_dims_rope=(8, 12, 12),
                     joint_attention_dim=128,
-                    pooled_projection_dim=128,
                     attn_implementation="eager",
                 )
             ).float(),
@@ -564,11 +560,17 @@ def test_float8_two_rank_sharded_fsdp2_and_additional_dit_families(tmp_path, rec
         (
             MiniMaxH3DiTModel(
                 MiniMaxH3DiTModelConfig(
+                    hidden_size=128,
                     num_layers=1,
+                    token_refiner_num_layers=1,
                     num_attention_heads=4,
                     attention_head_dim=32,
                     ffn_hidden_size=256,
-                    token_refiner_layers=1,
+                    text_dim=128,
+                    time_embed_hidden_size=128,
+                    time_embed_dim=64,
+                    adaln_out_features=18 * 128,
+                    final_adaln_out_features=2 * 128,
                     attn_implementation="eager",
                 )
             ).float(),
@@ -585,6 +587,21 @@ def test_float8_two_rank_sharded_fsdp2_and_additional_dit_families(tmp_path, rec
             leaf(x).square().mean().backward()
             device.synchronize()
         assert sum(e.count for e in trace.key_averages() if e.key == "aten::_scaled_mm") == 3
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
+@pytest.mark.parametrize("recipe", ["tensorwise", "rowwise"])
+def test_float8_two_rank_sharded_fsdp2(tmp_path, recipe):
+    """Verify 2-rank FSDP2 sharded Llama float8 training and DCP checkpoint continuation."""
+    if not device.IS_CUDA_AVAILABLE or torch.version.hip or runner_device_count() < 2:
+        pytest.skip("Requires two NVIDIA CUDA GPUs.")
+    if not all(device.get_gpu_compute_capability(rank) >= 89 for rank in range(2)):
+        pytest.skip("native float8 training requires NVIDIA SM89+")
+    pytest.importorskip("torchao.float8")
+    from transformers import LlamaConfig
+
+    from tests.tools.launch_utils import spawn_with_rendezvous
+    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 
     ckpt = tmp_path / "llama_hf"
     torch.manual_seed(0)
