@@ -190,16 +190,6 @@ train:
 
 ## Packed Offline Training
 
-For full-parameter offline H3 training, the existing `mfu` metric estimates
-useful model FLOPs from each sample's valid packed positions and `packed.text_len`.
-Legacy tail padding is excluded from the main-sequence token count.
-It counts the main DiT and text-refiner projections and attention, and excludes
-checkpoint recomputation, CFG's extra forward, and smaller operators. This is an
-analytical model-FLOPs estimate rather than a device profiler measurement. LoRA
-uses the existing unsupported-model fallback. If packed lengths are unavailable
-on any data-parallel rank, the meter warns and reports zero FLOPs for that step;
-in particular, online encoding may construct `packed` after metering.
-
 With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
 Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
 audio) use `process_condition(**batch) → model(**batch)` and return sample-mean
