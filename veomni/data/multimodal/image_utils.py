@@ -87,7 +87,7 @@ def smart_resize(
     return image
 
 
-def load_image_from_path(image: str, **kwargs):
+def load_image_from_path(image: str, image_mode: str = "RGB", **kwargs):
     if image.startswith("http://") or image.startswith("https://"):
         response = requests.get(image, timeout=(5, 30))
         # ``raise_for_status`` surfaces a 404 / 5xx with the URL + status code
@@ -99,11 +99,11 @@ def load_image_from_path(image: str, **kwargs):
         if not os.path.exists(image):
             raise FileNotFoundError(f"Image path does not exist: {image}")
         image_obj = Image.open(image)
-    return image_obj.convert("RGB")
+    return image_obj.convert(image_mode)
 
 
-def load_image_from_bytes(image: bytes, **kwargs):
-    return Image.open(BytesIO(image)).convert("RGB")
+def load_image_from_bytes(image: bytes, image_mode: str = "RGB", **kwargs):
+    return Image.open(BytesIO(image)).convert(image_mode)
 
 
 def load_image(image: ImageInput, **kwargs):
@@ -116,7 +116,7 @@ def load_image(image: ImageInput, **kwargs):
 
 
 def fetch_images(images: List[ImageInput], **kwargs):
-    images = [load_image(image) for image in images]
+    images = [load_image(image, **kwargs) for image in images]
     max_image_nums = kwargs.get("max_image_nums", len(images))
     images = images[:max_image_nums]
     images = [smart_resize(image, **kwargs) for image in images]
