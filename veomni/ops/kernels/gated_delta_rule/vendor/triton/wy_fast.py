@@ -295,8 +295,10 @@ def prepare_wy_repr_bwd(
     BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 128
-    BV = 128
+    # Bound per-tile temporaries for the 192 KiB UB on Ascend910B.
+    # The loops accumulate dA/dbeta/dg across feature tiles.
+    BK = 32
+    BV = 32
     beta = beta.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
 

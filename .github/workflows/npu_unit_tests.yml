@@ -173,6 +173,10 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
+      - name: Run MHC independently
+        run: |
+          .venv/bin/python -m scripts.ci.accelerator --backend npu --suite unit --only npu-unit-29 --pytest-arg=-k --pytest-arg=mhc --output-dir outputs/accelerator-ci/mhc-isolated
       - name: Run accelerator case tests
+        if: ${{ !cancelled() }}
         run: |
           .venv/bin/python -m scripts.ci.accelerator --backend npu --suite unit

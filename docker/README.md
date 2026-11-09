@@ -148,3 +148,8 @@ The A2 unit and e2e workflows now use the published x86 candidate at digest
 After the locked dependency sync, they verify retained wheel checksums and restore
 torch-npu post7, Triton 3.6.0, its Ascend overlay and A2 FLA into the test venv.
 These explicit overrides are candidate validation, not a lockfile migration.
+
+For the A2 UB regression, the WY backward kernel uses 32-wide K/V tiles while
+retaining its sequence chunk size. Existing Gated Delta Rule forward/backward
+parity tests cover the changed kernel. Unit CI runs MHC separately before the
+full suite to distinguish an MHC failure from fail-fast cancellation elsewhere.
