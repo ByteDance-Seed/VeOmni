@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
@@ -20,6 +19,7 @@ from veomni.ops import VeomniOp
 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
+from ..position_embedding import PositionEmbedding
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor, BagelSiglipNavitProcessor
@@ -244,49 +244,6 @@ class RotaryEmbedding2D(nn.Module):
         freqs = grid[..., None] * inv_freq[None, None, :]
         emb = torch.cat((freqs, freqs), dim=-1).flatten(0, 1)
         return emb.cos(), emb.sin()
-
-
-class PositionEmbedding(nn.Module):
-    def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
-        super().__init__()
-        self.max_num_patch_per_side = max_num_patch_per_side
-        self.hidden_size = hidden_size
-        self.pos_embed = nn.Parameter(
-            torch.zeros(max_num_patch_per_side**2, hidden_size),
-            requires_grad=False,
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-        if hasattr(self.pos_embed.data, "to_local"):
-            self.pos_embed.data.to_local().copy_(new_data)
-        else:
-            self.pos_embed.data.copy_(new_data)
-
-    def _init_weights(self) -> None:
-        self.reset_parameters()
-
-    def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
-        return self.pos_embed[position_ids.to(device=self.pos_embed.device)]
-
-
-def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
-    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return torch.from_numpy(np.concatenate([emb_h, emb_w], axis=1)).float()
-
-
-def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-    out = np.einsum("m,d->md", pos.reshape(-1), omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
 
 
 class MLPConnector(nn.Module):

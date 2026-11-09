@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import (
@@ -20,8 +20,13 @@ from .......distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
+from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+    Qwen2MLP as PatchedQwen2MLP,
+)
+from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+    Qwen2RMSNorm as PatchedQwen2RMSNorm,
+)
 from .......ops import VeomniOp
-from .......ops.kernels.swiglu_mlp import has_plain_linear_projections
 from .......ops.mask import MagiAttentionMask
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
@@ -335,50 +340,6 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     Packed CFG denoise is mixed in separately via :class:`InferenceMixinAccelerated`
     so this mixin stays runtime-only.
     """
-
-
-class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
-    """Qwen2 RMSNorm with instance-local VeomniOp dispatch."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6, *, config: BagelQwen2MoTConfig | None = None) -> None:
-        super().__init__(hidden_size, eps=eps)
-        self.config = config
-        rms_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_impl)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the instance-local ``rms_norm`` ``VeomniOp``."""
-        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
-
-
-class Qwen2MLPAccelerated(Qwen2MLP):
-    """Qwen2 SwiGLU MLP with instance-local VeomniOp dispatch."""
-
-    def __init__(self, config: BagelQwen2MoTConfig) -> None:
-        super().__init__(config)
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the instance-local ``swiglu_mlp`` ``VeomniOp`` for ``silu``/``swish`` on plain linear projections."""
-        if self.config.hidden_act not in {"silu", "swish"} and self.veomni_swiglu_mlp.impl != "eager":
-            raise ValueError(
-                f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
-                "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
-                "to use the Transformers reference implementation."
-            )
-
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-
-        return super().forward(x)
 
 
 def _apply_rotary_pos_emb(
@@ -744,8 +705,8 @@ class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen
     _supports_flex_attn = True
     _supports_magi_attn = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
-    mlp_cls = Qwen2MLPAccelerated
-    rms_norm_cls = Qwen2RMSNormAccelerated
+    mlp_cls = PatchedQwen2MLP
+    rms_norm_cls = PatchedQwen2RMSNorm
 
     @staticmethod
     def _create_checkpoint_tensor_converter(

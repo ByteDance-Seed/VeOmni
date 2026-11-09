@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.functional import scaled_dot_product_attention
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from transformers.utils import ModelOutput
 
 from veomni.ops import VeomniOp
@@ -691,19 +691,8 @@ def _check_packed_inference_mode(
     raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
 
 
-class BagelQwen2RotaryEmbedding(nn.Module):
-    """Official-compatible Qwen2 RoPE for BAGEL parity."""
-
-    def __init__(self, config: BagelQwen2MoTConfig, device: Optional[torch.device] = None):
-        super().__init__()
-        self.config = config
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-        self.rope_type = "default"
-        self.attention_scaling = 1.0
-        inv_freq, _ = self.compute_default_rope_parameters(config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+class BagelQwen2RotaryEmbedding(Qwen2RotaryEmbedding):
+    """Qwen2 RoPE preserving fp32 inverse frequencies across dtype casts and meta materialization."""
 
     def _apply(self, fn: Any, recurse: bool = True) -> nn.Module:
         # Rebuild the true fp32 table after ``fn`` so ``.to(bfloat16)`` does not
@@ -717,41 +706,6 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         self.inv_freq = inv_freq
         self.original_inv_freq = inv_freq.clone()
         return module
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: BagelQwen2MoTConfig,
-        device: Optional[torch.device] = None,
-        seq_len: Optional[int] = None,
-    ) -> tuple[torch.Tensor, float]:
-        """Compute default inverse frequencies and attention scaling factor for Qwen2 RoPE."""
-        del seq_len
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        dim = int(head_dim * partial_rotary_factor)
-        base = getattr(config, "rope_theta", None)
-        if base is None:
-            base = config.rope_parameters["rope_theta"]
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, 1.0
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
-        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 def _build_rms_norm(

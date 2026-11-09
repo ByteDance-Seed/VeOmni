@@ -295,7 +295,7 @@ class _CallCounter:
 
 @pytest.mark.parametrize("hidden_act", ["silu", "swish", "gelu"])
 def test_bagel_qwen2_mot_mlp_and_rms_norm_dispatch_through_veomni_ops(hidden_act: str) -> None:
-    """Verify ``Qwen2RMSNormAccelerated`` and ``Qwen2MLPAccelerated`` route through their ``VeomniOp`` handles."""
+    """Verify ``BagelQwen2MoTAccelerated`` reuses patched Qwen2 ``rms_norm_cls`` and ``mlp_cls`` ``VeomniOp`` handles."""
     from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
     from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as HFQwen2RMSNorm
 
@@ -316,7 +316,7 @@ def test_bagel_qwen2_mot_mlp_and_rms_norm_dispatch_through_veomni_ops(hidden_act
 
     torch.manual_seed(0)
     hf_norm = HFQwen2RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-    ours_norm = accelerated.Qwen2RMSNormAccelerated(cfg.hidden_size, eps=cfg.rms_norm_eps, config=cfg)
+    ours_norm = accelerated.BagelQwen2MoTAccelerated.rms_norm_cls(cfg.hidden_size, eps=cfg.rms_norm_eps, config=cfg)
     ours_norm.load_state_dict(hf_norm.state_dict())
     norm_counter = _CallCounter(ours_norm.veomni_rms_norm)
     ours_norm.veomni_rms_norm = norm_counter
@@ -327,7 +327,7 @@ def test_bagel_qwen2_mot_mlp_and_rms_norm_dispatch_through_veomni_ops(hidden_act
     assert norm_counter.calls == 2
 
     hf_mlp = HFQwen2MLP(cfg)
-    ours_mlp = accelerated.Qwen2MLPAccelerated(cfg)
+    ours_mlp = accelerated.BagelQwen2MoTAccelerated.mlp_cls(cfg)
     ours_mlp.load_state_dict(hf_mlp.state_dict())
     mlp_counter = _CallCounter(ours_mlp.veomni_swiglu_mlp)
     ours_mlp.veomni_swiglu_mlp = mlp_counter
@@ -604,7 +604,7 @@ def test_bagel_qwen2_rotary_embedding_to_empty_from_meta_rebuilds_fp32_table() -
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2RotaryEmbedding
 
     cfg = _flex_config()
-    ref_rotary = BagelQwen2RotaryEmbedding(cfg, device=torch.device("cpu"))
+    ref_rotary = BagelQwen2RotaryEmbedding(cfg)
     with torch.device("meta"):
         meta_model = accelerated.BagelQwen2MoTAccelerated(cfg)
     assert meta_model.model.rotary_emb.inv_freq.is_meta
