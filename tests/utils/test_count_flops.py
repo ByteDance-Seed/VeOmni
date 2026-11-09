@@ -73,6 +73,132 @@ def test_b200_device_flops():
         assert get_device_flops() == 2382.0
 
 
+def _minimax_h3_config():
+    return SimpleNamespace(
+        model_type="MiniMaxH3DiTModel",
+        condition_model_type="MiniMaxH3ConditionModel",
+        hidden_size=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        ffn_hidden_size=16,
+        num_layers=2,
+        token_refiner_num_layers=1,
+    )
+
+
+def _h3_packed(seq_len, text_len):
+    import torch
+
+    return {
+        "seq_len": seq_len,
+        "text_len": text_len,
+        "text_pos": torch.arange(text_len),
+        "img_pos": torch.arange(seq_len - text_len),
+        "audio_pos": torch.empty(0, dtype=torch.long),
+    }
+
+
+def test_minimax_h3_flops_counts_each_packed_sequence(mock_device_flops):
+    counter = VeomniFlopsCounter(_minimax_h3_config())
+    flops, promised = counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2, 1])
+    # Main projections 46080, attention 3840, refiner 11520 + 480 FLOPs.
+    assert flops == pytest.approx(30960 / 1e12)
+    assert promised == 1000.0
+    with_optional_arg, _ = counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2, 1], freeze_vit=False)
+    assert with_optional_arg == flops
+    empty, _ = counter.estimate_flops([], 2.0, h3_text_seqlens=[])
+    assert empty == 0
+    with pytest.raises(ValueError, match="one text length"):
+        counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2])
+    with pytest.raises(ValueError, match="within packed"):
+        counter.estimate_flops([4], 2.0, h3_text_seqlens=[5])
+    with pytest.raises(ValueError, match="positive"):
+        counter.estimate_flops([4], 0, h3_text_seqlens=[2])
+    with patch("veomni.utils.count_flops.logger.warning_rank0"):
+        unsupported, _ = counter.estimate_flops([4], 2.0, lora_config=_lora_config(8, ["q_proj"]))
+    assert unsupported == 0
+
+
+def test_minimax_h3_meter_excludes_legacy_tail_padding(monkeypatch, mock_device_flops):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_fl2va
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    compact = build_packed_fl2va(text_len=3, latent_t=2, latent_h=4, latent_w=4, audio_t=2, keyframe_indices=[])
+    legacy = dict(compact, seq_len=compact["seq_len"] + 28)
+    meter.add({"packed": [compact]})
+    compact_metrics = meter.step(delta_time=2.0, global_step=1)
+    meter.add({"packed": [legacy]})
+    legacy_metrics = meter.step(delta_time=2.0, global_step=2)
+    assert legacy_metrics["mfu"] == pytest.approx(compact_metrics["mfu"])
+    assert legacy_metrics["training/avg_sample_seq_len"] == compact["seq_len"]
+    assert meter.consume_tokens == 2 * compact["seq_len"]
+
+
+def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, mock_device_flops):
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=3,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    meter.add([{"packed": _h3_packed(2, 1)}, {"packed": _h3_packed(3, 1)}])
+    assert meter.batch_seqlens == [4, 2, 3]
+    assert meter.h3_text_seqlens == [2, 1, 1]
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    assert metrics["mfu"] > 0
+    assert meter.batch_seqlens == [] and meter.h3_text_seqlens == []
+    meter.add({"packed": _h3_packed(5, 2)})
+    assert meter.batch_seqlens == [5] and meter.h3_text_seqlens == [2]
+    with patch.object(helper.logger, "warning_rank0"):
+        meter.add({})
+        metrics = meter.step(delta_time=2.0, global_step=2)
+    assert metrics["mfu"] == 0
+    meter.add({"packed": _h3_packed(4, 2)})
+    assert meter.step(delta_time=2.0, global_step=3)["mfu"] > 0
+
+
+def test_minimax_h3_incomplete_remote_rank_does_not_publish_partial_mfu(monkeypatch, mock_device_flops):
+    from veomni.utils import helper
+
+    def fake_all_reduce(values, **kwargs):
+        if isinstance(values, tuple) and len(values) == 4:
+            return (*values[:3], 1)  # Only one of two ranks has valid packed data.
+        return values
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(helper, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.add({"packed": _h3_packed(4, 2)})
+    with patch.object(helper.logger, "warning_rank0") as warning:
+        metrics = meter.step(delta_time=1.0, global_step=1)
+    assert metrics["mfu"] == 0
+    warning.assert_called_once()
+
+
 def test_gb200_device_flops():
     with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA GB200"):
         assert get_device_flops() == 2565.0
@@ -719,3 +845,4 @@ class TestDeepseekV4Flops:
         compressed_flops, _ = VeomniFlopsCounter(compressed_config).estimate_flops(batch_seqlens, delta_time=1.0)
 
         assert compressed_flops < baseline_flops
+
