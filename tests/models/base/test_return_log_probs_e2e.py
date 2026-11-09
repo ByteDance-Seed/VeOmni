@@ -176,7 +176,8 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
 
 def _require_accelerator(toy_path: str):
-    assert get_device_type() in ("cuda", "npu"), "A CUDA or NPU device is required for these integration tests"
+    if get_device_type() not in ("cuda", "npu"):
+        pytest.skip("A CUDA or NPU device is required for these integration tests")
     assert os.path.isdir(toy_path), f"Path not found: {toy_path}"
 
 
