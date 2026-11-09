@@ -55,6 +55,14 @@ class PackedTrainingMixin:
                 "Qwen3-VL vision pack_encode: packed_features, pixel_values, image_grid_thw, "
                 "visual_pos_mask and visual_is_real required."
             )
+        # Metering: merged tokens for the real visuals in this packed batch, stashed
+        # BEFORE the SP slice below.
+        merge_area = int(self.config.vision_config.spatial_merge_size) ** 2
+        real_grids = image_grid_thw.reshape(-1, 3)[visual_is_real.reshape(-1).bool()]
+        self.metric_meter_set_seqlens(
+            "pack_encode",
+            [int(row.prod().item()) // merge_area for row in real_grids],
+        )
         self._packed_features = packed_features
         self._visual_pos_mask = visual_pos_mask
         self._visual_is_real = visual_is_real

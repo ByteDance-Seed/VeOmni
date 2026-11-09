@@ -450,11 +450,15 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                 )
                 with use_parallel_state(f"{name}_sp{sp_size}"):
                     modules = _build_modules(attn_implementation=attn, device=device, dtype=dtype)
-                    if device_type != "cpu":
-                        from torch.distributed.fsdp import fully_shard
+                    # Shard on CPU too. FSDP2 is what reduces gradient across the
+                    # group; without the wrap, SP=2 ranks each keep their own
+                    # un-reduced share and step to different weights. Skipping the
+                    # wrap on CPU (as an earlier version did) hides exactly the
+                    # behaviour this test is meant to check.
+                    from torch.distributed.fsdp import fully_shard
 
-                        for module in modules.values():
-                            fully_shard(module, mesh=ps.fsdp_mesh)
+                    for module in modules.values():
+                        fully_shard(module, mesh=ps.fsdp_mesh)
                     samples = _samples()
                     # Both settings get the same batch: at dp=2 every rank must see
                     # identical data for the mean to be comparable, and at sp=2 the
@@ -505,6 +509,21 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
             assert calls["slice"] and calls["pad"], (rank, name, calls)
             assert not reports[f"{name}_sp1_sp_calls"]["slice"], (rank, name, "SP=1 must not slice")
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], abs=1e-5), (rank, name, reports)
+            # Parameters after one AdamW step: FSDP2 is what reduces `.grad`
+            # across the group, so this is the first point where an SP that
+            # failed to reduce shows up. Measured difference is ~6e-8 — the
+            # reduction order differs because SP=2 slices the sequence.
+            probe1 = reports[f"{name}_sp1_param_probe"]
+            probe2 = reports[f"{name}_sp2_param_probe"]
+            assert probe1.keys() == probe2.keys()
+            for param_name, value1 in probe1.items():
+                assert probe2[param_name] == pytest.approx(value1, abs=1e-5), (
+                    rank,
+                    name,
+                    param_name,
+                    probe1,
+                    probe2,
+                )
 
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
 
@@ -530,3 +549,34 @@ def test_sp_matches_single_rank_on_accelerator(tmp_path: Path):
         for name in ("conversation", "packed"):
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], rel=5e-3), (rank, name, reports)
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], rel=5e-3), (rank, reports)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_module_meters_its_own_tokens_on_both_graphs():
+    """Per-module token accounting has to exist on both graphs, and the modules that
+    see one row per sample must agree on how many samples there are.
+
+    `OmniEnvironMeter` pairs a module's `seqlens` against the batch's `ds_idx` when
+    it decides which module drives multi-source accounting, and warns (reporting
+    zero tokens) when no module aligns. Before this, Qwen3-VL registered no meter at
+    all: every `trace/<module>/...` metric read zero.
+    """
+    for name, edges, build_batch in (
+        ("conversation", _CONVERSATION_EDGES, _conversation_batch),
+        ("packed", _PACKED_EDGES, _packed_batch),
+    ):
+        modules = _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32)
+        _graph_loss(modules, edges, build_batch(_samples()))
+
+        # `metric_meter_collect` drains the buffer, so collect once per module.
+        collected = {module_name: module.metric_meter_collect() for module_name, module in modules.items()}
+        for module_name, (flops, seqlens) in collected.items():
+            assert flops > 0, (name, module_name, "no FLOPs reported")
+            assert seqlens and any(s > 0 for s in seqlens), (name, module_name, seqlens)
+
+        if name == "packed":
+            # One packed row per sample, so the text encoder and the backbone that
+            # both consume that packed sequence must report the same sample count.
+            te_lens = collected["qwen3vl_text_encoder"][1]
+            llm_lens = collected["qwen3vl_llm"][1]
+            assert len(te_lens) == len(llm_lens) == 3, (te_lens, llm_lens)

@@ -12,6 +12,7 @@ import torch
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
 from .....mixins.base_mixin import BaseMixin
+from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import Qwen3VLVisionEncoderConfig
@@ -44,6 +45,21 @@ class TrainingMixin(TrainingModuleMixin):
     device: torch.device
     dtype: torch.dtype
 
+    def _merged_tokens_per_item(self, item: ConversationItem) -> int:
+        """Merged visual tokens one item contributes: ``prod(grid) / merge²``.
+
+        The tower's token domain is its *output* rows, not patch rows — the
+        merger collapses ``merge²`` patches into one. Reads the grid the
+        preprocessor stamped on the item, so it works for image and video alike.
+        """
+        grid = (item.meta or {}).get("_omni_grid") or (item.meta or {}).get("grid_thw")
+        if grid is None:
+            return 0
+        values = grid.tolist() if isinstance(grid, torch.Tensor) else list(grid)
+        t, h, w = (int(x) for x in values)
+        merge_area = int(self.config.vision_config.spatial_merge_size) ** 2
+        return int(t * h * w) // merge_area
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._conversation_carrier: Any = None
@@ -67,6 +83,12 @@ class TrainingMixin(TrainingModuleMixin):
         image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))
         real_image_items = [it for it in image_items if not it.is_dummy]
+        # Metering: this rank's own merged visual tokens, stashed BEFORE any SP
+        # slice so the count does not depend on `sp_size`.
+        self.metric_meter_set_seqlens(
+            "forward",
+            [self._merged_tokens_per_item(it) for it in (*real_image_items, *video_items) if not it.is_dummy],
+        )
         dummy = not (real_image_items or video_items)
         if not dummy:
             image_items = real_image_items
@@ -162,7 +184,45 @@ class TrainingMixin(TrainingModuleMixin):
         return {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw, "vit_metadata": vit_metadata}
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin):
+class VisionMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Qwen3-VL vision tower.
+
+    Tokens here are **merged visual tokens** (the ViT's output rows after the
+    patch merger), not text tokens — the tower never sees a text sequence. FLOPs
+    are the transformer blocks plus the patch-embed convolution and the mergers,
+    which is where a vision tower's compute actually goes. fwd+bwd ⇒ 6x for the
+    linear work, 12x for the quadratic attention.
+    """
+
+    config: Qwen3VLVisionEncoderConfig
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        cfg = self.config.vision_config
+        hidden = cfg.hidden_size
+        depth = cfg.depth
+        merge = cfg.spatial_merge_size
+
+        # Attention + MLP per block, mirroring the backbone's formula.
+        mlp_n = hidden * cfg.intermediate_size * 2  # gate/up share a projection, down is the second
+        attn_n = hidden * (3 * hidden + hidden)  # qkv + o
+        dense_n = (mlp_n + attn_n) * depth
+        # patch_embed (Conv3d) + one merger per visual, plus the DeepStack mergers.
+        patch_n = hidden * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
+        merger_n = (hidden * merge**2) * cfg.out_hidden_size
+        merger_count = 1 + len(cfg.deepstack_visual_indexes)
+
+        tokens = sum(seqlens)
+        seqlen_sq = sum(s * s for s in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * hidden * cfg.num_heads * depth
+        # One patch-embed + merger pass per *visual item*, and `tokens` already
+        # counts merged rows, so divide back out to get the item count.
+        per_item = max(1, tokens)
+        head_flops = 6 * (patch_n * per_item + merger_n * merger_count * per_item)
+        return (dense_flops + attn_flops + head_flops) / 1e12
+
+
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, VisionMeterMixin):
     """``generate()`` already lives on the native :class:`~.modeling.Qwen3VLVisionEncoder`
     (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
     """
