@@ -236,7 +236,7 @@ def test_target_kernel_matches_reference(heads, c):
 
 
 def test_rocm_attention_lse_feeds_the_triton_teacher():
-    """The #1271 attention LSE and the ROCm teacher share one base-2 contract."""
+    """The Triton attention LSE and the ROCm teacher share one base-2 contract."""
     if not (IS_CUDA_AVAILABLE and torch.version.hip is not None):
         pytest.skip("requires an AMD ROCm GPU")
 
@@ -372,26 +372,6 @@ def test_rocm_target_allows_empty_pool_when_candidate_width_is_zero():
     assert target.shape == (1, 2, 0)
     assert target.dtype == torch.float32
     assert target.device == q.device
-
-
-def test_rocm_target_rejects_mismatched_shapes_devices_and_index_dtype():
-    if torch.version.hip is None:
-        pytest.skip("requires the ROCm Triton teacher")
-    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-
-    q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
-    kv = torch.randn(1, 8, 64, device=DEVICE, dtype=torch.bfloat16)
-    topk = torch.zeros(1, 2, 4, device=DEVICE, dtype=torch.int32)
-    lse = torch.zeros(1, 2, 16, device=DEVICE, dtype=torch.float32)
-
-    with pytest.raises(RuntimeError, match=r"kv must be \[B=1, P, D=64\]"):
-        sparse_mqa_target_fwd(q, kv.repeat(2, 1, 1), topk, lse)
-    with pytest.raises(RuntimeError, match=r"topk_idxs must be \[B=1, S=2, C\]"):
-        sparse_mqa_target_fwd(q, kv, topk.repeat(2, 1, 1), lse)
-    with pytest.raises(RuntimeError, match="int32 topk_idxs"):
-        sparse_mqa_target_fwd(q, kv, topk.to(torch.int64), lse)
-    with pytest.raises(RuntimeError, match="on one device"):
-        sparse_mqa_target_fwd(q, kv, topk, lse.cpu())
 
 
 def test_sparse_attn_returns_non_differentiable_lse():

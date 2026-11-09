@@ -267,16 +267,10 @@ and DeepSeek V4's `hc_mult=4` layout.
 
 On AMD ROCm GPUs, `dsa_attention_implementation: triton` selects the same
 DeepSeek-V4 sparse MQA contract and returns the base-2 LSE consumed by the
-indexer-loss teacher.
-
-On AMD ROCm GPUs, `dsa_indexer_implementation: triton` keeps the TileLang
-indexer's contract: one fused Triton kernel applies ReLU, the per-head weight,
-the head sum and each query's visible range without materializing per-head
-logits; bounded pool-column chunks feed a running exact `torch.topk`, so the
-full `[B, S, P]` score row is never materialized. The backward recomputes only
-the selected logits. Its scores can train `dsa_indexer_loss` like the TileLang indexer's, with
-the teacher running as a Triton kernel on ROCm. The objective accepts the
-TileLang indexer/attention pair on NVIDIA or the Triton pair on ROCm.
+indexer-loss teacher. `dsa_indexer_implementation: triton` is the ROCm
+counterpart of the TileLang Lightning Indexer; with the Triton attention pair
+it can train `dsa_indexer_loss` on ROCm the same way the TileLang pair does on
+NVIDIA.
 
 The same three fields select `cann` on Ascend, which requires
 `cann_ops_transformer`:
