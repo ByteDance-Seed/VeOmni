@@ -208,6 +208,13 @@ flowchart TB
 run builds the same object a native user gets from `OmniModel.from_pretrained`;
 the launcher only projects the YAML onto `OmniConfig` first.
 
+Inference does not use sequence or context parallelism: keep `ulysses_size` and
+`cp_size` at 1 on every module. The generation loop decodes one token at a time
+on each rank, so there is no sequence to slice, and a module asked to generate
+under `sp_size > 1` refuses rather than answering with wrong tokens. Passing a
+training `base.yaml` to the Inferencer is fine — its parallel sizes are simply
+not applied. See [Sequence & Context Parallelism §6](../distributed/sequence_parallel.md#6-limitations-and-future-work).
+
 **Native HF:**
 
 ```python

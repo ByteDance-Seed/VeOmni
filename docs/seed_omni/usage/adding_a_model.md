@@ -219,8 +219,9 @@ So add a packed graph when profiling shows `pre_forward` bookkeeping is a
 measurable slice of the step **and** the modules are one family over one sequence.
 It is extra surface: a second train graph, `pack_*` hooks on every module in it,
 its own collation contract in `SeedOmniCollator`, and a parity test against the
-conversation path (`tests/seed_omni/modules/<family>/test_*_packing.py`). None of
-that is on the critical path for "support model X".
+conversation path (`tests/seed_omni/modules/<family>/test_*_accel_align.py`
+compares loss, per-parameter gradients and the AdamW step). None of that is on the
+critical path for "support model X".
 
 ## 5. Honour the contracts
 

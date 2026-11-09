@@ -23,10 +23,12 @@ Two Qwen3-VL specifics the backbone reconstructs from `conversation_list`:
   derived from each image item's `grid_thw` (mirrors
   `Qwen3VLModel.get_vision_position_ids`). Text segments use a 1-D run broadcast
   to all 3 rows.
-- **DeepStack** — vision features from layers `deepstack_visual_indexes`
-  (`[5, 11, 17]`) are added into the matching *interior* decoder layers. The
-  vision module emits them on `item.meta["deepstack"]`; the backbone threads them
-  into `Qwen3VLTextModel` as `deepstack_visual_embeds` + `visual_pos_masks`.
+- **DeepStack** — `deepstack_visual_indexes` (`[5, 11, 17]`) selects *ViT* layers;
+  the extra merger per selected layer produces one feature set each, and those
+  are added into the **first `len(deepstack_visual_indexes)` decoder layers**
+  (0, 1, 2 here), not into decoder layers with the same numbers. The vision
+  module emits them on `item.meta["deepstack"]`; the backbone threads them into
+  `Qwen3VLTextModel` as `deepstack_visual_embeds` + `visual_pos_masks`.
 
 `model.model_path` and the `sources` entries in `data.yaml` are **placeholders**:
 replace each with an absolute path (or an `hdfs://` URL) this job can read before
@@ -207,8 +209,10 @@ bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/bas
 
 The conversation graph stays the reference path: it is what inference uses, it is
 what the packed graph is meant to reproduce, and it is what you should ship first.
-(`test_qwen3vl_packing.py` pins the packer's outputs — masks, cu_seqlens, visual
-placement — not a full loss parity against the conversation graph.)
+The parity gate is `test_qwen3vl_accel_align.py`: it runs one step of each graph
+and compares the loss, every parameter gradient and the AdamW update that
+follows. `test_qwen3vl_packing.py` covers only the packer's own outputs — masks,
+cu_seqlens, visual placement.
 
 What packing buys here is **not** padding removal — the conversation path does not
 pad either; `pack_llm_conversations_for_forward` already concatenates every
@@ -217,8 +221,10 @@ per-item work happens*:
 
 - **Packed.** The CPU preprocessor does template / tokenize / patchify in the
   dataloader worker and emits one `packed_input_ids` / `packed_position_ids` /
-  `packed_attention_mask` triple. `batch_to_device` moves those top-level tensors
-  in one transfer; `pre_forward` then only builds the varlen args.
+  `packed_cu_seqlens` set. `batch_to_device` moves those top-level tensors in one
+  transfer; `pre_forward` then only builds the varlen args. Padding is absent by
+  construction, so no attention mask travels with the batch — the varlen
+  boundaries are the mask.
 - **Conversation.** The carrier's tensors are built per item in the worker, and
   `batch_to_device` deliberately leaves them there — "tensors a module keeps
   inside its conversation items stay where the preprocessor built them; placing
