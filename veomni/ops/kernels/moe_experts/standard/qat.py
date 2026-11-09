@@ -51,6 +51,11 @@ def wrapper(
     would change the selection, not just the arithmetic.
     """
 
+    if expert_dtype not in ("fp8", "fp4"):
+        # The value comes from a free-form checkpoint key, so a typo would
+        # otherwise train FP8 while the config claims something else.
+        raise ValueError(f"expert_dtype must be 'fp8' or 'fp4', got {expert_dtype!r}")
+
     def _quant_weight(weight: Tensor) -> Tensor:
         if weight.numel() == 0:
             return weight

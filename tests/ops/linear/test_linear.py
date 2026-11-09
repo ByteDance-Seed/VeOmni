@@ -355,21 +355,19 @@ def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantiz
 
 
 @_requires_torchao
-@pytest.mark.parametrize("placement", ["replicate", "shard0", "shard1_aligned"])
+@pytest.mark.parametrize("placement", ["replicate"])
 def test_linear_torchao_mxfp4_accepts_safe_dtensor_placements(single_rank_dist, placement):
-    """Quantization runs on the local shard, which is exact whenever no group is split.
+    """A ``Replicate`` placement is whole on this rank, which is the only case this row can serve.
 
-    MX groups run along the last dimension. A ``Replicate`` placement holds the
-    whole tensor; a shard along the output dimension copies whole groups; a shard
-    along the quantized dimension is exact while its width stays a multiple of the
-    group size. All three quantify the same values they would unsharded.
+    Sharded placements are refused by ``test_linear_torchao_mxfp4_refuses_a_sharded_dtensor``:
+    the arithmetic per shard is fine, but the GEMM needs a collective.
     """
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+    from torch.distributed.tensor import Replicate, distribute_tensor
 
     mesh = init_device_mesh("cpu", (1,))
     weight = torch.randn(32, 64, dtype=torch.bfloat16)
-    placements = {"replicate": [Replicate()], "shard0": [Shard(0)], "shard1_aligned": [Shard(1)]}[placement]
+    placements = {"replicate": [Replicate()]}[placement]
     dtensor = distribute_tensor(weight, mesh, placements)
     x = torch.randn(2, 64, dtype=torch.bfloat16)
 
@@ -403,3 +401,25 @@ def test_mxfp4_rejects_a_group_split_that_cannot_be_padded():
     weight = torch.randn(64, 96, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="divisible by block_size"):
         mxfp4_fake_quant(weight.chunk(2, dim=1)[0])
+
+
+@_requires_torchao
+@pytest.mark.parametrize("dim", [0, 1])
+def test_linear_torchao_mxfp4_refuses_a_sharded_dtensor(single_rank_dist, dim):
+    """The row is a tensor op: it cannot complete a GEMM spread across ranks.
+
+    A ``Shard(0)`` local piece yields partial *output* features and a ``Shard(1)``
+    piece is a partial *input*, so neither can be multiplied as if it were whole.
+    Completing either needs a collective this row does not issue. A one-rank mesh
+    shards nothing, so this asserts the guard on the placement metadata, which is
+    the property that decides it.
+    """
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    mesh = init_device_mesh("cpu", (1,))
+    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Shard(dim)])
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match="whole on this rank"):
+        VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))

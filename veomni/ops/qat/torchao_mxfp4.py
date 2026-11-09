@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 
 __all__ = [
@@ -90,21 +90,39 @@ class _MxFp4FakeQuant(torch.autograd.Function):
 
 
 def local_shard(tensor: Tensor) -> Tensor:
-    """Return the local tensor of a DTensor, or ``tensor`` unchanged.
+    """Unwrap a ``Replicate`` DTensor, and refuse one this op cannot combine.
 
-    Quantization runs on whatever this rank holds. That is exact under every
-    placement the parallel plans produce, because MX groups run along the last
-    dimension and a group is never split: a ``Replicate`` placement holds the
-    whole tensor, a shard along an earlier dimension copies whole groups, and a
-    shard along the last dimension is only produced when its width is a multiple
-    of the group size -- which :func:`mxfp4_fake_quant` checks.
+    A fake-quantizing row is a *tensor-level* op: it rounds what it is handed and
+    hands it to ``F.linear``. It does not gather or reduce, so it can only run on
+    an operand that is already whole on this rank.
+
+    ``Replicate`` qualifies -- the local shard is the entire tensor, and FSDP2
+    presents its parameters that way after the all-gather. A ``Shard`` placement
+    does not: the local pieces are partial operands, and completing the GEMM
+    needs a collective the row has no way to issue. Sharding the output dimension
+    would need a concat afterwards, and sharding the input dimension needs an
+    all-reduce; quantizing each piece locally is fine arithmetic, but the result
+    would be a partial product presented as a complete one.
+
+    So a sharded placement raises rather than returning wrong numbers. Use a
+    fully sharded FSDP2 mesh, which all-gathers before the forward, or keep this
+    row off the sharded axis.
 
     The bias goes through this too. Leaving it a DTensor while the weight became
     a plain tensor makes ``addmm`` reject the call with "got mixed torch.Tensor
     and DTensor", and the bias is not quantized, so its local form is the same
     value.
     """
-    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    if not isinstance(tensor, DTensor):
+        return tensor
+    if not all(isinstance(placement, Replicate) for placement in tensor.placements):
+        raise TypeError(
+            "MXFP4 fake quantization needs an operand that is whole on this rank, got placements "
+            f"{tuple(str(p) for p in tensor.placements)}. This row does not issue collectives: a sharded "
+            "weight would produce a partial product, so it is refused instead of silently mis-multiplied. "
+            "FSDP2 all-gathers before the forward and is therefore unaffected."
+        )
+    return tensor.to_local()
 
 
 def mxfp4_fake_quant(x: Tensor, block_size: int = MXFP4_BLOCK_SIZE) -> Tensor:

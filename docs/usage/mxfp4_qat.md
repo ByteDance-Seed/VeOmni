@@ -17,6 +17,11 @@ native FP4 training kernels and no Blackwell requirement.
 | `linear_implementation` | `linear` / `standard` | A model that owns its projections individually (Qwen3 attention `q/k/v/o`) |
 | `swiglu_mlp_implementation` | `swiglu_mlp` / `standard` | A model that runs the fused SwiGLU row (Qwen3 MLP `gate/up/down`) |
 
+Together they cover the **attention projections and the MLP projections**.
+`lm_head` is excluded: the causal-LM path either calls it directly or hands its
+weight to the loss operator, so neither row is on its call path — do not read
+these selections as producing a quantized output head.
+
 They are independent, and they are two of the four selections that make up a
 quantization-aware training recipe — the others being `moe_implementation` and
 `kv_round_implementation` for models that have experts or a KV cache. A model
@@ -59,9 +64,10 @@ model:
     swiglu_mlp_implementation: torchao_mxfp4
 ```
 
-An unselected field resolves to `eager`, so a config that sets only
-`linear_implementation` trains a weight+activation MXFP4 attention with an
-unquantized MLP. Selecting `torchao_mxfp4` without `torchao` installed raises
+An unselected field falls back to that family's host default — `eager` for
+`linear`, `liger_kernel` on GPU/MLU and `eager` on NPU for `swiglu_mlp`. Either
+way the MLP is **not** quantized, so a config that sets only
+`linear_implementation` trains MXFP4 attention with a full-precision MLP. Selecting `torchao_mxfp4` without `torchao` installed raises
 `Op 'linear' variant='standard' impl='torchao_mxfp4' requires unavailable
 package(s): 'torchao'` at model construction; it never falls back silently.
 
@@ -101,42 +107,38 @@ convergence recipe.
 
 ## Distributed behaviour
 
-The fake quantization runs inside the op, on whichever tensor the caller passes,
-and it is per-row: MX groups span the last dimension, so a row split is never a
-group split. Every placement the parallel plans produce quantizes the same
-values it would unsharded:
+These rows are **tensor-level**: they round the operand they are handed and pass
+it to `F.linear`. They do not issue collectives, so they can only run on an
+operand that is already whole on the calling rank.
 
 | Operand | Result |
 | --- | --- |
-| Plain tensor (FSDP2 after the all-gather) | exact |
-| `Replicate` DTensor | exact; the local shard is the whole tensor |
-| Shard along the output dimension | exact; each shard copies whole groups |
-| Shard along the quantized dimension, width a multiple of 32 | exact |
-| Shard along the quantized dimension, width not a multiple of 32 | `ValueError` |
+| Plain tensor | works |
+| `Replicate` DTensor | works; the local shard is the whole tensor |
+| Sharded DTensor (`Shard(0)`, `Shard(1)`, …) | `TypeError` |
 
-The last row is the only unsupported case, and it fails rather than rounding
-wrongly: a partial group has no defined scale. It is caught by the operand's own
-length, not by inspecting the placement, because the placement is not what
-determines correctness.
+A sharded weight is refused rather than mis-multiplied. `Shard(0)` leaves partial
+*output* features, needing a concat afterwards; `Shard(1)` leaves a partial
+*input* whose product needs an all-reduce. The per-shard arithmetic is fine, but
+returning it would present a partial product as a complete one.
 
-That table is a property of the quantizer, not of a parallelism mode, so it
-applies wherever the row runs. What each mode actually supports today:
+This does not restrict FSDP2: a fully sharded FSDP2 mesh all-gathers each block's
+parameters before its forward, so the row sees a whole tensor. What it does rule
+out is keeping a weight sharded *through* the GEMM, which is tensor parallelism —
+and VeOmni does not implement that anyway (`AcceleratorConfig` asserts
+`tp_size == 1`).
 
 | Mode | Status |
 | --- | --- |
-| FSDP2 / HSDP sharding | permitted; the per-row split is exact |
-| Sequence / context parallel | permitted |
-| Expert parallel | permitted; expert weights are not sharded on the quantized axis |
-| Tensor parallel | **not available in VeOmni at all** — `AcceleratorConfig` asserts `tp_size == 1`, so a `tp_size > 1` config fails before model construction, independently of QAT |
+| FSDP2 / HSDP sharding | works via FSDP2's own all-gather |
+| Sequence / context parallel | works; the sharded axis is the sequence |
+| Expert parallel | works; expert weights reach the GEMM whole on the owning rank |
+| Tensor parallel | not implemented in VeOmni, independently of this row |
 
 **Convergence under any multi-rank setting is unmeasured** — the numerical
-validation is single-device. Treat multi-rank QAT as untested, not as validated,
-and do not read the table above as end-to-end support for a mode VeOmni does not
-implement.
+validation is single-device. Treat multi-rank QAT as untested, not as validated.
 
-BF16 parameters with FP32 gradient reduction is what the example config pins and
-what was validated. `torch.compile` is the one combination refused outright, at
-config time, per the next subsection.
+`torch.compile` is refused outright, at config time, per the next subsection.
 
 ### `torch.compile` is rejected
 
@@ -147,8 +149,8 @@ raised from inside a fused kernel. `compile_decoder_blocks()` therefore rejects
 `linear_implementation: torchao_mxfp4` and `swiglu_mlp_implementation: torchao_mxfp4`
 before compiling, so the error names the config field instead of the assertion.
 
-Offloading is not restricted: CPU offload moves the shard to host and the op sees
-an ordinary tensor, so the fake quantization is unaffected.
+Offloading is not restricted: CPU offload moves the shard to host and the row sees
+an ordinary tensor.
 
 ## Checkpoints and export
 

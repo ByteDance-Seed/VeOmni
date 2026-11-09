@@ -1656,7 +1656,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "KV-cache and indexer-activation storage rounding. 'triton' (GPU) | 'eager'. "
-            "Unset: 'triton' on GPU, 'eager' on CPU/NPU/MLU. Selecting a row makes the model round "
+            "Unset means OFF -- no stored tensor is rounded; unlike the other fields there is no "
+            "host default. Selecting a row makes the model round "
             "stored KV and indexer operands to their inference storage dtype on every forward, "
             "which is what quantization-aware training needs to see deployment's rounding; leaving "
             "it unset trains in the model dtype. The block width, scale format and quantized prefix "
