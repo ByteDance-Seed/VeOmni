@@ -85,7 +85,6 @@ data:
     # modality). fps / frame bounds keep the sampled clip small.
     use_audio_in_video: false
     fps: 2.0
-    min_frames: 4
     max_frames: 8
 
 train:

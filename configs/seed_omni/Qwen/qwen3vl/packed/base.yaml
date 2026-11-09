@@ -78,7 +78,6 @@ data:
   mm_configs:
     use_audio_in_video: false
     fps: 2.0
-    min_frames: 4
     max_frames: 8
 
 train:

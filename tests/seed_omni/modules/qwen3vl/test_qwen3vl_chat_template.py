@@ -1,7 +1,13 @@
 """Unit tests for the Qwen3-VL ChatML template (text + image + video, class-based)."""
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class FakeTokenizer:

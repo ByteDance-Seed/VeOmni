@@ -20,6 +20,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from transformers.initialization import no_init_weights
 
 from veomni.models.checkpoint.weights import init_empty_weights
+from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
@@ -53,6 +54,9 @@ def _build_kwargs(attn_implementation: str | None) -> dict[str, Any]:
     return {"attn_implementation": attn_implementation} if attn_implementation is not None else {}
 
 
+logger = logging.get_logger(__name__)
+
+
 def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Split an upstream Qwen3-VL checkpoint into three SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
@@ -68,7 +72,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     # do the same or a CPU host dies in `_check_and_adjust_attn_implementation`.
     attn_implementation = kwargs.pop("attn_implementation", None)
     del kwargs
-    print(f"Loading Qwen3-VL from: {model_path}")
+    logger.info_rank0(f"Loading Qwen3-VL from: {model_path}")
     import veomni.models.seed_omni.modules  # noqa: F401
     from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
@@ -89,7 +93,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     text_cfg = cfg.text_config
     inner = model.model  # Qwen3VLModel: .visual + .language_model
 
-    print("Extracting qwen3vl_vision ...")
+    logger.info_rank0("Extracting qwen3vl_vision ...")
     vision_cfg = Qwen3VLVisionEncoderConfig(vision_config=cfg.vision_config.to_dict())
     with no_init_weights(), init_empty_weights():
         vision = Qwen3VLVisionEncoder._from_config(vision_cfg, **_build_kwargs(attn_implementation))
@@ -100,7 +104,7 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
     processor = AutoProcessor.from_pretrained(model_path)
     attach_module_assets(vision, image_processor=processor.image_processor, video_processor=processor.video_processor)
 
-    print("Extracting qwen3vl_text_encoder ...")
+    logger.info_rank0("Extracting qwen3vl_text_encoder ...")
     # Official Qwen3-VL puts `tie_word_embeddings` on the top-level config
     # (2B=True, 8B=False). Nested `text_config` often omits the field.
     tie_word_embeddings = bool(getattr(cfg, "tie_word_embeddings", getattr(text_cfg, "tie_word_embeddings", True)))
@@ -117,17 +121,30 @@ def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
         te.lm_head.load_state_dict(src_sd, assign=True)
     attach_module_assets(te, tokenizer=AutoTokenizer.from_pretrained(model_path))
-    print(f"  tie_word_embeddings={tie_word_embeddings}")
+    logger.info_rank0(f"  tie_word_embeddings={tie_word_embeddings}")
 
-    print("Extracting qwen3vl_llm ...")
+    logger.info_rank0("Extracting qwen3vl_llm ...")
     llm_cfg = Qwen3VLLlmConfig(
         text_config=text_cfg.to_dict(),
         spatial_merge_size=cfg.vision_config.spatial_merge_size,
     )
     with no_init_weights(), init_empty_weights():
         llm = Qwen3VLLlm._from_config(llm_cfg, **_build_kwargs(attn_implementation))
-    src = {k: v for k, v in inner.language_model.state_dict().items() if not k.startswith("embed_tokens.")}
-    llm.language_model.load_state_dict(src, assign=True, strict=False)
+    # The module owns no `embed_tokens` / `lm_head` (the text encoder does), so
+    # those two keys are the *only* legitimate difference. `strict=True` would
+    # reject them outright, and `strict=False` alone would also accept a
+    # half-populated module — assert the exact set instead, so a renamed or
+    # dropped layer fails here rather than as a meta tensor at the first step.
+    dropped = ("embed_tokens.", "lm_head.")
+    src = {k: v for k, v in inner.language_model.state_dict().items() if not k.startswith(dropped)}
+    src_keys = set(src)
+    expected_keys = set(llm.language_model.state_dict())
+    if src_keys != expected_keys:
+        raise RuntimeError(
+            "convert qwen3vl_llm: unexpected parameter mismatch. "
+            f"missing={sorted(expected_keys - src_keys)} unused={sorted(src_keys - expected_keys)}"
+        )
+    llm.language_model.load_state_dict(src, assign=True, strict=True)
 
     return {
         "modules": {"qwen3vl_vision": vision, "qwen3vl_text_encoder": te, "qwen3vl_llm": llm},
