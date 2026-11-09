@@ -187,11 +187,11 @@ class TrainingMixin(TrainingModuleMixin):
 class VisionMeterMixin(MetricMeterMixin):
     """Per-module training meter for the Qwen3-VL vision tower.
 
-    Tokens here are **merged visual tokens** (the ViT's output rows after the
-    patch merger), not text tokens — the tower never sees a text sequence. FLOPs
-    are the transformer blocks plus the patch-embed convolution and the mergers,
-    which is where a vision tower's compute actually goes. fwd+bwd ⇒ 6x for the
-    linear work, 12x for the quadratic attention.
+    `seqlens` carries **merged visual tokens** (the tower's output rows, what the
+    backbone sees), but the tower's own compute runs on **raw patch rows**: the
+    merger collapses `merge²` patches into one *after* the blocks. So the block
+    and patch-embed terms are scaled back up by `merge²`, and the merger terms are
+    the two projections that do the collapsing.
     """
 
     config: Qwen3VLVisionEncoderConfig
@@ -200,26 +200,37 @@ class VisionMeterMixin(MetricMeterMixin):
         cfg = self.config.vision_config
         hidden = cfg.hidden_size
         depth = cfg.depth
-        merge = cfg.spatial_merge_size
+        merge_area = int(cfg.spatial_merge_size) ** 2
+        num_heads = cfg.num_heads
+        head_dim = hidden // num_heads
 
-        # Attention + MLP per block, mirroring the backbone's formula.
-        mlp_n = hidden * cfg.intermediate_size * 2  # gate/up share a projection, down is the second
-        attn_n = hidden * (3 * hidden + hidden)  # qkv + o
-        dense_n = (mlp_n + attn_n) * depth
-        # patch_embed (Conv3d) + one merger per visual, plus the DeepStack mergers.
+        # The blocks see raw patches, `merge²` per merged token.
+        raw_seqlens = [max(0, int(s)) * merge_area for s in seqlens]
+        raw_tokens = sum(raw_seqlens)
+        raw_sq = sum(s * s for s in raw_seqlens)
+        merged_tokens = sum(max(0, int(s)) for s in seqlens)
+
+        # Transformer blocks: SwiGLU MLP (gate/up/down) + attention projections.
+        mlp_n = hidden * cfg.intermediate_size * 3
+        attn_linear_n = hidden * (3 * hidden + hidden)  # qkv + o
+        dense_n = (mlp_n + attn_linear_n) * depth
+        dense_flops = 6 * dense_n * raw_tokens
+        # Quadratic term: per layer, per token pair, `head_dim * num_heads` MACs.
+        attn_flops = 12 * raw_sq * head_dim * num_heads * depth
+
+        # patch_embed (Conv3d over each patch) — one pass per raw patch.
         patch_n = hidden * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
-        merger_n = (hidden * merge**2) * cfg.out_hidden_size
-        merger_count = 1 + len(cfg.deepstack_visual_indexes)
+        patch_flops = 6 * patch_n * raw_tokens
 
-        tokens = sum(seqlens)
-        seqlen_sq = sum(s * s for s in seqlens)
-        dense_flops = 6 * dense_n * tokens
-        attn_flops = 12 * seqlen_sq * hidden * cfg.num_heads * depth
-        # One patch-embed + merger pass per *visual item*, and `tokens` already
-        # counts merged rows, so divide back out to get the item count.
-        per_item = max(1, tokens)
-        head_flops = 6 * (patch_n * per_item + merger_n * merger_count * per_item)
-        return (dense_flops + attn_flops + head_flops) / 1e12
+        # Mergers: `linear_fc1` (hidden*merge² → hidden) then `linear_fc2`
+        # (hidden → out_hidden_size), run once per merged token, by the spatial
+        # merger plus one per DeepStack layer.
+        merger_count = 1 + len(cfg.deepstack_visual_indexes)
+        fc1_n = (hidden * merge_area) * hidden
+        fc2_n = hidden * cfg.out_hidden_size
+        merger_flops = 6 * (fc1_n + fc2_n) * merged_tokens * merger_count
+
+        return (dense_flops + attn_flops + patch_flops + merger_flops) / 1e12
 
 
 class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, VisionMeterMixin):

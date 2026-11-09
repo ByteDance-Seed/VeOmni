@@ -53,9 +53,12 @@ class TrainingMixin(TrainingModuleMixin):
         packed = pack_qwen3vl_conversations_for_forward(conversation_list, self.device, self._spatial_merge_size)
         inputs_embeds = packed["inputs_embeds"]
 
-        # Metering: this rank's own packed length, stashed BEFORE the SP slice
-        # below so the count does not depend on `sp_size`.
-        self.metric_meter_set_seqlens("forward", [int(inputs_embeds.size(1))])
+        # Metering: one length per sample, from the packer's `cu_seq_lens`, so
+        # `estimate_flops` squares each sample instead of the batch total and
+        # `OmniEnvironMeter` can align the list with `ds_idx`. Stashed BEFORE the
+        # SP slice below so the count does not depend on `sp_size`.
+        cu = packed["cu_seq_lens"].reshape(-1)
+        self.metric_meter_set_seqlens("forward", [int(s) for s in (cu[1:] - cu[:-1]).tolist()])
 
         if self.training and get_parallel_state().fsdp_enabled:
             inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, conversation_list)

@@ -574,9 +574,36 @@ def test_every_module_meters_its_own_tokens_on_both_graphs():
             assert flops > 0, (name, module_name, "no FLOPs reported")
             assert seqlens and any(s > 0 for s in seqlens), (name, module_name, seqlens)
 
+        # The backbone sees one row per sample on both graphs, so its lengths must
+        # be per-sample: a batch-total entry makes `estimate_flops` square the sum
+        # and leaves `OmniEnvironMeter` nothing to align against `ds_idx`.
+        llm_lens = collected["qwen3vl_llm"][1]
+        assert len(llm_lens) == 3, (name, "backbone must report one length per sample", llm_lens)
+
         if name == "packed":
             # One packed row per sample, so the text encoder and the backbone that
             # both consume that packed sequence must report the same sample count.
             te_lens = collected["qwen3vl_text_encoder"][1]
-            llm_lens = collected["qwen3vl_llm"][1]
             assert len(te_lens) == len(llm_lens) == 3, (te_lens, llm_lens)
+
+        # The tower's blocks and patch_embed run on raw patches — `merge²` rows per
+        # merged token — so those two terms must be `merge²` times what the same
+        # merged count would give. Check the ratio directly rather than a floor:
+        # dropping the expansion is the mistake this guards.
+        if name == "conversation":
+            vision_flops = collected["qwen3vl_vision"][0]
+            vision_lens = collected["qwen3vl_vision"][1]
+            cfg = modules["qwen3vl_vision"].config.vision_config
+            merge_area = cfg.spatial_merge_size**2
+            merged = sum(vision_lens)
+            raw = merged * merge_area
+
+            mlp_n = cfg.hidden_size * cfg.intermediate_size * 3
+            attn_n = cfg.hidden_size * (3 * cfg.hidden_size + cfg.hidden_size)
+            block_n = (mlp_n + attn_n) * cfg.depth
+            patch_n = cfg.hidden_size * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
+            # These two terms are the ones that scale with raw rows.
+            at_merged = 6 * (block_n + patch_n) * merged / 1e12
+            at_raw = 6 * (block_n + patch_n) * raw / 1e12
+            # Reported FLOPs must sit closer to the raw reading than the merged one.
+            assert vision_flops > (at_merged + at_raw) / 2, (vision_flops, at_merged, at_raw)
