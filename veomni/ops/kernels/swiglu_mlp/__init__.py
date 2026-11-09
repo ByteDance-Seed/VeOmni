@@ -50,10 +50,11 @@ FUSED_ACTIVATIONS = frozenset({"silu", "swish"})
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
-    A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead. The
-    fused rows that only read the tensors still work that way, because their own
-    ``forward`` accepts the modules' inputs.
+    Only an exact ``nn.Linear`` qualifies. A wrapped projection such as
+    ``LoraLinear`` has no ``weight``, and a ``Linear`` subclass such as torchao's
+    ``Float8Linear`` exposes one but does extra computation in its ``forward``
+    (float8 GEMMs). Either must run its own forward, so the MLP has to call the
+    projection modules instead of the weight-only fused path.
 
     Raises:
         ValueError: when a fallback is needed while ``mlp``'s own ``swiglu_mlp``
@@ -65,7 +66,7 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
             fallback.
 
     """
-    plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    plain = all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
     if plain:
         return True
 
