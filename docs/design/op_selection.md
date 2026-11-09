@@ -29,7 +29,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
-| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
+| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu`, `fla_npu_reuse` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
@@ -493,7 +493,7 @@ model:
 |---|---|---|---|
 | `rms_norm_gated_implementation` | `fla` | `fla`, `torch_npu` | HuggingFace reference implementation |
 | `causal_conv1d_implementation` | `fla` | `fla`, `triton` | No `cu_seqlens` path |
-| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (NVIDIA SM90-SM100) | `fla`, `triton`, `fla_npu` | No `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (NVIDIA SM90-SM100) | `fla`, `triton`, `fla_npu`, `fla_npu_reuse` | No `cu_seqlens` path |
 
 The Ascend gated RMSNorm uses `torch_npu`. The Ascend causal Conv1D and gated
 delta-rule implementations are vendored MindSpeed-MM Triton kernels named
@@ -502,6 +502,19 @@ second Ascend backend, `fla_npu`, an AscendC fused `torch.ops.npu.*` path that
 requires a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
+
+To retain AscendC forward intermediates for backward instead of recomputing
+them, explicitly set `model.ops_implementation.chunk_gated_delta_rule_implementation`
+to `fla_npu_reuse`. This opt-in row requires both `fla_npu` and
+`triton-ascend`; it trades additional activation memory for less backward
+recomputation. The default and `fla_npu` behavior are unchanged, and the
+memory and throughput impact depends on the model and configuration.
+
+Both AscendC rows reject an `initial_state` requiring gradients. They also
+reject `output_final_state=True` whenever any of Q/K/V/g/beta requires
+gradients, even if the caller does not use the final state. Qwen3.5
+shared-prefix training is rejected for these rows because it requires
+recurrent-state gradients; use `triton` on NPU for that training mode.
 
 ---
 
