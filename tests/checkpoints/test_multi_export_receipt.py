@@ -265,6 +265,9 @@ def _real_multi_save_worker(rank, directory, scope, cadence, same_output, target
             if target_exists == "stat_error":
                 expected_error = "manifest stat error" if rank == 1 else "failed on another rank"
                 assert expected_error in str(caught.value)
+            else:
+                assert repr(layout.step_dir(str(target_path), 1)) in str(caught.value)
+                assert "choose a new checkpoint save_path" in str(caught.value)
             for runtime in restored:
                 runtime.checkpoint.save_dcp.assert_not_called()
             if rank == 0:
