@@ -9,8 +9,8 @@ This can overlap part of checkpoint I/O with subsequent training. It does not
 make every checkpoint-related operation asynchronous or guarantee a stall-free
 save.
 
-The repository's pinned hardware
-dependencies; see [Ascend installation](../get_started/installation/install_ascend_x86.md)
+Install the repository's pinned hardware dependencies before running a recipe;
+see [Ascend installation](../get_started/installation/install_ascend_x86.md)
 and [trainer usage](../usage/trainer.md).
 
 ## Features
