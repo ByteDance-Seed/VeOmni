@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.seed_omni.modules import (
@@ -19,6 +20,9 @@ from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import (
     qwen3vl_vision_position_ids,
 )
 from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import build_qwen3vl_vit_metadata
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _save_fake_fast_tokenizer(module_path: Path) -> None:
@@ -142,45 +146,61 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     assert len(out["deepstack_features"]) == 1
 
 
-def test_vision_meter_counts_raw_patch_rows_and_both_merger_projections():
-    """Pin the vision meter's FLOPs to numbers worked out by hand on a tiny config.
+def test_vision_meter_counts_the_layers_the_vit_actually_has():
+    """Check the vision meter against the ViT's own parameter shapes.
 
-    The terms are easy to get subtly wrong: the ViT blocks run over *raw* patches
-    (``merge²`` of a merged token) while the mergers run over merged tokens, and
-    every DeepStack layer repeats its merger. Each of those mistakes leaves a
-    plausible number off by a constant factor, so the expected value below is
-    computed from the layer shapes rather than from the implementation.
+    The meter is easy to get wrong in ways that still look plausible: counting
+    the MLP as a SwiGLU when it is a two-layer GELU MLP, or sizing the merger
+    from `hidden` instead of the widened `hidden * merge²`. Deriving the
+    expectations from the instantiated module means the test disagrees with the
+    meter whenever either mistake comes back.
     """
     from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import VisionMeterMixin
+    from veomni.models.seed_omni.modules.qwen3vl.vision.configuration import Qwen3VLVisionEncoderConfig
+    from veomni.models.seed_omni.modules.qwen3vl.vision.modeling import Qwen3VLVisionEncoder
 
-    # Numbers small enough to work out on paper:
-    #   blocks   = 6 * ((4*8*3 SwiGLU) + (4*(3*4+4) qkvo)) * 2 layers * 12 raw tokens
-    #   attn     = 12 * 80 (sum of squared raw lengths) * head_dim 2 * heads 2 * 2 layers
-    #   patch    = 6 * (4*3*2*2² Conv3d) * 12 raw tokens
-    #   mergers  = 6 * ((4*2²)*4 fc1 + 4*6 fc2) * 3 merged tokens * (1 + 1 DeepStack)
-    vision_config = SimpleNamespace(
-        hidden_size=4,
-        depth=2,
-        num_heads=2,
-        intermediate_size=8,
-        in_channels=3,
-        temporal_patch_size=2,
-        patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=6,
-        deepstack_visual_indexes=[1],
-    )
+    config = Qwen3VLVisionEncoderConfig(ops_implementation=make_eager_ops_config())
     meter = VisionMeterMixin.__new__(VisionMeterMixin)
-    meter.config = SimpleNamespace(vision_config=vision_config)
-    # 23040 + 7680 + 6912 + 3168 = 40800
-    assert meter.estimate_flops([1, 2]) == pytest.approx(40800 / 1e12, rel=1e-9)
+    meter.config = config
 
-    # The merger is repeated per DeepStack layer: dropping it subtracts exactly
-    # one copy, 6 * 88 * 3 = 1584.
-    meter.config = SimpleNamespace(
-        vision_config=SimpleNamespace(**{**vars(vision_config), "deepstack_visual_indexes": []})
-    )
-    assert meter.estimate_flops([1, 2]) == pytest.approx((40800 - 1584) / 1e12, rel=1e-9)
+    vision = Qwen3VLVisionEncoder._from_config(config).visual
+    block = vision.blocks[0]
+    merger = vision.merger
+    merge_area = int(config.vision_config.spatial_merge_size) ** 2
+
+    def linear_params(layer):
+        """Input × output of an `nn.Linear`, read off the weight tensor."""
+        return layer.weight.numel()
+
+    per_block = linear_params(block.mlp.linear_fc1) + linear_params(block.mlp.linear_fc2)
+    for proj in (block.attn.qkv, block.attn.proj):
+        per_block += linear_params(proj)
+    merger_once = linear_params(merger.linear_fc1) + linear_params(merger.linear_fc2)
+
+    hidden = config.vision_config.hidden_size
+    depth = config.vision_config.depth
+    head_dim = hidden // config.vision_config.num_heads
+    patch_embed = linear_params(vision.patch_embed.proj)
+
+    seqlens = [3, 5]
+    raw_seqlens = [n * merge_area for n in seqlens]
+    raw_tokens = sum(raw_seqlens)
+    raw_sq = sum(n * n for n in raw_seqlens)
+    merged_tokens = sum(seqlens)
+    merger_count = 1 + len(config.vision_config.deepstack_visual_indexes)
+
+    dense = 6 * per_block * depth * raw_tokens
+    attn = 12 * raw_sq * head_dim * config.vision_config.num_heads * depth
+    patch = 6 * patch_embed * raw_tokens
+    mergers = 6 * merger_once * merged_tokens * merger_count
+    assert meter.estimate_flops(seqlens) == pytest.approx((dense + attn + patch + mergers) / 1e12, rel=1e-9)
+
+    # One DeepStack layer runs its own copy of the merger, so dropping it must
+    # remove exactly one `merger_once` per merged token.
+    no_deepstack = SimpleNamespace(**{**vars(config.vision_config), "deepstack_visual_indexes": []})
+    meter.config = SimpleNamespace(vision_config=no_deepstack)
+    without = (dense + attn + patch + 6 * merger_once * merged_tokens) / 1e12
+    assert meter.estimate_flops(seqlens) == pytest.approx(without, rel=1e-9)
 
 
 def test_vision_position_ids_layout():

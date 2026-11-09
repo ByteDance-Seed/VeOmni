@@ -210,8 +210,11 @@ class VisionMeterMixin(MetricMeterMixin):
         raw_sq = sum(s * s for s in raw_seqlens)
         merged_tokens = sum(max(0, int(s)) for s in seqlens)
 
-        # Transformer blocks: SwiGLU MLP (gate/up/down) + attention projections.
-        mlp_n = hidden * cfg.intermediate_size * 3
+        # The vision block's MLP is a plain two-layer GELU MLP — `linear_fc1`
+        # (hidden -> intermediate) then `linear_fc2` (intermediate -> hidden) —
+        # not the SwiGLU of the language stack, so it carries no third
+        # projection.
+        mlp_n = hidden * cfg.intermediate_size * 2
         attn_linear_n = hidden * (3 * hidden + hidden)  # qkv + o
         dense_n = (mlp_n + attn_linear_n) * depth
         dense_flops = 6 * dense_n * raw_tokens
@@ -222,12 +225,14 @@ class VisionMeterMixin(MetricMeterMixin):
         patch_n = hidden * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
         patch_flops = 6 * patch_n * raw_tokens
 
-        # Mergers: `linear_fc1` (hidden*merge² → hidden) then `linear_fc2`
-        # (hidden → out_hidden_size), run once per merged token, by the spatial
-        # merger plus one per DeepStack layer.
+        # Mergers: the patch merger widens to `hidden * merge²` and keeps that
+        # width, so `linear_fc1` maps `hidden*merge² -> hidden*merge²` and
+        # `linear_fc2` maps `hidden*merge² -> out_hidden_size`. Both run once
+        # per merged token, by the spatial merger plus one per DeepStack layer.
         merger_count = 1 + len(cfg.deepstack_visual_indexes)
-        fc1_n = (hidden * merge_area) * hidden
-        fc2_n = hidden * cfg.out_hidden_size
+        merged_width = hidden * merge_area
+        fc1_n = merged_width * merged_width
+        fc2_n = merged_width * cfg.out_hidden_size
         merger_flops = 6 * (fc1_n + fc2_n) * merged_tokens * merger_count
 
         return (dense_flops + attn_flops + patch_flops + merger_flops) / 1e12
