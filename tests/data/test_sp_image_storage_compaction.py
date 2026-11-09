@@ -99,6 +99,20 @@ def test_pinned_image_slices_preserve_original_view(monkeypatch):
     assert pinned_shard.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
 
 
+@pytest.mark.parametrize("key", ("pixel_values", "pixel_values_videos"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_real_pinned_image_slices_preserve_original_view(monkeypatch, key):
+    if not torch.accelerator.is_available():
+        pytest.skip("requires an accelerator-backed pinned-memory allocator")
+    monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(2, 1))
+    source = torch.arange(32, dtype=torch.float32).reshape(8, 4).pin_memory()
+    assert source.is_pinned()
+    shard = collators.SequenceParallelCollator().sp_slice(key, source, dim=0)
+    assert shard.is_pinned()
+    assert torch.equal(shard, source.narrow(0, 4, 4))
+    assert shard.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+
+
 def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(4, 2))
 
