@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
-from veomni.models.seed_omni.modules.base.packing import PACKED_ATTENTION_MASK
 from veomni.models.seed_omni.modules.qwen3vl.packing import (
     IMAGE_GRID_THW,
     PACKED_CU_SEQLENS,
@@ -28,6 +29,9 @@ from veomni.models.seed_omni.modules.qwen3vl.text_encoder.processing import Qwen
 from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _cfg_dir() -> Path:
@@ -294,7 +298,6 @@ def test_packed_collation_batches_an_undeclared_key_like_the_base_collator():
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
-            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
             **extra,
         }
 
@@ -315,7 +318,6 @@ def test_packed_collation_carries_the_multisource_metadata_the_meter_reads():
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
-            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
             "ds_idx": ds_idx,
             "source_name": source_name,
         }
@@ -339,7 +341,6 @@ def test_packed_collation_carries_cur_token_num():
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 4, dtype=torch.long),
-            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
             "cur_token_num": cur_token_num,
         }
 
@@ -360,7 +361,6 @@ def test_packed_collation_keeps_each_samples_visual_flags():
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 8, dtype=torch.long),
             PACKED_LABELS: torch.zeros(1, 8, dtype=torch.long),
-            PACKED_ATTENTION_MASK: torch.ones(1, 8, dtype=torch.long),
             # A distinct origin per sample, so a flag that ends up on the wrong row
             # is observable in the pixels too.
             PIXEL_VALUES: torch.arange(base, base + rows, dtype=torch.float).unsqueeze(1),
@@ -395,7 +395,6 @@ def test_packed_collation_masks_each_sample_boundary_label():
         return {
             PACKED_INPUT_IDS: torch.zeros(1, 4, dtype=torch.long),
             PACKED_LABELS: labels,
-            PACKED_ATTENTION_MASK: torch.ones(1, 4, dtype=torch.long),
         }
 
     batch = SeedOmniCollator()([_packed(5), _packed(9), _packed(11)])

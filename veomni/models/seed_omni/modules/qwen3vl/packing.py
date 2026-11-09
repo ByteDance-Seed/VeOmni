@@ -27,7 +27,6 @@ from veomni.utils.constants import IGNORE_INDEX
 
 from ...utils.conversation import ConversationItem
 from ..base.packing import (
-    PACKED_ATTENTION_MASK,
     PACKED_CU_SEQLENS,
     PACKED_FEATURES,
     PACKED_HIDDEN,
@@ -99,7 +98,6 @@ def pack_qwen3vl_conversations(
     """
     ids_chunks: list[torch.Tensor] = []
     label_chunks: list[torch.Tensor] = []
-    mask_chunks: list[torch.Tensor] = []
     position_chunks: list[torch.Tensor] = []
     visual_chunks: list[torch.Tensor] = []
     sample_lengths: list[int] = []
@@ -164,7 +162,6 @@ def pack_qwen3vl_conversations(
             cat_labels[0] = IGNORE_INDEX
         ids_chunks.append(cat_ids)
         label_chunks.append(cat_labels)
-        mask_chunks.append(torch.ones(cat_ids.numel(), dtype=torch.long))
         position_chunks.append(torch.cat(sample_pos, dim=1))
         visual_chunks.append(torch.cat(sample_visual, dim=0))
         sample_lengths.append(int(cat_ids.numel()))
@@ -174,7 +171,6 @@ def pack_qwen3vl_conversations(
 
     packed_ids = torch.cat(ids_chunks, dim=0).unsqueeze(0)
     packed_labels = torch.cat(label_chunks, dim=0).unsqueeze(0)
-    packed_attention = torch.cat(mask_chunks, dim=0).unsqueeze(0)
     packed_position = torch.cat(position_chunks, dim=1).unsqueeze(1)
     visual_mask = torch.cat(visual_chunks, dim=0).unsqueeze(0)
     cu = [0]
@@ -195,7 +191,6 @@ def pack_qwen3vl_conversations(
     return {
         PACKED_INPUT_IDS: packed_ids,
         PACKED_LABELS: packed_labels,
-        PACKED_ATTENTION_MASK: packed_attention,
         PACKED_POSITION_IDS: packed_position,
         PACKED_CU_SEQLENS: packed_cu,
         PACKED_MAX_LENGTH: max_length,
@@ -228,7 +223,6 @@ def visual_token_count(grid_thw: torch.Tensor, spatial_merge_size: int, is_real:
 __all__ = [
     "PACKED_INPUT_IDS",
     "PACKED_LABELS",
-    "PACKED_ATTENTION_MASK",
     "PACKED_POSITION_IDS",
     "PACKED_FEATURES",
     "PACKED_HIDDEN",

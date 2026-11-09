@@ -45,7 +45,6 @@ from ..data_collator import DataCollator
 _PACKED_CONCAT_DIM: Dict[str, int] = {
     "packed_input_ids": 1,
     "packed_labels": 1,
-    "packed_attention_mask": 1,
     "packed_position_ids": 2,
     "visual_pos_mask": 1,
     "pixel_values": 0,

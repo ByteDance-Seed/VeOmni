@@ -207,7 +207,6 @@ def test_length_fns_size_a_packed_sample_by_its_packed_tensors():
     packed = {
         "packed_input_ids": torch.zeros(1, 40, dtype=torch.long),
         "packed_labels": labels,
-        "packed_attention_mask": torch.ones(1, 40, dtype=torch.long),
     }
     assert get_length_fn(packed) == 40
     assert get_length_by_labels_fn(packed) == 12
