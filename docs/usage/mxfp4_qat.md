@@ -26,8 +26,9 @@ They are independent, and they are two of the four selections that make up a
 quantization-aware training recipe — the others being `moe_implementation` and
 `kv_round_implementation` for models that have experts or a KV cache. A model
 that fuses its MLP reads only the second field; a model with per-projection
-control reads the first. Set both to quantize every projection. There is no
-global recipe switch: each family owns its own row. See
+control reads the first. Set both to quantize every attention and MLP
+projection (`lm_head` stays full precision, see above). There is no global
+recipe switch: each family owns its own row. See
 [op selection](../design/op_selection.md).
 
 ## Recipe
@@ -40,7 +41,7 @@ global recipe switch: each family owns its own row. See
 | Quantized | Both GEMM operands (activation and weight) |
 | Backward | Straight-through, using the quantized operands |
 | Dependency | `torchao`, optional; the row is unavailable without it |
-| Device | Device-agnostic PyTorch math. Validated on CPU and NVIDIA CUDA; NPU and MLU are untested |
+| Device | Device-agnostic PyTorch math. CPU and NVIDIA CUDA are supported. **NPU and MLU are rejected at config-parse time** (`arguments_types._NPU_ALLOWED` / `_MLU_ALLOWED` exclude the row), not merely untested |
 
 A projection whose last dimension is not a multiple of 32 raises rather than
 being padded: the deployment kernels index one scale per 32-wide group, so a
@@ -52,6 +53,7 @@ partial group has no defined scale.
 
 ```bash
 uv sync --locked --extra gpu --dev
+source .venv/bin/activate      # train.sh resolves torchrun from PATH
 uv pip install torchao==0.18.0
 ```
 
@@ -136,7 +138,9 @@ and VeOmni does not implement that anyway (`AcceleratorConfig` asserts
 | Tensor parallel | not implemented in VeOmni, independently of this row |
 
 **Convergence under any multi-rank setting is unmeasured** — the numerical
-validation is single-device. Treat multi-rank QAT as untested, not as validated.
+validation is single-device CPU. The example config pins BF16 parameters with
+FP32 gradient reduction, but that is a **configuration choice, not a validated
+result**: nothing about FSDP2 gradient reduction has been measured here.
 
 `torch.compile` is refused outright, at config time, per the next subsection.
 
@@ -153,6 +157,13 @@ Offloading is not restricted: CPU offload moves the shard to host and the row se
 an ordinary tensor.
 
 ## Checkpoints and export
+
+**A restart must re-select the rows.** The trainer passes its own
+`OpsImplementationConfig` when it builds the model, and that object replaces
+whatever the exported checkpoint recorded. Launching a resumed run without
+`linear_implementation` / `swiglu_mlp_implementation` therefore trains at full
+precision while the checkpoint still says otherwise — the saved selections are
+metadata, not a default.
 
 Weight names are unchanged, so DCP resume, HF safetensors export and reload all
 work with no extra state: the fake-quant scales are derived on every forward and
