@@ -2,6 +2,13 @@
 
 This document describes VeOmni's architecture for AI coding agents. Read this to understand where code lives and how components interact.
 
+`veomni/utils/flops_meter.py` registers optional model-specific FLOPs metadata
+callbacks for the shared `EnvironMeter`. The meter accumulates their results,
+calls the existing counter, and handles DP reduction and per-step reset. DiT
+models without a model-specific callback use the default latent-based callback;
+HF models retain their existing metadata path without a callback. See
+`docs/design/flops_metadata_callback.md` for the extension contract.
+
 ## Module Map
 
 ```

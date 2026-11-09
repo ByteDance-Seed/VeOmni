@@ -199,9 +199,19 @@ per sample, in the same order as `batch_seqlens` and no greater than its main le
 The estimate includes the main DiT and text-refiner projection and attention
 operations. It excludes activation-checkpoint recomputation, CFG's extra forward,
 and smaller operations, and is not a device-profiler measurement. H3 LoRA uses
-the existing unsupported-model zero-FLOPs fallback. If packed lengths are missing
-on any data-parallel rank, the meter warns and reports zero FLOPs for the step;
-online encoding may construct `packed` only after the meter runs.
+the existing unsupported-model zero-FLOPs fallback. Inputs without usable packed
+lengths contribute no FLOPs; other available inputs and ranks are still counted.
+Thus missing metadata can make the reported MFU an underestimate. Online encoding
+may construct `packed` only after the meter runs, resulting in zero MFU when no
+rank has usable lengths.
+
+For the model-specific FLOPs metadata callback contract, see:
+
+```{toctree}
+:maxdepth: 1
+
+../design/flops_metadata_callback.md
+```
 
 With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
 Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
