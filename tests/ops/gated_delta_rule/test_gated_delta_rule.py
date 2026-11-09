@@ -654,6 +654,8 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
         pytest.param("triton", 77, 256, 20, False, id="triton-repeated-partial-wide-head"),
         pytest.param("triton", 128, 64, 1, True, id="triton-packed-small-head"),
         pytest.param("triton", 128, 128, 1, True, id="triton-packed"),
+        pytest.param("fla_npu", 128, 128, 1, False, id="fla-npu-unpacked"),
+        pytest.param("fla_npu", 128, 128, 1, True, id="fla-npu-packed"),
         pytest.param("fla_npu_reuse", 128, 128, 1, True, id="fla-npu-reuse-packed"),
         pytest.param("fla_npu_reuse", 128, 128, 1, "empty", id="fla-npu-reuse-packed-empty"),
     ),
@@ -661,10 +663,10 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats, packed):
     """Compare optimized kernels with independent eager segment references."""
     _require_npu_gdr_dependencies()
-    if impl == "fla_npu_reuse":
+    if impl in ("fla_npu", "fla_npu_reuse"):
         pytest.importorskip("fla_npu")
-        if not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
-            pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    if impl == "fla_npu_reuse" and not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
