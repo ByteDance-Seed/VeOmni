@@ -199,6 +199,62 @@ def test_minimax_h3_incomplete_remote_rank_does_not_publish_partial_mfu(monkeypa
     warning.assert_called_once()
 
 
+@pytest.mark.parametrize("missing_field", ["text_len", "seq_len"])
+def test_minimax_h3_missing_length_defers_to_model(monkeypatch, mock_device_flops, missing_field):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import packed_seq_params
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    malformed = _h3_packed(4, 2)
+    del malformed[missing_field]
+    with patch.object(helper.logger, "warning_rank0"):
+        meter.add({"packed": [_h3_packed(4, 2), malformed]})
+        assert meter.step(delta_time=1.0, global_step=1)["mfu"] == 0
+    with pytest.raises(KeyError, match=missing_field):
+        packed_seq_params(malformed, "cpu")
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    assert meter.step(delta_time=1.0, global_step=2)["mfu"] > 0
+
+
+@pytest.mark.parametrize("defect", ["missing_position", "none_position", "invalid_length", "invalid_item"])
+def test_minimax_h3_invalid_packed_skips_mfu(monkeypatch, mock_device_flops, defect):
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    malformed = _h3_packed(4, 2)
+    if defect == "missing_position":
+        del malformed["img_pos"]
+    elif defect == "none_position":
+        malformed["img_pos"] = None
+    elif defect == "invalid_length":
+        malformed["text_len"] = 5
+    else:
+        malformed = None
+    with patch.object(helper.logger, "warning_rank0"):
+        meter.add({"packed": [_h3_packed(4, 2), malformed]})
+        assert meter.step(delta_time=1.0, global_step=1)["mfu"] == 0
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    assert meter.step(delta_time=1.0, global_step=2)["mfu"] > 0
+
+
 def test_gb200_device_flops():
     with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA GB200"):
         assert get_device_flops() == 2565.0

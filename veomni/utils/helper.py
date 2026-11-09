@@ -161,14 +161,20 @@ def _compute_minimax_h3_seqlens(micro_batch: Dict[str, Any]) -> tuple[List[int],
         return [], []
     if isinstance(packed, dict):
         packed = [packed]
+    if not isinstance(packed, (list, tuple)):
+        return [], []
     seq_lens, text_lens = [], []
     for item in packed:
-        if not isinstance(item, dict) or "seq_len" not in item or "text_len" not in item:
-            raise ValueError("MiniMax-H3 packed item must contain seq_len and text_len")
-        seq_len, text_len = int(item["seq_len"]), int(item["text_len"])
-        used_len = sum(item[key].numel() for key in ("text_pos", "img_pos", "audio_pos"))
+        if not isinstance(item, dict):
+            return [], []
+        seq_len, text_len = item.get("seq_len"), item.get("text_len")
+        positions = [item.get(key) for key in ("text_pos", "img_pos", "audio_pos")]
+        if any(value is None for value in (seq_len, text_len, *positions)):
+            return [], []
+        seq_len, text_len = int(seq_len), int(text_len)
+        used_len = sum(position.numel() for position in positions)
         if used_len <= 0 or used_len > seq_len or text_len < 0 or text_len > used_len:
-            raise ValueError(f"Invalid MiniMax-H3 packed lengths: {seq_len=}, {used_len=}, {text_len=}")
+            return [], []
         seq_lens.append(used_len)
         text_lens.append(text_len)
     return seq_lens, text_lens
@@ -332,8 +338,8 @@ class EnvironMeter:
                     self._h3_lengths_complete = False
                     if not self._h3_missing_packed_warned:
                         logger.warning_rank0(
-                            "MiniMax-H3 FLOPs are unavailable without packed sequence lengths; "
-                            "online encoding may construct them after the meter runs."
+                            "MiniMax-H3 FLOPs are unavailable with missing or invalid packed sequence lengths; "
+                            "for online training, encoding may construct them after the meter runs."
                         )
                         self._h3_missing_packed_warned = True
                 self.batch_seqlens.extend(seq_lens)
