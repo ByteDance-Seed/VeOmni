@@ -3,6 +3,7 @@ from functools import partial
 from typing import Literal
 
 import pytest
+import torch
 from utils import DummyDataset, process_dummy_example
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -299,3 +300,51 @@ def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, d
             prefetch_factor=None,
             seed=0,
         )
+
+
+class _EpochDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.epoch = 0
+
+    def __len__(self):
+        return 10
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __getitem__(self, index):
+        return [{"input_ids": torch.tensor([self.epoch, index]), "attention_mask": torch.ones(2)}]
+
+
+def test_native_sampler_restores_shuffle_and_dataset_epoch():
+    from veomni.data.data_loader import StatefulDistributedSampler
+
+    dataset = _EpochDataset()
+    sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, seed=19)
+    sampler.set_epoch(3)
+    iterator = iter(sampler)
+    next(iterator)
+    state = sampler.state_dict()
+    expected = list(iterator)
+    resumed_dataset = _EpochDataset()
+    resumed = StatefulDistributedSampler(resumed_dataset, num_replicas=1, rank=0, seed=19)
+    resumed.load_state_dict(state)
+    assert resumed_dataset.epoch == 3
+    assert list(resumed) == expected
+
+
+def test_worker_sampler_restores_epoch_dependent_preprocessing():
+    from veomni.data.dataset import _MapStyleSamplerWrapper
+
+    dataset = _EpochDataset()
+    sampler = _MapStyleSamplerWrapper(dataset, num_replicas=1, rank=0, seed=19, shuffle=True)
+    sampler.set_epoch(3)
+    iterator = iter(sampler)
+    next(iterator)
+    state = sampler.state_dict()
+    expected = [sample[0]["input_ids"].tolist() for sample in iterator]
+    resumed_dataset = _EpochDataset()
+    resumed = _MapStyleSamplerWrapper(resumed_dataset, num_replicas=1, rank=0, seed=19, shuffle=True)
+    resumed.load_state_dict(state)
+    assert resumed_dataset.epoch == 3
+    assert [sample[0]["input_ids"].tolist() for sample in resumed] == expected

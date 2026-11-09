@@ -1125,7 +1125,7 @@ class _MapStyleSamplerWrapper(IterableDataset):
                 f"Cannot restore _MapStyleSamplerWrapper with a different sampler setup: {'; '.join(mismatches)}"
             )
 
-        self.epoch = state_dict["epoch"]
+        self.set_epoch(state_dict["epoch"])
         self._yielded = state_dict["yielded"]
         self._just_resumed = True
 

@@ -739,6 +739,19 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
+    def prepare_loss_reduction(self, micro_batches: Any) -> None:
+        """Prepare the whole step's loss denominators before gradient accumulation.
+
+        Subclasses with non-token objectives may override this together with
+        ``prepare_micro_batch_loss`` and ``postforward``.
+        """
+        self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
+
+    def prepare_micro_batch_loss(self, micro_batch: Any) -> None:
+        """Prepare this micro-batch's token counts for ``postforward``."""
+        self.micro_batch_token_len = count_loss_token(micro_batch)
+
     def train_step(
         self,
         data_iterator: Any,
@@ -757,9 +770,7 @@ class BaseTrainer(Stateful, ABC):
         total_loss_dict = defaultdict(int)
         total_aux_metrics = defaultdict(float)
 
-        # token num for fixed_ce_loss in postforward
-        self.micro_batches_token_len = count_loss_token(micro_batches)
-        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
+        self.prepare_loss_reduction(micro_batches)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
@@ -769,8 +780,7 @@ class BaseTrainer(Stateful, ABC):
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
-            # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.prepare_micro_batch_loss(micro_batch)
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
