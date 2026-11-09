@@ -280,6 +280,14 @@ def _mhc_pre_inputs(batch: int, seq_len: int, hc_mult: int, hidden: int, seed: i
     return x, fn, scale, base
 
 
+def _noncontiguous_last_dim(shape: tuple[int, ...], *, dtype: torch.dtype, seed: int) -> Tensor:
+    torch.manual_seed(seed)
+    storage = torch.randn(*shape[:-1], shape[-1] * 2, device="cuda", dtype=dtype)
+    tensor = storage[..., ::2]
+    assert tensor.shape == shape and not tensor.is_contiguous()
+    return tensor
+
+
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
 @pytest.mark.parametrize(("batch", "seq_len", "hidden"), [(1, 32, 256), (2, 37, 320)])
 def test_mhc_triton_pre_post_matches_eager(batch: int, seq_len: int, hidden: int):
@@ -362,6 +370,96 @@ def test_mhc_triton_head_matches_eager():
     eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(triton_grads, eager_grads, strict=True):
         assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+@pytest.mark.parametrize("hc_mult", [1, 2, 4, 8, 16])
+def test_mhc_triton_supported_stream_counts(hc_mult: int):
+    hidden = 33
+    x, fn, scale, base = _mhc_pre_inputs(1, 3, hc_mult, hidden, seed=100 + hc_mult)
+    args = (1e-6, hc_mult, 3, 1e-6)
+    x_t, fn_t, scale_t, base_t = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    values_t = resolve_op("mhc", "pre", "triton").wrapper(x_t, fn_t, scale_t, base_t, *args)
+    values_e = resolve_op("mhc", "pre", "eager").wrapper(x_e, fn_e, scale_e, base_e, *args)
+    for actual, expected in zip(values_t, values_e, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grad_outputs = tuple(torch.randn_like(value) for value in values_t)
+    grads_t = torch.autograd.grad(values_t, (x_t, fn_t, scale_t, base_t), grad_outputs=grad_outputs)
+    grads_e = torch.autograd.grad(values_e, (x_e, fn_e, scale_e, base_e), grad_outputs=grad_outputs)
+    for actual, expected in zip(grads_t, grads_e, strict=True):
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+def test_mhc_triton_empty_sequence_backward():
+    hc_mult, hidden = 4, 64
+    x, fn, scale, base = _mhc_pre_inputs(1, 0, hc_mult, hidden, seed=37)
+    leaves = make_grad_leaves(x, fn, scale, base)
+    outputs = resolve_op("mhc", "pre", "triton").wrapper(*leaves, 1e-6, hc_mult, 20, 1e-6)
+    sum(output.sum() for output in outputs).backward()
+    for tensor in leaves:
+        assert tensor.grad is not None
+        assert tensor.grad.shape == tensor.shape
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+def test_mhc_triton_post_noncontiguous_direct_gradients():
+    batch, seq_len, hc_mult, hidden = 1, 5, 4, 129
+    residual = _noncontiguous_last_dim((batch, seq_len, hc_mult, hidden), dtype=torch.bfloat16, seed=41)
+    output = _noncontiguous_last_dim((batch, seq_len, hidden), dtype=torch.bfloat16, seed=42)
+    post = _noncontiguous_last_dim((batch, seq_len, hc_mult), dtype=torch.float32, seed=43)
+    comb = _noncontiguous_last_dim((batch, seq_len, hc_mult, hc_mult), dtype=torch.float32, seed=44)
+    grad = _noncontiguous_last_dim(tuple(residual.shape), dtype=torch.bfloat16, seed=45)
+    inputs_t = make_grad_leaves(output, residual, post, comb)
+    inputs_e = make_grad_leaves(*(tensor.contiguous() for tensor in (output, residual, post, comb)))
+    y_t = resolve_op("mhc", "post", "triton").wrapper(*inputs_t)
+    y_e = resolve_op("mhc", "post", "eager").wrapper(*inputs_e)
+    torch.testing.assert_close(y_t, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grads_t = torch.autograd.grad(y_t, inputs_t, grad_outputs=grad)
+    grads_e = torch.autograd.grad(y_e, inputs_e, grad_outputs=grad.contiguous())
+    for actual, expected in zip(grads_t, grads_e, strict=True):
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+def test_mhc_triton_pre_production_width():
+    hc_mult, hidden = 4, 7168
+    x, fn, scale, base = _mhc_pre_inputs(1, 3, hc_mult, hidden, seed=47)
+    args = (1e-6, hc_mult, 3, 1e-6)
+    inputs_t = make_grad_leaves(x, fn, scale, base)
+    inputs_e = make_grad_leaves(x, fn, scale, base)
+    values_t = resolve_op("mhc", "pre", "triton").wrapper(*inputs_t, *args)
+    values_e = resolve_op("mhc", "pre", "eager").wrapper(*inputs_e, *args)
+    grad_outputs = tuple(torch.randn_like(value) for value in values_t)
+    grads_t = torch.autograd.grad(values_t, inputs_t, grad_outputs=grad_outputs)
+    grads_e = torch.autograd.grad(values_e, inputs_e, grad_outputs=grad_outputs)
+    for actual, expected in zip(grads_t, grads_e, strict=True):
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+def test_mhc_triton_rejects_invalid_contracts():
+    hc_mult, hidden = 4, 64
+    x, fn, scale, base = _mhc_pre_inputs(1, 8, hc_mult, hidden, seed=53)
+    pre = resolve_op("mhc", "pre", "triton").wrapper
+    post_op = resolve_op("mhc", "post", "triton").wrapper
+    with pytest.raises(ValueError, match="scale shape"):
+        pre(x, fn, scale.view(1, 3), base, 1e-6, hc_mult, 20, 1e-6)
+    with pytest.raises(ValueError, match="base shape"):
+        pre(x, fn, scale, base.view(1, -1), 1e-6, hc_mult, 20, 1e-6)
+    with pytest.raises(ValueError, match="nonzero hidden"):
+        pre(x[..., :0], fn[:, :0], scale, base, 1e-6, hc_mult, 20, 1e-6)
+
+    output = torch.randn(1, 8, hidden, device="cuda", dtype=torch.float32)
+    post = torch.randn(1, 8, hc_mult, device="cuda")
+    comb = torch.randn(1, 8, hc_mult, hc_mult, device="cuda")
+    with pytest.raises(TypeError, match="share a dtype"):
+        post_op(output, x, post, comb)
+    with pytest.raises(TypeError, match="float16, bfloat16, or float32"):
+        post_op(output.to(torch.int32), x.to(torch.int32), post, comb)
 
 
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")

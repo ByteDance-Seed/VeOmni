@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
-from ..helper import require_triton_input
+from ..helper import require_triton_input, require_triton_tensors
 
 
 def wrapper(
@@ -33,7 +33,22 @@ def wrapper(
     row, the mix coefficients stay in FP32 rather than being rounded to the
     residual dtype first.
     """
+    hc_mult = residual.shape[-2] if residual.ndim >= 2 else 0
+    require_triton_input(residual, hc_mult)
+    expected_output = residual.shape[:-2] + residual.shape[-1:]
+    if output.shape != expected_output:
+        raise ValueError(f"Triton mHC post expects output shape {expected_output}, got {tuple(output.shape)}")
+    if post.shape != residual.shape[:-1]:
+        raise ValueError(f"Triton mHC post expects post shape {residual.shape[:-1]}, got {tuple(post.shape)}")
+    expected_comb = residual.shape[:-1] + (hc_mult,)
+    if comb.shape != expected_comb:
+        raise ValueError(f"Triton mHC post expects comb shape {expected_comb}, got {tuple(comb.shape)}")
+    require_triton_tensors(residual, output=output, post=post, comb=comb)
+    if output.dtype != residual.dtype:
+        raise TypeError(
+            f"Triton mHC post requires output and residual to share a dtype, got {output.dtype} and {residual.dtype}"
+        )
+
     from ..vendor.triton_mhc import hc_post_mix
 
-    require_triton_input(residual, residual.shape[-2])
     return hc_post_mix(residual, output, post.float(), comb.float())

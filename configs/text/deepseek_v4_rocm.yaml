@@ -1,0 +1,82 @@
+# Sample DeepSeek-V4-Flash-Base SFT config for AMD ROCm (FSDP2 + optional EP).
+# This branch provides Triton sparse attention and mHC; the indexer remains eager
+# so the config does not depend on the separate Triton-indexer feature branch.
+
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  # Optional DeepSeek-V4 model_config overrides (DSpark MTP & DSA indexer loss):
+  # model_config:
+  #   dspark_block_size: 0
+  #   dspark_noise_token_id: 128799
+  #   dspark_target_layer_ids: null
+  #   dspark_markov_rank: 256
+  #   dspark_n_routed_experts: null
+  #   dspark_num_experts_per_tok: null
+  #   mtp_loss_coef: 1.0
+  #   freeze_mtp: false
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: liger_kernel
+    dsa_attention_implementation: triton
+    dsa_indexer_implementation: eager
+    mhc_implementation: triton
+    rms_norm_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+    qat_implementation: none
+  optimizer:
+    type: muon
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    # Quack is NVIDIA-only; use the pure-PyTorch Gram implementation on ROCm.
+    muon_ns_implementation: gram
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  max_seq_len: 2048
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  max_steps: 1000
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_flash_base_rocm_tulu_sft
+    manager: dcp
+    save_steps: 100
+    # ROCm torch 2.12 is outside the current DCP-to-HF consolidation guard.
+    save_hf_weights: false
+  wandb:
+    project: VeOmni
+    name: deepseek_v4_flash_base_rocm_tulu_sft
