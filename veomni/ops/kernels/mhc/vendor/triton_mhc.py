@@ -157,6 +157,12 @@ class _UnweightedRMSNorm(torch.autograd.Function):
 
 def unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     """Return ``x * rsqrt(mean(x**2, -1) + eps)`` in FP32."""
+    if not x.is_cuda:
+        raise ValueError("Triton mHC RMS norm requires a GPU tensor")
+    if x.dim() == 0 or x.shape[-1] == 0:
+        raise ValueError(f"Triton mHC RMS norm requires a nonzero last dimension, got {tuple(x.shape)}")
+    if x.dtype not in _TORCH_TO_TL_DTYPE:
+        raise TypeError(f"Triton mHC RMS norm does not support {x.dtype}")
     return _UnweightedRMSNorm.apply(x, eps)
 
 
@@ -341,7 +347,7 @@ class _MixTail(torch.autograd.Function):
             K=k,
             BLOCK_LEADING=block,
         )
-        mixes_flat = mixes_c.reshape(rows, -1)
+        mixes_flat = mixes_c.reshape(rows, (2 + k) * k)
         d_scale = torch.stack(
             [
                 (mixes_flat[:, :k] * d_logit[:, :k]).sum(),
@@ -375,10 +381,17 @@ def mhc_mix_tail(
     comb scales and ``base`` the matching biases.
     """
     _check_hc_mult(hc_mult)
-    if mixes.shape[-1] != (2 + hc_mult) * hc_mult or base.numel() != (2 + hc_mult) * hc_mult:
-        raise ValueError(f"mHC mixes and base must have {(2 + hc_mult) * hc_mult} channels")
-    if scale.numel() != 3:
-        raise ValueError(f"mHC pre expects three scales, got {scale.numel()}")
+    channels = (2 + hc_mult) * hc_mult
+    if mixes.dim() == 0 or mixes.shape[-1] != channels:
+        raise ValueError(f"mHC mixes must have {channels} channels")
+    if scale.shape != (3,):
+        raise ValueError(f"mHC pre expects scale shape (3,), got {tuple(scale.shape)}")
+    if base.shape != (channels,):
+        raise ValueError(f"mHC pre expects base shape ({channels},), got {tuple(base.shape)}")
+    if not mixes.is_cuda or scale.device != mixes.device or base.device != mixes.device:
+        raise ValueError("Triton mHC mixes, scale, and base must be GPU tensors on the same device")
+    if any(tensor.dtype not in _TORCH_TO_TL_DTYPE for tensor in (mixes, scale, base)):
+        raise TypeError("Triton mHC mixes, scale, and base must use supported floating dtypes")
     return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps)
 
 
@@ -522,9 +535,13 @@ class _Sinkhorn(torch.autograd.Function):
 
 def sinkhorn_normalize(comb: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
     """Column-normalize ``comb``, then alternate row / column normalization ``iters - 1`` times."""
-    k = comb.shape[-1]
-    if comb.dim() < 2 or comb.shape[-2] != k:
+    if comb.dim() < 2 or comb.shape[-2] != comb.shape[-1]:
         raise ValueError(f"Sinkhorn expects a [..., K, K] tensor, got {tuple(comb.shape)}")
+    if not comb.is_cuda:
+        raise ValueError("Triton mHC Sinkhorn requires a GPU tensor")
+    if comb.dtype not in _TORCH_TO_TL_DTYPE:
+        raise TypeError(f"Triton mHC Sinkhorn does not support {comb.dtype}")
+    k = comb.shape[-1]
     _check_hc_mult(k)
     # The reference always applies the leading column normalization, so zero
     # iterations behaves like one.
@@ -653,9 +670,13 @@ def hc_collapse(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     ``x`` is ``[..., K, D]`` and ``pre`` is ``[..., K]``; ``pre`` may be FP32
     while ``x`` is BF16.
     """
+    if x.dim() < 2 or x.shape[-1] == 0:
+        raise ValueError(f"mHC collapse expects [..., K, D] with nonzero D, got {tuple(x.shape)}")
     _check_hc_mult(x.shape[-2])
     if pre.shape != x.shape[:-1]:
         raise ValueError(f"mHC collapse weights {tuple(pre.shape)} do not match streams {tuple(x.shape)}")
+    if not x.is_cuda or pre.device != x.device:
+        raise ValueError("Triton mHC collapse streams and weights must be GPU tensors on the same device")
     if x.dtype not in _TORCH_TO_TL_DTYPE or pre.dtype not in _TORCH_TO_TL_DTYPE:
         raise TypeError(f"mHC collapse expects floating streams and weights, got {x.dtype} and {pre.dtype}")
     return _Collapse.apply(x, pre)
@@ -829,6 +850,8 @@ def hc_post_mix(residual: torch.Tensor, output: torch.Tensor, post: torch.Tensor
     ``[..., K]`` and ``comb`` ``[..., K, K]``. Accumulates in FP32 and returns
     ``residual.dtype``.
     """
+    if residual.dim() < 2 or residual.shape[-1] == 0:
+        raise ValueError(f"mHC post expects residual [..., K, D] with nonzero D, got {tuple(residual.shape)}")
     k = residual.shape[-2]
     _check_hc_mult(k)
     if output.shape != residual.shape[:-2] + residual.shape[-1:]:
@@ -837,4 +860,10 @@ def hc_post_mix(residual: torch.Tensor, output: torch.Tensor, post: torch.Tensor
         raise ValueError(
             f"mHC post mixes {tuple(post.shape)} / {tuple(comb.shape)} do not match residual {tuple(residual.shape)}"
         )
+    if any(tensor.device != residual.device for tensor in (output, post, comb)) or not residual.is_cuda:
+        raise ValueError("Triton mHC post tensors must be GPU tensors on the same device")
+    if output.dtype != residual.dtype:
+        raise TypeError(f"mHC post output and residual must share a dtype, got {output.dtype} and {residual.dtype}")
+    if any(tensor.dtype not in _TORCH_TO_TL_DTYPE for tensor in (residual, output, post, comb)):
+        raise TypeError("Triton mHC post tensors must use supported floating dtypes")
     return _PostMix.apply(residual, output, post, comb)

@@ -273,7 +273,9 @@ On AMD ROCm GPUs, `mhc_implementation: triton` runs Triton forward/backward
 kernels adapted from AMD Primus for the norm, mix tail, Sinkhorn, collapse and
 post-mix; the mix GEMM stays an FP32 `F.linear`. It supports `hc_mult` in
 1, 2, 4, 8 and 16 and keeps the mix coefficients in FP32, like the TileKernels
-path.
+path. `configs/text/deepseek_v4_rocm.yaml` is a runnable ROCm example; it keeps
+the DSA indexer eager so this mHC selection does not depend on another feature
+branch.
 
 The same three fields select `cann` on Ascend, which requires
 `cann_ops_transformer`:

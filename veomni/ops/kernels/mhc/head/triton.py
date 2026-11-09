@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..helper import require_triton_input
+from ..helper import require_triton_input, require_triton_tensors
 
 
 def wrapper(
@@ -33,9 +33,18 @@ def wrapper(
     hc_eps: float,
 ) -> Tensor:
     """Collapse the residual streams with the Triton norm and collapse kernels."""
+    require_triton_input(hidden_streams, hc_mult)
+    expected_fn = (hc_mult, hc_mult * hidden_streams.shape[-1])
+    if fn.shape != expected_fn:
+        raise ValueError(f"Triton mHC head expects fn shape {expected_fn}, got {tuple(fn.shape)}")
+    if scale.shape != (1,):
+        raise ValueError(f"Triton mHC head expects scale shape (1,), got {tuple(scale.shape)}")
+    if base.shape != (hc_mult,):
+        raise ValueError(f"Triton mHC head expects base shape ({hc_mult},), got {tuple(base.shape)}")
+    require_triton_tensors(hidden_streams, fn=fn, scale=scale, base=base)
+
     from ..vendor.triton_mhc import hc_collapse, unweighted_rms_norm
 
-    require_triton_input(hidden_streams, hc_mult)
     mixes = F.linear(unweighted_rms_norm(hidden_streams.flatten(start_dim=2), norm_eps), fn.float())
     pre = torch.sigmoid(mixes * scale.float() + base.float()) + hc_eps
     return hc_collapse(hidden_streams, pre)
