@@ -28,8 +28,9 @@ Model selects experts → accumulate counts per layer → reach reporting step
 
 A reporting window includes multiple forwards and micro-batches. With an interval
 of 100 in a normal run starting from scratch, the first report covers observations
-from steps 1–100, and the next window starts at step 101. The heatmap caption shows
-the corresponding range.
+from steps 1–100, but its caption is `Steps 0-100` because the initial
+accumulation start is zero. The next window starts at step 101 and, if reported
+at step 200, is captioned `Steps 101-200`.
 
 ### Load normalization and imbalance metrics
 
@@ -59,9 +60,16 @@ For E experts, let `C[l,e]` be the count and
 `D[l,e] = E * P[l,e] - 1`. The three metrics are the maximum, minimum and mean
 absolute value of each row of D.
 
-Uniform routing with observations gives zero for all three. A registered layer
+Uniform routing with observations gives zero for all three. Once the monitor
+has allocated counters from at least one router observation, a registered layer
 without observations has a zero row, producing `max_vio=-1`, `min_vio=-1` and
 `avg_vio=1`. This means **no observations**, not balanced routing or measured load.
+
+Before any router has recorded data, the counter dictionary is empty:
+`_stack_and_reduce()` returns an empty matrix and `compute_metrics()` returns
+`{}`. No heatmap or violation metrics are published, and the caption range does
+not advance. Once counters exist, resets zero them without removing them; a
+later window with no new observations can therefore still produce zero rows.
 
 ### Aggregation across parallel ranks
 
@@ -74,7 +82,6 @@ The current callback supplies `parallel_state.fsdp_group` as the DP+SP aggregati
 group. It does not perform an additional expert-parallel (EP) group reduction,
 which would treat replicated gate observations as more distinct tokens. Although
 the generic argument help mentions EP/DP, this call chain determines the actual
-
 communication scope.
 
 ### Monitor integration and counting scope
@@ -93,6 +100,10 @@ monitor, so counts are not a census of unique training samples or tokens.
 
 ## Configuration and usage
 
+`OmniTrainer` (including SeedOmni runs) does not support this monitor: its
+argument validation rejects a positive `moe_load_balance_monitor_interval`.
+Use this feature with a supported MoE recipe on the standard trainer.
+
 Merge this fragment into an existing supported MoE recipe:
 
 ```yaml
@@ -110,7 +121,7 @@ for your intended online or offline mode before training.
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `train.moe_load_balance_monitor_interval` | `0` | Disabled at zero; the callback also disables for negative values. Use a positive integer N to report every N optimizer steps. |
+| `train.moe_load_balance_monitor_interval` | `0` | Disabled at zero; negative values are silently ignored and also disable monitoring. Use a positive integer N to report every N optimizer steps. |
 | `train.wandb.enable` | `false` | Required for the standard callback to publish scalars and images. Monitoring itself can be enabled without W&B. |
 
 Run through at least one reporting boundary. Confirm startup reports attached
@@ -121,5 +132,11 @@ router modules and inspect these W&B keys:
 * `moe/{max,min,avg}_vio/{max,avg}`: across-layer aggregates.
 
 Only global rank 0 publishes, but **all ranks must execute metric computation**.
+The current callback does not pass `format_only_on`, so every rank also builds
+the matplotlib heatmap and encodes its PNG at each non-empty report; non-logging
+ranks discard that formatted result. This adds CPU work even on those ranks.
+Custom callers can pass `format_only_on=False` on non-logging ranks to skip
+formatting, while still calling `compute_metrics` on every rank for reduction
+and counter reset.
 In particular, `moe/min_vio/max` is the maximum of the per-layer minimum values;
 it is not the most negative deficit across all layers.
