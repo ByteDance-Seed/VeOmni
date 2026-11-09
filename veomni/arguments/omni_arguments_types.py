@@ -291,7 +291,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         train_type=train_type,
         infer_type=infer_type,
         generation_kwargs={
-            **(omni_cfg.generation_kwargs or {} if infer_graph_from_ckpt and omni_cfg is not None else {}),
+            **(omni_cfg.generation_kwargs or {} if omni_cfg is not None else {}),
             **args.infer.generation_kwargs,
         },
     )

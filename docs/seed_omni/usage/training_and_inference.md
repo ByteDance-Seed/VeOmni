@@ -205,9 +205,9 @@ flowchart TB
 
 `generate()` always lives on the native `modeling.py`, so an all-eager Inferencer
 run builds the same object a native user gets from `OmniModel.from_pretrained`;
-the launcher only projects the YAML onto `OmniConfig` first. When `infer_graph`
-comes from the checkpoint, `infer.generation_kwargs` overrides the checkpoint's
-`generation_kwargs` defaults per key rather than replacing the bag.
+the launcher only projects the YAML onto `OmniConfig` first. When the checkpoint
+declares `generation_kwargs` defaults, `infer.generation_kwargs` overrides them
+per key rather than replacing the bag.
 
 **Native HF:**
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn as nn
@@ -50,38 +48,43 @@ def _make_veomni_runtime(cfg, modules):
 
 
 def test_bagel_text_encoder_injects_raw_bos_for_understanding() -> None:
-    """Verify ``BagelTextEncoder.generate`` appends an embedded BOS output item on the first understanding step."""
+    """Verify ``BagelTextEncoderPreprocessor`` appends a ``BAGEL_START_TOKEN`` BOS item for ``infer_und`` and ``BagelTextEncoder.generate`` embeds it."""
+    from tests.seed_omni.modules.bagel.test_processing import _bagel_template
+    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import BagelTextEncoderPreprocessor
+
     BagelTextEncoder = native_model_cls("bagel_text_encoder")
     BagelTextEncoderConfig = config_cls("bagel_text_encoder")
-    model = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=8, hidden_size=4)).eval()
-    model._chat_template = SimpleNamespace(bos_token_id=3)
+    model = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=256, hidden_size=4)).eval()
+    model._chat_template = _bagel_template()
     with torch.no_grad():
-        model.embed_tokens.weight.copy_(torch.arange(32, dtype=torch.float32).reshape(8, 4))
+        model.embed_tokens.weight.copy_(torch.arange(256 * 4, dtype=torch.float32).reshape(256, 4))
 
-    prompt = ConversationItem(
-        type="text",
-        value=torch.tensor([1, 2]),
-        role="user",
-        meta={"_omni_tokenized": True, "input_ids": torch.tensor([1, 2])},
-    )
-    conversation = model.generate([prompt], generation_kwargs={"infer_type": "infer_und"})["conversation_list"]
+    preprocessor = BagelTextEncoderPreprocessor(model._chat_template)
+    sample = [ConversationItem(type="text", value="hi", role="user")]
+    preprocessor({"conversation_list": [sample]}, inference=True, generation_kwargs={"infer_type": "infer_und"})
 
+    assert len(sample) == 2
+    assert sample[-1].type == "text"
+    assert sample[-1].role == "assistant"
+    assert sample[-1].meta[BAGEL_PHASE_KEY] == BAGEL_START_TOKEN
+    bos_id = model._chat_template.bos_token_id
+    assert sample[-1].meta["input_ids"].tolist() == [bos_id]
+
+    conversation = model.generate(sample)["conversation_list"]
     assert len(conversation) == 2
-    assert conversation[-1].type == "output"
     assert conversation[-1].meta[BAGEL_PHASE_KEY] == BAGEL_START_TOKEN
-    assert conversation[-1].meta["input_ids"].tolist() == [3]
-    torch.testing.assert_close(conversation[-1].value, model.embed_tokens.weight[3].reshape(1, 4))
+    torch.testing.assert_close(conversation[-1].value, model.embed_tokens.weight[bos_id].reshape(1, 4))
 
 
 def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(monkeypatch) -> None:
-    """Verify ``BagelQwen2MoT.generate`` prefills the prompt on ``prompt_encode`` and decodes the tail BOS token on ``text_ar``."""
+    """Verify ``BagelQwen2MoT.generate`` prefills the full ``conversation_list`` (including ``BAGEL_START_TOKEN``) on ``prompt_encode`` and decodes the tail ``output`` item on ``text_ar``."""
     BagelQwen2MoT = native_model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).eval()
     hidden_size = int(model.config.hidden_size)
     prompt = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
     bos = ConversationItem(
-        type="output",
+        type="text",
         value=torch.full((1, hidden_size), 2.0),
         role="assistant",
         meta={BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
@@ -93,11 +96,11 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
         calls.append(("prefill", list(conversation_list)))
         self._generation_state.main.install_cache(
             cache=self._new_empty_cache(),
-            cache_len=2,
-            next_position_id=torch.tensor(2),
+            cache_len=3,
+            next_position_id=torch.tensor(3),
             device=self.device,
         )
-        return torch.full((2, hidden_size), 3.0)
+        return torch.full((3, hidden_size), 3.0)
 
     def _decode(self, conversation_list):
         del self
@@ -107,21 +110,21 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
     monkeypatch.setattr(type(model), "_prefill_prompt", _prefill)
     monkeypatch.setattr(type(model), "_decode_next_token", _decode)
 
-    conversation = model.generate(
-        [prompt, bos],
-        generation_kwargs={"infer_type": "infer_und"},
-    )["conversation_list"]
-    assert calls == [("prefill", [prompt])]
-    assert conversation[-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
-    torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 2.0))
+    conversation = model.generate([prompt, bos])["conversation_list"]
+    assert calls == [("prefill", [prompt, bos])]
+    assert bos.type == "output"
+    assert bos.meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
+    torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 3.0))
 
-    conversation = model.generate(
-        conversation,
-        generation_kwargs={"infer_type": "infer_und"},
-    )["conversation_list"]
-    assert calls == [("prefill", [prompt]), ("decode", [prompt, bos])]
-    assert conversation == [prompt, bos]
+    conversation = model.generate(conversation)["conversation_list"]
+    assert calls == [("prefill", [prompt, bos])]
     assert BAGEL_PHASE_KEY not in bos.meta
+    torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 3.0))
+
+    conversation = model.generate(conversation)["conversation_list"]
+    assert calls == [("prefill", [prompt, bos]), ("decode", [prompt, bos])]
+    assert conversation == [prompt, bos]
+    assert bos.type == "output"
     torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 4.0))
 
 

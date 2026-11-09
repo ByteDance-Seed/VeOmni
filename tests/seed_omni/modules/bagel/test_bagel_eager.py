@@ -68,21 +68,31 @@ def test_eager_und_generate_runs(dtype: torch.dtype) -> None:
         role="user",
     )
     bos = ConversationItem(
-        type="output",
+        type="text",
         value=torch.randn(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
         role="assistant",
         meta={BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
     )
 
-    outputs = model.generate([prompt, bos], generation_kwargs={"infer_type": "infer_und"})
-    assert model._generation_state.main.cache is not None
-    assert outputs["conversation_list"][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
-
-    outputs = model.generate(outputs["conversation_list"], generation_kwargs={"infer_type": "infer_und"})
+    outputs = model.generate([prompt, bos])
     conversation = outputs["conversation_list"]
     tail = conversation[-1]
+    assert model._generation_state.main.cache is not None
+    assert tail.type == "output"
+    assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
+    assert torch.is_tensor(tail.value)
+    assert tail.value.dtype == dtype
+    assert tail.value.shape == (1, int(model.config.hidden_size))
+    assert torch.isfinite(tail.value).all()
+
+    outputs = model.generate(conversation)
+    tail = outputs["conversation_list"][-1]
     assert tail.type == "output"
     assert BAGEL_PHASE_KEY not in tail.meta
+
+    outputs = model.generate(outputs["conversation_list"])
+    tail = outputs["conversation_list"][-1]
+    assert tail.type == "output"
     assert torch.is_tensor(tail.value)
     assert tail.value.dtype == dtype
     assert tail.value.shape == (1, int(model.config.hidden_size))

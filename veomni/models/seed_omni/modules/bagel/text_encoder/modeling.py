@@ -9,7 +9,7 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, iter_desired_items, maybe_merge_outputs
 from ...text_encoder.modeling import TextEncoder
-from ..sources import BAGEL_FLOW_QUERY, BAGEL_PHASE_KEY, BAGEL_START_TOKEN
+from ..sources import BAGEL_FLOW_QUERY, BAGEL_PHASE_KEY
 from .configuration import BagelTextEncoderConfig
 from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 
@@ -82,11 +82,11 @@ class BagelTextEncoder(TextEncoder):
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Embed prompt text tokens, sample AR decode tokens, or emit ``start_image_gen``."""
+        """Embed prompt text tokens or sample the next AR decode token."""
         tail = conversation_list[-1]
         batched = [conversation_list]
 
-        if tail.type == "text" and tail.role == "user":
+        if tail.type == "text":
             input_ids, batch_shape = prepare_bagel_encode_input_ids(
                 batched,
                 device=self.device,
@@ -99,19 +99,6 @@ class BagelTextEncoder(TextEncoder):
                 device=self.device,
                 dtype=self.dtype,
             )
-            infer_type = str((generation_kwargs or {}).get("infer_type") or "infer_und")
-            if infer_type == "infer_und" and not self._bos_injected:
-                input_ids = self._token_id_tensor(self._chat_template.bos_token_id)
-                start_embed = self.encode(input_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
-                conversation_list.append(
-                    ConversationItem(
-                        type="output",
-                        value=start_embed,
-                        role="assistant",
-                        meta={"input_ids": input_ids.reshape(-1).detach(), BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
-                    )
-                )
-                self._bos_injected = True
             return {"conversation_list": batched[0]}
 
         if tail.type == "output":
@@ -134,12 +121,6 @@ class BagelTextEncoder(TextEncoder):
             if output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
                 outputs["generated"] = self._flush_text_generated(batched[0])
-            return outputs
-
-        outputs: Dict[str, Any] = {"conversation_list": batched[0]}
-        infer_type = str((generation_kwargs or {}).get("infer_type", ""))
-        if infer_type in {"infer_gen", "infer_edit"}:
-            outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
             return outputs
 
         raise ValueError(f"Invalid type: {tail.type}")

@@ -10,7 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
-from ..sources import BAGEL_CONTEXT_KEY, bagel_context
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_PHASE_KEY, BAGEL_START_TOKEN, bagel_context
 from .processing import is_bagel_vision_marker
 
 
@@ -75,7 +75,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
             generation_kwargs=generation_kwargs,
         )
         if add_generation_prompt:
-            parts = self.apply_generation_prompt(parts)
+            parts = self.apply_generation_prompt(parts, generation_kwargs=generation_kwargs)
         self.tokenize(parts)
         return self.merge_text_embeds(parts)
 
@@ -97,8 +97,26 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
         return self._insert_prompt_context_image_markers(sample)
 
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
-        return sample
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
+        """Append the assistant ``<|im_start|>`` start token for understanding inference."""
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        if infer_type != "infer_und":
+            return sample
+        out = list(sample)
+        out.append(
+            ConversationItem(
+                type="text",
+                value=self.chat_markers.bos_token,
+                role="assistant",
+                meta={"loss_mask": 0, BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
+            )
+        )
+        return out
 
     def tokenize(self, parts: list[ConversationItem]) -> None:
         """Tokenize untokenized text items in place and populate ``input_ids``, ``labels``, and ``attention_mask``."""

@@ -840,7 +840,9 @@ def test_bagel_preprocessors_route_tagged_edit_without_infer_type() -> None:
 
 
 def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only() -> None:
-    """Verify ``infer_und`` preprocessing routes user images to SigLIP context only."""
+    """Verify ``infer_und`` preprocessing routes user images to SigLIP context only and appends the assistant start token."""
+    from veomni.models.seed_omni.modules.bagel.sources import BAGEL_PHASE_KEY, BAGEL_START_TOKEN
+
     vae_pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
@@ -854,9 +856,11 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only() -> 
     vae_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
     text_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
 
-    assert [item.type for item in batch[0]] == ["text", "image", "text"]
+    assert [item.type for item in batch[0]] == ["text", "image", "text", "text"]
     assert batch[0][1].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert torch.equal(batch[0][1].value, image)
+    assert batch[0][-1].role == "assistant"
+    assert batch[0][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
 
 
 def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context() -> None:

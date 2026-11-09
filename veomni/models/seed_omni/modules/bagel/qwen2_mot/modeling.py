@@ -102,30 +102,34 @@ class InferenceMixin:
             raise ValueError("BAGEL Qwen2-MoT generate requires conversation_list.")
 
         generation_kwargs = generation_kwargs or {}
-        infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
-        # Generation/edit rebuilds all CFG prompt caches. Understanding reuses
-        # the main cache and starts AR from the raw assistant BOS embedding.
-        if infer_mode == "gen":
+        tail = conversation_list[-1]
+        is_start_token = bagel_phase(tail) == BAGEL_START_TOKEN
+        # Prefill the full conversation_list (including the assistant start token
+        # on understanding requests). The first text_ar pass returns the prefilled
+        # start-token hidden state; subsequent AR steps decode the tail output item.
+        if self._generation_state.main.cache is None or tail.type != "output":
             hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
-        elif self._generation_state.main.cache is None:
-            tail = conversation_list[-1]
-            if tail.type != "output" or bagel_phase(tail) != BAGEL_START_TOKEN:
-                raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
-            self._prefill_prompt(conversation_list[:-1], generation_kwargs)
+            if is_start_token:
+                if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                    hidden_states = hidden_states.squeeze(0)
+                if hidden_states.dim() != 2:
+                    raise ValueError(
+                        f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}."
+                    )
+                tail.type = "output"
+                tail.value = hidden_states[-1:].contiguous()
             return {"conversation_list": conversation_list}
-        else:
-            hidden_states = self._decode_next_token(conversation_list)
 
-        if infer_mode != "gen":
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            if hidden_states.dim() != 2:
-                raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
-            tail = conversation_list[-1]
-            if tail.type != "output":
-                raise ValueError(f"BAGEL understanding decode expects tail output item, got {tail.type!r}.")
-            tail.value = hidden_states[-1:].contiguous()
+        if is_start_token:
             tail.meta.pop(BAGEL_PHASE_KEY, None)
+            return {"conversation_list": conversation_list}
+
+        hidden_states = self._decode_next_token(conversation_list)
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+        if hidden_states.dim() != 2:
+            raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
+        tail.value = hidden_states[-1:].contiguous()
         return {"conversation_list": conversation_list}
 
     def _prepare_denoise_query(

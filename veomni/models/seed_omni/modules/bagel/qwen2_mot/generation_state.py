@@ -208,7 +208,6 @@ class MotGenerationState:
     also remembers the branch layout between denoise and velocity collection.
     """
 
-    _infer_mode: str = "und"
     _velocity_buffer: dict[str, torch.Tensor] = field(default_factory=dict)
     _pending_denoise_branches: tuple[str, ...] | None = None
     _pending_denoise_query_len: int | None = None
@@ -217,27 +216,12 @@ class MotGenerationState:
     _cfg_img: MotCacheContext = field(default_factory=lambda: MotCacheContext("image CFG"))
 
     def reset(self) -> None:
-        self._infer_mode = "und"
         self._velocity_buffer.clear()
         self._pending_denoise_branches = None
         self._pending_denoise_query_len = None
         self._main.reset()
         self._cfg_text.reset()
         self._cfg_img.reset()
-
-    def update_infer_mode(self, generation_kwargs: dict[str, Any]) -> str:
-        """Update and return the sticky inference mode (``'und'`` or ``'gen'``) from ``generation_kwargs``."""
-        # Later graph steps omit infer_type, so the mode is sticky until the
-        # graph resets this module's local inference state.
-        if "infer_type" in generation_kwargs:
-            infer_type = str(generation_kwargs["infer_type"])
-            if infer_type not in {"infer_und", "infer_gen", "infer_edit"}:
-                raise ValueError(f"Unsupported BAGEL infer_type: {infer_type!r}.")
-            infer_mode = "und" if infer_type == "infer_und" else "gen"
-        else:
-            infer_mode = self._infer_mode or "und"
-        self._infer_mode = infer_mode
-        return self._infer_mode
 
     # ── CFG cache contexts ──────────────────────────────────
 

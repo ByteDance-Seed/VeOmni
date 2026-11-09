@@ -968,28 +968,12 @@ def test_omni_model_resolve_generation_kwargs_uses_config_defaults():
     model = _build_omni_model()
     model.config.generation_kwargs = {"max_new_tokens": 64}
 
-    assert model.config.infer_type == "infer_gen"
-    assert model.resolve_generation_kwargs(None) == {
-        "max_new_tokens": 64,
-        "infer_type": "infer_gen",
-    }
+    assert model.resolve_generation_kwargs(None) == {"max_new_tokens": 64}
     assert model.resolve_generation_kwargs({"temperature": 0.2}) == {
         "max_new_tokens": 64,
         "temperature": 0.2,
-        "infer_type": "infer_gen",
     }
-    assert model.resolve_generation_kwargs({"max_new_tokens": 8}) == {
-        "max_new_tokens": 8,
-        "infer_type": "infer_gen",
-    }
-    assert model.resolve_generation_kwargs({"infer_type": "infer_und"}) == {
-        "max_new_tokens": 64,
-        "infer_type": "infer_und",
-    }
-    assert model.resolve_generation_kwargs({"infer_type": None}) == {
-        "max_new_tokens": 64,
-        "infer_type": "infer_gen",
-    }
+    assert model.resolve_generation_kwargs({"max_new_tokens": 8}) == {"max_new_tokens": 8}
 
 
 def test_omni_model_post_init_unions_child_no_split_modules():
