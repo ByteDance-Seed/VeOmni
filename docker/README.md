@@ -100,27 +100,7 @@ docker build --platform "$platform" \
   --label "ai.veomni.target=$target" \
   --build-arg FLA_BUILD_JOBS=4 -t "$image" .
 
-mkdir -p reports
-docker image inspect "$image" > reports/image-inspect.json
-docker run --rm --entrypoint /bin/bash \
-  -v "$PWD/reports:/reports" \
-  -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-  -e TARGET="$target" -e REVISION="$revision" "$image" -c '
-    set -eo pipefail
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    python /app/docker/ascend/tests/ascend_image_smoke.py \
-      --image-inspect /reports/image-inspect.json \
-      --expected-docker-commit "$REVISION" --target "$TARGET" \
-      --output /reports/smoke.json
-  '
 ```
-
-The smoke validates the image architecture, Python 3.12, CANN, package versions,
-retained wheel checksums, FLA Stable ABI, and library imports without NPU execution.
-It accepts Python 3.12 patch updates, unlike the source branch's exact 3.12.16
-check. `pip check` results are recorded separately: a passed packaging smoke
-can still have `dependency_consistent=false` (including the project's original
-torch-npu pin versus the image's post7 override). Inspect both fields before use.
 
 The retained `/app/<target>-ci-wheels.sha256` and wheels can be used to restore
 these overrides after creating a separate CI environment. A new `uv sync` does
@@ -130,15 +110,14 @@ and checksums record a particular build, not a fully locked dependency solution.
 
 These additions do not change the existing automatic Quay publishing workflows.
 The source fork's private GHCR candidate workflows and A5 diagnostics are not
-included. Full image builds, packaging smoke and target-device numerical tests
+included. Full image builds and target-device numerical tests
 must pass before these candidates are treated as validated runtime images.
 
 ### Build an A2 x86 candidate in GitHub Actions
 
 The `Build CANN 9.2.1 A2 candidate` workflow builds the A3-derived A2 x86
-Dockerfile on a hosted runner without an NPU. It runs the packaging smoke before
-pushing `ghcr.io/<owner>/veomni:cann921-a2-x86-<commit>` and uploads the smoke
-report. Inspect `dependency_consistent` separately from packaging status.
+Dockerfile on a hosted runner without an NPU and publishes
+`ghcr.io/<owner>/veomni:cann921-a2-x86-<commit>`.
 Pushing Docker changes to zpl1n/ascend-cann921-a2-a3 triggers the build.
 Manual dispatch also works once the workflow exists on the default branch.
 Make the GHCR package publicly pullable before using it in upstream PR CI.
@@ -149,12 +128,8 @@ image until a candidate has been published and verified.
 
 The `Build CANN 9.2.1 A3 candidate` workflow in
 [build-cann921-a3.yml](../.github/workflows/build-cann921-a3.yml) is manual-only.
-It builds the A3 Dockerfile on `ubuntu-22.04-arm` for `linux/arm64`, runs the
-packaging smoke without an NPU, and publishes only after that smoke passes:
+It builds the A3 Dockerfile on `ubuntu-22.04-arm` for `linux/arm64` and publishes:
 `ghcr.io/<owner>/veomni:cann921-a3-arm64-<commit>-<run-id>-<attempt>`.
-The smoke report is retained as the `cann921-a3-packaging` artifact, including
-on failures when a report is available. Dependency consistency is reported
-separately; a successful build is not NPU hardware acceptance.
 
 Register the workflow on the repository's default branch before manual dispatch,
 then select `zpl1n/ascend-cann921-a2-a3` as the run branch. For this fork:
