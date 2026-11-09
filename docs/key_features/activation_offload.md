@@ -168,8 +168,8 @@ Swap Stream:     [D2H Layer 0]     [D2H Layer 1]     [D2H Layer 2]    ...
 ```
 
 During the forward pass, after computing each layer's forward, the hidden states are
-copied to CPU on the swap stream without blocking the default stream. The GPU storage
-is then freed (after synchronization), reducing peak memory.
+copied to CPU on the swap stream without blocking the default stream. After synchronization, the tensor is rebound to empty storage. The original
+allocation can be released only when no other references or aliases retain it.
 During the backward pass, before each layer's backward needs its hidden states, they
 are prefetched back to GPU on the swap stream.
 
@@ -233,23 +233,21 @@ Args:
 
 #### `async_save_on_cpu(block_idx, depth, manager, custom_check_fn=None, prefetch=True)`
 
-A `saved_tensors_hooks` context that intercepts saved tensors and offloads them to
-CPU. The high-level API supplies one manager per matched module sequence. Manual
-callers must create and reuse a manager for all blocks in the same sequence:
+A low-level `saved_tensors_hooks` context. Prefer the high-level
+`apply_async_activation_offload` example above for a supported model: it selects
+module inputs and handles matching views when `hidden_states` is identifiable.
+Verify that selected modules expose that input; otherwise the wrapper can also
+fall back to an unfiltered hook. Do not wrap an arbitrary sequence of
+blocks with the unfiltered low-level hook. Without `custom_check_fn`, every
+eligible saved tensor can be selected, including outputs already saved by an
+earlier block; changing their storage during a later pack can violate autograd's
+saved-tensor contract.
 
-```python
-from veomni.distributed.async_offload import OffloadManager, PinnedBufferPool, async_save_on_cpu
-
-pool = PinnedBufferPool()
-manager = OffloadManager(host_buffer_pool=pool)
-try:
-    for block_idx, block in enumerate(blocks):
-        with async_save_on_cpu(block_idx=block_idx, depth=len(blocks), manager=manager):
-            hidden_states = block(hidden_states)
-    loss_fn(hidden_states).backward()
-finally:
-    manager.reset()
-```
+Manual integrations must establish compatible checkpoint boundaries and tensor
+ownership, filter the intended safe inputs, and share one `OffloadManager` across
+the sequence. They must reset that manager after backward or failure. A filter
+alone does not establish compatibility for an arbitrary model; retain the Wan
+restriction above and validate the integration on the target device.
 
 Args:
 
@@ -270,10 +268,11 @@ lifecycle across GPU and CPU:
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
    (non-blocking). Record a `d2h_event` for synchronization.
-3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, free the GPU
-   storage by resizing to 0.
-4. **H2D (launch_h2d):** On the swap stream, resize GPU storage back and copy from
-   pinned CPU buffer (non-blocking). Record an `h2d_event`.
+3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, bind the tensor
+   to fresh empty storage. Aliases may keep its original allocation alive.
+4. **H2D (launch_h2d):** On the swap stream, allocate new device storage with the
+   saved size/stride, copy from the pinned CPU buffer (non-blocking), and bind
+   the tensor to that restored storage. Record an `h2d_event`.
 5. **Wait H2D:** The default stream waits on `h2d_event` before accessing the tensor.
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`

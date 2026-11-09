@@ -54,7 +54,10 @@ a sampled step successfully records:
 In general, let `S_c` be source c's loss sum, `N_c` its valid token count, and
 `N = sum_c N_c` the total successfully recorded count. These metrics are
 `S_c / N_c`, `S_c / N` and `N_c`, respectively. A source with zero valid tokens
-emits no metrics.
+omits these three CE-related metrics. If sample metadata was recorded, it can
+still emit `samples/<source>`, `input_tokens/<source>` and
+`label_tokens_per_sample/<source>` (supervised tokens divided by samples). These
+help diagnose sources that provide input samples but no supervision.
 
 The example contributions sum to `1.5 + 0.75 = 2.25`, the overall mean CE of the
 successfully recorded tokens. This need not equal the trainer's returned loss:
@@ -81,8 +84,10 @@ computation.
 A causal language model predicts the next token from the current position, so CE
 must use the corresponding next-token label. Outside SP, labels are shifted unless
 `shift_labels` is already supplied. Under sequence parallelism (SP), the collator
-has already shifted them; they must not be shifted twice. Ignored labels and
-masked padding do not contribute to the denominator.
+has already shifted them; they must not be shifted twice. Valid-token counting
+uses labels different from `ignore_index`. Padding labels must also be set to
+`ignore_index`; masking padding only in `attention_mask` does not exclude it
+from these CE metrics or their denominator.
 
 SP splits sequences across processes, so one original sequence may cross a slice
 boundary. The computer uses segment information to preserve its source, combines
@@ -118,6 +123,8 @@ Merge this **configuration fragment** into a working causal-LM text or VLM recip
 
 ```yaml
 train:
+  wandb:
+    enable: true
   channel_loss:
     enable: true
     interval: 10
@@ -150,7 +157,10 @@ packed_metadata = {
 Use the original recipe's launch command after merging. First use `interval: 1`
 for a short diagnostic run and check metadata errors and token counts; then
 increase the interval for normal training. The callback adds metrics to both
-`step_train_metrics` and `step_env_metrics` for the existing trainer logging
-callbacks. Keys use `<stable-source-id>__<sanitized-display-name>`, such as
+`step_train_metrics` and `step_env_metrics`. Enable W&B as in the fragment
+above and configure its online/offline mode, or register a metrics-consuming
+callback after `ChannelLossCallback`. With the default `train.wandb.enable: false`,
+the standard logging callbacks do not expose these metrics: `TqdmCallback` runs
+before they are added. Keys use `<stable-source-id>__<sanitized-display-name>`, such as
 `channel_loss/source-i-0__books` for integer source 0 named books. IDs prevent distinct
 sources with colliding sanitized names from silently sharing a time series.

@@ -215,6 +215,22 @@ always win — a fallback is consulted only when the current path is absent.
 | `model/extra_state/extra_state_rank_{R}.pt` | The model-side loader reads this sidecar from the resolved model directory if present; it does not restore a standalone `lr_scheduler.pt`. |
 | `loader/rank_{R}.pt`, `extra_state/rank_{R}.pt` | `trainer_state_rank_{R}.pt`, then the 0.1.12 pickle's job cursor when `global_step` is present |
 
+A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
+can pass marker discovery even when the per-rank model sidecars are missing.
+The current loader skips missing sidecars; the default runtime then keeps its
+initialized scheduler rather than restoring the saved schedule. Do not continue
+training assuming that discovery proves scheduler restoration.
+
+For such a checkpoint, resume with the compatible revision/environment that
+wrote and reads that scheduler layout, and verify the restored step and learning
+rate before continuing. To migrate instead, work on a copy: convert the saved
+scheduler state into the `lr_scheduler` key of each rank's model
+`extra_state/extra_state_rank_{R}.pt`, preserving any model-specific rank-local
+state as well. This is a format conversion, not a file rename; the repository
+does not provide an automatic standalone-scheduler fallback here. Validate the
+restored scheduler state and next learning-rate update against a compatible
+resume before using the converted checkpoint for training.
+
 What those older shapes looked like:
 
 | Era | Step directory |

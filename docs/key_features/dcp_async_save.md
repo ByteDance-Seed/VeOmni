@@ -128,7 +128,7 @@ Merge this **configuration fragment** into an existing distributed recipe:
 train:
   checkpoint:
     manager: dcp
-    output_dir: output/async-check
+    output_dir: /shared/veomni/async-check
     save_async: true
     save_steps: 100
     save_epochs: 0
@@ -137,11 +137,16 @@ train:
     save_hf_weights: false
 ```
 
+Replace `/shared/veomni/async-check` with storage mounted at the same path and
+readable/writable by every rank on every node, or retain the recipe's existing
+shared output directory. An absolute path alone does not make storage shared.
+With `dcp_save_to_lowest_rank: false`, shards may be written on different nodes;
+separate node-local directories do not form a complete resumable checkpoint.
 Keep the recipe's model/data/optimizer settings and run its original launch
 command. The directory for optimizer step 100 is:
 
 ```text
-output/async-check/
+/shared/veomni/async-check/
   model_assets/
   checkpoints/
     global_step_100/
@@ -176,7 +181,7 @@ completion, merge this setting into an otherwise compatible recipe:
 ```yaml
 train:
   checkpoint:
-    load_path: output/async-check/checkpoints/global_step_100
+    load_path: /shared/veomni/async-check/checkpoints/global_step_100
 ```
 
 The examples are verifiable configuration fragments, not a self-contained training
