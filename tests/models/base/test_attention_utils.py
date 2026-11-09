@@ -358,11 +358,12 @@ def test_mask_utils_create_causal_mask_isolates_packed_samples_with_2d_all_ones_
         assert _mask_kept(mask, 4, 3)
 
 
-def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
+@pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_flex_attention", "flash_attention_2"])
+def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples(impl):
     from torch.nn.attention.flex_attention import BlockMask
 
     config = PreTrainedConfig()
-    config._attn_implementation = "veomni_flex_attention"
+    config._attn_implementation = impl
     config.sliding_window = 3
     inputs_embeds = torch.randn(1, 8, 16)
     attention_mask = torch.ones(1, 8, dtype=torch.long)
@@ -377,11 +378,224 @@ def test_mask_utils_create_sliding_window_causal_mask_isolates_packed_samples():
         position_ids=position_ids,
         cu_seq_lens_q=cu_seqlens,
     )
-    assert isinstance(mask, BlockMask)
-    zero = torch.tensor(0)
-    assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
-    assert not mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
-    assert mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
+    if impl == "flash_attention_2":
+        # Flash carries the sliding window in kernel kwargs and returns None for all-valid inputs.
+        assert mask is None
+        padded = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long)
+        mask_padded = create_sliding_window_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=padded,
+            past_key_values=None,
+            position_ids=position_ids,
+            cu_seq_lens_q=cu_seqlens,
+        )
+        assert isinstance(mask_padded, torch.Tensor) and mask_padded.shape == (1, 8)
+        torch.testing.assert_close(mask_padded, padded)
+    elif impl == "veomni_flex_attention":
+        assert isinstance(mask, BlockMask)
+        zero = torch.tensor(0)
+        assert not mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+        assert not mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
+        assert mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
+    else:
+        assert isinstance(mask, torch.Tensor)
+        assert mask.shape == (1, 1, 8, 8)
+        assert not _mask_kept(mask, 3, 2)
+        assert not _mask_kept(mask, 7, 3)
+        assert _mask_kept(mask, 7, 5)
+
+
+def test_create_causal_mask_unpacked_multi_row_batch_preserves_sdpa_fast_path():
+    """An unpacked B>=2 batch has cu_seqlens.numel() >= 3 ([0, S, 2*S]) and must still return None on SDPA."""
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
+    inputs_embeds = torch.randn(2, 6, 8)
+    attention_mask = torch.ones(2, 6, dtype=torch.long)
+    cu_seqlens = torch.tensor([0, 6, 12], dtype=torch.int32)
+
+    assert (
+        create_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            cu_seq_lens_q=cu_seqlens,
+        )
+        is None
+    )
+
+
+def _row_kept_keys(mask, impl: str, query: int, kv_len: int) -> list[int]:
+    if impl == "veomni_flex_attention":
+        zero = torch.tensor(0)
+        q = torch.tensor(query)
+        return [k for k in range(kv_len) if bool(mask.mask_mod(zero, zero, q, torch.tensor(k)))]
+    return [k for k in range(kv_len) if _mask_kept(mask, query, k)]
+
+
+@pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_flex_attention"])
+def test_create_sliding_window_causal_mask_applies_or_mask_function_after_window(impl):
+    """or_mask_function must be composed on top of (causal AND window), matching HF."""
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    config.sliding_window = 3
+
+    # 1. All-true overlay: within each packed segment, every key is visible; across segments, isolated.
+    inputs_8 = torch.randn(1, 8, 8)
+    mask_packed = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_8,
+        attention_mask=torch.ones(1, 8, dtype=torch.long),
+        past_key_values=None,
+        or_mask_function=lambda *args: torch.tensor(True, dtype=torch.bool),
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    assert _row_kept_keys(mask_packed, impl, 1, 8) == [0, 1, 2, 3]
+    assert _row_kept_keys(mask_packed, impl, 5, 8) == [4, 5, 6, 7]
+
+    # Single-segment [0, 8] matches the non-packed HF path on all 8 keys.
+    if impl == "veomni_flex_attention":
+        mask_single = create_sliding_window_causal_mask(
+            config=config,
+            inputs_embeds=inputs_8,
+            attention_mask=torch.ones(1, 8, dtype=torch.long),
+            past_key_values=None,
+            or_mask_function=lambda *args: torch.tensor(True, dtype=torch.bool),
+            cu_seq_lens_q=torch.tensor([0, 8], dtype=torch.int32),
+        )
+        assert _row_kept_keys(mask_single, impl, 1, 8) == list(range(8))
+
+    # 2. Sink-style overlay (keep key 0 of the segment): key 0 survives outside the sliding window.
+    inputs_10 = torch.randn(1, 10, 8)
+    sink_overlay = lambda *args: args[3] == 0  # noqa: E731
+    mask_sink_packed = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_10,
+        attention_mask=torch.ones(1, 10, dtype=torch.long),
+        past_key_values=None,
+        or_mask_function=sink_overlay,
+        cu_seq_lens_q=torch.tensor([0, 5, 10], dtype=torch.int32),
+    )
+    mask_sink_unpacked = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_10[:, :5],
+        attention_mask=torch.ones(1, 5, dtype=torch.long),
+        past_key_values=None,
+        or_mask_function=sink_overlay,
+    )
+    # Query 4 (window [2, 3, 4]) also keeps key 0 via or_mask_function, and matches unpacked HF.
+    assert _row_kept_keys(mask_sink_packed, impl, 4, 10) == [0, 2, 3, 4]
+    assert _row_kept_keys(mask_sink_unpacked, impl, 4, 5) == [0, 2, 3, 4]
+
+
+@pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_flex_attention"])
+def test_create_sliding_window_causal_mask_non_causal_uses_symmetric_window(impl):
+    """When config.is_causal is False, the packed sliding window is symmetric (abs(q - kv) <= sw)."""
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    config.is_causal = False
+    config.sliding_window = 2
+    inputs_embeds = torch.randn(1, 8, 8)
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+
+    mask_packed = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    # Segment 0 is [0, 1, 2, 3]; symmetric window sw=2 means |q - kv| <= 2 within the segment.
+    assert _row_kept_keys(mask_packed, impl, 0, 8) == [0, 1, 2]
+    assert _row_kept_keys(mask_packed, impl, 1, 8) == [0, 1, 2, 3]
+    assert _row_kept_keys(mask_packed, impl, 3, 8) == [1, 2, 3]
+    # Segment 1 is [4, 5, 6, 7]; q=4 must not see k=2 or k=3 from segment 0.
+    assert _row_kept_keys(mask_packed, impl, 4, 8) == [4, 5, 6]
+
+    # Single-segment [0, 4] matches the non-packed HF path on every row.
+    mask_unpacked = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=inputs_embeds[:, :4],
+        attention_mask=attention_mask[:, :4],
+        past_key_values=None,
+    )
+    for q in range(4):
+        assert _row_kept_keys(mask_packed, impl, q, 4) == _row_kept_keys(mask_unpacked, impl, q, 4)
+
+
+def test_create_sliding_window_causal_mask_validates_explicit_sliding_window():
+    config = PreTrainedConfig()
+    config._attn_implementation = "sdpa"
+    config.sliding_window = 4
+    inputs_embeds = torch.randn(1, 8, 8)
+
+    with pytest.raises(ValueError, match="disagrees with config.sliding_window"):
+        create_sliding_window_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=None,
+            sliding_window=2,
+        )
+
+    missing_cfg = PreTrainedConfig()
+    missing_cfg._attn_implementation = "flash_attention_2"
+    with pytest.raises(ValueError, match="sliding_window"):
+        create_sliding_window_causal_mask(
+            config=missing_cfg,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=None,
+        )
+
+    explicit_cfg = PreTrainedConfig()
+    explicit_cfg._attn_implementation = "sdpa"
+    mask = create_sliding_window_causal_mask(
+        config=explicit_cfg,
+        inputs_embeds=inputs_embeds,
+        attention_mask=torch.ones(1, 8, dtype=torch.long),
+        past_key_values=None,
+        sliding_window=2,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    assert getattr(explicit_cfg, "sliding_window", None) is None
+    assert _row_kept_keys(mask, "sdpa", 3, 8) == [2, 3]
+
+
+def test_mask_utils_does_not_mutate_veomni_config_or_subconfigs():
+    from transformers import Gemma3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    config = as_veomni_config(Gemma3Config())
+    assert config.ops_implementation == {}
+    assert config.text_config.ops_implementation == {}
+    assert config.vision_config.ops_implementation == {}
+    assert "ops_implementation" not in config.to_diff_dict()
+
+    inputs_embeds = torch.randn(1, 8, 8)
+    for attn_impl in ("eager", "sage_attention"):
+        create_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=None,
+            attn_implementation=attn_impl,
+        )
+        create_sliding_window_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=None,
+            sliding_window=4,
+            attn_implementation=attn_impl,
+        )
+
+    assert config.ops_implementation == {}
+    assert config.text_config.ops_implementation == {}
+    assert config.vision_config.ops_implementation == {}
+    assert "ops_implementation" not in config.to_diff_dict()
 
 
 @pytest.mark.parametrize("impl", ["sage_attention", "veomni_sage_attention"])

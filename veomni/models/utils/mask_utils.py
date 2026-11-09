@@ -44,6 +44,24 @@ from veomni.ops.mask import (
 )
 
 
+class _AttnImplView:
+    """Expose one attention impl for HF mask dispatch without mutating the config."""
+
+    def __init__(self, config: PreTrainedConfig, impl: str, sliding_window: int | None = None) -> None:
+        object.__setattr__(self, "_config", config)
+        object.__setattr__(self, "_impl", impl)
+        object.__setattr__(self, "_sliding_window", sliding_window)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "sliding_window" and self._sliding_window is not None:
+            return self._sliding_window
+        return getattr(self._config, name)
+
+    @property
+    def _attn_implementation(self) -> str:
+        return self._impl
+
+
 def _resolve_attn_implementation(config: PreTrainedConfig, attn_implementation: str | None = None) -> str:
     """Resolve the active attention implementation from ``config``."""
     if isinstance(attn_implementation, str) and attn_implementation:
@@ -79,7 +97,7 @@ def _extract_cu_seqlens(kwargs: dict[str, Any]) -> tuple[Tensor | None, Tensor |
     return cu_q, cu_k
 
 
-def _should_use_packed_mask(cu_seqlens: Tensor | None, attn_impl: str) -> bool:
+def _should_use_packed_mask(cu_seqlens: Tensor | None, attn_impl: str, batch_size: int = 1) -> bool:
     """Return whether ``cu_seqlens`` should route through ``veomni.ops.mask``."""
     if cu_seqlens is None:
         return False
@@ -88,7 +106,19 @@ def _should_use_packed_mask(cu_seqlens: Tensor | None, attn_impl: str) -> bool:
         return False
     if canonical in ("flex_attention", "magi_attention"):
         return True
-    return cu_seqlens.numel() >= 3
+    # ``cu_seqlens`` is batch-flattened: one segment per row is not packing.
+    return cu_seqlens.numel() - 1 > batch_size
+
+
+def _resolve_sliding_window(config: PreTrainedConfig, sliding_window: int | None = None) -> int:
+    """Resolve and cross-check ``sliding_window`` against ``config.sliding_window``."""
+    config_window = getattr(config, "sliding_window", None)
+    if sliding_window is not None and config_window is not None and sliding_window != config_window:
+        raise ValueError(f"sliding_window={sliding_window} disagrees with config.sliding_window={config_window}.")
+    resolved = sliding_window if sliding_window is not None else config_window
+    if resolved is None:
+        raise ValueError("Could not find a `sliding_window` argument in the config, or it is not set")
+    return resolved
 
 
 def _is_prebuilt_mask(attention_mask: Tensor | BlockMask | MagiAttentionMask | None) -> bool:
@@ -176,7 +206,7 @@ def _finalize_packed_mask(
             existing_4d_mask = _to_eager_additive(existing_4d_mask, packed_kwargs["dtype"])
         mask = _merge_dense_attention_masks(existing_4d_mask, mask)
 
-    if canonical == "eager" and cu_seqlens.numel() >= 3:
+    if canonical == "eager" and cu_seqlens.numel() - 1 > packed_kwargs["batch_size"]:
         packed_only_kwargs = dict(packed_kwargs)
         packed_only_kwargs.pop("attention_mask", None)
         packed_only_kwargs["impl"] = "sdpa"
@@ -256,7 +286,7 @@ def create_causal_mask(
 
     attn_impl = _resolve_attn_implementation(config, kwargs.get("attn_implementation"))
     cu_seqlens, cu_seqlens_k = _extract_cu_seqlens(kwargs)
-    if _should_use_packed_mask(cu_seqlens, attn_impl):
+    if _should_use_packed_mask(cu_seqlens, attn_impl, inputs_embeds.shape[0]):
         assert cu_seqlens is not None
         past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
         if past_seen > 0:
@@ -295,26 +325,19 @@ def create_causal_mask(
         return attention_mask
 
     hf_impl = "veomni_sage_attention" if attn_impl == "sage_attention" else attn_impl
-    previous_impl = getattr(config, "_attn_implementation", None)
-    changed_impl = previous_impl != hf_impl
-    if changed_impl:
-        config._attn_implementation = hf_impl
-    try:
-        return _hf_create_causal_mask(
-            config=config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            or_mask_function=or_mask_function,
-            and_mask_function=and_mask_function,
-            block_sequence_ids=block_sequence_ids,
-            layer_idx=layer_idx,
-            allow_is_causal_skip=allow_is_causal_skip,
-        )
-    finally:
-        if changed_impl:
-            config._attn_implementation = previous_impl
+    hf_config = config if getattr(config, "_attn_implementation", None) == hf_impl else _AttnImplView(config, hf_impl)
+    return _hf_create_causal_mask(
+        config=hf_config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        or_mask_function=or_mask_function,
+        and_mask_function=and_mask_function,
+        block_sequence_ids=block_sequence_ids,
+        layer_idx=layer_idx,
+        allow_is_causal_skip=allow_is_causal_skip,
+    )
 
 
 def create_sliding_window_causal_mask(
@@ -328,22 +351,27 @@ def create_sliding_window_causal_mask(
     block_sequence_ids: Tensor | None = None,
     layer_idx: int | None = None,
     allow_is_causal_skip: bool = True,
+    sliding_window: int | None = None,
     **kwargs: Any,
 ) -> Tensor | BlockMask | MagiAttentionMask | None:
-    """Create a sliding-window causal mask, routing packed ``cu_seq_lens_q`` inputs through ``veomni.ops.mask``."""
+    """Create a sliding-window causal mask, routing packed ``cu_seq_lens_q`` inputs through ``veomni.ops.mask``.
+
+    Flash-like backends return ``None`` (or a 2D padding mask) here and do not
+    encode the window in the returned mask; callers must still forward
+    ``sliding_window=...`` to the attention forward. When ``sliding_window`` is
+    provided explicitly, it is cross-checked against ``config.sliding_window``.
+    """
     if isinstance(attention_mask, (BlockMask, MagiAttentionMask)):
         return attention_mask
 
     attn_impl = _resolve_attn_implementation(config, kwargs.get("attn_implementation"))
     cu_seqlens, cu_seqlens_k = _extract_cu_seqlens(kwargs)
-    if _should_use_packed_mask(cu_seqlens, attn_impl):
+    if _should_use_packed_mask(cu_seqlens, attn_impl, inputs_embeds.shape[0]):
         assert cu_seqlens is not None
         past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
         if past_seen > 0:
             raise ValueError("Packed sliding-window attention mask does not support cached sequences.")
-        sliding_window = getattr(config, "sliding_window", None)
-        if sliding_window is None:
-            raise ValueError("Could not find a `sliding_window` argument in the config, or it is not set")
+        resolved_window = _resolve_sliding_window(config, sliding_window)
         existing_4d = attention_mask if isinstance(attention_mask, Tensor) and attention_mask.ndim >= 3 else None
         q_len = inputs_embeds.shape[1]
         kv_len = q_len + past_seen
@@ -366,7 +394,7 @@ def create_sliding_window_causal_mask(
         mask = sliding_window_mask(
             q_len,
             kv_len,
-            sliding_window=sliding_window,
+            sliding_window=resolved_window,
             cu_seqlens=cu_seqlens,
             **packed_kwargs,
         )
@@ -378,33 +406,31 @@ def create_sliding_window_causal_mask(
             cu_seqlens=cu_seqlens,
             packed_kwargs=packed_kwargs,
             existing_4d_mask=existing_4d,
-            sliding_window=sliding_window,
+            sliding_window=resolved_window,
         )
 
     if _is_prebuilt_mask(attention_mask):
         return attention_mask
 
+    resolved_window = _resolve_sliding_window(config, sliding_window)
     hf_impl = "veomni_sage_attention" if attn_impl == "sage_attention" else attn_impl
-    previous_impl = getattr(config, "_attn_implementation", None)
-    changed_impl = previous_impl != hf_impl
-    if changed_impl:
-        config._attn_implementation = hf_impl
-    try:
-        return _hf_create_sliding_window_causal_mask(
-            config=config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            or_mask_function=or_mask_function,
-            and_mask_function=and_mask_function,
-            block_sequence_ids=block_sequence_ids,
-            layer_idx=layer_idx,
-            allow_is_causal_skip=allow_is_causal_skip,
-        )
-    finally:
-        if changed_impl:
-            config._attn_implementation = previous_impl
+    needs_view = (
+        getattr(config, "_attn_implementation", None) != hf_impl
+        or getattr(config, "sliding_window", None) != resolved_window
+    )
+    hf_config = _AttnImplView(config, hf_impl, sliding_window=resolved_window) if needs_view else config
+    return _hf_create_sliding_window_causal_mask(
+        config=hf_config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        or_mask_function=or_mask_function,
+        and_mask_function=and_mask_function,
+        block_sequence_ids=block_sequence_ids,
+        layer_idx=layer_idx,
+        allow_is_causal_skip=allow_is_causal_skip,
+    )
 
 
 __all__ = ["create_causal_mask", "create_sliding_window_causal_mask"]
