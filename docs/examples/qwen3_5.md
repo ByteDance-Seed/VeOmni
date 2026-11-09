@@ -266,9 +266,9 @@ legacy metadata on every layer.
 The `fla_npu` adapter fixes `disable_recompute=True` to retain the cumulative
 gates and A matrix needed by the stable backward API. The separate opt-in
 `fla_npu_reuse` row also retains forward state for backward on 910C and needs
-the stable decomposed GDN operators. It falls back to the regular path for
-empty packed segments and trades memory for less recomputation; measure both
-correctness and memory/throughput on the actual image and configuration.
+the stable decomposed GDN operators. Both paths compact empty packed segments
+while preserving their state slots. Reuse trades memory for less recomputation;
+measure correctness and memory/throughput on the actual image and configuration.
 
 AscendC GDN requires manual installation. Repository tests include optional
 native comparison cases; they run only when the required NPU and dependencies

@@ -508,8 +508,8 @@ them, explicitly set `model.ops_implementation.chunk_gated_delta_rule_implementa
 to `fla_npu_reuse`. This opt-in row requires both `fla_npu` and
 `triton-ascend`; it trades additional activation memory for less backward
 recomputation. The reuse path requires Ascend 910C and the decomposed GDN
-entries in a current `fla_npu` build. When packed boundaries contain empty
-sequences, the adapter falls back to the regular `fla_npu` path.
+entries in a current `fla_npu` build. Both AscendC paths remove empty packed
+segments before kernel dispatch and restore their final-state slots afterward.
 The default and `fla_npu` behavior are unchanged, and the memory and
 throughput impact depends on the model and configuration.
 

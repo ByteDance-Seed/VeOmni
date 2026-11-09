@@ -22,6 +22,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 @pytest.fixture
 def adapter(monkeypatch):
@@ -161,27 +166,205 @@ def test_standard_backend_keeps_existing_saved_state_contract(adapter, monkeypat
     assert all(torch.equal(grad, value) for grad, value in zip(grads[:3], values, strict=True))
 
 
-def test_empty_packed_sequence_falls_back_to_standard_backend(adapter, monkeypatch):
-    """An empty packed segment follows the upstream forward and backward."""
+@pytest.mark.parametrize("use_reuse", (False, True))
+def test_nonempty_packed_boundaries_and_state_are_not_replaced(adapter, monkeypatch, use_reuse):
+    """The usual packed path reuses its boundary tensor and initial state."""
     main, reuse = adapter
-    values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    values = [torch.ones(1, 4, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
     gate = torch.ones(1, 4, 2)
+    cu = torch.tensor([0, 2, 4])
+    initial = torch.ones(2, 2, 128, 128, dtype=torch.bfloat16)
+
+    def forward(q, k, v, g, beta, scale, state, output_state, boundaries, cu_list, chunks, host_chunks, chunk_size):
+        """Check original objects remain on the fast path."""
+        assert boundaries is cu and state is initial and cu_list == [0, 2, 4]
+        assert host_chunks[str(chunk_size)] == [0, 0, 1, 0]
+        result = (g, q.transpose(1, 2), q.new_empty(0), None)
+        return result + (q, k, v) if use_reuse else result
+
+    monkeypatch.setattr(reuse if use_reuse else main, "_chunk_fwd_reuse" if use_reuse else "_chunk_fwd", forward)
+    _, saved = (reuse if use_reuse else main).forward(
+        *values, gate, gate, initial_state=initial, cu_seqlens=cu, chunk_indices_list={"64": [0, 0, 1, 0]}
+    )
+    assert saved.tensors[6] is initial and saved.tensors[7] is cu
+
+
+@pytest.mark.parametrize("use_reuse", (False, True))
+def test_empty_packed_sequence_preserves_boundaries_and_initial_states(adapter, monkeypatch, use_reuse):
+    """Both backends compact empty segments and preserve original state owners."""
+    main, reuse = adapter
+    values = [torch.ones(1, 4, 2, 128, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+    initial = torch.arange(5, dtype=torch.bfloat16).view(5, 1, 1, 1).expand(5, 2, 128, 128).contiguous()
     calls = []
 
-    def standard_forward(q, k, v, g, *args):
-        """Return a minimal upstream-compatible forward result."""
-        calls.append("standard")
-        return g, q.transpose(1, 2), q.new_empty(0), None
+    def forward(q, k, v, g, beta, scale, state, output_state, cu, cu_list, chunks, host_chunks, chunk_size):
+        """Require compact metadata and original nonempty owners."""
+        calls.append("forward")
+        assert cu.tolist() == cu_list == [0, 2, 4]
+        assert host_chunks[str(chunk_size)] == [0, 0, 1, 0]
+        torch.testing.assert_close(state, initial[[1, 3]], atol=0, rtol=0)
+        result = (g, q.transpose(1, 2), q.new_empty(0), None)
+        return result + (q, k, v) if use_reuse else result
 
-    def standard_backward(q, k, v, g, beta, *args):
-        """Return minimal upstream-compatible gradients."""
-        calls.append("standard_backward")
+    def backward(q, k, v, g, beta, a, scale, state, do, cu, cu_list, chunks, host_chunks, chunk_size, *retained):
+        """Backward must use the same compact metadata and initial states."""
+        calls.append("backward")
+        assert cu.tolist() == cu_list == [0, 2, 4]
+        assert host_chunks[str(chunk_size)] == [0, 0, 1, 0]
+        torch.testing.assert_close(state, initial[[1, 3]], atol=0, rtol=0)
+        assert len(retained) == (3 if use_reuse else 0)
         return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.zeros_like(beta), torch.zeros_like(g)
 
-    monkeypatch.setattr(main, "_chunk_fwd", standard_forward)
-    monkeypatch.setattr(main, "_chunk_bwd", standard_backward)
-    output, saved = reuse.forward(*values, gate, gate, cu_seqlens=torch.tensor([0, 2, 2, 4]))
-    assert calls == ["standard"] and not saved.metadata.reuse_intermediates
-    grads = reuse.backward((torch.ones_like(output[0]), output[1]), saved)
-    assert calls == ["standard", "standard_backward"]
+    if use_reuse:
+        monkeypatch.setattr(reuse, "_chunk_fwd_reuse", forward)
+        monkeypatch.setattr(reuse, "_chunk_bwd_reuse", backward)
+    else:
+        monkeypatch.setattr(main, "_chunk_fwd", forward)
+        monkeypatch.setattr(main, "_chunk_bwd", backward)
+    chosen = reuse if use_reuse else main
+    output, saved = chosen.forward(
+        *values,
+        gate,
+        gate,
+        initial_state=initial,
+        cu_seqlens=torch.tensor([0, 0, 2, 2, 4, 4]),
+        chunk_indices_list={"64": [1, 0, 3, 0]},
+    )
+    assert calls == ["forward"] and saved.metadata.reuse_intermediates == use_reuse
+    grads = chosen.backward((torch.ones_like(output[0]), output[1]), saved)
+    assert calls == ["forward", "backward"]
     assert all(torch.equal(grad, value) for grad, value in zip(grads[:3], values, strict=True))
+
+
+@pytest.mark.parametrize("use_reuse", (False, True))
+@pytest.mark.parametrize("with_initial", (False, True))
+def test_empty_packed_inference_restores_final_state_slots(adapter, monkeypatch, use_reuse, with_initial):
+    """Empty segments keep their own initial state or zero in the final state."""
+    main, reuse = adapter
+    values = [torch.ones(1, 4, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+    initial = torch.arange(5, dtype=torch.float32).view(5, 1, 1, 1).expand(5, 2, 128, 128).contiguous()
+    compact_final = torch.full((2, 2, 128, 128), 11.0)
+
+    def forward(q, k, v, g, beta, scale, state, output_state, cu, cu_list, chunks, host_chunks, chunk_size):
+        """Return distinct final states for each nonempty segment."""
+        assert cu.tolist() == cu_list == [0, 2, 4]
+        if with_initial:
+            torch.testing.assert_close(state, initial[[1, 3]], atol=0, rtol=0)
+        else:
+            assert state is None
+        result = (g, q.transpose(1, 2), q.new_empty(0), compact_final)
+        return result + (q, k, v) if use_reuse else result
+
+    monkeypatch.setattr(reuse if use_reuse else main, "_chunk_fwd_reuse" if use_reuse else "_chunk_fwd", forward)
+    output, _ = (reuse if use_reuse else main).forward(
+        *values,
+        gate,
+        gate,
+        initial_state=initial if with_initial else None,
+        cu_seqlens=torch.tensor([0, 0, 2, 2, 4, 4]),
+        output_final_state=True,
+    )
+    expected = initial.clone() if with_initial else torch.zeros_like(initial)
+    expected[[1, 3]] = compact_final
+    torch.testing.assert_close(output[1], expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_reuse", (False, True))
+@pytest.mark.parametrize("with_initial", (False, True))
+def test_all_empty_packed_sequence_has_empty_output_and_identity_states(adapter, use_reuse, with_initial):
+    """Zero-token packed calls preserve initial states without launching a kernel."""
+    main, reuse = adapter
+    values = [torch.empty(1, 0, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
+    gate = torch.empty(1, 0, 2)
+    initial = torch.arange(3, dtype=torch.float32).view(3, 1, 1, 1).expand(3, 2, 128, 128).contiguous()
+    output, _ = (reuse if use_reuse else main).forward(
+        *values,
+        gate,
+        gate,
+        initial_state=initial if with_initial else None,
+        cu_seqlens=torch.tensor([0, 0, 0, 0]),
+        output_final_state=True,
+    )
+    assert output[0].shape == (1, 0, 2, 128)
+    torch.testing.assert_close(output[1], initial if with_initial else torch.zeros_like(initial), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_reuse", (False, True))
+def test_all_empty_packed_training_backward_returns_empty_gradients(adapter, use_reuse):
+    """Zero-token backward preserves input shapes and dtypes without native ops."""
+    from veomni.ops.registry import _make_autograd_fn
+
+    main, reuse = adapter
+    values = [torch.empty(1, 0, 2, 128, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    gate = torch.empty(1, 0, 2, dtype=torch.float32, requires_grad=True)
+    beta = torch.empty(1, 0, 2, dtype=torch.bfloat16, requires_grad=True)
+    chosen = reuse if use_reuse else main
+    output, saved = chosen.forward(
+        *values, gate, beta, cu_seqlens=torch.tensor([0, 0, 0]), use_qk_l2norm_in_kernel=True
+    )
+    grads = chosen.backward((torch.empty_like(output[0]), output[1]), saved)
+    for actual, expected in zip(grads[:5], (*values, gate, beta), strict=True):
+        assert actual.shape == expected.shape and actual.dtype == expected.dtype and actual.numel() == 0
+    assert grads[5:] == (None, None)
+    wrapped = _make_autograd_fn(chosen.forward, chosen.backward)
+    result, _ = wrapped(*values, gate, beta, cu_seqlens=torch.tensor([0, 0, 0]), use_qk_l2norm_in_kernel=True)
+    result.backward(torch.empty_like(result))
+    for leaf in (*values, gate, beta):
+        assert leaf.grad is not None and leaf.grad.shape == leaf.shape and leaf.grad.dtype == leaf.dtype
+
+
+@pytest.mark.parametrize("use_reuse", (False, True))
+def test_empty_packed_rejects_invalid_boundaries(adapter, use_reuse):
+    """A repeated boundary must not hide a decreasing or truncated range."""
+    main, reuse = adapter
+    values = [torch.ones(1, 4, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+    for boundaries in ([0, 2, 1, 1, 4], [0, 2, 2, 3], [0, 3, 2, 4], [1, 4]):
+        with pytest.raises(ValueError, match="nondecreasing and span"):
+            (reuse if use_reuse else main).forward(*values, gate, gate, cu_seqlens=torch.tensor(boundaries))
+    invalid_state = torch.zeros(3, 2, 64, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="initial_state must match"):
+        (reuse if use_reuse else main).forward(
+            *values, gate, gate, initial_state=invalid_state, cu_seqlens=torch.tensor([0, 2, 2, 4])
+        )
+
+
+def test_invalid_packed_offsets_fail_before_chunk_metadata_build(adapter, monkeypatch):
+    """A huge invalid offset cannot trigger an unbounded host index allocation."""
+    main, _ = adapter
+    values = [torch.ones(1, 4, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+
+    def unexpected_metadata(*args, **kwargs):
+        """Detect any attempt to expand an invalid sequence range."""
+        raise AssertionError("chunk metadata was built before boundary validation")
+
+    monkeypatch.setattr(main, "_prepare_chunk_indices_list", unexpected_metadata)
+    monkeypatch.setattr(main, "_prepare_chunk_indices", unexpected_metadata)
+    with pytest.raises(ValueError, match="nondecreasing and span"):
+        main.forward(*values, gate, gate, cu_seqlens=torch.tensor([0, 10**12, 4]))
+    with pytest.raises(ValueError, match="nondecreasing and span"):
+        main.precompute_varlen_metadata(torch.tensor([0, 10**12, 4]), num_heads=2)
+
+
+def test_checkpoint_forward_failure_does_not_poison_later_backward():
+    """An exception retained by pytest must not retain a checkpoint hook."""
+    import traceback
+
+    from tests.ops.gated_delta_rule._checkpoint_guard import checkpoint_nonreentrant
+
+    calls = []
+
+    def fail_forward(value):
+        """Raise on the first checkpoint forward to exercise cleanup."""
+        calls.append(value)
+        raise RuntimeError("checkpoint sentinel")
+
+    with pytest.raises(RuntimeError, match="checkpoint sentinel") as captured:
+        checkpoint_nonreentrant(fail_forward, torch.ones(1, requires_grad=True))
+    unrelated = torch.tensor([3.0], requires_grad=True)
+    unrelated.square().sum().backward()
+    assert unrelated.grad.item() == 6.0 and len(calls) == 1
+    assert "fail_forward" in {frame.name for frame in traceback.extract_tb(captured.value.__traceback__)}
