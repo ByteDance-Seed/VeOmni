@@ -51,7 +51,6 @@ class _Meta:
     chunk_indices: dict[str, Tensor | None] | None
     chunk_indices_list: dict[str, list[int] | None] | None
     reuse_intermediates: bool = False
-    all_empty: bool = False
 
 
 def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
@@ -267,7 +266,7 @@ def _chunk_list(
 
 def _expand_empty_final_states(
     initial_state: Tensor | None,
-    compact_final_state: Tensor | None,
+    compact_final_state: Tensor,
     nonempty_indices: list[int],
     num_sequences: int,
     query: Tensor,
@@ -275,21 +274,16 @@ def _expand_empty_final_states(
     value: Tensor,
 ) -> Tensor:
     """Restore empty sequence slots without changing their initial state."""
-    if compact_final_state is None:
-        dtype = torch.float32
-        device = query.device
-    else:
-        dtype = compact_final_state.dtype
-        device = compact_final_state.device
+    dtype = compact_final_state.dtype
+    device = compact_final_state.device
     if initial_state is None:
         full_state = torch.zeros(
             (num_sequences, query.shape[1], key.shape[-1], value.shape[-1]), dtype=dtype, device=device
         )
     else:
         full_state = initial_state.to(device=device, dtype=dtype).clone()
-    if compact_final_state is not None:
-        indices = torch.tensor(nonempty_indices, dtype=torch.long, device=device)
-        full_state.index_copy_(0, indices, compact_final_state)
+    indices = torch.tensor(nonempty_indices, dtype=torch.long, device=device)
+    full_state.index_copy_(0, indices, compact_final_state)
     return full_state
 
 
@@ -437,6 +431,7 @@ def forward(
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
     are rejected. Extra NPU varlen tables are accepted; missing
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
+    Packed inputs may contain empty segments, but the token dimension must be nonzero.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -469,6 +464,8 @@ def forward(
         raise ValueError(
             f"Expected q/k/v in [B, T, H, D] and g/beta in [B, T, H]; got q={tuple(query.shape)}, g={tuple(g.shape)}."
         )
+    if query_h.shape[2] == 0:
+        raise ValueError("fla_npu GDN requires at least one token.")
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
@@ -533,32 +530,6 @@ def forward(
             nonempty_indices = [
                 index for index, (start, end) in enumerate(zip(cu_seqlens_list, cu_seqlens_list[1:])) if end > start
             ]
-            if not nonempty_indices:
-                _validate_gdn_contract(query_h, key_h, value_h, chunk_size, initial_opt)
-                output = value.new_empty(value.shape)
-                final_state = (
-                    _expand_empty_final_states(
-                        initial_opt, None, nonempty_indices, original_num_sequences, query_h, key_h, value_h
-                    )
-                    if output_final_state
-                    else output.new_empty(0)
-                )
-                empty = unused_like(query_h)
-                return (output, final_state), SavedState(
-                    (query_h, key_h, value_h, g, beta, empty, initial_state, cu_opt, empty, empty),
-                    _Meta(
-                        scale if scale is not None else key_h.shape[-1] ** -0.5,
-                        chunk_size,
-                        output_final_state,
-                        use_qk_l2norm_in_kernel,
-                        initial_opt is not None,
-                        True,
-                        cu_seqlens_list,
-                        chunk_indices,
-                        chunk_indices_list,
-                        all_empty=True,
-                    ),
-                )
             cu_seqlens_list = [0] + [cu_seqlens_list[index + 1] for index in nonempty_indices]
             # AscendC consumes host metadata; do not upload a replacement cu
             # tensor on every layer when the input boundaries live on NPU.
@@ -665,16 +636,6 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         query_inv_norm,
         key_inv_norm,
     ) = saved.tensors[:10]
-    if meta.all_empty:
-        return (
-            torch.zeros_like(query_h).transpose(1, 2),
-            torch.zeros_like(key_h).transpose(1, 2),
-            torch.zeros_like(value_h).transpose(1, 2),
-            torch.zeros_like(g_cum),
-            torch.zeros_like(beta),
-            None,
-            None,
-        )
     do, _dht = grad_output
     initial_opt = initial_state if meta.has_initial_state else None
     cu_opt = cu_seqlens if meta.has_cu_seqlens else None

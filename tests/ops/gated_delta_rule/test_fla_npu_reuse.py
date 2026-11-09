@@ -272,47 +272,14 @@ def test_empty_packed_inference_restores_final_state_slots(adapter, monkeypatch,
 
 
 @pytest.mark.parametrize("use_reuse", (False, True))
-@pytest.mark.parametrize("with_initial", (False, True))
-def test_all_empty_packed_sequence_has_empty_output_and_identity_states(adapter, use_reuse, with_initial):
-    """Zero-token packed calls preserve initial states without launching a kernel."""
+def test_zero_token_input_is_rejected(adapter, use_reuse):
+    """Zero-token batches are outside the backend contract, with or without packing."""
     main, reuse = adapter
     values = [torch.empty(1, 0, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
     gate = torch.empty(1, 0, 2)
-    initial = torch.arange(3, dtype=torch.float32).view(3, 1, 1, 1).expand(3, 2, 128, 128).contiguous()
-    output, _ = (reuse if use_reuse else main).forward(
-        *values,
-        gate,
-        gate,
-        initial_state=initial if with_initial else None,
-        cu_seqlens=torch.tensor([0, 0, 0, 0]),
-        output_final_state=True,
-    )
-    assert output[0].shape == (1, 0, 2, 128)
-    torch.testing.assert_close(output[1], initial if with_initial else torch.zeros_like(initial), atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("use_reuse", (False, True))
-def test_all_empty_packed_training_backward_returns_empty_gradients(adapter, use_reuse):
-    """Zero-token backward preserves input shapes and dtypes without native ops."""
-    from veomni.ops.registry import _make_autograd_fn
-
-    main, reuse = adapter
-    values = [torch.empty(1, 0, 2, 128, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
-    gate = torch.empty(1, 0, 2, dtype=torch.float32, requires_grad=True)
-    beta = torch.empty(1, 0, 2, dtype=torch.bfloat16, requires_grad=True)
-    chosen = reuse if use_reuse else main
-    output, saved = chosen.forward(
-        *values, gate, beta, cu_seqlens=torch.tensor([0, 0, 0]), use_qk_l2norm_in_kernel=True
-    )
-    grads = chosen.backward((torch.empty_like(output[0]), output[1]), saved)
-    for actual, expected in zip(grads[:5], (*values, gate, beta), strict=True):
-        assert actual.shape == expected.shape and actual.dtype == expected.dtype and actual.numel() == 0
-    assert grads[5:] == (None, None)
-    wrapped = _make_autograd_fn(chosen.forward, chosen.backward)
-    result, _ = wrapped(*values, gate, beta, cu_seqlens=torch.tensor([0, 0, 0]), use_qk_l2norm_in_kernel=True)
-    result.backward(torch.empty_like(result))
-    for leaf in (*values, gate, beta):
-        assert leaf.grad is not None and leaf.grad.shape == leaf.shape and leaf.grad.dtype == leaf.dtype
+    for cu in (None, torch.tensor([], dtype=torch.int32), torch.tensor([0]), torch.tensor([0, 0])):
+        with pytest.raises(ValueError, match="requires at least one token"):
+            (reuse if use_reuse else main).forward(*values, gate, gate, cu_seqlens=cu)
 
 
 @pytest.mark.parametrize("use_reuse", (False, True))
