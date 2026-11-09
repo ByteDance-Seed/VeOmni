@@ -144,12 +144,11 @@ the device checks on an A3 machine. The builder does not include NPU tests or
 resolve the outstanding VeOmni legacy FLA API incompatibility.
 
 The A2 unit and e2e workflows now use the published x86 candidate at digest
-`sha256:f17737f877ab58f9aebd5feacafda46b8303ae42356a515923135c846fc82aae`.
+`sha256:c05565d0f6fb7c7d713bf5e6237b0508d7617a5ff7f3cf7cd4181033552d4105`.
 After the locked dependency sync, they verify retained wheel checksums and restore
-torch-npu post7, Triton 3.6.0, its Ascend overlay and A2 FLA into the test venv.
+torch-npu post7, Triton 3.6.0, its Ascend 3.6.0.post2 overlay and A2 FLA into the test venv.
 These explicit overrides are candidate validation, not a lockfile migration.
 
 The rebuilt A2 x86 candidate uses Triton-Ascend `3.6.0.post2` over base Triton
 `3.6.0`; the A2 ARM and A3 recipes still use Ascend `3.6.0`. Its Docker build
-asserts the installed post2 version. Device CI remains pinned to the previous
-image until the new build has been published and its digest verified.
+asserts the installed post2 version. Device CI uses the published post2 image digest above, verified anonymously against its A2 target and source revision.
