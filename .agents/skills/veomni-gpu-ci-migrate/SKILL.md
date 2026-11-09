@@ -180,7 +180,10 @@ For metadata/state tests, preserve exact values, failure ordering and restoratio
 6. Label the result CPU/mock contract coverage, not that package's NPU numerics.
 
 Avoid broad module-level skips when reusable independent cases can be collected.
-Do not remove legitimate CUDA guards from architecture-specific tests.
+Do not remove legitimate CUDA guards from architecture-specific tests. Preserve
+unsupported-host skips for ordinary CPU/MLU runs of accelerator-only tests;
+required NPU CI hardware failures belong in runner preflight. Do not replace
+those skips with unconditional assertions merely to prevent an all-skipped CI run.
 
 ### 3.3 Preserve distributed semantics
 
@@ -221,6 +224,13 @@ unresolved cause instead of continuing speculative edits. Continue independent r
 2. Check exact-file and directory-level selections, including filters.
 3. If already selected, record existing coverage; do not add duplicate commands.
 4. For an uncovered accelerator case, add the minimal selector to `scripts/ci/accelerator/suites/npu.json` with the correct `suite` (`unit` or `e2e`). Keep runner setup and triggers in the workflow YAML.
+   Preserve each source row's `conditional` behavior and triggering predicate.
+   A conditional NPU row must be paired with an equivalent workflow condition
+   that passes `--include-conditional` to the runner only when appropriate.
+   Verify selection both when the predicate is true and when it is false; the
+   flag includes all conditional rows in that suite, so inspect their scope too.
+   If equivalent gating cannot be established, keep the row unresolved. Never
+   silently drop the condition or count a permanently unselected row as wired.
 5. Preserve runner/image/dependency conventions and separate CPU-only contract
    overrides from real-NPU/compiler claims.
 6. Add a hardware preflight matching each launch's worker count, bounded execution
@@ -228,9 +238,16 @@ unresolved cause instead of continuing speculative edits. Continue independent r
 7. Record whether the command was run locally, in the target image or in public CI.
    A workflow edit alone proves none of those execution outcomes.
 
-Required accelerator selections must fail when hardware preflight fails or no
-case executes. Define any allowed skips explicitly; an all-skipped selection
-cannot pass the coverage gate. Preserve the pytest exit code through pipelines
+Required accelerator selections must fail when hardware preflight fails.
+Freeze a non-empty set of expected required parameterized node IDs from the original scope and
+collection evidence, with explicit mappings for renamed cases. Require an
+executable CI gate to match each required ID against JUnit/results and reject
+missing, deselected, skipped, failed or errored cases even when other cases pass.
+Allowed skips apply only to explicitly optional cases. If the gate is missing
+or unverified, report coverage as incomplete rather than validated-and-wired.
+Evaluate conditional required IDs only when their predicate is active; record
+inactive conditions separately and fail an unexpectedly empty active selection.
+Preserve the pytest exit code through pipelines
 (`pipefail` with `tee`) and upload existing logs/JUnit with `if: always()` even
 after failure. Bound workers before the enclosing step deadline.
 
@@ -241,7 +258,11 @@ executed but unwired tests distinct from validated-and-wired migrations.
 
 ### 5.1 Compare with the baseline
 
-Run related original coverage against the final tree and repository quality checks.
+After the final generation/edit, run the repository formatter and lint on every
+generated or modified Python file, including final newlines and top-level
+spacing. Rerun these checks after any later generated output. Run related
+original coverage against the final tree and repository quality checks; report
+pre-existing failures separately and do not claim a clean gate while they remain.
 Compare file/node IDs, not only totals. Map renamed/parameterized tests explicitly.
 If the user limits validation, record what was omitted without claiming success.
 

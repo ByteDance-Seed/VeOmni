@@ -137,6 +137,9 @@ Apply the ownership rules from testing knowledge in order:
 2. Add a file only for a separate behavior/fixture/launcher that needs it.
 3. Read both exact-file and parent-directory CI selections.
 4. Retain existing CPU/CUDA parameters and guards.
+   Keep unsupported-host `pytest.skip` behavior for direct CPU/MLU runs of
+   accelerator-only tests. Enforce mandatory NPU availability in CI runner
+   preflight, not with an unconditional hardware assertion in a shared test.
 
 Use `veomni.utils.device` helpers where appropriate, after reading their actual
 signatures. Guard optional imports at their use sites. Keep mocks local to a test
@@ -186,9 +189,17 @@ coverage, matching the largest launch in that step, bounded execution and JUnit
 artifacts. Do not copy private Python/CANN paths or device IDs into public CI.
 
 For a required real-device selection, fail preflight when its backend or device
-count is unavailable. Check JUnit for actual execution: zero collected cases or
-an entirely skipped selection is not a successful CI gate. If every selected
-case is required, reject any skip; otherwise document the allowed skips by case.
+count is unavailable. Establish a non-empty set of expected required parameterized node IDs
+from the approved matrix and collection evidence before execution; do not derive
+the required set from only the results that happened to pass. Make the CI gate
+compare that set against JUnit/results using an explicit node-ID mapping. Fail
+if any required case is missing, deselected, skipped, failed or errored, even if
+other cases in the directory pass. Allowed skips must name optional cases only
+and cannot waive required coverage. Preserve this check as an executable gate,
+not just a report instruction; if it is not implemented or verified, mark the
+coverage gate incomplete. For conditional selections, evaluate required IDs
+only under their active predicate and record inactive conditions explicitly;
+an unexpectedly empty active selection is a failure.
 Upload logs with `if: always()` so a failed test still leaves evidence, and retain
 the test exit status when using pipelines (for example, Bash `pipefail` with
 `tee`). Keep the outer timeout longer than the worker/collective deadlines.
@@ -224,7 +235,11 @@ CPU contracts, mocked behavior, real NPU numerics and distributed ST separately.
 
 1. Run baseline-related coverage against the final tree and compare by file/node ID.
    Account explicitly for renamed or newly parameterized tests.
-2. Run repository quality checks and relevant checks for any helper you changed.
+2. After the final generation/edit, run the repository formatter and lint on
+   every generated or modified Python file, then the repository quality checks
+   and relevant helper checks. Preserve a final newline and top-level spacing;
+   rerun after any subsequent generated output. Do not claim completion when
+   lint fails, and distinguish pre-existing failures from newly introduced ones.
    If the user explicitly limits validation, honor it and list omitted checks.
 3. Confirm CI selection including -k/-m, node IDs, ignore options and conditions.
 4. For requested reuse, repeat the analysis on materially different interfaces;
