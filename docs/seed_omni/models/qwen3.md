@@ -152,7 +152,7 @@ Resume by pointing `load_path` at that directory:
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3/train/base.yaml \
-  --train.checkpoint.load_path outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
+  --train.checkpoint.load_path outputs/qwen3_omni_sft/checkpoints/global_step_500
 ```
 
 ---
@@ -197,8 +197,8 @@ in `transformers` too). A run trained from a split root exports one `hf_ckpt/`
 subfolder per module; assemble a flat root from them:
 
 ```bash
-STEP=outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
-ASM=outputs/qwen3_0.6b_omni_sft/infer_ckpt/global_step_500
+STEP=outputs/qwen3_omni_sft/checkpoints/global_step_500
+ASM=outputs/qwen3_omni_sft/infer_ckpt/global_step_500
 mkdir -p "$ASM"
 for m in qwen3_text_encoder qwen3_llm; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"

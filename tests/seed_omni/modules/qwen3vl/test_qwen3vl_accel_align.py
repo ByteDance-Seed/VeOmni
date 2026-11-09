@@ -26,6 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.distributed.tensor import DTensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.training_utils import make_eager_ops_config
@@ -182,6 +183,9 @@ def _samples() -> list[list[ConversationItem]]:
     from veomni.data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY, VideoMetadata
     from veomni.data.seed_omni.utils.video import VideoInputs
 
+    # Fixed seed: `_samples` draws the image and video pixels at random, and two
+    # runs must see the *same* batch for their losses and gradients to be comparable.
+    torch.manual_seed(1234)
     video_metadata = VideoMetadata(fps=2.0, total_num_frames=4, frames_indices=list(range(4)), requested_fps=2.0)
     samples: list[list[ConversationItem]] = [
         [
@@ -270,20 +274,29 @@ def _packed_batch(samples: list[list[ConversationItem]]) -> dict:
 
 
 def _graph_loss(
-    modules: dict[str, torch.nn.Module], edges: list[dict[str, str]], batch: dict, *, count_sp: bool = False
+    modules: dict[str, torch.nn.Module],
+    edges: list[dict[str, str]],
+    batch: dict,
+    *,
+    count_sp: bool = False,
+    backward: bool = False,
 ):
-    """One forward over the graph; optionally also report how often it sliced for SP.
+    """One forward over the graph, optionally backward, optionally counting SP calls.
 
-    The counter is what keeps the SP test honest: a loss that matches because
+    `backward` returns `(loss, grads, sp_calls)` where ``grads`` maps ``(module,
+    param)`` to a host copy of its gradient, flattened from any DTensor. Gradients
+    are what an SP regression actually corrupts — a loss can match while a gather
+    silently averages the shards instead of concatenating them, and only the
+    per-parameter gradient shows it.
+
+    The SP counter is what keeps the SP test honest: a loss that matches because
     neither run took the SP branch proves nothing, and that is exactly what a
-    regression in the parallelism guards would look like.
+    regression in the parallelism guards looks like. Every module that slices
+    imports the helper by name, so the counter wraps each of those bindings.
     """
     calls = {"slice": 0, "pad": 0}
     restores = []
     if count_sp:
-        # Every module that slices imports the helper by name, so the counter has
-        # to wrap each of those bindings — patching one module would miss the
-        # others and report "no SP" for a path that did slice.
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
         from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
@@ -318,15 +331,41 @@ def _graph_loss(
             for key, value in batch.items()
         }
         out = model.forward(moved, node_runner=TrainNodeRunner())
+        loss = out["loss"]
+        grads: dict[tuple[str, str], torch.Tensor] = {}
+        if backward:
+            loss.backward()
+            for name, module in modules.items():
+                for param_name, param in module.named_parameters():
+                    if param.grad is None:
+                        continue
+                    grad = param.grad
+                    grad = grad.full_tensor() if isinstance(grad, DTensor) else grad
+                    grads[(name, param_name)] = grad.detach().float().clone()
     finally:
         for target, attr, original in restores:
             setattr(target, attr, original)
-    return (out["loss"], dict(calls)) if count_sp else out["loss"]
+
+    if backward:
+        return loss, grads, dict(calls)
+    return (loss, dict(calls)) if count_sp else loss
+
+
+def _adamw_step(modules: dict[str, torch.nn.Module]) -> None:
+    """One AdamW step over the modules, using the `.grad` the backward left."""
+    params = [param for module in modules.values() for param in module.parameters()]
+    optimizer = torch.optim.AdamW(params, lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False)
+    optimizer.step()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_conversation_and_packed_graphs_agree_on_cpu():
-    """The two graphs encode the same model, so a one-step loss must match.
+    """The two graphs encode the same model, so a step must match on loss,
+    every parameter gradient, and the AdamW update that follows.
+
+    Loss alone is not enough: a graph could reach the same scalar while routing
+    the gradient of the dummy anchor, the video frames or the image differently,
+    and only the per-parameter comparison shows it.
 
     Each graph gets its own modules *and its own samples*. A conversation run is
     destructive to the carrier: `scatter_qwen3vl_visual_embeds` writes the vision
@@ -336,20 +375,48 @@ def test_conversation_and_packed_graphs_agree_on_cpu():
     and fail on the shape. Nothing is wrong with the design — one carrier is meant
     to be consumed once — the test just must not share one.
     """
-    conversation_loss = _graph_loss(
-        _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32),
-        _CONVERSATION_EDGES,
-        _conversation_batch(_samples()),
+    conversation_modules = _build_modules(
+        attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32
     )
-    packed_loss = _graph_loss(
-        _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32),
-        _PACKED_EDGES,
-        _packed_batch(_samples()),
+    packed_modules = _build_modules(attn_implementation="veomni_sdpa", device=torch.device("cpu"), dtype=torch.float32)
+    conversation_loss, conversation_grads, _ = _graph_loss(
+        conversation_modules, _CONVERSATION_EDGES, _conversation_batch(_samples()), backward=True
     )
+    packed_loss, packed_grads, _ = _graph_loss(packed_modules, _PACKED_EDGES, _packed_batch(_samples()), backward=True)
 
     assert torch.allclose(conversation_loss.float(), packed_loss.float(), atol=1e-6, rtol=1e-6), (
         f"conversation {float(conversation_loss)} != packed {float(packed_loss)}"
     )
+
+    # The dummy anchor only exists to keep the vision tower in the graph, so a
+    # gradient reaching every vision parameter is the evidence it did.
+    assert conversation_grads and packed_grads
+    assert set(conversation_grads) == set(packed_grads)
+    vision_grads = [key for key in packed_grads if key[0] == "qwen3vl_vision"]
+    assert len(vision_grads) > 1, "the dummy anchor must give the vision tower a gradient"
+
+    for key in conversation_grads:
+        torch.testing.assert_close(
+            packed_grads[key], conversation_grads[key], atol=1e-6, rtol=1e-5, msg=lambda m, k=key: f"{k}: {m}"
+        )
+
+    # AdamW is a deterministic function of the gradients, so a matching step is
+    # implied by matching gradients — but it is the thing a trainer applies, and
+    # comparing post-step parameters catches a gradient that agrees while some
+    # other input to the optimizer (weight decay over the wrong tensor set) does not.
+    _adamw_step(conversation_modules)
+    _adamw_step(packed_modules)
+    for name, module in conversation_modules.items():
+        reference = dict(module.named_parameters())
+        actual = dict(packed_modules[name].named_parameters())
+        for param_name in reference:
+            torch.testing.assert_close(
+                actual[param_name].detach(),
+                reference[param_name].detach(),
+                atol=1e-6,
+                rtol=1e-5,
+                msg=lambda m, k=(name, param_name): f"{k}: {m}",
+            )
 
 
 def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> None:
@@ -393,9 +460,24 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # identical data for the mean to be comparable, and at sp=2 the
                     # ranks are slices of one replicated batch.
                     batch = build_batch(samples)
-                    loss, sp_calls = _graph_loss(modules, edges, batch, count_sp=True)
+                    loss, _, sp_calls = _graph_loss(modules, edges, batch, count_sp=True, backward=True)
                     reports[f"{name}_sp{sp_size}"] = float(loss.detach().float())
                     reports[f"{name}_sp{sp_size}_sp_calls"] = sp_calls
+                    # Compare *parameters after an optimizer step*, not pre-reduce
+                    # gradients. Under FSDP2 the cross-rank reduction of `.grad`
+                    # happens when the optimizer consumes it, so reading `param.grad`
+                    # right after `backward()` shows this rank's un-reduced share —
+                    # which legitimately differs between SP ranks (each holds half
+                    # the sequence). The stepped weights are the reduced result.
+                    _adamw_step(modules)
+                    probes = sorted(modules.items())[:1]
+                    reports[f"{name}_sp{sp_size}_param_probe"] = {
+                        f"{mod_name}.{param_name}": float(
+                            (param.full_tensor() if isinstance(param, DTensor) else param).detach().float().sum()
+                        )
+                        for mod_name, module in probes
+                        for param_name, param in list(module.named_parameters())[:4]
+                    }
                 clear_parallel_state()
         Path(out_dir, f"rank{rank}.json").write_text(json.dumps(reports), encoding="utf-8")
     finally:
@@ -423,6 +505,7 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
             assert calls["slice"] and calls["pad"], (rank, name, calls)
             assert not reports[f"{name}_sp1_sp_calls"]["slice"], (rank, name, "SP=1 must not slice")
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], abs=1e-5), (rank, name, reports)
+
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
 
 

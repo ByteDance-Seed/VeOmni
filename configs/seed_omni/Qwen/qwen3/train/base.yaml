@@ -79,7 +79,7 @@ train:
   dyn_bsz: true
 
   checkpoint:
-    output_dir: outputs/qwen3_0.6b_omni_sft
+    output_dir: outputs/qwen3_omni_sft
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -88,7 +88,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3_0.6b_omni_sft
+    name: qwen3_omni_sft
 
 infer:
   generation_kwargs:
