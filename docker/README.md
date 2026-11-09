@@ -122,8 +122,7 @@ Pushing Docker changes to zpl1n/ascend-cann921-a2-a3 triggers the build.
 Manual dispatch also works once the workflow exists on the default branch.
 Make the GHCR package publicly pullable before using it in upstream PR CI.
 Record the pushed digest and test an anonymous pull before updating A2 CI.
-Device numerical tests remain required. Existing A2 CI still uses its previous
-image until a candidate has been published and verified.
+Device numerical tests remain required.
 ### Build an A3 candidate in GitHub Actions
 
 The `Build CANN 9.2.1 A3 candidate` workflow in
@@ -143,3 +142,9 @@ This runner needs ARM64 CPU capacity, not an A3 NPU. If hosted ARM64 runners
 are unavailable, build with the local commands above on an ARM64 host and run
 the device checks on an A3 machine. The builder does not include NPU tests or
 resolve the outstanding VeOmni legacy FLA API incompatibility.
+
+The A2 unit and e2e workflows now use the published x86 candidate at digest
+`sha256:f17737f877ab58f9aebd5feacafda46b8303ae42356a515923135c846fc82aae`.
+After the locked dependency sync, they verify retained wheel checksums and restore
+torch-npu post7, Triton 3.6.0, its Ascend overlay and A2 FLA into the test venv.
+These explicit overrides are candidate validation, not a lockfile migration.
