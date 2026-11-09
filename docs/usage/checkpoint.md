@@ -23,6 +23,19 @@ A step directory is split by *who owns the state*. `model/`, `loader/` and
 nothing else. The two exports are inference artifacts that resume never reads.
 `<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni).
 
+With `train.checkpoint.manager: dcp`, `load_path: auto` discovers the newest
+structurally complete step, including a model-only step without optimizer
+state. Discovery does not prove that the step is valid for training resume.
+A normal trainer resume requests the optimizer;
+MultiOptimizer recovery rejects missing or unproven optimizer identity rather
+than silently replacing its state. To start a separate weights-only run from a
+full-model checkpoint, export verified model weights to HF format, check the
+exported dtypes and layout, supply them as `model.model_path`, and leave
+`load_path` unset with a new checkpoint output directory. LoRA requires its
+base model and adapter separately. This starts new optimizer, scheduler and data
+state rather than continuing the old run. If only BF16 model weights were
+saved, exporting them as FP32 cannot recover the master's discarded low bits.
+
 ## What each path holds
 
 | Path | Holds | Written by |
@@ -554,7 +567,7 @@ resume: they cannot establish scheduler and group provenance. The standalone
 `MultiOptimizer.state_dict()` returns a snapshot and copies tensor states on
 their current devices, which can temporarily require as much extra device
 memory as the optimizer tensors themselves. That raw snapshot supports the
-built-in AdamW, AnyPrecisionAdamW and DistributedMuon leaves, as well as
+built-in AdamW, AnyPrecisionAdamW, SwapAdamW and DistributedMuon leaves, as well as
 registered adapters. Custom serialization hooks and adapters must preserve state faithfully.
 It does not prove the identity needed for raw restoration. Use the high-level
 `DistributedCheckpointer` for save and restore; its save path avoids this copy.
