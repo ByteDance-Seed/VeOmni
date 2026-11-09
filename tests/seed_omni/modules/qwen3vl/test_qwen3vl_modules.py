@@ -3,6 +3,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
@@ -139,6 +140,47 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     )
     assert out["image_embeds"].abs().sum().item() == 0.0
     assert len(out["deepstack_features"]) == 1
+
+
+def test_vision_meter_counts_raw_patch_rows_and_both_merger_projections():
+    """Pin the vision meter's FLOPs to numbers worked out by hand on a tiny config.
+
+    The terms are easy to get subtly wrong: the ViT blocks run over *raw* patches
+    (``merge²`` of a merged token) while the mergers run over merged tokens, and
+    every DeepStack layer repeats its merger. Each of those mistakes leaves a
+    plausible number off by a constant factor, so the expected value below is
+    computed from the layer shapes rather than from the implementation.
+    """
+    from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import VisionMeterMixin
+
+    # Numbers small enough to work out on paper:
+    #   blocks   = 6 * ((4*8*3 SwiGLU) + (4*(3*4+4) qkvo)) * 2 layers * 12 raw tokens
+    #   attn     = 12 * 80 (sum of squared raw lengths) * head_dim 2 * heads 2 * 2 layers
+    #   patch    = 6 * (4*3*2*2² Conv3d) * 12 raw tokens
+    #   mergers  = 6 * ((4*2²)*4 fc1 + 4*6 fc2) * 3 merged tokens * (1 + 1 DeepStack)
+    vision_config = SimpleNamespace(
+        hidden_size=4,
+        depth=2,
+        num_heads=2,
+        intermediate_size=8,
+        in_channels=3,
+        temporal_patch_size=2,
+        patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=6,
+        deepstack_visual_indexes=[1],
+    )
+    meter = VisionMeterMixin.__new__(VisionMeterMixin)
+    meter.config = SimpleNamespace(vision_config=vision_config)
+    # 23040 + 7680 + 6912 + 3168 = 40800
+    assert meter.estimate_flops([1, 2]) == pytest.approx(40800 / 1e12, rel=1e-9)
+
+    # The merger is repeated per DeepStack layer: dropping it subtracts exactly
+    # one copy, 6 * 88 * 3 = 1584.
+    meter.config = SimpleNamespace(
+        vision_config=SimpleNamespace(**{**vars(vision_config), "deepstack_visual_indexes": []})
+    )
+    assert meter.estimate_flops([1, 2]) == pytest.approx((40800 - 1584) / 1e12, rel=1e-9)
 
 
 def test_vision_position_ids_layout():
