@@ -498,17 +498,20 @@ model:
 The Ascend gated RMSNorm uses `torch_npu`. The Ascend causal Conv1D and gated
 delta-rule implementations are vendored MindSpeed-MM Triton kernels named
 `triton` and additionally require `triton-ascend`. The gated delta rule has a
-second Ascend backend, `fla_npu`, an AscendC fused `torch.ops.npu.*` path that
-requires a manual `fla_npu` install. Registrations live in
-`veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
-values are documented by `OpsImplementationConfig`.
+second Ascend backend, `fla_npu`, a fused AscendC path called through
+`fla_npu.ops.ascendc` that requires a manual `fla_npu` install. Registrations
+live in `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and
+allowed values are documented by `OpsImplementationConfig`.
 
 To retain AscendC forward intermediates for backward instead of recomputing
 them, explicitly set `model.ops_implementation.chunk_gated_delta_rule_implementation`
 to `fla_npu_reuse`. This opt-in row requires both `fla_npu` and
 `triton-ascend`; it trades additional activation memory for less backward
-recomputation. The default and `fla_npu` behavior are unchanged, and the
-memory and throughput impact depends on the model and configuration.
+recomputation. The reuse path requires Ascend 910C and the decomposed GDN
+entries in a current `fla_npu` build. When packed boundaries contain empty
+sequences, the adapter falls back to the regular `fla_npu` path.
+The default and `fla_npu` behavior are unchanged, and the memory and
+throughput impact depends on the model and configuration.
 
 Both AscendC rows reject an `initial_state` requiring gradients. They also
 reject `output_final_state=True` whenever any of Q/K/V/g/beta requires
