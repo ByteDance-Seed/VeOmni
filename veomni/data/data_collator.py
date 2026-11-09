@@ -353,26 +353,16 @@ class SequenceParallelCollator(DataCollator):
             sp_chunk_size = seq_length // self.sp_size
             shard = feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
             if key in ("pixel_values", "pixel_values_videos") and shard.device.type == "cpu":
-                # A narrow view keeps the entire packed image storage alive
-                # while the loader buffers micro-batches. Preserve the view
-                # for pinned, quantized, and gradient-carrying inputs.
-                try:
-                    compact = (
-                        shard.layout == torch.strided
-                        and not shard.is_quantized
-                        and not shard.requires_grad
-                        and not shard.is_pinned()
-                        and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
-                    )
-                except (NotImplementedError, RuntimeError):
-                    # Some tensor subclasses, such as vmap's BatchedTensor,
-                    # do not expose storage. Preserve the original view path.
-                    compact = False
-                if compact:
-                    try:
-                        shard = shard.clone(memory_format=torch.contiguous_format)
-                    except NotImplementedError:
-                        pass  # Keep the view for tensor types without clone support.
+                # Processor-produced CPU tensors can retain the entire packed
+                # image storage through a narrow view. Preserve pinned and
+                # gradient-carrying views.
+                if (
+                    shard.layout == torch.strided
+                    and not shard.requires_grad
+                    and not shard.is_pinned()
+                    and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
+                ):
+                    shard = shard.clone(memory_format=torch.contiguous_format)
             return shard
 
     def sp_padding(

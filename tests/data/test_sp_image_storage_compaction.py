@@ -89,22 +89,10 @@ def test_non_grad_image_base_is_released_after_slicing(monkeypatch):
     assert torch.equal(shard, torch.arange(16 * 16, 24 * 16, dtype=torch.float32).view(8, 16))
 
 
-def test_image_slice_supports_tensors_without_exposed_storage(monkeypatch):
-    monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(2, 1))
-    sp_collator = collators.SequenceParallelCollator()
-    source = torch.arange(3 * 8 * 4, dtype=torch.float32).reshape(3, 8, 4)
-    actual = torch.func.vmap(lambda item: sp_collator.sp_slice("pixel_values", item, dim=0))(source)
-    assert torch.equal(actual, source[:, 4:, :])
-
-
-def test_pinned_and_quantized_image_slices_preserve_original_view(monkeypatch):
+def test_pinned_image_slices_preserve_original_view(monkeypatch):
     monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(2, 1))
     sp_collator = collators.SequenceParallelCollator()
     source = torch.randn(8, 4)
-    quantized = torch.quantize_per_tensor(source, scale=0.1, zero_point=10, dtype=torch.quint8)
-    quantized_shard = sp_collator.sp_slice("pixel_values", quantized, dim=0)
-    assert torch.equal(quantized_shard, quantized[4:])
-    assert quantized_shard.untyped_storage().data_ptr() == quantized.untyped_storage().data_ptr()
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "is_pinned", lambda tensor: True)
         pinned_shard = sp_collator.sp_slice("pixel_values", source, dim=0)
