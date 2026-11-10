@@ -174,7 +174,8 @@ jobs:
         run: |
           uv pip install --python .venv/bin/python triton==3.2.0
           uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
-            --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
+            --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ \
+            --trusted-host triton-ascend.osinfra.cn
           uv run --frozen python -c "from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
