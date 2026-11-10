@@ -2136,11 +2136,15 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": text_position_ids,
             }
+            # --- Patch.1 ---
+            # Only build the mask for layer types present in ``self.config.layer_types``
+            # and forward ``**kwargs`` into ``create_causal_mask`` for packed sequences.
             causal_mask_mapping = {}
             if "full_attention" in self.config.layer_types:
                 causal_mask_mapping["full_attention"] = create_causal_mask(**{**kwargs, **mask_kwargs})
             if "linear_attention" in self.config.layer_types:
                 causal_mask_mapping["linear_attention"] = create_recurrent_attention_mask(**mask_kwargs)
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

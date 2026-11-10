@@ -75,6 +75,9 @@ config.add_import("types", names=["SimpleNamespace"])
 # build cu_seqlens and pad window indices, so re-add the alias here.
 config.add_import("torch.nn.functional", alias="F", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen2_5_VLTextModel.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -1385,6 +1388,13 @@ def qwen2_5_vl_attention_forward_patched(
     return attn_output, attn_weights
 
 
+# ================================================================
+# Patch: Qwen2_5_VLTextModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "Qwen2_5_VLTextModel.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -1426,6 +1436,7 @@ def qwen2_5_vl_text_model_forward_patched(
 
     # It may already have been prepared by e.g. `generate`
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
         # Prepare mask arguments
         mask_kwargs = {
             **kwargs,
@@ -1442,6 +1453,7 @@ def qwen2_5_vl_text_model_forward_patched(
         # The sliding window alternating layers are not always activated depending on the config
         if self.has_sliding_layers:
             causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)

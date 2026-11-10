@@ -63,6 +63,9 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``LlamaModel.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
@@ -145,6 +148,12 @@ def llama_model_init_patched(self, config):
     self.post_init()
 
 
+# ================================================================
+# Patch: LlamaModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "LlamaModel.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -173,6 +182,7 @@ def llama_model_forward_patched(
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
         position_ids = position_ids.unsqueeze(0)
 
+    # --- Patch.1 ---
     causal_mask = create_causal_mask(
         **{
             **kwargs,
@@ -183,6 +193,7 @@ def llama_model_forward_patched(
             "position_ids": position_ids,
         }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

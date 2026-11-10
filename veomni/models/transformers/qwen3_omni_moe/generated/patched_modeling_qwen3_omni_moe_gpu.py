@@ -1965,6 +1965,9 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
     #    index 0 is the text_position_ids used for the causal mask).
     # 2. Return MoeModelOutputWithPast so @capture_outputs can inject
     #    router_logits via the registered OutputRecorder.
+    # 3. Forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+    #    ``veomni.models.utils.mask_utils.create_causal_mask`` so packed sequences
+    #    build an isolated mask once in the model forward.
     # NOTE: the @merge_with_config_defaults / @capture_outputs / @auto_docstring
     # decorators on the upstream method are preserved by patchgen.
     # ================================================================
@@ -2019,6 +2022,7 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         else:
             text_position_ids = position_ids[0]
 
+        # --- Patch.3 ---
         # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
         # ("Deprecated and unused" — see masking_utils.py:917).
         attention_mask = create_causal_mask(
@@ -2031,6 +2035,7 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
                 "position_ids": text_position_ids,
             }
         )
+        # --- Patch.3 ---
 
         hidden_states = inputs_embeds
 

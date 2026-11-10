@@ -130,6 +130,11 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# (FlexAttention BlockMask / MagiAttentionMask / dense 4D mask) once in
+# ``Qwen3VLTextModel.forward`` instead of building an unisolated HF mask or
+# rebuilding a 4D mask inside every decoder layer.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
@@ -208,6 +213,12 @@ def qwen3_vl_text_model_init_patched(self, config):
     self.post_init()
 
 
+# ================================================================
+# Patch: Qwen3VLTextModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "Qwen3VLTextModel.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -257,6 +268,7 @@ def qwen3_vl_text_model_forward_patched(
     else:
         text_position_ids = None
 
+    # --- Patch.1 ---
     attention_mask = create_causal_mask(
         **{
             **kwargs,
@@ -267,6 +279,7 @@ def qwen3_vl_text_model_forward_patched(
             "position_ids": text_position_ids,
         }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
 

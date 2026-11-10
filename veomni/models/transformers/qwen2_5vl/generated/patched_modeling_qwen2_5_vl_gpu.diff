@@ -1169,7 +1169,7 @@
  @auto_docstring
  class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
      config: Qwen2_5_VLTextConfig
-@@ -766,22 +1213,21 @@
+@@ -766,24 +1213,30 @@
          "attentions": Qwen2_5_VLAttention,
      }
 
@@ -1197,8 +1197,17 @@
 -        # Initialize weights and apply final processing
          self.post_init()
 
++    # ================================================================
++    # Patch: Qwen2_5_VLTextModel.forward
++    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
++    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
++    #    create_sliding_window_causal_mask}`` so packed sequences build an
++    #    isolated mask once in the model forward
++    # ================================================================
      @merge_with_config_defaults
-@@ -815,16 +1261,6 @@
+     @capture_outputs
+     @auto_docstring
+@@ -815,16 +1268,6 @@
          elif position_ids.ndim == 2:
              position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -1215,15 +1224,26 @@
          if position_ids.ndim == 3 and position_ids.shape[0] == 4:
              text_position_ids = position_ids[0]
              position_ids = position_ids[1:]
-@@ -836,6 +1272,7 @@
+@@ -834,8 +1277,10 @@
+
+         # It may already have been prepared by e.g. `generate`
          if not isinstance(causal_mask_mapping := attention_mask, dict):
++            # --- Patch.1 ---
              # Prepare mask arguments
              mask_kwargs = {
 +                **kwargs,
                  "config": self.config,
                  "inputs_embeds": inputs_embeds,
                  "attention_mask": attention_mask,
-@@ -870,6 +1307,12 @@
+@@ -849,6 +1294,7 @@
+             # The sliding window alternating layers are not always activated depending on the config
+             if self.has_sliding_layers:
+                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
++            # --- Patch.1 ---
+
+         hidden_states = inputs_embeds
+         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+@@ -870,6 +1316,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -1236,7 +1256,7 @@
 
 
  @auto_docstring
-@@ -1066,14 +1509,27 @@
+@@ -1066,14 +1518,27 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1269,7 +1289,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1083,53 +1539,35 @@
+@@ -1083,53 +1548,35 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1343,7 +1363,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1180,6 +1618,25 @@
+@@ -1180,6 +1627,25 @@
              position_ids = None
          return position_ids
 
@@ -1369,7 +1389,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1190,39 +1647,166 @@
+@@ -1190,39 +1656,166 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1547,7 +1567,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1233,6 +1817,15 @@
+@@ -1233,6 +1826,15 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1563,7 +1583,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1241,16 +1834,21 @@
+@@ -1241,16 +1843,21 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1586,7 +1606,7 @@
 
 
  @auto_docstring
-@@ -1265,16 +1863,29 @@
+@@ -1265,16 +1872,29 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1617,7 +1637,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1314,91 +1925,83 @@
+@@ -1314,91 +1934,83 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1751,7 +1771,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1578,5 +2181,49 @@
+@@ -1578,5 +2190,49 @@
 
          return input_ids, model_kwargs
 

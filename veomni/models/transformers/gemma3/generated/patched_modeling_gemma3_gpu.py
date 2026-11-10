@@ -542,6 +542,13 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Gemma3TextModel.forward
+    # 1. resolve this instance's bound attention implementation and forward
+    #    ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+    #    ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}``
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -570,6 +577,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             # Mask builders must follow this instance's attention impl.
             for layer in self.layers[: self.config.num_hidden_layers]:
                 handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
@@ -595,6 +603,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 "full_attention": create_causal_mask(**mask_kwargs),
                 "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
             }
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = {}

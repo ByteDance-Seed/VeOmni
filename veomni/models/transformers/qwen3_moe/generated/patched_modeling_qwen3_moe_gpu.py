@@ -547,6 +547,13 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen3MoeModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -584,8 +591,10 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        # --- Patch.1 ---
         # transformers 5.9 dropped ``cache_position`` from these constructors
-        # ("Deprecated and unused" — see masking_utils.py:917).
+        # ("Deprecated and unused" — see masking_utils.py:917). Forward ``**kwargs``
+        # so ``veomni.models.utils.mask_utils`` can build packed masks from ``cu_seq_lens_q``.
         causal_mask = mask_function(
             **{
                 **kwargs,
@@ -596,6 +605,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 "position_ids": position_ids,
             }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

@@ -96,6 +96,8 @@ def create_gemma3_masks(
     if past_key_values is not None:
         raise ValueError("Packed Gemma 3 VLM attention does not support past_key_values.")
 
+    # Route packed inputs through ``veomni.models.utils.mask_utils`` so
+    # ``block_sequence_ids`` and ``cu_seq_lens_q`` compose into isolated masks.
     block_sequence_ids = (
         None
         if token_type_ids is None

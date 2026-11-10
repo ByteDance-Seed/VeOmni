@@ -133,6 +133,9 @@ config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3VLMoeTextModel.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
@@ -225,6 +228,12 @@ config.override_method(
 )
 
 
+# ================================================================
+# Patch: Qwen3VLMoeTextModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "Qwen3VLMoeTextModel.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -274,6 +283,7 @@ def qwen3_vl_moe_text_model_forward_patched(
     else:
         text_position_ids = None
 
+    # --- Patch.1 ---
     attention_mask = create_causal_mask(
         **{
             **kwargs,
@@ -284,6 +294,7 @@ def qwen3_vl_moe_text_model_forward_patched(
             "position_ids": text_position_ids,
         }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
 

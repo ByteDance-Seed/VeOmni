@@ -1322,6 +1322,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen3VLTextModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+    #    sequences build an isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1370,6 +1376,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         else:
             text_position_ids = None
 
+        # --- Patch.1 ---
         attention_mask = create_causal_mask(
             **{
                 **kwargs,
@@ -1380,6 +1387,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 "position_ids": text_position_ids,
             }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
 

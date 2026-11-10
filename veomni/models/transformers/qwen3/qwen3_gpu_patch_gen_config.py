@@ -65,6 +65,9 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "ForSequenceClassificationLoss"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen3Model.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -143,6 +146,13 @@ def qwen3_model_init_patched(self, config):
     self.post_init()
 
 
+# ================================================================
+# Patch: Qwen3Model.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "Qwen3Model.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -173,6 +183,7 @@ def qwen3_model_forward_patched(
 
     # It may already have been prepared by e.g. `generate`
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
         # Prepare mask arguments
         mask_kwargs = {
             **kwargs,
@@ -189,6 +200,7 @@ def qwen3_model_forward_patched(
         # The sliding window alternating layers are not always activated depending on the config
         if self.has_sliding_layers:
             causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)

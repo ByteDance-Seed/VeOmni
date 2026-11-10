@@ -55,6 +55,9 @@ config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel a
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``DeepseekV3Model.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
@@ -253,6 +256,12 @@ def deepseek_v3_model_init_patched(self, config):
     self.post_init()
 
 
+# ================================================================
+# Patch: DeepseekV3Model.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
 @config.override_method(
     "DeepseekV3Model.forward",
     description="Forward packed sequence metadata to VeOmni mask builders",
@@ -281,6 +290,7 @@ def deepseek_v3_model_forward_patched(
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
         position_ids = position_ids.unsqueeze(0)
 
+    # --- Patch.1 ---
     causal_mask = create_causal_mask(
         **{
             **kwargs,
@@ -291,6 +301,7 @@ def deepseek_v3_model_forward_patched(
             "position_ids": position_ids,
         }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

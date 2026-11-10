@@ -383,6 +383,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen2Model.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -416,6 +423,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             mask_kwargs = {
                 **kwargs,
                 "config": self.config,
@@ -429,6 +437,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             }
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
 

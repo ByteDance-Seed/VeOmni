@@ -73,6 +73,9 @@ config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen3MoeModel.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -256,6 +259,13 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     return router_logits, router_top_value, router_indices
 
 
+# ================================================================
+# Patch: Qwen3MoeModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
 @config.override_method("Qwen3MoeModel.forward", description="Support SP in Qwen3MoeModel.forward")
 def qwen3_moe_model_forward_patched(
     self,
@@ -291,8 +301,10 @@ def qwen3_moe_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+    # --- Patch.1 ---
     # transformers 5.9 dropped ``cache_position`` from these constructors
-    # ("Deprecated and unused" — see masking_utils.py:917).
+    # ("Deprecated and unused" — see masking_utils.py:917). Forward ``**kwargs``
+    # so ``veomni.models.utils.mask_utils`` can build packed masks from ``cu_seq_lens_q``.
     causal_mask = mask_function(
         **{
             **kwargs,
@@ -303,6 +315,7 @@ def qwen3_moe_model_forward_patched(
             "position_ids": position_ids,
         }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

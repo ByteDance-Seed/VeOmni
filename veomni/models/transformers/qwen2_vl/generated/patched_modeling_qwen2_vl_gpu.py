@@ -962,6 +962,13 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen2VLTextModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1002,6 +1009,7 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             # Prepare mask arguments
             mask_kwargs = {
                 **kwargs,
@@ -1018,6 +1026,7 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

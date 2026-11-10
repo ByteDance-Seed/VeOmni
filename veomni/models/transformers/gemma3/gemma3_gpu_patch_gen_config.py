@@ -65,6 +65,9 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Gemma3TextModel.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -74,6 +77,13 @@ config.drop_import_names("use_kernelized_func")
 _bidirectional_window_overlay = None  # noqa: E305  resolved from the generated modeling file
 
 
+# ================================================================
+# Patch: Gemma3TextModel.forward
+# 1. resolve this instance's bound attention implementation and forward
+#    ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+#    ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}``
+# ================================================================
 @config.override_method(
     "Gemma3TextModel.forward",
     description="Route packed and non-packed masks through veomni.models.utils.mask_utils",
@@ -103,6 +113,7 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
         # Mask builders must follow this instance's attention impl.
         for layer in self.layers[: self.config.num_hidden_layers]:
             handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
@@ -128,6 +139,7 @@ def gemma3_textmodel_forward_patched(
             "full_attention": create_causal_mask(**mask_kwargs),
             "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
         }
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = {}

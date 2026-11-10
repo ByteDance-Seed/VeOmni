@@ -66,6 +66,9 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen2Model.forward``.
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -167,6 +170,13 @@ def qwen2_mlp_forward_patched(self, x):
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ================================================================
+# Patch: Qwen2Model.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
 @config.override_method("Qwen2Model.forward", description="Support SP in Qwen2Model.forward")
 def qwen2_model_forward_patched(
     self,
@@ -198,6 +208,7 @@ def qwen2_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
         mask_kwargs = {
             **kwargs,
             "config": self.config,
@@ -211,6 +222,7 @@ def qwen2_model_forward_patched(
         }
         if self.has_sliding_layers:
             causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
 

@@ -536,7 +536,7 @@
 
      def forward(
          self,
-@@ -572,22 +620,27 @@
+@@ -572,24 +620,35 @@
              init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
@@ -569,16 +569,27 @@
 -        # Initialize weights and apply final processing
          self.post_init()
 
++    # ================================================================
++    # Patch: DeepseekV3Model.forward
++    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
++    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
++    #    sequences build an isolated mask once in the model forward
++    # ================================================================
      @merge_with_config_defaults
-@@ -618,11 +671,14 @@
+     @capture_outputs
+     @auto_docstring
+@@ -617,13 +676,18 @@
+             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
              position_ids = position_ids.unsqueeze(0)
 
++        # --- Patch.1 ---
          causal_mask = create_causal_mask(
 -            config=self.config,
 -            inputs_embeds=inputs_embeds,
 -            attention_mask=attention_mask,
 -            past_key_values=past_key_values,
 -            position_ids=position_ids,
+-        )
 +            **{
 +                **kwargs,
 +                "config": self.config,
@@ -587,10 +598,12 @@
 +                "past_key_values": past_key_values,
 +                "position_ids": position_ids,
 +            }
-         )
++        )
++        # --- Patch.1 ---
 
          hidden_states = inputs_embeds
-@@ -646,6 +702,12 @@
+         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+@@ -646,6 +710,12 @@
          )
 
 
@@ -603,7 +616,7 @@
  @auto_docstring
  class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -658,8 +720,9 @@
+@@ -658,8 +728,9 @@
          self.model = DeepseekV3Model(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -615,7 +628,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -673,26 +736,15 @@
+@@ -673,26 +744,15 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -647,7 +660,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -700,25 +752,41 @@
+@@ -700,25 +760,41 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,

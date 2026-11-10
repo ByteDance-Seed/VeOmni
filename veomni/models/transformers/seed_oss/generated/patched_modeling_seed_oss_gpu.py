@@ -385,6 +385,12 @@ class SeedOssModel(SeedOssPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: SeedOssModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+    #    sequences build an isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -412,6 +418,7 @@ class SeedOssModel(SeedOssPreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
+        # --- Patch.1 ---
         causal_mask = create_causal_mask(
             **{
                 **kwargs,
@@ -422,6 +429,7 @@ class SeedOssModel(SeedOssPreTrainedModel):
                 "position_ids": position_ids,
             }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

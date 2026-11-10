@@ -303,7 +303,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -354,11 +383,10 @@
+@@ -354,13 +383,18 @@
          self.layers = nn.ModuleList(
              [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -315,16 +315,27 @@
 -        # Initialize weights and apply final processing
          self.post_init()
 
++    # ================================================================
++    # Patch: LlamaModel.forward
++    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
++    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
++    #    sequences build an isolated mask once in the model forward
++    # ================================================================
      @merge_with_config_defaults
-@@ -389,11 +417,14 @@
+     @capture_outputs
+     @auto_docstring
+@@ -388,13 +422,18 @@
+             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
              position_ids = position_ids.unsqueeze(0)
 
++        # --- Patch.1 ---
          causal_mask = create_causal_mask(
 -            config=self.config,
 -            inputs_embeds=inputs_embeds,
 -            attention_mask=attention_mask,
 -            past_key_values=past_key_values,
 -            position_ids=position_ids,
+-        )
 +            **{
 +                **kwargs,
 +                "config": self.config,
@@ -333,10 +344,12 @@
 +                "past_key_values": past_key_values,
 +                "position_ids": position_ids,
 +            }
-         )
++        )
++        # --- Patch.1 ---
 
          hidden_states = inputs_embeds
-@@ -417,6 +448,12 @@
+         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+@@ -417,6 +456,12 @@
          )
 
 
@@ -349,7 +362,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +466,9 @@
+@@ -429,8 +474,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -361,7 +374,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +482,110 @@
+@@ -444,55 +490,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

@@ -1217,7 +1217,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -756,11 +1316,10 @@
+@@ -756,13 +1316,18 @@
          self.layers = nn.ModuleList(
              [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1229,16 +1229,27 @@
 -        # Initialize weights and apply final processing
          self.post_init()
 
++    # ================================================================
++    # Patch: Qwen3VLTextModel.forward
++    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
++    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
++    #    sequences build an isolated mask once in the model forward
++    # ================================================================
      @merge_with_config_defaults
-@@ -812,11 +1371,14 @@
+     @capture_outputs
+     @auto_docstring
+@@ -811,13 +1376,18 @@
+         else:
              text_position_ids = None
 
++        # --- Patch.1 ---
          attention_mask = create_causal_mask(
 -            config=self.config,
 -            inputs_embeds=inputs_embeds,
 -            attention_mask=attention_mask,
 -            past_key_values=past_key_values,
 -            position_ids=text_position_ids,
+-        )
 +            **{
 +                **kwargs,
 +                "config": self.config,
@@ -1247,10 +1258,12 @@
 +                "past_key_values": past_key_values,
 +                "position_ids": text_position_ids,
 +            }
-         )
++        )
++        # --- Patch.1 ---
 
          hidden_states = inputs_embeds
-@@ -851,9 +1413,23 @@
+
+@@ -851,9 +1421,23 @@
              past_key_values=past_key_values,
          )
 
@@ -1274,7 +1287,7 @@
          visual_pos_masks = visual_pos_masks.to(hidden_states.device)
          visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
          hidden_states = hidden_states.clone()
-@@ -862,6 +1438,12 @@
+@@ -862,6 +1446,12 @@
          return hidden_states
 
 
@@ -1287,7 +1300,7 @@
  @auto_docstring
  class Qwen3VLModel(Qwen3VLPreTrainedModel):
      base_model_prefix = "model"
-@@ -870,11 +1452,9 @@
+@@ -870,11 +1460,9 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1302,7 +1315,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1034,6 +1614,13 @@
+@@ -1034,6 +1622,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1316,7 +1329,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1042,57 +1629,40 @@
+@@ -1042,57 +1637,40 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1396,7 +1409,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1144,6 +1714,24 @@
+@@ -1144,6 +1722,24 @@
              position_ids = None
          return position_ids
 
@@ -1421,7 +1434,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1157,48 +1745,189 @@
+@@ -1157,48 +1753,189 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1628,7 +1641,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1208,25 +1937,71 @@
+@@ -1208,25 +1945,71 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1705,7 +1718,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1234,13 +2009,17 @@
+@@ -1234,13 +2017,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1724,7 +1737,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1257,16 +2036,28 @@
+@@ -1257,16 +2044,28 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1754,7 +1767,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1295,6 +2086,16 @@
+@@ -1295,6 +2094,16 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1771,7 +1784,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1309,48 +2110,10 @@
+@@ -1309,48 +2118,10 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1822,7 +1835,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1361,27 +2124,39 @@
+@@ -1361,27 +2132,39 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1870,7 +1883,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1569,6 +2344,47 @@
+@@ -1569,6 +2352,47 @@
 
          return input_ids, model_kwargs
 
