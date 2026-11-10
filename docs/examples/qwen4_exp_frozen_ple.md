@@ -1,7 +1,9 @@
 # Freeze Qwen4-Exp PLE embeddings
 
-To freeze the per-layer embedding (PLE) n-gram tables, merge this YAML fragment
-into your Qwen4-Exp training configuration.
+To freeze the per-layer embedding (PLE) n-gram tables with the VLM SFT entry
+point (`tasks/train_vlm.py`), merge this YAML fragment into your Qwen4-Exp
+training configuration. This option is implemented by `VLMModelRuntime`;
+other model runtimes do not apply it.
 
 ```yaml
 train:
@@ -27,15 +29,16 @@ keep the dtype they have after model parallelization.
   on the training device when VeOmni checks their placement. Offloading
   these shards to CPU fails that check.
 - **DDP.** The current implementation does not support `fsdp_mode: ddp`
-  with `freeze_ple_embeddings: true`. The model type check reads `model.config`,
-  while the DDP wrapper stores the original model at `model.module`.
+  with `freeze_ple_embeddings: true`; training and checkpoint restore with
+  this combination have not been validated.
   `fsdp_mode` defaults to `fsdp2`, which is also the setting in the Qwen4-Exp
   training example.
 
 ## Resume from a checkpoint
 
-- **Frozen tables.** VeOmni freezes the tables before restoring the checkpoint.
-  Loading weights into the tables preserves their configured training dtype and
+- **Frozen tables.** VeOmni freezes the tables before model parallelization and checkpoint restore.
+  The requested table dtype is applied after parallelization and before optimizer
+  construction. Loading weights into the tables preserves their configured training dtype and
   frozen status.
 - **Optimizer state.** If the PLE tables were trainable when the checkpoint
   was saved, the saved optimizer parameter groups may include them.
