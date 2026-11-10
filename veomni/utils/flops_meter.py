@@ -14,6 +14,11 @@
 
 """Optional callbacks for model-specific FLOPs metadata."""
 
+from . import logging
+
+
+logger = logging.get_logger(__name__)
+
 
 def _compute_wan_seqlens(micro_batch):
     """Compute DiT sequence lengths from latent shapes."""
@@ -56,10 +61,16 @@ def _extract_minimax_h3_metadata(micro_batch):
             seq_len, text_len = item.get("seq_len"), item.get("text_len")
             positions = [item.get(key) for key in ("text_pos", "img_pos", "audio_pos")]
             if any(value is None for value in (seq_len, text_len, *positions)):
+                logger.warning_once(
+                    "MiniMax-H3 FLOPs metadata is incomplete or invalid; MFU and token metrics may be underestimated."
+                )
                 break
             seq_len, text_len = int(seq_len), int(text_len)
             used_len = sum(position.numel() for position in positions)
             if used_len <= 0 or used_len > seq_len or text_len < 0 or text_len > used_len:
+                logger.warning_once(
+                    "MiniMax-H3 FLOPs metadata is incomplete or invalid; MFU and token metrics may be underestimated."
+                )
                 break
             sample_seq_lens.append(used_len)
             sample_text_lens.append(text_len)

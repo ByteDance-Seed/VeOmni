@@ -7,17 +7,17 @@ callback. HF models retain their existing metadata handling without a callback.
 ## Callback contract
 
 Register a function under the config's `model_type` in
-[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L73). The meter
+[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L84). The meter
 selects it during [`EnvironMeter.__init__`](../../veomni/utils/helper.py#L228)
 and calls it from [`add`](../../veomni/utils/helper.py#L269), once per input
 micro-batch. Callbacks receive the same input supplied to `add`: a batch
 dictionary or a list of batch dictionaries, depending on the training path.
 The default DiT callback preserves the existing dictionary-based latent path.
 
-[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L79) returns
+[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L90) returns
 `None` for configs without `condition_model_type`. For DiT configs it looks up
 the model type, falling back to the registered `__default_dit__` callback,
-which uses the existing [`_compute_wan_seqlens`](../../veomni/utils/flops_meter.py#L18)
+which uses the existing [`_compute_wan_seqlens`](../../veomni/utils/flops_meter.py#L23)
 latent shape calculation.
 
 The callback returns `(batch_seqlens, extra_flops_kwargs)`:
@@ -55,7 +55,7 @@ def extract_example_metadata(batch):
 FLOPS_METADATA_CALLBACKS["ExampleModel"] = extract_example_metadata
 ```
 
-For MiniMax-H3, [`_extract_minimax_h3_metadata`](../../veomni/utils/flops_meter.py#L43)
+For MiniMax-H3, [`_extract_minimax_h3_metadata`](../../veomni/utils/flops_meter.py#L48)
 extracts main and text-refiner lengths from offline `packed` data. The existing
 [`VeomniFlopsCounter`](../../veomni/utils/count_flops.py#L73) calculates the
 formula. H3 online training may create `packed` after the meter runs; if no
