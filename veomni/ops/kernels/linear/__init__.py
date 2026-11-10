@@ -19,11 +19,10 @@ Variant ``standard`` is a 2D linear projection ``x @ weight.T + bias``. Variant
 groups. An empty bias tensor denotes an unused bias, so a caller without one
 does not have to branch on ``None``.
 
-Two quantization-aware-training rows sit next to the eager reference: ``qat``
-fake-quantizes both GEMM operands with the DeepSeek-V4 TileLang quantizers, and
-``torchao_mxfp4`` fake-quantizes them to MXFP4 through torchao. Both keep the
-multiply in the model dtype, which is what an emulated low-precision deployment
-GEMM computes.
+The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
+operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
+model dtype, which is what an emulated low-precision deployment GEMM computes.
+torchao-backed formats are registered separately, on top of this family.
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
@@ -32,7 +31,6 @@ from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
 from .standard import qat as standard_qat
-from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 
 
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
@@ -72,13 +70,4 @@ register_op(
     wrapper=grouped_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
-)
-
-register_op(
-    "linear",
-    "standard",
-    "torchao_mxfp4",
-    description="MXFP4 (E2M1 with E8M0 block scales) fake-quantized dense linear projection",
-    wrapper=standard_torchao_mxfp4.wrapper,
-    requires=("torchao",),
 )

@@ -68,7 +68,7 @@ veomni/
 │   ├── install.py      Idempotent process-wide attention integration
 │   ├── batch_invariant/  Scoped deterministic ATen patch
 │   ├── qat/            Fake-quantization primitives called by the qat rows
-│   │                   (DeepSeek-V4 FP8/FP4 TileLang; torchao MXFP4)
+│   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping

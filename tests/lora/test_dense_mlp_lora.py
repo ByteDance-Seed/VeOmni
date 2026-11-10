@@ -186,12 +186,12 @@ def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
 
 
 @pytest.mark.skipif(
-    "torchao_mxfp4" not in OP_REGISTRY.list_available("swiglu_mlp", "standard"),
-    reason="the torchao_mxfp4 row needs the optional 'torchao' package",
+    "qat" not in OP_REGISTRY.list_available("swiglu_mlp", "standard"),
+    reason="the qat row needs TileLang on SM90+",
 )
 def test_mlp_lora_refuses_the_quantizing_row():
     """Silently running the base layer at full precision would leave the config claiming QAT."""
-    mlp = _build_mlp("qwen3", "torchao_mxfp4", torch.float32, get_device_type())
+    mlp = _build_mlp("qwen3", "qat", torch.float32, get_device_type())
     model = _wrap(mlp)
 
     x = torch.randn(2, 5, 16, device=get_device_type())

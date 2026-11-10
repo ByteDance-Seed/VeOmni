@@ -26,7 +26,6 @@ get_started/installation/install_ascend_arm.md
 
 
 usage/arguments.md
-usage/mxfp4_qat.md
 usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md

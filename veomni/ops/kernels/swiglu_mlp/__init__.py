@@ -28,7 +28,6 @@ from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import qat as standard_qat
-from .standard import torchao_mxfp4 as standard_torchao_mxfp4
 
 
 _GPU = GpuKernelRequirement()
@@ -38,7 +37,7 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
 #: Only these need a projection's own ``weight``; every other row is a plain
 #: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
-QUANTIZING_IMPLS = frozenset({"qat", "torchao_mxfp4"})
+QUANTIZING_IMPLS = frozenset({"qat"})
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
@@ -115,14 +114,6 @@ register_op(
     requires=("tilelang",),
 )
 
-register_op(
-    "swiglu_mlp",
-    "standard",
-    "torchao_mxfp4",
-    description="MXFP4 (E2M1 with E8M0 block scales) fake-quantized SwiGLU MLP with optional activation clamping",
-    wrapper=standard_torchao_mxfp4.wrapper,
-    requires=("torchao",),
-)
 
 register_op(
     "swiglu_mlp",

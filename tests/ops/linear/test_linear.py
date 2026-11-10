@@ -23,23 +23,18 @@ import torch.nn.functional as F
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.utils.linear_utils import QUANTIZING_LINEAR_IMPLS
 from veomni.ops import OP_REGISTRY, VeomniOp
-from veomni.utils.import_utils import is_package_available
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
-_requires_torchao = pytest.mark.skipif(
-    not is_package_available("torchao"),
-    reason="torchao_mxfp4 row requires the optional 'torchao' package",
-)
-
 
 def _empty_bias(weight: torch.Tensor) -> torch.Tensor:
+    """The empty-tensor sentinel the family uses for an unused bias."""
     return weight.new_empty(0)
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao_mxfp4"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat"]
     assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
@@ -78,38 +73,6 @@ def test_linear_eager_handles_empty_input():
     assert op(x, w, _empty_bias(w)).shape == (0, 8)
 
 
-def test_linear_explicit_unavailable_impl_raises():
-    """A row whose package is missing must fail loudly rather than fall back to eager."""
-    if is_package_available("torchao"):
-        pytest.skip("torchao is installed, so the row resolves")
-    with pytest.raises(RuntimeError, match="requires unavailable package"):
-        VeomniOp("linear", "standard", "torchao_mxfp4")
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_forward_matches_manual_round_trip():
-    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
-
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    torch.manual_seed(0)
-    x = torch.randn(2, 5, 64, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
-    b = torch.randn(32, dtype=torch.bfloat16)
-
-    expected = F.linear(mxfp4_fake_quant(x), mxfp4_fake_quant(w), b)
-    torch.testing.assert_close(op(x, w, b), expected)
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_actually_rounds():
-    """The row must change the numbers; passing through unquantized would be a silent no-op."""
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    torch.manual_seed(0)
-    x = torch.randn(4, 64, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
-    assert not torch.equal(op(x, w, _empty_bias(w)), F.linear(x, w, None))
-
-
 def test_linear_qat_rows_require_tilelang_on_sm90():
     """The TileLang rows are declared with the hardware and package they need."""
     entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
@@ -117,133 +80,6 @@ def test_linear_qat_rows_require_tilelang_on_sm90():
     assert ("qat", ("tilelang",)) in {
         (entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "grouped")
     }
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_backward_is_straight_through():
-    """Gradients use the quantized operands, matching torchao's MX QAT backward."""
-    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
-
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    torch.manual_seed(0)
-    x = torch.randn(4, 64, dtype=torch.bfloat16, requires_grad=True)
-    w = torch.randn(32, 64, dtype=torch.bfloat16, requires_grad=True)
-    op(x, w, _empty_bias(w)).sum().backward()
-
-    grad_out = torch.ones(4, 32, dtype=torch.bfloat16)
-    torch.testing.assert_close(
-        x.grad.float(), grad_out.float() @ mxfp4_fake_quant(w).detach().float(), rtol=1e-2, atol=1e-2
-    )
-    torch.testing.assert_close(
-        w.grad.float(), grad_out.t().float() @ mxfp4_fake_quant(x).detach().float(), rtol=1e-2, atol=1e-2
-    )
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_bias_gradient():
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    torch.manual_seed(0)
-    x = torch.randn(2, 5, 64, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
-    b = torch.randn(32, dtype=torch.bfloat16, requires_grad=True)
-    op(x, w, b).sum().backward()
-    torch.testing.assert_close(b.grad, torch.full_like(b.grad, 10.0))
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_rejects_partial_group():
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    x = torch.randn(2, 48, dtype=torch.bfloat16)
-    w = torch.randn(32, 48, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        op(x, w, _empty_bias(w))
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_handles_empty_input():
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    x = torch.randn(0, 64, dtype=torch.bfloat16, requires_grad=True)
-    w = torch.randn(32, 64, dtype=torch.bfloat16, requires_grad=True)
-    out = op(x, w, _empty_bias(w))
-    assert out.shape == (0, 32)
-
-    # A zero-token micro-batch must still reach the weights with zero gradients.
-    out.sum().backward()
-    torch.testing.assert_close(w.grad, torch.zeros_like(w.grad))
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_quantizes_even_with_no_tokens():
-    """The zero-token path must not be the branch that skips the quantizer.
-
-    Comparing a ``float32`` activation against the eager row does not tell the
-    two apart, because an empty tensor has no values to round; instead assert the
-    call reaches ``mxfp4_fake_quant`` for both operands.
-    """
-    from veomni.ops.kernels.linear.standard import torchao_mxfp4 as impl
-
-    seen: list[tuple[tuple[int, ...], int]] = []
-
-    def _record(tensor, block_size=32):
-        seen.append((tuple(tensor.shape), block_size))
-        return tensor
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(impl, "mxfp4_fake_quant", _record)
-    try:
-        x = torch.randn(0, 64, dtype=torch.bfloat16)
-        w = torch.randn(32, 64, dtype=torch.bfloat16)
-        impl.wrapper(x, w, _empty_bias(w))
-    finally:
-        monkeypatch.undo()
-
-    assert seen == [((0, 64), 32), ((32, 64), 32)]
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_accepts_non_contiguous_input():
-    """A sliced activation arrives non-contiguous and torchao's to_mx asserts contiguity."""
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
-    sliced = torch.randn(3, 8, 64, dtype=torch.bfloat16)[:, :5]
-    assert not sliced.is_contiguous()
-    assert op(sliced, w, _empty_bias(w)).shape == (3, 5, 32)
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_rejects_float16():
-    op = VeomniOp("linear", "standard", "torchao_mxfp4")
-    x = torch.randn(2, 64, dtype=torch.float16)
-    w = torch.randn(32, 64, dtype=torch.float16)
-    with pytest.raises(TypeError, match="bfloat16 or float32"):
-        op(x, w, _empty_bias(w))
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_default_block_size_is_the_ocp_width():
-    """The default must be the 32-wide deployment group; a different width silently retrains a different recipe."""
-    from veomni.ops.kernels.linear.standard import torchao_mxfp4 as impl
-
-    assert impl.MXFP4_BLOCK_SIZE == 32
-    x = torch.randn(2, 64, dtype=torch.bfloat16)
-    w = torch.randn(8, 64, dtype=torch.bfloat16)
-    torch.testing.assert_close(
-        impl.wrapper(x, w, _empty_bias(w)),
-        impl.wrapper(x, w, _empty_bias(w), block_size=32),
-    )
-
-
-@_requires_torchao
-@pytest.mark.parametrize("block_size", [16, 64])
-def test_linear_torchao_mxfp4_block_size_changes_the_rounding(block_size: int):
-    """``block_size`` reaches the quantizer rather than being accepted and dropped."""
-    from veomni.ops.kernels.linear.standard import torchao_mxfp4 as impl
-
-    torch.manual_seed(0)
-    x = torch.randn(2, 128, dtype=torch.bfloat16)
-    w = torch.randn(8, 128, dtype=torch.bfloat16)
-    default = impl.wrapper(x, w, _empty_bias(w))
-    assert not torch.equal(default, impl.wrapper(x, w, _empty_bias(w), block_size=block_size))
 
 
 @pytest.fixture
@@ -264,42 +100,6 @@ def single_rank_dist(monkeypatch):
     finally:
         if created and dist.is_initialized():
             dist.destroy_process_group()
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_accepts_replicated_dtensor_parameter(single_rank_dist):
-    """FSDP2 hands the projection a DTensor in some placements; quantizing the local shard must work.
-
-    Returning a plain tensor for the weight while leaving the bias a DTensor makes
-    ``addmm`` reject the call with "got mixed torch.Tensor and DTensor", so both
-    operands take the same path.
-    """
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Replicate, distribute_tensor
-
-    mesh = init_device_mesh("cpu", (1,))
-    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Replicate()])
-    bias = distribute_tensor(torch.randn(32, dtype=torch.bfloat16), mesh, [Replicate()])
-    x = torch.randn(2, 64, dtype=torch.bfloat16)
-
-    out = VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, bias)
-
-    assert isinstance(out, torch.Tensor)
-    assert out.shape == (2, 32)
-
-
-@_requires_torchao
-def test_linear_torchao_mxfp4_accepts_replicated_dtensor_with_empty_input(single_rank_dist):
-    """The zero-token path must not be the one branch that skips the placement normalization."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Replicate, distribute_tensor
-
-    mesh = init_device_mesh("cpu", (1,))
-    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Replicate()])
-    bias = distribute_tensor(torch.randn(32, dtype=torch.bfloat16), mesh, [Replicate()])
-    x = torch.randn(0, 64, dtype=torch.bfloat16)
-
-    assert VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, bias).shape == (0, 32)
 
 
 def test_project_through_op_falls_back_to_a_wrapped_module():
@@ -352,74 +152,3 @@ def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantiz
 
     with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
         project_through_op(FakeOp(), Wrapped(), torch.randn(2, 8))
-
-
-@_requires_torchao
-@pytest.mark.parametrize("placement", ["replicate"])
-def test_linear_torchao_mxfp4_accepts_safe_dtensor_placements(single_rank_dist, placement):
-    """A ``Replicate`` placement is whole on this rank, which is the only case this row can serve.
-
-    Sharded placements are refused by ``test_linear_torchao_mxfp4_refuses_a_sharded_dtensor``:
-    the arithmetic per shard is fine, but the GEMM needs a collective.
-    """
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Replicate, distribute_tensor
-
-    mesh = init_device_mesh("cpu", (1,))
-    weight = torch.randn(32, 64, dtype=torch.bfloat16)
-    placements = {"replicate": [Replicate()]}[placement]
-    dtensor = distribute_tensor(weight, mesh, placements)
-    x = torch.randn(2, 64, dtype=torch.bfloat16)
-
-    out = VeomniOp("linear", "standard", "torchao_mxfp4")(x, dtensor, dtensor.new_empty(0))
-    expected = VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))
-
-    assert isinstance(out, torch.Tensor)
-    assert out.shape == (2, 32)
-    torch.testing.assert_close(out, expected)
-
-
-@_requires_torchao
-def test_mxfp4_quantization_of_a_row_shard_equals_the_full_tensor():
-    """Sharding the output dimension is a lossless split, which is what lets the row run sharded."""
-    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
-
-    torch.manual_seed(0)
-    weight = torch.randn(64, 128, dtype=torch.bfloat16)
-    full = mxfp4_fake_quant(weight)
-    for shards in (2, 4):
-        recomputed = torch.cat([mxfp4_fake_quant(s) for s in weight.chunk(shards, dim=0)], dim=0)
-        torch.testing.assert_close(recomputed, full, rtol=0, atol=0)
-
-
-@_requires_torchao
-def test_mxfp4_rejects_a_group_split_that_cannot_be_padded():
-    """A shard that splits a group has no defined scale, so it must fail rather than round wrongly."""
-    from veomni.ops.qat.torchao_mxfp4 import mxfp4_fake_quant
-
-    # in=96 splits into 48-wide halves, not a multiple of the 32-wide group.
-    weight = torch.randn(64, 96, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        mxfp4_fake_quant(weight.chunk(2, dim=1)[0])
-
-
-@_requires_torchao
-@pytest.mark.parametrize("dim", [0, 1])
-def test_linear_torchao_mxfp4_refuses_a_sharded_dtensor(single_rank_dist, dim):
-    """The row is a tensor op: it cannot complete a GEMM spread across ranks.
-
-    A ``Shard(0)`` local piece yields partial *output* features and a ``Shard(1)``
-    piece is a partial *input*, so neither can be multiplied as if it were whole.
-    Completing either needs a collective this row does not issue. A one-rank mesh
-    shards nothing, so this asserts the guard on the placement metadata, which is
-    the property that decides it.
-    """
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Shard, distribute_tensor
-
-    mesh = init_device_mesh("cpu", (1,))
-    weight = distribute_tensor(torch.randn(32, 64, dtype=torch.bfloat16), mesh, [Shard(dim)])
-    x = torch.randn(2, 64, dtype=torch.bfloat16)
-
-    with pytest.raises(TypeError, match="whole on this rank"):
-        VeomniOp("linear", "standard", "torchao_mxfp4")(x, weight, weight.new_empty(0))

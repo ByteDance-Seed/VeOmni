@@ -7,7 +7,7 @@ handles. There is no process-global bind and no silent eager fallback after
 an optimized row is selected.
 
 Quantization-aware training is not a recipe field. Each family that can round
-its operands owns a `qat` (or `torchao_mxfp4`) row, and stored KV/indexer
+its operands owns a `qat` row, and stored KV/indexer
 activations round through the `kv_round` family. What used to be one global
 `qat_implementation` switch is now these independent selections.
 
@@ -26,8 +26,8 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+), `torchao_mxfp4` (MXFP4 QAT) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+), `torchao_mxfp4` (MXFP4 QAT) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants) |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants) |
 | KV / indexer storage round | `kv_round_implementation` | `eager`, `triton` (GPU) | off (`None`); `"triton"` when explicitly selected on GPU | Model `__init__` via an instance-local `VeomniOp` (`fp8` variant); block width and quantized prefix are call arguments |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -65,10 +65,8 @@ A `deepgemm_fp8` expert GEMM quantizes its own operands, so combining it with a
 `qat` row on `linear_implementation` or `swiglu_mlp_implementation` raises at
 config-parse time.
 
-`torchao_mxfp4` is the same kind of row as `qat`, on `linear` and `swiglu_mlp`.
-Its row on `swiglu_mlp` reaches only models that run the fused SwiGLU; a model
-that owns its projections reads `linear_implementation` instead. Both require the
-optional `torchao` package and are unavailable without it.
+torchao-backed formats register as further rows on the same families, on top of
+this mechanism. Their rows are added by the PRs that own those formats.
 
 **The nine general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
@@ -468,7 +466,6 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
-| `torchao_mxfp4` | Registered MXFP4 fake-quant row | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
 
 #### `linear_implementation`
@@ -476,7 +473,6 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `eager` | Registered `F.linear` row | — |
-| `torchao_mxfp4` | Registered MXFP4 fake-quant row | `torchao` package |
 
 Both quantizing rows refuse to run on a projection substituted after
 construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):

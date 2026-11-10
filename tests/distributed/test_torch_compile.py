@@ -1178,63 +1178,48 @@ def _model_with_ops(**ops_fields) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
-def test_compile_rejects_torchao_mxfp4(field):
-    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
-    from veomni.distributed.torch_compile import _reject_incompatible_ops
+def test_compile_allows_every_registered_row_today(monkeypatch):
+    """No registered row is currently marked uncompilable, so the check must be inert."""
+    from veomni.distributed import torch_compile
 
-    with pytest.raises(RuntimeError, match=f"{field}='torchao_mxfp4'"):
-        _reject_incompatible_ops(_model_with_ops(**{field: "torchao_mxfp4"}))
-
-
-@pytest.mark.parametrize(
-    "ops_fields",
-    [
-        {},
-        {"linear_implementation": "eager"},
-        {"linear_implementation": "qat"},
-        {"swiglu_mlp_implementation": "liger_kernel"},
-    ],
-)
-def test_compile_allows_other_rows(ops_fields):
-    from veomni.distributed.torch_compile import _reject_incompatible_ops
-
-    _reject_incompatible_ops(_model_with_ops(**ops_fields))
+    monkeypatch.setattr(torch_compile, "_UNCOMPILABLE_IMPLS", {})
+    torch_compile._reject_incompatible_ops(_model_with_ops(linear_implementation="qat"))
 
 
-def test_compile_rejection_is_skipped_without_an_ops_config():
-    """A model with no ops config has nothing to reject and must not crash the build."""
-    from veomni.distributed.torch_compile import _reject_incompatible_ops
+def test_compile_rejection_names_the_offending_field(monkeypatch):
+    """A registered uncompilable row is reported by field, not by an Inductor assertion."""
+    from veomni.distributed import torch_compile
 
-    _reject_incompatible_ops(nn.Linear(4, 4))
+    monkeypatch.setattr(torch_compile, "_UNCOMPILABLE_IMPLS", {"linear_implementation": "uncompilable_row"})
+    with pytest.raises(RuntimeError, match="linear_implementation='uncompilable_row'"):
+        torch_compile._reject_incompatible_ops(_model_with_ops(linear_implementation="uncompilable_row"))
 
 
-def test_compile_rejection_walks_sub_configs():
+def test_compile_rejection_walks_sub_configs(monkeypatch):
     """A multimodal root carries its text tower's ops one level down.
 
     Qwen3-VL binds the MLP row from ``config.text_config``, so a child-only
-    selection is real and must be caught; a root-only selection that the child
-    overrides is not, and the walk has to report the path so the level is clear.
+    selection is real and must be caught; the message names the path.
     """
-    from veomni.distributed.torch_compile import _uncompilable_at
+    from veomni.distributed import torch_compile
+
+    monkeypatch.setattr(torch_compile, "_UNCOMPILABLE_IMPLS", {"linear_implementation": "bad"})
 
     def ops(lin=None):
         return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
 
-    child_only = SimpleNamespace(
-        ops_config=ops(lin="torchao_mxfp4"),
-        sub_configs={},
-    )
     root = SimpleNamespace(
         ops_config=ops(lin="eager"),
         sub_configs={"text_config": None},
-        text_config=child_only,
+        text_config=SimpleNamespace(ops_config=ops(lin="bad"), sub_configs={}),
     )
-    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
+    assert torch_compile._uncompilable_at(root, prefix="") == ["text_config.linear_implementation='bad'"]
 
 
-def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row():
-    from veomni.distributed.torch_compile import _uncompilable_at
+def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row(monkeypatch):
+    from veomni.distributed import torch_compile
+
+    monkeypatch.setattr(torch_compile, "_UNCOMPILABLE_IMPLS", {"linear_implementation": "bad"})
 
     def ops(lin=None):
         return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
@@ -1244,4 +1229,4 @@ def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row():
         sub_configs={"text_config": None},
         text_config=SimpleNamespace(ops_config=ops(lin="qat"), sub_configs={}),
     )
-    assert _uncompilable_at(root, prefix="") == []
+    assert torch_compile._uncompilable_at(root, prefix="") == []

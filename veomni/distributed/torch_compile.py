@@ -167,11 +167,12 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
-#: Op rows whose kernels emit dtypes Inductor cannot lower.
-_UNCOMPILABLE_IMPLS = {
-    "linear_implementation": "torchao_mxfp4",
-    "swiglu_mlp_implementation": "torchao_mxfp4",
-}
+#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by ops field.
+#: A torchao-backed fake-quant row belongs here: ``MXTensor`` materializes
+#: ``float8_e8m0fnu`` scale tensors and Inductor's codegen has no lowering for
+#: that dtype. Registering the row here turns an assertion raised deep inside a
+#: fused kernel into a statement about the config.
+_UNCOMPILABLE_IMPLS: dict[str, str] = {}
 
 
 def _uncompilable_selections(ops) -> list[str]:
@@ -188,10 +189,9 @@ def _uncompilable_selections(ops) -> list[str]:
 def _reject_incompatible_ops(model: nn.Module) -> None:
     """Reject op selections ``torch.compile`` cannot lower, at any config depth.
 
-    ``torchao_mxfp4`` materializes ``float8_e8m0fnu`` scale tensors and
-    Inductor's codegen has no lowering for that dtype (``missing from
-    torch._inductor.codegen.cpp.DTYPE_TO_CPP``). Checking here turns an opaque
-    assertion from inside a fused kernel into a statement about the config.
+    A row registers itself in ``_UNCOMPILABLE_IMPLS`` when its kernel emits a
+    dtype Inductor cannot lower. Checking here turns an assertion raised from
+    inside a fused kernel into a statement about the config.
 
     The walk covers nested configs because that is how the selections bind: a
     multimodal root carries its text tower's ops under ``sub_configs``, and a
@@ -205,8 +205,8 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
-            f"{', '.join(offending)}: those rows emit float8_e8m0fnu scale tensors, which "
-            "Inductor cannot lower. Disable compilation or select a different row."
+            f"{', '.join(offending)}: those rows emit a dtype Inductor cannot lower. "
+            "Disable compilation or select a different row."
         )
 
 

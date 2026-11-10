@@ -29,7 +29,7 @@ from torch import Tensor, nn
 
 #: ``linear`` rows that fake-quantize the weight they are handed, and therefore
 #: cannot fall back to calling a wrapped projection module.
-QUANTIZING_LINEAR_IMPLS = frozenset({"qat", "torchao_mxfp4"})
+QUANTIZING_LINEAR_IMPLS = frozenset({"qat"})
 
 
 __all__ = [
