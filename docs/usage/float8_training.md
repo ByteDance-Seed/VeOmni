@@ -80,7 +80,7 @@ Model-specific eligible DiT projection patterns:
 | Property | Support |
 |---|---|
 | Models | Dense `qwen3`, `llama`; DiT `WanTransformer3DModel`, `QwenImageTransformer2DModel`, `LTXVideoTransformerModel`, `MiniMaxH3DiTModel` |
-| Recipes | `tensorwise` (default), `rowwise` (token-wise activation × channel-wise weight scaling), `rowwise_with_gw_hp` (rowwise forward/dgrad with BF16 wgrad) |
+| Recipes | `tensorwise` (default), `rowwise` (token-wise activation × channel-wise weight scaling), `rowwise_with_gw_hp` (rowwise forward, token-wise `grad_output` × tensorwise weight for `dX`, and uncast high-precision operands for `dW`) |
 | Modules | Explicitly selected plain `nn.Linear` transformer block projections with `in_features` and `out_features` divisible by 16 |
 | Excluded | LLM `lm_head`; DiT patchify, timestep/caption/condition embedders, AdaLN modulation layers, and final output projections |
 | Hardware | NVIDIA CUDA SM89 or newer (Ada, Hopper, Blackwell) |
@@ -96,6 +96,6 @@ before FSDP2 wraps transformer blocks.
 ## Recipe selection
 
 - **`tensorwise`**: Uses per-tensor dynamic scaling across all three GEMMs (`output`, `dX`, `dW`).
-- **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for forward and activation-gradient (`dX`) GEMMs while keeping weight-gradient (`dW`) accumulation in BF16, cutting `dX`/`dW` quantization error by ~25–35% vs `tensorwise`.
+- **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for the forward GEMM, token-wise `grad_output` scaling with tensorwise weight scaling for the activation-gradient (`dX`) GEMM, and skips FP8 casts for the weight-gradient (`dW`) operands.
 - **`rowwise`**: Uses rowwise scaling across all three GEMMs (`output`, `dX`, `dW`).
 - **`torch.compile` status**: `model.accelerator.torch_compile.enable=True` is currently rejected by `validate_float8_training()` (`ValueError: float8 training with torch.compile is not yet validated.`), so supported FSDP2 float8 training runs in eager mode (`torch_compile.enable=False`). In standalone block microbenchmarks outside `validate_float8_training()`, wrapping `Float8Linear` blocks with `torch.compile` fuses torchao's dynamic scaling and transpose into a single Triton kernel before `aten::_scaled_mm`.
