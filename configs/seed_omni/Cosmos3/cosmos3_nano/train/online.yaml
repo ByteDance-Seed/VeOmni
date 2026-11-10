@@ -55,7 +55,9 @@ model:
 data:
   train_path: dataset/cosmos3-demo/video_dataset_file.jsonl
   train_size: 1000000000000
-  datasets_type: iterable
+  # mapping, not iterable: its sampler cursor resumes exactly. A plain iterable dataset sharded
+  # over more than one dp rank saves no cursor, so a resumed run would restart the stream.
+  datasets_type: mapping
   data_type: seedomni
   source_name: cosmos3_sft_jsonl
   # Token budget of one packed micro-batch (the reference recipe's). Needs the MoT's recompute,

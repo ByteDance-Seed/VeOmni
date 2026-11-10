@@ -158,6 +158,13 @@ connector, seeded `seed + dp_rank`, and is checkpointed per rank with that
 module, so a resumed run continues the same stream; see
 [Module Sampling State](../mixins/module_rng_state.md).
 
+A run resumed from a checkpoint trains the same steps as an uninterrupted one,
+bit for bit, in both the online and the offline-training recipe (measured on
+4 cards, resuming at step 3 of 6). Both read a `mapping` dataset, whose sampler
+cursor is saved exactly. Keep it: with `datasets_type: iterable` on more than
+one dp rank the stream is wrapped in `ShardedIterableDataset`, which saves no
+cursor, so a resumed run starts the data over.
+
 ## 5. What is not supported
 
 - **Generation.** There is no flow sampler, so the recipes and the converted
