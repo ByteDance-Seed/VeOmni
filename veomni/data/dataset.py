@@ -458,6 +458,10 @@ def get_length_fn(sample: Any) -> int:
         return _sum_sequence_like(sample["attention_mask"])
     if "input_ids" in sample:
         return _numel_sequence_like(sample["input_ids"])
+    if "packed_input_ids" in sample:
+        # A packed sample has no carrier and no dense ids: its one sequence is
+        # already joined, so that tensor *is* the length.
+        return _numel_sequence_like(sample["packed_input_ids"])
     if "conversation_list" in sample:
         return _conversation_total_length(sample["conversation_list"])
     return 1
@@ -492,6 +496,13 @@ def get_length_by_labels_fn(sample: Any) -> int:
 
     if "labels" in sample:
         counted = _count_supervised_labels(sample["labels"])
+        if counted is not None:
+            return counted
+
+    if "packed_labels" in sample:
+        # The packed path names its labels `packed_labels`, so the generic
+        # `labels` branch above never sees them.
+        counted = _count_supervised_labels(sample["packed_labels"])
         if counted is not None:
             return counted
 
