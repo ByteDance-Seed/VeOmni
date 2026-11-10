@@ -232,16 +232,13 @@ and YAML inputs.
 
 ## DiT Fixed Microbatches
 
-`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false` unless the
-condition model provides `get_dyn_bsz_length_fn()`; then a recipe's `train.dyn_bsz: true`
-groups samples by token budget (`micro_batch_size` must be 1).
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
 `DiTDataCollator` produces dict-of-lists microbatches; the existing
 `get_condition` / `process_condition` / model-forward path is unchanged.
 Models return sample-mean scalar losses, and the trainer divides by the number
 of accumulation microbatches. Packing and SP/CP handling remain model-owned.
 Offline embedding allows multiple samples but keeps one microbatch per step.
-See `docs/usage/dit_microbatching.md` and
-`docs/usage/data_packing_and_dyn_bsz.md#dit-diffusion-packing`.
+See `docs/usage/dit_microbatching.md`.
 
 MiniMax H3 prepares samples independently in `process_condition` and concatenates
 multi-sample inputs inside its model forward. Its layouts contain no 64-row tail;

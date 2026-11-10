@@ -1,7 +1,5 @@
 # dit preprocess should not be used for llm or mllms
-import json
 import os
-import random
 
 from ..preprocess import PREPROCESSOR_REGISTRY
 
@@ -119,35 +117,3 @@ def minimax_h3_preprocess(conversations, **kwargs):
 
     # FL2VA keyframes extracted from video frames in condition_model.get_condition()
     return prompt, audios, [], videos
-
-
-@PREPROCESSOR_REGISTRY.register("cosmos3_sft_jsonl")
-def cosmos3_sft_jsonl_preprocess(conversations, data_dir="", cfg_dropout_rate=0.0, **kwargs):
-    """One SFT JSONL row -> ``(prompt, {}, [], [video_path])``.
-
-    The row is one clip: ``t2w_windows[0]``'s ``caption_json`` (the training target) or its dense
-    ``caption``. The T2V/I2V/V2V draw is not made here but in ``Cosmos3ConditionModel.process_condition``.
-    """
-
-    def caption_of(window, example):
-        structured = window.get("caption_json")
-        if isinstance(structured, str):
-            if structured.strip():
-                return structured.strip()
-        elif structured is not None:
-            return json.dumps(structured, ensure_ascii=False)
-        for caption in (window.get("caption"), example.get("caption")):
-            if isinstance(caption, str) and caption.strip():
-                return caption.strip().rstrip(".") + "."
-        raise ValueError(f"cosmos3_sft_jsonl needs 'caption_json' or a 'caption'; keys {sorted(window)}.")
-
-    window = conversations["t2w_windows"][0]
-    prompt = caption_of(window, conversations)
-    # CFG dropout: train the unconditional branch too, like the reference's cfg_dropout_rate.
-    rate = float(cfg_dropout_rate or 0.0)
-    if rate >= 1.0 or (rate > 0.0 and random.random() < rate):
-        prompt = ""
-    vision_path = conversations["vision_path"]
-    if data_dir and "://" not in vision_path and not os.path.isabs(vision_path):
-        vision_path = os.path.join(data_dir, vision_path)
-    return prompt, {}, [], [vision_path]

@@ -76,7 +76,6 @@ examples/minimax_h3_smoke_test.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
-examples/cosmos3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
 ```

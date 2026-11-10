@@ -211,24 +211,3 @@ def test_packed_length_counts_text_plus_latent_patches():
     from_frames = cosmos3_packed_length({"input_ids": ids, "videos": torch.zeros(17, 3, 256, 320)}, **geometry)
     from_latents = cosmos3_packed_length({"input_ids": ids, "latents": torch.zeros(48, 5, 16, 20)}, **geometry)
     assert from_frames == from_latents == (7 + 1) + 8 * 10 * 5 + 2
-
-
-def test_sft_jsonl_preprocess():
-    from veomni.data.multimodal.dit.preprocess import cosmos3_sft_jsonl_preprocess
-
-    row = {"vision_path": "videos/a.mp4", "t2w_windows": [{"caption_json": {"subjects": ["a bridge"]}}]}
-    prompt, audios, images, videos = cosmos3_sft_jsonl_preprocess(row, data_dir="/data")
-    assert prompt == '{"subjects": ["a bridge"]}'
-    assert (audios, images, videos) == ({}, [], ["/data/videos/a.mp4"])
-
-    dense = {"vision_path": "/abs/a.mp4", "t2w_windows": [{"caption": "a bridge"}]}
-    assert cosmos3_sft_jsonl_preprocess(dense, data_dir="/data") == ("a bridge.", {}, [], ["/abs/a.mp4"])
-    assert cosmos3_sft_jsonl_preprocess(row, cfg_dropout_rate=1.0)[0] == ""
-
-    # An empty structured caption falls back to the dense one; a URI is not joined to data_dir.
-    blank = {
-        "vision_path": "https://host/a.mp4",
-        "t2w_windows": [{"caption_json": " ", "caption": " "}],
-        "caption": "a bridge",
-    }
-    assert cosmos3_sft_jsonl_preprocess(blank, data_dir="/data") == ("a bridge.", {}, [], ["https://host/a.mp4"])

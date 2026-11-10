@@ -17,7 +17,7 @@ import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Sequence
+from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -303,7 +303,6 @@ class DiTTrainer:
     training_task: Literal["offline_training", "online_training", "offline_embedding"]
     offline_embedding_save_dir: str = None
     offline_embedding_saver: OfflineEmbeddingSaver = None
-    dyn_bsz_length_fn: Optional[Callable[[Any], int]] = None
 
     def __init__(self, args: VeOmniDiTArguments):
         if args.train.channel_loss.enable:
@@ -314,8 +313,8 @@ class DiTTrainer:
         self.base.args = args
 
         # rewrite _setup, setup arguments for dit training.
-        # ``base._setup`` registers ParallelState; ``_build_dataset`` then settles
-        # dyn_bsz and dataloader_batch_size, once the condition model is known.
+        # ``base._setup`` registers ParallelState; DiT then recomputes
+        # dataloader_batch_size from ``dp_size``.
         self._setup()
         # Builds the condition model and, unless this is an embedding-only run,
         # the DiT itself along with its optimizer.
@@ -350,6 +349,10 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
+        args.train.dyn_bsz = False
+        # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
+        # (default), so it was set to 1. Recompute now that dyn_bsz=False.
+        args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
@@ -385,19 +388,6 @@ class DiTTrainer:
 
     def _build_dataset(self):
         args: VeOmniDiTArguments = self.base.args
-        # Token-budget grouping needs the condition model to price a sample; DiT models without
-        # ``get_dyn_bsz_length_fn`` keep fixed-sample batching.
-        get_length_fn = getattr(self.condition_model, "get_dyn_bsz_length_fn", None)
-        args.train.dyn_bsz = args.train.dyn_bsz and get_length_fn is not None
-        if args.train.dyn_bsz:
-            if args.train.micro_batch_size != 1:
-                raise ValueError("train.dyn_bsz=True packs one micro batch per sample group; set micro_batch_size=1.")
-            self.dyn_bsz_length_fn = get_length_fn()
-        else:
-            # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
-            # (default), so it was set to 1. Recompute now that dyn_bsz=False.
-            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
-
         self.base._build_dataset()
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
@@ -441,7 +431,7 @@ class DiTTrainer:
             self.base.train_steps = args.train_steps
 
     def _build_dataloader(self):
-        """Build dataloader with dyn_bsz=False for DiT (fixed batch), unless the condition model prices samples."""
+        """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
         args = self.base.args
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
@@ -457,7 +447,6 @@ class DiTTrainer:
                 dyn_bsz=args.train.dyn_bsz,
                 dyn_bsz_runtime=args.train.dyn_bsz_runtime,
                 dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
-                dyn_bsz_length_fn=self.dyn_bsz_length_fn,
                 dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
                 dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
                 num_workers=args.data.dataloader.num_workers,
