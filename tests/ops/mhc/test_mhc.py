@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""mHC eager vs HuggingFace DeepSeek-V4, and TileLang / CANN vs eager."""
+"""mHC eager vs HuggingFace DeepSeek-V4, and fused backends vs eager."""
 
 from __future__ import annotations
 
@@ -299,8 +299,9 @@ def test_mhc_triton_pre_post_matches_eager(batch: int, seq_len: int, hidden: int
     eager_post = resolve_op("mhc", "post", "eager").wrapper
     triton_post = resolve_op("mhc", "post", "triton").wrapper
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         inference = triton_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    with torch.no_grad():
         eager_inference = eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
     for actual, expected in zip(inference, eager_inference, strict=True):
         assert actual.dtype == expected.dtype
@@ -361,7 +362,8 @@ def test_mhc_triton_head_matches_eager():
 
     x_t, fn_t, scale_t, base_t = make_grad_leaves(x, fn, scale, base)
     x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
-    y_t = triton_head(x_t, fn_t, scale_t, base_t, norm_eps, hc_mult, hc_eps)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        y_t = triton_head(x_t, fn_t, scale_t, base_t, norm_eps, hc_mult, hc_eps)
     y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
     torch.testing.assert_close(y_t, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
 
@@ -373,9 +375,11 @@ def test_mhc_triton_head_matches_eager():
 
 
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
-@pytest.mark.parametrize("hc_mult", [1, 2, 4, 8, 16])
-def test_mhc_triton_supported_stream_counts(hc_mult: int):
-    hidden = 33
+@pytest.mark.parametrize(
+    ("hc_mult", "hidden"),
+    [(1, 33), (2, 33), (4, 7168), (8, 33), (16, 33)],
+)
+def test_mhc_triton_supported_stream_counts(hc_mult: int, hidden: int):
     x, fn, scale, base = _mhc_pre_inputs(1, 3, hc_mult, hidden, seed=100 + hc_mult)
     args = (1e-6, hc_mult, 3, 1e-6)
     x_t, fn_t, scale_t, base_t = make_grad_leaves(x, fn, scale, base)
@@ -420,22 +424,6 @@ def test_mhc_triton_post_noncontiguous_direct_gradients():
 
     grads_t = torch.autograd.grad(y_t, inputs_t, grad_outputs=grad)
     grads_e = torch.autograd.grad(y_e, inputs_e, grad_outputs=grad.contiguous())
-    for actual, expected in zip(grads_t, grads_e, strict=True):
-        assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
-
-
-@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
-def test_mhc_triton_pre_production_width():
-    hc_mult, hidden = 4, 7168
-    x, fn, scale, base = _mhc_pre_inputs(1, 3, hc_mult, hidden, seed=47)
-    args = (1e-6, hc_mult, 3, 1e-6)
-    inputs_t = make_grad_leaves(x, fn, scale, base)
-    inputs_e = make_grad_leaves(x, fn, scale, base)
-    values_t = resolve_op("mhc", "pre", "triton").wrapper(*inputs_t, *args)
-    values_e = resolve_op("mhc", "pre", "eager").wrapper(*inputs_e, *args)
-    grad_outputs = tuple(torch.randn_like(value) for value in values_t)
-    grads_t = torch.autograd.grad(values_t, inputs_t, grad_outputs=grad_outputs)
-    grads_e = torch.autograd.grad(values_e, inputs_e, grad_outputs=grad_outputs)
     for actual, expected in zip(grads_t, grads_e, strict=True):
         assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
 
