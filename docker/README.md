@@ -143,22 +143,15 @@ are unavailable, build with the local commands above on an ARM64 host and run
 the device checks on an A3 machine. The builder does not include NPU tests or
 resolve the outstanding VeOmni legacy FLA API incompatibility.
 
-The A2 unit and e2e workflows now use the published x86 candidate at digest
-`sha256:c05565d0f6fb7c7d713bf5e6237b0508d7617a5ff7f3cf7cd4181033552d4105`.
-After the locked dependency sync, they verify retained wheel checksums and restore
-torch-npu post7, Triton 3.6.0, its Ascend 3.6.0.post2 overlay and A2 FLA into the test venv.
-These explicit overrides are candidate validation, not a lockfile migration.
+The A2 unit and e2e workflows use the published x86 candidate at digest
+`sha256:164b1e7268fb95649cf3edc3c87e0ba8464a150510e3ac9064dd48a2b877a90d`.
+After locked dependency sync, they verify retained wheel checksums and restore
+torch-npu post7, Triton 3.2.0, its Ascend 3.2.2 overlay and A2 FLA into the venv.
+These explicit overrides test compatibility with CANN 9.2.1; they are not a
+lockfile migration. The branch includes newer upstream GDN changes, so results
+are not a single-variable comparison against the earlier post2 run.
 
-The rebuilt A2 x86 candidate uses Triton-Ascend `3.6.0.post2` over base Triton
-`3.6.0`; the A2 ARM and A3 recipes still use Ascend `3.6.0`. Its Docker build
-asserts the installed post2 version. Device CI uses the published post2 image digest above, verified anonymously against its A2 target and source revision.
-
-The next A2 x86 rebuild selects Triton-Ascend `3.2.2` over base Triton `3.2.0`
-for compatibility testing with the existing CANN 9.2.1/torch-npu post7 stack.
-CI remains on the published post2 digest until this rebuild is published.
-The branch also includes newer upstream GDN changes, so its results are not a
-single-variable comparison against the earlier post2 run.
-
-The A3 ARM64 rebuild also selects Triton-Ascend `3.2.2`. Its base Triton is
-`3.5.0`, as required by the upstream v3.2.2 ARM packaging configuration;
-the A2 x86 base remains `3.2.0`. A2 ARM is unchanged.
+The A3 ARM64 candidate uses Triton-Ascend 3.2.2 over base Triton 3.5.0, as
+required by upstream ARM packaging. It is available at
+`ghcr.io/zpl1n/veomni@sha256:f4c1fbedbbf7cf47567a541e53d9d926cdc7ca576f66eead307d106274fef620`.
+A2 ARM is unchanged. Image publication does not establish device numerical correctness.

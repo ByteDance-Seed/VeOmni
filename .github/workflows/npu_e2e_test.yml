@@ -49,7 +49,7 @@ jobs:
     runs-on: [self-hosted, 910b-8]
     timeout-minutes: 120
     container:
-      image: ghcr.io/zpl1n/veomni@sha256:c05565d0f6fb7c7d713bf5e6237b0508d7617a5ff7f3cf7cd4181033552d4105
+      image: ghcr.io/zpl1n/veomni@sha256:164b1e7268fb95649cf3edc3c87e0ba8464a150510e3ac9064dd48a2b877a90d
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
@@ -146,11 +146,11 @@ jobs:
           sha256sum --check /app/a2-ci-wheels.sha256
           uv pip install --python .venv/bin/python --no-deps --reinstall /app/torch_npu-*.whl
           uv pip install --python .venv/bin/python pybind11
-          uv pip install --python .venv/bin/python --no-deps --reinstall /app/triton-3.6.0-*.whl
+          uv pip install --python .venv/bin/python --no-deps --reinstall /app/triton-3.2.0-*.whl
           uv pip install --python .venv/bin/python --no-deps --reinstall /app/triton_ascend-*.whl
           uv pip install --python .venv/bin/python --no-deps --reinstall /app/flash_linear_attention_npu_a2-*.whl
           TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python /app/check_packaged_wheel_api.py
-          .venv/bin/python -c "from importlib.metadata import version; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.6.0'; assert version('triton-ascend') == '3.6.0.post2'; from triton._C.libtriton import ascend; from fla_npu.ops import ascendc; assert callable(ascendc.chunk_gated_delta_rule_fwd)"
+          .venv/bin/python -c "from importlib.metadata import version; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.2.0'; assert version('triton-ascend') == '3.2.2'; from triton._C.libtriton import ascend; from fla_npu.ops import ascendc; assert callable(ascendc.chunk_gated_delta_rule_fwd)"
       - name: Check final pip list
         run: |
           uv pip list
