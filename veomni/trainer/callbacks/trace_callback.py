@@ -243,6 +243,7 @@ class EnvironMeterCallback(Callback):
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:
+        """Reduce training metrics in a consistent group order and publish step statistics."""
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
             delta_time,

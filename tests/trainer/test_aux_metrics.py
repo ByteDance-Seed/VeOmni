@@ -339,6 +339,7 @@ def _environ_meter_callback(env_metrics=None, lr=None):
 
 
 def _metric_schema_worker(rank, endpoint):
+    """Compare reductions when ranks provide metric keys in different orders."""
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         callback = _environ_meter_callback()
@@ -365,6 +366,7 @@ def test_metric_reduction_aligns_different_key_orders():
 
 
 def _metric_subgroup_worker(rank, endpoint):
+    """Check that metric reductions stay within each independent FSDP group."""
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
     try:
         first = dist.new_group([0, 1], backend="gloo")
