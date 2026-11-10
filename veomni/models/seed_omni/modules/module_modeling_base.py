@@ -30,10 +30,38 @@ class PretrainedOmniModule(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then bind module-owned processor / tokenizer sidecars."""
+        """Load weights, then bind module-owned processor / tokenizer sidecars.
+
+        A module may declare :meth:`_allowed_checkpoint_mismatches`, naming the
+        keys its own ``_create_checkpoint_tensor_converter`` re-shapes rather than
+        loads. That converter only runs through VeOmni's loaders; HF's
+        ``from_pretrained`` (what a single-process eager inference run uses) sees
+        the same mismatch and refuses to start. So the load is retried with
+        ``ignore_mismatched_sizes=True``, but only when *every* mismatched key is
+        one the module declared — anything else still raises, so an unintended
+        shape change is not swallowed.
+        """
         from .module_processing_base import bind_module_assets
 
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except RuntimeError as error:
+            allowed = cls._allowed_checkpoint_mismatches(pretrained_model_name_or_path, args, kwargs)
+            if not allowed:
+                raise
+            # HF reports the mismatch two ways depending on version (a "size mismatch"
+            # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
+            # retry rather than matching on the message, and let the check below decide.
+            model, info = super().from_pretrained(
+                pretrained_model_name_or_path, *args, ignore_mismatched_sizes=True, output_loading_info=True, **kwargs
+            )
+            mismatched = {name for name, _, _ in info["mismatched_keys"]}
+            unexpected = mismatched - allowed
+            if unexpected or not mismatched:
+                raise RuntimeError(
+                    f"{cls.__name__}: the load failed, and its size mismatches are not the ones this module "
+                    f"re-initialises on purpose (declared {sorted(allowed)}, got {sorted(mismatched)})."
+                ) from error
         # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded
         # module config, forwarded by ``OmniModel._load_modules``) — that's a
         # different "config" than the launcher/runtime overrides dict
@@ -47,6 +75,21 @@ class PretrainedOmniModule(PreTrainedModel):
             config_overrides=config_overrides,
         )
         return model
+
+    @classmethod
+    def _allowed_checkpoint_mismatches(
+        cls,
+        pretrained_model_name_or_path: Any,
+        args: tuple,
+        kwargs: dict[str, Any],
+    ) -> frozenset[str]:
+        """Checkpoint keys whose shape mismatch this module re-initialises on purpose.
+
+        Empty by default. Override when a module's
+        :meth:`_create_checkpoint_tensor_converter` reshapes a tensor at load:
+        the converter covers VeOmni's loaders, and this covers HF's.
+        """
+        return frozenset()
 
     def save_pretrained(
         self,

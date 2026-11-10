@@ -369,6 +369,45 @@ def test_image_mode_retargets_the_merger_and_freezes_the_tower():
     assert int(text_encoder._trainable_row_mask.sum()) == len(type(text_encoder)._VISION_SPECIAL_TOKENS)
 
 
+def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Path):
+    """The recipe's inference path loads the retargeted merger instead of raising.
+
+    Eager inference (`fsdp_mode: eager`, `OmniModel.from_pretrained`) goes through HF's
+    own `from_pretrained`, not VeOmni's loader — so `_MergerProjectionConverter`,
+    which drops the stock-shape `linear_fc2` during training, never runs. Without
+    the module declaring that one mismatch, the documented convert-then-infer flow
+    dies at startup with a size-mismatch error. A second case pins the guard: a
+    mismatch the module did *not* declare still raises.
+    """
+    Vision = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
+    VisionConfig = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
+
+    # A stock checkpoint at the ViT's own width (`out_hidden_size` unretargeted).
+    stock_config = VisionConfig(vision_config=dict(_VISION_CONFIG), ops_implementation=make_eager_ops_config())
+    source = tmp_path / "qwen3vl_vision"
+    source.mkdir(parents=True)
+    Vision(stock_config).save_pretrained(source)
+    from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
+
+    Qwen2VLImageProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
+    Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
+
+    retargeted = VisionConfig(
+        vision_config=dict(_VISION_CONFIG), out_hidden_size=HIDDEN, ops_implementation=make_eager_ops_config()
+    )
+    model = Vision.from_pretrained(str(source), config=retargeted)
+    assert model.visual.merger.linear_fc2.weight.shape[0] == HIDDEN
+
+    # The guard: retargeting the ViT's hidden size is not a declared mismatch.
+    stray = VisionConfig(
+        vision_config={**_VISION_CONFIG, "hidden_size": HIDDEN * 2, "num_heads": 2},
+        out_hidden_size=HIDDEN,
+        ops_implementation=make_eager_ops_config(),
+    )
+    with pytest.raises(RuntimeError, match="not the ones this module re-initialises"):
+        Vision.from_pretrained(str(source), config=stray)
+
+
 def test_a_composed_step_trains_only_what_the_overrides_selected():
     """One graph step backprops into the merger, the vision rows and the backbone."""
     modules = _build_modules(device=torch.device("cpu"), dtype=torch.float32)

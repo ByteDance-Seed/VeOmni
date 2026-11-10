@@ -277,6 +277,14 @@ checkpoint converter (`_MergerProjectionConverter`) drops it at load and the wei
 loader re-initialises it. `merger.norm` and `merger.linear_fc1` still load from the
 checkpoint — no build-time surgery.
 
+That converter only runs through VeOmni's own weight loaders, so single-process
+**eager inference** — which loads through HF's `from_pretrained` — would otherwise
+fail at startup on that one shape mismatch. The module therefore also declares the
+retargeted `linear_fc2` keys via `_allowed_checkpoint_mismatches`, and the load
+retries with `ignore_mismatched_sizes=True` **only** when every mismatch is a
+declared one; anything else still raises, so an unintended shape change cannot be
+swallowed.
+
 `freeze: true` then freezes the ViT blocks and keeps only the merger trainable, and
 `disable_deepstack: true` zeroes `deepstack_visual_indexes` because the plain
 `qwen3_llm` backbone has no DeepStack injection path. The ViT consequently produces

@@ -168,6 +168,18 @@ else:
 
 logger = logging.get_logger(__name__)
 
+_MERGER_PROJECTION_SUFFIXES = ("merger.linear_fc2.weight", "merger.linear_fc2.bias")
+
+
+def is_retargeted_merger_key(name: str) -> bool:
+    """Whether ``name`` is the patch merger's output projection (not a deepstack one).
+
+    A ``out_hidden_size`` override rebuilds this tensor at a different shape, so
+    its stock checkpoint value cannot be loaded and must be re-initialised. The
+    deepstack mergers keep the ViT's own width and are never retargeted.
+    """
+    return name.endswith(_MERGER_PROJECTION_SUFFIXES) and "deepstack" not in name
+
 
 class _MergerProjectionConverter:
     """Drop the patch-merger output projection (``merger.linear_fc2``) from the
@@ -183,7 +195,7 @@ class _MergerProjectionConverter:
         self._model = model
 
     def can_handle(self, name: str) -> bool:
-        return name.endswith(("merger.linear_fc2.weight", "merger.linear_fc2.bias")) and "deepstack" not in name
+        return is_retargeted_merger_key(name)
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional["ConvertedCheckpointTensor"]:
         try:
@@ -277,6 +289,27 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     @staticmethod
     def _create_checkpoint_tensor_converter(model: "PretrainedOmniModule") -> _MergerProjectionConverter:
         return _MergerProjectionConverter(model)
+
+    @classmethod
+    def _allowed_checkpoint_mismatches(
+        cls,
+        pretrained_model_name_or_path: Any,
+        args: tuple,
+        kwargs: dict[str, Any],
+    ) -> frozenset[str]:
+        """Allow the retargeted merger projection's shape mismatch, and nothing else.
+
+        ``out_hidden_size`` rebuilds ``merger.linear_fc2`` at the LLM's width, so a
+        stock Qwen3-VL checkpoint no longer matches. VeOmni's loaders drop that
+        tensor through :class:`_MergerProjectionConverter`; HF's ``from_pretrained``
+        — the single-process eager inference path — has to be told the same thing,
+        which is what this declares. Returned empty when the config kept the
+        checkpoint's own width, so a stray mismatch there still raises.
+        """
+        config = kwargs.get("config")
+        if config is None or getattr(config, "out_hidden_size", None) is None:
+            return frozenset()
+        return frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
 
     def freeze_model(self) -> None:
         """When ``config.freeze``, freeze the ViT but keep the patch merger
