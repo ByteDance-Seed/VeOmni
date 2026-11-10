@@ -210,6 +210,8 @@ def _factory_worker(rank, world_size, rendezvous, root, mode):
         params = list(model.parameters())
         if mode == "order" and rank == 1:
             params.reverse()
+        if mode == "freeze_mismatch" and rank == 1:
+            model.lm_head.weight.requires_grad_(False)
         if mode in ("constructor-error", "extra-constructor-error") and rank == 1:
 
             def fail(*args, **kwargs):
@@ -246,7 +248,7 @@ def _factory_worker(rank, world_size, rendezvous, root, mode):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize(
-    "mode", ["success", "order", "lr", "momentum", "constructor-error", "extra-constructor-error"]
+    "mode", ["success", "order", "lr", "momentum", "freeze_mismatch", "constructor-error", "extra-constructor-error"]
 )
 def test_file_optimizer_factory_coordinates_real_group_failures(tmp_path, mode):
     mp.start_processes(
@@ -269,7 +271,11 @@ def _file_step_worker(rank, rendezvous, root, mode):
 
     dist_utils.get_device_type = lambda: "cpu"
     dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=5 if mode == "asymmetric_step_hook" else 20),
     )
     try:
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
@@ -307,6 +313,11 @@ def _file_step_worker(rank, rendezvous, root, mode):
             p.grad = None
         model.ngram_embedding.weight.grad = torch.full_like(model.ngram_embedding.weight, 0.1)
         original = model.ngram_embedding.weight.detach().clone()
+        hook_calls = []
+        if mode == "asymmetric_step_hook" and rank == 0:
+            leaf.register_step_pre_hook(lambda *_args: hook_calls.append(True))
+        if mode == "asymmetric_restore_failure" and rank == 0:
+            optimizer._veomni_dcp_restore_failed = True
         if mode == "disk_failure" and rank == 1:
 
             def fail_allocate(*args, **kwargs):
@@ -321,8 +332,18 @@ def _file_step_worker(rank, rendezvous, root, mode):
         result = torch.tensor(int(error is not None))
         dist.all_reduce(result)
         assert int(result) == (0 if mode == "success" else 2), (rank, mode, error)
-        if mode == "grad_mismatch":
+        if mode in ("grad_mismatch", "asymmetric_step_hook", "asymmetric_restore_failure"):
             torch.testing.assert_close(original, model.ngram_embedding.weight, rtol=0, atol=0)
+        if mode in ("asymmetric_step_hook", "asymmetric_restore_failure"):
+            expected = (
+                "no closures or step hooks"
+                if rank == 0 and mode == "asymmetric_step_hook"
+                else "failed checkpoint restore"
+                if rank == 0
+                else "validating file-backed optimizer step failed on another rank"
+            )
+            assert expected in str(error)
+            assert not hook_calls
         if mode == "disk_failure":
             assert leaf._ple_state_poisoned
             with pytest.raises(RuntimeError, match="checkpoint|state failed"):
@@ -332,7 +353,9 @@ def _file_step_worker(rank, rendezvous, root, mode):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("mode", ["success", "grad_mismatch", "disk_failure"])
+@pytest.mark.parametrize(
+    "mode", ["success", "grad_mismatch", "disk_failure", "asymmetric_step_hook", "asymmetric_restore_failure"]
+)
 def test_file_optimizer_step_coordinates_before_muon_collectives(tmp_path, mode):
     mp.start_processes(
         _file_step_worker,

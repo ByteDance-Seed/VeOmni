@@ -974,7 +974,9 @@ def _lora_extra_parallel_export_worker(rank, rendezvous, output_dir, ep_dim, fsd
     from veomni.distributed.parallel_plan import SpecInfo
     from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
         fsdp_rank, ep_rank = mesh.get_coordinate()

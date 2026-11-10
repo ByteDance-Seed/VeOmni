@@ -545,26 +545,39 @@ class MultiOptimizer(Optimizer, Stateful):
         )
 
     def step(self, closure=None):
-        if getattr(self, "_veomni_dcp_restore_failed", False):
+        restore_failed = getattr(self, "_veomni_dcp_restore_failed", False)
+        if restore_failed and not self._qwen38_ple_world_profile:
             raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
         children = tuple(self.optimizers_dict.values())
         qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
         if self._qwen38_ple_world_profile:
             from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
 
-            # Group order and configuration are uniform across ranks by contract.
-            # File allocation and gradient-traffic failures remain coordinated.
-            if (
-                closure is not None
-                or _global_optimizer_pre_hooks
-                or _global_optimizer_post_hooks
-                or len(qwen_children) != len(children)
-                or any(
-                    not opt._ple_world_profile or opt._optimizer_step_pre_hooks or opt._optimizer_step_post_hooks
-                    for opt in qwen_children
-                )
-            ):
-                raise ValueError("File-backed optimizer requires coordinated children and no closures or step hooks")
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            error = None
+            try:
+                if restore_failed:
+                    raise RuntimeError(
+                        "MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer"
+                    )
+                if (
+                    closure is not None
+                    or _global_optimizer_pre_hooks
+                    or _global_optimizer_post_hooks
+                    or len(qwen_children) != len(children)
+                    or any(
+                        not opt._ple_world_profile or opt._optimizer_step_pre_hooks or opt._optimizer_step_post_hooks
+                        for opt in qwen_children
+                    )
+                ):
+                    raise ValueError(
+                        "File-backed optimizer requires coordinated children and no closures or step hooks"
+                    )
+            except BaseException as exc:
+                error = exc
+            # No participant enters a child collective until all ranks agree.
+            raise_if_any_rank_failed(error, "validating file-backed optimizer step")
             for opt in qwen_children:
                 opt._prepare_file_step()
         uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
@@ -776,7 +789,9 @@ def _file_profile_group_signature(model, param_groups):
                 layout = (tuple(parameter.device_mesh.mesh_dim_names or ()), tuple(map(str, parameter.placements)))
             else:
                 layout = None
-            parameters.append((name, tuple(parameter.shape), str(parameter.dtype), layout))
+            parameters.append(
+                (name, tuple(parameter.shape), str(parameter.dtype), bool(parameter.requires_grad), layout)
+            )
         options = []
         for key, value in sorted(group.items()):
             if key == "params":
