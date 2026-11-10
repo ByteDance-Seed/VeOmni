@@ -1,5 +1,10 @@
 [
   {
+    "name": "qwen38-lora-export-guard-cpu",
+    "suite": "unit",
+    "args": ["-s", "-x", "tests/lora/test_veomni_lora_native.py::test_adapter_export_rejects_trainable_base_before_writing"]
+  },
+  {
     "name": "device-api-scoped-exceptions-unit",
     "suite": "unit",
     "args": ["-v", "-s", "-x", "tests/special_sanity/test_device_api_usage.py"]

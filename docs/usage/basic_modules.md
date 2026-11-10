@@ -402,10 +402,10 @@ states in host buffers — pinned by default, pageable when `state_offload_pin_m
 is `false` or a pinned allocation fails — and streams them to the device in
 batches, lowering peak device memory.
 
-This optimizer's moments use the parameter dtype and it does not create FP32
-master weights. BF16 parameters therefore have BF16 moments and BF16 parameter
-writes; select an optimizer with the desired precision policy when FP32 masters
-are required.
+With `state_offload: cpu`, the AdamW moments use the parameter dtype and no FP32
+master weights are created. BF16 parameters therefore have BF16 moments and
+BF16 parameter writes; select an optimizer with the desired precision policy
+when FP32 masters are required.
 `state_offload: cpu` cannot be combined with selective ExtraParallel parameter
 CPU offload (`cpu_offload_extra_parallel_names`).
 
