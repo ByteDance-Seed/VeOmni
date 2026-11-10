@@ -170,6 +170,10 @@ logger = logging.get_logger(__name__)
 
 _MERGER_PROJECTION_SUFFIXES = ("merger.linear_fc2.weight", "merger.linear_fc2.bias")
 
+# The checkpoint keys a retargeted merger re-initialises: HF's own loader needs the
+# same list `_MergerProjectionConverter` drops from VeOmni's loaders.
+_RETARGETED_MERGER_KEYS = frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
+
 
 def is_retargeted_merger_key(name: str) -> bool:
     """Whether ``name`` is the patch merger's output projection (not a deepstack one).
@@ -292,30 +296,47 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
         return _MergerProjectionConverter(model)
 
     @classmethod
-    def _allowed_checkpoint_mismatches(
-        cls,
-        pretrained_model_name_or_path: Any,
-        args: tuple,
-        kwargs: dict[str, Any],
-    ) -> frozenset[str]:
-        """Allow the retargeted merger projection's shape mismatch, and nothing else.
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
+        """Load the tower, re-initialising a merger this config retargeted.
 
         ``out_hidden_size`` rebuilds ``merger.linear_fc2`` at the LLM's width, so a
-        stock Qwen3-VL checkpoint no longer matches. VeOmni's loaders drop that
-        tensor through :class:`_MergerProjectionConverter`; HF's ``from_pretrained``
-        — the single-process eager inference path — has to be told the same thing,
-        which is what this declares. Returned empty when the config kept the
-        checkpoint's own width, so a stray mismatch there still raises.
-
-        The override can arrive either on the config object or as a direct keyword;
-        both are checked, so a caller that skips the config route is not left with
-        the stock-shape refusal this exists to prevent.
+        stock Qwen3-VL checkpoint no longer matches it. VeOmni's own loaders drop
+        that tensor through :class:`_MergerProjectionConverter`; single-process
+        eager inference loads through this HF entry point instead, which refuses to
+        start on the mismatch. Retry once accepting mismatches, and keep the result
+        only when they are exactly the merger projection — any other shape change
+        still raises. With ``out_hidden_size`` unset nothing is retried, so a
+        standard Qwen3-VL load is untouched.
         """
-        config = kwargs.get("config")
-        config_retargets = config is not None and getattr(config, "out_hidden_size", None) is not None
-        if not (config_retargets or kwargs.get("out_hidden_size") is not None):
-            return frozenset()
-        return frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
+        if getattr(kwargs.get("config"), "out_hidden_size", None) is None:
+            return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+        # Popped so the retry can set its own, and so the base's asset binding
+        # always receives a bare model rather than HF's `(model, info)` tuple.
+        want_info = kwargs.pop("output_loading_info", False)
+        try:
+            loaded = super().from_pretrained(
+                pretrained_model_name_or_path, *args, output_loading_info=want_info, **kwargs
+            )
+        except RuntimeError as error:
+            # HF reports the mismatch two ways depending on version (a "size mismatch"
+            # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
+            # retry rather than matching on the message, and let the check below decide.
+            model, info = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=True,
+                output_loading_info=True,
+                **kwargs,
+            )
+            unexpected = {name for name, _, _ in info["mismatched_keys"]} - _RETARGETED_MERGER_KEYS
+            if unexpected:
+                raise RuntimeError(
+                    f"{cls.__name__}: the load failed, and its size mismatches are not the retargeted merger "
+                    f"({sorted(unexpected)})."
+                ) from error
+            return (model, info) if want_info else model
+        return loaded
 
     def freeze_model(self) -> None:
         """When ``config.freeze``, freeze the ViT but keep the patch merger

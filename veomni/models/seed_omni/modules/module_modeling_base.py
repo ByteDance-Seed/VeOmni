@@ -30,59 +30,10 @@ class PretrainedOmniModule(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then bind module-owned processor / tokenizer sidecars.
-
-        A module may declare :meth:`_allowed_checkpoint_mismatches`, naming the
-        keys its own ``_create_checkpoint_tensor_converter`` re-shapes rather than
-        loads. That converter only runs through VeOmni's loaders; HF's
-        ``from_pretrained`` (what a single-process eager inference run uses) sees
-        the same mismatch and refuses to start. So the load is retried with
-        ``ignore_mismatched_sizes=True``, but only when *every* mismatched key is
-        one the module declared — anything else still raises, so an unintended
-        shape change is not swallowed.
-
-        ``ignore_mismatched_sizes`` and ``output_loading_info`` are resolved here
-        rather than forwarded, so the retry can set them without colliding with a
-        caller that passed either one, and so ``bind_module_assets`` always gets a
-        bare model (HF returns a ``(model, info)`` tuple when loading info is
-        requested).
-        """
+        """Load weights, then bind module-owned processor / tokenizer sidecars."""
         from .module_processing_base import bind_module_assets
 
-        want_info = kwargs.pop("output_loading_info", False)
-        user_ignore = kwargs.pop("ignore_mismatched_sizes", False)
-        try:
-            loaded = super().from_pretrained(
-                pretrained_model_name_or_path,
-                *args,
-                ignore_mismatched_sizes=user_ignore,
-                output_loading_info=want_info,
-                **kwargs,
-            )
-        except RuntimeError as error:
-            allowed = cls._allowed_checkpoint_mismatches(pretrained_model_name_or_path, args, kwargs)
-            if not allowed or user_ignore:
-                raise
-            # HF reports the mismatch two ways depending on version (a "size mismatch"
-            # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
-            # retry rather than matching on the message, and let the check below decide.
-            model, info = super().from_pretrained(
-                pretrained_model_name_or_path,
-                *args,
-                ignore_mismatched_sizes=True,
-                output_loading_info=True,
-                **kwargs,
-            )
-            mismatched = {name for name, _, _ in info["mismatched_keys"]}
-            unexpected = mismatched - allowed
-            if unexpected or not mismatched:
-                raise RuntimeError(
-                    f"{cls.__name__}: the load failed, and its size mismatches are not the ones this module "
-                    f"re-initialises on purpose (declared {sorted(allowed)}, got {sorted(mismatched)})."
-                ) from error
-            loaded = (model, info) if want_info else model
-        model = loaded[0] if want_info else loaded
-
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded
         # module config, forwarded by ``OmniModel._load_modules``) — that's a
         # different "config" than the launcher/runtime overrides dict
@@ -95,22 +46,7 @@ class PretrainedOmniModule(PreTrainedModel):
             checkpoint_path=str(pretrained_model_name_or_path),
             config_overrides=config_overrides,
         )
-        return loaded
-
-    @classmethod
-    def _allowed_checkpoint_mismatches(
-        cls,
-        pretrained_model_name_or_path: Any,
-        args: tuple,
-        kwargs: dict[str, Any],
-    ) -> frozenset[str]:
-        """Checkpoint keys whose shape mismatch this module re-initialises on purpose.
-
-        Empty by default. Override when a module's
-        :meth:`_create_checkpoint_tensor_converter` reshapes a tensor at load:
-        the converter covers VeOmni's loaders, and this covers HF's.
-        """
-        return frozenset()
+        return model
 
     def save_pretrained(
         self,

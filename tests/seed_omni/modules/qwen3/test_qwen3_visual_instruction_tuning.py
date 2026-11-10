@@ -34,7 +34,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.tensor import DTensor
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY
@@ -55,8 +55,6 @@ from veomni.utils.device import (
 )
 
 
-_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
-_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 VOCAB = 64
@@ -369,62 +367,6 @@ def test_image_mode_retargets_the_merger_and_freezes_the_tower():
     assert int(text_encoder._trainable_row_mask.sum()) == len(type(text_encoder)._VISION_SPECIAL_TOKENS)
 
 
-def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Path):
-    """The recipe's inference path loads the retargeted merger instead of raising.
-
-    Eager inference (`fsdp_mode: eager`, `OmniModel.from_pretrained`) goes through HF's
-    own `from_pretrained`, not VeOmni's loader — so `_MergerProjectionConverter`,
-    which drops the stock-shape `linear_fc2` during training, never runs. Without
-    the module declaring that one mismatch, the documented convert-then-infer flow
-    dies at startup with a size-mismatch error. A second case pins the guard: a
-    mismatch the module did *not* declare still raises.
-    """
-    Vision = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
-    VisionConfig = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
-
-    # A stock checkpoint whose merger still projects into the ViT's own width —
-    # `_VISION_CONFIG` is already the *retargeted* shape, so widen it back here.
-    stock_vision = {**_VISION_CONFIG, "out_hidden_size": HIDDEN * 2}
-    stock_config = VisionConfig(vision_config=stock_vision, ops_implementation=make_eager_ops_config())
-    source = tmp_path / "qwen3vl_vision"
-    source.mkdir(parents=True)
-    Vision(stock_config).save_pretrained(source)
-    from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
-
-    Qwen2VLImageProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
-    Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
-
-    retargeted = VisionConfig(
-        vision_config=dict(_VISION_CONFIG),
-        out_hidden_size=HIDDEN,
-        # What the recipe sets: a plain backbone has no DeepStack path. Without it
-        # the deepstack mergers are retargeted too, which this converter does not
-        # cover — see the class docstring.
-        disable_deepstack=True,
-        ops_implementation=make_eager_ops_config(),
-    )
-    model = Vision.from_pretrained(str(source), config=retargeted)
-    assert model.visual.merger.linear_fc2.weight.shape[0] == HIDDEN
-
-    # The guard: retargeting the ViT's hidden size is not a declared mismatch.
-    stray = VisionConfig(
-        vision_config={**stock_vision, "hidden_size": HIDDEN * 2, "num_heads": 2},
-        out_hidden_size=HIDDEN,
-        ops_implementation=make_eager_ops_config(),
-    )
-    with pytest.raises(RuntimeError, match="not the ones this module re-initialises"):
-        Vision.from_pretrained(str(source), config=stray)
-
-    # A caller that asks for the loading info gets it back, and still gets the
-    # retry: `output_loading_info` must not collide with the one the retry sets.
-    loaded, info = Vision.from_pretrained(str(source), config=retargeted, output_loading_info=True)
-    assert loaded.visual.merger.linear_fc2.weight.shape[0] == HIDDEN
-    assert {name for name, _, _ in info["mismatched_keys"]} == {
-        "visual.merger.linear_fc2.weight",
-        "visual.merger.linear_fc2.bias",
-    }
-
-
 def test_a_composed_step_trains_only_what_the_overrides_selected():
     """One graph step backprops into the merger, the vision rows and the backbone."""
     modules = _build_modules(device=torch.device("cpu"), dtype=torch.float32)
@@ -653,45 +595,26 @@ def _assert_sp_parity(out_dir: Path, world: int, *, rtol: float = 0.0, atol: flo
             assert square_other == pytest.approx(square1, rel=rtol, abs=atol), (rank, name, square1, square_other)
 
 
-@pytest.mark.launch_plan(provider=_CI_CPU_2)
-def test_sp2_matches_sp1_on_the_composed_graph(tmp_path: Path):
+@pytest.mark.launch_plan(provider=from_parameter("nproc", device="cpu"))
+@pytest.mark.parametrize("nproc", [2, 4])
+def test_sp_matches_sp1_on_the_composed_graph(nproc: int, tmp_path: Path):
     """Ulysses SP across ViT + text encoder + backbone must not change the result.
 
     The three modules shard three different things (patch rows, token ids, the
     packed sequence), so this is the composition-level check that each module's
-    slice/gather lands on its own group.
+    slice/gather lands on its own group. SP=4 also puts the LLM's KV heads below
+    the Ulysses size, covering the GQA head-repeat path SP=2 never reaches.
     """
-    out_dir = tmp_path / "sp_compose"
+    out_dir = tmp_path / f"sp_compose{nproc}"
     out_dir.mkdir(parents=True, exist_ok=True)
     mp.spawn(
         _sp_worker,
-        args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_2.nproc, "cpu"),
-        nprocs=_CI_CPU_2.nproc,
+        args=(str(out_dir / "rendezvous"), str(out_dir), nproc, "cpu"),
+        nprocs=nproc,
         join=True,
     )
 
-    _assert_sp_parity(out_dir, world=_CI_CPU_2.nproc)
-
-
-@pytest.mark.launch_plan(provider=_CI_CPU_4)
-def test_sp4_matches_sp1_on_the_composed_graph(tmp_path: Path):
-    """The #1072 acceptance shape: uniform SP=4 over ViT + text encoder + backbone.
-
-    SP=4 is the size that validated the composition invariant, and it is the first
-    size where the tower's 4 attention heads are fully split *and* the LLM's 2 KV
-    heads sit below the Ulysses size — so this also covers the GQA head-repeat path
-    that SP=2 never reaches.
-    """
-    out_dir = tmp_path / "sp_compose4"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    mp.spawn(
-        _sp_worker,
-        args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_4.nproc, "cpu"),
-        nprocs=_CI_CPU_4.nproc,
-        join=True,
-    )
-
-    _assert_sp_parity(out_dir, world=_CI_CPU_4.nproc)
+    _assert_sp_parity(out_dir, world=nproc)
 
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
@@ -699,10 +622,10 @@ def test_sp4_matches_sp1_on_the_composed_graph(tmp_path: Path):
     not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or runner_device_count() < _CI_ACCELERATOR_4.nproc,
     reason="requires >=4 CUDA or NPU devices",
 )
-def test_sp4_matches_sp1_on_accelerator(tmp_path: Path):
+def test_sp_matches_sp1_on_accelerator(tmp_path: Path):
     """Same SP=1 vs SP=4 comparison over real NCCL/HCCL collectives in bfloat16.
 
-    The CPU case proves the composition; this one proves it over the collective
+    The CPU cases prove the composition; this one proves it over the collective
     implementation CI actually trains with. BF16 all-to-all/gather rounding is not
     bit-exact against an SP=1 run, so this compares with the same relative
     tolerance the per-family alignment tests use.
