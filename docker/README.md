@@ -145,7 +145,7 @@ resolve the outstanding VeOmni legacy FLA API incompatibility.
 
 The A2 unit and e2e workflows use the published x86 candidate at digest
 `sha256:164b1e7268fb95649cf3edc3c87e0ba8464a150510e3ac9064dd48a2b877a90d`.
-The container image and Triton-Ascend download source differ from upstream. Dependency
+The container image and Triton-Ascend installer differ from upstream. Dependency
 sync, pinned Triton versions and uv run commands otherwise follow upstream unchanged.
 This validates the candidate system/CANN environment with upstream dependencies,
 not the exact Python package versions preinstalled in the image. Inspect the
@@ -156,5 +156,4 @@ required by upstream ARM packaging. It is available at
 `ghcr.io/zpl1n/veomni@sha256:f4c1fbedbbf7cf47567a541e53d9d926cdc7ca576f66eead307d106274fef620`.
 A2 ARM is unchanged. Image publication does not establish device numerical correctness.
 
-NPU CI downloads Triton-Ascend from https://triton-ascend.osinfra.cn/pypi/simple/
-with --extra-index-url and --trusted-host triton-ascend.osinfra.cn.
+NPU CI installs pinned Triton-Ascend with the test venv Python and pip from the upstream Huawei index. ensurepip supplies pip in the uv-created venv.

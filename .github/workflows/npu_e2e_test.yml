@@ -154,9 +154,9 @@ jobs:
         # stuck. Mirrors docker/ascend/Dockerfile.ascend_9.1.0_*_910b.x86.
         run: |
           uv pip install --python .venv/bin/python triton==3.2.0
-          uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
-            --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ \
-            --trusted-host triton-ascend.osinfra.cn
+          .venv/bin/python -m ensurepip
+          .venv/bin/python -m pip install triton-ascend==3.2.1 \
+            --index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
           uv run --frozen python -c "from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
