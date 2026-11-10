@@ -1,3 +1,4 @@
+# Rebuild the ARM candidate after repository Actions are restored.
 name: Build CANN 9.2.1 A3 candidate
 on:
   workflow_dispatch:
