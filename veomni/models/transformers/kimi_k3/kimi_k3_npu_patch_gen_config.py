@@ -43,6 +43,7 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     kimi_pretrained_init_weights_patched,
     kimi_rmsnorm_forward_patched,
     kimi_rmsnorm_init_patched,
+    moonvit3d_pretrained_init_weights_patched,
     situ_and_mul_forward_patched,
     situ_and_mul_init_patched,
 )
@@ -202,6 +203,17 @@ config.override_method(
     "KimiK3PreTrainedModel._init_weights",
     replacement=kimi_k3_pretrained_init_weights_patched,
     description="Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias",
+)
+
+
+config.override_method(
+    "MoonViT3dPretrainedModel._init_weights",
+    replacement=moonvit3d_pretrained_init_weights_patched,
+    description=(
+        "Vision-tower init under the FSDP2 meta flow: composite-model smart_apply dispatches "
+        "sub-models to their own _init_weights and the default chain has no branch for the "
+        "learnable 2D pos-emb (or the KDA o_norm / to_empty-zeroed tower norms)"
+    ),
 )
 
 # ── Parallel plans ───────────────────────────────────────────────────────────

@@ -48,9 +48,11 @@ if _NPU_AVAILABLE:
     # Unexpected failures importing the implementation under test fail
     # collection here instead of silently skipping every test.
     from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda as kda_reference
+    from veomni.ops.kernels.kda.ascendc import chunk_kda_ascendc_kimi as kda_wrapper
     from veomni.ops.kernels.kda.ascendc.chunk_kda_ascendc_kimi import chunk_kda_ascendc
 else:
     kda_reference = None
+    kda_wrapper = None
     chunk_kda_ascendc = None
 
 _SKIP_REASON = "AscendC chunk_kda requires an Ascend NPU with fla_npu and triton_ascend_kernels installed"
@@ -232,4 +234,125 @@ def test_intermediate_states_honor_transposed_layout():
         )
     assert h_npu.shape == h_ref.shape
     torch.testing.assert_close(h_npu.float(), h_ref.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=3e-2, atol=3e-2)
+
+
+def test_group_ranges_by_chunk_budget_packs_greedily():
+    # 64-token chunks: segments of 128, 64, 200, 500 tokens -> 2, 1, 4, 8 chunks.
+    groups = kda_wrapper._group_ranges_by_chunk_budget([(0, 128), (128, 192), (192, 392), (392, 892)], 64, 10)
+    assert groups == [[(0, 128), (128, 192), (192, 392)], [(392, 892)]]
+    # A single over-budget range stays its own group: ranges cannot be split.
+    assert kda_wrapper._group_ranges_by_chunk_budget([(0, 5000)], 64, 10) == [[(0, 5000)]]
+    # Exactly at the budget: one group.
+    assert kda_wrapper._group_ranges_by_chunk_budget([(0, 64), (64, 128)], 64, 2) == [[(0, 64), (64, 128)]]
+
+
+def test_short_segment_varlen_dispatch_matches_reference():
+    """Segments shorter than _KDA_MIN_FUSED_SEGMENT run through the eager reference.
+
+    A 1-3 token segment makes the fused kernel corrupt the *following*
+    segments' outputs; the dispatch routes those rows through the eager
+    reference while long segments keep the fused kernel.
+    """
+    H, K, V = 4, 128, 128
+    T = 512
+    q, k, v, g, beta = _make_inputs(1, T, H, K, V, seed=45)
+    cu = torch.tensor([0, 200, 202, 512], dtype=torch.long, device=DEVICE)
+
+    kda_wrapper._KDA_SHORT_SEG_WARNED = False
+    with pytest.warns(UserWarning, match="shorter than"):
+        o_npu, _ = chunk_kda_ascendc(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            use_qk_l2norm_in_kernel=True,
+            transpose_state_layout=True,
+            cu_seqlens=cu,
+            chunk_size=64,
+        )
+
+    o_ref, _ = kda_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        use_qk_l2norm_in_kernel=True,
+        transpose_state_layout=True,
+        cu_seqlens=cu,
+        chunk_size=64,
+    )
+    torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=3e-2, atol=3e-2)
+
+
+def test_over_budget_varlen_splits_and_matches_reference():
+    """Above the chunk budget the fused kernel corrupts the first heads' outputs.
+
+    A varlen call of 42 chunks x 48 heads NaNs heads 0-1 (data-independent,
+    reproduced with random inputs), while <= 35 chunks stays clean. The dispatch
+    must split the call into budget-sized fused groups, which is bit-identical
+    to per-segment computation, and keep matching the eager reference.
+    """
+    H, K, V, seg_len, n_seg = 48, 128, 128, 400, 6
+    T = seg_len * n_seg
+    q, k, v, g, beta = _make_inputs(1, T, H, K, V, seed=41)
+    cu = torch.tensor([i * seg_len for i in range(n_seg + 1)], dtype=torch.long, device=DEVICE)
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    dt_bias = 0.1 * torch.randn(H * K, device=DEVICE, dtype=torch.float32)
+    shared = dict(
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        transpose_state_layout=True,
+        cu_seqlens=cu,
+        chunk_size=64,
+    )
+
+    kda_wrapper._KDA_CHUNK_BUDGET_WARNED = False
+    with pytest.warns(UserWarning, match="chunk budget"):
+        o_npu, _ = chunk_kda_ascendc(q, k, v, g, beta, **shared)
+    assert torch.isfinite(o_npu.float()).all()
+
+    o_ref, _ = kda_reference(q, k, v, g, beta, **shared)
+    torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_over_budget_small_heads_split_matches_reference():
+    """Small-head calls above the budget also split and match the reference."""
+    H, K, V, seg_len, n_seg = 2, 64, 64, 300, 8
+    T = seg_len * n_seg
+    q, k, v, g, beta = _make_inputs(1, T, H, K, V, seed=43)
+    cu = torch.tensor([i * seg_len for i in range(n_seg + 1)], dtype=torch.long, device=DEVICE)
+
+    kda_wrapper._KDA_CHUNK_BUDGET_WARNED = False
+    with pytest.warns(UserWarning, match="chunk budget"):
+        o_npu, _ = chunk_kda_ascendc(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            use_qk_l2norm_in_kernel=True,
+            transpose_state_layout=True,
+            cu_seqlens=cu,
+            chunk_size=64,
+        )
+
+    o_ref, _ = kda_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        use_qk_l2norm_in_kernel=True,
+        transpose_state_layout=True,
+        cu_seqlens=cu,
+        chunk_size=64,
+    )
     torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=3e-2, atol=3e-2)

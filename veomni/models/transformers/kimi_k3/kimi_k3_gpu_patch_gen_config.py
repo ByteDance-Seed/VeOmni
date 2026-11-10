@@ -93,6 +93,13 @@ Patches (skeleton):
     them softmax attention and the recurrent KDA state leak across packed
     samples. ``KimiLinearForCausalLM.forward`` forwards the collator's
     (unexpanded, still-valid) kwargs the same way for text-only batches.
+18. ``MoonViT3dPretrainedModel._init_weights`` --vision-tower init under the
+    FSDP2 meta flow: composite-model smart_apply dispatches sub-models to
+    their own ``_init_weights`` and the transformers default chain has no
+    branch for the learnable 2D pos-emb (or the KDA o_norm / to_empty-zeroed
+    tower norms), so ``to_empty`` leaves raw device memory in the pos-emb --
+    zeroed NPU pages silently drop visual position information; fsdp offload
+    leaves uninitialized CPU memory that poisons image features with NaN.
 """
 
 import os
@@ -1347,6 +1354,61 @@ def kimi_k3_pretrained_init_weights_patched(self, module):
     elif isinstance(module, FusedRMSNormGated):
         module.reset_parameters()
     elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+        module.reset_parameters()
+
+
+@config.override_method(
+    "MoonViT3dPretrainedModel._init_weights",
+    description="Vision-tower weight init under the FSDP2 meta flow: composite-model "
+    "smart_apply dispatches sub-models to their own _init_weights and the "
+    "transformers default chain has no branch for the learnable 2D pos-emb "
+    "(or the KDA o_norm / to_empty-zeroed tower norms), so to_empty leaves raw "
+    "device memory in the pos-emb -- zeroed NPU pages silently drop visual "
+    "position information and fsdp offload leaves uninitialized CPU memory "
+    "that poisons image features with NaN from the first step",
+)
+def moonvit3d_pretrained_init_weights_patched(self, module):
+    # important: this ported version of Llava isn't meant for training from scratch - only
+    # inference and fine-tuning - so the proper init weights code has been removed - the original codebase
+    # https://github.com/haotian-liu/LLaVA/tree/main/llava should serve for that purpose
+    # Modification: the tower's VisionTowerConfig carries no initializer_range /
+    # text_config (unlike the root KimiK3Config), so mirror the transformers
+    # default std ladder instead of its composite-config fallback.
+    if hasattr(self.config, "initializer_range"):
+        std = self.config.initializer_range or 0.02
+    elif hasattr(self.config, "init_std"):
+        std = self.config.init_std
+    elif hasattr(self.config, "initializer_factor"):
+        std = self.config.initializer_factor
+    else:
+        # 0.02 is the standard default value across the library
+        std = getattr(self.config.get_text_config(), "initializer_range", 0.02)
+
+    if hasattr(module, "class_embedding"):
+        module.class_embedding.data.normal_(mean=0.0, std=std)
+
+    if isinstance(module, (nn.Linear, nn.Conv2d)):
+        module.weight.data.normal_(mean=0.0, std=std)
+        if module.bias is not None:
+            module.bias.data.zero_()
+    elif isinstance(module, nn.Embedding):
+        module.weight.data.normal_(mean=0.0, std=std)
+        if module.padding_idx is not None:
+            _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+    elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+        # Modification: FSDP2 meta flow materializes with to_empty (all
+        # zeros); restore the construction defaults (ones, zero bias).
+        module.weight.data.fill_(1.0)
+        if getattr(module, "bias", None) is not None:
+            module.bias.data.zero_()
+    elif isinstance(module, FusedRMSNormGated):
+        # KDA o_norm affine scale: restore the ones default after to_empty
+        # materialization (checkpoint-missing keys re-init here as well).
+        module.reset_parameters()
+    elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+        # Vision pos-emb is a raw nn.Parameter filled only by
+        # reset_parameters(); without this branch to_empty materialization
+        # leaves allocator garbage in it.
         module.reset_parameters()
 
 

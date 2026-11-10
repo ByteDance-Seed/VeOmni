@@ -43,6 +43,8 @@
 #      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
 #    - method_override: KimiK3PreTrainedModel._init_weights
 #      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
+#    - method_override: MoonViT3dPretrainedModel._init_weights
+#      Vision-tower weight init under the FSDP2 meta flow: composite-model smart_apply dispatches sub-models to their own _init_weights and the transformers default chain has no branch for the learnable 2D pos-emb (or the KDA o_norm / to_empty-zeroed tower norms), so to_empty leaves raw device memory in the pos-emb -- zeroed NPU pages silently drop visual position information and fsdp offload leaves uninitialized CPU memory that poisons image features with NaN from the first step
 #    - method_override: KimiK3ForConditionalGeneration.get_position_id_func
 #      VLM trainer data hook: K3 derives positions inside the modeling (vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); return an arange stub for generic consumers
 #    - method_override: KimiK3ForConditionalGeneration.get_extra_collate_infos
@@ -2524,6 +2526,12 @@ def tpool_patch_merger(
     return outputs
 
 
+# ======================================================================
+# [MODIFIED CLASS] MoonViT3dPretrainedModel
+# Methods patched: _init_weights
+# ======================================================================
+
+
 class MoonViT3dPretrainedModel(PreTrainedModel):
     config_class = None
     model_type = "moonvit3d"
@@ -2587,6 +2595,50 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
             raise NotImplementedError(f"Not support {self.merge_type}")
 
         return hidden_states
+
+    def _init_weights(self, module):
+        # important: this ported version of Llava isn't meant for training from scratch - only
+        # inference and fine-tuning - so the proper init weights code has been removed - the original codebase
+        # https://github.com/haotian-liu/LLaVA/tree/main/llava should serve for that purpose
+        # Modification: the tower's VisionTowerConfig carries no initializer_range /
+        # text_config (unlike the root KimiK3Config), so mirror the transformers
+        # default std ladder instead of its composite-config fallback.
+        if hasattr(self.config, "initializer_range"):
+            std = self.config.initializer_range or 0.02
+        elif hasattr(self.config, "init_std"):
+            std = self.config.init_std
+        elif hasattr(self.config, "initializer_factor"):
+            std = self.config.initializer_factor
+        else:
+            # 0.02 is the standard default value across the library
+            std = getattr(self.config.get_text_config(), "initializer_range", 0.02)
+
+        if hasattr(module, "class_embedding"):
+            module.class_embedding.data.normal_(mean=0.0, std=std)
+
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+        elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+            # Modification: FSDP2 meta flow materializes with to_empty (all
+            # zeros); restore the construction defaults (ones, zero bias).
+            module.weight.data.fill_(1.0)
+            if getattr(module, "bias", None) is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, FusedRMSNormGated):
+            # KDA o_norm affine scale: restore the ones default after to_empty
+            # materialization (checkpoint-missing keys re-init here as well).
+            module.reset_parameters()
+        elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+            # Vision pos-emb is a raw nn.Parameter filled only by
+            # reset_parameters(); without this branch to_empty materialization
+            # leaves allocator garbage in it.
+            module.reset_parameters()
 
 
 # ============================================================================

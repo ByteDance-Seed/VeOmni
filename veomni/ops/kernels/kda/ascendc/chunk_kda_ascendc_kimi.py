@@ -27,6 +27,14 @@ from triton_ascend_kernels.attention.fla.kda.chunk import (
 )
 
 
+# One-shot warning flags for the short-segment and chunk-budget split
+# dispatches in ``chunk_kda_ascendc`` (see the guard near the entry's
+# dispatch), and for the finite-output corruption fallback.
+_KDA_SHORT_SEG_WARNED = False
+_KDA_CHUNK_BUDGET_WARNED = False
+_KDA_CORRUPT_WARNED = False
+
+
 def _fla_npu_compat_canonical_chunk_indices_none():
     """fla-npu @3f4c016 compat (kept local so site-packages stays pristine).
 
@@ -177,6 +185,35 @@ def _varlen_saved_tensor(tensor):
 
 def _host_chunk_count(cu_seqlens, chunk_size):
     return sum((end - start + chunk_size - 1) // chunk_size for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]))
+
+
+def _all_finite(*tensors):
+    """Host-side finiteness check; the bool conversion is the only device sync."""
+    for tensor in tensors:
+        if tensor is not None and not bool(torch.isfinite(tensor).all()):
+            return False
+    return True
+
+
+def _group_ranges_by_chunk_budget(ranges, chunk_size, budget):
+    """Greedily group consecutive ranges so each group stays within the chunk budget.
+
+    A single range whose own chunk count exceeds the budget is kept as its own
+    group: ranges cannot be split without changing the recurrence semantics.
+    """
+    groups = []
+    current = []
+    chunks = 0
+    for a, b in ranges:
+        range_chunks = (b - a + chunk_size - 1) // chunk_size
+        if current and chunks + range_chunks > budget:
+            groups.append(current)
+            current, chunks = [], 0
+        current.append((a, b))
+        chunks += range_chunks
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _can_use_fused_kda_bwd(
@@ -693,6 +730,234 @@ class ChunkKDAFunction(torch.autograd.Function):
         )
 
 
+# The fused AscendC chunk_kda kernel returns NaN once any varlen segment is
+# shorter than this many tokens (see the dispatch guard in ``chunk_kda_ascendc``).
+_KDA_MIN_FUSED_SEGMENT = 4
+
+# The same kernel additionally corrupts the first heads' outputs once a varlen
+# call's total chunk count crosses this budget. Verified on captured training
+# batches and reproduced with random data (i.e. a deterministic, data-independent
+# kernel bug): 36+ chunks x 48 heads NaNs heads 0-1 and the damage grows with the
+# grid (37 chunks corrupts heads 0-4); <= 35 chunks stays clean, and the fused
+# backward corrupts exactly when the forward does. Stateless varlen segments are
+# independent, so grouping consecutive segments into budget-sized fused calls
+# avoids the corrupt grid with bit-identical outputs (split == single call below
+# the threshold, verified bitwise). The budget keeps a margin below the measured
+# 35-chunk clean bound; the eager reference is unaffected.
+_KDA_MAX_FUSED_CHUNKS = 32
+
+
+def _kda_eager_reference(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    use_gate_in_kernel,
+    use_beta_sigmoid_in_kernel,
+    allow_neg_eigval,
+    cu_seqlens,
+    cu_seqlens_cpu,
+    safe_gate,
+    lower_bound,
+    disable_recompute,
+    return_intermediate_states,
+    state_v_first,
+    chunk_size,
+    A_log,
+    dt_bias,
+):
+    """Run the eager reference with the caller's full semantics (stateful included)."""
+    from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda_naive
+
+    return chunk_kda_naive(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
+        return_intermediate_states=return_intermediate_states,
+        transpose_state_layout=state_v_first,
+        chunk_size=chunk_size,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _chunk_kda_dispatch_segments(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_host,
+    A_log,
+    dt_bias,
+    scale,
+    cu_dtype,
+    use_qk_l2norm_in_kernel,
+    use_gate_in_kernel,
+    use_beta_sigmoid_in_kernel,
+    allow_neg_eigval,
+    state_v_first,
+    safe_gate,
+    lower_bound,
+    chunk_size,
+    disable_recompute,
+):
+    """Stateless split dispatch routing around two fused-AscendC failure modes.
+
+    1. Segments shorter than ``_KDA_MIN_FUSED_SEGMENT`` tokens corrupt the
+       outputs of the *following* segments: they run the eager reference on
+       their own rows.
+    2. Calls whose total chunk count exceeds ``_KDA_MAX_FUSED_CHUNKS`` corrupt
+       the first heads' outputs (see the constant's comment): consecutive long
+       segments are grouped so every fused call stays within the budget. A
+       single segment larger than the budget keeps its own call and relies on
+       the finite-output check below.
+
+    Segment groups are independent in stateless varlen mode, so per-group calls
+    are output-identical to a single call (verified bit-identical below the
+    corruption threshold). Every fused call's output is checked for NaN/inf and
+    falls back to the eager reference on corruption unless the inputs
+    themselves are already non-finite (upstream divergence is not masked here).
+    This bounds the eager reference's autograd memory to the routed rows.
+    """
+    lens = [b - a for a, b in zip(cu_host[:-1], cu_host[1:])]
+    long_ranges = [(a, b) for (a, b), n in zip(zip(cu_host[:-1], cu_host[1:]), lens) if n >= _KDA_MIN_FUSED_SEGMENT]
+    short_ranges = [
+        (a, b) for (a, b), n in zip(zip(cu_host[:-1], cu_host[1:]), lens) if 0 < n < _KDA_MIN_FUSED_SEGMENT
+    ]
+
+    from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda_naive
+
+    def _ranges_to_cu(ranges):
+        # Re-based cumulative boundaries over the selected segments: row
+        # selection compresses positions, so absolute boundaries no longer hold.
+        cu = [0]
+        for a, b in ranges:
+            cu.append(cu[-1] + (b - a))
+        return torch.tensor(cu, dtype=cu_dtype)
+
+    def _rows(ranges):
+        return torch.cat([torch.arange(a, b, device=q.device) for a, b in ranges]) if ranges else None
+
+    def _eager_sub(ranges):
+        idx = _rows(ranges)
+        # Sub cu-seqlens stay on host: the AscendC entry and the eager
+        # reference both consume host metadata.
+        return chunk_kda_naive(
+            q[:, idx],
+            k[:, idx],
+            v[:, idx],
+            g[:, idx],
+            beta[:, idx],
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            cu_seqlens=_ranges_to_cu(ranges),
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            disable_recompute=disable_recompute,
+            transpose_state_layout=state_v_first,
+            chunk_size=chunk_size,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )[0]
+
+    if not long_ranges:
+        # Every segment is short: one eager call over the whole batch.
+        return chunk_kda_naive(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            cu_seqlens=torch.tensor(list(cu_host), dtype=cu_dtype),
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            disable_recompute=disable_recompute,
+            transpose_state_layout=state_v_first,
+            chunk_size=chunk_size,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+
+    inputs_finite = None
+
+    def _inputs_finite_lazy():
+        nonlocal inputs_finite
+        if inputs_finite is None:
+            inputs_finite = _all_finite(q, k, v, g, beta)
+        return inputs_finite
+
+    o = torch.zeros(q.shape[0], q.shape[1], v.shape[2], v.shape[3], dtype=q.dtype, device=q.device)
+    for group in _group_ranges_by_chunk_budget(long_ranges, chunk_size, _KDA_MAX_FUSED_CHUNKS):
+        idx = _rows(group)
+        o_group = ChunkKDAFunction.apply(
+            q[:, idx],
+            k[:, idx],
+            v[:, idx],
+            g[:, idx],
+            beta[:, idx],
+            A_log,
+            dt_bias,
+            scale,
+            None,
+            False,
+            use_qk_l2norm_in_kernel,
+            use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel,
+            allow_neg_eigval,
+            state_v_first,
+            _ranges_to_cu(group),
+            None,
+            safe_gate,
+            lower_bound,
+            chunk_size,
+            disable_recompute,
+            False,
+        )[0]
+        if not _all_finite(o_group) and _inputs_finite_lazy():
+            global _KDA_CORRUPT_WARNED
+            if not _KDA_CORRUPT_WARNED:
+                _KDA_CORRUPT_WARNED = True
+                warnings.warn(
+                    "chunk_kda_ascendc: a budget-sized fused call still returned non-finite outputs "
+                    "from finite inputs (unexpected: please report the call shape); falling back to "
+                    "the eager reference for that call.",
+                    stacklevel=2,
+                )
+            o_group = _eager_sub(group)
+        o = o.index_copy(1, idx, o_group)
+    if short_ranges:
+        o = o.index_copy(1, _rows(short_ranges), _eager_sub(short_ranges))
+    return o, None
+
+
 @torch.compiler.disable
 def chunk_kda_ascendc(
     q: torch.Tensor,
@@ -783,9 +1048,93 @@ def chunk_kda_ascendc(
     assert g.shape == (B, T, HV, K), f"g must have shape [B, T, HV, K]={[B, T, HV, K]}, got {list(g.shape)}"
     assert beta.shape == (B, T, HV), f"beta must have shape [B, T, HV]={[B, T, HV]}, got {list(beta.shape)}"
 
+    # Two verified fused-AscendC failure modes are routed around per segment
+    # group (see _chunk_kda_dispatch_segments): (a) segments shorter than
+    # _KDA_MIN_FUSED_SEGMENT tokens corrupt the outputs of the *following*
+    # segments, and (b) calls whose total chunk count exceeds
+    # _KDA_MAX_FUSED_CHUNKS corrupt the first heads' outputs. Both are
+    # data-independent kernel bugs (the eager reference on the same inputs is
+    # correct). SP-alignment tail padding legitimately surfaces as a 1-3 token
+    # trailing segment, so the short-segment dispatch routinely absorbs it.
+    if cu_seqlens is not None:
+        _cu_host = _host_int_tuple(cu_seqlens)
+        if _cu_host is not None and len(_cu_host) >= 2:
+            _lens = [b - a for a, b in zip(_cu_host[:-1], _cu_host[1:])]
+            # The chunk budget is characterized for the AscendC path
+            # (chunk_size=64); other chunk sizes keep the finite-output check
+            # below as their only guard.
+            _over_budget = chunk_size == 64 and _host_chunk_count(_cu_host, chunk_size) > _KDA_MAX_FUSED_CHUNKS
+            if min(_lens) < _KDA_MIN_FUSED_SEGMENT or _over_budget:
+                global _KDA_SHORT_SEG_WARNED, _KDA_CHUNK_BUDGET_WARNED
+                if min(_lens) < _KDA_MIN_FUSED_SEGMENT and not _KDA_SHORT_SEG_WARNED:
+                    _KDA_SHORT_SEG_WARNED = True
+                    warnings.warn(
+                        f"chunk_kda_ascendc: varlen contains segment(s) shorter than "
+                        f"{_KDA_MIN_FUSED_SEGMENT} tokens (min={min(_lens)}, cu_seqlens={_cu_host}); "
+                        f"dispatching those segments through the eager reference because the "
+                        f"fused AscendC kernel returns NaN on short segments.",
+                        stacklevel=2,
+                    )
+                if _over_budget and not _KDA_CHUNK_BUDGET_WARNED:
+                    _KDA_CHUNK_BUDGET_WARNED = True
+                    warnings.warn(
+                        f"chunk_kda_ascendc: varlen call needs {_host_chunk_count(_cu_host, chunk_size)} "
+                        f"chunks > {_KDA_MAX_FUSED_CHUNKS}; splitting into budget-sized fused calls "
+                        f"because the fused AscendC kernel corrupts the first heads' outputs above "
+                        f"the chunk budget.",
+                        stacklevel=2,
+                    )
+                _stateless = initial_state is None and not output_final_state and not return_intermediate_states
+                if _stateless:
+                    return _chunk_kda_dispatch_segments(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        cu_host=_cu_host,
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        scale=scale if scale is not None else K**-0.5,
+                        cu_dtype=cu_seqlens.dtype,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                        use_gate_in_kernel=use_gate_in_kernel,
+                        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                        allow_neg_eigval=allow_neg_eigval,
+                        state_v_first=state_v_first,
+                        safe_gate=safe_gate,
+                        lower_bound=lower_bound,
+                        chunk_size=chunk_size,
+                        disable_recompute=disable_recompute,
+                    )
+                return _kda_eager_reference(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    scale,
+                    initial_state,
+                    output_final_state,
+                    use_qk_l2norm_in_kernel,
+                    use_gate_in_kernel,
+                    use_beta_sigmoid_in_kernel,
+                    allow_neg_eigval,
+                    cu_seqlens,
+                    cu_seqlens_cpu,
+                    safe_gate,
+                    lower_bound,
+                    disable_recompute,
+                    return_intermediate_states,
+                    state_v_first,
+                    chunk_size,
+                    A_log,
+                    dt_bias,
+                )
+
     if scale is None:
         scale = K**-0.5
-    return ChunkKDAFunction.apply(
+    result = ChunkKDAFunction.apply(
         q,
         k,
         v,
@@ -809,3 +1158,42 @@ def chunk_kda_ascendc(
         disable_recompute,
         return_intermediate_states,
     )
+    # Safety net for fused-kernel corruption outside the characterized
+    # envelopes (dense batches, other chunk sizes, unmapped shapes): rerun the
+    # call through the eager reference when finite inputs produced non-finite
+    # outputs. Non-finite inputs pass through unchanged: upstream divergence is
+    # the trainer's signal, not this guard's.
+    if not _all_finite(result[0]) and _all_finite(q, k, v, g, beta):
+        global _KDA_CORRUPT_WARNED
+        if not _KDA_CORRUPT_WARNED:
+            _KDA_CORRUPT_WARNED = True
+            warnings.warn(
+                "chunk_kda_ascendc: fused kernel returned non-finite outputs from finite inputs; "
+                "falling back to the eager reference for this call.",
+                stacklevel=2,
+            )
+        return _kda_eager_reference(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel,
+            allow_neg_eigval,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            safe_gate,
+            lower_bound,
+            disable_recompute,
+            return_intermediate_states,
+            state_v_first,
+            chunk_size,
+            A_log,
+            dt_bias,
+        )
+    return result
