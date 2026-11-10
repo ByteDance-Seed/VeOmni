@@ -71,16 +71,16 @@ RUN rm -f /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/f
     python -m pip install --no-deps --force-reinstall /app/torch_npu-*.whl && \
     python -m pip install pybind11 wheel ninja
 
-# Install base triton==3.6.0 first, then the cp312/x86_64 Ascend 3.6.0.post2
+# Install base triton==3.2.0 first, then the cp312/x86_64 Ascend 3.2.2
 # overlay so its patched libtriton.so wins. --no-deps preserves
 # VeOmni's scipy/decorator versions instead of applying the wheel's older pins.
-# CI must also restore triton==3.6.0 and pybind11 after its exact uv sync;
+# CI must also restore triton==3.2.0 and pybind11 after its exact uv sync;
 # system site-packages are not inherited by the CI venv.
 RUN python -m pip uninstall -y triton triton-ascend && \
-    python -m pip download --no-deps --only-binary=:all: --dest /app "triton==3.6.0" && \
-    python -m pip install --no-deps /app/triton-3.6.0-*.whl && \
+    python -m pip download --no-deps --only-binary=:all: --dest /app "triton==3.2.0" && \
+    python -m pip install --no-deps /app/triton-3.2.0-*.whl && \
     python -m pip download --no-deps --dest /app \
-        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.6.0.post2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" && \
+        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" && \
     python -m pip install --no-deps --force-reinstall /app/triton_ascend-*.whl && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     python -c "from triton._C.libtriton import ascend"
@@ -107,7 +107,7 @@ RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-
 # The npu extra installs the x86_64 TorchCodec 0.10.0 wheel.
 
 # Record the actual resolved Python packages alongside the retained artifacts.
-RUN python -c "from importlib.metadata import version; assert version('torch').split('+')[0] == '2.10.0'; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.6.0'; assert version('triton-ascend') == '3.6.0.post2'; assert version('transformers') == '5.16.1'" && \
+RUN python -c "from importlib.metadata import version; assert version('torch').split('+')[0] == '2.10.0'; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.2.0'; assert version('triton-ascend') == '3.2.2'; assert version('transformers') == '5.16.1'" && \
     python -m pip freeze > /app/a2-image-requirements.txt && \
     sha256sum /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu_a2-*.whl > /app/a2-ci-wheels.sha256
 

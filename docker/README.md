@@ -152,3 +152,9 @@ These explicit overrides are candidate validation, not a lockfile migration.
 The rebuilt A2 x86 candidate uses Triton-Ascend `3.6.0.post2` over base Triton
 `3.6.0`; the A2 ARM and A3 recipes still use Ascend `3.6.0`. Its Docker build
 asserts the installed post2 version. Device CI uses the published post2 image digest above, verified anonymously against its A2 target and source revision.
+
+The next A2 x86 rebuild selects Triton-Ascend `3.2.2` over base Triton `3.2.0`
+for compatibility testing with the existing CANN 9.2.1/torch-npu post7 stack.
+CI remains on the published post2 digest until this rebuild is published.
+The branch also includes newer upstream GDN changes, so its results are not a
+single-variable comparison against the earlier post2 run.
