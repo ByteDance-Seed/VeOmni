@@ -36,6 +36,18 @@ base model and adapter separately. This starts new optimizer, scheduler and data
 state rather than continuing the old run. If only BF16 model weights were
 saved, exporting them as FP32 cannot recover the master's discarded low bits.
 
+MultiOptimizer recovery also binds overlapping parameter and buffer storage
+views, including their local shape, strides and relative offsets. A checkpoint
+created before this storage-view proof existed is rejected for optimizer resume,
+even when its target has no shared views; the old metadata cannot prove that the
+source was also unshared. Use a separately verified migration or a new
+weights-only run rather than silently assuming identical update behavior.
+This proof currently requires Linux procfs for nonempty CPU model tensors and
+rejects shared CPU mappings, quantized, non-strided, and meta model tensors.
+Accelerator tensors must use framework-owned storage; externally imported or
+shared accelerator allocations are not proved by this check. File-backed
+optimizer moments are separate from model tensors and are not restricted here.
+
 ## What each path holds
 
 | Path | Holds | Written by |
