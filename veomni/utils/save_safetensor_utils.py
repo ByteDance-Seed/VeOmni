@@ -365,27 +365,29 @@ def save_hf_safetensor(
     """Save model weights in HuggingFace safetensors format.
 
     This function is self-contained w.r.t. synchronization: it calls ``synchronize()`` at
-    entry to flush pending GPU operations before reading tensor data. All ranks
-    coordinate completion and errors before returning; only rank 0 writes in legacy
-    mode. Callers do not need to add external synchronization around this function.
+    entry to flush pending device operations before reading tensor data. When
+    distributed is initialized, all ranks must call this function. The legacy
+    path coordinates the rank-0 export result on the default world group before
+    returning, even when a per-module parallel state is provided.
 
     Supports two modes:
-    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
-      for efficient distributed save directly from the live FSDP model. Must be called on all ranks.
-    - Legacy mode: Loads from checkpoint and converts to safetensors on rank 0.
+    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-NPU): Uses HuggingFaceStorageWriter
+      for efficient distributed save directly from the live FSDP model.
+    - Legacy mode, including NPU: Loads from checkpoint and converts to safetensors on rank 0.
 
     Args:
         save_hf_safetensor_path: Output path for saved HuggingFace safetensors.
-        ckpt_manager: Checkpoint manager type. Used for routing (distributed when "dcp")
-            and passed to legacy ``ckpt_to_state_dict``.
+        ckpt_manager: Checkpoint manager type. Used for routing and passed to legacy
+            ``ckpt_to_state_dict``. On NPU, "dcp" also uses the legacy path.
         model_assets: Model assets (e.g., config, tokenizer) to save alongside weights.
 
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Only rank 0 reads and converts the checkpoint. Every rank must call
-            this function to participate in distributed failure coordination.
-            Required by non-dcp checkpoint managers (e.g., omnistore).
+            Only rank 0 reads, converts and writes the checkpoint in legacy mode.
+            When distributed is initialized, all ranks must call this function
+            to participate in the failure-coordination collective.
+            Set to true on the global rank 0 whenever the legacy path is selected.
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.

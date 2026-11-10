@@ -3,6 +3,7 @@
 
 """CPU/Gloo regressions for canonical EP-first DCP expert coordinates."""
 
+import os
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -264,10 +265,13 @@ def _layout_worker(rank, world, directory, rendezvous):
             assert exported["layer.experts.weight"].dtype == torch.float32
             assert exported["layer.bias"].dtype == torch.bfloat16
             cli_dir = directory + "known_legacy_hf"
+            repo_root = Path(__file__).resolve().parents[2]
+            cli_env = os.environ.copy()
+            cli_env["PYTHONPATH"] = os.pathsep.join((str(repo_root), cli_env.get("PYTHONPATH", "")))
             subprocess.run(
                 [
                     sys.executable,
-                    "scripts/merge_dcp_to_hf.py",
+                    str(repo_root / "scripts" / "merge_dcp_to_hf.py"),
                     "--load-dir",
                     path,
                     "--save-dir",
@@ -282,6 +286,8 @@ def _layout_worker(rank, world, directory, rendezvous):
                 ],
                 check=True,
                 timeout=60,
+                cwd=repo_root,
+                env=cli_env,
             )
             exported = load_file(cli_dir + "/model.safetensors")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
