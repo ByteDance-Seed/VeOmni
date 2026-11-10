@@ -37,9 +37,10 @@ def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
     ties them together -- it indexes a weight's scale by the same block counter as
     the activation's -- so one number describes its recipe, not two.
     """
+    # A quantizing row always gets a weight: ``resolve_projection`` raises for a
+    # wrapped projection instead of handing back a shortcut.
     weight, shortcut = resolve_projection("qat", linear, x)
-    if shortcut is not None:  # pragma: no cover - resolve_projection raises instead
-        return shortcut
+    assert shortcut is None
     bias = getattr(linear, "bias", None)
     if x.numel() == 0:
         return F.linear(x, weight, bias)
