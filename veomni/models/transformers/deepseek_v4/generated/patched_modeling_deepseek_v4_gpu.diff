@@ -173,7 +173,7 @@
 +from veomni.ops import VeomniOp
 +from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 +from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
++from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 +from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 +
@@ -1599,7 +1599,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -973,18 +1647,52 @@
+@@ -973,18 +1647,48 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -1615,9 +1615,7 @@
 +        # One call covers every row: the quantizing rows fake-quantize the weights
 +        # they are handed, and the clamp stays in the model dtype either way. The
 +        # selection lives on the op, so this forward has no recipe to branch on.
-+        # `use_fused_swiglu` also owns the refusal for a quantizing row it cannot
-+        # serve (non-SwiGLU activation, wrapped projection).
-+        if use_fused_swiglu(self, self.config.hidden_act):
++        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -1628,8 +1626,6 @@
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
 +                swiglu_limit=self.limit,
 +            )
-+        # `use_fused_swiglu` already refused a quantizing row above, so reaching this
-+        # line means the selection trains in the model dtype on purpose.
 +        gate = self.gate_proj(x).float().clamp(max=self.limit)
 +        up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
 +        return self.down_proj((self.act_fn(gate) * up).to(x.dtype))
@@ -1659,7 +1655,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -992,33 +1700,70 @@
+@@ -992,33 +1696,70 @@
          self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
@@ -1753,7 +1749,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +1777,28 @@
+@@ -1032,14 +1773,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -1785,7 +1781,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,23 +1821,54 @@
+@@ -1062,23 +1817,54 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1844,7 +1840,7 @@
          self.shared_experts = DeepseekV4MLP(config)
 
      def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
-@@ -1093,6 +1883,12 @@
+@@ -1093,6 +1879,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1857,7 +1853,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1107,41 +1903,51 @@
+@@ -1107,41 +1899,51 @@
 
      """
 
@@ -1928,7 +1924,7 @@
 
 
  @auto_docstring
-@@ -1252,9 +2058,27 @@
+@@ -1252,9 +2054,27 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1957,7 +1953,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1263,10 +2087,23 @@
+@@ -1263,10 +2083,23 @@
          self.layers = nn.ModuleList(
              [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1982,7 +1978,7 @@
 
          # Initialize weights and apply final processing
          self.post_init()
-@@ -1283,38 +2120,154 @@
+@@ -1283,38 +2116,154 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2147,7 +2143,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2276,90 @@
+@@ -1323,9 +2272,90 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2239,7 +2235,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +2431,12 @@
+@@ -1397,6 +2427,12 @@
      return overall_loss * num_experts
 
 
@@ -2252,7 +2248,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1404,6 +2444,9 @@
+@@ -1404,6 +2440,9 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2262,7 +2258,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = DeepseekV4Model(config)
-@@ -1412,54 +2455,51 @@
+@@ -1412,54 +2451,51 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_local_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2351,7 +2347,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2511,168 @@
+@@ -1471,26 +2507,168 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2534,7 +2530,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2680,22 @@
+@@ -1498,7 +2676,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

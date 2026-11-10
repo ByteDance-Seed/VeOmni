@@ -74,7 +74,7 @@ from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadat
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -148,7 +148,7 @@ def qwen4_exp_text_mlp_init_patched(self, config, intermediate_size=None):
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen4_exp_text_mlp_forward_patched(self, x):
-    if use_fused_swiglu(self, self.config.hidden_act):
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -188,7 +188,7 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])

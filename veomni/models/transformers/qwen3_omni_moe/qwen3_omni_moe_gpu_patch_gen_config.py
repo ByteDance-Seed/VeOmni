@@ -80,7 +80,7 @@ from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -130,7 +130,7 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -291,7 +291,7 @@ def qwen3_omni_moe_thinker_text_mlp_init_patched(self, config, intermediate_size
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen3_omni_moe_thinker_text_mlp_forward_patched(self, x):
-    if use_fused_swiglu(self, self.config.hidden_act):
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,

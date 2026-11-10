@@ -637,33 +637,3 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     # The FP32 clamp disagrees, so the assertion above is not vacuous.
     widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
     assert not torch.equal(expected, widened)
-
-
-def test_use_fused_swiglu_refuses_a_quantizing_row_on_a_non_silu_activation():
-    """Every fused row is a SwiGLU kernel, so another activation cannot quantize.
-
-    The refusal belongs in the family, not in each model: the alternative is one
-    copy of the rule per consumer, all of which stop being true once a pass-through
-    `act_fn` variant lands (#1430).
-    """
-    from torch import nn
-
-    from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
-
-    class MLP:
-        def __init__(self, impl):
-            from types import SimpleNamespace
-
-            self.gate_proj = nn.Linear(4, 4, bias=False)
-            self.up_proj = nn.Linear(4, 4, bias=False)
-            self.down_proj = nn.Linear(4, 4, bias=False)
-            self.veomni_swiglu_mlp = SimpleNamespace(impl=impl)
-
-    assert use_fused_swiglu(MLP("eager"), "silu") is True
-    assert use_fused_swiglu(MLP("eager"), "swish") is True
-
-    with pytest.raises(ValueError, match="hidden_act='gelu'.*rounds nothing"):
-        use_fused_swiglu(MLP("qat"), "gelu")
-
-    # A reference row keeps the fallback: that is a legitimate precision choice.
-    assert use_fused_swiglu(MLP("eager"), "gelu") is False

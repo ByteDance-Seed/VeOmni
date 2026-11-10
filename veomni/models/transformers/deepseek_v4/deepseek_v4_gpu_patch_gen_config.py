@@ -81,7 +81,7 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -115,7 +115,7 @@ config.add_import("typing", names=["Optional"])
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -1785,9 +1785,7 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     # One call covers every row: the quantizing rows fake-quantize the weights
     # they are handed, and the clamp stays in the model dtype either way. The
     # selection lives on the op, so this forward has no recipe to branch on.
-    # `use_fused_swiglu` also owns the refusal for a quantizing row it cannot
-    # serve (non-SwiGLU activation, wrapped projection).
-    if use_fused_swiglu(self, self.config.hidden_act):
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -1798,8 +1796,6 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
             swiglu_limit=self.limit,
         )
-    # `use_fused_swiglu` already refused a quantizing row above, so reaching this
-    # line means the selection trains in the model dtype on purpose.
     gate = self.gate_proj(x).float().clamp(max=self.limit)
     up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
     return self.down_proj((self.act_fn(gate) * up).to(x.dtype))
