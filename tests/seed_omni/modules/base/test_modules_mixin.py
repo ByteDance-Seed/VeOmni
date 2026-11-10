@@ -821,14 +821,14 @@ def test_init_resolves_relative_module_paths():
 
 
 def _qwen3_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3"
 
 
 def test_qwen3_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "infer/graph_infer.yaml",
     )
 
     assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
@@ -842,7 +842,7 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "infer/graph_infer.yaml",
     )
     assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.generation_graph is not None

@@ -4,18 +4,28 @@
 # preprocessor; graph nodes are pack_encode / pack_forward / pack_decode.
 # Inference graphs are unchanged (conversation FSM).
 #
+# Prerequisite — split the upstream Qwen3-VL checkpoint, OR point `model_path`
+# straight at the upstream root: `qwen3vl/hf_layout.py` registers a `qwen3_vl`
+# HF layout, so an upstream checkpoint loads with no offline split.
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path Qwen3-VL-2B-Instruct \
+#     --output_dir Qwen3-VL-2B-Instruct-split
+#
 # Launch:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/packed/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/packed/base.yaml
 #
 # Combine with a single FSDP tree over the composed OmniModel:
 #   --model.accelerator.fsdp_config.fsdp_scope model
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# absolute paths this job can read before training.
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+  model_path: Qwen3-VL-2B-Instruct
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3vl_2b/packed/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3vl_2b/packed/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3vl/packed/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3vl/packed/graph_train.yaml
     infer_graph:
-      vision_understanding: configs/seed_omni/Qwen/qwen3vl_2b/infer/graph_infer.yaml
+      vision_understanding: configs/seed_omni/Qwen/qwen3vl/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -55,7 +65,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3vl_2b/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3vl/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -68,7 +78,6 @@ data:
   mm_configs:
     use_audio_in_video: false
     fps: 2.0
-    min_frames: 4
     max_frames: 8
 
 train:
@@ -79,7 +88,7 @@ train:
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/qwen3vl_2b_omni_sft_packed
+    output_dir: outputs/qwen3vl_omni_sft_packed
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -88,7 +97,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3vl_2b_omni_sft_packed
+    name: qwen3vl_omni_sft_packed
 
 infer:
   generation_kwargs:

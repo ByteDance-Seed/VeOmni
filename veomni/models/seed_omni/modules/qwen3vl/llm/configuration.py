@@ -26,12 +26,10 @@ class Qwen3VLLlmConfig(OmniModuleConfig):
         self,
         text_config: Optional[Dict[str, Any]] = None,
         spatial_merge_size: int = 2,
-        image_token_id: int = 151655,
         **kwargs,
     ):
         self.text_config = Qwen3VLTextConfig(**text_config) if text_config else Qwen3VLTextConfig()
         self.spatial_merge_size = spatial_merge_size
-        self.image_token_id = image_token_id
         # This backbone owns no wte / lm_head, so there is nothing to tie — the
         # real ``embed_tokens``<->head tie lives in ``qwen3vl_text_encoder``. The
         # source Qwen3-VL ``text_config`` defaults the flag True, which would drive

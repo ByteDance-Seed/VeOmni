@@ -34,7 +34,6 @@ from veomni.utils.constants import IGNORE_INDEX
 # because the graph YAML passes node outputs by name.
 PACKED_INPUT_IDS = "packed_input_ids"
 PACKED_LABELS = "packed_labels"
-PACKED_ATTENTION_MASK = "packed_attention_mask"
 PACKED_POSITION_IDS = "packed_position_ids"
 PACKED_FEATURES = "packed_features"
 PACKED_HIDDEN = "packed_hidden"
@@ -66,13 +65,8 @@ def masked_scatter_embeds(
 
     ``embeds`` is ``[N, S, D]`` or ``[N * S, D]``. ``mask`` is ``[1, T]`` / ``[T]``.
 
-    Surplus rows in ``embeds`` are consumed silently by ``masked_scatter`` — it
-    takes the first N source elements and drops the rest. Counting the mask's
-    True values here would catch that, but by the time a training step reaches
-    this the mask is on the device, and counting a device mask costs a stream
-    sync every step. So the row count is checked upstream instead, host-side,
-    where each tower compares the packer's stamped count against its own config;
-    the check below only fires on the CPU path (tests, offline packing).
+    Pass exactly as many rows as ``mask`` selects: ``masked_scatter`` takes the
+    first N source elements and drops any surplus without complaining.
     """
     packed = ensure_packed_batch_dim(packed_features)
     if mask.dim() == 1:
@@ -81,12 +75,6 @@ def masked_scatter_embeds(
     if hidden.dim() == 3:
         hidden = hidden.reshape(-1, hidden.size(-1))
     mask_3d = mask.unsqueeze(-1).expand_as(packed)
-    if mask.device.type == "cpu":
-        n_true = int(mask.sum().item())
-        if hidden.size(0) != n_true:
-            raise ValueError(
-                f"masked_scatter_embeds: mask selects {n_true} tokens but embeds has {hidden.size(0)} rows."
-            )
     return packed.masked_scatter(mask_3d, hidden.to(device=packed.device, dtype=packed.dtype))
 
 
@@ -105,7 +93,6 @@ def shift_packed_labels(packed_labels: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "PACKED_ATTENTION_MASK",
     "PACKED_CU_SEQLENS",
     "PACKED_FEATURES",
     "PACKED_HIDDEN",

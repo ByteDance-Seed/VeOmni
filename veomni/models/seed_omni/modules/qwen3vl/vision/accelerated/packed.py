@@ -13,6 +13,7 @@ from ...packing import (
     PACKED_FEATURES,
     fold_dummy_anchor,
     masked_scatter_embeds,
+    visual_row_mask,
     visual_token_count,
 )
 from ..modeling import build_qwen3vl_vit_metadata
@@ -28,7 +29,7 @@ class PackedTrainingMixin:
         super().__init__(*args, **kwargs)
         self._packed_features: Optional[torch.Tensor] = None
         self._visual_pos_mask: Optional[torch.Tensor] = None
-        self._visual_num_real: int = 0
+        self._visual_is_real: Optional[torch.Tensor] = None
         self._image_grid_thw: Optional[torch.Tensor] = None
         self._pack_sp_own_len: Optional[int] = None
 
@@ -39,17 +40,32 @@ class PackedTrainingMixin:
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         visual_pos_mask: Optional[torch.Tensor] = None,
-        visual_num_real: int = 0,
+        visual_is_real: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        if packed_features is None or pixel_values is None or image_grid_thw is None or visual_pos_mask is None:
+        if (
+            packed_features is None
+            or pixel_values is None
+            or image_grid_thw is None
+            or visual_pos_mask is None
+            or visual_is_real is None
+        ):
             raise ValueError(
-                "Qwen3-VL vision pack_encode: packed_features, pixel_values, image_grid_thw, visual_pos_mask required."
+                "Qwen3-VL vision pack_encode: packed_features, pixel_values, image_grid_thw, "
+                "visual_pos_mask and visual_is_real required."
             )
+        # Metering: merged tokens for the real visuals in this packed batch, stashed
+        # BEFORE the SP slice below.
+        merge_area = int(self.config.vision_config.spatial_merge_size) ** 2
+        real_grids = image_grid_thw.reshape(-1, 3)[visual_is_real.reshape(-1).bool()]
+        self.metric_meter_set_seqlens(
+            "pack_encode",
+            [int(row.prod().item()) // merge_area for row in real_grids],
+        )
         self._packed_features = packed_features
         self._visual_pos_mask = visual_pos_mask
-        self._visual_num_real = int(visual_num_real)
+        self._visual_is_real = visual_is_real
         self._image_grid_thw = image_grid_thw
         pixels = pixel_values.to(device=self.device, dtype=self.dtype, non_blocking=True)
         grid = image_grid_thw.to(device=self.device, non_blocking=True)
@@ -72,7 +88,7 @@ class PackedTrainingMixin:
             "pixel_values": pixels,
             "image_grid_thw": grid,
             "vit_metadata": vit_metadata,
-            "is_dummy": self._visual_num_real == 0,
+            "is_dummy": not bool(visual_is_real.any()),
         }
 
     def pack_encode(
@@ -112,32 +128,33 @@ class PackedTrainingMixin:
 
         packed = self._packed_features
         mask = self._visual_pos_mask
-        n_real = self._visual_num_real
+        is_real = self._visual_is_real
         grid = self._image_grid_thw if self._image_grid_thw is not None else image_grid_thw
         merge = self.config.vision_config.spatial_merge_size
-        n_real_tokens = visual_token_count(grid, merge, n_real)
+        n_real_tokens = visual_token_count(grid, merge, is_real)
         self._packed_features = None
         self._visual_pos_mask = None
+        self._visual_is_real = None
         self._image_grid_thw = None
-        self._visual_num_real = 0
 
-        dummy_tail = image_embeds[n_real_tokens:] if image_embeds.size(0) > n_real_tokens else None
+        # Select by the per-row flag, not by position: a packed batch holds every
+        # sample's visuals in whatever order the collator joined them.
+        real_tokens = visual_row_mask(grid, merge, is_real)
+        dummy_tokens = ~real_tokens
+        real_embeds = image_embeds[real_tokens]
+        dummy_embeds = image_embeds[dummy_tokens]
+
         if n_real_tokens > 0:
-            packed = masked_scatter_embeds(packed, mask, image_embeds[:n_real_tokens])
-        if dummy_tail is not None and dummy_tail.numel() > 0:
-            packed = fold_dummy_anchor(packed, dummy_tail)
+            packed = masked_scatter_embeds(packed, mask, real_embeds)
+        if dummy_embeds.numel() > 0:
+            packed = fold_dummy_anchor(packed, dummy_embeds)
         elif n_real_tokens == 0:
             packed = fold_dummy_anchor(packed, image_embeds)
 
         if deepstack_features:
-            real_deepstack = [
-                layer[:n_real_tokens] if n_real_tokens > 0 else layer[:0] for layer in deepstack_features
-            ]
-            dummy_deepstack = (
-                [layer[n_real_tokens:] for layer in deepstack_features] if n_real_tokens < image_embeds.size(0) else []
-            )
-            stacked = torch.stack(real_deepstack, dim=0)
-            if dummy_deepstack and dummy_deepstack[0].numel() > 0:
+            stacked = torch.stack([layer[real_tokens] for layer in deepstack_features], dim=0)
+            dummy_deepstack = [layer[dummy_tokens] for layer in deepstack_features]
+            if dummy_deepstack[0].numel() > 0:
                 packed = fold_dummy_anchor(packed, torch.stack(dummy_deepstack, dim=0))
         else:
             stacked = packed.new_zeros(0, 0, packed.size(-1))

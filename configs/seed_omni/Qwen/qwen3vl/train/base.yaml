@@ -1,29 +1,36 @@
 # VeOmni training / inference config for OmniModel — Qwen3-VL-2B-Instruct.
 #
 # Launch training (text + image + video understanding SFT):
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl/train/base.yaml
 #
 # Launch inference (image/video understanding):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl/train/base.yaml \
 #     --infer.images /path/to/image.jpg \
 #     --infer.prompt "What is in this image?" \
 #     --infer.output_dir qwen3vl_out
 #
-# Prerequisite — split the upstream Qwen3-VL checkpoint:
+# Prerequisite — split the upstream Qwen3-VL checkpoint, OR point `model_path`
+# straight at the upstream root: `qwen3vl/hf_layout.py` registers a
+# `qwen3_vl` HF layout, so an upstream checkpoint loads with no offline split and
+# its HF export is written back in the upstream layout.
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+#     --model_path Qwen3-VL-2B-Instruct \
+#     --output_dir Qwen3-VL-2B-Instruct-split
 #
-# Produces three module sub-folders (qwen3vl_vision / qwen3vl_text_encoder /
-# qwen3vl_llm) under model.model.model_path.
+# Either root works. A split root holds three module sub-folders
+# (qwen3vl_vision / qwen3vl_text_encoder / qwen3vl_llm) under
+# model.model.model_path.
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# absolute paths this job can read before training.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+  model_path: Qwen3-VL-2B-Instruct
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3vl_2b/train/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3vl_2b/train/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3vl/train/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3vl/train/graph_train.yaml
     infer_graph:
-      vision_understanding: configs/seed_omni/Qwen/qwen3vl_2b/infer/graph_infer.yaml
+      vision_understanding: configs/seed_omni/Qwen/qwen3vl/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -63,7 +70,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3vl_2b/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3vl/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -78,7 +85,6 @@ data:
     # modality). fps / frame bounds keep the sampled clip small.
     use_audio_in_video: false
     fps: 2.0
-    min_frames: 4
     max_frames: 8
 
 train:
@@ -89,7 +95,7 @@ train:
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/qwen3vl_2b_omni_sft
+    output_dir: outputs/qwen3vl_omni_sft
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -98,7 +104,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3vl_2b_omni_sft
+    name: qwen3vl_omni_sft
 
 infer:
   generation_kwargs:

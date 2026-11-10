@@ -28,12 +28,23 @@ class PackedTrainingMixin:
     def pack_encode_pre(
         self,
         packed_input_ids: Optional[torch.Tensor] = None,
+        packed_cu_seqlens: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
         if packed_input_ids is None:
             raise ValueError("Qwen3-VL text encoder pack_encode: packed_input_ids is required.")
         input_ids = packed_input_ids.reshape(-1).to(device=self.device, non_blocking=True)
+        # Metering: per-sample packed lengths from the collator's `cu_seqlens`, so
+        # this module reports the same sample count as the backbone — the meter
+        # pairs the two when deciding which module's lengths drive multi-source
+        # accounting. Stashed BEFORE the SP slice below.
+        if packed_cu_seqlens is not None:
+            cu = packed_cu_seqlens.reshape(-1)
+            lengths = [int(s) for s in (cu[1:] - cu[:-1]).tolist()]
+        else:
+            lengths = [int(input_ids.numel())]
+        self.metric_meter_set_seqlens("pack_encode", lengths)
         if get_parallel_state().sp_size > 1:
             self._pack_sp_own_len = int(input_ids.size(0))
             input_ids = sp_pad(input_ids, dim=0, pad_value=0)

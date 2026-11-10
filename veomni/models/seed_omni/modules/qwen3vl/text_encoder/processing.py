@@ -39,8 +39,16 @@ class Qwen3VLTextEncoderPreprocessor(TextEncoderPreprocessor):
         *,
         config_overrides: dict[str, Any] | None = None,
     ) -> TextEncoderChatTemplate:
-        del config_overrides
-        return Qwen3VLChatTemplate(build_tokenizer(module_path))
+        """Build the template, telling it the merge size it must split rows by.
+
+        A video item holds raw patch rows (``_store_patches`` splits by
+        ``t*h*w``), so the template needs the merge factor to know how many rows
+        one frame contributes and how many merged tokens it becomes.
+        """
+        overrides = config_overrides or {}
+        template = Qwen3VLChatTemplate(build_tokenizer(module_path))
+        template.spatial_merge_size = int(overrides.get("spatial_merge_size", 2))
+        return template
 
     def __call__(
         self,

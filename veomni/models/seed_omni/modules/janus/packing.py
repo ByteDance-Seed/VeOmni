@@ -23,7 +23,6 @@ from veomni.utils.constants import IGNORE_INDEX
 
 from ...utils.conversation import ConversationItem
 from ..base.packing import (
-    PACKED_ATTENTION_MASK,
     PACKED_FEATURES,
     PACKED_HIDDEN,
     PACKED_INPUT_IDS,
@@ -40,7 +39,11 @@ from ..base.packing import (
 JANUS_NUM_IMAGE_TOKENS = 576
 
 # Keys written onto the training batch by :class:`JanusTextEncoderPreprocessor`
-# when ``packed_preprocess`` is set.
+# when ``packed_preprocess`` is set. They stay with this family rather than
+# moving to ``base/packing.py``: Janus' packed attention mask and und/gen image
+# masks mean nothing to another family's packer, and a shared spelling would
+# only invite a shared assumption that is not there.
+PACKED_ATTENTION_MASK = "packed_attention_mask"
 UND_IMAGE_MASK = "und_image_mask"
 GEN_IMAGE_MASK = "gen_image_mask"
 PIXEL_VALUES_UND = "pixel_values_und"

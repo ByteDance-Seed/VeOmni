@@ -10,43 +10,49 @@ graph model. This is the minimal **text-only** omni model: the monolithic
 | `qwen3_text_encoder` | `embed_tokens` (+ `lm_head` if untied) + tokenizer | token ↔ embedding, CE loss head, ChatML template |
 | `qwen3_llm` | decoder backbone (no embed / no head) | `inputs_embeds → hidden_states` |
 
-All paths below assume the upstream HuggingFace checkpoint (the post-trained
-chat model) lives at `/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. Adjust to your own
-storage.
+`model.model_path` and the `sources` entry in `data.yaml` are **placeholders**:
+replace each with an absolute path (or an `hdfs://` URL) this job can read before
+launching. `data.train_path` in `base.yaml` also still resolves as a file path —
+the loader checks `os.path.isdir` / `isfile`, so a bare name fails rather than
+being expanded against a storage root.
 
-Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/`.
+Config dir: `configs/seed_omni/Qwen/qwen3/`.
 
 The layout follows [the shared config layout](../usage/training_and_inference.md#1-config-layout).
 Both training and inference take the **same** `base.yaml`.
 
 | File | Role |
 |------|------|
-| `qwen3_0.6b/train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. |
-| `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
-| `qwen3_0.6b/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
-| `qwen3_0.6b/train/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
-| `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
+| `qwen3/train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. |
+| `qwen3/train/modules_train.yaml` | Per-module training overrides. Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `qwen3/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
+| `qwen3/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). Shared by every task. |
+| `qwen3/infer/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
+
+The directory name carries no size: the modules, graphs and kernels are the same
+at every Qwen3 size, and `model.model_path` alone picks the checkpoint. A recipe
+that genuinely needs its own plumbing (Qwen3-MoE, visual instruction tuning) gets
+its own task folder beside `train/`.
 
 ---
 
 ## 1. Checkpoint
 
 Qwen3 registers an HF layout (`modules/qwen3/hf_layout.py`), so `model.model_path`
-can be the **upstream checkpoint itself** — `base.yaml` already points at
-`/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. The layout routes `model.embed_tokens.*`
+can be the **upstream checkpoint itself** — `base.yaml` already points at one. The
+layout routes `model.embed_tokens.*`
 (and `lm_head.*`) plus the tokenizer to `qwen3_text_encoder`, and the rest of
 `model.*` to `qwen3_llm`; the graphs default to the YAML in this config dir. HF
 exports are then written in the upstream layout (see
 [Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
 
-The offline split still works, through the same layout, and is what a composed
-model such as [§7](#7-visual-instruction-tuning-qwen3-06b-into-image-understanding)
-needs:
+The offline split still works, through the same layout, and is what a
+cross-family composed model needs:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  --model_path /abs/path/to/Qwen3-0.6B \
+  --output_dir /abs/path/to/seed_omni/Qwen3-0.6B
 ```
 
 Either root works as `model.model_path`.
@@ -65,9 +71,9 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3_0.6b/train/data.yaml
+# configs/seed_omni/Qwen/qwen3/data.yaml
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
+  - tulu-3-sft-mixture   # placeholder: replace with an absolute path
 names:
   - tulu-3-sft-mixture
 schedule:
@@ -86,14 +92,14 @@ The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml
+  configs/seed_omni/Qwen/qwen3/train/base.yaml
 ```
 
 Key knobs (override on the CLI):
 
 - `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length.
+- `--data.max_seq_len` — packed sequence length (`dyn_bsz` token budget unit: `micro_batch_size * max_seq_len`).
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -102,8 +108,8 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -122,13 +128,12 @@ the output back:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
-- Every module inherits the global `ulysses_size`; do not set a per-module
-  `ulysses_size` (nothing validates that modules agree). The wte is a per-token lookup, so its sequence shards exactly like
+- Every module inherits the global `ulysses_size`. The wte is a per-token lookup, so its sequence shards exactly like
   the LLM backbone.
 - `world % sp_size == 0`; a larger `micro_batch_size` gives longer packed
   sequences to slice across SP ranks.
@@ -146,8 +151,8 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --train.checkpoint.load_path outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
+  --train.checkpoint.load_path outputs/qwen3_omni_sft/checkpoints/global_step_500
 ```
 
 ---
@@ -161,23 +166,39 @@ upstream Qwen3 root (what `base.yaml` points at) or a split root holding
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  configs/seed_omni/Qwen/qwen3/train/base.yaml \
   --model.model_config.infer_type infer_text \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
 # -> "<think> ... the sum of 2 plus 2, which is 4 ..." (coherent chat output)
 ```
 
+`tasks/omni/infer_omni_native.py` is the other entry point — a single-process
+`OmniModel.from_pretrained` + `generate` load with no VeOmni runtime. It takes
+`--model_path` / `--prompt` / `--max_new_tokens` and writes `reply.txt`:
+
+```bash
+python tasks/omni/infer_omni_native.py \
+  --model_path /abs/path/to/Qwen3-0.6B \
+  --prompt "What is 2+2?" \
+  --output_dir qwen3_out \
+  --max_new_tokens 1024
+```
+
+See [Training and Inference §5](../usage/training_and_inference.md#5-inference)
+for how the two entry points differ; `--infer_type` defaults to the checkpoint's
+own `infer_text`, so Qwen3 needs no flag for it.
+
 A run trained from the upstream root exports `hf_ckpt/` as one Qwen3 checkpoint,
 so infer from it directly with `--model.model_path <step_dir>/hf_ckpt` (it loads
 in `transformers` too). A run trained from a split root exports one `hf_ckpt/`
-subfolder per module; assemble a flat root from them (same pattern as Janus):
+subfolder per module; assemble a flat root from them:
 
 ```bash
-STEP=outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
-ASM=outputs/qwen3_0.6b_omni_sft/infer_ckpt/global_step_500
+STEP=outputs/qwen3_omni_sft/checkpoints/global_step_500
+ASM=outputs/qwen3_omni_sft/infer_ckpt/global_step_500
 mkdir -p "$ASM"
 for m in qwen3_text_encoder qwen3_llm; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
@@ -190,33 +211,32 @@ done
 ## 6. Alignment with the original text trainer
 
 Because Qwen3 is text-only, the omni path must compute the **same loss** as the
-classic text trainer (`tasks/train_text.py`). Two checks:
-
-**(a) Numeric equivalence** — feed one identical token sequence through the
-monolithic `Qwen3ForCausalLM` and through the split path
-(`qwen3_text_encoder` embed → `qwen3_llm` → tied projection):
-
-```bash
-python scripts/seed_omni/check_qwen3_alignment.py \
-  --base /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
-# -> max|logit diff| ~8e-5, CE loss identical to 6 d.p. (RESULT: ALIGNED)
-```
-
-**(b) Trainer comparison** — run the classic text trainer on the same model +
-data and compare the loss curve:
+classic text trainer (`tasks/train_text.py`). Run the classic text trainer on
+the same model + data and compare the loss curve:
 
 ```bash
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --data.train_path /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data \
+  --model.model_path /abs/path/to/Qwen3-0.6B \
+  --data.train_path /abs/path/to/tulu-3-sft-mixture \
   --data.max_seq_len 2048 --train.global_batch_size 8 --train.micro_batch_size 1 \
   --train.max_steps 15 --train.wandb.enable false
 ```
 
-The classic `chatml` template labels the whole assistant block (role prefix +
-`<|im_end|>`); the omni `qwen3_text_encoder` template masks the
-`<|im_start|>assistant\n` prefix, which accounts for the small residual gap.
+Two intentional input differences keep a small residual gap even on matched
+data:
+
+1. **Assistant-prefix mask.** The classic `chatml` template labels the whole
+   assistant block (role prefix + `<|im_end|>`); the omni
+   `qwen3_text_encoder` template masks the `<|im_start|>assistant\n` prefix.
+2. **Tulu system turns.** For Tulu rows that open with a system message,
+   SeedOmni's `tulu_3_sft_mixture_preprocess` folds that system text into the
+   first user turn (`<system>…</system>\n…`), while the classic ChatML
+   template keeps a separate system turn. The two trainers therefore see
+   different token sequences on those rows.
+
+For a parity comparison, filter to Tulu rows **without** a system message (or
+otherwise feed both trainers the same already-normalized conversations) and
+compare losses on those matched inputs and labels.
 
 ---
 
@@ -322,7 +342,7 @@ DeepStack mergers.
 ### 7.4 Config
 
 The configs live alongside the text-only Qwen3-0.6B ones in
-`configs/seed_omni/Qwen/qwen3_0.6b/`, distinguished by a `visual_instruction_tuning`
+`configs/seed_omni/Qwen/qwen3/`, distinguished by a `visual_instruction_tuning`
 suffix:
 
 | File | Role |
@@ -337,7 +357,7 @@ suffix:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
+  configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml
 ```
 
 Trainable params are `qwen3vl_vision.visual.merger.*`, the whole `qwen3_llm`
@@ -352,7 +372,7 @@ as [§3.1](#31-sequence-parallelism-ulysses):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -366,7 +386,7 @@ Use the trained-checkpoint command below for real outputs.
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml \
   --model.model_config.infer_type understanding \
   --infer.images /path/to/image.jpg \
   --infer.prompt "What is in this image?" \
@@ -382,9 +402,9 @@ cwd-relative full path double-joins it and fails with a cryptic
 `HFValidationError: Repo id must be in the form ...`.
 
 ```bash
-STEP=outputs/qwen3_0.6b_visual_instruction_tuning/checkpoints/global_step_2000
+STEP=outputs/qwen3_visual_instruction_tuning/checkpoints/global_step_2000
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
+  configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml \
   --model.model_config.infer_type understanding \
   --model.model_path "$STEP" \
   --infer.images /path/to/image.jpg \

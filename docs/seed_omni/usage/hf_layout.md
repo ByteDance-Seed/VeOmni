@@ -56,7 +56,7 @@ QWEN3_HF_LAYOUT = OmniHFLayout(
         ),
     },
     tied_source_keys={"lm_head.weight": "model.embed_tokens.weight"},
-    graph_dir="configs/seed_omni/Qwen/qwen3_0.6b/train",
+    graph_dir="configs/seed_omni/Qwen/qwen3/train",
     training_graphs="graph_train.yaml",
     generation_graphs={"infer_text": "graph_infer.yaml"},
     infer_type="infer_text",

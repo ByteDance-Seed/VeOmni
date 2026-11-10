@@ -16,15 +16,15 @@
 #
 # Train:
 #   bash train.sh tasks/omni/train_omni.py \
-#     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
+#     configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml
 
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/graph_train.yaml
     infer_graph:
-      understanding: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/graph_infer.yaml
+      understanding: configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -64,7 +64,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -83,7 +83,7 @@ train:
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/qwen3_0.6b_visual_instruction_tuning
+    output_dir: outputs/qwen3_visual_instruction_tuning
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -92,7 +92,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3_0.6b_visual_instruction_tuning
+    name: qwen3_visual_instruction_tuning
 
 infer:
   generation_kwargs:

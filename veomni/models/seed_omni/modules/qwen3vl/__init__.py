@@ -8,4 +8,4 @@ sub-modules for the SeedOmni graph runtime:
 * ``qwen3vl_llm``          — text backbone (M-RoPE + DeepStack injection).
 """
 
-from . import convert_model, llm, text_encoder, vision  # noqa: F401
+from . import convert_model, hf_layout, llm, text_encoder, vision  # noqa: F401
