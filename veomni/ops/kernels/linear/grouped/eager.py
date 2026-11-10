@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+
+from .._module import resolve_projection
 
 
 def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, n_groups: int, block_size: int = 128) -> Tensor:
@@ -44,3 +46,22 @@ def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, n_groups: int, block_siz
     if bias.numel() > 0:
         out = out + bias.view(n_groups, out_per_group)
     return out
+
+
+def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
+    """Row entry point: take the projection module and dispatch to :func:`wrapper`.
+
+    ``n_groups`` comes from the module rather than the call, because the grouped
+    layout is a property of the projection, not of the tensor handed in.
+    """
+    weight, shortcut = resolve_projection("eager", linear, x)
+    if shortcut is not None:
+        return shortcut
+    bias = getattr(linear, "bias", None)
+    return wrapper(
+        x,
+        weight,
+        bias if bias is not None else weight.new_empty(0),
+        n_groups=linear.n_groups,
+        block_size=block_size,
+    )

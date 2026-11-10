@@ -19,7 +19,9 @@ which stay in the model dtype -- is expressed the same way as every other kernel
 choice: each family has an op row, and the model constructs a handle.
 
 * Linear projections go through a ``VeomniOp("linear", ...)`` handle, so the
-  family's selected row decides whether they are fake-quantized.
+  family's selected row decides whether they are fake-quantized. The handle takes
+  the projection module (``self.veomni_q_a_proj(self.q_a_proj, x)``) and reaches the
+  weight itself, which keeps adapters working.
 * Stored KV and indexer activations go through a ``VeomniOp("kv_round", ...)``
   handle, whose block width, scale format and quantized prefix are call
   arguments because the three DeepSeek-V4 recipes differ.
@@ -61,7 +63,10 @@ _EXPECTED_LINEAR = {
     "DeepseekV4Indexer.forward": {"q_b_proj"},
     "DeepseekV4HCACompressor.forward": set(),
     "DeepseekV4CSACompressor.forward": set(),
-    "DeepseekV4MLP.forward": {"gate_proj", "up_proj", "down_proj"},
+    # The shared expert runs through `swiglu_mlp`, which takes the three weight
+    # tensors directly rather than a projection module; see
+    # `test_the_shared_expert_uses_its_own_family_row` below.
+    "DeepseekV4MLP.forward": set(),
 }
 _EXPECTED_PLAIN = {
     "DeepseekV4Attention.forward": set(),
@@ -129,11 +134,11 @@ def _storage_round_calls(module, qualname):
 
 
 def _projection_calls(module, qualname):
-    """Split the projections *qualname* uses into handle-driven and plain sets.
+    """Split the projections *qualname* drives into row-driven and plain sets.
 
-    A handle call is ``self.veomni_<name>(x, self.<name>.weight, ...)``, so the
-    projection is recognized by the weight it reads rather than by the handle's
-    attribute name. Anything still invoked as ``self.<name>_proj(...)`` runs the
+    A row-driven call is ``self.veomni_<x>(self.<x>_proj, ...)``: the handle takes the
+    projection module itself, so the projection is recognized by the module named as
+    the first argument. Anything still invoked as ``self.<x>_proj(...)`` runs the
     module directly and therefore stays in the model dtype.
     """
     tree = _method_ast(module, qualname)
@@ -142,31 +147,18 @@ def _projection_calls(module, qualname):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        # ``project_through_op(self.veomni_x, self.x, ...)`` names the projection
-        # as its second argument; a direct handle call names it by its ``weight``.
-        if isinstance(func, ast.Name) and func.id == "project_through_op":
-            operand = node.args[1]
-            if isinstance(operand, ast.Attribute) and isinstance(operand.value, ast.Name):
-                if operand.value.id == "self":
-                    via_handle.add(operand.attr)
+        if isinstance(func, ast.Attribute) and func.attr.startswith("veomni_") and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name) and first.value.id == "self":
+                via_handle.add(first.attr)
             elif (
-                isinstance(operand, ast.Attribute)
-                and isinstance(operand.value, ast.Attribute)
-                and isinstance(operand.value.value, ast.Name)
-                and operand.value.value.id == "self"
+                isinstance(first, ast.Attribute)
+                and isinstance(first.value, ast.Attribute)
+                and isinstance(first.value.value, ast.Name)
+                and first.value.value.id == "self"
             ):
                 # ``attn.q_a_proj`` in dspark-style helpers.
-                via_handle.add(operand.attr)
-        elif isinstance(func, ast.Attribute) and func.attr.startswith("veomni_"):
-            for arg in node.args:
-                if (
-                    isinstance(arg, ast.Attribute)
-                    and arg.attr == "weight"
-                    and isinstance(arg.value, ast.Attribute)
-                    and isinstance(arg.value.value, ast.Name)
-                    and arg.value.value.id == "self"
-                ):
-                    via_handle.add(arg.value.attr)
+                via_handle.add(first.attr)
         elif isinstance(func, ast.Attribute) and func.attr.endswith("_proj"):
             path = ast.unparse(func)
             if path.startswith("self."):

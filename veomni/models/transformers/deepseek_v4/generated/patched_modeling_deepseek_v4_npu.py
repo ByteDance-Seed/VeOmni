@@ -130,7 +130,6 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.linear_utils import project_through_op
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
@@ -870,11 +869,7 @@ class DeepseekV4Indexer(nn.Module):
         )
 
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
-        q = (
-            project_through_op(self.veomni_q_b_proj, self.q_b_proj, q_residual)
-            .view(batch, seq_len, -1, self.head_dim)
-            .transpose(1, 2)
-        )
+        q = self.veomni_q_b_proj(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = self.veomni_rope(q, cos_q, sin_q).transpose(1, 2)
         q = self.veomni_kv_round(q)
         weights = self.scorer.weights_proj(hidden_states).float() * (
@@ -1345,16 +1340,12 @@ class DeepseekV4Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
 
-        q_residual = self.q_a_norm(project_through_op(self.veomni_q_a_proj, self.q_a_proj, hidden_states))
-        q = self.q_b_norm(project_through_op(self.veomni_q_b_proj, self.q_b_proj, q_residual).view(*hidden_shape))
+        q_residual = self.q_a_norm(self.veomni_q_a_proj(self.q_a_proj, hidden_states))
+        q = self.q_b_norm(self.veomni_q_b_proj(self.q_b_proj, q_residual).view(*hidden_shape))
         q = q.transpose(1, 2)
         q = self.veomni_rope(q, cos, sin)
 
-        kv = (
-            self.kv_norm(project_through_op(self.veomni_kv_proj, self.kv_proj, hidden_states))
-            .view(*hidden_shape)
-            .transpose(1, 2)
-        )
+        kv = self.kv_norm(self.veomni_kv_proj(self.kv_proj, hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = self.veomni_rope(kv, cos, sin)
         kv = self.veomni_kv_round(kv, rope_features=self.config.qk_rope_head_dim)
 
@@ -1504,10 +1495,8 @@ class DeepseekV4Attention(nn.Module):
 
         attn_output = self.veomni_rope(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
-        grouped = project_through_op(
-            self.veomni_o_a_proj, self.o_a_proj, grouped, n_groups=self.config.o_groups
-        ).flatten(2)
-        output = project_through_op(self.veomni_o_b_proj, self.o_b_proj, grouped)
+        grouped = self.veomni_o_a_proj(self.o_a_proj, grouped).flatten(2)
+        output = self.veomni_o_b_proj(self.o_b_proj, grouped)
         if build_indexer_loss:
             return output, attn_weights, indexer_kl, indexer_uniform
         return output, attn_weights

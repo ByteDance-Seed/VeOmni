@@ -23,23 +23,26 @@ high precision.
 from __future__ import annotations
 
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....qat import fp8_fake_quant_act, fp8_fake_quant_weight
+from .._module import resolve_projection
 
 
-def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = 128) -> Tensor:
-    """Run ``F.linear`` with blockwise FP8 fake-quantized activation and weight.
-
-    An empty ``bias`` tensor denotes an unused bias.
+def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
+    """Run ``linear`` with blockwise FP8 fake-quantized activation and weight.
 
     ``block_size`` sets both operands' granularity: ``1 x block_size`` activation
     blocks and square ``block_size x block_size`` weight tiles. The deployment GEMM
     ties them together -- it indexes a weight's scale by the same block counter as
     the activation's -- so one number describes its recipe, not two.
     """
+    weight, shortcut = resolve_projection("qat", linear, x)
+    if shortcut is not None:  # pragma: no cover - resolve_projection raises instead
+        return shortcut
+    bias = getattr(linear, "bias", None)
     if x.numel() == 0:
-        return F.linear(x, weight, None if bias.numel() == 0 else bias)
+        return F.linear(x, weight, bias)
     x_q = fp8_fake_quant_act(x, block_size=block_size)
     w_q = fp8_fake_quant_weight(weight, block_size=block_size)
-    return F.linear(x_q, w_q, None if bias.numel() == 0 else bias)
+    return F.linear(x_q, w_q, bias)

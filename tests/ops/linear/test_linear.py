@@ -21,16 +21,11 @@ import torch
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.models.utils.linear_utils import QUANTIZING_LINEAR_IMPLS
 from veomni.ops import OP_REGISTRY, VeomniOp
+from veomni.ops.kernels.linear._module import QUANTIZING_IMPLS
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-
-def _empty_bias(weight: torch.Tensor) -> torch.Tensor:
-    """The empty-tensor sentinel the family uses for an unused bias."""
-    return weight.new_empty(0)
 
 
 def test_linear_registry_entries():
@@ -43,18 +38,19 @@ def test_linear_registry_entries():
 def test_linear_eager_matches_f_linear():
     op = VeomniOp("linear", "standard", "eager")
     x = torch.randn(2, 3, 16)
-    w = torch.randn(8, 16)
-    b = torch.randn(8)
-    torch.testing.assert_close(op(x, w, b), F.linear(x, w, b))
-    torch.testing.assert_close(op(x, w, _empty_bias(w)), F.linear(x, w, None))
+    linear = torch.nn.Linear(16, 8)
+    torch.testing.assert_close(op(linear, x), F.linear(x, linear.weight, linear.bias))
+
+    no_bias = torch.nn.Linear(16, 8, bias=False)
+    torch.testing.assert_close(op(no_bias, x), F.linear(x, no_bias.weight, None))
 
 
 def test_linear_eager_backward_matches_f_linear():
     op = VeomniOp("linear", "standard", "eager")
     x = torch.randn(4, 16, requires_grad=True)
-    w = torch.randn(8, 16, requires_grad=True)
-    b = torch.randn(8, requires_grad=True)
-    op(x, w, b).sum().backward()
+    linear = torch.nn.Linear(16, 8)
+    w, b = linear.weight, linear.bias
+    op(linear, x).sum().backward()
 
     x_ref = x.detach().clone().requires_grad_()
     w_ref = w.detach().clone().requires_grad_()
@@ -69,8 +65,7 @@ def test_linear_eager_backward_matches_f_linear():
 def test_linear_eager_handles_empty_input():
     op = VeomniOp("linear", "standard", "eager")
     x = torch.randn(0, 16)
-    w = torch.randn(8, 16)
-    assert op(x, w, _empty_bias(w)).shape == (0, 8)
+    assert op(torch.nn.Linear(16, 8), x).shape == (0, 8)
 
 
 def test_linear_qat_rows_require_tilelang_on_sm90():
@@ -102,11 +97,9 @@ def single_rank_dist(monkeypatch):
             dist.destroy_process_group()
 
 
-def test_project_through_op_falls_back_to_a_wrapped_module():
+def test_a_wrapped_projection_falls_back_to_its_own_forward():
     """A wrapped projection keeps its base layer at ``base_layer`` and owns no ``weight``."""
     from torch import nn
-
-    from veomni.models.utils.linear_utils import project_through_op
 
     class Wrapped(nn.Module):
         """Stand-in for ``LoraLinear``: no ``weight`` attribute, own forward."""
@@ -122,22 +115,21 @@ def test_project_through_op_falls_back_to_a_wrapped_module():
 
     module = Wrapped()
     x = torch.randn(2, 8)
-    handle = VeomniOp("linear", "standard", "eager")
+    op = VeomniOp("linear", "standard", "eager")
 
-    out = project_through_op(handle, module, x)
+    out = op(module, x)
 
     assert module.calls == 1
+    # A real forward, not a reimplementation: the adapter's own math ran.
     torch.testing.assert_close(out, module.base_layer(x))
-    # The fallback is a real forward, not a reimplementation.
-    torch.testing.assert_close(out, F.linear(x, module.base_layer.weight, None))
 
 
-@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_LINEAR_IMPLS))
-def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantizing_impl):
+@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
+def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
     """Running the unquantized base layer would leave the config claiming QAT."""
     from torch import nn
 
-    from veomni.models.utils.linear_utils import project_through_op
+    from veomni.ops.kernels.linear._module import resolve_projection
 
     class Wrapped(nn.Module):
         def __init__(self):
@@ -147,8 +139,27 @@ def test_project_through_op_refuses_a_quantizing_row_on_a_wrapped_module(quantiz
         def forward(self, x):
             return self.base_layer(x)
 
-    class FakeOp:
-        impl = quantizing_impl
+    with pytest.raises(ValueError, match="cannot run on .Wrapped."):
+        resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8))
 
-    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
-        project_through_op(FakeOp(), Wrapped(), torch.randn(2, 8))
+
+def test_the_grouped_row_reads_n_groups_from_the_projection():
+    """The module owns the group count; the caller passes only the tensor."""
+    from torch import nn
+
+    class Grouped(nn.Linear):
+        def __init__(self, in_per_group, out_features, n_groups):
+            super().__init__(in_per_group, out_features, bias=False)
+            self.n_groups = n_groups
+
+    n_groups, in_per_group, out_per_group = 2, 8, 4
+    linear = Grouped(in_per_group, n_groups * out_per_group, n_groups)
+    x = torch.randn(3, n_groups, in_per_group)
+
+    out = VeomniOp("linear", "grouped", "eager")(linear, x)
+
+    expected = torch.bmm(
+        x.reshape(-1, n_groups, in_per_group).transpose(0, 1),
+        linear.weight.view(n_groups, out_per_group, in_per_group).transpose(1, 2),
+    ).transpose(0, 1)
+    torch.testing.assert_close(out.reshape(-1, n_groups, out_per_group), expected)

@@ -88,6 +88,15 @@ These arguments are **not** `model.ops_implementation` fields. They are paramete
 of the registered row, resolved at the call site, so changing one is a modeling
 change rather than a config change. What the config decides is *which row runs*.
 
+The `linear` rows take the projection **module** rather than a weight tensor, so a
+model writes `self.veomni_q_a_proj(self.q_a_proj, x)`. Whether a projection can be
+driven by its weight, or has to run its own `forward`, is decided once inside the
+family (`veomni/ops/kernels/linear/_module.py`). Adapters are why: a `LoraLinear`
+keeps the real layer at `base_layer` and owns no `weight`, so a weight-taking call
+site would break the moment someone attached an adapter. A reference row calls the
+wrapped module; a quantizing row refuses rather than training at full precision
+under a config that claimed otherwise.
+
 Selecting every family is a legitimate configuration — it makes training see
 exactly what an FP8 deployment computes — and `configs/text/deepseek_v4_qat.yaml`
 is that example:

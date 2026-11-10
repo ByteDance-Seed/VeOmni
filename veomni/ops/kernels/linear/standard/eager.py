@@ -16,15 +16,20 @@
 
 from __future__ import annotations
 
-import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
+
+from .._module import resolve_projection
 
 
-def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = 128) -> Tensor:
-    """Run ``F.linear`` with an empty tensor denoting an unused bias.
+def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
+    """Run ``linear`` in the model dtype; ``block_size`` is unused here.
 
-    ``block_size`` keeps the family-wide keyword so one signature serves every
-    row; this reference does not quantize, so the value is unused.
+    The family-wide keyword is part of the shared signature so a model can call any
+    row the same way; this reference does not quantize.
     """
     del block_size
-    return F.linear(x, weight, None if bias.numel() == 0 else bias)
+    weight, shortcut = resolve_projection("eager", linear, x)
+    if shortcut is not None:
+        return shortcut
+    bias = getattr(linear, "bias", None)
+    return nn.functional.linear(x, weight, bias)

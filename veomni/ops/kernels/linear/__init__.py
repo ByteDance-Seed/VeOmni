@@ -16,8 +16,12 @@
 
 Variant ``standard`` is a 2D linear projection ``x @ weight.T + bias``. Variant
 ``grouped`` is a block-diagonal grouped projection over ``n_groups`` head
-groups. An empty bias tensor denotes an unused bias, so a caller without one
-does not have to branch on ``None``.
+groups.
+
+Rows take the projection **module**, not raw tensors: ``op(self.q_a_proj, x)``.
+``_module.resolve_projection`` decides how to reach the weight, so a model never
+has to know whether it is looking at an ``nn.Linear`` or a wrapped one, and never
+branches on the row itself.
 
 The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
 operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
@@ -59,7 +63,7 @@ register_op(
     "grouped",
     "eager",
     description="PyTorch block-diagonal grouped linear projection",
-    wrapper=grouped_eager.wrapper,
+    wrapper=grouped_eager.module_wrapper,
 )
 
 register_op(
@@ -67,7 +71,7 @@ register_op(
     "grouped",
     "qat",
     description="TileLang blockwise FP8 fake-quantized grouped linear projection",
-    wrapper=grouped_qat.wrapper,
+    wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
 )

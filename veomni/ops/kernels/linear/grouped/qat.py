@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....qat import fp8_fake_quant_act, fp8_fake_quant_weight
+from .._module import resolve_projection
 from . import eager as grouped_eager
 
 
@@ -42,3 +43,18 @@ def wrapper(
     x_q = fp8_fake_quant_act(x, block_size=block_size)
     w_q = fp8_fake_quant_weight(weight, block_size=block_size)
     return grouped_eager.wrapper(x_q, w_q, bias, n_groups=n_groups, block_size=block_size)
+
+
+def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
+    """Row entry point: take the projection module and dispatch to :func:`wrapper`."""
+    weight, shortcut = resolve_projection("qat", linear, x)
+    if shortcut is not None:  # pragma: no cover - resolve_projection raises instead
+        return shortcut
+    bias = getattr(linear, "bias", None)
+    return wrapper(
+        x,
+        weight,
+        bias if bias is not None else weight.new_empty(0),
+        n_groups=linear.n_groups,
+        block_size=block_size,
+    )
