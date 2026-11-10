@@ -87,7 +87,7 @@ so the cache looks complete and the error only shows in `offline_training`.
 `offline_embedding` freezes every module, so it never writes or restores module
 weights; encoder weights always come from each module's `model_path`. A saved
 step is therefore only the cursor, and its manifest
-[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L324), so
+[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L348), so
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
