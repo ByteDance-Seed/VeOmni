@@ -7,14 +7,14 @@ callback. HF models retain their existing metadata handling without a callback.
 ## Callback contract
 
 Register a function under the config's `model_type` in
-[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L84). The meter
+[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L82). The meter
 selects it during [`EnvironMeter.__init__`](../../veomni/utils/helper.py#L228)
 and calls it from [`add`](../../veomni/utils/helper.py#L269), once per input
 micro-batch. Callbacks receive the same input supplied to `add`: a batch
 dictionary or a list of batch dictionaries, depending on the training path.
 The default DiT callback preserves the existing dictionary-based latent path.
 
-[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L90) returns
+[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L88) returns
 `None` for configs without `condition_model_type`. For DiT configs it looks up
 the model type, falling back to the registered `__default_dit__` callback,
 which uses the existing [`_compute_wan_seqlens`](../../veomni/utils/flops_meter.py#L23)
