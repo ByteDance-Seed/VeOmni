@@ -168,21 +168,9 @@ else:
 
 logger = logging.get_logger(__name__)
 
-_MERGER_PROJECTION_SUFFIXES = ("merger.linear_fc2.weight", "merger.linear_fc2.bias")
-
-# The checkpoint keys a retargeted merger re-initialises: HF's own loader needs the
-# same list `_MergerProjectionConverter` drops from VeOmni's loaders.
+# The checkpoint keys a retargeted merger re-initialises. Named once because both
+# the VeOmni loader (which drops them) and HF's (which refuses to) need the same pair.
 _RETARGETED_MERGER_KEYS = frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
-
-
-def is_retargeted_merger_key(name: str) -> bool:
-    """Whether ``name`` is the patch merger's output projection (not a deepstack one).
-
-    A ``out_hidden_size`` override rebuilds this tensor at a different shape, so
-    its stock checkpoint value cannot be loaded and must be re-initialised. The
-    deepstack mergers keep the ViT's own width and are never retargeted.
-    """
-    return name.endswith(_MERGER_PROJECTION_SUFFIXES) and "deepstack" not in name
 
 
 class _MergerProjectionConverter:
@@ -199,8 +187,7 @@ class _MergerProjectionConverter:
         self._model = model
 
     def can_handle(self, name: str) -> bool:
-        """Claim the patch merger's output projection, and nothing else."""
-        return is_retargeted_merger_key(name)
+        return name.endswith(("merger.linear_fc2.weight", "merger.linear_fc2.bias")) and "deepstack" not in name
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional["ConvertedCheckpointTensor"]:
         try:
