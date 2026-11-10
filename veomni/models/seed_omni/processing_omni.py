@@ -220,10 +220,21 @@ class OmniProcessor:
         inference: bool = False,
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
-        """Run the module preprocessor chain on an existing ``conversation_list``."""
-        batch = {"conversation_list": [conversation]}
+        """Run the module preprocessor chain on an existing ``conversation_list``.
+
+        Returns the whole preprocessed ``batch`` dict, not just the carrier: a
+        packed preprocessor consumes ``conversation_list`` and writes its packed
+        tensors onto the same dict, so returning only the carrier would drop
+        everything it produced. On the conversation path the result is still
+        ``{"conversation_list": <conversation>}``.
+        """
+        batch: dict[str, Any] = {"conversation_list": [conversation]}
         self.preprocess_batch(batch, inference=inference, **generation_kwargs)
-        return {"conversation_list": batch["conversation_list"][0]}
+        if "conversation_list" in batch:
+            # Still a carrier-based sample: unwrap the per-sample batch dimension
+            # so callers get one conversation, exactly as before.
+            batch["conversation_list"] = batch["conversation_list"][0]
+        return batch
 
     def preprocess_batch(
         self,

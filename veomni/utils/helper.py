@@ -158,18 +158,25 @@ def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     return dit_latents_seqlens
 
 
+def _as_index_list(ds_idx: Any) -> List[int]:
+    """Normalize a batch's per-sample source indices to a plain ``list[int]``.
+
+    Three shapes reach this: a tensor (``PackingCollator`` concatenates per-sample
+    indices), a list (a collator that keeps them per sample), or a bare int (a
+    single-sample micro batch).
+    """
+    if isinstance(ds_idx, torch.Tensor):
+        return ds_idx.tolist()
+    if isinstance(ds_idx, list):
+        return [int(idx) for idx in ds_idx]
+    return [int(ds_idx)]
+
+
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     ds_idx = micro_batch.pop("ds_idx")
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
-    if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch (e.g. PackingCollator)
-        return ds_idx.tolist()
-    if isinstance(ds_idx, list):
-        # SeedOmniCollator gathers per-sample ds_idx into a list
-        return [int(idx) for idx in ds_idx]
-    # single-sample micro batch
-    return [int(ds_idx)]
+    return _as_index_list(ds_idx)
 
 
 def compute_device_memory_metrics() -> Dict[str, Any]:
