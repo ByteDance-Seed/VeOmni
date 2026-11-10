@@ -104,11 +104,124 @@ Create `configs/seed_omni/<model>/<task>/` following
 [the config layout](training_and_inference.md#1-config-layout): `base.yaml`,
 `modules_train.yaml`, `graph_train.yaml`, plus shared `infer/` graphs and
 `data.yaml`. Edges only declare order; conversation graphs move data through the
-conversation list. Packed graphs (such as Janus `packed/graph_train.yaml`) call
-`pack_*` methods and move packed tensors on the batch dict instead.
+conversation list.
 
 If the model needs a new data source, add a preprocessor as described in
 [Data Format](data_format.md#custom-datasets).
+
+### 4.1 Packing (Optional)
+
+A second graph shape exists: packed graphs (Qwen3-VL's
+`packed/graph_train.yaml` is the in-tree example) call `pack_*` methods and move
+packed tensors on the batch dict instead of a conversation carrier. The
+text-encoder preprocessor builds one flat token sequence per sample on the CPU —
+tokens, M-RoPE positions, visual masks — and every later node only mask-selects
+its own embeddings and `masked_scatter`s them back.
+
+**Adding a model does not require it.** Ship the conversation graph first: it is
+the reference path, it is what inference uses, and it is what a packed graph must
+keep matching. Packing is a throughput optimization, not a capability.
+
+It is also not a padding win, despite how it reads: the conversation path does not
+pad either — it concatenates every sample's embed segments into one varlen
+sequence too. What packing changes is *where* the per-item work runs. The packed
+path has the dataloader worker emit one ready-made tensor triple, so
+`batch_to_device` moves it in a single transfer. The conversation path's carrier
+tensors are built per item and `batch_to_device` deliberately leaves them on the
+host ("placing those is the module's own `pre_forward` job"), so the step pays one
+`to(device)` per `ConversationItem` plus a `torch.cat` over all of them.
+
+So the gain is bounded by the step's Python and H2D bookkeeping, not by the
+model's FLOPs, and it scales with **item count** rather than token count. Measured
+against the real Qwen3-VL-2B checkpoint on one A100 (4 images + two ~400-token
+turns per sample):
+
+| Samples / micro-batch | items | per-item placement | one-shot | backbone forward | saved |
+|---|---|---|---|---|---|
+| 3 | 18 | 1.26 ms | 0.05 ms | 223 ms | 0.54% |
+| 8 | 48 | 4.55 ms | 0.08 ms | 511 ms | 0.88% |
+
+On Qwen3-Omni-30B-A3B the same fixed cost measured −1.01% step time at a
+VRAM-saturating batch and −0.44% at mbs=2, against `fsdp_scope: model` alone
+recovering 0.47% / 0.21% of that same gap.
+
+| Round | `packed` vs `split` | `packed` vs `mfsdp` |
+|-------|--------------------|---------------------|
+| Qwen3-VL-2B, 3 samples, 4.1k rows | n/a | −0.54% |
+| Qwen3-VL-2B, 8 samples, 11k rows | n/a | −0.88% |
+| Qwen3-Omni-30B, thinker mbs=12 (VRAM-saturating) | −1.01% | −0.54% |
+| Qwen3-Omni-30B, thinker mbs=2 | −0.44% | −0.23% |
+| Qwen3-Omni-30B, speech (6 modules), mbs=32 | −3.45% | −0.18% |
+
+Two readings matter here:
+
+- **The wrap scope is the bigger lever.** `split` → `mfsdp` (`fsdp_scope: model`)
+  recovers 0.47% / 0.21% / 3.28% on the Omni rounds, leaving the data path
+  0.18–0.54% on top — inside packed's own 27 ms jitter at the saturated batch.
+- **It buys step-side overhead, nothing else.** Where a module runs one utterance
+  at a time regardless (the talker), or the micro-batch holds few samples, there
+  is little left to win.
+
+#### Where packing does not apply
+
+Packing needs **one shared token axis**. The packer emits a single
+`packed_features` tensor of shape `(1, T, D)`, and each module in the graph writes
+its own embeddings into it with `masked_scatter_embeds` over a boolean mask:
+
+```python
+# Two different masks, both (T,):
+#   `owned` — which encoded rows belong to this module (derived from the flag)
+#   `mask`  — where those rows sit in the packed sequence (`visual_pos_mask`)
+owned = visual_row_mask(grid, merge, is_real)
+real_embeds = image_embeds[owned]
+packed = masked_scatter_embeds(packed, mask, real_embeds)
+```
+
+`masked_scatter_embeds(packed, mask, embeds)` writes `embeds` — one vector per
+`mask`-selected position — into `packed` wherever `mask` is true. The third
+argument is therefore the module's encoded output, not the selector.
+
+
+Every participant therefore has to agree on **what it writes**: `T` (what one row
+of the shared tensor means) and `D` (the width it is written at), with each row
+owned by exactly one module. A module's *own* internals are unconstrained — it may
+run at any width or length as long as it adapts to the packed layout before the
+scatter. That holds for a family whose modules are different *views of the same
+sequence* — the text encoder owns tokens, the vision tower owns visual rows, the
+backbone reads the whole thing — which is what the packed graphs of Qwen3-VL and
+Janus are.
+
+It does **not** hold for an arbitrary assembly of modules:
+
+- **A row set that cannot be known before the modules run.** Packing decides the
+  row layout on the CPU, so a module whose rows depend on another module's *output*
+  has no static split to pack. (A module that merely *reads* a shorter sequence
+  internally is fine — the vision tower sees patch rows, not the LLM sequence — as
+  long as what it writes still covers exactly the rows it owns.) Two modules
+  claiming the same rows is the same defect seen from the other side.
+- **A row written at the wrong width.** The constraint is on what a module
+  *writes into* `packed_features`, not on its internal width: a tower may run at
+  any hidden size as long as it projects before the scatter — Qwen3-VL's ViT is
+  1024-wide and its merger emits 2048. A module that cannot produce the shared
+  width, or that needs to hand its output to another module at a different width,
+  is not a `masked_scatter` participant.
+- **A graph composed across families** (say a ViT from one checkpoint with a
+  backbone from another). The packer's token layout is family-specific — Qwen3-VL
+  builds M-RoPE and a `visual_pos_mask`; another family would build different
+  metadata — so a mixed graph has no single layout to pack.
+
+When the composition does not fit, keep the conversation graph: it moves each
+modality's own tensors on the carrier, and each module reads what it needs at its
+own length. A heterogeneous graph is a legitimate design; it just cannot be
+collapsed onto one row axis.
+
+So add a packed graph when profiling shows `pre_forward` bookkeeping is a
+measurable slice of the step **and** the modules are one family over one sequence.
+It is extra surface: a second train graph, `pack_*` hooks on every module in it,
+its own collation contract in `SeedOmniCollator`, and a parity test against the
+conversation path (`tests/seed_omni/modules/<family>/test_*_accel_align.py`
+compares loss, per-parameter gradients and the AdamW step). None of that is on the
+critical path for "support model X".
 
 ## 5. Honour the contracts
 

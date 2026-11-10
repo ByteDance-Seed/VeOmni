@@ -282,7 +282,7 @@ The pieces that complete this workflow are in place:
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
-[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L511)
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L516)
 returns. The training graph must only mutate `ConversationItem` fields in
 place (for example `value` and `meta`); it must not replace the list, append
 items, or drop items. Structural changes belong in the processor / collator

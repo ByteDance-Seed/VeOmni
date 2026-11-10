@@ -80,11 +80,12 @@ The `output_dir` becomes `model.model_path` in `base.yaml`.
 
 ### 2.1 Load an upstream checkpoint directly
 
-A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY`, today `qwen3`)
-skips the convert: `model.model_path` (or `OmniModel.from_pretrained` /
-`OmniProcessor.from_pretrained`) can name the upstream HF checkpoint. Detection
-is by the root `config.json`'s `model_type`: `omni` is a split checkpoint, a type
-with a registered layout loads through it, and any other type is an error.
+A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY` — for example
+`qwen3` and `qwen3_vl`) skips the convert: `model.model_path` (or
+`OmniModel.from_pretrained` / `OmniProcessor.from_pretrained`) can name the
+upstream HF checkpoint. Detection is by the root `config.json`'s `model_type`:
+`omni` is a split checkpoint, a type with a registered layout loads through it,
+and any other type is an error.
 
 - **Load.** Each process writes a weight-free view of the split checkpoint (module
   configs, tokenizer / processors, root config and graphs) to a temp directory
@@ -206,6 +207,13 @@ flowchart TB
 `generate()` always lives on the native `modeling.py`, so an all-eager Inferencer
 run builds the same object a native user gets from `OmniModel.from_pretrained`;
 the launcher only projects the YAML onto `OmniConfig` first.
+
+Inference does not use sequence or context parallelism: keep `ulysses_size` and
+`cp_size` at 1 on every module. The generation loop decodes one token at a time
+on each rank, so there is no sequence to slice, and a module asked to generate
+under `sp_size > 1` refuses rather than answering with wrong tokens. Passing a
+training `base.yaml` to the Inferencer is fine — its parallel sizes are simply
+not applied. See [Sequence & Context Parallelism §6](../distributed/sequence_parallel.md#6-limitations-and-future-work).
 
 **Native HF:**
 
