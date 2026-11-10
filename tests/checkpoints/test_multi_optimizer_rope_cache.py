@@ -22,6 +22,35 @@ from veomni.optim.optimizer import MultiOptimizer
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+def test_dynamic_rope_prefixed_cache_without_shared_fallback_fails_closed():
+    from transformers import Gemma3TextConfig
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3RotaryEmbedding
+
+    from veomni.checkpoint.dynamic_rope import dynamic_rope_checkpoint_contract
+
+    config = Gemma3TextConfig(
+        hidden_size=32,
+        head_dim=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        max_position_embeddings=16,
+        layer_types=["full_attention"],
+        rope_parameters={"full_attention": {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}},
+    )
+    rope = Gemma3RotaryEmbedding(config)
+    rope.full_attention_max_seq_len_cached = 16
+    assert len(dynamic_rope_checkpoint_contract(rope)) == 1
+    del rope.max_seq_len_cached
+    # Transformers 5.16's dynamic-rope decorator eagerly reads the shared
+    # fallback even with a prefixed cache. Do not certify an unrestorable state.
+    with pytest.raises(RuntimeError, match="Cannot prove dynamic RoPE checkpoint cache") as exc:
+        dynamic_rope_checkpoint_contract(rope)
+    assert isinstance(exc.value.__cause__, AttributeError)
+    with pytest.raises(AttributeError, match="max_seq_len_cached"):
+        rope(torch.zeros((1, 16, 8)), torch.arange(16).reshape(1, -1), layer_type="full_attention")
+
+
 def test_runtime_preflight_allows_dynamic_rope_training_without_checkpoint():
     from veomni.models.model_runtime import VeOmniModelRuntime
 

@@ -589,7 +589,7 @@ resume: they cannot establish scheduler and group provenance. The standalone
 `MultiOptimizer.state_dict()` returns a snapshot and copies tensor states on
 their current devices, which can temporarily require as much extra device
 memory as the optimizer tensors themselves. That raw snapshot supports the
-built-in AdamW, AnyPrecisionAdamW and DistributedMuon leaves, as well as
+built-in AdamW, AnyPrecisionAdamW, SwapAdamW and DistributedMuon leaves, as well as
 registered adapters. Custom serialization hooks and adapters must preserve state faithfully.
 It does not prove the identity needed for raw restoration. Use the high-level
 `DistributedCheckpointer` for save and restore; its save path avoids this copy.
