@@ -1375,7 +1375,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "linear_implementation": frozenset(),
-    "kv_round_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
@@ -1402,7 +1402,7 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
     "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
     "linear_implementation": frozenset(),
-    "kv_round_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
@@ -1652,17 +1652,16 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    kv_round_implementation: Optional[str] = field(
-        default=None,
+    kv_round_implementation: Literal["none", "eager", "triton"] = field(
+        default="none",
         metadata={
-            "help": "KV-cache and indexer-activation storage rounding. 'triton' (GPU) | 'eager'. "
-            "Unset means OFF -- no stored tensor is rounded; unlike the other fields there is no "
-            "host default. Selecting a row makes the model round "
-            "stored KV and indexer operands to their inference storage dtype on every forward, "
-            "which is what quantization-aware training needs to see deployment's rounding; leaving "
-            "it unset trains in the model dtype. The block width, scale format and quantized prefix "
-            "are call arguments, because DeepSeek-V4's window KV, compressed KV and indexer logits "
-            "use different ones."
+            "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
+            "unchanged and is the default, because this family has no host default and its reference "
+            "row ('eager') does round -- unlike every other field, 'eager' here is not 'off'. "
+            "'triton' (GPU) and 'eager' both round stored KV and indexer operands to their inference "
+            "storage dtype on every forward, which is what quantization-aware training needs to see "
+            "deployment's rounding. A model selects the variant that owns its geometry; this field "
+            "only chooses the implementation."
         },
     )
 
@@ -1789,20 +1788,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        # A ``deepgemm_fp8`` expert GEMM quantizes its own operands, so a
-        # fake-quantizing family on the same path would round them twice.
-        if self.moe_implementation == "deepgemm_fp8":
-            conflicting = [
-                field
-                for field in ("linear_implementation", "swiglu_mlp_implementation")
-                if getattr(self, field) == "qat"
-            ]
-            if conflicting:
-                raise ValueError(
-                    f"moe_implementation='deepgemm_fp8' cannot be combined with {conflicting}. "
-                    "DeepGEMM already quantizes the expert GEMM operands; set those families to "
-                    "'eager' (or another non-quantizing row)."
-                )
+        # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
+        # ``qat`` are two values of the same ``moe_implementation`` field, so they
+        # cannot both be selected; ``linear_implementation`` and
+        # ``swiglu_mlp_implementation`` are separate GEMMs with separate operands,
+        # so quantizing them alongside a DeepGEMM expert GEMM rounds nothing twice.
+        # The shared expert in particular is a dense SwiGLU FFN, not one of the
+        # routed experts.
 
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (

@@ -56,7 +56,7 @@ when the selected implementation runs.
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
-| `kv_round` | `fp8` | `eager`, `triton` (GPU); block width and quantized prefix are call arguments |
+| `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (GPU); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 

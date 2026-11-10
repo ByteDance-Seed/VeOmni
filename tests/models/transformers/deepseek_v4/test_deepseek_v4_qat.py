@@ -15,10 +15,8 @@
 """QAT wiring for DeepSeek V4's patched modeling.
 
 The recipe -- which tensors are rounded the way inference rounds them, and
-which stay in the model dtype -- used to be a global ``qat_implementation``
-recipe that every call site passed around. It is now expressed the same way as
-every other kernel choice: each family has an op row, and the model constructs
-a handle.
+which stay in the model dtype -- is expressed the same way as every other kernel
+choice: each family has an op row, and the model constructs a handle.
 
 * Linear projections go through a ``VeomniOp("linear", ...)`` handle, so the
   family's selected row decides whether they are fake-quantized.
@@ -45,6 +43,7 @@ import pytest
 
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_gpu
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling_npu
+from veomni.ops import VeomniOp
 
 
 # The projections DeepSeek V4 serves as a true low-precision GEMM, and the ones
@@ -74,7 +73,9 @@ _EXPECTED_PLAIN = {
 }
 
 # The activation-only recipe: tensors rounded because inference *stores* them
-# that way, listed as (helper, argument) pairs.
+# that way, listed as (call, argument) pairs. A storage site is the kv_round
+# handle itself (`self.veomni_kv_round(...)`), so "which tensors are rounded" is
+# the set of arguments it receives.
 #
 # The counts carry weight. Each compressor finalizes its output in two separate
 # branches -- one for packed sequences, one for the windowed/cached path -- and
@@ -82,25 +83,25 @@ _EXPECTED_PLAIN = {
 # while leaving every shape and loss curve plausible. The main attention's Q
 # appears nowhere on purpose: it is never stored, so inference keeps it in the
 # model dtype all the way into attention.
+_KV_ROUND = "self.veomni_kv_round"
 _EXPECTED_STORAGE_ROUND = {
-    "DeepseekV4Attention.forward": [("round_stored_kv", "kv")],
+    "DeepseekV4Attention.forward": [(_KV_ROUND, "kv")],
     "DeepseekV4Indexer.forward": [
-        ("round_indexer_act", "compressed"),
-        ("round_indexer_act", "q"),
+        (_KV_ROUND, "compressed"),
+        (_KV_ROUND, "q"),
     ],
     "DeepseekV4HCACompressor.forward": [
-        ("round_stored_kv", "compressed"),
-        ("round_stored_kv", "compressed"),
+        (_KV_ROUND, "compressed"),
+        (_KV_ROUND, "compressed"),
     ],
     "DeepseekV4CSACompressor.forward": [
-        ("round_stored_kv", "compressed"),
-        ("round_stored_kv", "compressed"),
+        (_KV_ROUND, "compressed"),
+        (_KV_ROUND, "compressed"),
     ],
     "DeepseekV4MLP.forward": [],
     # The routed experts hand their raw weights to the family row on the fused
-    # path. The non-SwiGLU branch cannot call the row, so it re-applies that
-    # row's rounding itself -- pinned here so the recipe cannot silently lose it.
-    "DeepseekV4Experts.forward": [("round_expert_operands", "self.moe_implementation")],
+    # path; there is no model-side rounding left to count.
+    "DeepseekV4Experts.forward": [],
 }
 
 
@@ -112,13 +113,18 @@ def _method_ast(module, qualname):
 
 
 def _storage_round_calls(module, qualname):
-    """List the ``(helper, first argument)`` pairs of storage-rounding calls."""
+    """List the ``(callee, rounded argument)`` pairs of storage-rounding calls.
+
+    The kv_round handle is called directly, so a rounding site is recognized by the
+    callee expression rather than by a helper name.
+    """
     calls = []
     for node in ast.walk(_method_ast(module, qualname)):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        if not isinstance(node, ast.Call):
             continue
-        if node.func.id in ("round_stored_kv", "round_indexer_act", "round_expert_operands"):
-            calls.append((node.func.id, ast.unparse(node.args[0])))
+        callee = ast.unparse(node.func)
+        if callee == _KV_ROUND:
+            calls.append((_KV_ROUND, ast.unparse(node.args[0])))
     return sorted(calls)
 
 
@@ -195,28 +201,36 @@ def test_storage_rounding_covers_exactly_the_stored_tensors(modeling):
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
 def test_storage_rounding_is_off_until_asked_for(modeling):
-    """An unset ``kv_round_implementation`` must leave every tensor in the model dtype."""
+    """The default selection leaves every stored tensor in the model dtype.
+
+    "Off" is the ``none`` row rather than an absent handle, so the model builds its
+    kv_round handle unconditionally like every other family -- and that row returns
+    its input, which is checked here.
+    """
+    import torch
+
     from tests.models.tiny_configs import tiny_deepseek_v4_config
 
     config = tiny_deepseek_v4_config()
-    assert config.ops_config.kv_round_implementation is None
-    assert modeling._storage_round_op(config, "fp8") is None
+    assert config.ops_config.kv_round_implementation == "none"
+
+    kv = torch.randn(2, 3, 128, dtype=torch.bfloat16)
+    handle = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+    assert handle.impl == "none"
+    torch.testing.assert_close(handle(kv, rope_features=64), kv, rtol=0, atol=0)
+    torch.testing.assert_close(handle(kv), kv, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_storage_round_op_follows_the_instance_selection(modeling):
+def test_kv_round_op_follows_the_instance_selection(modeling):
     """Selecting a row must reach the modules that round stored tensors."""
     from tests.models.tiny_configs import tiny_deepseek_v4_config
-    from veomni.utils.device import IS_NPU_AVAILABLE
 
     config = tiny_deepseek_v4_config()
     config._set_ops_implementation({"kv_round_implementation": "eager"})
-    handle = modeling._storage_round_op(config, "fp8")
-    assert handle is not None
-    assert (handle.op, handle.variant, handle.impl) == ("kv_round", "fp8", "eager")
-    if IS_NPU_AVAILABLE:
-        # No CUDA row here; the NPU variant still builds the same handle shape.
-        assert handle.op == "kv_round"
+    assert config.ops_config.kv_round_implementation == "eager"
+    handle = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+    assert (handle.op, handle.variant, handle.impl) == ("kv_round", "deepseek_v4", "eager")
 
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
@@ -228,7 +242,7 @@ def test_stored_kv_rounds_only_the_nope_prefix(modeling):
     # trailing RoPE channels (64 here) in the model dtype.
     rope_features = 64
     kv = torch.randn(2, 3, 128, dtype=torch.bfloat16)
-    rounded = modeling.round_stored_kv(kv, rope_features, _FakeOp("kv_round", "fp8", "eager"))
+    rounded = modeling.VeomniOp("kv_round", "deepseek_v4", "eager")(kv, rope_features=rope_features)
 
     assert torch.equal(rounded[..., -rope_features:], kv[..., -rope_features:])
     assert not torch.equal(rounded[..., :-rope_features], kv[..., :-rope_features])
@@ -241,7 +255,7 @@ def test_indexer_act_rounds_whole_128_wide_heads(modeling):
     import torch
 
     x = torch.randn(2, 3, 128, dtype=torch.bfloat16)
-    rounded = modeling.round_indexer_act(x, _FakeOp("kv_round", "fp8", "eager"))
+    rounded = modeling.VeomniOp("kv_round", "deepseek_v4", "eager")(x)
 
     assert rounded.shape == x.shape
     assert not torch.equal(rounded, x)
@@ -254,8 +268,9 @@ def test_storage_rounding_is_a_no_op_when_off(modeling):
     import torch
 
     kv = torch.randn(2, 3, 128, dtype=torch.bfloat16)
-    assert modeling.round_stored_kv(kv, 64, None) is kv
-    assert modeling.round_indexer_act(kv, None) is kv
+    off = modeling.VeomniOp("kv_round", "deepseek_v4", "none")
+    torch.testing.assert_close(off(kv, rope_features=64), kv, rtol=0, atol=0)
+    torch.testing.assert_close(off(kv), kv, rtol=0, atol=0)
 
 
 class _FakeOp:
@@ -271,9 +286,11 @@ class _FakeOp:
 
     def __call__(self, x, **kwargs):
         self.calls.append(kwargs)
-        from veomni.ops.kernels.kv_round.fp8.eager import fp8_roundtrip
+        from veomni.ops.kernels.kv_round.deepseek_v4 import eager
 
-        return fp8_roundtrip(x, **kwargs)
+        if kwargs.get("rope_features") is None:
+            return eager.round_indexer_act(x)
+        return eager.round_window_kv(x, kwargs["rope_features"])
 
 
 def _build_tiny_model(linear_impl: str):
@@ -325,3 +342,59 @@ def test_deepseek_v4_lora_runs_on_the_reference_linear_row():
         out = model(input_ids=input_ids)
 
     assert out.logits.shape == (1, 4, config.vocab_size)
+
+
+@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
+def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
+    """The fused expert rows bake SiLU into their kernels, so another activation cannot use them.
+
+    The fallback loops over experts in Python instead, which means it cannot reach
+    the family row and therefore does not round -- the same behaviour as every other
+    model's fallback. Pinning it here keeps DeepSeek-V4 from becoming the one model
+    whose non-SiLU experts quantize.
+    """
+    import copy
+
+    import torch
+
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+    from veomni.arguments import OpsImplementationConfig
+
+    config = tiny_deepseek_v4_config()
+    # `gelu` is what selects the fallback; no published checkpoint uses it, which is
+    # exactly why the path needs a test rather than a reader.
+    config = copy.deepcopy(config)
+    config.hidden_act = "gelu"
+    config._set_ops_implementation(
+        OpsImplementationConfig(
+            attn_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            linear_implementation="eager",
+            moe_implementation="eager",
+            dsa_attention_implementation="eager",
+            dsa_indexer_implementation="eager",
+            mhc_implementation="eager",
+            kv_round_implementation="none",
+        )
+    )
+
+    if modeling.__name__.endswith("_npu"):
+        pytest.skip("the DSV4 NPU build needs torch_npu")
+
+    model = modeling.DeepseekV4Experts(config)
+    assert model.use_swiglu_mlp is False
+    # The parameters are allocated with `torch.empty`; a real build fills them from
+    # a checkpoint, so give them finite values before the forward.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.1)
+
+    hidden_states = torch.randn(4, config.hidden_size)
+    selected = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2]], dtype=torch.long)
+    weights = torch.full((4, 2), 0.5)
+
+    output = model(hidden_states, selected, weights)
+
+    assert output.shape == hidden_states.shape
+    assert torch.isfinite(output).all()

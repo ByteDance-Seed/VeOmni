@@ -1,0 +1,113 @@
+# DeepSeek-V4-Flash SFT with every op selected for low-precision quantization-aware
+# training (QAT). This is the "all families quantized" reference; `deepseek_v4.yaml` is
+# the same model training in the model dtype.
+#
+# Quantization-aware training is per family, not a global recipe. Each family that can
+# round its GEMM operands owns a `qat` row, and stored KV/indexer activations round
+# through the `kv_round` family. Selecting them all here makes training see exactly the
+# values an FP8 deployment computes; leaving a field at its reference row trains that
+# family in the model dtype.
+#
+# What each selection rounds:
+#   linear_implementation        attention and indexer projections (q_a/q_b/kv/o_a/o_b):
+#                                both GEMM operands, 1x128 activation blocks, 128x128
+#                                weight tiles, ue8m0 power-of-two scales.
+#   swiglu_mlp_implementation    the shared expert's fused SwiGLU projections, same
+#                                recipe; the clamp and silu*mul stay in the model dtype.
+#   moe_implementation           routed experts on the fused-MoE path: activation in
+#                                1x128 blocks, weights per the checkpoint's
+#                                `expert_dtype` (FP4 in 1x32 groups on V4-Flash, else
+#                                FP8 tiles). Routing weights are never rounded -- they
+#                                choose which experts run, not just the arithmetic.
+#   kv_round_implementation      the tensors inference *stores*: window KV in 64-wide
+#                                FP8 groups over the NoPE channels (the RoPE tail stays
+#                                in the model dtype) and indexer logits over whole
+#                                128-wide heads. `kv_round` is the one field with an
+#                                explicit `none` row, because `eager` there is a real
+#                                row that rounds; `none` leaves stored tensors alone.
+#
+# Hardware: the `qat` rows carry requirement=NVIDIA_SM90_PLUS and requires=tilelang, so a
+# pre-SM90 host fails when the handle is built rather than mid-training.
+#
+# Swapping `moe_implementation` to `deepgemm_fp8` is a valid variant of this config: it
+# runs native FP8 expert GEMMs instead of fake-quantizing the experts, while `linear`,
+# `swiglu_mlp` and `kv_round` stay on their QAT rows. Those are separate GEMMs -- in
+# particular `swiglu_mlp` is the shared expert, which DeepGEMM does not cover -- so the
+# two selections compose rather than conflict.
+#
+# Precision: BF16 parameters with FP32 gradient reduction. The fake quantizers are
+# straight-through, so the FP32 master weights keep updating normally and checkpoints
+# stay ordinary floating point -- no quantized tensors are ever persisted.
+
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  ops_implementation:
+    # Kept at their low-precision rows from deepseek_v4.yaml; not QAT-related.
+    attn_implementation: eager
+    cross_entropy_loss_implementation: liger_kernel
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    mhc_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+    # Every quantizable family, all on the QAT rows.
+    linear_implementation: qat
+    swiglu_mlp_implementation: qat
+    moe_implementation: qat
+    kv_round_implementation: triton
+  optimizer:
+    type: muon
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    muon_ns_implementation: gram_quack
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        # FP32 reduction keeps the straight-through gradients in the wider format;
+        # the quantizers themselves upcast internally, so param dtype does not matter
+        # to them.
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  max_seq_len: 2048
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  max_steps: 1000
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_flash_qat_tulu_sft
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: deepseek_v4_flash_qat_tulu_sft

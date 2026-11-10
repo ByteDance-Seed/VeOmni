@@ -70,6 +70,8 @@ veomni/
 │   ├── qat/            Fake-quantization primitives called by the qat rows
 │   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
+│                       (a model-specific variant sits in a model-named
+│                        subpackage, e.g. kv_round/deepseek_v4)
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
 ├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`

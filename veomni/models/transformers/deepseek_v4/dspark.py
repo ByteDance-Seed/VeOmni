@@ -275,8 +275,10 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         kv = attn.veomni_rope(kv, cos, sin)
         # Same storage recipe as the main attention: the NoPE channels are
         # stored FP8 in 64-wide groups and the RoPE tail stays in the model dtype.
-        if attn.veomni_kv_round is not None and kv.numel() > 0:
-            kv = attn.veomni_kv_round(kv, block_size=64, quant_features=kv.shape[-1] - attn.config.qk_rope_head_dim)
+        # Same row and same recipe as the main attention; the variant owns the
+        # geometry, and "off" is that row's `none` implementation rather than a
+        # missing handle.
+        kv = attn.veomni_kv_round(kv, rope_features=attn.config.qk_rope_head_dim)
         return kv.squeeze(1)
 
     def _packed_draft_attention(

@@ -34,7 +34,6 @@ from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RT
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
-from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -390,26 +389,3 @@ def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
         )
         torch.testing.assert_close(sp_attn_proj, ref_attn_proj, atol=EAGER_ATOL, rtol=EAGER_RTOL)
         assert ref_logits.shape == (1, 8, config.vocab_size)
-
-
-def test_qwen3_wires_the_configured_linear_implementation():
-    """Attention projections and the fused MLP read their own op field, not module type."""
-    import copy
-
-    config = copy.deepcopy(_tiny_config())
-    ours = _build_qwen3(
-        config,
-        SimpleNamespace(
-            **{
-                **vars(eager_ops_config()),
-                "linear_implementation": "eager",
-                "swiglu_mlp_implementation": "eager",
-            }
-        ),
-    )
-
-    attention = ours.model.layers[0].self_attn
-    assert isinstance(attention.veomni_linear, VeomniOp)
-    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
-    assert attention.veomni_linear.impl == "eager"
-    assert ours.model.layers[0].mlp.veomni_swiglu_mlp.impl == "eager"

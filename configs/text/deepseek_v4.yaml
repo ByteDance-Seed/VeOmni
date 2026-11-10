@@ -23,15 +23,6 @@ model:
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
-    # Quantization-aware training is per family, not a global recipe.
-    # `linear`/`swiglu_mlp`/`moe_experts: qat` fake-quantize the operands FP8
-    # inference runs as true FP8 GEMMs; `kv_round: triton` rounds the KV entries
-    # and indexer logits it stores. Both need SM90+. Routed experts follow the
-    # checkpoint's `expert_dtype` (FP4 on V4-Flash) and are covered on the
-    # fused-MoE path only. Set them all to the reference rows to train in the
-    # model dtype. Leaving `kv_round_implementation` unset (the default) rounds
-    # no stored tensor; `triton` or `eager` selects the row that does.
-    # kv_round_implementation: triton
   optimizer:
     # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
     # Switch back with `type: adamw` if needed.

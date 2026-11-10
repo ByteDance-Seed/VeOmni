@@ -192,12 +192,6 @@ config.add_import(
 )
 
 
-@config.add_helper
-def _deepseek_v4_rope_op(config=None) -> VeomniOp:
-    impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
-    return VeomniOp("rope", "deepseek_v4", impl)
-
-
 # ================================================================
 # Patch: DeepSeek V4 RMSNorm
 # ================================================================
@@ -389,70 +383,6 @@ def deepseek_v4_decoder_layer_forward_patched(
     return output
 
 
-@config.add_helper
-def _storage_round_op(config: "DeepseekV4Config", variant: str) -> "VeomniOp | None":
-    """The instance's KV storage-rounding handle for ``variant``, or ``None`` when off.
-
-    ``kv_round_implementation`` is an ordinary op field, so an unset value means
-    training in the model dtype and there is nothing to call. The DeepSeek-V4
-    recipes then pass their own block width, scale format and quantized prefix at
-    the call site: window KV is FP8 over 64-wide groups up to the RoPE boundary,
-    while the indexer rounds whole 128-wide heads.
-    """
-    impl = config.ops_config.kv_round_implementation
-    if impl is None:
-        return None
-    return VeomniOp("kv_round", variant, impl)
-
-
-@config.add_helper
-def round_expert_operands(
-    impl: str, hidden_states: torch.Tensor, gate_up_proj: torch.Tensor, down_proj: torch.Tensor, expert_dtype: str
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply a quantizing ``moe_experts`` row's rounding outside the fused GEMM.
-
-    The non-SwiGLU expert loop cannot call the family row, so it asks the row
-    which recipe is selected and reproduces that rounding directly. A reference
-    row leaves all three operands untouched.
-    """
-    # The only quantizing ``moe_experts`` row today. Kept inline rather than as a
-    # module constant because codegen copies only the helper, not the module.
-    if impl != "qat":
-        return hidden_states, gate_up_proj, down_proj
-    from veomni.ops.qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
-
-    def _weight(weight: torch.Tensor) -> torch.Tensor:
-        if expert_dtype == "fp4":
-            return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
-        return fp8_fake_quant_stacked_weight(weight)
-
-    return (
-        fp8_fake_quant_act(hidden_states) if hidden_states.numel() > 0 else hidden_states,
-        _weight(gate_up_proj),
-        _weight(down_proj),
-    )
-
-
-@config.add_helper
-def round_stored_kv(kv: torch.Tensor, rope_features: int, op: "VeomniOp | None") -> torch.Tensor:
-    """Round an attention KV entry to its inference storage dtype.
-
-    Only the leading NoPE channels are stored FP8; the trailing RoPE channels
-    stay in the model dtype, so the round trip stops at that split.
-    """
-    if op is None or kv.numel() == 0:
-        return kv
-    return op(kv, block_size=64, quant_features=kv.shape[-1] - rope_features)
-
-
-@config.add_helper
-def round_indexer_act(x: torch.Tensor, op: "VeomniOp | None") -> torch.Tensor:
-    """Round an indexer activation over whole 128-wide channel groups."""
-    if op is None or x.numel() == 0:
-        return x
-    return op(x, block_size=128)
-
-
 # ================================================================
 # Patch: packed compressed-attention windows
 # 1. Keep every HCA/CSA compression window within one packed sequence.
@@ -471,8 +401,8 @@ def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config"):
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-    self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.veomni_kv_round = _storage_round_op(config, "fp8")
+    self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
 
 
 @config.override_method(
@@ -489,8 +419,8 @@ def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config"):
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.indexer = DeepseekV4Indexer(config)
-    self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.veomni_kv_round = _storage_round_op(config, "fp8")
+    self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
 
 
 @config.override_method(
@@ -578,7 +508,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
+        compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
         return compressed.unsqueeze(1), CompressedCandidates(
             range_starts=rate_metadata["range_starts"],
             range_ends=rate_metadata["range_ends"],
@@ -626,7 +556,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
+    compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
     compressed_kv = compressed.unsqueeze(1)
 
     if compressed_kv.shape[2] == 0:
@@ -716,7 +646,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
+        compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
         compressed_kv = compressed.unsqueeze(1)
         # The indexer gets the global metadata next to a local shard on purpose: it
         # summarises the same windows through its own projections, so it does its
@@ -796,7 +726,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = round_stored_kv(compressed, self.rotary_emb.config.qk_rope_head_dim, self.veomni_kv_round)
+    compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
     compressed_kv = compressed.unsqueeze(1)
     indexer_output = self.indexer(
         hidden_states,
@@ -839,8 +769,8 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         "deepseek_v4",
         config.ops_config.dsa_indexer_implementation,
     )
-    self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.veomni_kv_round = _storage_round_op(config, "fp8")
+    self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
 
 
 @config.override_method(
@@ -1013,7 +943,7 @@ def deepseek_v4_indexer_forward_patched(
 
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = round_indexer_act(compressed, self.veomni_kv_round)
+    compressed = self.veomni_kv_round(compressed)
     compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
 
     cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
@@ -1023,7 +953,7 @@ def deepseek_v4_indexer_forward_patched(
         .transpose(1, 2)
     )
     q = self.veomni_rope(q, cos_q, sin_q).transpose(1, 2)
-    q = round_indexer_act(q, self.veomni_kv_round)
+    q = self.veomni_kv_round(q)
     weights = self.scorer.weights_proj(hidden_states).float() * (
         self.scorer.weights_scaling * self.scorer.softmax_scale
     )
@@ -1148,8 +1078,8 @@ def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_i
         config.ops_config.dsa_attention_implementation,
     )
     self.veomni_attn = VeomniOp("attention", "standard", config.ops_config.attn_implementation)
-    self.veomni_rope = _deepseek_v4_rope_op(config)
-    self.veomni_kv_round = _storage_round_op(config, "fp8")
+    self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
     self.veomni_o_a_proj = VeomniOp("linear", "grouped", config.ops_config.linear_implementation)
     self.veomni_o_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
 
@@ -1182,7 +1112,7 @@ def deepseek_v4_attention_forward_patched(
         .transpose(1, 2)
     )
     kv = self.veomni_rope(kv, cos, sin)
-    kv = round_stored_kv(kv, self.config.qk_rope_head_dim, self.veomni_kv_round)
+    kv = self.veomni_kv_round(kv, rope_features=self.config.qk_rope_head_dim)
 
     if past_key_values is not None:
         kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -1773,11 +1703,11 @@ class PatchedDeepseekV4Experts(nn.Module):
         gate_up_proj = self.gate_up_proj
         if not self.use_swiglu_mlp:
             # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
-            # through the family row. Apply that row's own rounding here instead:
-            # skipping it would train a recipe the deployment kernel never runs.
-            hidden_states, gate_up_proj, down_proj = round_expert_operands(
-                self.moe_implementation, hidden_states, gate_up_proj, down_proj, self.expert_dtype
-            )
+            # through the family row: the fused kernel bakes SiLU into both its
+            # forward and its backward, so a different activation has no fused row
+            # to run. It therefore trains in the model dtype, like every other
+            # model's fallback -- quantizing only this one would make DeepSeek-V4
+            # the single model whose non-SiLU experts round.
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

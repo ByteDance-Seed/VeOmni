@@ -284,7 +284,12 @@ def _ops_dict(value):
 def _resolve_ops(selections):
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
+    from .legacy_qat_selections import migrate_retired_selections
 
+    # Configs written before QAT became per-family still carry the retired names.
+    # See veomni/models/legacy_qat_selections.py -- deleting that module and this
+    # line drops the compatibility.
+    selections = migrate_retired_selections(selections)
     resolved = OpsImplementationConfig(**{key: value for key, value in selections.items() if value is not None})
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:

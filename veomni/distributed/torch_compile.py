@@ -167,61 +167,6 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
-#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by ops field.
-#: A torchao-backed fake-quant row belongs here: ``MXTensor`` materializes
-#: ``float8_e8m0fnu`` scale tensors and Inductor's codegen has no lowering for
-#: that dtype. Registering the row here turns an assertion raised deep inside a
-#: fused kernel into a statement about the config.
-_UNCOMPILABLE_IMPLS: dict[str, str] = {}
-
-
-def _uncompilable_selections(ops) -> list[str]:
-    """Return the offending ``field=impl`` strings on one ops config, if any."""
-    if ops is None:
-        return []
-    return [
-        f"{field}={getattr(ops, field)!r}"
-        for field, impl in _UNCOMPILABLE_IMPLS.items()
-        if getattr(ops, field, None) == impl
-    ]
-
-
-def _reject_incompatible_ops(model: nn.Module) -> None:
-    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
-
-    A row registers itself in ``_UNCOMPILABLE_IMPLS`` when its kernel emits a
-    dtype Inductor cannot lower. Checking here turns an assertion raised from
-    inside a fused kernel into a statement about the config.
-
-    The walk covers nested configs because that is how the selections bind: a
-    multimodal root carries its text tower's ops under ``sub_configs``, and a
-    module resolves the selection from the config it was built with -- so a
-    child-only selection is real, and a root-only one may be overridden by the
-    child. Both directions are checked; the message names the path so the
-    offending level is unambiguous.
-    """
-    config = getattr(model, "config", None)
-    offending = _uncompilable_at(config, prefix="")
-    if offending:
-        raise RuntimeError(
-            "model.accelerator.torch_compile cannot be combined with "
-            f"{', '.join(offending)}: those rows emit a dtype Inductor cannot lower. "
-            "Disable compilation or select a different row."
-        )
-
-
-def _uncompilable_at(config, *, prefix: str) -> list[str]:
-    """Collect offending selections on ``config`` and every sub-config below it."""
-    if config is None:
-        return []
-    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
-    for name in getattr(config, "sub_configs", {}) or {}:
-        child = getattr(config, name, None)
-        if child is not None:
-            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
-    return found
-
-
 def compile_decoder_blocks(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -241,7 +186,6 @@ def compile_decoder_blocks(
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
-    _reject_incompatible_ops(model)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,

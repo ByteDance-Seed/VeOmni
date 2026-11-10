@@ -50,8 +50,6 @@ _FIELD_TO_OP = {
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
 
-_FUNCTIONAL_IMPLEMENTATION_FIELDS: set[str] = set()
-
 
 def _registered_implementations(op: str) -> set[str]:
     """Return implementation names registered across every op variant and device."""
@@ -74,10 +72,10 @@ def test_yaml_op_implementation_names_are_registered():
                 continue
 
             for field, implementation in implementations.items():
+                # Every op-selection field names a registered family, so an
+                # unmapped key is a stale config rather than a field to skip.
                 op = _FIELD_TO_OP.get(field)
                 if op is None:
-                    if field in _FUNCTIONAL_IMPLEMENTATION_FIELDS:
-                        continue
                     invalid.append(f"{path.relative_to(REPO_ROOT)}: unmapped implementation field {field!r}")
                     continue
                 if implementation in _registered_implementations(op):

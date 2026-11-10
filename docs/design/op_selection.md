@@ -6,10 +6,10 @@ cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, mHC, and Qwen4-Exp Q
 handles. There is no process-global bind and no silent eager fallback after
 an optimized row is selected.
 
-Quantization-aware training is not a recipe field. Each family that can round
-its operands owns a `qat` row, and stored KV/indexer
-activations round through the `kv_round` family. What used to be one global
-`qat_implementation` switch is now these independent selections.
+Quantization-aware training is not a separate recipe. Each family that can round
+its operands owns a `qat` row, and stored KV/indexer activations round through the
+`kv_round` family. Selecting them is independent per family, so a run can quantize
+only the GEMMs, only the stored activations, or both.
 
 ## Quick Reference
 
@@ -28,7 +28,7 @@ If a field is not in this table, it is not an op-selection knob.
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants) |
-| KV / indexer storage round | `kv_round_implementation` | `eager`, `triton` (GPU) | off (`None`); `"triton"` when explicitly selected on GPU | Model `__init__` via an instance-local `VeomniOp` (`fp8` variant); block width and quantized prefix are call arguments |
+| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (GPU) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -37,33 +37,85 @@ If a field is not in this table, it is not an op-selection knob.
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
-### Reproducing a deployment recipe
+### Quantization is chosen per op, not as a recipe
 
-A DeepSeek-V4 FP8 deployment recipe is these selections together, not one name:
+Every family that can round its operands owns a `qat` row, and each is selected on
+its own field. There is no recipe name to switch on and no requirement that the
+selections agree: one run can fake-quantize the dense projections while the routed
+experts stay in the model dtype, or round the stored KV while every GEMM runs
+full precision. Any subset is valid, and the resulting numerics are simply the
+subset's.
+
+That independence is the point. A deployment kernel rounds whatever that kernel
+rounds, and the model's families are usually on different paths — the attention
+projections, the shared expert's SwiGLU, the routed experts and the KV cache are
+four different kernels in inference, with four different granularities. Binding
+them to one switch forces a training run to simulate rounding it does not have.
+
+The geometry is independent too, at two levels.
+
+**Across rows:** every row carries its own keyword argument with its own default,
+so the three GEMM families and the storage round trip can each run a different
+width in the same job. Nothing links them: `linear` at 128 and `kv_round` at 64 is
+an ordinary combination.
+
+**Across call sites of one row:** the argument travels with the call, not with the
+implementation name, so one model can round the same row differently in different
+places. DeepSeek-V4 does exactly that — `round_stored_kv` passes `block_size=64`
+for the NoPE prefix of a KV entry while `round_indexer_act` passes `block_size=128`
+over a whole indexer head, both through the same `kv_round`/`deepseek_v4` row. The
+variant owns the two geometries, so the numbers live in one place and neither call
+site repeats them; a row named after a width would have needed a second row for
+the second site without changing what the kernel does.
+
+| Argument | Row | What it selects |
+| --- | --- | --- |
+| `block_size` | `linear`, `swiglu_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
+| `block_size` | `kv_round` (`standard`) | Group width over the last dimension |
+| `quant_features` | `kv_round` (`standard`) | How many leading channels to round, so a call can stop partway through the last dimension |
+| `rope_features` | `kv_round` (`deepseek_v4`) | Which of the model's two geometries applies: pass the trailing RoPE channels for a KV entry, or `None` to round a whole indexer head |
+| `expert_dtype` | `moe_experts` (`qat`) | `fp8` tiles or `fp4` groups, following the checkpoint |
+
+One limitation worth stating plainly: on the GEMM rows a single `block_size` sets
+the activation block *and* the weight tile, because the deployment recipe ties them
+(the FP8 GEMM indexes a weight's scale by the same block counter as the
+activation's). A recipe that used different widths for the two operands would need
+the row to take them separately; none does today.
+
+These arguments are **not** `model.ops_implementation` fields. They are parameters
+of the registered row, resolved at the call site, so changing one is a modeling
+change rather than a config change. What the config decides is *which row runs*.
+
+Selecting every family is a legitimate configuration — it makes training see
+exactly what an FP8 deployment computes — and `configs/text/deepseek_v4_qat.yaml`
+is that example:
 
 ```yaml
 ops_implementation:
-  linear_implementation: qat          # dense projections, 1x128 act / 128x128 weight tiles
+  linear_implementation: qat          # attention and indexer projections
   swiglu_mlp_implementation: qat      # the shared expert's fused SwiGLU
-  moe_implementation: qat             # routed experts, following the checkpoint's expert_dtype
-  kv_round_implementation: triton     # stored KV (FP8, 64-wide, NoPE prefix) and indexer logits
+  moe_implementation: qat             # routed experts, per the checkpoint's expert_dtype
+  kv_round_implementation: triton     # stored KV and indexer logits
 ```
 
-Leaving `kv_round_implementation` unset rounds no stored tensor; leaving the
-GEMM families at their reference rows trains them in the model dtype. The
-selection is independent, so a partial recipe is expressible — and, because a
-row's hardware and package `requires` are checked when the handle is built, an
-unavailable selection raises instead of silently falling back.
+Leaving any of them at its reference row trains that family in the model dtype.
+`kv_round_implementation` is the one field with an explicit `none` value, because
+its reference row rounds: every other family spells "off" as `eager`, which there
+already does nothing. Registering `none` as a row rather than asking callers to skip
+a missing handle keeps the field shaped like the rest — the model always builds its
+handle and the row decides. The variant is `deepseek_v4` whenever a model selects
+this row: the model names its own variant, and the config only chooses the
+implementation.
 
-The block widths are call arguments rather than part of the implementation name.
-That is deliberate: DeepSeek-V4 rounds window KV in 64-wide groups up to the RoPE
-boundary, compressed KV and indexer logits in 128-wide whole heads, and the
-DeepSeek-V4.1 recipes use different widths and scale formats again. Encoding them
-in the name would multiply the rows without changing what the kernel does.
+One thing is rejected rather than run: a row's hardware and package `requires` are
+checked when its handle is built, so an unavailable selection raises instead of
+falling back to `eager`.
 
-A `deepgemm_fp8` expert GEMM quantizes its own operands, so combining it with a
-`qat` row on `linear_implementation` or `swiglu_mlp_implementation` raises at
-config-parse time.
+There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
+values of the same `moe_implementation` field, so the routed experts cannot be
+quantized twice; the dense families are separate GEMMs, so pairing them with
+DeepGEMM experts is a valid recipe -- and the only way to quantize the shared
+expert, which DeepGEMM does not cover.
 
 torchao-backed formats register as further rows on the same families, on top of
 this mechanism. Their rows are added by the PRs that own those formats.
@@ -112,6 +164,35 @@ former `npu` implementation names still parse with a deprecation warning; see th
 [Arguments](../usage/arguments.md#deprecated-values).
 
 ---
+
+### Loading a config written before the per-family rows
+
+Temporary. New saves never produce this shape, and the migration in
+`veomni/models/legacy_qat_selections.py` will be removed.
+
+A model config records whatever ops fields existed when it was written, so a
+checkpoint exported before this refactor still carries `qat_implementation`.
+`_resolve_ops()` translates it before validation — one choke point every path
+reaches, so `from_pretrained`, a re-save and a caller override all behave alike.
+
+| Retired value | Becomes |
+|---|---|
+| `qat_implementation: none` | *(dropped)* — "train in the model dtype" is an unset field today, so nothing else changes. This covers essentially every published checkpoint, because `none` was the default |
+| `qat_implementation: fp8_blockwise` | `ValueError` naming the replacement fields. It cannot translate here: which rows apply depends on the model's families, and a Qwen3 checkpoint has neither routed experts nor a KV cache |
+
+Select a quantized run explicitly instead:
+
+```yaml
+ops_implementation:
+  linear_implementation: qat
+  swiglu_mlp_implementation: qat
+  moe_implementation: qat
+  kv_round_implementation: triton
+```
+
+To drop the compatibility, delete `veomni/models/legacy_qat_selections.py` and the
+one import in `configuration_base._resolve_ops` (search for
+`legacy_qat_selections`). An old config then fails to load instead of migrating.
 
 ## Lifecycle Overview
 

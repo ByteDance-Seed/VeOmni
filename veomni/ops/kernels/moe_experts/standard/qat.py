@@ -29,6 +29,65 @@ from ....qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, f
 from . import triton as standard_triton
 
 
+def quantize_expert_operands(
+    hidden_states: Tensor,
+    fc1_1_weight: Tensor,
+    fc1_2_weight: Tensor,
+    fc2_weight: Tensor,
+    fc1_1_2_weight: Tensor,
+    *,
+    expert_dtype: str = "fp8",
+    block_size: int = 128,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Apply this row's rounding to the activations and expert weights.
+
+    Kept as a named function rather than inlined so the rounding is readable on its
+    own and can be exercised without a fused GEMM. Only this row calls it.
+
+    Empty weight tensors denote unused layouts and are returned unchanged.
+    Routing weights are not an input: they decide which experts run, so rounding
+    them would change the selection rather than the arithmetic.
+
+    Args:
+        hidden_states: Token activations entering the experts.
+        fc1_1_weight: First gate/up slab, or an empty tensor when unused.
+        fc1_2_weight: Second gate/up slab, or an empty tensor when unused.
+        fc2_weight: Down-projection weights.
+        fc1_1_2_weight: Fused gate/up slab, or an empty tensor when unused.
+        expert_dtype: ``"fp8"`` for stacked FP8 tiles, ``"fp4"`` for 32-wide groups.
+        block_size: Side length of the FP8 weight tile; ignored for FP4, whose
+            group width is fixed by the checkpoint's scale layout.
+
+    Returns:
+        The rounded activation followed by the four rounded weights.
+
+    Raises:
+        ValueError: if ``expert_dtype`` is neither ``"fp8"`` nor ``"fp4"``. The
+            value comes from a free-form checkpoint key, so a typo would
+            otherwise train FP8 while the config claims something else.
+    """
+    if expert_dtype not in ("fp8", "fp4"):
+        raise ValueError(f"expert_dtype must be 'fp8' or 'fp4', got {expert_dtype!r}")
+
+    def _quant_weight(weight: Tensor) -> Tensor:
+        if weight.numel() == 0:
+            return weight
+        if expert_dtype == "fp4":
+            # FP4 group width is fixed by the checkpoint's scale layout, which is
+            # one scale per 32 input channels; ``block_size`` is the FP8 tile.
+            return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
+        return fp8_fake_quant_stacked_weight(weight, block_size=block_size)
+
+    hidden_q = fp8_fake_quant_act(hidden_states, block_size=block_size) if hidden_states.numel() > 0 else hidden_states
+    return (
+        hidden_q,
+        _quant_weight(fc1_1_weight),
+        _quant_weight(fc1_2_weight),
+        _quant_weight(fc2_weight),
+        _quant_weight(fc1_1_2_weight),
+    )
+
+
 def wrapper(
     hidden_states: Tensor,
     routing_weights: Tensor,
@@ -51,29 +110,23 @@ def wrapper(
     would change the selection, not just the arithmetic.
     """
 
-    if expert_dtype not in ("fp8", "fp4"):
-        # The value comes from a free-form checkpoint key, so a typo would
-        # otherwise train FP8 while the config claims something else.
-        raise ValueError(f"expert_dtype must be 'fp8' or 'fp4', got {expert_dtype!r}")
-
-    def _quant_weight(weight: Tensor) -> Tensor:
-        if weight.numel() == 0:
-            return weight
-        if expert_dtype == "fp4":
-            # FP4 group width is fixed by the checkpoint's scale layout, which is
-            # one scale per 32 input channels; ``block_size`` is the FP8 tile.
-            return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
-        return fp8_fake_quant_stacked_weight(weight, block_size=block_size)
-
-    hidden_q = fp8_fake_quant_act(hidden_states, block_size=block_size) if hidden_states.numel() > 0 else hidden_states
+    hidden_q, fc1_1_q, fc1_2_q, fc2_q, fc1_1_2_q = quantize_expert_operands(
+        hidden_states,
+        fc1_1_weight,
+        fc1_2_weight,
+        fc2_weight,
+        fc1_1_2_weight,
+        expert_dtype=expert_dtype,
+        block_size=block_size,
+    )
     return standard_triton.wrapper(
         hidden_q,
         routing_weights,
         selected_experts,
-        _quant_weight(fc1_1_weight),
-        _quant_weight(fc1_2_weight),
-        _quant_weight(fc2_weight),
-        _quant_weight(fc1_1_2_weight),
+        fc1_1_q,
+        fc1_2_q,
+        fc2_q,
+        fc1_1_2_q,
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,

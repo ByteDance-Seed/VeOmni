@@ -31,9 +31,12 @@ from ....qat import fp8_fake_quant_act, fp8_fake_quant_weight
 def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = 128) -> Tensor:
     """Run ``F.linear`` with blockwise FP8 fake-quantized activation and weight.
 
-    An empty ``bias`` tensor denotes an unused bias. ``block_size`` is shared by
-    the ``1 x block_size`` activation blocks and the square weight tiles, so a
-    caller reproduces a deployment recipe by choosing it here.
+    An empty ``bias`` tensor denotes an unused bias.
+
+    ``block_size`` sets both operands' granularity: ``1 x block_size`` activation
+    blocks and square ``block_size x block_size`` weight tiles. The deployment GEMM
+    ties them together -- it indexes a weight's scale by the same block counter as
+    the activation's -- so one number describes its recipe, not two.
     """
     if x.numel() == 0:
         return F.linear(x, weight, None if bias.numel() == 0 else bias)

@@ -34,7 +34,8 @@ def wrapper(
 
     ``x`` has shape ``[..., n_groups, in_per_group]`` and ``weight`` has shape
     ``[n_groups * out_per_group, in_per_group]``. An empty ``bias`` tensor
-    denotes an unused bias.
+    denotes an unused bias. ``block_size`` sets the activation blocks and the
+    weight tiles together, as :mod:`linear.standard.qat` documents.
     """
     if x.numel() == 0:
         return grouped_eager.wrapper(x, weight, bias, n_groups=n_groups, block_size=block_size)

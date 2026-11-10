@@ -12,4 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP8 KV storage-rounding kernel implementations."""
+"""Model-agnostic storage-rounding implementations.
+
+These know only the tensor contract: group the last dimension into
+``block_size``-wide blocks, optionally stop at ``quant_features``, round to
+``float8_e4m3fn`` with ``ue8m0`` scales, and hand the dequantized values back
+through a straight-through estimator. They do not know what a KV cache, a NoPE
+channel or an indexer head is -- a model-specific variant supplies that.
+"""
