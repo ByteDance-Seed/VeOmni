@@ -173,6 +173,7 @@ def test_gate_allows_seed_omni_module_config_under_cp(monkeypatch):
 
 @pytest.mark.parametrize("is_npu,ulysses_size", [(True, 1), (False, 2)])
 def test_seed_omni_cp_opt_in_does_not_bypass_device_or_hybrid_gate(monkeypatch, is_npu, ulysses_size):
+    """Keep Seed-Omni behind device and hybrid-topology qualification."""
     from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
 
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)

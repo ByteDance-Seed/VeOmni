@@ -185,6 +185,7 @@ def _slice_conv1d_weight(
 
 
 def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysses") -> None:
+    """Compare full and sharded PLE token, convolution, and gradient halos."""
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -320,6 +321,7 @@ def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_hybrid(packed):
+    """Check nonzero PLE halos for packed and unpacked U2CP2 sequences."""
     torchrun(_run_ple_halo_equivalence, _CI_ACCELERATOR_4.nproc, packed, "hybrid")
 
 
@@ -329,6 +331,7 @@ def _run_qsa_equivalence(
     parallel_mode: str = "ulysses",
     qsa_implementation: str = "eager",
 ) -> None:
+    """Compare full and sharded QSA outputs and gradients."""
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -581,6 +584,7 @@ def _run_gated_deltanet_equivalence(
     num_v_heads: int | None = None,
     parallel_mode: str = "ulysses",
 ) -> None:
+    """Compare full and sharded GatedDeltaNet outputs and gradients."""
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -1031,6 +1035,7 @@ def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
 
 
 def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
+    """Compare sharded VLM placeholders and vision gradients with the full sequence."""
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -1220,6 +1225,7 @@ def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_hybrid():
+    """Check VLM placeholder and vision-gradient parity under U2CP2."""
     torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_4.nproc, "hybrid")
 
 
