@@ -66,6 +66,7 @@ def test_valid_seqlens_cpu(cu, tail, expected):
 @pytest.mark.skipif(not _npu_test_eligible(), reason="requires an Ascend NPU")
 @pytest.mark.parametrize("cu,tail,expected", _CASES)
 def test_valid_seqlens_ascend(cu, tail, expected):
+    """Check tail-segment extraction on the assigned Ascend device."""
     assert IS_NPU_AVAILABLE and torch.npu.is_available(), "Ascend CI must provide an available NPU"
     value = torch.tensor(cu, dtype=torch.int32, device="npu")
     result = valid_seqlens_from_cu_seqlens(value, tail_padding_length=tail)
