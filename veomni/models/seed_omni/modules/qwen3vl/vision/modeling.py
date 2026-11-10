@@ -195,6 +195,7 @@ class _MergerProjectionConverter:
         self._model = model
 
     def can_handle(self, name: str) -> bool:
+        """Claim the patch merger's output projection, and nothing else."""
         return is_retargeted_merger_key(name)
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional["ConvertedCheckpointTensor"]:
