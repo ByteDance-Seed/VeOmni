@@ -35,7 +35,7 @@ straight-through estimator, which is sound here because every scale derives from
 its own group's amax and rounds up, so no element saturates.
 """
 
-from ...platform import GpuKernelRequirement
+from ...platform import NVIDIA_SM89_PLUS, ROCM_GPU, GpuKernelRequirement
 from ...registry import register_op
 from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import none as dsv4_none
@@ -45,7 +45,11 @@ from .standard import none as standard_none
 from .standard import triton as standard_triton
 
 
-_GPU = GpuKernelRequirement()
+#: The Triton row casts to ``tl.float8e4nv``, which Triton enables on NVIDIA only
+#: from SM89 -- Ampere has no E4M3 type, so an SM80/SM86 host would resolve this
+#: row and then fail in compilation. ROCm is left as it was; nothing about the
+#: narrowing above says anything about it.
+_GPU_FP8 = GpuKernelRequirement(platforms=(NVIDIA_SM89_PLUS, ROCM_GPU))
 
 register_op(
     "kv_round",
@@ -72,7 +76,7 @@ register_op(
     standard_triton.forward,
     standard_triton.backward,
     description="Triton blockwise FP8 (E4M3 + UE8M0 scale) storage round-trip with straight-through backward",
-    requirement=_GPU,
+    requirement=_GPU_FP8,
     requires=("triton",),
     default=True,
 )
@@ -108,7 +112,7 @@ register_op(
         "Triton DeepSeek-V4 storage rounding: the same two geometries as the eager row on the "
         "Triton round trip, straight-through backward"
     ),
-    requirement=_GPU,
+    requirement=_GPU_FP8,
     requires=("triton",),
     default=True,
 )

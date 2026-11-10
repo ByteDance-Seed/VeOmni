@@ -116,7 +116,7 @@ config.add_import("typing", names=["Optional"])
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.models.utils.linear_utils", names=["project_through_op"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections", "reject_quantizing_row"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -1805,6 +1805,17 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
             swiglu_limit=self.limit,
         )
+    # Every fused row implements SwiGLU only, so a different `hidden_act` has no
+    # row to run and trains through the projection modules. That is fine for a
+    # reference row, but a quantizing one would round nothing while the config
+    # said otherwise, so refuse it here rather than after the run.
+    reject_quantizing_row(
+        self,
+        f"hidden_act={self.config.hidden_act!r}: every `swiglu_mlp` row is a SwiGLU kernel, so a shared "
+        "expert with this activation trains through the projection modules and rounds nothing",
+        remedy="Use hidden_act='silu' to quantize the shared expert, or "
+        "swiglu_mlp_implementation='eager' to train it in the model dtype.",
+    )
     gate = self.gate_proj(x).float().clamp(max=self.limit)
     up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
     return self.down_proj((self.act_fn(gate) * up).to(x.dtype))

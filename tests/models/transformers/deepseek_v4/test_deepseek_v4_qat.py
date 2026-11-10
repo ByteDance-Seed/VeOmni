@@ -398,3 +398,85 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
 
     assert output.shape == hidden_states.shape
     assert torch.isfinite(output).all()
+
+
+@pytest.mark.parametrize("modeling", [modeling_gpu], ids=["gpu"])
+def test_a_quantizing_shared_expert_row_refuses_a_non_silu_activation(modeling):
+    """A shared expert with `hidden_act='gelu'` cannot honor a quantizing row.
+
+    The MLP falls through to the projection modules for any activation the fused
+    SwiGLU kernel does not implement, so nothing would be rounded. Refusing beats
+    training at full precision on a config that says QAT.
+    """
+    import copy
+    from types import SimpleNamespace
+
+    import torch
+
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+    from veomni.arguments import OpsImplementationConfig
+
+    config = copy.deepcopy(tiny_deepseek_v4_config())
+    config.hidden_act = "gelu"
+    config._set_ops_implementation(
+        OpsImplementationConfig(
+            attn_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            linear_implementation="eager",
+            moe_implementation="eager",
+            dsa_attention_implementation="eager",
+            dsa_indexer_implementation="eager",
+            mhc_implementation="eager",
+            kv_round_implementation="none",
+        )
+    )
+
+    model = modeling.DeepseekV4MLP(config)
+    # The `qat` row is registered for CUDA/SM90 only, so it cannot be resolved on a
+    # CPU test host. Substitute the resolved handle: what this test pins is the
+    # forward's own decision, not the registry's hardware gate.
+    model.veomni_swiglu_mlp = SimpleNamespace(impl="qat")
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.1)
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*rounds nothing"):
+        model(torch.randn(4, config.hidden_size))
+
+
+@pytest.mark.parametrize("modeling", [modeling_gpu], ids=["gpu"])
+def test_an_unquantized_shared_expert_keeps_the_non_silu_fallback(modeling):
+    """The refusal is scoped to quantizing rows; `eager` still trains the fallback."""
+    import copy
+
+    import torch
+
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+    from veomni.arguments import OpsImplementationConfig
+
+    config = copy.deepcopy(tiny_deepseek_v4_config())
+    config.hidden_act = "gelu"
+    config._set_ops_implementation(
+        OpsImplementationConfig(
+            attn_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            linear_implementation="eager",
+            moe_implementation="eager",
+            dsa_attention_implementation="eager",
+            dsa_indexer_implementation="eager",
+            mhc_implementation="eager",
+            kv_round_implementation="none",
+        )
+    )
+
+    model = modeling.DeepseekV4MLP(config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.1)
+
+    output = model(torch.randn(4, config.hidden_size))
+
+    assert output.shape == (4, config.hidden_size)
+    assert torch.isfinite(output).all()

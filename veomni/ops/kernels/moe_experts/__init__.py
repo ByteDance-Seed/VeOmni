@@ -44,6 +44,12 @@ from .standard import triton as standard_triton
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
+#: ``moe_experts`` rows that fake-quantize the weights they are handed. Adapters
+#: need the real weights, and ``moe_experts_lora`` has no matching row, so an
+#: expert-LoRA request on one of these must be refused rather than silently
+#: falling back to a full-precision ``eager`` base.
+QUANTIZING_IMPLS = frozenset({"qat"})
+
 
 register_op(
     "moe_unpermute",

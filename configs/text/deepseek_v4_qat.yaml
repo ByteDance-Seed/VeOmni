@@ -26,8 +26,9 @@
 #                                explicit `none` row, because `eager` there is a real
 #                                row that rounds; `none` leaves stored tensors alone.
 #
-# Hardware: the `qat` rows carry requirement=NVIDIA_SM90_PLUS and requires=tilelang, so a
-# pre-SM90 host fails when the handle is built rather than mid-training.
+# Hardware: the `qat` rows carry requirement=NVIDIA_SM90_PLUS and requires=tilelang, and the
+# `kv_round` Triton row is NVIDIA SM89+ (FP8 E4M3), so a host below those fails when the
+# handle is built rather than mid-training.
 #
 # Swapping `moe_implementation` to `deepgemm_fp8` is a valid variant of this config: it
 # runs native FP8 expert GEMMs instead of fake-quantizing the experts, while `linear`,

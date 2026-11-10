@@ -60,15 +60,29 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
     if plain:
         return True
 
-    handle = getattr(mlp, "veomni_swiglu_mlp", None)
-    impl = getattr(handle, "impl", None)
-    if impl in QUANTIZING_IMPLS:
-        raise ValueError(
-            f"swiglu_mlp_implementation={impl!r} cannot run on a wrapped projection: the row fake-quantizes "
-            "the projection weights it is handed, and a layer substituted after construction (LoRA) keeps "
-            "them at `base_layer`. Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down."
-        )
+    reject_quantizing_row(
+        mlp,
+        "a wrapped projection: a layer substituted after construction (LoRA) keeps the base weights at "
+        "`base_layer`, so the handle cannot read the weight the row asks for",
+        remedy="Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down.",
+    )
     return False
+
+
+def reject_quantizing_row(owner: nn.Module, reason: str, *, remedy: str) -> None:
+    """Raise when ``owner``'s ``swiglu_mlp`` row quantizes and its call site cannot run it.
+
+    Two model-side paths bypass ``owner.veomni_swiglu_mlp``: a projection wrapped
+    after construction, and an activation the fused SwiGLU kernel does not
+    implement. Neither can hand a fake-quantizing row the weights it rounds, so
+    falling through would train at full precision on a config that says otherwise.
+    Call this on such a path instead of returning quietly.
+    """
+    handle = getattr(owner, "veomni_swiglu_mlp", None)
+    impl = getattr(handle, "impl", None)
+    if impl not in QUANTIZING_IMPLS:
+        return
+    raise ValueError(f"swiglu_mlp_implementation={impl!r} cannot run on {reason}. {remedy}")
 
 
 register_op(

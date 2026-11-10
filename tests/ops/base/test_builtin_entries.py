@@ -39,6 +39,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
+_GPU_NVIDIA_SM89_ROCM = ("gpu", (("nvidia", 89, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
@@ -174,10 +175,10 @@ _BUILTIN_ENTRIES = (
     ("moe_experts_lora", "independent", "fused_npu", "npu", _NPU, ()),
     ("kv_round", "standard", "none", "any", _ANY, ()),
     ("kv_round", "standard", "eager", "any", _ANY, ()),
-    ("kv_round", "standard", "triton", "cuda", _GPU, ("triton",)),
+    ("kv_round", "standard", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
     ("kv_round", "deepseek_v4", "none", "any", _ANY, ()),
     ("kv_round", "deepseek_v4", "eager", "any", _ANY, ()),
-    ("kv_round", "deepseek_v4", "triton", "cuda", _GPU, ("triton",)),
+    ("kv_round", "deepseek_v4", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("linear", "standard", "eager", "any", _ANY, ()),

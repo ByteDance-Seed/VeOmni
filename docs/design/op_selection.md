@@ -28,7 +28,7 @@ If a field is not in this table, it is not an op-selection knob.
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants) |
-| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (GPU) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments |
+| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -61,12 +61,14 @@ an ordinary combination.
 
 **Across call sites of one row:** the argument travels with the call, not with the
 implementation name, so one model can round the same row differently in different
-places. DeepSeek-V4 does exactly that — `round_stored_kv` passes `block_size=64`
-for the NoPE prefix of a KV entry while `round_indexer_act` passes `block_size=128`
-over a whole indexer head, both through the same `kv_round`/`deepseek_v4` row. The
-variant owns the two geometries, so the numbers live in one place and neither call
-site repeats them; a row named after a width would have needed a second row for
-the second site without changing what the kernel does.
+places. DeepSeek-V4 does exactly that: a stored KV entry passes
+`rope_features=qk_rope_head_dim`, which selects 64-wide groups over the NoPE prefix
+and leaves the RoPE tail in the model dtype, while an indexer activation passes
+`rope_features=None` and rounds its whole head in 128-wide groups — both through the
+same `kv_round`/`deepseek_v4` row. The variant owns the two geometries, so the
+numbers live in one place and neither call site repeats them; a row named after a
+width would have needed a second row for the second site without changing what the
+kernel does.
 
 | Argument | Row | What it selects |
 | --- | --- | --- |
@@ -110,6 +112,15 @@ implementation.
 One thing is rejected rather than run: a row's hardware and package `requires` are
 checked when its handle is built, so an unavailable selection raises instead of
 falling back to `eager`.
+
+A second rejection covers the paths a row cannot serve. A fake-quantizing row reads
+the weights it is handed, so a model-side branch that bypasses it would train at
+full precision while the config still said QAT. Those branches refuse the
+quantizing selection instead of falling through: a projection wrapped after
+construction (LoRA) raises, an activation the fused SwiGLU kernel does not implement
+raises, and expert LoRA raises on the `qat` experts row because no adapter forward
+would quantize the base weights. Only quantizing rows are affected — every
+reference row keeps its fallback.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be

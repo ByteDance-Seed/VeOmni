@@ -135,7 +135,7 @@ from veomni.models.utils.linear_utils import project_through_op
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections, reject_quantizing_row
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -1674,6 +1674,17 @@ class DeepseekV4MLP(nn.Module):
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
                 swiglu_limit=self.limit,
             )
+        # Every fused row implements SwiGLU only, so a different `hidden_act` has no
+        # row to run and trains through the projection modules. That is fine for a
+        # reference row, but a quantizing one would round nothing while the config
+        # said otherwise, so refuse it here rather than after the run.
+        reject_quantizing_row(
+            self,
+            f"hidden_act={self.config.hidden_act!r}: every `swiglu_mlp` row is a SwiGLU kernel, so a shared "
+            "expert with this activation trains through the projection modules and rounds nothing",
+            remedy="Use hidden_act='silu' to quantize the shared expert, or "
+            "swiglu_mlp_implementation='eager' to train it in the model dtype.",
+        )
         gate = self.gate_proj(x).float().clamp(max=self.limit)
         up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
         return self.down_proj((self.act_fn(gate) * up).to(x.dtype))

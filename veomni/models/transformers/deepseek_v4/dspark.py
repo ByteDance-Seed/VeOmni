@@ -255,8 +255,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         if self.stage_id != 0:
             raise RuntimeError("only the first DSpark stage owns main_proj")
         concatenated = torch.cat(draft_hiddens, dim=-1) if isinstance(draft_hiddens, list) else draft_hiddens
-        projected = self.veomni_main_proj(concatenated, self.main_proj.weight, self.main_proj.weight.new_empty(0))
-        return self.main_norm(projected)
+        return self.main_norm(project_through_op(self.veomni_main_proj, self.main_proj, concatenated))
 
     def _window_kv(
         self,
