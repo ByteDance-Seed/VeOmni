@@ -11,10 +11,14 @@ SIGNAL_TEXT_DONE = "text_done"
 
 
 class Qwen3TextEncoder(TextEncoder):
-    """Qwen3 ChatML text encoder.
+    """Qwen3 ChatML text encoder, optionally image/video aware.
 
-    Only the ChatML autoregression (keyed on eos / ``<|im_end|>``) is
-    implemented here; SP-aware training hooks live in ``accelerated.py``.
+    With ``config.enable_image`` the module is handed the Qwen3-VL chat template
+    (media items wrapped in ``<|vision_start|> … <|vision_end|>``), so a sibling
+    vision module's projected embeds ride along the conversation carrier exactly
+    as they do for ``qwen3vl_text_encoder``. Only the ChatML autoregression
+    (keyed on eos / ``<|im_end|>``) is implemented here; SP-aware training hooks
+    and the image-mode vision-token freeze live in ``accelerated.py``.
     """
 
     config_class = Qwen3TextEncoderConfig
