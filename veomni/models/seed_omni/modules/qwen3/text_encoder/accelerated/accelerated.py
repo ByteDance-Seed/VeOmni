@@ -41,7 +41,9 @@ class TrainingMixin(BaseTrainingMixin):
     _trainable_row_mask: Optional[torch.Tensor]
 
     def __init__(self, *args, **kwargs) -> None:
+        """Forward to the base encoder; start with no embedding-row restriction."""
         super().__init__(*args, **kwargs)
+        # Set by `freeze_model` in image mode; `None` means "no row restriction".
         self._trainable_row_mask: Optional[torch.Tensor] = None
 
     @pre_forward("encode")
@@ -50,10 +52,12 @@ class TrainingMixin(BaseTrainingMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Pack the carrier's token ids for the shared text-encoder forward."""
         return super().encode_pre(conversation_list, **kwargs)
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
+        """Scatter packed embeddings back onto the carrier's text segments."""
         return super().encode_post(**outputs)
 
     @pre_forward("decode")
@@ -62,10 +66,12 @@ class TrainingMixin(BaseTrainingMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Stack hidden states and shifted labels for the LM-head loss."""
         return super().decode_pre(conversation_list, **kwargs)
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
+        """Rename the node's scalar ``loss`` to the graph's ``_loss`` key."""
         return super().decode_post(**outputs)
 
     def freeze_model(self) -> None:
@@ -141,6 +147,13 @@ class TrainingMixin(BaseTrainingMixin):
         return parallel_state.extra_parallel_rank("emb") * rows
 
     def _mask_frozen_embedding_rows(self, embed_tokens: torch.nn.Module, args: tuple) -> None:
+        """Zero the gradient of every row outside ``_trainable_row_mask``.
+
+        Registered as an ``embed_tokens`` forward pre-hook so it runs after FSDP2 has
+        unsharded the table (FSDP's own hook is prepended), and slices the mask to
+        this rank's rows when an ``emb`` plan split the table. Hooked once per
+        parameter: FSDP2 keeps one unsharded Parameter across steps.
+        """
         weight = embed_tokens.weight
         if not weight.requires_grad or getattr(weight, "_frozen_rows_masked", False):
             return
@@ -206,6 +219,11 @@ class TrainingMixin(BaseTrainingMixin):
         optimizer.register_step_pre_hook(self._decay_trainable_rows)
 
     def _decay_trainable_rows(self, optimizer: torch.optim.Optimizer, args: tuple, kwargs: dict) -> None:
+        """Apply ``_row_weight_decay`` to the trainable rows, before this step's update.
+
+        Re-zeroes the group's ``weight_decay`` every step because loading a checkpoint
+        rebuilds the param groups from their saved hyperparameters.
+        """
         weight = self._decayed_weight
         group = _param_group_of(optimizer, weight)
         if group is None or weight.grad is None:
@@ -218,6 +236,7 @@ class TrainingMixin(BaseTrainingMixin):
 
 
 def _param_group_of(optimizer: torch.optim.Optimizer, param: torch.Tensor) -> Optional[Dict[str, Any]]:
+    """The param group holding ``param`` (by identity), or ``None``."""
     return next((g for g in optimizer.param_groups if any(p is param for p in g["params"])), None)
 
 
@@ -238,23 +257,28 @@ class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):
 
     @property
     def _enable_image(self) -> bool:
+        """Whether this module runs in image mode (the recipe's ``enable_image``)."""
         return self.config.enable_image
 
     @property
     def tokenizer(self) -> Any:
+        """The module's tokenizer, bound by ``bind_module_assets``."""
         return self._tokenizer
 
     @tokenizer.setter
     def tokenizer(self, tokenizer: Any) -> None:
+        """Bind the tokenizer and rebuild the chat template it implies.
+
+        Only the template differs: image mode reuses the Qwen3-VL ChatML template
+        (adds the vision wrap tokens and per-frame video segments); otherwise the
+        text-only Qwen3 ChatML.
+        """
         self._tokenizer = tokenizer
-        # Only the template differs: image mode reuses the Qwen3-VL ChatML template
-        # (adds the vision wrap tokens and per-frame video segments); otherwise the
-        # text-only Qwen3 ChatML.
         self._chat_template = Qwen3VLChatTemplate(tokenizer) if self._enable_image else Qwen3ChatTemplate(tokenizer)
 
 
 class Qwen3TextEncoderAccelerated(VeOmniMixin, Qwen3TextEncoder):
-    pass
+    """Text encoder with the SP-aware training hooks and image-mode row masking."""
 
 
 __all__ = ["Qwen3TextEncoderAccelerated"]

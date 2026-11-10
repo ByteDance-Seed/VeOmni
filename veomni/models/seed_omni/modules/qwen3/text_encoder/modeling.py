@@ -25,6 +25,7 @@ class Qwen3TextEncoder(TextEncoder):
     preprocessor_class = Qwen3TextEncoderPreprocessor
 
     def __init__(self, config: Qwen3TextEncoderConfig):
+        """Build the shared :class:`TextEncoder` with this module's config."""
         super().__init__(config)
 
     def generate(
@@ -33,6 +34,7 @@ class Qwen3TextEncoder(TextEncoder):
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Run one ChatML FSM step: embed the prompt, or sample the next token."""
         del kwargs
         tail = conversation_list[-1]
         if not self._prompt_encoded:

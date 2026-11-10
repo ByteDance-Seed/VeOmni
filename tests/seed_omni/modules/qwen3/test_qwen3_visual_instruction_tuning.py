@@ -13,10 +13,12 @@ overrides:
 * ``qwen3_text_encoder``: ``enable_image`` switches it to the Qwen3-VL chat
   template and turns ``freeze_model`` into "vision special-token rows only".
 
-The two properties worth pinning are that the composed graph actually trains the
-overrides it was configured with, and that it survives Ulysses SP — the SP slice
-crosses three modules with three different shard layouts (patch rows, token ids,
-packed sequence), so a wrong-ranks all-to-all shows up as a loss mismatch.
+The three properties worth pinning are that the composed graph actually trains the
+overrides it was configured with, that it converges on the toy batch rather than
+merely running, and that it survives Ulysses SP at the issue's acceptance shape —
+the SP slice crosses three modules with three different shard layouts (patch rows,
+token ids, packed sequence), so a wrong-ranks all-to-all shows up as a loss
+mismatch at SP=2 and again at SP=4.
 """
 
 from __future__ import annotations
@@ -47,18 +49,22 @@ from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 VOCAB = 64
 HIDDEN = 16
 
+# 4 query / 2 KV heads: divisible by SP=2 *and* SP=4, so the same config carries the
+# parity cases up to the SP=4 shape from #1072. SP=4 also puts the KV heads below the
+# Ulysses size, which is the GQA repeat path rather than the plain head split.
 _TEXT_CONFIG = {
     "vocab_size": VOCAB,
     "hidden_size": HIDDEN,
     "intermediate_size": 32,
     "num_hidden_layers": 1,
-    "num_attention_heads": 2,
-    "num_key_value_heads": 1,
-    "head_dim": 8,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 4,
     "max_position_embeddings": 64,
 }
 # `depth: 2` so a DeepStack index could point at a real interior layer; the recipe
@@ -67,7 +73,7 @@ _VISION_CONFIG = {
     "depth": 2,
     "hidden_size": HIDDEN,
     "intermediate_size": 32,
-    "num_heads": 2,
+    "num_heads": 4,
     "in_channels": 3,
     "patch_size": 16,
     "temporal_patch_size": 2,
@@ -109,9 +115,11 @@ class _SmallTokenizer:
     bos_token_id = None
 
     def convert_tokens_to_ids(self, token):
+        """Map a special token to its id, or ``-1`` for an unknown token."""
         return _VISION_SPECIAL_TOKENS.get(token, -1)
 
     def __call__(self, text, add_special_tokens=False):
+        """Greedy longest-match tokenize ``text`` against the special tokens."""
         del add_special_tokens
         ids, index = [], 0
         while index < len(text):
@@ -126,6 +134,7 @@ class _SmallTokenizer:
         return {"input_ids": ids}
 
     def decode(self, ids, **kwargs):
+        """Decode to text; the FSM only checks for an empty result."""
         del ids, kwargs
         return ""
 
@@ -245,6 +254,7 @@ def _batch() -> dict:
 
 
 def _omni(modules: dict[str, torch.nn.Module]) -> OmniModel:
+    """Wrap ``modules`` in the recipe's training graph as an :class:`OmniModel`."""
     config = OmniConfig(
         _module_entries={name: {"model_path": name} for name in _MODULES},
         training_graphs={"default": _GRAPH_EDGES},
@@ -254,6 +264,7 @@ def _omni(modules: dict[str, torch.nn.Module]) -> OmniModel:
 
 
 def _graph_loss(modules: dict[str, torch.nn.Module], batch: dict, *, backward: bool = False):
+    """Run one forward through the composed graph and return the scalar loss."""
     model = _omni(modules)
     first = next(iter(modules.values()))
     device, dtype = first.device, first.dtype
@@ -407,6 +418,41 @@ def test_the_frozen_rows_survive_an_adamw_step():
     assert torch.isfinite(loss)
 
 
+def test_the_toy_recipe_converges():
+    """#1072's acceptance check: a few dozen steps on the toy batch actually descend.
+
+    "The graph runs" is not convergence — a freeze that leaves the head untrained, a
+    detached merger, or a vision prefix the LLM never sees all produce a flat loss
+    curve from a valid forward. So this drives the recipe's optimizer path
+    (AdamW + ``configure_optimizer``) and requires the loss to come down, which is
+    only possible if the gradient reaches the three blocks the overrides selected.
+    """
+    steps = 30
+    modules = _build_modules(device=torch.device("cpu"), dtype=torch.float32)
+    text_encoder = modules["qwen3_text_encoder"]
+    params = [param for module in modules.values() for param in module.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=2e-2, weight_decay=0.01, foreach=False)
+    text_encoder.configure_optimizer(optimizer)
+
+    losses = []
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        # The graph writes hidden states back onto the carrier it is given, so each
+        # step needs a fresh batch rather than the consumed one.
+        loss = _graph_loss(modules, _batch())
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach()))
+        assert torch.isfinite(loss), losses
+
+    head = sum(losses[:3]) / 3
+    tail = sum(losses[-3:]) / 3
+    assert tail < 0.95 * head, (head, tail, losses)
+    # Not just "lower on average": the curve is monotone enough that no step undoes
+    # the progress of the previous one by more than noise.
+    assert all(later <= earlier + 1e-3 for earlier, later in zip(losses, losses[1:])), losses
+
+
 def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
     """The two silent-failure modes are errors, not wrong training."""
     TextEncoderAccelerated = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_text_encoder"]()
@@ -427,6 +473,7 @@ def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
 
     class _UnknownTokenizer(_SmallTokenizer):
         def convert_tokens_to_ids(self, token):
+            """Simulate a tokenizer that has no id for the token at all."""
             return None
 
     unknown = TextEncoderAccelerated(
@@ -444,6 +491,7 @@ def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
 
     class _NegativeTokenizer(_SmallTokenizer):
         def convert_tokens_to_ids(self, token):
+            """Simulate a tokenizer that reports an unk id of ``-1``."""
             return -1
 
     wrapping = TextEncoderAccelerated(
@@ -460,15 +508,14 @@ def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
         wrapping.freeze_model()
 
 
-def _sp_worker(rank: int, rendezvous: str, out_dir: str) -> None:
-    """Run the composed graph at SP=1 and SP=2 and record loss + stepped params.
+def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int) -> None:
+    """Run the composed graph at SP=1 and SP=``world`` and record loss + stepped params.
 
     CPU/Gloo on purpose: the launch plan marks this a CPU case, and a CUDA host
     would otherwise resolve ``nccl`` for CPU tensors. The accelerator matrix is
     covered by the per-family alignment tests; what this one adds is the
     *composition* of three modules under one SP size.
     """
-    world = 2
     device = torch.device("cpu")
     dist.init_process_group(
         "gloo",
@@ -478,7 +525,7 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str) -> None:
     )
     try:
         reports: dict[str, object] = {}
-        for sp_size in (1, 2):
+        for sp_size in (1, world):
             name = f"sp{sp_size}"
             ps = _init_parallel_state(
                 dp_size=world if sp_size == 1 else 1,
@@ -517,6 +564,19 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+def _assert_sp_parity(out_dir: Path, world: int) -> None:
+    """Every rank saw the same loss, and every param left the step with the SP=1 value."""
+    for rank in range(world):
+        reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
+        assert reports[f"sp{world}_loss"] == pytest.approx(reports["sp1_loss"], abs=1e-5), (rank, reports["sp1_loss"])
+        probe1, probe_other = reports["sp1_probe"], reports[f"sp{world}_probe"]
+        assert probe1.keys() == probe_other.keys()
+        for name, (total1, square1) in probe1.items():
+            total_other, square_other = probe_other[name]
+            assert total_other == pytest.approx(total1, abs=1e-5), (rank, name, total1, total_other)
+            assert square_other == pytest.approx(square1, abs=1e-5), (rank, name, square1, square_other)
+
+
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_sp2_matches_sp1_on_the_composed_graph(tmp_path: Path):
     """Ulysses SP across ViT + text encoder + backbone must not change the result.
@@ -527,14 +587,22 @@ def test_sp2_matches_sp1_on_the_composed_graph(tmp_path: Path):
     """
     out_dir = tmp_path / "sp_compose"
     out_dir.mkdir(parents=True, exist_ok=True)
-    mp.spawn(_sp_worker, args=(str(out_dir / "rendezvous"), str(out_dir)), nprocs=2, join=True)
+    mp.spawn(_sp_worker, args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_2.nproc), nprocs=2, join=True)
 
-    for rank in range(2):
-        reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert reports["sp2_loss"] == pytest.approx(reports["sp1_loss"], abs=1e-5), (rank, reports["sp1_loss"])
-        probe1, probe2 = reports["sp1_probe"], reports["sp2_probe"]
-        assert probe1.keys() == probe2.keys()
-        for name, (total1, square1) in probe1.items():
-            total2, square2 = probe2[name]
-            assert total2 == pytest.approx(total1, abs=1e-5), (rank, name, total1, total2)
-            assert square2 == pytest.approx(square1, abs=1e-5), (rank, name, square1, square2)
+    _assert_sp_parity(out_dir, world=_CI_CPU_2.nproc)
+
+
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
+def test_sp4_matches_sp1_on_the_composed_graph(tmp_path: Path):
+    """The #1072 acceptance shape: uniform SP=4 over ViT + text encoder + backbone.
+
+    SP=4 is the size that validated the composition invariant, and it is the first
+    size where the tower's 4 attention heads are fully split *and* the LLM's 2 KV
+    heads sit below the Ulysses size — so this also covers the GQA head-repeat path
+    that SP=2 never reaches.
+    """
+    out_dir = tmp_path / "sp_compose4"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mp.spawn(_sp_worker, args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_4.nproc), nprocs=4, join=True)
+
+    _assert_sp_parity(out_dir, world=_CI_CPU_4.nproc)

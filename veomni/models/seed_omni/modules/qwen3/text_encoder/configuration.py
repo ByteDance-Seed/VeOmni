@@ -28,5 +28,6 @@ class Qwen3TextEncoderConfig(TextEncoderConfig):
         enable_image: bool = False,
         **kwargs,
     ):
+        """Store ``enable_image`` and hand the rest to :class:`TextEncoderConfig`."""
         self.enable_image = enable_image
         super().__init__(**kwargs)
