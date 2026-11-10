@@ -126,7 +126,7 @@ Device numerical tests remain required.
 ### Build an A3 candidate in GitHub Actions
 
 The `Build CANN 9.2.1 A3 candidate` workflow in
-[build-cann921-a3.yml](../.github/workflows/build-cann921-a3.yml) is manual-only.
+[build-cann921-a3.yml](../.github/workflows/build-cann921-a3.yml) supports manual dispatch and branch pushes that change its workflow or A3 Dockerfile.
 It builds the A3 Dockerfile on `ubuntu-22.04-arm` for `linux/arm64` and publishes:
 `ghcr.io/<owner>/veomni:cann921-a3-arm64-<commit>-<run-id>-<attempt>`.
 
