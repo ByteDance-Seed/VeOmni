@@ -145,11 +145,11 @@ resolve the outstanding VeOmni legacy FLA API incompatibility.
 
 The A2 unit and e2e workflows use the published x86 candidate at digest
 `sha256:164b1e7268fb95649cf3edc3c87e0ba8464a150510e3ac9064dd48a2b877a90d`.
-After locked dependency sync, they verify retained wheel checksums and restore
-torch-npu post7, Triton 3.2.0, its Ascend 3.2.2 overlay and A2 FLA into the venv.
-These explicit overrides test compatibility with CANN 9.2.1; they are not a
-lockfile migration. The branch includes newer upstream GDN changes, so results
-are not a single-variable comparison against the earlier post2 run.
+Only the container image differs from the upstream NPU workflows. Dependency
+sync, Triton installation and uv run commands follow upstream unchanged.
+This validates the candidate system/CANN environment with upstream dependencies,
+not the exact Python package versions preinstalled in the image. Inspect the
+final package list for the versions actually tested.
 
 The A3 ARM64 candidate uses Triton-Ascend 3.2.2 over base Triton 3.5.0, as
 required by upstream ARM packaging. It is available at
