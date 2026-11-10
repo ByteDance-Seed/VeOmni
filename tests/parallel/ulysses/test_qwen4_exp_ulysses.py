@@ -191,11 +191,20 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    if parallel_mode not in ("ulysses", "cp", "hybrid"):
+        raise ValueError(f"Unsupported parallel mode: {parallel_mode}")
+    if parallel_mode == "hybrid":
+        assert world_size == 4
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            cp_size=world_size if parallel_mode == "cp" else 1,
-            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
+            cp_size=2 if parallel_mode == "hybrid" else world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size // 2
+            if parallel_mode == "hybrid"
+            else world_size
+            if parallel_mode == "ulysses"
+            else 1,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
@@ -306,6 +315,12 @@ def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
     if get_device_type() == "npu":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_run_ple_halo_equivalence, _CI_ACCELERATOR_2.nproc, False, "cp")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_hybrid(packed):
+    torchrun(_run_ple_halo_equivalence, _CI_ACCELERATOR_4.nproc, packed, "hybrid")
 
 
 def _run_qsa_equivalence(
@@ -1170,6 +1185,23 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
                         atol=2e-2,
                         msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                     )
+            if parallel_mode == "hybrid":
+                # The mean loss makes BF16 gradients small enough that an absolute
+                # tolerance alone could accept a completely missing vision path.
+                for name, actual, expected in (
+                    ("pixels", actual_pixel_grad, expected_pixel_grad),
+                    (
+                        "patch embedding",
+                        model.visual.patch_embed.proj.weight.grad,
+                        expected_parameter_grads["visual.patch_embed.proj.weight"],
+                    ),
+                ):
+                    assert actual is not None and expected is not None, f"Missing gradient for {name}"
+                    expected = expected.float()
+                    norm = torch.linalg.vector_norm(expected)
+                    error = torch.linalg.vector_norm(actual.float() - expected)
+                    assert torch.isfinite(norm) and norm > 0, f"Invalid reference gradient for {name}"
+                    assert torch.isfinite(error) and error < 0.5 * norm, f"Missing or badly scaled {name} gradient"
     finally:
         clear_parallel_state()
 
@@ -1186,7 +1218,6 @@ def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
     torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_2.nproc, "cp")
 
 
-@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_hybrid():
     torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_4.nproc, "hybrid")
