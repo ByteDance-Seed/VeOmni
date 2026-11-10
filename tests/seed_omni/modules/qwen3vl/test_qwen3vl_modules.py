@@ -395,3 +395,12 @@ def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Pat
         "visual.merger.linear_fc2.weight",
         "visual.merger.linear_fc2.bias",
     }
+    # Both shapes of this call must still bind the module's processors. HF returns
+    # `(model, info)` when loading info is requested, and that tuple reaching
+    # `bind_module_assets` binds nothing — silently, since a tuple has no
+    # `preprocessor_class`. Assert on the model, not just the return shape.
+    assert loaded._image_processor is not None
+    assert loaded._video_processor is not None
+    plain = Vision.from_pretrained(str(source), config=retargeted)
+    assert plain._image_processor is not None
+    assert plain._video_processor is not None

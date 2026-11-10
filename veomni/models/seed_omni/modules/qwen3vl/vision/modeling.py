@@ -290,20 +290,24 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
         stock Qwen3-VL checkpoint no longer matches it. VeOmni's own loaders drop
         that tensor through :class:`_MergerProjectionConverter`; single-process
         eager inference loads through this HF entry point instead, which refuses to
-        start on the mismatch. Retry once accepting mismatches, and keep the result
-        only when they are exactly the merger projection — any other shape change
-        still raises. With ``out_hidden_size`` unset nothing is retried, so a
-        standard Qwen3-VL load is untouched.
+        start on the mismatch. Retry once accepting mismatches and keep that result
+        only when every mismatched key is one of the retargeted pair — any other
+        mismatch is re-raised with the offending keys. With ``out_hidden_size``
+        unset nothing is retried, so a standard Qwen3-VL load is untouched.
+
+        A caller's own ``ignore_mismatched_sizes=True`` still bypasses the check,
+        as it would on any HF model; this only supplies the retry the recipe needs.
         """
         if getattr(kwargs.get("config"), "out_hidden_size", None) is None:
             return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
-        # Popped so the retry can set its own, and so the base's asset binding
-        # always receives a bare model rather than HF's `(model, info)` tuple.
+        # Loading info is requested unconditionally: the retry needs `mismatched_keys`
+        # to decide whether the shape change is the one this loader re-initialises,
+        # and asking again afterwards would mean a second pass over the weights.
         want_info = kwargs.pop("output_loading_info", False)
         try:
-            loaded = super().from_pretrained(
-                pretrained_model_name_or_path, *args, output_loading_info=want_info, **kwargs
+            model, info = super().from_pretrained(
+                pretrained_model_name_or_path, *args, output_loading_info=True, **kwargs
             )
         except RuntimeError as error:
             # HF reports the mismatch two ways depending on version (a "size mismatch"
@@ -322,8 +326,18 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
                     f"{cls.__name__}: the load failed, and its size mismatches are not the retargeted merger "
                     f"({sorted(unexpected)})."
                 ) from error
-            return (model, info) if want_info else model
-        return loaded
+
+        # The base class received `(model, info)` above and so skipped its asset
+        # binding (`bind_module_assets` sees no `preprocessor_class` on a tuple and
+        # returns). Bind the bare model here instead of loading twice.
+        from ...module_processing_base import bind_module_assets
+
+        bind_module_assets(
+            model,
+            checkpoint_path=str(pretrained_model_name_or_path),
+            config_overrides={k: v for k, v in kwargs.items() if k != "config"},
+        )
+        return (model, info) if want_info else model
 
     def freeze_model(self) -> None:
         """When ``config.freeze``, freeze the ViT but keep the patch merger

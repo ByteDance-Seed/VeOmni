@@ -280,10 +280,16 @@ checkpoint — no build-time surgery.
 That converter only runs through VeOmni's own weight loaders, so single-process
 **eager inference** — which loads through HF's `from_pretrained` — would otherwise
 fail at startup on that one shape mismatch. `Qwen3VLVisionEncoder.from_pretrained`
-therefore retries once accepting mismatches, and keeps the result **only** when the
-mismatched keys are exactly the retargeted `linear_fc2` pair; anything else still
-raises, so an unintended shape change cannot be swallowed. With `out_hidden_size`
-unset nothing is retried, so a standard Qwen3-VL load is unaffected.
+therefore retries once with `ignore_mismatched_sizes=True`, and keeps that result
+**only** when every mismatched key is one of the retargeted `linear_fc2` pair;
+otherwise it re-raises with the offending keys, so an unintended shape change is
+still reported. With `out_hidden_size` unset nothing is retried, so a standard
+Qwen3-VL load never reaches the retry.
+
+Note the retry is the module's own fallback, not a global policy: a caller that
+passes `ignore_mismatched_sizes=True` explicitly still gets HF's behaviour of
+accepting any mismatch, on this model as on any other. The guard describes what
+this loader does on its own initiative.
 
 `freeze: true` then freezes the ViT blocks and keeps only the merger trainable, and
 `disable_deepstack: true` zeroes `deepstack_visual_indexes` because the plain
