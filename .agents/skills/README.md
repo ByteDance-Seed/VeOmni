@@ -12,6 +12,8 @@ Each skill is a folder containing a `SKILL.md` with YAML frontmatter:
 │   └── SKILL.md          # name + description frontmatter, then instructions
 ├── veomni-debug/
 │   └── SKILL.md
+├── veomni-new-model/
+│   └── SKILL.md          # full migration workflow; narrower scope on request
 ├── veomni-patchgen-model/
 │   ├── SKILL.md          # the spine: applies to every model
 │   └── references/       # loaded on demand, per model category
