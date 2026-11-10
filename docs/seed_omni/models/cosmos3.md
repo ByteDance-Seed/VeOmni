@@ -73,6 +73,11 @@ generation pass). They would never get a gradient anyway, so freezing them
 changes no update; it makes every trainable parameter reach the loss, which is
 what DDP needs.
 
+Joint training is a switch, not a tuned recipe. With the recipe's optimizer
+settings, a 4-card smoke run's gradient norm went from 0.56 to 15.4 in two
+steps, and the DiT-trainer port's joint run diverged from its third step. Lower
+the learning rate before training both towers.
+
 ## 3. Data
 
 `data.source_name: cosmos3_sft_jsonl` reads the open-source SFT JSONL dump, one
