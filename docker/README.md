@@ -158,3 +158,7 @@ for compatibility testing with the existing CANN 9.2.1/torch-npu post7 stack.
 CI remains on the published post2 digest until this rebuild is published.
 The branch also includes newer upstream GDN changes, so its results are not a
 single-variable comparison against the earlier post2 run.
+
+The A3 ARM64 rebuild also selects Triton-Ascend `3.2.2`. Its base Triton is
+`3.5.0`, as required by the upstream v3.2.2 ARM packaging configuration;
+the A2 x86 base remains `3.2.0`. A2 ARM is unchanged.
