@@ -22,6 +22,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import PackedConversation, preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
@@ -31,6 +32,61 @@ ALIGN_ATOL = 2e-2
 ALIGN_RTOL = 2e-2
 ALIGN_GRAD_ATOL = 5e-2
 ALIGN_GRAD_RTOL = 5e-2
+
+
+class FakeBagelTokenizer:
+    """Char-ordinal tokenizer with the marker tokens/ids that ``BagelChatTemplate`` resolves."""
+
+    bos_token = "<s>"
+    eos_token = "</s>"
+    boi_token = "<boi>"
+    eoi_token = "<eoi>"
+    bos_token_id = 1
+    eos_token_id = 2
+    boi_token_id = 3
+    eoi_token_id = 4
+    pad_token_id = 0
+    unk_token_id = -1
+    special_tokens = {
+        "<s>": 1,
+        "</s>": 2,
+        "<boi>": 3,
+        "<eoi>": 4,
+        "<|im_start|>": 5,
+        "<|im_end|>": 2,
+        "<|vision_start|>": 7,
+        "<|vision_end|>": 8,
+    }
+
+    def convert_tokens_to_ids(self, token):
+        return self.special_tokens.get(token, self.unk_token_id)
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        special_by_id = {v: k for k, v in self.special_tokens.items()}
+        return "".join(special_by_id.get(int(t), chr(max(32, int(t)))) for t in token_ids)
+
+    def __call__(self, text, add_special_tokens=False):
+        del add_special_tokens
+        input_ids = []
+        index = 0
+        while index < len(text):
+            matched = False
+            for token, token_id in sorted(self.special_tokens.items(), key=lambda item: len(item[0]), reverse=True):
+                if text.startswith(token, index):
+                    input_ids.append(token_id)
+                    index += len(token)
+                    matched = True
+                    break
+            if matched:
+                continue
+            input_ids.append(ord(text[index]))
+            index += 1
+        return {"input_ids": input_ids}
+
+
+def bagel_template() -> BagelChatTemplate:
+    return BagelChatTemplate(FakeBagelTokenizer())
 
 
 def bagel_cfg_dir() -> Path:
