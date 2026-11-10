@@ -39,7 +39,6 @@
 # Adapted from AMD-AGI/Primus v26.8.0 (v4_attention_kernels/_triton_common/rmsnorm.py,
 # hc_glue.py, sinkhorn.py, hc_collapse.py and hc_expand.py); modified for VeOmni.
 
-# ruff: noqa
 """Triton forward/backward kernels for DeepSeek-V4 mHC.
 
 ``unweighted_rms_norm`` feeds the mix GEMM, which stays in ``F.linear``;
@@ -57,22 +56,9 @@ import triton
 import triton.language as tl
 
 
-SUPPORTED_HC_MULT = (1, 2, 4, 8, 16)
-
-_TORCH_TO_TL_DTYPE = {
-    torch.float32: tl.float32,
-    torch.float16: tl.float16,
-    torch.bfloat16: tl.bfloat16,
-}
-
 _STREAM_BLOCK_M = 16
 _STREAM_BLOCK_D = 128
 _STREAM_NUM_WARPS = 4
-
-
-def _check_hc_mult(hc_mult: int) -> None:
-    if hc_mult not in SUPPORTED_HC_MULT:
-        raise ValueError(f"Triton mHC supports hc_mult in {SUPPORTED_HC_MULT}, got {hc_mult}")
 
 
 def _leading_rows(shape: torch.Size, trailing: int) -> int:
@@ -80,11 +66,6 @@ def _leading_rows(shape: torch.Size, trailing: int) -> int:
     for size in shape[: len(shape) - trailing]:
         rows *= size
     return rows
-
-
-# ---------------------------------------------------------------------------
-# Unweighted RMS norm with an FP32 result
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -157,18 +138,7 @@ class _UnweightedRMSNorm(torch.autograd.Function):
 
 def unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     """Return ``x * rsqrt(mean(x**2, -1) + eps)`` in FP32."""
-    if not x.is_cuda:
-        raise ValueError("Triton mHC RMS norm requires a GPU tensor")
-    if x.dim() == 0 or x.shape[-1] == 0:
-        raise ValueError(f"Triton mHC RMS norm requires a nonzero last dimension, got {tuple(x.shape)}")
-    if x.dtype not in _TORCH_TO_TL_DTYPE:
-        raise TypeError(f"Triton mHC RMS norm does not support {x.dtype}")
     return _UnweightedRMSNorm.apply(x, eps)
-
-
-# ---------------------------------------------------------------------------
-# Mix tail: (pre, post, comb) from the mix GEMM output
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -186,10 +156,11 @@ def _mix_tail_fwd_kernel(
     EPS: tl.constexpr,
     POST_MULT: tl.constexpr,
     K: tl.constexpr,
+    SAVE_STATES: tl.constexpr,
     BLOCK_LEADING: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = (pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING)).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING).to(tl.int64)
     mask = offs < N
     k_idx = tl.arange(0, K)
     KK: tl.constexpr = K * K
@@ -218,9 +189,10 @@ def _mix_tail_fwd_kernel(
 
     row_k = offs[:, None] * K + k_idx[None, :]
     row_kk = offs[:, None, None] * KK + k_idx[None, :, None] * K + k_idx[None, None, :]
-    tl.store(PRE_SIG_PTR + row_k, pre_sig, mask=mask[:, None])
-    tl.store(POST_SIG_PTR + row_k, post_sig, mask=mask[:, None])
-    tl.store(COMB_SM_PTR + row_kk, comb_sm, mask=mask[:, None, None])
+    if SAVE_STATES:
+        tl.store(PRE_SIG_PTR + row_k, pre_sig, mask=mask[:, None])
+        tl.store(POST_SIG_PTR + row_k, post_sig, mask=mask[:, None])
+        tl.store(COMB_SM_PTR + row_kk, comb_sm, mask=mask[:, None, None])
     tl.store(PRE_PTR + row_k, pre_sig + EPS, mask=mask[:, None])
     tl.store(POST_PTR + row_k, POST_MULT * post_sig, mask=mask[:, None])
     tl.store(COMB_PTR + row_kk, comb_sm + EPS, mask=mask[:, None, None])
@@ -242,8 +214,8 @@ def _mix_tail_bwd_kernel(
     K: tl.constexpr,
     BLOCK_LEADING: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = (pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING)).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING).to(tl.int64)
     mask = offs < N
     k_idx = tl.arange(0, K)
     KK: tl.constexpr = K * K
@@ -282,7 +254,7 @@ def _mix_tail_block(rows: int, k: int) -> int:
 
 class _MixTail(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, mixes, scale, base, hc_mult: int, post_mult: float, eps: float):
+    def forward(ctx, mixes, scale, base, hc_mult: int, post_mult: float, eps: float, save_states: bool):
         k = hc_mult
         mixes_c = mixes.contiguous().to(torch.float32)
         scale_c = scale.contiguous().to(torch.float32)
@@ -293,9 +265,12 @@ class _MixTail(torch.autograd.Function):
         pre = torch.empty((*leading, k), dtype=torch.float32, device=device)
         post = torch.empty((*leading, k), dtype=torch.float32, device=device)
         comb = torch.empty((*leading, k, k), dtype=torch.float32, device=device)
-        pre_sig = torch.empty((rows, k), dtype=torch.float32, device=device)
-        post_sig = torch.empty((rows, k), dtype=torch.float32, device=device)
-        comb_sm = torch.empty((rows, k, k), dtype=torch.float32, device=device)
+        if save_states:
+            pre_sig = torch.empty((rows, k), dtype=torch.float32, device=device)
+            post_sig = torch.empty((rows, k), dtype=torch.float32, device=device)
+            comb_sm = torch.empty((rows, k, k), dtype=torch.float32, device=device)
+        else:
+            pre_sig = post_sig = comb_sm = torch.empty(1, dtype=torch.float32, device=device)
         block = _mix_tail_block(rows, k)
         _mix_tail_fwd_kernel[(triton.cdiv(rows, block),)](
             mixes_c,
@@ -311,13 +286,15 @@ class _MixTail(torch.autograd.Function):
             EPS=float(eps),
             POST_MULT=float(post_mult),
             K=k,
+            SAVE_STATES=save_states,
             BLOCK_LEADING=block,
         )
-        ctx.save_for_backward(mixes_c, scale_c, pre_sig, post_sig, comb_sm)
-        ctx.hc_mult = k
-        ctx.post_mult = float(post_mult)
-        ctx.leading = tuple(leading)
-        ctx.dtypes = (mixes.dtype, scale.dtype, base.dtype)
+        if save_states:
+            ctx.save_for_backward(mixes_c, scale_c, pre_sig, post_sig, comb_sm)
+            ctx.hc_mult = k
+            ctx.post_mult = float(post_mult)
+            ctx.leading = tuple(leading)
+            ctx.dtypes = (mixes.dtype, scale.dtype, base.dtype)
         return pre, post, comb
 
     @staticmethod
@@ -364,6 +341,7 @@ class _MixTail(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -380,24 +358,8 @@ def mhc_mix_tail(
     ``mixes`` is ``[..., (2 + hc) * hc]``; ``scale`` holds the pre / post /
     comb scales and ``base`` the matching biases.
     """
-    _check_hc_mult(hc_mult)
-    channels = (2 + hc_mult) * hc_mult
-    if mixes.dim() == 0 or mixes.shape[-1] != channels:
-        raise ValueError(f"mHC mixes must have {channels} channels")
-    if scale.shape != (3,):
-        raise ValueError(f"mHC pre expects scale shape (3,), got {tuple(scale.shape)}")
-    if base.shape != (channels,):
-        raise ValueError(f"mHC pre expects base shape ({channels},), got {tuple(base.shape)}")
-    if not mixes.is_cuda or scale.device != mixes.device or base.device != mixes.device:
-        raise ValueError("Triton mHC mixes, scale, and base must be GPU tensors on the same device")
-    if any(tensor.dtype not in _TORCH_TO_TL_DTYPE for tensor in (mixes, scale, base)):
-        raise TypeError("Triton mHC mixes, scale, and base must use supported floating dtypes")
-    return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps)
-
-
-# ---------------------------------------------------------------------------
-# Sinkhorn-Knopp normalization
-# ---------------------------------------------------------------------------
+    save_states = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (mixes, scale, base))
+    return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps, save_states)
 
 
 @triton.jit
@@ -412,8 +374,8 @@ def _sinkhorn_fwd_kernel(
     SAVE_STATES: tl.constexpr,
     BLOCK_LEADING: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = (pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING)).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING).to(tl.int64)
     mask = offs[:, None, None] < N
     r_offs = tl.arange(0, K)
     c_offs = tl.arange(0, K)
@@ -449,8 +411,8 @@ def _sinkhorn_bwd_kernel(
     EPS: tl.constexpr,
     BLOCK_LEADING: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = (pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING)).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK_LEADING + tl.arange(0, BLOCK_LEADING).to(tl.int64)
     mask = offs[:, None, None] < N
     r_offs = tl.arange(0, K)
     c_offs = tl.arange(0, K)
@@ -535,22 +497,9 @@ class _Sinkhorn(torch.autograd.Function):
 
 def sinkhorn_normalize(comb: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
     """Column-normalize ``comb``, then alternate row / column normalization ``iters - 1`` times."""
-    if comb.dim() < 2 or comb.shape[-2] != comb.shape[-1]:
-        raise ValueError(f"Sinkhorn expects a [..., K, K] tensor, got {tuple(comb.shape)}")
-    if not comb.is_cuda:
-        raise ValueError("Triton mHC Sinkhorn requires a GPU tensor")
-    if comb.dtype not in _TORCH_TO_TL_DTYPE:
-        raise TypeError(f"Triton mHC Sinkhorn does not support {comb.dtype}")
-    k = comb.shape[-1]
-    _check_hc_mult(k)
     # The reference always applies the leading column normalization, so zero
     # iterations behaves like one.
     return _Sinkhorn.apply(comb, max(int(iters), 1), eps)
-
-
-# ---------------------------------------------------------------------------
-# Stream collapse: out[..., d] = sum_k pre[..., k] * x[..., k, d]
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -564,20 +513,21 @@ def _collapse_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    rm = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    rd = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    d64 = D.to(tl.int64)
+    rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rd = tl.program_id(1).to(tl.int64) * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
     mask_m = rm < M
     mask_d = rd < D
     x3 = tl.load(
-        X_PTR + rm[:, None, None] * (K * D) + k_ax[None, :, None] * D + rd[None, None, :],
+        X_PTR + rm[:, None, None] * (K * d64) + k_ax[None, :, None] * d64 + rd[None, None, :],
         mask=mask_m[:, None, None] & mask_d[None, None, :],
         other=0.0,
     ).to(tl.float32)
     pre = tl.load(PRE_PTR + rm[:, None] * K + k_ax[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
     out = tl.sum(pre[:, :, None] * x3, axis=1)
     tl.store(
-        OUT_PTR + rm[:, None] * D + rd[None, :],
+        OUT_PTR + rm[:, None] * d64 + rd[None, :],
         out.to(OUT_PTR.dtype.element_ty),
         mask=mask_m[:, None] & mask_d[None, :],
     )
@@ -596,16 +546,17 @@ def _collapse_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_d = tl.program_id(1)
-    rm = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d64 = D.to(tl.int64)
+    pid_d = tl.program_id(1).to(tl.int64)
+    rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
     mask_m = rm < M
     mask_d = rd < D
     mask3 = mask_m[:, None, None] & mask_d[None, None, :]
-    stream = rm[:, None, None] * (K * D) + k_ax[None, :, None] * D + rd[None, None, :]
+    stream = rm[:, None, None] * (K * d64) + k_ax[None, :, None] * d64 + rd[None, None, :]
     x3 = tl.load(X_PTR + stream, mask=mask3, other=0.0).to(tl.float32)
-    g = tl.load(G_PTR + rm[:, None] * D + rd[None, :], mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(
+    g = tl.load(G_PTR + rm[:, None] * d64 + rd[None, :], mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(
         tl.float32
     )
     pre = tl.load(PRE_PTR + rm[:, None] * K + k_ax[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
@@ -670,21 +621,7 @@ def hc_collapse(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     ``x`` is ``[..., K, D]`` and ``pre`` is ``[..., K]``; ``pre`` may be FP32
     while ``x`` is BF16.
     """
-    if x.dim() < 2 or x.shape[-1] == 0:
-        raise ValueError(f"mHC collapse expects [..., K, D] with nonzero D, got {tuple(x.shape)}")
-    _check_hc_mult(x.shape[-2])
-    if pre.shape != x.shape[:-1]:
-        raise ValueError(f"mHC collapse weights {tuple(pre.shape)} do not match streams {tuple(x.shape)}")
-    if not x.is_cuda or pre.device != x.device:
-        raise ValueError("Triton mHC collapse streams and weights must be GPU tensors on the same device")
-    if x.dtype not in _TORCH_TO_TL_DTYPE or pre.dtype not in _TORCH_TO_TL_DTYPE:
-        raise TypeError(f"mHC collapse expects floating streams and weights, got {x.dtype} and {pre.dtype}")
     return _Collapse.apply(x, pre)
-
-
-# ---------------------------------------------------------------------------
-# Residual post-mix: new[..., h, d] = post[..., h] * out[..., d] + sum_k comb[..., k, h] * x[..., k, d]
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -700,25 +637,30 @@ def _post_mix_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    rm = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    rd = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    d64 = D.to(tl.int64)
+    rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rd = tl.program_id(1).to(tl.int64) * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
     mask_m = rm < M
     mask_d = rd < D
     mask2 = mask_m[:, None] & mask_d[None, :]
     x3 = tl.load(
-        X_PTR + rm[:, None, None] * (K * D) + k_ax[None, :, None] * D + rd[None, None, :],
+        X_PTR + rm[:, None, None] * (K * d64) + k_ax[None, :, None] * d64 + rd[None, None, :],
         mask=mask_m[:, None, None] & mask_d[None, None, :],
         other=0.0,
     ).to(tl.float32)
-    out_tile = tl.load(OUT_PTR + rm[:, None] * D + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
+    out_tile = tl.load(OUT_PTR + rm[:, None] * d64 + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
     for h in range(K):
         comb_col = tl.load(
             COMB_PTR + rm[:, None] * (K * K) + k_ax[None, :] * K + h, mask=mask_m[:, None], other=0.0
         ).to(tl.float32)
         post_h = tl.load(POST_PTR + rm * K + h, mask=mask_m, other=0.0).to(tl.float32)
         new_h = post_h[:, None] * out_tile + tl.sum(comb_col[:, :, None] * x3, axis=1)
-        tl.store(NEW_PTR + rm[:, None] * (K * D) + h * D + rd[None, :], new_h.to(NEW_PTR.dtype.element_ty), mask=mask2)
+        tl.store(
+            NEW_PTR + rm[:, None] * (K * d64) + h * d64 + rd[None, :],
+            new_h.to(NEW_PTR.dtype.element_ty),
+            mask=mask2,
+        )
 
 
 @triton.jit
@@ -738,23 +680,24 @@ def _post_mix_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_d = tl.program_id(1)
-    rm = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d64 = D.to(tl.int64)
+    pid_d = tl.program_id(1).to(tl.int64)
+    rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
     mask_m = rm < M
     mask_d = rd < D
     mask2 = mask_m[:, None] & mask_d[None, :]
     mask3 = mask_m[:, None, None] & mask_d[None, None, :]
-    stream = rm[:, None, None] * (K * D) + k_ax[None, :, None] * D + rd[None, None, :]
+    stream = rm[:, None, None] * (K * d64) + k_ax[None, :, None] * d64 + rd[None, None, :]
     x3 = tl.load(X_PTR + stream, mask=mask3, other=0.0).to(tl.float32)
     g3 = tl.load(G_PTR + stream, mask=mask3, other=0.0).to(tl.float32)
-    out_tile = tl.load(OUT_PTR + rm[:, None] * D + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
+    out_tile = tl.load(OUT_PTR + rm[:, None] * d64 + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
     post = tl.load(POST_PTR + rm[:, None] * K + k_ax[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
 
     # d_out[d] = sum_h post[h] * g[h, d]; d_post[h] = sum_d out[d] * g[h, d]
     tl.store(
-        DOUT_PTR + rm[:, None] * D + rd[None, :],
+        DOUT_PTR + rm[:, None] * d64 + rd[None, :],
         tl.sum(post[:, :, None] * g3, axis=1).to(DOUT_PTR.dtype.element_ty),
         mask=mask2,
     )
@@ -767,7 +710,7 @@ def _post_mix_bwd_kernel(
             COMB_PTR + rm[:, None] * (K * K) + k * K + k_ax[None, :], mask=mask_m[:, None], other=0.0
         ).to(tl.float32)
         tl.store(
-            DX_PTR + rm[:, None] * (K * D) + k * D + rd[None, :],
+            DX_PTR + rm[:, None] * (K * d64) + k * d64 + rd[None, :],
             tl.sum(comb_row[:, :, None] * g3, axis=1).to(DX_PTR.dtype.element_ty),
             mask=mask2,
         )
@@ -775,7 +718,7 @@ def _post_mix_bwd_kernel(
     # d_comb[k, h] = sum_d x[k, d] * g[h, d]
     partial_kk = pid_d.to(tl.int64) * M * (K * K) + rm[:, None] * (K * K)
     for h in range(K):
-        g_h = tl.load(G_PTR + rm[:, None] * (K * D) + h * D + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
+        g_h = tl.load(G_PTR + rm[:, None] * (K * d64) + h * d64 + rd[None, :], mask=mask2, other=0.0).to(tl.float32)
         tl.store(
             DCOMB_PARTIAL_PTR + partial_kk + k_ax[None, :] * K + h,
             tl.sum(x3 * g_h[:, None, :], axis=2),
@@ -850,20 +793,4 @@ def hc_post_mix(residual: torch.Tensor, output: torch.Tensor, post: torch.Tensor
     ``[..., K]`` and ``comb`` ``[..., K, K]``. Accumulates in FP32 and returns
     ``residual.dtype``.
     """
-    if residual.dim() < 2 or residual.shape[-1] == 0:
-        raise ValueError(f"mHC post expects residual [..., K, D] with nonzero D, got {tuple(residual.shape)}")
-    k = residual.shape[-2]
-    _check_hc_mult(k)
-    if output.shape != residual.shape[:-2] + residual.shape[-1:]:
-        raise ValueError(f"mHC post output {tuple(output.shape)} does not match residual {tuple(residual.shape)}")
-    if post.shape != residual.shape[:-1] or comb.shape != residual.shape[:-1] + (k,):
-        raise ValueError(
-            f"mHC post mixes {tuple(post.shape)} / {tuple(comb.shape)} do not match residual {tuple(residual.shape)}"
-        )
-    if any(tensor.device != residual.device for tensor in (output, post, comb)) or not residual.is_cuda:
-        raise ValueError("Triton mHC post tensors must be GPU tensors on the same device")
-    if output.dtype != residual.dtype:
-        raise TypeError(f"mHC post output and residual must share a dtype, got {output.dtype} and {residual.dtype}")
-    if any(tensor.dtype not in _TORCH_TO_TL_DTYPE for tensor in (residual, output, post, comb)):
-        raise TypeError("Triton mHC post tensors must use supported floating dtypes")
     return _PostMix.apply(residual, output, post, comb)

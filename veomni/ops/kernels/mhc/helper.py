@@ -16,9 +16,9 @@
 
 Eager inlines unweighted RMSNorm. TileLang adapters validate CUDA placement,
 BF16 dtype, rank-4 layout, and ``hc_mult=4`` here; Triton adapters validate
-GPU placement, rank-4 layout, and the stream count. Registry requirements
-separately restrict the TileLang rows to NVIDIA SM90 or later with the
-``tile_kernels`` package, and the Triton rows to AMD ROCm.
+the complete tensor contract before importing the vendor module. Registry
+requirements separately restrict the TileLang rows to NVIDIA SM90 or later
+with the ``tile_kernels`` package, and the Triton rows to AMD ROCm.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from torch import Tensor
 
 POST_MULTIPLIER = 2.0
 TRITON_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+TRITON_HC_MULTS = (1, 2, 4, 8, 16)
 
 
 def unweighted_rms(x: Tensor, eps: float) -> Tensor:
@@ -56,6 +57,8 @@ def require_triton_input(x: Tensor, hc_mult: int) -> None:
         raise TypeError(f"Triton mHC requires float16, bfloat16, or float32 activations, got {x.dtype}")
     if x.ndim != 4:
         raise ValueError(f"Triton mHC expects [batch, sequence, hc, hidden], got {tuple(x.shape)}")
+    if hc_mult not in TRITON_HC_MULTS:
+        raise ValueError(f"Triton mHC supports hc_mult in {TRITON_HC_MULTS}, got {hc_mult}")
     if x.shape[-2] != hc_mult:
         raise ValueError(f"Triton mHC got {x.shape[-2]} residual streams for hc_mult={hc_mult}")
     if x.shape[-1] == 0:
@@ -69,3 +72,24 @@ def require_triton_tensors(reference: Tensor, **tensors: Tensor) -> None:
             raise ValueError(f"Triton mHC requires {name} on {reference.device}, got {tensor.device}")
         if tensor.dtype not in TRITON_FLOAT_DTYPES:
             raise TypeError(f"Triton mHC requires {name} to use float16, bfloat16, or float32, got {tensor.dtype}")
+
+
+def require_triton_parameters(
+    hidden_streams: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    *,
+    output_channels: int,
+    scale_channels: int,
+    operation: str,
+) -> None:
+    """Validate one mHC projection's parameters."""
+    expected_fn = (output_channels, hidden_streams.shape[-2] * hidden_streams.shape[-1])
+    if fn.shape != expected_fn:
+        raise ValueError(f"Triton mHC {operation} expects fn shape {expected_fn}, got {tuple(fn.shape)}")
+    if scale.shape != (scale_channels,):
+        raise ValueError(f"Triton mHC {operation} expects scale shape ({scale_channels},), got {tuple(scale.shape)}")
+    if base.shape != (output_channels,):
+        raise ValueError(f"Triton mHC {operation} expects base shape ({output_channels},), got {tuple(base.shape)}")
+    require_triton_tensors(hidden_streams, fn=fn, scale=scale, base=base)
