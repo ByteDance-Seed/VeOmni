@@ -347,6 +347,9 @@ magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "10
 create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
+[tool.setuptools]
+license-files = ["LICENSE", "docs/licenses/hunyuanvideo15/LICENSE.txt", "docs/licenses/hunyuanvideo15/NOTICE.txt"]
+
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
 
