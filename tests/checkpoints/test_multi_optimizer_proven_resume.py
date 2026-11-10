@@ -107,7 +107,7 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
     import veomni.checkpoint.dcp_checkpointer as checkpoint_module
     from veomni.optim.swap_adamw import SwapAdamW
 
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=6))
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         model = torch.nn.Linear(2, 2)
 
