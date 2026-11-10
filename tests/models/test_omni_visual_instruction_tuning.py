@@ -177,6 +177,7 @@ def _write_png(path: Path, rgb: tuple[int, int, int], size: int = 32) -> None:
     raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
+        """One PNG chunk: length, type, payload, CRC over type+payload."""
         body = kind + payload
         return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 

@@ -306,9 +306,14 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
         — the single-process eager inference path — has to be told the same thing,
         which is what this declares. Returned empty when the config kept the
         checkpoint's own width, so a stray mismatch there still raises.
+
+        The override can arrive either on the config object or as a direct keyword;
+        both are checked, so a caller that skips the config route is not left with
+        the stock-shape refusal this exists to prevent.
         """
         config = kwargs.get("config")
-        if config is None or getattr(config, "out_hidden_size", None) is None:
+        config_retargets = config is not None and getattr(config, "out_hidden_size", None) is not None
+        if not (config_retargets or kwargs.get("out_hidden_size") is not None):
             return frozenset()
         return frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
 

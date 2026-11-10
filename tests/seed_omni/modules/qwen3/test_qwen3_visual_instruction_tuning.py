@@ -382,8 +382,10 @@ def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Pat
     Vision = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
     VisionConfig = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
 
-    # A stock checkpoint at the ViT's own width (`out_hidden_size` unretargeted).
-    stock_config = VisionConfig(vision_config=dict(_VISION_CONFIG), ops_implementation=make_eager_ops_config())
+    # A stock checkpoint whose merger still projects into the ViT's own width —
+    # `_VISION_CONFIG` is already the *retargeted* shape, so widen it back here.
+    stock_vision = {**_VISION_CONFIG, "out_hidden_size": HIDDEN * 2}
+    stock_config = VisionConfig(vision_config=stock_vision, ops_implementation=make_eager_ops_config())
     source = tmp_path / "qwen3vl_vision"
     source.mkdir(parents=True)
     Vision(stock_config).save_pretrained(source)
@@ -393,19 +395,34 @@ def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Pat
     Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
 
     retargeted = VisionConfig(
-        vision_config=dict(_VISION_CONFIG), out_hidden_size=HIDDEN, ops_implementation=make_eager_ops_config()
+        vision_config=dict(_VISION_CONFIG),
+        out_hidden_size=HIDDEN,
+        # What the recipe sets: a plain backbone has no DeepStack path. Without it
+        # the deepstack mergers are retargeted too, which this converter does not
+        # cover — see the class docstring.
+        disable_deepstack=True,
+        ops_implementation=make_eager_ops_config(),
     )
     model = Vision.from_pretrained(str(source), config=retargeted)
     assert model.visual.merger.linear_fc2.weight.shape[0] == HIDDEN
 
     # The guard: retargeting the ViT's hidden size is not a declared mismatch.
     stray = VisionConfig(
-        vision_config={**_VISION_CONFIG, "hidden_size": HIDDEN * 2, "num_heads": 2},
+        vision_config={**stock_vision, "hidden_size": HIDDEN * 2, "num_heads": 2},
         out_hidden_size=HIDDEN,
         ops_implementation=make_eager_ops_config(),
     )
     with pytest.raises(RuntimeError, match="not the ones this module re-initialises"):
         Vision.from_pretrained(str(source), config=stray)
+
+    # A caller that asks for the loading info gets it back, and still gets the
+    # retry: `output_loading_info` must not collide with the one the retry sets.
+    loaded, info = Vision.from_pretrained(str(source), config=retargeted, output_loading_info=True)
+    assert loaded.visual.merger.linear_fc2.weight.shape[0] == HIDDEN
+    assert {name for name, _, _ in info["mismatched_keys"]} == {
+        "visual.merger.linear_fc2.weight",
+        "visual.merger.linear_fc2.bias",
+    }
 
 
 def test_a_composed_step_trains_only_what_the_overrides_selected():

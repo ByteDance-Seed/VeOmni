@@ -40,20 +40,38 @@ class PretrainedOmniModule(PreTrainedModel):
         ``ignore_mismatched_sizes=True``, but only when *every* mismatched key is
         one the module declared — anything else still raises, so an unintended
         shape change is not swallowed.
+
+        ``ignore_mismatched_sizes`` and ``output_loading_info`` are resolved here
+        rather than forwarded, so the retry can set them without colliding with a
+        caller that passed either one, and so ``bind_module_assets`` always gets a
+        bare model (HF returns a ``(model, info)`` tuple when loading info is
+        requested).
         """
         from .module_processing_base import bind_module_assets
 
+        want_info = kwargs.pop("output_loading_info", False)
+        user_ignore = kwargs.pop("ignore_mismatched_sizes", False)
         try:
-            model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            loaded = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=user_ignore,
+                output_loading_info=want_info,
+                **kwargs,
+            )
         except RuntimeError as error:
             allowed = cls._allowed_checkpoint_mismatches(pretrained_model_name_or_path, args, kwargs)
-            if not allowed:
+            if not allowed or user_ignore:
                 raise
             # HF reports the mismatch two ways depending on version (a "size mismatch"
             # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
             # retry rather than matching on the message, and let the check below decide.
             model, info = super().from_pretrained(
-                pretrained_model_name_or_path, *args, ignore_mismatched_sizes=True, output_loading_info=True, **kwargs
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=True,
+                output_loading_info=True,
+                **kwargs,
             )
             mismatched = {name for name, _, _ in info["mismatched_keys"]}
             unexpected = mismatched - allowed
@@ -62,6 +80,9 @@ class PretrainedOmniModule(PreTrainedModel):
                     f"{cls.__name__}: the load failed, and its size mismatches are not the ones this module "
                     f"re-initialises on purpose (declared {sorted(allowed)}, got {sorted(mismatched)})."
                 ) from error
+            loaded = (model, info) if want_info else model
+        model = loaded[0] if want_info else loaded
+
         # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded
         # module config, forwarded by ``OmniModel._load_modules``) — that's a
         # different "config" than the launcher/runtime overrides dict
@@ -74,7 +95,7 @@ class PretrainedOmniModule(PreTrainedModel):
             checkpoint_path=str(pretrained_model_name_or_path),
             config_overrides=config_overrides,
         )
-        return model
+        return loaded
 
     @classmethod
     def _allowed_checkpoint_mismatches(

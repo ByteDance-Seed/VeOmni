@@ -35,6 +35,7 @@ class _LossRecorder(Callback):
     """Append every step's loss (already reduced) to a JSON file on rank 0."""
 
     def __init__(self, trainer: OmniTrainer) -> None:
+        """Start with empty curves; ``on_step_end`` fills them."""
         super().__init__(trainer)
         self.losses: list[float] = []
         self.grad_norms: list[float] = []
