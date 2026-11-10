@@ -37,7 +37,8 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -62,11 +63,12 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -329,7 +331,7 @@ def deepseek_v3_model_forward_patched(
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def deepseek_v3_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    if use_fused_swiglu(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -364,6 +366,7 @@ class PatchedDeepseekV3Experts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

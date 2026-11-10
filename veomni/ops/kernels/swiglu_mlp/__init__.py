@@ -40,6 +40,17 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 QUANTIZING_IMPLS = frozenset({"qat"})
 
 
+def _supports_hidden_act(hidden_act: str | None) -> bool:
+    """Whether the fused SwiGLU rows implement ``hidden_act``.
+
+    Both directions of every fused row are SiLU: the TileLang ``qat`` rows and the
+    Liger kernel do not take an activation at all, and the Triton fused kernels
+    call ``aten.silu`` / ``silu_backward`` directly. Any other activation has no
+    row to run -- see the ``act_fn`` variant tracked in #1430.
+    """
+    return hidden_act in (None, "silu", "swish")
+
+
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
@@ -49,12 +60,14 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
     ``forward`` accepts the modules' inputs.
 
     Raises:
-        ValueError: when the projections are wrapped while ``mlp``'s own
-            ``swiglu_mlp`` selection is a fake-quantizing row. Such a row cannot
-            read a weight it is not handed, and falling back would run the base
-            layers at full precision while the config still claims
-            quantization-aware training -- a silent correctness bug, not a
-            graceful degradation. Every non-quantizing row keeps the fallback.
+        ValueError: when a fallback is needed while ``mlp``'s own ``swiglu_mlp``
+            selection is a fake-quantizing row. A wrapped projection has no
+            ``weight`` for the row to read: ``LoraLinear`` keeps the base layer at
+            ``base_layer``, so falling back would run at full precision while the
+            config claimed quantization-aware training -- a silent correctness bug,
+            not a graceful degradation. Every non-quantizing row keeps the
+            fallback.
+
     """
     plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
     if plain:
@@ -65,6 +78,39 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
         "a wrapped projection: a layer substituted after construction (LoRA) keeps the base weights at "
         "`base_layer`, so the handle cannot read the weight the row asks for",
         remedy="Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down.",
+    )
+    return False
+
+
+def use_fused_swiglu(mlp: nn.Module, hidden_act: str | None) -> bool:
+    """Whether to run ``mlp`` through its ``swiglu_mlp`` row.
+
+    Returns ``True`` when the row can serve this MLP, and ``False`` when the caller
+    must fall back to the projection modules. The fallback is refused outright if
+    the selected row fake-quantizes, because neither reason for falling back can
+    hand that row the weights it rounds -- it would train at full precision on a
+    config that says otherwise. This is the single decision point every consumer
+    should call; ``has_plain_linear_projections`` remains the plain-projection
+    predicate underneath.
+
+    Args:
+        mlp: The MLP block that owns the projections.
+        hidden_act: Its configured activation, normally ``config.hidden_act``.
+
+    Raises:
+        ValueError: when a fallback is needed and the row quantizes. The two
+            fallback reasons are a wrapped projection (LoRA) and an activation
+            outside ``{"silu", "swish"}``; the message names the one that applies.
+            Support for other activations is tracked in #1430.
+    """
+    if _supports_hidden_act(hidden_act) and has_plain_linear_projections(mlp):
+        return True
+    reject_quantizing_row(
+        mlp,
+        f"hidden_act={hidden_act!r}: every `swiglu_mlp` row is a SwiGLU kernel, so this MLP trains "
+        "through the projection modules and rounds nothing",
+        remedy="Use hidden_act='silu' to quantize it, or swiglu_mlp_implementation='eager' to train "
+        "it in the model dtype.",
     )
     return False
 

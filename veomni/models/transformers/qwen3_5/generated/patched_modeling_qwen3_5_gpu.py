@@ -127,7 +127,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
@@ -1073,7 +1073,7 @@ class Qwen3_5MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if use_fused_swiglu(self, self.config.hidden_act):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

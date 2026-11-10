@@ -396,9 +396,8 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
 def test_a_quantizing_shared_expert_row_refuses_a_non_silu_activation(modeling):
     """A shared expert with `hidden_act='gelu'` cannot honor a quantizing row.
 
-    The MLP falls through to the projection modules for any activation the fused
-    SwiGLU kernel does not implement, so nothing would be rounded. Refusing beats
-    training at full precision on a config that says QAT.
+    ``use_fused_swiglu`` owns the decision, so this pins the wiring: the MLP must
+    not reach its fallback while the config claims QAT.
     """
     import copy
     from types import SimpleNamespace

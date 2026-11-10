@@ -80,7 +80,8 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -114,11 +115,12 @@ config.add_import("typing", names=["Optional"])
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections", "reject_quantizing_row"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -1693,9 +1695,10 @@ class PatchedDeepseekV4Experts(nn.Module):
             # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
             # through the family row: the fused kernel bakes SiLU into both its
             # forward and its backward, so a different activation has no fused row
-            # to run. It therefore trains in the model dtype, like every other
-            # model's fallback -- quantizing only this one would make DeepSeek-V4
-            # the single model whose non-SiLU experts round.
+            # to run. It therefore trains in the model dtype -- for every model, so
+            # DeepSeek-V4 is not the one exception whose non-SiLU experts round.
+            # A quantizing selection cannot honor that, so refuse it here.
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1782,7 +1785,9 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     # One call covers every row: the quantizing rows fake-quantize the weights
     # they are handed, and the clamp stays in the model dtype either way. The
     # selection lives on the op, so this forward has no recipe to branch on.
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    # `use_fused_swiglu` also owns the refusal for a quantizing row it cannot
+    # serve (non-SwiGLU activation, wrapped projection).
+    if use_fused_swiglu(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -1793,17 +1798,8 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
             swiglu_limit=self.limit,
         )
-    # Every fused row implements SwiGLU only, so a different `hidden_act` has no
-    # row to run and trains through the projection modules. That is fine for a
-    # reference row, but a quantizing one would round nothing while the config
-    # said otherwise, so refuse it here rather than after the run.
-    reject_quantizing_row(
-        self,
-        f"hidden_act={self.config.hidden_act!r}: every `swiglu_mlp` row is a SwiGLU kernel, so a shared "
-        "expert with this activation trains through the projection modules and rounds nothing",
-        remedy="Use hidden_act='silu' to quantize the shared expert, or "
-        "swiglu_mlp_implementation='eager' to train it in the model dtype.",
-    )
+    # `use_fused_swiglu` already refused a quantizing row above, so reaching this
+    # line means the selection trains in the model dtype on purpose.
     gate = self.gate_proj(x).float().clamp(max=self.limit)
     up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
     return self.down_proj((self.act_fn(gate) * up).to(x.dtype))

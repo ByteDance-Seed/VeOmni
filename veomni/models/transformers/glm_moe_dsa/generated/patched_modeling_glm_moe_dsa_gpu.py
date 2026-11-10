@@ -73,7 +73,8 @@ from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
@@ -577,7 +578,7 @@ class GlmMoeDsaMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if use_fused_swiglu(self, self.config.hidden_act):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -664,6 +665,7 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

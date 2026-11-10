@@ -31,7 +31,7 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
 )
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_swiglu
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -56,12 +56,13 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.ops.kernels.dsa.mask",
@@ -153,7 +154,7 @@ def glm_moe_dsa_model_init_patched(self, config: GlmMoeDsaConfig):
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def glm_moe_dsa_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    if use_fused_swiglu(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,

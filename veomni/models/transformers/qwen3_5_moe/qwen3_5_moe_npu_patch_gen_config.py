@@ -118,6 +118,7 @@ config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_proj
 # Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
 # packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
 # once in ``Qwen3_5MoeTextModel.forward``.
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_swiglu"])
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
@@ -126,6 +127,7 @@ config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
