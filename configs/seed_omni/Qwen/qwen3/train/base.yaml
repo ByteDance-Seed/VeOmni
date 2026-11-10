@@ -1,24 +1,25 @@
 # VeOmni training / inference config for OmniModel — Qwen3-0.6B.
 #
 # Launch training:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3/train/base.yaml
 #
 # Launch inference (text-only chat):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3/train/base.yaml \
 #     --infer.prompt "What is 2+2?" \
 #     --infer.output_dir qwen3_out
 #
 # model_path is the upstream Qwen3 checkpoint, loaded through the qwen3 HF layout;
 # HF exports keep its layout. A split root from scripts/seed_omni/convert_model.py
-# works too.
+# works too. It is a placeholder: replace it with an absolute path this job can
+# read (`base.yaml`'s `data.train_path` and `data.yaml`'s `sources` likewise).
 
 model:
-  model_path: /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B
+  model_path: Qwen3-0.6B
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3_0.6b/train/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/train/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3/train/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3/train/graph_train.yaml
     infer_graph:
-      infer_text: configs/seed_omni/Qwen/qwen3_0.6b/train/graph_infer.yaml
+      infer_text: configs/seed_omni/Qwen/qwen3/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -59,7 +60,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3_0.6b/train/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -78,7 +79,7 @@ train:
   dyn_bsz: true
 
   checkpoint:
-    output_dir: outputs/qwen3_0.6b_omni_sft
+    output_dir: outputs/qwen3_omni_sft
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -87,7 +88,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3_0.6b_omni_sft
+    name: qwen3_omni_sft
 
 infer:
   generation_kwargs:
