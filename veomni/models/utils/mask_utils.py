@@ -135,7 +135,13 @@ def _resolve_skip_ulysses(attn_impl: str, extra_kwargs: dict[str, Any]) -> bool:
 
 
 def _validate_existing_4d_mask(existing_4d: Tensor, q_len: int, attn_impl: str, extra_kwargs: dict[str, Any]) -> None:
-    """Validate that a pre-built 3D/4D mask matches the post-Ulysses sequence length."""
+    """Validate that a pre-built 3D/4D mask is supported by the backend and matches the post-Ulysses sequence length."""
+    canonical = attn_impl.removeprefix("veomni_")
+    if canonical not in ("eager", "sdpa"):
+        raise ValueError(
+            f"packed {attn_impl} attention does not support a pre-built 3D/4D tensor attention_mask; "
+            "pass a 2D padding mask or a backend mask object instead"
+        )
     eff_q_len, _ = effective_sequence_lengths(
         q_len,
         q_len,
@@ -195,6 +201,11 @@ def _finalize_packed_mask(
 ) -> Tensor | BlockMask | MagiAttentionMask | None:
     """Merge existing 4D masks and enforce ``-inf`` cross-sample isolation on eager masks."""
     if not isinstance(mask, Tensor):
+        if existing_4d_mask is not None:
+            raise ValueError(
+                f"packed {packed_kwargs['impl']} attention does not support a pre-built 3D/4D tensor attention_mask; "
+                "pass a 2D padding mask or a backend mask object instead"
+            )
         return mask
 
     attn_impl = packed_kwargs["impl"]

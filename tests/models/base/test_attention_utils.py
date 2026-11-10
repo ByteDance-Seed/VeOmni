@@ -624,3 +624,32 @@ def test_mask_utils_keeps_sage_attention_on_flash_mask_path(impl):
         cu_seq_lens_q=cu_seqlens,
     )
     assert isinstance(mask_padded, torch.Tensor) and mask_padded.shape == (1, 8)
+
+
+@pytest.mark.parametrize("impl", ["veomni_flex_attention", "veomni_magi_attention", "flash_attention_2"])
+def test_mask_utils_rejects_existing_4d_tensor_mask_for_non_dense_packed_backends(impl):
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    config.sliding_window = 3
+    inputs_embeds = torch.randn(1, 8, 16)
+    existing_4d = torch.ones(1, 1, 8, 8, dtype=torch.bool).tril()
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="does not support a pre-built 3D/4D tensor attention_mask"):
+        create_causal_mask(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=existing_4d,
+            past_key_values=None,
+            cu_seq_lens_q=cu_seqlens,
+        )
+
+    if impl != "veomni_magi_attention":
+        with pytest.raises(ValueError, match="does not support a pre-built 3D/4D tensor attention_mask"):
+            create_sliding_window_causal_mask(
+                config=config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=existing_4d,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seqlens,
+            )
