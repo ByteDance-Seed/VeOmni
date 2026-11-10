@@ -34,7 +34,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.tensor import DTensor
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY
@@ -46,10 +46,18 @@ from veomni.models.seed_omni.modules.qwen3.text_encoder.processing import Qwen3T
 from veomni.models.seed_omni.modules.qwen3vl.vision.processing import Qwen3VLVisionPreprocessor
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+)
 
 
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
+_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 VOCAB = 64
 HIDDEN = 16
@@ -448,9 +456,12 @@ def test_the_toy_recipe_converges():
     head = sum(losses[:3]) / 3
     tail = sum(losses[-3:]) / 3
     assert tail < 0.95 * head, (head, tail, losses)
-    # Not just "lower on average": the curve is monotone enough that no step undoes
-    # the progress of the previous one by more than noise.
-    assert all(later <= earlier + 1e-3 for earlier, later in zip(losses, losses[1:])), losses
+    # Not just "lower on average": every 5-step window mean is below the one before
+    # it, so a curve that only drifts down by luck cannot pass. Window means rather
+    # than per-step values, because a single step's rounding order differs between
+    # CPU kernels / torch builds and one noisy step is not a convergence failure.
+    windows = [sum(losses[i : i + 5]) / 5 for i in range(0, steps - 4, 5)]
+    assert all(later < earlier for earlier, later in zip(windows, windows[1:])), windows
 
 
 def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
@@ -508,17 +519,19 @@ def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
         wrapping.freeze_model()
 
 
-def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int) -> None:
+def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int, device_type: str) -> None:
     """Run the composed graph at SP=1 and SP=``world`` and record loss + stepped params.
 
-    CPU/Gloo on purpose: the launch plan marks this a CPU case, and a CUDA host
-    would otherwise resolve ``nccl`` for CPU tensors. The accelerator matrix is
-    covered by the per-family alignment tests; what this one adds is the
-    *composition* of three modules under one SP size.
+    ``device_type="cpu"`` uses Gloo and float32; anything else is the accelerator
+    path the same worker takes over NCCL/HCCL in bfloat16, so the CPU case pins the
+    composition and the accelerator case pins the real collectives.
     """
-    device = torch.device("cpu")
+    on_accelerator = device_type != "cpu"
+    device = torch.device(f"{device_type}:{rank}" if on_accelerator else "cpu")
+    if on_accelerator:
+        get_torch_device().set_device(rank)
     dist.init_process_group(
-        "gloo",
+        "gloo" if not on_accelerator else get_dist_comm_backend(),
         init_method=f"file://{rendezvous}",
         world_size=world,
         rank=rank,
@@ -532,13 +545,13 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int) -> None:
                 dp_shard_size=world if sp_size == 1 else 1,
                 ulysses_size=sp_size,
                 dp_mode="fsdp2",
-                device_type="cpu",
+                device_type=device_type,
                 name=name,
             )
             with use_parallel_state(name):
                 from torch.distributed.fsdp import fully_shard
 
-                modules = _build_modules(device=device, dtype=torch.float32)
+                modules = _build_modules(device=device, dtype=torch.float32 if not on_accelerator else torch.bfloat16)
                 for module in modules.values():
                     fully_shard(module, mesh=ps.fsdp_mesh)
                 loss, _ = _graph_loss(modules, _batch(), backward=True)
@@ -564,17 +577,20 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int) -> None:
         dist.destroy_process_group()
 
 
-def _assert_sp_parity(out_dir: Path, world: int) -> None:
+def _assert_sp_parity(out_dir: Path, world: int, *, rtol: float = 0.0, atol: float = 1e-5) -> None:
     """Every rank saw the same loss, and every param left the step with the SP=1 value."""
     for rank in range(world):
         reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert reports[f"sp{world}_loss"] == pytest.approx(reports["sp1_loss"], abs=1e-5), (rank, reports["sp1_loss"])
+        assert reports[f"sp{world}_loss"] == pytest.approx(reports["sp1_loss"], rel=rtol, abs=atol), (
+            rank,
+            reports["sp1_loss"],
+        )
         probe1, probe_other = reports["sp1_probe"], reports[f"sp{world}_probe"]
         assert probe1.keys() == probe_other.keys()
         for name, (total1, square1) in probe1.items():
             total_other, square_other = probe_other[name]
-            assert total_other == pytest.approx(total1, abs=1e-5), (rank, name, total1, total_other)
-            assert square_other == pytest.approx(square1, abs=1e-5), (rank, name, square1, square_other)
+            assert total_other == pytest.approx(total1, rel=rtol, abs=atol), (rank, name, total1, total_other)
+            assert square_other == pytest.approx(square1, rel=rtol, abs=atol), (rank, name, square1, square_other)
 
 
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
@@ -587,7 +603,12 @@ def test_sp2_matches_sp1_on_the_composed_graph(tmp_path: Path):
     """
     out_dir = tmp_path / "sp_compose"
     out_dir.mkdir(parents=True, exist_ok=True)
-    mp.spawn(_sp_worker, args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_2.nproc), nprocs=2, join=True)
+    mp.spawn(
+        _sp_worker,
+        args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_2.nproc, "cpu"),
+        nprocs=_CI_CPU_2.nproc,
+        join=True,
+    )
 
     _assert_sp_parity(out_dir, world=_CI_CPU_2.nproc)
 
@@ -603,6 +624,36 @@ def test_sp4_matches_sp1_on_the_composed_graph(tmp_path: Path):
     """
     out_dir = tmp_path / "sp_compose4"
     out_dir.mkdir(parents=True, exist_ok=True)
-    mp.spawn(_sp_worker, args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_4.nproc), nprocs=4, join=True)
+    mp.spawn(
+        _sp_worker,
+        args=(str(out_dir / "rendezvous"), str(out_dir), _CI_CPU_4.nproc, "cpu"),
+        nprocs=_CI_CPU_4.nproc,
+        join=True,
+    )
 
     _assert_sp_parity(out_dir, world=_CI_CPU_4.nproc)
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or runner_device_count() < _CI_ACCELERATOR_4.nproc,
+    reason="requires >=4 CUDA or NPU devices",
+)
+def test_sp4_matches_sp1_on_accelerator(tmp_path: Path):
+    """Same SP=1 vs SP=4 comparison over real NCCL/HCCL collectives in bfloat16.
+
+    The CPU case proves the composition; this one proves it over the collective
+    implementation CI actually trains with. BF16 all-to-all/gather rounding is not
+    bit-exact against an SP=1 run, so this compares with the same relative
+    tolerance the per-family alignment tests use.
+    """
+    out_dir = tmp_path / "sp_compose4_acc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mp.spawn(
+        _sp_worker,
+        args=(str(out_dir / "rendezvous"), str(out_dir), _CI_ACCELERATOR_4.nproc, get_device_type()),
+        nprocs=_CI_ACCELERATOR_4.nproc,
+        join=True,
+    )
+
+    _assert_sp_parity(out_dir, world=_CI_ACCELERATOR_4.nproc, rtol=5e-3, atol=1e-4)
