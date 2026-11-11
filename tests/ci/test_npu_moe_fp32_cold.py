@@ -15,12 +15,13 @@
 """FSDP2 + expert-parallel optimizer/DCP cold-recovery regression on Ascend."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch.distributed.checkpoint import FileSystemReader
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from tests.ci._npu_moe_fp32_cold_worker import run, run_selective
 from veomni.checkpoint.layout import weights_dir
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -86,13 +87,80 @@ def _assert_ep2_checkpoint_layout(checkpoint_dir):
         assert {(tuple(chunk.offsets), tuple(chunk.sizes)) for chunk in metadata.chunks} == chunks
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
+def _require_two_native_npus():
+    """Fail an assigned or explicitly required NPU test when its lease is unusable."""
+    capabilities = runner_capabilities() if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    if capabilities is not None and capabilities.backend != "npu":
+        if required:
+            pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires an NPU CI assignment")
+        pytest.skip("requires an NPU CI assignment")
+    npu = getattr(torch, "npu", None)
+    if not IS_NPU_AVAILABLE or npu is None or not npu.is_available() or npu.device_count() < 2:
+        if required or (capabilities is not None and capabilities.backend == "npu"):
+            pytest.fail("Assigned or required NPU runtime must provide two usable devices")
+        pytest.skip("requires two native Ascend devices")
+
+
+def _native_npu_launch(context):
+    """Keep an unavailable required test runnable so its guard reports failure."""
+    caps = context.capabilities
+    if caps.backend == "npu" and len(caps.devices) >= 2:
+        return LaunchSpec(nproc=2, device="accelerator")
+    return LaunchSpec(device="cpu")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "backend,required,available,count,outcome",
+    [
+        (None, False, False, 0, "skip"),
+        (None, True, False, 0, "fail"),
+        ("npu", False, False, 0, "fail"),
+        ("npu", False, True, 1, "fail"),
+        ("npu", False, True, 2, "pass"),
+        ("cuda", False, True, 2, "skip"),
+        ("cuda", True, True, 2, "fail"),
+    ],
+)
+def test_native_npu_guard_respects_ci_assignment(monkeypatch, backend, required, available, count, outcome):
+    monkeypatch.setitem(globals(), "IS_NPU_AVAILABLE", available)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(is_available=lambda: available, device_count=lambda: count), raising=False
+    )
+    if backend is None:
+        monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
+    else:
+        monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "test")
+        monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend=backend))
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1" if required else "0")
+    if outcome == "fail":
+        with pytest.raises(pytest.fail.Exception):
+            _require_two_native_npus()
+    elif outcome == "skip":
+        with pytest.raises(pytest.skip.Exception):
+            _require_two_native_npus()
+    else:
+        _require_two_native_npus()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_native_npu_launch_keeps_missing_devices_runnable():
+    assert _native_npu_launch(SimpleNamespace(capabilities=SimpleNamespace(backend="cpu", devices=()))) == LaunchSpec(
+        device="cpu"
+    )
+    assert _native_npu_launch(
+        SimpleNamespace(capabilities=SimpleNamespace(backend="npu", devices=("0",)))
+    ) == LaunchSpec(device="cpu")
+    assert _native_npu_launch(
+        SimpleNamespace(capabilities=SimpleNamespace(backend="npu", devices=("0", "1")))
+    ) == LaunchSpec(nproc=2, device="accelerator")
+
+
+@pytest.mark.launch_plan(provider=_native_npu_launch)
 @pytest.mark.parametrize("ep", [1, 2])
 def test_native_fsdp_expert_fp32_dcp_cold_resume(tmp_path, ep):
-    if not IS_NPU_AVAILABLE or torch.npu.device_count() < 2:
-        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
-            pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires two native NPU devices")
-        pytest.skip("requires two native Ascend devices")
+    _require_two_native_npus()
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     for phase in ("fresh", "resume"):
@@ -116,12 +184,9 @@ def test_native_fsdp_expert_fp32_dcp_cold_resume(tmp_path, ep):
         _assert_ep2_checkpoint_layout(tmp_path / "ep2-dcp")
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
+@pytest.mark.launch_plan(provider=_native_npu_launch)
 def test_native_fp32_expert_selective_offload_cold_resume(tmp_path):
-    if not IS_NPU_AVAILABLE or torch.npu.device_count() < 2:
-        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
-            pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires two native NPU devices")
-        pytest.skip("requires two native Ascend devices")
+    _require_two_native_npus()
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     results = {}

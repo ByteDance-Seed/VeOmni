@@ -1950,6 +1950,184 @@ def test_model_object_alias_graph_must_match_on_resume(tmp_path, kind):
     torch.testing.assert_close(target.p, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("source_shared", [False, True])
+def test_distinct_tensor_storage_alias_must_match_before_resume(tmp_path, source_shared):
+    def build(shared):
+        model = torch.nn.Module()
+        model.p = torch.nn.Parameter(torch.ones(3))
+        view = model.p.detach()
+        model.register_buffer("view", view if shared else view.clone())
+        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([model.p])}, ["leaf"])
+        return model, optimizer
+
+    source, optimizer = build(source_shared)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored = build(not source_shared)
+    before = (target.p.detach().clone(), target.view.detach().clone())
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.p, before[0], rtol=0, atol=0)
+    torch.testing.assert_close(target.view, before[1], rtol=0, atol=0)
+
+
+def test_matching_storage_views_resume_and_update(tmp_path):
+    def build():
+        model = torch.nn.Module()
+        model.p = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+        model.register_buffer("view", model.p.detach()[::2])
+        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([model.p], lr=0.01)}, ["leaf"])
+        return model, optimizer
+
+    def step(model, optimizer):
+        model.p.grad = torch.ones_like(model.p)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    source, optimizer = build()
+    step(source, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored = build()
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    step(source, optimizer)
+    step(target, restored)
+    torch.testing.assert_close(target.p, source.p, rtol=0, atol=0)
+    torch.testing.assert_close(target.view, source.view, rtol=0, atol=0)
+
+
+def test_storage_view_geometry_and_disjoint_views_are_distinguished():
+    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+
+    base = torch.arange(8, dtype=torch.float32)
+    parameter = torch.nn.Parameter(base[:4])
+    overlap = base[1:4:2]
+    shifted = base[:3:2]
+    disjoint = base[4:]
+
+    def graph(view):
+        return _model_storage_alias_graph(
+            {id(parameter): {"parameter:p"}, id(view): {"buffer:view"}},
+            {id(parameter): parameter, id(view): view},
+        )
+
+    assert graph(overlap) and graph(shifted)
+    assert graph(overlap) != graph(shifted)
+    assert graph(disjoint)["storage_groups"]
+    independent = base[4:].clone()
+    assert not graph(independent)["storage_groups"]
+    assert graph(disjoint) != graph(independent)
+
+
+def test_storage_view_proof_binds_internal_overlap_and_quantization():
+    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+
+    def graph(value):
+        return _model_storage_alias_graph({id(value): {"buffer:view"}}, {id(value): value})
+
+    assert graph(torch.ones(1).expand(3)) != graph(torch.ones(3))
+    with pytest.raises(RuntimeError, match="quantized"):
+        graph(torch.quantize_per_tensor(torch.ones(3), 0.1, 0, torch.quint8))
+
+
+def test_storage_view_proof_binds_empty_shared_storage():
+    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+
+    first = torch.empty(0)
+    shared = first.detach()
+    independent = torch.empty(0)
+
+    def graph(second):
+        return _model_storage_alias_graph(
+            {id(first): {"buffer:first"}, id(second): {"buffer:second"}},
+            {id(first): first, id(second): second},
+        )
+
+    assert graph(shared)["storage_groups"]
+    assert not graph(independent)["storage_groups"]
+    assert graph(shared) != graph(independent)
+
+
+def test_storage_view_proof_ignores_unrelated_non_ascii_mapping(tmp_path):
+    import mmap
+
+    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+
+    path = tmp_path / "模型.bin"
+    path.write_bytes(bytes(64))
+    with path.open("r+b") as file, mmap.mmap(file.fileno(), 64, access=mmap.ACCESS_COPY):
+        value = torch.ones(3)
+        _model_storage_alias_graph({id(value): {"buffer:view"}}, {id(value): value})
+
+
+@pytest.mark.parametrize("method", ["from_file", "frombuffer"])
+def test_storage_view_proof_rejects_shared_cpu_mappings(tmp_path, method):
+    import mmap
+
+    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+
+    path = tmp_path / "mapping.bin"
+    path.write_bytes(bytes(64))
+    with path.open("r+b") as file:
+        if method == "from_file":
+            value = torch.from_file(str(path), shared=True, size=16, dtype=torch.float32)
+        else:
+            mapping = mmap.mmap(file.fileno(), 64, access=mmap.ACCESS_WRITE)
+            value = torch.frombuffer(mapping, dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="shared CPU model tensor mappings"):
+            _model_storage_alias_graph({id(value): {"buffer:view"}}, {id(value): value})
+        if method == "frombuffer":
+            del value
+            mapping.close()
+
+
+def test_old_layout_without_storage_view_proof_is_rejected(tmp_path, monkeypatch):
+    import veomni.checkpoint.optimizer_resume_layout as layout
+
+    source, optimizer = _model_and_optimizer()
+    original = layout._local_layout
+
+    def legacy_layout(*args, **kwargs):
+        value = original(*args, **kwargs)
+        if isinstance(value, dict):
+            value.pop("model_storage_aliases_v1")
+        return value
+
+    parallel = SimpleNamespace(dp_mode="ddp")
+    with monkeypatch.context() as patch:
+        patch.setattr(layout, "_local_layout", legacy_layout)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    target, restored = _model_and_optimizer()
+    before = target.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="layout|identity"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.weight, before, rtol=0, atol=0)
+
+
 def _save_destination_stat_error_worker(rank, checkpoint, location, endpoint):
     import errno
     import os
