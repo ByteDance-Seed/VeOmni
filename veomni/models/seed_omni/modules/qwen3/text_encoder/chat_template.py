@@ -4,10 +4,6 @@ Wraps each turn in ``<|im_start|>{role}\\n{content}<|im_end|>\\n`` (standard Qwe
 ChatML — every turn is closed); the closing ``<|im_end|>`` is supervised only on
 assistant turns. Reuses :class:`TextEncoderChatTemplate` for tokenize / merge /
 pack; only the ChatML templating and generation prompt are model-specific.
-
-:class:`Qwen3VLChatTemplate` is re-exported from the ``qwen3vl`` family rather
-than re-implemented here: image mode is the Qwen3-VL template (per-frame video
-segments with timestamps, vision wrap tokens), so a second copy would drift.
 """
 
 from __future__ import annotations
@@ -16,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....utils.conversation import ConversationItem
-from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatMarkers, Qwen3VLChatTemplate
 from ...text_encoder.chat_template import TextEncoderChatTemplate
 
 
@@ -84,11 +79,3 @@ class Qwen3ChatTemplate(TextEncoderChatTemplate):
         out = list(sample)
         out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
         return out
-
-
-__all__ = [
-    "Qwen3ChatMarkers",
-    "Qwen3ChatTemplate",
-    "Qwen3VLChatMarkers",
-    "Qwen3VLChatTemplate",
-]

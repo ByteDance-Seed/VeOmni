@@ -129,6 +129,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
+        """Bind the arguments, config and accelerator settings for one module."""
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
@@ -517,6 +518,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def has_trainable_parameters(self) -> bool:
+        """Whether any parameter of this module requires grad (cached after first use)."""
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters

@@ -1,8 +1,25 @@
+# Cross-family composition — three ordinary modules, no new Python:
+#
+#   qwen3vl_vision        from the SeedOmni Qwen3-VL modules, retargeted onto the
+#                         0.6B backbone and frozen except its patch merger
+#   qwen3_text_encoder    from the SeedOmni Qwen3 modules, in image mode
+#   qwen3_llm             from the SeedOmni Qwen3 modules
+#
+# The `model_config:` overrides are what turn a text-only LLM into an image
+# understanding one; nothing here is specific to this recipe's Python.
 qwen3vl_vision:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct/qwen3vl_vision
+  # Absolute on purpose: this module comes from a *different* checkpoint than
+  # `model.model_path` (which is the Qwen3-0.6B split root). Per-module paths are
+  # resolved under `model.model_path` unless they are absolute.
+  model_path: /abs/path/to/Qwen3-VL-2B-Instruct-split/qwen3vl_vision
   model_config:
+    # Retarget the ViT's own patch merger instead of adding a projector: the
+    # Qwen3-VL ViT emits 2048-d tokens, Qwen3-0.6B needs 1024. `linear_fc2` then
+    # has the wrong shape and is re-initialised at load.
     out_hidden_size: 1024
+    # The plain Qwen3 backbone has no DeepStack injection path.
     disable_deepstack: true
+    # Freeze the ViT blocks; `freeze_model` keeps the merger trainable.
     freeze: true
 qwen3_text_encoder:
   model_path: qwen3_text_encoder
@@ -10,6 +27,8 @@ qwen3_text_encoder:
     gradient_checkpointing:
       enable: false
   model_config:
+    # Use the Qwen3-VL chat template (vision wrap tokens) and keep only the
+    # vision special-token embedding rows trainable.
     enable_image: true
 qwen3_llm:
   model_path: qwen3_llm

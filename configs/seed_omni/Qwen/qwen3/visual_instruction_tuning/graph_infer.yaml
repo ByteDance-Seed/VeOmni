@@ -1,4 +1,9 @@
-# Qwen3-0.6B visual instruction tuning inference — image understanding (I2T).
+# Qwen3-0.6B visual instruction tuning — image understanding (I2T) inference.
+#
+# Same FSM shape as the text-only Qwen3 graph, with the vision tower in front of
+# the prompt encode: `qwen3vl_vision` turns the request's images into rows on the
+# carrier, `qwen3_text_encoder` (image mode) templates + embeds the text around
+# them, then the ChatML AR loop runs.
 initial: prompt_encode
 
 states:

@@ -1,5 +1,12 @@
+# `sources` are placeholders: replace each entry with an absolute path (or an
+# `hdfs://` URL) this job can read. `names` are preprocessor keys in
+# veomni/data/seed_omni/preprocess.py — not paths, leave them as they are.
+#
+# Image-caption data is enough for this recipe: the Qwen3-0.6B backbone is
+# plain M-RoPE-free, so it consumes merged image tokens only (no video frame
+# timestamps, no DeepStack).
 sources:
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - sharegpt4v_cap_100k
 names:
   - sharegpt4v_cap_100k
 schedule:
