@@ -123,13 +123,26 @@ checked when its handle is built, so an unavailable selection raises instead of
 falling back to `eager`.
 
 A second rejection covers the paths a row cannot serve. A fake-quantizing row reads
-the weights it is handed, so a model-side branch that bypasses it would train at
-full precision while the config still said QAT. Those branches refuse the
-quantizing selection instead of falling through: a projection wrapped after
-construction (LoRA) raises, an activation the fused SwiGLU kernel does not implement
-raises, and expert LoRA raises on the `qat` experts row because no adapter forward
-would quantize the base weights. Only quantizing rows are affected — every
-reference row keeps its fallback.
+the weights it is handed, so a branch that bypasses it would train at full precision
+while the config still said QAT. Three of them refuse instead of falling through,
+each where the information lives:
+
+- **An activation no quantizing row implements** is refused at *config load* by
+  `configuration_base._reject_quantized_swiglu_on_an_unfused_activation`. The
+  model's gate excludes those activations before the handle is called, so without
+  the check the config would claim QAT and quantize nothing. Failing at load also
+  beats failing on step one. `swiglu_mlp.FUSED_ACTIVATIONS` holds the set.
+- **A projection wrapped after construction** (LoRA keeps the base layer at
+  `base_layer`, so there is no `weight`) is refused by
+  `has_plain_linear_projections` when it calls `reject_quantizing_row`.
+- **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
+  because no adapter forward would quantize the base weights.
+
+Only quantizing rows are affected — every reference row keeps its fallback. The
+routed-expert side has its own refusals, at two levels: `moe_implementation='qat'`
+with a non-SwiGLU activation is refused in the model's expert forward (the
+activation is fused into the grouped GEMM there, so the Python fallback genuinely
+cannot quantize), and expert LoRA is refused as above.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be

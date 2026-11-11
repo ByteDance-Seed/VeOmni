@@ -81,11 +81,14 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
 def reject_quantizing_row(owner: nn.Module, reason: str, *, remedy: str) -> None:
     """Raise when ``owner``'s ``swiglu_mlp`` row quantizes and its call site cannot run it.
 
-    Two model-side paths bypass ``owner.veomni_swiglu_mlp``: a projection wrapped
-    after construction, and an activation the fused SwiGLU kernel does not
-    implement. Neither can hand a fake-quantizing row the weights it rounds, so
-    falling through would train at full precision on a config that says otherwise.
-    Call this on such a path instead of returning quietly.
+    A wrapped projection (LoRA keeps the base layer at ``base_layer``) has no
+    ``weight`` for the row to read, so falling through would train at full
+    precision on a config that says otherwise. ``has_plain_linear_projections``
+    calls this on that path.
+
+    An unsupported *activation* is refused earlier, at config load, by
+    ``configuration_base._reject_quantized_swiglu_on_an_unfused_activation`` --
+    before a handle is even built. Do not route that case through here.
     """
     handle = getattr(owner, "veomni_swiglu_mlp", None)
     impl = getattr(handle, "impl", None)
