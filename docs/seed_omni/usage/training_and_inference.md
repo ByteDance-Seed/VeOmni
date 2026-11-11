@@ -206,7 +206,9 @@ flowchart TB
 
 `generate()` always lives on the native `modeling.py`, so an all-eager Inferencer
 run builds the same object a native user gets from `OmniModel.from_pretrained`;
-the launcher only projects the YAML onto `OmniConfig` first.
+the launcher only projects the YAML onto `OmniConfig` first. When the checkpoint
+declares `generation_kwargs` defaults, `infer.generation_kwargs` overrides them
+per key rather than replacing the bag.
 
 Inference does not use sequence or context parallelism: keep `ulysses_size` and
 `cp_size` at 1 on every module. The generation loop decodes one token at a time

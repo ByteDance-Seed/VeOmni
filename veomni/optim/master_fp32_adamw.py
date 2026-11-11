@@ -119,6 +119,19 @@ class MasterFP32AdamW(Optimizer):
             raise ValueError(
                 "loaded state dict contains a parameter group that doesn't match the size of optimizer's group"
             )
+        if any(
+            group.get("qwen3_image_row_mask") != saved.get("qwen3_image_row_mask")
+            for group, saved in zip(groups, saved_groups, strict=True)
+        ):
+            raise RuntimeError(
+                "Optimizer checkpoint Qwen3 image row-mask identity differs; explicit migration is required"
+            )
+        if any(
+            group.get("qwen3_image_row_mask") is not None
+            and (group.get("weight_decay") != 0.0 or saved.get("weight_decay") != 0.0)
+            for group, saved in zip(groups, saved_groups, strict=True)
+        ):
+            raise RuntimeError("Optimizer checkpoint Qwen3 image row-mask requires zero weight decay")
         id_map = dict(
             zip(
                 chain.from_iterable(group["params"] for group in saved_groups),

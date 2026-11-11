@@ -60,7 +60,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
@@ -81,7 +80,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationL
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -188,13 +187,6 @@ class Qwen3MoeAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -204,7 +196,7 @@ class Qwen3MoeAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -555,6 +547,13 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen3MoeModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -592,15 +591,21 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        # --- Patch.1 ---
         # transformers 5.9 dropped ``cache_position`` from these constructors
-        # ("Deprecated and unused" — see masking_utils.py:917).
+        # ("Deprecated and unused" — see masking_utils.py:917). Forward ``**kwargs``
+        # so ``veomni.models.utils.mask_utils`` can build packed masks from ``cu_seq_lens_q``.
         causal_mask = mask_function(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
