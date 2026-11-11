@@ -167,6 +167,23 @@ def test_minimax_h3_image_vae_roundtrip():
     assert decoded.shape == image.shape
 
 
+def test_minimax_h3_image_vae_tiles_and_stitches():
+    vae = _tiny_vae().eval()
+    vae.enable_tiling(
+        tile_sample_min_height=64,
+        tile_sample_min_width=64,
+        tile_sample_min_overlap_height=16,
+        tile_sample_min_overlap_width=16,
+    )
+    image = torch.randn(1, 3, 96, 128)
+    with torch.no_grad():
+        latent = vae.encode(image).latent_dist.mode()
+        decoded = vae.decode(latent).sample
+
+    assert latent.shape == (1, 24, 6, 8)
+    assert decoded.shape == image.shape
+
+
 def test_minimax_h3_image_vae_uses_diffusers_checkpoint_names():
     keys = set(_tiny_vae().state_dict())
     expected = {
@@ -220,6 +237,31 @@ def test_minimax_h3_image_patchify_matches_unpatchify():
 def test_minimax_h3_image_canvas_size_uses_minimum_area():
     assert get_image_canvas_size(1024, 1024, 2048 * 2048, 32) == (2048, 2048)
     assert get_image_canvas_size(2048, 2048, 2048 * 2048, 32) == (2048, 2048)
+
+
+def test_minimax_h3_text_encoder_inherits_condition_ops(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text_encoder_module
+
+    captured = {}
+
+    class FakeLanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = torch.nn.Identity()
+
+    class FakeQwen3VLModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = FakeLanguageModel()
+            captured["config"] = config
+
+    monkeypatch.setattr(text_encoder_module, "Qwen3VLModel", FakeQwen3VLModel)
+    config = _tiny_condition_config()
+    config._set_ops_implementation(eager_ops_config())
+    text_encoder_module.MiniMaxH3TextEncoder(num_retained_layers=1, config=config)
+
+    assert captured["config"].ops_config.attn_implementation == "eager"
 
 
 def test_minimax_h3_image_edit_presentation_tags_picture_blocks():
@@ -316,11 +358,23 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         def forward(self, input_ids, attention_mask=None, **kwargs):
             return torch.randn(input_ids.shape[1], 16, dtype=torch.bfloat16)
 
+    class FakeImageProcessor:
+        merge_size = 2
+
+        def __call__(self, images, return_tensors="pt"):
+            return {
+                "pixel_values": torch.zeros(len(images), 3, 4, 4),
+                "image_grid_thw": torch.tensor([[1, 4, 4]] * len(images)),
+            }
+
+    class FakeProcessor:
+        image_processor = FakeImageProcessor()
+
     def fake_init(self, condition_config):
         self._text_encoder = FakeTextEncoder()
         self._vae = vae
         self._tokenizer = FakeTokenizer()
-        self._processor = None
+        self._processor = FakeProcessor()
 
     from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
         MiniMaxH3ImageConditionModel,
@@ -328,6 +382,27 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
 
     monkeypatch.setattr(MiniMaxH3ImageConditionModel, "_init_encoders", fake_init)
     pipe = MiniMaxH3ImagePipeline.from_pretrained(str(tmp_path), torch_dtype=torch.bfloat16)
-    image = pipe("a cat", height=32, width=32, min_generation_area=1024, seed=0)
+    assert pipe.dit.dit.video_patch_proj.weight.dtype == torch.float32
+    assert pipe.dit.dit.time_embedder.proj_in.weight.dtype == torch.float32
+    assert pipe.dit.dit.final_layer.video_out.weight.dtype == torch.float32
+    assert pipe.dit.dit.final_layer.pdd_out[0].weight.dtype == torch.float32
 
+    image = pipe("a cat", height=32, width=32, min_generation_area=1024, seed=0)
     assert image.size == (32, 32)
+
+    from veomni.models.diffusers.minimax_h3_image import inference as inference_module
+
+    monkeypatch.setattr(
+        inference_module,
+        "_resize_reference",
+        lambda image, min_short_edge, max_short_edge: image.convert("RGB"),
+    )
+    edit = pipe(
+        "edit <Picture 1>",
+        height=64,
+        width=64,
+        min_generation_area=1024,
+        references=[Image.new("RGB", (64, 64), "red")],
+        seed=0,
+    )
+    assert edit.size == (64, 64)

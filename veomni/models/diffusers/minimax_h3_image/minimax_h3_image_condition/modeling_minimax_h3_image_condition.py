@@ -52,6 +52,10 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ImageConditionModelConfig
     supports_gradient_checkpointing = False
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention belongs to the delegated components, which validate their own backends.
+        return attn_implementation
+
     def __init__(self, config: MiniMaxH3ImageConditionModelConfig, **kwargs):
         super().__init__(config, **kwargs)
         self._text_encoder = None
@@ -106,7 +110,10 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         logger.info_rank0("MiniMax-H3-Image VAE loaded.")
 
         with _init_empty_weights():
-            self._text_encoder = MiniMaxH3TextEncoder(num_retained_layers=config.text_encoder_num_retained_layers)
+            self._text_encoder = MiniMaxH3TextEncoder(
+                num_retained_layers=config.text_encoder_num_retained_layers,
+                config=config,
+            )
         text_path = os.path.join(base, config.text_encoder_subfolder)
         filter_fn = self._text_encoder_filter(config.text_encoder_num_retained_layers)
         loaded = self._stream_load_weights(self._text_encoder, text_path, torch.bfloat16, filter_fn=filter_fn)

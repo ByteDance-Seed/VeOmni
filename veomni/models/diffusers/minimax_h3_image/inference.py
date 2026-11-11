@@ -163,6 +163,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         dit_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch_dtype)
+        pipe._keep_dit_fp32_modules()
         load_model_weights(pipe.dit, os.path.join(model_path, "transformer"), init_device="cpu")
         pipe.dit.eval()
         pipe._load_pdd_heads(pdd_state)
@@ -190,13 +191,33 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             head.weight.data = weight[index].clone()
             head.bias.data = bias[index].clone()
 
+    def _keep_dit_fp32_modules(self) -> None:
+        """Preserve the released checkpoint's FP32 projections across loading."""
+        modules = (
+            self.dit.dit.video_patch_proj,
+            self.dit.dit.time_embedder,
+            self.dit.dit.final_layer.video_out,
+            self.dit.dit.final_layer.pdd_out,
+        )
+        for module in modules:
+            if module is not None:
+                module.to(torch.float32)
+
+    @staticmethod
+    def _parameter_on_device(parameter: torch.Tensor, device: torch.device) -> bool:
+        if parameter.device.type != device.type:
+            return False
+        if parameter.device.index is None or device.index is None:
+            return True
+        return parameter.device.index == device.index
+
     def _stage(self, names) -> None:
         for name in names:
             module = getattr(self, name)
             if module is None:
                 continue
             parameter = next(module.parameters(), None)
-            if parameter is None or parameter.device == self.device:
+            if parameter is None or self._parameter_on_device(parameter, self.device):
                 continue
             module.to(self.device)
 
