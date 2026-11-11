@@ -309,12 +309,15 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
         self._generation_state = FlowGenerationState()
         self.post_init()
-        nn.init.constant_(self.llm2vae.weight, 0)
-        nn.init.constant_(self.llm2vae.bias, 0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, PositionEmbedding):
             module.reset_parameters()
+            return
+        if module is self.llm2vae:
+            nn.init.constant_(module.weight, 0)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
             return
         super()._init_weights(module)
 

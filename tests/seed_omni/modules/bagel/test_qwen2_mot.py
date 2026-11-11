@@ -226,6 +226,25 @@ def test_bagel_modules_ops_dispatch_meta_rotary_and_flops(available_nvidia_ops) 
     assert rotary.original_inv_freq.dtype == torch.float32
     torch.testing.assert_close(rotary.inv_freq, ref_rotary.inv_freq)
 
+    # BagelFlowConnector meta -> to_empty -> init_weights preserves zero-initialized llm2vae velocity head
+    flow_cfg = OMNI_CONFIG_REGISTRY["bagel_flow_connector"]()(
+        hidden_size=16,
+        z_channels=2,
+        latent_patch_size=1,
+        patch_latent_dim=2,
+        max_latent_size=4,
+        timestep_frequency_embedding_size=4,
+    )
+    eager_flow = OMNI_MODEL_REGISTRY["bagel_flow_connector"]()(flow_cfg)
+    with torch.device("meta"):
+        meta_flow = OMNI_MODEL_REGISTRY["bagel_flow_connector"]()(flow_cfg)
+    materialized_flow = meta_flow.to_empty(device="cpu")
+    materialized_flow.init_weights()
+    assert torch.count_nonzero(materialized_flow.llm2vae.weight) == 0
+    assert torch.count_nonzero(materialized_flow.llm2vae.bias) == 0
+    assert torch.count_nonzero(materialized_flow.vae2llm.weight) > 0
+    torch.testing.assert_close(materialized_flow.latent_pos_embed.pos_embed, eager_flow.latent_pos_embed.pos_embed)
+
     siglip_cfg = BagelSiglipNavitConfig(
         hidden_size=32,
         intermediate_size=64,
