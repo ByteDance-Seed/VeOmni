@@ -53,16 +53,22 @@ _SDPA = frozenset({"sdpa"})
 _EAGER = frozenset({"eager"})
 
 
-def _compose_or_and(kwargs: dict[str, Any]) -> dict[str, Any]:
+def _compose_or_and(kwargs: dict[str, Any], *, compose_overlays: bool = True) -> dict[str, Any]:
     """Compose optional OR/AND predicates into one Transformers mask function."""
     extra = dict(kwargs)
     mask_function = extra.pop("mask_function", causal_mask_function)
     or_mask_function = extra.pop("or_mask_function", None)
     and_mask_function = extra.pop("and_mask_function", None)
-    if or_mask_function is not None:
-        mask_function = or_masks(mask_function, or_mask_function)
-    if and_mask_function is not None:
-        mask_function = and_masks(mask_function, and_mask_function)
+    if compose_overlays:
+        if or_mask_function is not None:
+            mask_function = or_masks(mask_function, or_mask_function)
+        if and_mask_function is not None:
+            mask_function = and_masks(mask_function, and_mask_function)
+    else:
+        if or_mask_function is not None:
+            extra["or_mask_function"] = or_mask_function
+        if and_mask_function is not None:
+            extra["and_mask_function"] = and_mask_function
     extra["mask_function"] = mask_function
     extra.pop("device", None)
     return extra
@@ -80,9 +86,14 @@ def _to_eager_additive(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.T
     return torch.where(mask, torch.zeros((), device=mask.device, dtype=dtype), min_dtype)
 
 
-def _require_canonical_causal(backend: str, mask_function: Any) -> None:
+def _require_canonical_causal(
+    backend: str,
+    mask_function: Any,
+    or_mask_function: Any = None,
+    and_mask_function: Any = None,
+) -> None:
     """Reject visibility predicates that a flash-like or range backend would drop."""
-    if mask_function is not causal_mask_function:
+    if mask_function is not causal_mask_function or or_mask_function is not None or and_mask_function is not None:
         raise ValueError(
             f"{backend} cannot represent a custom mask_function through this shape API; "
             "use SDPA/FlexAttention or backend-specific mask metadata."
@@ -219,13 +230,18 @@ def sliding_window_mask(
     kwargs. ``skip_ulysses`` is forwarded to the Flex / SDPA builders.
     """
     backend = impl.removeprefix("veomni_")
-    extra = _compose_or_and(kwargs)
+    extra = _compose_or_and(kwargs, compose_overlays=False)
     extra["skip_ulysses"] = skip_ulysses
     cu_seqlens = extra.pop("cu_seqlens", None)
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support sliding_window_mask")
     if backend in _FLASH:
-        _require_canonical_causal(backend, extra["mask_function"])
+        _require_canonical_causal(
+            backend,
+            extra["mask_function"],
+            extra.get("or_mask_function"),
+            extra.get("and_mask_function"),
+        )
         return flash_attention_mask_builder(
             batch_size,
             q_len,
