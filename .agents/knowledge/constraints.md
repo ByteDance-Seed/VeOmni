@@ -187,16 +187,17 @@ Core files:
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
-    - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
-      still joins the save reduction and the promotion collectives. The sidecar
-      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
-      (the resume completeness marker) lands last. Each step writes a new
-      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
-      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
-      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
-      (VeOmni 0.1.12). Delete that module and its two imports to drop the
-      fallback; the load then raises.
-    - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
+    - The lr scheduler is per-rank, in
+      ``model/<module>/extra_state/extra_state_rank_{R}.pt`` beside whatever
+      state the runtime contributes. There is no replicated sidecar file. That
+      pickle is written before ``dcp.save`` / ``dcp.async_save``, so DCP's
+      ``.metadata`` (the resume completeness marker) lands last. Each step
+      writes a new ``global_step_{N}/``; a failed save has no ``.metadata`` and
+      is skipped. With ``stage_dir`` the pickle is staged with the shards and
+      every marker is copied last at promotion. There is no fallback to a
+      pre-split layout: a VeOmni 0.1.12 / 0.2.x checkpoint no longer resumes
+      (see ``docs/usage/checkpoint.md``).
+    - ``extra_state/rank_{R}.pt`` stays per-rank: the step counter and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 
