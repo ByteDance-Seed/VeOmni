@@ -41,14 +41,6 @@ from veomni.utils.device import get_device_type, get_rocm_gcn_arch
 DEVICE = get_device_type()
 
 
-@pytest.fixture(autouse=True)
-def clear_qat_hardware_gate_cache():
-    """Keep process-level hardware caching isolated between QAT tests."""
-    qat_hardware.quantizer_backend.cache_clear()
-    yield
-    qat_hardware.quantizer_backend.cache_clear()
-
-
 def _require_fp8_quantizer_gpu():
     """Skip unless this GPU runs the TileLang or the Triton FP8 quantizers."""
     if get_rocm_gcn_arch() in qat_hardware.TRITON_FP8_ARCHS:
@@ -97,8 +89,10 @@ def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
     vendor_calls = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
     _install_fake_quant_backend(monkeypatch, vendor_calls, "veomni.ops.qat.triton_quant")
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
-    monkeypatch.setattr(qat_hardware, "get_rocm_gcn_arch", lambda: None)
+    error = RuntimeError("QAT quantizers require an SM90 or later NVIDIA CUDA GPU")
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
 
     for name, call in _qat_entry_calls():
         with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
@@ -109,20 +103,15 @@ def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
 def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
     """The hardware gate does not intercept supported QAT calls."""
     vendor_calls = []
-    hardware_checks = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
-
-    def supports_sm90(self):
-        hardware_checks.append(True)
-        return True
-
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", supports_sm90)
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "tilelang")
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: None)
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: None)
 
     for name, call in _qat_entry_calls():
         vendor_calls.clear()
         call()
         assert vendor_calls, f"{name} did not reach the vendor backend after the hardware check"
-    assert hardware_checks == [True]
 
 
 def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkeypatch):
@@ -130,9 +119,10 @@ def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkey
     tilelang_calls, triton_calls = [], []
     _install_fake_quant_backend(monkeypatch, tilelang_calls)
     _install_fake_quant_backend(monkeypatch, triton_calls, "veomni.ops.qat.triton_quant")
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
-    monkeypatch.setattr(type(qat_hardware.ROCM_GPU), "matches", lambda self: True)
-    monkeypatch.setattr(qat_hardware, "get_rocm_gcn_arch", lambda: "gfx942")
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "triton")
+    error = RuntimeError("QAT TileLang quantizers require an SM90 or later NVIDIA CUDA GPU")
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
 
     for name, call in _qat_entry_calls():
         triton_calls.clear()
@@ -154,8 +144,16 @@ def reference_quantizers(monkeypatch):
     quantize-dequantize numerics for layout, prefix, straight-through gradients,
     and temporary parameter substitution assertions.
     """
-    monkeypatch.setattr(fp8_blockwise, "act_quant", reference_act_quant)
-    monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", reference_fp8_weight_quant)
+
+    def act_quant_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
+        return reference_act_quant(x, block_size, scale_fmt, scale_dtype, dequant)
+
+    def weight_quant_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
+        return reference_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype, dequant)
+
+    monkeypatch.setattr(fp8_blockwise, "_act_quant_impl", act_quant_impl)
+    monkeypatch.setattr(fp8_blockwise, "_fp8_weight_quant_impl", weight_quant_impl)
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "reference")
 
 
 @pytest.fixture
@@ -230,6 +228,11 @@ def test_fake_quant_rejects_non_bfloat16_operands():
         fp8_fake_quant_weight(torch.zeros(128, 128))
     with pytest.raises(TypeError, match="bfloat16 activation"):
         fp8_fake_quant_act_prefix(torch.zeros(2, 512), 128)
+
+
+def test_fake_quant_rejects_a_cpu_operand_before_backend_import():
+    with pytest.raises(RuntimeError, match="QAT FP8 quantizers require"):
+        fp8_fake_quant_act(torch.zeros(2, 128, dtype=torch.bfloat16))
 
 
 def test_fake_quant_rejects_an_unknown_scale_fmt():

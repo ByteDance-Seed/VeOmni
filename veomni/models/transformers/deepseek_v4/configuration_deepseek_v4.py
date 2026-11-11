@@ -62,6 +62,7 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
     dspark_num_experts_per_tok: int | None = None
     mtp_loss_coef: float = 1.0
     freeze_mtp: bool = False
+    _supports_fp8_blockwise_qat = True
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -174,9 +175,54 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
                         f"dspark_target_layer_ids contains {layer_idx!r}, outside [0, {self.num_hidden_layers})."
                     )
 
+    def _validate_qat_prerequisites(self) -> None:
+        if self.ops_config.qat_implementation != "fp8_blockwise":
+            return
+
+        quant_config = getattr(self, "quantization_config", None) or {}
+        if not isinstance(quant_config, dict):
+            quant_config = quant_config.to_dict() if hasattr(quant_config, "to_dict") else vars(quant_config)
+        top_level_expert_dtype = getattr(self, "expert_dtype", None)
+        metadata_expert_dtype = quant_config.get("expert_dtype")
+        if (
+            top_level_expert_dtype is not None
+            and metadata_expert_dtype is not None
+            and top_level_expert_dtype != metadata_expert_dtype
+        ):
+            raise ValueError(
+                "DeepSeek-V4 QAT requires expert_dtype to agree between the top-level config and "
+                f"quantization_config, got {top_level_expert_dtype!r} and {metadata_expert_dtype!r}."
+            )
+        expert_dtype = top_level_expert_dtype or metadata_expert_dtype or "fp8"
+        if expert_dtype not in ("fp8", "fp4"):
+            raise ValueError(f"DeepSeek-V4 QAT supports expert_dtype 'fp8' or 'fp4', got {expert_dtype!r}.")
+        self.expert_dtype = expert_dtype
+
+        raw_weight_block_size = quant_config.get("weight_block_size") or (128, 128)
+        if not isinstance(raw_weight_block_size, (list, tuple)) or len(raw_weight_block_size) != 2:
+            raise ValueError(
+                "DeepSeek-V4 quantization_config.weight_block_size must contain two dimensions, "
+                f"got {raw_weight_block_size!r}."
+            )
+        weight_block_size = tuple(raw_weight_block_size)
+        if weight_block_size != (128, 128):
+            raise ValueError(
+                "DeepSeek-V4 fp8_blockwise QAT trains with 128x128 weight tiles, "
+                f"but quantization_config.weight_block_size is {weight_block_size}."
+            )
+
+        if expert_dtype == "fp4":
+            import torch
+
+            if torch.version.hip is not None:
+                raise ValueError(
+                    "DeepSeek-V4 FP4 expert QAT requires NVIDIA TileLang; AMD ROCm supports FP8 experts only."
+                )
+
     def validate_build_prerequisites(self) -> None:
         """Refuse an invalid DSpark MTP or Lightning Indexer KL configuration before weight loading."""
         self._validate_mtp_prerequisites()
+        self._validate_qat_prerequisites()
 
         enabled = self.dsa_indexer_loss
         if not isinstance(enabled, bool):

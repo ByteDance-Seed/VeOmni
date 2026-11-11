@@ -47,15 +47,26 @@ def fp8_quantizers(request):
     return triton_quant
 
 
+def _require_triton_quantizers():
+    pytest.importorskip("triton")
+    if get_rocm_gcn_arch() not in TRITON_FP8_ARCHS:
+        pytest.skip("requires the ROCm Triton FP8 quantizers")
+    from veomni.ops.qat import triton_quant
+
+    return triton_quant
+
+
 def test_fp8_scale_pairing_rejects_e8m0_without_format():
     from veomni.ops.qat.scale import validate_fp8_scale_pairing
 
     validate_fp8_scale_pairing(None, torch.float32)
     validate_fp8_scale_pairing("ue8m0", torch.float8_e8m0fnu)
-    with pytest.raises(AssertionError, match="powers of two"):
+    with pytest.raises(ValueError, match="powers of two"):
         validate_fp8_scale_pairing(None, torch.float8_e8m0fnu)
-    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+    with pytest.raises(ValueError, match="float32 and float8_e8m0fnu"):
         validate_fp8_scale_pairing(None, torch.float16)
+    with pytest.raises(ValueError, match="scale_fmt"):
+        validate_fp8_scale_pairing("typo", torch.float32)
 
 
 def test_tilelang_fp4_quant_matches_reference_and_dequantizes():
@@ -148,6 +159,53 @@ def test_act_quant_matches_reference_across_row_tiles(fp8_quantizers, scale_fmt,
     )
 
 
+@pytest.mark.parametrize("scale_fmt", (None, "ue8m0"))
+def test_triton_act_quant_propagates_nonfinite_blocks_like_reference(scale_fmt):
+    quantizers = _require_triton_quantizers()
+    x = torch.zeros(3, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[0, 0] = float("nan")
+    x[1, 0] = float("inf")
+    x[2, 0] = float("-inf")
+
+    actual, actual_scales = quantizers.act_quant(x, scale_fmt=scale_fmt)
+    expected, expected_scales = reference_act_quant(x, scale_fmt=scale_fmt)
+    actual_float, expected_float = actual.float(), expected.float()
+    assert torch.equal(torch.isnan(actual_float), torch.isnan(expected_float))
+    assert torch.equal(torch.nan_to_num(actual_float), torch.nan_to_num(expected_float))
+    assert torch.isnan(actual_scales[0]).all()
+    assert torch.equal(actual_scales[1:], expected_scales[1:])
+
+    actual_dequant = quantizers.act_quant(x, scale_fmt=scale_fmt, dequant=True)
+    expected_dequant = reference_act_quant(x, scale_fmt=scale_fmt, dequant=True)
+    assert torch.equal(torch.isnan(actual_dequant), torch.isnan(expected_dequant))
+    assert torch.equal(torch.nan_to_num(actual_dequant), torch.nan_to_num(expected_dequant))
+
+
+def test_triton_fp8_rounding_ties_and_subnormal_boundary_match_reference():
+    quantizers = _require_triton_quantizers()
+    x = torch.zeros(1, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[0, :6] = torch.tensor(
+        [448.0, 1.0625, -1.0625, 2**-10, -(2**-10), -0.0],
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+
+    actual, scales = quantizers.act_quant(x, scale_fmt="ue8m0")
+    expected, expected_scales = reference_act_quant(x, scale_fmt="ue8m0")
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scales.view(torch.int32), expected_scales.view(torch.int32))
+
+
+def test_triton_quantizers_reject_invalid_public_inputs():
+    quantizers = _require_triton_quantizers()
+    with pytest.raises(ValueError, match="nonzero last dimension"):
+        quantizers.act_quant(torch.empty(2, 0, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="scale_fmt"):
+        quantizers.act_quant(torch.empty(2, 128, device=DEVICE, dtype=torch.bfloat16), scale_fmt="typo")
+    with pytest.raises(ValueError, match="scale_fmt"):
+        quantizers.fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_fmt="typo")
+
+
 def _weight_quant_test_input():
     """A 2x3 grid of 128x128 tiles, each exercising a different scale regime."""
     torch.manual_seed(6)
@@ -198,6 +256,24 @@ def test_fp8_weight_quant_matches_reference(fp8_quantizers):
     assert 0.0 < tile_amax[0, 2] < 1.0
     assert scales[0, 1] == 1e-4 / 448.0
     assert scales[0, 2] == 1e-4 / 448.0
+
+
+@pytest.mark.parametrize("scale_fmt", (None, "ue8m0"))
+def test_triton_weight_quant_propagates_nonfinite_tile_like_reference(scale_fmt):
+    quantizers = _require_triton_quantizers()
+    x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[0, 0] = float("nan")
+
+    actual, actual_scales = quantizers.fp8_weight_quant(x, scale_fmt=scale_fmt)
+    expected, _ = reference_fp8_weight_quant(x, scale_fmt=scale_fmt)
+    actual_float, expected_float = actual.float(), expected.float()
+    assert torch.equal(torch.isnan(actual_float), torch.isnan(expected_float))
+    assert torch.equal(torch.nan_to_num(actual_float), torch.nan_to_num(expected_float))
+    assert torch.isnan(actual_scales).all()
+
+    actual_dequant = quantizers.fp8_weight_quant(x, scale_fmt=scale_fmt, dequant=True)
+    expected_dequant = reference_fp8_weight_quant(x, scale_fmt=scale_fmt, dequant=True)
+    assert torch.equal(torch.isnan(actual_dequant), torch.isnan(expected_dequant))
 
 
 @pytest.mark.parametrize(
@@ -325,22 +401,22 @@ def test_fp8_weight_quant_dequant_fuses_the_round_trip(fp8_quantizers):
 def test_fp8_weight_quant_rejects_unsupported_inputs(fp8_quantizers):
     fp8_weight_quant = fp8_quantizers.fp8_weight_quant
 
-    with pytest.raises(AssertionError, match="2D weight"):
+    with pytest.raises(ValueError, match="2D weight"):
         fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))
-    with pytest.raises(AssertionError, match="bfloat16 weight"):
+    with pytest.raises(TypeError, match="bfloat16"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.float32))
-    with pytest.raises(AssertionError, match="divisible by block_size"):
+    with pytest.raises(ValueError, match="divisible by block_size"):
         fp8_weight_quant(torch.empty(128, 200, device=DEVICE, dtype=torch.bfloat16))
-    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+    with pytest.raises(ValueError, match="float32 and float8_e8m0fnu"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float16)
     # An E8M0 scale cannot represent the unrounded FP32 scale the kernel would
     # divide by, so the pairing has to be rejected instead of drifting.
-    with pytest.raises(AssertionError, match="powers of two"):
+    with pytest.raises(ValueError, match="powers of two"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
 
 
 def test_act_quant_rejects_e8m0_without_format(fp8_quantizers):
-    with pytest.raises(AssertionError, match="powers of two"):
+    with pytest.raises(ValueError, match="powers of two"):
         fp8_quantizers.act_quant(
             torch.empty(4, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu
         )

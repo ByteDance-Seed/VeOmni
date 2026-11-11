@@ -71,6 +71,13 @@ def _host(monkeypatch: pytest.MonkeyPatch, *, on_npu: bool, modeling_backend: st
     monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", on_npu)
 
 
+def test_model_without_qat_support_is_rejected_before_build():
+    config = SimpleNamespace(ops_config=SimpleNamespace(qat_implementation="fp8_blockwise"))
+
+    with pytest.raises(ValueError, match="does not implement qat_implementation"):
+        auto.check_model_build_prerequisites(config)
+
+
 # --- MagiAttention context parallelism ---------------------------------------------
 
 
