@@ -100,20 +100,26 @@ def _h3_packed(seq_len, text_len):
 
 def test_minimax_h3_flops_counts_each_packed_sequence(mock_device_flops):
     counter = VeomniFlopsCounter(_minimax_h3_config())
-    flops, promised = counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2, 1])
+    flops, promised = counter.estimate_flops([4, 2], 2.0, model_metadata={"h3_text_seqlens": [2, 1]})
     # Main projections 46080, attention 3840, refiner 11520 + 480 FLOPs.
     assert flops == pytest.approx(30960 / 1e12)
     assert promised == 1000.0
-    with_optional_arg, _ = counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2, 1], freeze_vit=False)
+    with_optional_arg, _ = counter.estimate_flops(
+        [4, 2], 2.0, model_metadata={"h3_text_seqlens": [2, 1]}, freeze_vit=False
+    )
     assert with_optional_arg == flops
-    empty, _ = counter.estimate_flops([], 2.0, h3_text_seqlens=[])
+    empty, _ = counter.estimate_flops([], 2.0, model_metadata={"h3_text_seqlens": []})
     assert empty == 0
+    empty_without_metadata, _ = counter.estimate_flops([], 2.0)
+    assert empty_without_metadata == 0
     with pytest.raises(ValueError, match="one text length"):
-        counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2])
+        counter.estimate_flops([4], 2.0)
+    with pytest.raises(ValueError, match="one text length"):
+        counter.estimate_flops([4, 2], 2.0, model_metadata={"h3_text_seqlens": [2]})
     with pytest.raises(ValueError, match="within packed"):
-        counter.estimate_flops([4], 2.0, h3_text_seqlens=[5])
+        counter.estimate_flops([4], 2.0, model_metadata={"h3_text_seqlens": [5]})
     with pytest.raises(ValueError, match="positive"):
-        counter.estimate_flops([4], 0, h3_text_seqlens=[2])
+        counter.estimate_flops([4], 0, model_metadata={"h3_text_seqlens": [2]})
     with patch("veomni.utils.count_flops.logger.warning_rank0"):
         unsupported, _ = counter.estimate_flops([4], 2.0, lora_config=_lora_config(8, ["q_proj"]))
     assert unsupported == 0
@@ -160,12 +166,12 @@ def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, moc
     meter.add({"packed": [_h3_packed(4, 2)]})
     meter.add([{"packed": _h3_packed(2, 1)}, {"packed": _h3_packed(3, 1)}])
     assert meter.batch_seqlens == [4, 2, 3]
-    assert meter._extra_flops_kwargs["h3_text_seqlens"] == [2, 1, 1]
+    assert meter._model_metadata["h3_text_seqlens"] == [2, 1, 1]
     metrics = meter.step(delta_time=2.0, global_step=1)
     assert metrics["mfu"] > 0
-    assert meter.batch_seqlens == [] and meter._extra_flops_kwargs == {}
+    assert meter.batch_seqlens == [] and meter._model_metadata == {}
     meter.add({"packed": _h3_packed(5, 2)})
-    assert meter.batch_seqlens == [5] and meter._extra_flops_kwargs["h3_text_seqlens"] == [2]
+    assert meter.batch_seqlens == [5] and meter._model_metadata["h3_text_seqlens"] == [2]
     meter.add({})
     metrics = meter.step(delta_time=2.0, global_step=2)
     assert metrics["mfu"] > 0
@@ -258,6 +264,8 @@ def test_registered_flops_metadata_callback_handles_step(monkeypatch, mock_devic
     from veomni.utils import flops_meter, helper
 
     def extract_metadata(batch):
+        if "text_lengths" not in batch:
+            return batch["lengths"], {}
         return batch["lengths"], {"text_lengths": batch["text_lengths"]}
 
     monkeypatch.setitem(flops_meter.FLOPS_METADATA_CALLBACKS, "ExampleDiT", extract_metadata)
@@ -273,15 +281,28 @@ def test_registered_flops_metadata_callback_handles_step(monkeypatch, mock_devic
     )
     calls = []
 
-    def estimate(lengths, delta_time, **kwargs):
-        calls.append((list(lengths), delta_time, list(kwargs["text_lengths"])))
-        return 100, 1000
+    def estimate(tokens_sum, lengths, delta_time, model_metadata=None):
+        text_lengths = None if model_metadata is None else list(model_metadata["text_lengths"])
+        calls.append((tokens_sum, list(lengths), delta_time, text_lengths))
+        return 0 if text_lengths is None else 100
 
-    meter.estimate_flops = estimate
+    meter.estimate_flops.__self__.estimate_func["ExampleDiT"] = estimate
     meter.add({"lengths": [4], "text_lengths": [2]})
+    meter.add({"lengths": [6], "text_lengths": [3]})
     assert meter.step(delta_time=1.0, global_step=1)["mfu"] == pytest.approx(0.1)
-    assert calls == [([4], 1.0, [2])]
-    assert meter._extra_flops_kwargs == {}
+    assert calls == [(10, [4, 6], 1.0, [2, 3])]
+    assert meter._model_metadata == {}
+    meter.add({"lengths": [5], "text_lengths": [1]})
+    assert meter.step(delta_time=2.0, global_step=2)["mfu"] == pytest.approx(0.1)
+    assert calls[-1] == (5, [5], 2.0, [1])
+    assert meter._model_metadata == {}
+    meter.add({"lengths": []})
+    assert meter.step(delta_time=1.0, global_step=3)["mfu"] == 0
+    assert calls[-1] == (0, [], 1.0, None)
+    assert meter._model_metadata == {}
+    meter.add({"lengths": [7], "text_lengths": [4]})
+    assert meter.step(delta_time=1.0, global_step=4)["mfu"] == pytest.approx(0.1)
+    assert calls[-1] == (7, [7], 1.0, [4])
 
 
 def test_hf_model_keeps_original_metadata_path(monkeypatch, mock_device_flops):
@@ -311,7 +332,7 @@ def test_hf_model_keeps_original_metadata_path(monkeypatch, mock_device_flops):
     }
     meter.add(batch)
     assert meter.batch_seqlens == [3]
-    assert meter._extra_flops_kwargs == {}
+    assert meter._model_metadata == {}
     assert meter._flops_metadata_callback is None
     assert meter.images_seqlens == [4]
     assert len(meter._batch_token_stats) == 1

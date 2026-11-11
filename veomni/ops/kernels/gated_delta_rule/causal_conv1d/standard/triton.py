@@ -46,7 +46,6 @@ def forward(
 ) -> tuple[Tensor, SavedState]:
     """NPU causal conv1d. *weight* is FLA ``[D, W]``; the kernel wants ``[W, D]``."""
     from ...vendor.triton.convolution import causal_conv1d_fwd_impl
-    from ...vendor.triton.utils import is_arch35
 
     del seq_idx, backend
     if bias is None:
@@ -57,9 +56,6 @@ def forward(
         # ``veomni.models.auto`` leaves ``cu_seq_lens_q`` on CPU for NPU fusion
         # attention. This kernel indexes ``cu_seqlens`` on ``x.device``.
         cu_seqlens = cu_seqlens.to(device=x.device, non_blocking=True)
-
-    if is_arch35():
-        raise NotImplementedError("causal_conv1d is not supported on arch35")
 
     weight_wd = weight.transpose(0, 1).contiguous()
     bias_opt = optional_tensor(bias)
@@ -83,10 +79,6 @@ def forward(
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
     """Return ``(grad_x, grad_weight, grad_bias, grad_cu_seqlens)``."""
     from ...vendor.triton.convolution import causal_conv1d_bwd_impl
-    from ...vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        raise NotImplementedError("causal_conv1d is not supported on arch35")
 
     meta = saved.metadata
     assert isinstance(meta, _Meta)

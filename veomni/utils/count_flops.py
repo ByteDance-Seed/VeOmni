@@ -118,7 +118,7 @@ class VeomniFlopsCounter:
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
 
-    def _estimate_minimax_h3_flops(self, tokens_sum, batch_seqlens, delta_time, h3_text_seqlens=None, **kwargs):
+    def _estimate_minimax_h3_flops(self, tokens_sum, batch_seqlens, delta_time, model_metadata=None, **kwargs):
         """Estimate useful full-parameter H3 training TFLOPS for the conditional branch.
 
         Counts the major DiT and text-refiner projections and attention matmuls.
@@ -127,6 +127,7 @@ class VeomniFlopsCounter:
         """
         if not batch_seqlens:
             return 0.0
+        h3_text_seqlens = (model_metadata or {}).get("h3_text_seqlens")
         if h3_text_seqlens is None or len(h3_text_seqlens) != len(batch_seqlens):
             raise ValueError("MiniMax-H3 FLOPs requires one text length per packed sample")
         if delta_time <= 0:
@@ -1509,7 +1510,7 @@ class VeomniFlopsCounter:
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
         freeze_vit: bool | None = None,
-        h3_text_seqlens=None,
+        model_metadata=None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1527,7 +1528,8 @@ class VeomniFlopsCounter:
                 models.
             freeze_vit (bool, optional): Whether the vision tower is frozen during full
                 fine-tuning. Ignored when ``lora_config`` is provided.
-            h3_text_seqlens (List[int], optional): Per-sample H3 text-refiner lengths.
+            model_metadata (dict, optional): Model-specific metadata interpreted by the selected estimator.
+                Metadata-aware estimators must also handle an omitted argument when no metadata was collected.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1550,8 +1552,8 @@ class VeomniFlopsCounter:
             kwargs["images_seqlens"] = images_seqlens
         if freeze_vit is not None:
             kwargs["freeze_vit"] = freeze_vit
-        if h3_text_seqlens is not None and self.config.model_type == "MiniMaxH3DiTModel":
-            kwargs["h3_text_seqlens"] = h3_text_seqlens
+        if model_metadata is not None:
+            kwargs["model_metadata"] = model_metadata
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)

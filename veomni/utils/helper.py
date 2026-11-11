@@ -132,18 +132,25 @@ def _compute_image_seqlens(
     return image_seqlens
 
 
+def _as_index_list(ds_idx: Any) -> List[int]:
+    """Normalize a batch's per-sample source indices to a plain ``list[int]``.
+
+    Three shapes reach this: a tensor (``PackingCollator`` concatenates per-sample
+    indices), a list (a collator that keeps them per sample), or a bare int (a
+    single-sample micro batch).
+    """
+    if isinstance(ds_idx, torch.Tensor):
+        return ds_idx.tolist()
+    if isinstance(ds_idx, list):
+        return [int(idx) for idx in ds_idx]
+    return [int(ds_idx)]
+
+
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     ds_idx = micro_batch.pop("ds_idx")
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
-    if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch (e.g. PackingCollator)
-        return ds_idx.tolist()
-    if isinstance(ds_idx, list):
-        # SeedOmniCollator gathers per-sample ds_idx into a list
-        return [int(idx) for idx in ds_idx]
-    # single-sample micro batch
-    return [int(ds_idx)]
+    return _as_index_list(ds_idx)
 
 
 def compute_device_memory_metrics() -> Dict[str, Any]:
@@ -226,7 +233,7 @@ class EnvironMeter:
         self.batch_ds_idx = []
         self.images_seqlens = []
         self._flops_metadata_callback = get_flops_metadata_callback(config)
-        self._extra_flops_kwargs = {}
+        self._model_metadata = {}
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 
@@ -282,10 +289,10 @@ class EnvironMeter:
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:
-            seq_lens, extra_flops_kwargs = self._flops_metadata_callback(micro_batch)
+            seq_lens, model_metadata = self._flops_metadata_callback(micro_batch)
             self.batch_seqlens.extend(seq_lens)
-            for name, values in extra_flops_kwargs.items():
-                self._extra_flops_kwargs.setdefault(name, []).extend(values)
+            for name, values in model_metadata.items():
+                self._model_metadata.setdefault(name, []).extend(values)
 
     def _record_token_stats(self, batch):
         """Meter standard packed batches without changing existing data-cursor accounting.
@@ -355,13 +362,13 @@ class EnvironMeter:
         lora_config: Optional["VeOmniLoraConfig"] = None,
         freeze_vit: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        flops_kwargs = {}
+        counter_kwargs = {}
         if self.images_seqlens:
-            flops_kwargs["images_seqlens"] = self.images_seqlens
+            counter_kwargs["images_seqlens"] = self.images_seqlens
         lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
         if lora_config is not None:
             if self.supports_lora_flops:
-                flops_kwargs["lora_config"] = lora_config
+                counter_kwargs["lora_config"] = lora_config
             elif not self._warned_unsupported_lora_flops:
                 logger.warning_rank0(
                     "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
@@ -369,12 +376,15 @@ class EnvironMeter:
                 )
                 self._warned_unsupported_lora_flops = True
         if freeze_vit is not None and self.supports_lora_flops:
-            flops_kwargs["freeze_vit"] = freeze_vit
-        flops_kwargs.update(self._extra_flops_kwargs)
+            counter_kwargs["freeze_vit"] = freeze_vit
+        # Omit empty metadata for existing counters; metadata-aware estimators
+        # must accept an omitted argument for steps without model-specific data.
+        if self._model_metadata:
+            counter_kwargs["model_metadata"] = self._model_metadata
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,
-            **flops_kwargs,
+            **counter_kwargs,
         )
         if lora_flops_unavailable:
             flops_achieved = 0
@@ -461,7 +471,7 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
-        self._extra_flops_kwargs = {}
+        self._model_metadata = {}
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 

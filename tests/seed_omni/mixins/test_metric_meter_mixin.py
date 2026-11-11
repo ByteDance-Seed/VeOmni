@@ -167,6 +167,26 @@ def test_consumed_tokens_accumulate_per_module_across_steps(single_process_meter
     assert meter.consume_chunks == 2
 
 
+def test_add_counts_a_packed_batch_by_its_packed_sequences(single_process_meter):
+    """A packed batch carries no conversation carrier, so counting `conversation_list`
+    alone reports zero samples for a whole packed run. `packed_cu_seqlens` has one
+    boundary per sample and does not depend on multi-source metadata being attached."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "packed_cu_seqlens": torch.tensor([0, 8, 16])})
+    assert meter.batch_count == 2
+
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "packed_cu_seqlens": torch.tensor([0, 8])})
+    assert meter.batch_count == 3
+
+
+def test_add_counts_a_packed_batch_with_no_boundaries_as_one_sample(single_process_meter):
+    """A hand-built batch without `packed_cu_seqlens` is still one micro-batch of
+    samples, not zero."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long)})
+    assert meter.batch_count == 1
+
+
 def test_step_resets_the_per_step_sample_accumulator(single_process_meter):
     meter = single_process_meter
     meter.add({"conversation_list": [object(), object()]})
