@@ -33,6 +33,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .fsdp2.grad_scaling import configure_singleton_gradient_scaling
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -776,8 +777,16 @@ def parallelize_model_fsdp2(
                 gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
                 if IS_NPU_AVAILABLE:
-                    # NPU is using torch 2.7
-                    _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
+                    para_kwargs = extra_parallel_fsdp_kwargs[para]
+                    para_mp_policy = para_kwargs.get("mp_policy")
+                    if not configure_singleton_gradient_scaling(
+                        _para_mod,
+                        mesh_size=para_kwargs["mesh"].size(),
+                        reduce_dtype=para_mp_policy.reduce_dtype if para_mp_policy is not None else None,
+                        gradient_divide_factor=gradient_divide_factor,
+                    ):
+                        # Keep the legacy normalization API for other NPU groups and dtypes.
+                        _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
                 else:

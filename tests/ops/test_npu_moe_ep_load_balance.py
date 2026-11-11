@@ -529,11 +529,15 @@ def test_replica_prefixes_restore_exact_owner_rows_with_multiple_targets(tmp_pat
 
 
 def _cpu_memory_lifetime_worker(rank, world_size, rendezvous):
+    from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
     group = dist.group.WORLD
     try:
         with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(DefaultDeviceType, "get_device_type", staticmethod(lambda: "cpu"))
             patch.setattr(npu_moe, "stream_synchronize", lambda: None)
+            patch.setattr(npu_moe, "_is_triton_ascend_available", lambda: False)
             patch.setattr(npu_moe, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True, ep_group=group))
             patch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=group))
             for frozen in ((), ("gate_up",), ("down",), ("gate_up", "down")):
@@ -625,8 +629,6 @@ def _cpu_memory_lifetime_worker(rank, world_size, rendezvous):
                             reference_input = hidden.detach().clone().requires_grad_(True)
                             (F.silu(reference_input * 2) * reference_input * 6).sum().backward()
                             torch.testing.assert_close(hidden.grad, reference_input.grad)
-            from torch.utils.checkpoint import checkpoint
-
             for reentrant in (False, True):
                 weights = _ExpertWeights(rank)
                 balancer = _RecordingBalancer(group, optimize_memory=True)
@@ -685,6 +687,26 @@ def test_segmented_gmm_empty_segments_preserve_input_and_weight_gradients(counts
     expected_grads = torch.autograd.grad(expected.sum(), (tokens, local, replica))
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("counts", [[2, 3, 0, 0], [0, 0, 2, 3]])
+def test_segmented_gmm_no_grad_reuses_single_output(counts):
+    tokens = torch.randn(5, 3)
+    local = torch.randn(2, 5, 3)
+    replica = torch.randn(2, 5, 3)
+    outputs = []
+
+    def gemm(*args):
+        output = _cpu_group_gemm(*args)
+        outputs.append(output)
+        return output
+
+    with torch.no_grad():
+        actual = npu_moe.npu_ep_memory.segmented_group_gemm(
+            tokens, local, replica, torch.tensor(counts), sum(counts[:2]), gemm
+        )
+    assert len(outputs) == 1 and actual is outputs[0]
+    assert actual.is_contiguous()
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")

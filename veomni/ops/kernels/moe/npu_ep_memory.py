@@ -184,6 +184,33 @@ class _EmptyGroupGemm(torch.autograd.Function):
 def segmented_group_gemm(tokens, local_weight, replica_weight, counts, local_tokens, group_gemm):
     """Execute original and replica token segments using the existing NPU kernel."""
     groups = local_weight.shape[0]
+    # Keep the empty weight's zero-gradient edge when recording a graph.
+    skip_empty = (
+        not torch.is_grad_enabled()
+        and tokens.shape[0] > 0
+        and tokens.dtype == local_weight.dtype == replica_weight.dtype
+    )
+    # The native M-split GMM accepts per-expert 2D views and returns one
+    # output in physical expert order, avoiding the two result allocations
+    # followed by a concatenation.
+    if (
+        skip_empty
+        and tokens.device.type == "npu"
+        and tokens.dtype == torch.bfloat16
+        and tokens.is_contiguous()
+        and 0 < local_tokens < tokens.shape[0]
+        and groups + replica_weight.shape[0] <= 128
+        and local_weight.stride()[1:] == replica_weight.stride()[1:]
+        and (local_weight.is_contiguous() or local_weight.transpose(1, 2).is_contiguous())
+        and (replica_weight.is_contiguous() or replica_weight.transpose(1, 2).is_contiguous())
+        and counts.dtype == torch.int64
+        and counts.is_contiguous()
+    ):
+        weights = [*local_weight.transpose(1, 2).unbind(), *replica_weight.transpose(1, 2).unbind()]
+        return torch_npu.npu_grouped_matmul(
+            [tokens], weights, group_list=counts, split_item=2, group_type=0, group_list_type=1
+        )[0]
+
     outputs = []
     for segment, weight, segment_counts in (
         (tokens[:local_tokens], local_weight, counts[:groups]),
@@ -192,6 +219,8 @@ def segmented_group_gemm(tokens, local_weight, replica_weight, counts, local_tok
         transposed_weight = weight.transpose(1, 2)
         if segment.shape[0]:
             outputs.append(group_gemm(segment, transposed_weight, segment_counts))
-        else:
+        elif not skip_empty:
             outputs.append(_EmptyGroupGemm.apply(segment, transposed_weight))
+    if len(outputs) == 1:
+        return outputs[0].contiguous()
     return torch.cat(outputs, dim=0)

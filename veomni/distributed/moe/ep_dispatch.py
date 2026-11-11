@@ -82,9 +82,9 @@ def _validate_ep_balance_dispatch(
     physical_slots_per_rank = plan.num_local_experts + (plan.max_replicas_per_rank if plan.replicas else 0)
     physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
     physical_ids = plan.selected_physical_experts.reshape(-1)
-    if physical_ids.is_cuda:
-        # Keep the full defensive validation, but avoid one GPU synchronization
-        # for every range/count scalar read below.
+    npu_memory = physical_ids.device.type == "npu" and getattr(load_balancer, "optimize_memory", False)
+    if physical_ids.is_cuda or npu_memory:
+        # Validate the same routing metadata on the host after a single transfer.
         physical_ids = physical_ids.cpu()
     if physical_ids.numel() and (
         int(physical_ids.min().item()) < 0 or int(physical_ids.max().item()) >= physical_num_experts

@@ -1,9 +1,32 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 import veomni.ops.kernels.cross_entropy.chunk_loss as chunk_loss_module
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
+def test_chunk_loss_reclaims_only_npu_before_computation(monkeypatch, device):
+    class BeforeLoss(Exception):
+        pass
+
+    events = []
+    reclaim = Mock(side_effect=lambda: events.append("reclaim"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(empty_cache=reclaim), raising=False)
+
+    def stop_before_compute():
+        events.append("compute")
+        raise BeforeLoss
+
+    monkeypatch.setattr(chunk_loss_module, "get_parallel_state", stop_before_compute)
+    hidden = SimpleNamespace(device=SimpleNamespace(type=device))
+    with pytest.raises(BeforeLoss):
+        chunk_loss_module.chunk_loss_function(hidden, None, None)
+    assert events == (["reclaim"] if device == "npu" else []) + ["compute"]
+    assert reclaim.call_count == (1 if device == "npu" else 0)
 
 
 def test_chunk_loss_reuses_valid_token_denominator(monkeypatch):

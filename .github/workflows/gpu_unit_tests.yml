@@ -148,6 +148,7 @@ jobs:
             tests/parallel/test_moe_ordered_weight_grad.py \
             tests/parallel/test_moe_weight_grad_overlap.py \
             tests/utils/test_moe_ep_load_balance_config.py \
+            tests/utils/test_fsdp_singleton_grad_scaling.py \
             tests/utils/test_moe_router_replay.py \
             tests/utils/test_moe_monitor.py \
             tests/utils/test_moe_monitor_wandb_smoke.py

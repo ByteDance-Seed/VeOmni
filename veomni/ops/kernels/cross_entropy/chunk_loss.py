@@ -14,8 +14,8 @@
 
 """Chunked cross-entropy loss for causal LM heads.
 
-Hardware-agnostic: composes ``F.linear`` and ``eager_cross_entropy`` and runs
-on both CUDA and Ascend NPU without any device-specific calls. Selected via
+Composes ``F.linear`` and ``eager_cross_entropy`` on CUDA and Ascend NPU.
+NPU reclaims unused allocator cache before computing the loss. Selected via
 ``OpsImplementationConfig.cross_entropy_loss_implementation == "chunk_loss"``
 (the default); ``"npu"`` is kept as a back-compat alias for the same kernel.
 
@@ -97,6 +97,10 @@ def chunk_loss_function(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    # Reclaim inactive NPU cache once before allocating loss workspaces.
+    if hidden_states.device.type == "npu":
+        torch.npu.empty_cache()
+
     sp_enabled = get_parallel_state().sp_enabled
     if shift_labels is not None:
         labels = shift_labels

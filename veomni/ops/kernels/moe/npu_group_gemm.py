@@ -215,6 +215,9 @@ def _npu_ep_balanced_moe_forward(
         physical_num_experts,
         plan.tokens_per_local_physical_expert,
         ep_group,
+        host_counts_ready=(
+            optimize_memory and hidden_states.device.type == "npu" and dist.get_backend(ep_group) == "hccl"
+        ),
     )
 
     host_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
@@ -329,11 +332,16 @@ def alltoall_dispatch(
     num_global_experts: int,
     num_global_tokens_per_local_expert: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
+    *,
+    host_counts_ready: bool = False,
 ):
     hidden_states, unpermute_indices = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
     hidden_states = all_to_all(ep_group, hidden_states, output_splits, input_splits)
 
-    stream_synchronize()
+    # The collective already orders device consumers. Only an unfinished
+    # host count transfer requires waiting before the CPU reads its values.
+    if not host_counts_ready or num_global_tokens_per_local_expert.device.type != "cpu":
+        stream_synchronize()
     ep_size = 1 if ep_group is None else dist.get_world_size(ep_group)
     num_local_experts = num_global_experts // ep_size
     assert num_global_experts % ep_size == 0, (

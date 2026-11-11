@@ -731,7 +731,7 @@ def build_ep_balance_plan(
     # The planner already needs host-side integer metadata. Transfer IDs once
     # on accelerators so validation and each concrete replica rewrite do not introduce
     # separate device synchronizations. Preserve the public result device.
-    host_planning = selected_experts.device.type in ("cuda", "npu")
+    host_planning = selected_experts.is_cuda or selected_experts.device.type == "npu"
     planning_selected = selected_experts.cpu() if host_planning else selected_experts
     flat_selected = planning_selected.reshape(-1)
     if flat_selected.numel() and (

@@ -57,6 +57,16 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/test_model_forward_no_implicit_sync.py",
+    # CUDA-only EP permutation implementation with an explicit CPU reference.
+    "veomni/distributed/moe/chunk_permutation.py",
+    # Backend contract tests must name CUDA to exercise its guarded paths.
+    "tests/parallel/test_moe_chunk_permutation.py",
+    "tests/parallel/test_moe_ep_cuda_host_plan.py",
+    "tests/parallel/test_moe_ordered_weight_grad.py",
+    "tests/ops/test_group_gemm_two_storage.py",
+    "tests/ops/test_ep_weight_grad_group_selection.py",
+    "tests/ops/test_ep_weighted_combine.py",
+    "tests/ops/test_chunk_loss.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
