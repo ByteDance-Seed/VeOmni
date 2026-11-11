@@ -57,6 +57,12 @@ from veomni.utils.device import (
 
 _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
+# Everything here builds and runs on CPU unless a case says otherwise; the two SP
+# cases declare their own multi-process plans and the accelerator case below
+# overrides this. Without the module-level plan the single-process cases fall back
+# to `default_plan`, which claims an accelerator card each on a GPU runner.
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 VOCAB = 64
 HIDDEN = 16
 

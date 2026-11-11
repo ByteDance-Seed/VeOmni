@@ -327,11 +327,12 @@ it sets that param group's `weight_decay` to 0 and applies the module's configur
 value (the model-level `optimizer.weight_decay` unless the module overrides it) to the
 vision rows alone, from an optimizer step pre-hook, before the update as AdamW would.
 
-`configure_optimizer(optimizer)` is called by `ModuleRuntime` **immediately after the
-module's optimizer is built, before the lr scheduler and before any checkpoint load.**
-Three consequences worth knowing:
+`configure_optimizer(optimizer)` is called by `ModuleRuntime` immediately after the
+module's optimizer is built, before the lr scheduler and before any checkpoint load —
+see the [Optimizer Hook contract](../mixins/configure_optimizer.md) for the general
+rules. What is specific to this recipe:
 
-- **It changes the param-group layout.** When the table shares a group with other
+- **It may change the param-group layout.** When the table shares a group with other
   parameters, it is moved into a new single-parameter group with `weight_decay: 0.0`;
   when it is alone in its group, that group's `weight_decay` is zeroed in place. The
   group count is part of the optimizer state key space, so a checkpoint is only
