@@ -424,6 +424,41 @@ def test_the_frozen_rows_survive_an_adamw_step():
     assert torch.isfinite(loss)
 
 
+def test_the_hook_rebuilds_the_table_group_and_survives_a_restore():
+    """The param-group change and the restore rule, both from the contract.
+
+    `configure_optimizer` moves the table into its own decay-free group when it
+    shares one, which changes the group count — part of the optimizer-state key
+    space. This pins that layout, then simulates what loading a checkpoint does to
+    it (param groups rebuilt from their saved hyperparameters, decay back at 0.5)
+    and requires the next step to keep the frozen rows out of the decay anyway.
+    """
+    modules = _build_modules(device=torch.device("cpu"), dtype=torch.float32)
+    text_encoder = modules["qwen3_text_encoder"]
+    table = text_encoder.embed_tokens.weight
+    # A group the table shares with something else, so the hook has to split it.
+    shared = [table, torch.nn.Parameter(torch.zeros(4))]
+    optimizer = torch.optim.AdamW([{"params": shared, "weight_decay": 0.5}], lr=1e-2, foreach=False)
+
+    text_encoder.configure_optimizer(optimizer)
+    assert len(optimizer.param_groups) == 2, [len(g["params"]) for g in optimizer.param_groups]
+    table_group = next(g for g in optimizer.param_groups if any(p is table for p in g["params"]))
+    assert len(table_group["params"]) == 1, "the table must be alone in its group"
+    assert table_group["weight_decay"] == 0.0
+    untouched = next(g for g in optimizer.param_groups if any(p is not table for p in g["params"]))
+    assert untouched["weight_decay"] == 0.5, "other parameters keep their decay"
+
+    # A restore rebuilds groups with their saved hyperparameters: decay is back.
+    table_group["weight_decay"] = 0.5
+    mask = text_encoder._trainable_row_mask
+    before = table.detach().clone()
+    _graph_loss(modules, _batch(), backward=True)
+    optimizer.step()
+
+    assert torch.equal(table.detach()[~mask], before[~mask]), "frozen rows decayed after a restore"
+    assert table_group["weight_decay"] == 0.0, "the step hook must re-zero the group decay"
+
+
 def test_the_toy_recipe_converges():
     """#1072's acceptance check: a few dozen steps on the toy batch actually descend.
 
@@ -547,6 +582,17 @@ def test_a_typo_in_the_worker_model_config_is_an_error(tmp_path: Path):
             Qwen3TextEncoderPreprocessor.from_pretrained(str(config_dir), config_overrides={"enable_imag": True})
 
 
+def _table_rows(weight: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+    """``{trainable, frozen}`` sums over the embedding table's two row groups.
+
+    ``weight`` is a DTensor under FSDP2, so it is gathered first: the row groups are
+    defined on the full table, and gathering also exercises the offset the module
+    computed for this rank's slice. Sums (not tensors) keep the report JSON small.
+    """
+    full = (weight.full_tensor() if isinstance(weight, DTensor) else weight).detach().float()
+    return {"trainable": float(full[mask].sum()), "frozen": float(full[~mask].sum())}
+
+
 def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int, device_type: str) -> None:
     """Run the composed graph at SP=1 and SP=``world`` and record loss + stepped params.
 
@@ -588,7 +634,20 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int, device_type
                 # optimizer consumes it, so this is the first point where an SP
                 # slice that failed to reduce shows up.
                 params = [param for module in modules.values() for param in module.parameters()]
-                torch.optim.AdamW(params, lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False).step()
+                optimizer = torch.optim.AdamW(params, lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False)
+                # The recipe's own hook, so the row-wise decay runs under the same
+                # FSDP2/SP wrapping the trainer uses — the single-process tests call
+                # it on an unsharded table and cannot see a DTensor-offset mistake.
+                modules["qwen3_text_encoder"].configure_optimizer(optimizer)
+                table_module = modules["qwen3_text_encoder"]
+                before = _table_rows(table_module.embed_tokens.weight, table_module._trainable_row_mask)
+                optimizer.step()
+                after = _table_rows(table_module.embed_tokens.weight, table_module._trainable_row_mask)
+                reports[f"{name}_rows"] = {
+                    "trainable": [before["trainable"], after["trainable"]],
+                    "frozen": [before["frozen"], after["frozen"]],
+                    "groups": len(optimizer.param_groups),
+                }
                 reports[f"{name}_probe"] = {
                     f"{mod_name}.{param_name}": [
                         float(full.sum()),
@@ -619,6 +678,20 @@ def _assert_sp_parity(out_dir: Path, world: int, *, rtol: float = 0.0, atol: flo
             total_other, square_other = probe_other[name]
             assert total_other == pytest.approx(total1, rel=rtol, abs=atol), (rank, name, total1, total_other)
             assert square_other == pytest.approx(square1, rel=rtol, abs=atol), (rank, name, square1, square_other)
+
+        # The row-wise decay under this wrapping: the frozen rows must be untouched
+        # by the step (no gradient, and no group decay leaking onto them), the
+        # vision rows must have moved, and SP=4 must agree with SP=1 on both. The
+        # single-process test cannot show this — it never shards the table.
+        rows1, rows_other = reports["sp1_rows"], reports[f"sp{world}_rows"]
+        assert rows1["groups"] == rows_other["groups"], (rank, rows1["groups"], rows_other["groups"])
+        for label in ("frozen", "trainable"):
+            before1, after1 = rows1[label]
+            before_other, after_other = rows_other[label]
+            assert before_other == pytest.approx(before1, rel=rtol, abs=atol), (rank, label, "before")
+            assert after_other == pytest.approx(after1, rel=rtol, abs=atol), (rank, label, "after")
+        assert rows1["frozen"][0] == rows1["frozen"][1], (rank, "frozen rows must not move", rows1["frozen"])
+        assert rows1["trainable"][0] != rows1["trainable"][1], (rank, "vision rows must move", rows1["trainable"])
 
 
 @pytest.mark.launch_plan(provider=from_parameter("nproc", device="cpu"))

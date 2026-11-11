@@ -99,7 +99,7 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
-| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, right after the optimizer is built and before the lr scheduler and any checkpoint load |
+| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, right after the optimizer is built and before the lr scheduler and any checkpoint load. **May change the param-group count**, which is part of the optimizer-state key space: a checkpoint is only resumable under the same hook. See `docs/seed_omni/models/qwen3.md` §7.2 for a worked example |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |

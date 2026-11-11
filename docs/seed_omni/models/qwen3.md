@@ -326,8 +326,24 @@ output head. The module's `configure_optimizer` takes the table's weight decay o
 it sets that param group's `weight_decay` to 0 and applies the module's configured
 value (the model-level `optimizer.weight_decay` unless the module overrides it) to the
 vision rows alone, from an optimizer step pre-hook, before the update as AdamW would.
-`ModuleRuntime` calls `configure_optimizer(optimizer)` right after building a module's
-optimizer, before the lr scheduler and any checkpoint load.
+
+`configure_optimizer(optimizer)` is called by `ModuleRuntime` **immediately after the
+module's optimizer is built, before the lr scheduler and before any checkpoint load.**
+Three consequences worth knowing:
+
+- **It changes the param-group layout.** When the table shares a group with other
+  parameters, it is moved into a new single-parameter group with `weight_decay: 0.0`;
+  when it is alone in its group, that group's `weight_decay` is zeroed in place. The
+  group count is part of the optimizer state key space, so a checkpoint is only
+  resumable if it was written by a run with the same hook. **Resuming from a
+  checkpoint saved by a run without this hook is not supported for this recipe** — the
+  saved optimizer state is rejected on restore.
+- **The decay is re-applied every step.** Loading a checkpoint rebuilds param groups
+  from their saved hyperparameters, which would bring back the group-level decay, so
+  the step pre-hook re-zeroes it each time before applying the row-wise value.
+- **Nothing is applied when the table is in no group** (for example an optimizer built
+  over a subset that excludes it): that path logs a rank-0 warning rather than failing,
+  because there is no group decay to take over either.
 
 > The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved stub).
 > They start training from there; for a better starting point, mean-init them before
