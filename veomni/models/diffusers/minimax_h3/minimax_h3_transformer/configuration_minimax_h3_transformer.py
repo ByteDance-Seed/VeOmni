@@ -26,6 +26,8 @@ class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
+        audio_enabled: bool = True,
+        num_pdd_heads: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -48,3 +50,5 @@ class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
         self.norm_eps = norm_eps
         self.qk_norm_eps = qk_norm_eps
         self.final_norm_eps = final_norm_eps
+        self.audio_enabled = audio_enabled
+        self.num_pdd_heads = num_pdd_heads
