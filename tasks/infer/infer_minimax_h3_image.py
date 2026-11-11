@@ -1,13 +1,17 @@
+import os
+
 import torch
 from PIL import Image
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.diffusers.minimax_h3_image.inference import MiniMaxH3ImagePipeline
+from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_flash_attn_2_available
 
 
+attn_implementation = "flash_attention_2" if get_device_type() != "cpu" and is_flash_attn_2_available() else "eager"
 OPS = OpsImplementationConfig(
-    attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "eager",
+    attn_implementation=attn_implementation,
     moe_implementation="eager",
     cross_entropy_loss_implementation="eager",
     rms_norm_implementation="eager",
@@ -34,12 +38,16 @@ image = pipe(
 )
 image.save("t2i.png")
 
-reference = Image.open("reference.png")
-image = pipe(
-    prompt="<Picture 1> The same character, now standing in a snowy forest at night",
-    height=2048,
-    width=2048,
-    references=[reference],
-    seed=0,
-)
-image.save("edit.png")
+reference_path = "reference.png"
+if os.path.isfile(reference_path):
+    reference = Image.open(reference_path)
+    image = pipe(
+        prompt="<Picture 1> The same character, now standing in a snowy forest at night",
+        height=2048,
+        width=2048,
+        references=[reference],
+        seed=0,
+    )
+    image.save("edit.png")
+else:
+    print(f"Skipping edit example: {reference_path} not found.")

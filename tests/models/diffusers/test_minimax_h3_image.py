@@ -195,6 +195,25 @@ def test_minimax_h3_image_vae_tiles_and_stitches():
     assert decoded.shape == image.shape
 
 
+def test_minimax_h3_image_vae_rejects_non_advancing_tiles():
+    vae = _tiny_vae()
+    with pytest.raises(ValueError, match="positive"):
+        vae.enable_tiling(tile_sample_min_height=0)
+    with pytest.raises(ValueError, match="positive"):
+        vae.enable_tiling(tile_sample_min_overlap_height=0)
+    with pytest.raises(ValueError, match="greater than"):
+        vae.enable_tiling(
+            tile_sample_min_height=64,
+            tile_sample_min_width=64,
+            tile_sample_min_overlap_height=64,
+            tile_sample_min_overlap_width=64,
+        )
+    with pytest.raises(ValueError, match="greater than the overlap"):
+        vae._split_tiles(128, 64, 64)
+    with pytest.raises(ValueError, match="overlap must be positive"):
+        vae._split_tiles(128, 64, 0)
+
+
 def test_minimax_h3_image_vae_uses_diffusers_checkpoint_names():
     keys = set(_tiny_vae().state_dict())
     expected = {
@@ -483,3 +502,32 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         seed=0,
     )
     assert edit.size == (64, 64)
+
+
+def test_minimax_h3_image_pipeline_offloads_dit_on_failure(monkeypatch):
+    class FakeModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.zeros(1))
+
+    class FakeConditionModel:
+        def encode_text(self, prompt, reference_images=None, device=None, dtype=None):
+            return torch.zeros(1, 1, 16), torch.tensor([1])
+
+    class FailingDiT(FakeModule):
+        def forward_image(self, **kwargs):
+            raise RuntimeError("boom")
+
+    pipe = MiniMaxH3ImagePipeline()
+    pipe.condition_model = FakeConditionModel()
+    pipe.text_encoder = FakeModule()
+    pipe.vae = FakeModule()
+    pipe.dit = FailingDiT()
+    calls = []
+    monkeypatch.setattr(pipe, "_stage", lambda names: calls.append(("stage", tuple(names))))
+    monkeypatch.setattr(pipe, "_offload", lambda names: calls.append(("offload", tuple(names))))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipe("a cat", height=32, width=32, min_generation_area=1024)
+
+    assert ("offload", ("dit",)) in calls

@@ -328,31 +328,34 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
 
         self._offload(["text_encoder", "vae"])
         self._stage(["dit"])
-        for step in range(num_steps):
-            timestep = float(1.0 - self.scheduler.sigmas[step])
-            if reference_latents:
-                unique_timesteps = torch.tensor(
-                    [self.reference_noise_aug, timestep], dtype=torch.float32, device=self.device
-                )
-                timestep_indices = torch.ones(sequence_length, dtype=torch.long, device=self.device)
-                timestep_indices[image_indices[:num_reference_rows]] = 0
-            else:
-                unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
-                timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
+        try:
+            for step in range(num_steps):
+                timestep = float(1.0 - self.scheduler.sigmas[step])
+                if reference_latents:
+                    unique_timesteps = torch.tensor(
+                        [self.reference_noise_aug, timestep], dtype=torch.float32, device=self.device
+                    )
+                    timestep_indices = torch.ones(sequence_length, dtype=torch.long, device=self.device)
+                    timestep_indices[image_indices[:num_reference_rows]] = 0
+                else:
+                    unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
+                    timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
 
-            noise_pred = self.dit.forward_image(
-                x=rows,
-                prompt_embeds=prompt_embeds,
-                unique_timesteps=unique_timesteps,
-                timestep_indices=timestep_indices,
-                token_tags=token_tags,
-                position_ids=position_ids,
-                image_indices=image_indices,
-                text_indices=text_indices,
-                pdd_step_index=step,
-            )
-            target_rows = self.scheduler.step(noise_pred[num_reference_rows:], step, target_rows)
-            rows = torch.cat([condition_rows, target_rows], dim=0) if condition_rows is not None else target_rows
+                noise_pred = self.dit.forward_image(
+                    x=rows,
+                    prompt_embeds=prompt_embeds,
+                    unique_timesteps=unique_timesteps,
+                    timestep_indices=timestep_indices,
+                    token_tags=token_tags,
+                    position_ids=position_ids,
+                    image_indices=image_indices,
+                    text_indices=text_indices,
+                    pdd_step_index=step,
+                )
+                target_rows = self.scheduler.step(noise_pred[num_reference_rows:], step, target_rows)
+                rows = torch.cat([condition_rows, target_rows], dim=0) if condition_rows is not None else target_rows
+        finally:
+            self._offload(["dit"])
 
         latents = unpatchify_image_rows(
             target_rows,
@@ -361,7 +364,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             self.latent_channels,
             self.patch_size,
         )
-        self._offload(["dit"])
         self._stage(["vae"])
         latents_mean = torch.tensor(self.vae.config.latents_mean, device=self.device).view(1, -1, 1, 1)
         latents_std = torch.tensor(self.vae.config.latents_std, device=self.device).view(1, -1, 1, 1)

@@ -8,7 +8,10 @@ and reference-image editing.
 ## Download
 
 ```shell
-hf download MiniMaxAI/MiniMax-H3-Image --local-dir pretrained_models/MiniMax-H3-Image
+hf download MiniMaxAI/MiniMax-H3-Image --local-dir pretrained_models/MiniMax-H3-Image \
+  --include 'transformer/*' --include 'text_encoder/*' \
+  --include 'vae_diffusers/*' --include 'processor/*' \
+  --include 'pdd_fused_heads.safetensors' --include 'pdd_config.json'
 ```
 
 The checkpoint directory contains:
@@ -19,7 +22,6 @@ MiniMax-H3-Image/
 ├── vae_diffusers/               # image VAE in diffusers layout
 ├── text_encoder/                # Qwen3-VL, read at layer 50
 ├── processor/
-├── tokenizer/
 ├── pdd_fused_heads.safetensors  # one output head per sampling step
 └── pdd_config.json
 ```

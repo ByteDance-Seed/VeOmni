@@ -458,16 +458,43 @@ class MiniMaxH3ImageVAE(nn.Module):
         tile_sample_min_overlap_height: int | None = None,
         tile_sample_min_overlap_width: int | None = None,
     ) -> None:
+        height = self.tile_sample_min_height if tile_sample_min_height is None else tile_sample_min_height
+        width = self.tile_sample_min_width if tile_sample_min_width is None else tile_sample_min_width
+        overlap_height = (
+            self.tile_sample_min_overlap_height
+            if tile_sample_min_overlap_height is None
+            else tile_sample_min_overlap_height
+        )
+        overlap_width = (
+            self.tile_sample_min_overlap_width
+            if tile_sample_min_overlap_width is None
+            else tile_sample_min_overlap_width
+        )
+        if height <= 0 or width <= 0 or overlap_height <= 0 or overlap_width <= 0:
+            raise ValueError(
+                f"Tiled VAE sizes and overlaps must be positive: got height={height}, width={width}, "
+                f"overlap_height={overlap_height}, overlap_width={overlap_width}."
+            )
+        if height <= overlap_height or width <= overlap_width:
+            raise ValueError(
+                "Tiled VAE sampling requires each tile size to be greater than its overlap: "
+                f"got height={height}, overlap_height={overlap_height}, width={width}, overlap_width={overlap_width}."
+            )
         self.use_tiling = True
-        self.tile_sample_min_height = tile_sample_min_height or self.tile_sample_min_height
-        self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
-        self.tile_sample_min_overlap_height = tile_sample_min_overlap_height or self.tile_sample_min_overlap_height
-        self.tile_sample_min_overlap_width = tile_sample_min_overlap_width or self.tile_sample_min_overlap_width
+        self.tile_sample_min_height = height
+        self.tile_sample_min_width = width
+        self.tile_sample_min_overlap_height = overlap_height
+        self.tile_sample_min_overlap_width = overlap_width
 
     def disable_tiling(self) -> None:
         self.use_tiling = False
 
     def _split_tiles(self, length: int, tile_size: int, min_overlap: int) -> tuple[list[int], list[int], list[int]]:
+        if tile_size <= 0 or min_overlap <= 0 or tile_size <= min_overlap:
+            raise ValueError(
+                f"Tile size and overlap must be positive, with tile size greater than the overlap: got tile_size={tile_size}, "
+                f"min_overlap={min_overlap}."
+            )
         if tile_size >= length:
             return [0], [length], []
         num_tiles = math.ceil(length / tile_size)
