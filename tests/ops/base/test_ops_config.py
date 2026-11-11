@@ -1072,3 +1072,76 @@ def test_current_selections_are_untouched_by_the_migration():
 
     selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
     assert migrate_retired_selections(selections) == selections
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_quantizing_swiglu_row_is_refused_on_an_unfused_activation():
+    """SiLU is the only activation with a quantizing row, so `gelu` must not be accepted.
+
+    The model's MLP falls back to its projection modules for any other activation,
+    which never reaches the row -- the config would claim QAT while the step ran in
+    the model dtype. The check lives in the config layer because that is the one
+    place every model reaches, and it fails at load time rather than on step one.
+    """
+    import copy
+
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    def apply(activation, impl):
+        config = Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+        )
+        config.hidden_act = activation
+        veomni_config = as_veomni_config(copy.deepcopy(config), validate=False)
+        veomni_config._set_ops_implementation({"swiglu_mlp_implementation": impl})
+        return veomni_config
+
+    # SiLU is what the row implements; the default selection is unaffected.
+    assert apply("silu", "qat").ops_config.swiglu_mlp_implementation == "qat"
+    assert apply("swish", "qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        apply("gelu", "qat")
+
+    # A reference row trains in the model dtype on purpose, so it stays available.
+    assert apply("gelu", "eager").ops_config.swiglu_mlp_implementation == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_vlm_vision_config_is_not_mistaken_for_the_quantized_decoder():
+    """A VLM's `vision_config` also carries `hidden_act`, but runs no `swiglu_mlp`.
+
+    Gemma-family vision encoders use GELU-tanh, so checking every sub-config would
+    reject a text-side selection that is perfectly valid. Only a config with a
+    decoder stack (``num_hidden_layers``) is inspected.
+    """
+    import copy
+
+    from transformers import Qwen3VLMoeConfig
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    config = Qwen3VLMoeConfig()
+    assert config.vision_config.hidden_act == "gelu_pytorch_tanh"
+    assert not hasattr(config.vision_config, "num_hidden_layers")
+
+    def apply(source, **ops):
+        veomni_config = as_veomni_config(copy.deepcopy(source), validate=False)
+        veomni_config._set_ops_implementation(ops)
+        return veomni_config
+
+    # Text side is SiLU, so the selection is fine even though vision is not.
+    assert apply(config, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    # The text side is what decides.
+    gelu_text = copy.deepcopy(config)
+    gelu_text.text_config.hidden_act = "gelu"
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        apply(gelu_text, swiglu_mlp_implementation="qat")

@@ -28,6 +28,42 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
 
+def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, proposed: Mapping) -> None:
+    """Refuse a quantizing ``swiglu_mlp`` selection the model's activation cannot run.
+
+    The fused rows implement SiLU (``standard``) and GELU-tanh (``geglu``). A model
+    whose activation is anything else falls back to its projection modules, which
+    never reach the row -- so the config would claim quantization-aware training
+    while the step ran in the model dtype.
+
+    Checked here rather than at each forward: this is the one place every model
+    reaches, including a VLM's ``text_config``, because ``collect`` already walks
+    ``sub_configs``. It also fails at load time instead of on the first step.
+    """
+    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS, QUANTIZING_IMPLS
+
+    if proposed.get("swiglu_mlp_implementation") not in QUANTIZING_IMPLS:
+        return
+    # Only a decoder stack runs the SwiGLU MLP this row serves. A VLM's
+    # ``vision_config`` also carries ``hidden_act`` (Gemma3's is
+    # ``gelu_pytorch_tanh``) but its encoder has no ``swiglu_mlp`` at all, so
+    # checking it would reject a perfectly good text-side selection.
+    if not hasattr(config, "num_hidden_layers"):
+        return
+    # Gemma-style text configs name the field ``hidden_activation``; the rest use
+    # ``hidden_act``. A config with neither has no SwiGLU MLP to quantize.
+    activation = getattr(config, "hidden_act", None) or getattr(config, "hidden_activation", None)
+    if activation is None or activation in FUSED_ACTIVATIONS:
+        return
+    raise ValueError(
+        f"swiglu_mlp_implementation={proposed['swiglu_mlp_implementation']!r} cannot run on "
+        f"hidden_act={activation!r}: the fused `swiglu_mlp` rows quantize SiLU (`standard`) or "
+        "GELU-tanh (`geglu`, which registers no quantizing row), so this model's MLP would fall "
+        "back to its projection modules and round nothing. Set swiglu_mlp_implementation='eager' "
+        "to train in the model dtype. Quantizing other activations is tracked in #1430."
+    )
+
+
 def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) -> None:
     if not diff.get("ops_implementation"):
         diff.pop("ops_implementation", None)
@@ -185,6 +221,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                 proposed["attn_implementation"] = OpsImplementationConfig.normalize_attention_backend(
                     proposed["attn_implementation"]
                 )
+            _reject_quantized_swiglu_on_an_unfused_activation(config, proposed)
             pending.append((config, proposed))
             for key in config.sub_configs:
                 child = getattr(config, key, None)

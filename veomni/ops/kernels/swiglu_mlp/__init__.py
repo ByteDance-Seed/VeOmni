@@ -39,6 +39,13 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
 QUANTIZING_IMPLS = frozenset({"qat"})
 
+#: Activations the quantizing rows implement. ``standard`` is SiLU in both
+#: directions (forward and backward); ``geglu`` is GELU-tanh but registers no
+#: quantizing row, so its activation is deliberately absent. A model outside this
+#: set has no quantizing row at all, and selecting one would round nothing -- which
+#: is why ``configuration_base`` refuses the combination at load time (#1430).
+FUSED_ACTIVATIONS = frozenset({"silu", "swish"})
+
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
