@@ -1,0 +1,19 @@
+# LLaDA2.0-Uni-16B inference — text-to-image (T2I) CFG VQ block diffusion.
+initial: vq_diffuse
+
+states:
+  vq_diffuse:
+    body:
+      - { from: llada2_uni_text_encoder, to: llada2_uni_llm }
+      - { from: llada2_uni_llm,          to: llada2_uni_text_encoder }
+      - { from: llada2_uni_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: vq_done }, next_state: decode }
+      - { condition: { type: default }, next_state: vq_diffuse }
+
+  decode:
+    body:
+      - { from: llada2_uni_decoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: done }
+      - { condition: { type: default }, next_state: done }
