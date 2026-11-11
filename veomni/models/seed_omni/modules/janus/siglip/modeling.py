@@ -64,6 +64,11 @@ class JanusSiglip(InferenceMixin, PretrainedOmniModule):
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
     supports_gradient_checkpointing = True
+    # The tower runs through VeOmni's patched attention, which takes the selected
+    # backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusSiglipConfig):
         super().__init__(config)

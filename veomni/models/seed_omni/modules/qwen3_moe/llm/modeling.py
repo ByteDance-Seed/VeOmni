@@ -35,6 +35,12 @@ class Qwen3MoeLlm(SimpleArGenerationMixin, PretrainedOmniModule):
     main_input_name = "inputs_embeds"
     _no_split_modules = ["Qwen3MoeDecoderLayer"]
     supports_gradient_checkpointing = True
+    # Same capability flags the dense Qwen3 backbone declares: the patched
+    # attention takes the selected backend explicitly, so dense backends
+    # (``sdpa`` / ``eager``) must not be gated out at construction.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: Qwen3MoeLlmConfig):
         super().__init__(config)

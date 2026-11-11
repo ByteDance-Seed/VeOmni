@@ -234,6 +234,11 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     # Mirrors HF ``JanusVQVAE._no_split_modules`` with our quantiser subclass in
     # place of theirs, so the FSDP wrap plan is unchanged by the swap below.
     _no_split_modules = ["JanusVQVAEAttnBlock", "JanusVQVAEResnetBlock", "JanusVqvaeVectorQuantizer"]
+    # The codec runs through VeOmni's patched attention, which takes the selected
+    # backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)

@@ -184,6 +184,11 @@ class JanusLlama(InferenceMixin, PretrainedOmniModule):
     _no_split_modules = ["LlamaDecoderLayer"]
     # Inner ``language_model`` is VeOmni's patched ``LlamaModel`` (fused ops + SP).
     supports_gradient_checkpointing = True
+    # The backbone runs through VeOmni's patched attention, which takes the
+    # selected backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusLlamaConfig):
         super().__init__(config)

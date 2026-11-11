@@ -50,7 +50,13 @@ def _decoder_block_class_names(model: nn.Module) -> set[str]:
     """Decoder-layer class names in ``_no_split_modules``.
 
     An entry is either a bare class name (``LlamaDecoderLayer``) or, on a
-    SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``).
+    SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``
+    — see ``_scoped_no_split_modules``). The scope has to be stripped because
+    matching is against ``type(module).__name__``: a composed ``OmniModel``
+    carries no ``model_type`` in
+    :data:`_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`, so
+    :func:`validate_compile_model` passes it through, and leaving the prefix on
+    would make :func:`compile_decoder_blocks` find zero blocks and raise.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:

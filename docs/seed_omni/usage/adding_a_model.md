@@ -37,7 +37,14 @@ Under `veomni/models/seed_omni/modules/<family>/<sub>/`:
   module takes part in inference, an in-file `InferenceMixin` with the FSM
   `generate()` and its state. `InferenceMixin` must come **before**
   `PretrainedOmniModule` in the bases. The class must load and run under plain
-  `from_pretrained` with no VeOmni import.
+  `from_pretrained` with no VeOmni import. Declare the HF attention capability
+  flags the module accepts on the class itself — `PretrainedOmniModule` leaves
+  `_supports_sdpa` / `_supports_flash_attn` / `_supports_flex_attn` at the
+  transformers default of `False`, so a module whose inner backbone runs
+  through VeOmni's patched attention has to opt in or HF rejects `sdpa` (the
+  default) at construction. `modules/qwen3/llm/modeling.py` copies them off the
+  inner model; `modules/qwen3vl/llm/modeling.py` sets `_supports_sdpa = True`
+  because the wrapper only delegates.
 - `accelerated/accelerated.py`: `TrainingMixin` and `VeOmniMixin` plus IDE type
   stubs (below), and `class XAccelerated(VeOmniMixin, X)`. The Janus modules
   under `modules/janus/*/` are the reference pattern.
