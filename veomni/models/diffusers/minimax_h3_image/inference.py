@@ -20,7 +20,7 @@ from PIL import Image, ImageOps
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 from veomni.utils import logging
-from veomni.utils.device import get_device_type
+from veomni.utils.device import get_device_type, get_torch_device
 
 from ..minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from ..minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
@@ -88,7 +88,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
 
     def __init__(self, device=None, torch_dtype=torch.bfloat16):
         super().__init__()
-        self.device = torch.device(device) if device is not None else torch.device(get_device_type())
+        self.device = self._resolve_device(device)
         self.torch_dtype = torch_dtype
         self.condition_model: MiniMaxH3ImageConditionModel | None = None
         self.text_encoder = None
@@ -102,6 +102,16 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         self.latent_channels = 24
         self.reference_noise_aug = 0.999
         self.max_sequence_length = 4096
+
+    @staticmethod
+    def _resolve_device(device) -> torch.device:
+        resolved = torch.device(device) if device is not None else torch.device(get_device_type())
+        if resolved.index is None and resolved.type != "cpu":
+            try:
+                resolved = torch.device(resolved.type, get_torch_device().current_device())
+            except (AttributeError, RuntimeError):
+                pass
+        return resolved
 
     @staticmethod
     def from_pretrained(

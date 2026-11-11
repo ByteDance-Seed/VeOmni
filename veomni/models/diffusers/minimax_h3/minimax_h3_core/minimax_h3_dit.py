@@ -779,20 +779,8 @@ class MiniMaxH3DiT(nn.Module):
             refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
             refiner_host = tuple(int(value) for value in refiner_host)
 
-        sp_group = get_ulysses_sequence_parallel_group()
-        sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
-        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        unit = (seq_len + sp_world - 1) // sp_world
-        padded_seq_len = unit * sp_world
-        pad = padded_seq_len - seq_len
-
-        if pad:
-            position_ids = torch.cat(
-                (position_ids, position_ids[-1:].expand(pad, -1)),
-                dim=0,
-            )
-            timestep_indices = torch.cat((timestep_indices, timestep_indices.new_zeros(pad)))
-            token_tags = torch.cat((token_tags, token_tags.new_zeros(pad)))
+        if get_ulysses_sequence_parallel_group() is not None:
+            raise NotImplementedError("MiniMax-H3-Image forward_image does not support sequence parallelism yet.")
 
         rope_freqs = self.rope(position_ids.unsqueeze(0)).to(device)
         decoder_input, t_emb = self._embed_image(
@@ -803,20 +791,13 @@ class MiniMaxH3DiT(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=refiner_host,
             refiner_max_seqlen=refiner_max,
-            seq_len=padded_seq_len,
+            seq_len=seq_len,
             device=device,
         )
 
         combined_indices = (timestep_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype)
         rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype)
-
-        local_timestep_indices = timestep_indices
-        if sp_world > 1:
-            start = unit * sp_rank
-            decoder_input = decoder_input.narrow(0, start, unit)
-            combined_indices = combined_indices.narrow(0, start, unit)
-            local_timestep_indices = timestep_indices.narrow(0, start, unit)
 
         cu_seqlens = cu_host
         block_kwargs = {
@@ -827,7 +808,7 @@ class MiniMaxH3DiT(nn.Module):
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
             "valid_seqlen": seq_len,
-            "use_ulysses": sp_world > 1,
+            "use_ulysses": False,
         }
         hidden = decoder_input
         for block in self.blocks:
@@ -839,11 +820,9 @@ class MiniMaxH3DiT(nn.Module):
         video, _ = self.final_layer(
             hidden,
             t_emb=t_emb,
-            inverse_indices=local_timestep_indices.to(device),
+            inverse_indices=timestep_indices.to(device),
             pdd_step_index=pdd_step_index,
         )
-        if sp_group is not None:
-            video = _Gather.apply(sp_group, video, 0, True, False)
         return video.index_select(0, image_pos.to(device))
 
     def forward(

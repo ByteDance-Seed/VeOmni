@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
+import pytest
 import torch
 from PIL import Image
 from safetensors.torch import save_file
@@ -107,6 +109,15 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
 
     assert inputs["x"].grad is not None
     assert inputs["prompt_embeds"].grad is not None
+
+
+def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit
+
+    model = _build_model()
+    monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: object())
+    with pytest.raises(NotImplementedError, match="sequence parallelism"):
+        model.forward_image(**_image_inputs(), pdd_step_index=0)
 
 
 def test_minimax_h3_image_forward_keeps_fp32_projection_modules():
@@ -262,6 +273,72 @@ def test_minimax_h3_text_encoder_inherits_condition_ops(monkeypatch):
     text_encoder_module.MiniMaxH3TextEncoder(num_retained_layers=1, config=config)
 
     assert captured["config"].ops_config.attn_implementation == "eager"
+
+
+def test_minimax_h3_image_condition_forwards_config_to_text_encoder(tmp_path, monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text_encoder_module
+    from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition import (
+        modeling_minimax_h3_image_condition as condition_module,
+    )
+
+    base = tmp_path
+    (base / "processor").mkdir()
+    (base / "text_encoder").mkdir()
+    vae_dir = base / "vae_diffusers"
+    vae_dir.mkdir()
+    (vae_dir / "diffusion_pytorch_model.safetensors").write_bytes(b"")
+
+    captured = {}
+
+    class FakeTextEncoder(torch.nn.Module):
+        def __init__(self, num_retained_layers, config=None):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.zeros(1))
+            captured["num_retained_layers"] = num_retained_layers
+            captured["config"] = config
+
+    class FakeVAEConfig:
+        @classmethod
+        def from_pretrained(cls, path):
+            return cls()
+
+    class FakeVAE(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.zeros(1))
+            self.config = config
+
+        def load_state_dict(self, *args, **kwargs):
+            return None
+
+    class FakeProcessor:
+        tokenizer = object()
+
+        @classmethod
+        def from_pretrained(cls, path):
+            return cls()
+
+    monkeypatch.setattr(condition_module, "AutoProcessor", FakeProcessor)
+    monkeypatch.setattr(condition_module, "MiniMaxH3ImageVAEConfig", FakeVAEConfig)
+    monkeypatch.setattr(condition_module, "MiniMaxH3ImageVAE", FakeVAE)
+    monkeypatch.setattr(condition_module, "load_file", lambda path: {})
+    monkeypatch.setattr(condition_module, "_init_empty_weights", lambda: nullcontext())
+    monkeypatch.setattr(
+        condition_module.MiniMaxH3ImageConditionModel,
+        "_stream_load_weights",
+        staticmethod(lambda *args, **kwargs: 1),
+    )
+    monkeypatch.setattr(text_encoder_module, "MiniMaxH3TextEncoder", FakeTextEncoder)
+
+    config = _tiny_condition_config(
+        base_model_path=str(base),
+        skip_encoder_load=False,
+    )
+    config._set_ops_implementation(eager_ops_config())
+    condition_module.MiniMaxH3ImageConditionModel(config)
+
+    assert captured["num_retained_layers"] == 50
+    assert captured["config"] is config
 
 
 def test_minimax_h3_image_edit_presentation_tags_picture_blocks():
