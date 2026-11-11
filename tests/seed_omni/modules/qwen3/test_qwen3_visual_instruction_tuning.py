@@ -467,7 +467,7 @@ def test_the_toy_recipe_converges():
 
 
 def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
-    """The two silent-failure modes are errors, not wrong training."""
+    """The silent-failure modes are errors, not wrong training."""
     TextEncoderAccelerated = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_text_encoder"]()
     TextEncoderConfig = OMNI_CONFIG_REGISTRY["qwen3_text_encoder"]()
 
@@ -519,6 +519,32 @@ def test_image_mode_rejects_an_untied_head_and_unknown_vision_tokens():
     wrapping._tokenizer = _NegativeTokenizer()
     with pytest.raises(ValueError, match="outside the embedding table"):
         wrapping.freeze_model()
+
+
+def test_a_typo_in_the_worker_model_config_is_an_error(tmp_path: Path):
+    """A misspelled `model_config` key must not silently leave the mode off.
+
+    The worker selects its chat template from `enable_image`, applying overrides
+    with a permissive `update` — so `enable_imag: true` would land as a stray
+    attribute and the run would quietly train the text-only template.
+    """
+    from unittest.mock import patch
+
+    import veomni.models.seed_omni.modules.qwen3.text_encoder.processing as processing
+
+    config_dir = tmp_path / "qwen3_text_encoder"
+    config_dir.mkdir(parents=True)
+    OMNI_CONFIG_REGISTRY["qwen3_text_encoder"]()(
+        vocab_size=VOCAB, hidden_size=HIDDEN, tie_word_embeddings=True
+    ).save_pretrained(config_dir)
+
+    with patch.object(processing, "build_tokenizer", lambda module_path: _SmallTokenizer()):
+        # The correct spelling still selects the VL template.
+        worker = Qwen3TextEncoderPreprocessor.from_pretrained(str(config_dir), config_overrides={"enable_image": True})
+        assert type(worker._chat_template).__name__ == "Qwen3VLChatTemplate"
+
+        with pytest.raises(ValueError, match="look misspelled"):
+            Qwen3TextEncoderPreprocessor.from_pretrained(str(config_dir), config_overrides={"enable_imag": True})
 
 
 def _sp_worker(rank: int, rendezvous: str, out_dir: str, world: int, device_type: str) -> None:

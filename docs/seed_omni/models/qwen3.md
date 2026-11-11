@@ -364,6 +364,18 @@ layouts — so `save_hf_weights` writes one `hf_ckpt/<module>/` per module.
 
 ### 7.4 Train on ShareGPT4V
 
+`data.yaml`'s `sources` must be SeedOmni-format rows, **not** the raw
+ShareGPT4V release. Each row needs `source_name`, a `conversations` list of
+`{"from": "human"|"gpt", "value": ...}` turns with `<image>` marking where the
+picture goes, and an `images` list holding one PNG/JPEG per placeholder — see
+[Data format](../usage/data_format.md) §1 for the exact schema and the
+`sharegpt4v_cap_100k` example. Pointing `sources` at an unconverted CSV/JSONL
+from the upstream release does not work: the loader pairs `images[i]` with the
+i-th media placeholder in `conversations`, and preprocessors dispatch on
+`source_name`, so a raw row fails before training starts.
+
+Once the rows are in that shape:
+
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3/visual_instruction_tuning/base.yaml
