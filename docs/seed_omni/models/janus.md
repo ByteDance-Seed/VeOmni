@@ -44,12 +44,27 @@ the trainer and its `infer.*` block drives the inferencer.
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Point at the checkpoint
 
-The monolithic HF checkpoint is split into one sub-checkpoint per OmniModule
-(SigLIP encoder, VQVAE codec + generation head, LLaMA backbone). The converter
-reads `model_type` from the HF `config.json` and dispatches to the Janus family
-converter.
+Janus registers an [`OmniHFLayout`](../usage/hf_layout.md) under `model_type:
+janus`, so `model.model_path` can name the upstream HF checkpoint directly — no
+offline convert, and `save_hf_weights` writes back one checkpoint in that
+upstream layout, which loads with `transformers` or with `model.model_path`
+again.
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B
+```
+
+The layout cuts the checkpoint into one sub-checkpoint per OmniModule (SigLIP
+encoder, VQVAE codec + generation head, LLaMA backbone) at the upstream key
+prefixes, so every source tensor lands on exactly one module.
+
+To materialise the modules on disk instead, run the family converter — the
+layout gives both paths, and on a checkpoint whose tie flags agree they hold
+identical module weights:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
@@ -57,8 +72,11 @@ python scripts/seed_omni/convert_model.py \
   --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
 ```
 
-The `output_dir` becomes `model.model_path` in `base.yaml` (a split-checkpoint
-root folder, not a single HF checkpoint).
+The `output_dir` is then a split-checkpoint root (a folder of per-module
+subfolders, not a single HF checkpoint). The converter is also the only path for
+a DeepSeek ``multi_modality`` source, which it rewrites to the HF layout first,
+and the only one that records the family's generation defaults (`guidance_scale`
+among them) and the tokenizer-derived `gen_image_token_id`.
 
 ---
 
@@ -206,11 +224,12 @@ The two inference launches are described in
 
 `tasks/omni/infer_omni.py` runs a generation graph selected by
 `--model.model_config.infer_type` (a key into the `model.model_config.infer_graph`
-map in `base.yaml`; defaults to `infer_interleave`). `--model.model_path` is a
-**split-checkpoint root** that holds one subfolder per module (`janus_siglip/`,
+map in `base.yaml`; defaults to `infer_interleave`). `--model.model_path` takes
+either the upstream HF checkpoint (loaded through the layout, as in step 1) or a
+split-checkpoint root holding one subfolder per module (`janus_siglip/`,
 `janus_vqvae/`, `janus_text_encoder/`, `janus_llama/`), each with its own
-`config.json` + weights; `base.yaml` already points it at the step-1 converter
-output, so you can infer directly with the converted base model.
+`config.json` + weights. `base.yaml` points it at the split root the step-1
+converter writes, so you can infer directly with the converted base model.
 
 Each module opts into FSDP / extra-parallel via its inference module YAML's
 `accelerator` block; `OmniInferencer` auto-detects whether any module needs a
@@ -223,9 +242,19 @@ distributed run. Two ready-made inference module files ship with the config:
 
 ### 5.1 Inferring from a trained checkpoint
 
-Training writes each module's HF weights one level deeper, under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Assemble a flat root
-the loader understands by linking each module's `hf_ckpt/` to `<root>/<module>`:
+Under an HF `model_path`, `save_hf_weights` writes one merged export in the
+source's own layout at
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/` — the same keys, dtypes and
+shard files as the upstream root, plus its non-weight sidecars. Pass it straight
+to `--model.model_path` (the layout loads it again) or to `transformers`:
+
+```bash
+--model.model_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_20/hf_ckpt
+```
+
+A split-checkpoint run (no HF layout to write back to) instead writes per-module
+folders under `hf_ckpt/<module>/`; assemble those into a flat root by linking
+each module's folder to `<root>/<module>`:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
@@ -236,7 +265,7 @@ for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
 done
 ```
 
-Then pass `--model.model_path "$ASM"` to any of the commands below.
+Then pass `--model.model_path "$ASM"`.
 
 **Image understanding (I2T / VQA)** — `infer/graph_infer_und.yaml`.
 
