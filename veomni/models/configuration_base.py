@@ -28,6 +28,39 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
 
+#: Config classes whose blocks build a ``swiglu_mlp`` handle, keyed by class name,
+#: so the check can tell a real consumer from a config that merely happens to carry
+#: a gated-MLP shape. Everything with a text decoder is a consumer; these are the
+#: two vision towers that also are, because their patches bind the handle too
+#: (``qwen2_5_vl_vision_mlp_init_patched`` and its Omni sibling).
+_EXTRA_SWIGLU_VISION_CONFIGS = frozenset(
+    {
+        "Qwen2_5_VLVisionConfig",
+        "Qwen2_5OmniVisionEncoderConfig",
+    }
+)
+
+
+def _binds_swiglu_mlp(config: PretrainedConfig) -> bool:
+    """Whether ``config``'s blocks build a ``swiglu_mlp`` handle.
+
+    A config-level test cannot infer this from shape alone: Qwen2.5-VL's vision
+    tower carries ``intermediate_size``, ``depth`` and an activation, and *does*
+    bind the handle, while Qwen3-VL's vision tower has the same shape and binds
+    nothing. Guessing either way gets a real configuration wrong -- the first
+    would let a quantizing selection train unquantized, the second would block a
+    perfectly good text-side selection because a vision tower uses GELU.
+
+    So: the language model is always a consumer (its MLP is what the row serves),
+    and the two vision towers that bind the handle are named explicitly. A new
+    model that binds ``swiglu_mlp`` outside its text stack adds its config class
+    here.
+    """
+    if "text" in type(config).__name__.lower() or hasattr(config, "num_hidden_layers"):
+        return True
+    return type(config).__name__ in _EXTRA_SWIGLU_VISION_CONFIGS
+
+
 def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, proposed: Mapping) -> None:
     """Refuse a quantizing ``swiglu_mlp`` selection the model's activation cannot run.
 
@@ -44,13 +77,7 @@ def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, 
 
     if proposed.get("swiglu_mlp_implementation") not in QUANTIZING_IMPLS:
         return
-    # A gated MLP is what this row serves, and every such block declares an
-    # ``intermediate_size``. Do not test for a decoder stack (``num_hidden_layers``)
-    # or for ``depth``: Qwen2.5-VL and Qwen2.5-Omni vision towers use ``depth`` and
-    # *do* bind ``swiglu_mlp``, so a stack-shaped test let them through unquantized.
-    # Configs without a gated MLP (embeddings, vocoders, norm-only blocks) have no
-    # ``intermediate_size`` and are skipped.
-    if not hasattr(config, "intermediate_size"):
+    if not _binds_swiglu_mlp(config):
         return
     # Gemma-style configs name the field ``hidden_activation``; the rest use
     # ``hidden_act``. A config with neither has no MLP activation to check.
@@ -223,7 +250,10 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                 proposed["attn_implementation"] = OpsImplementationConfig.normalize_attention_backend(
                     proposed["attn_implementation"]
                 )
-            _reject_quantized_swiglu_on_an_unfused_activation(config, proposed)
+            # Only the validating pass reports; the post-init and load-time passes
+            # build the tree first and are checked once the whole picture is known.
+            if _validate:
+                _reject_quantized_swiglu_on_an_unfused_activation(config, proposed)
             pending.append((config, proposed))
             for key in config.sub_configs:
                 child = getattr(config, key, None)

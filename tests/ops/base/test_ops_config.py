@@ -1115,19 +1115,15 @@ def test_a_quantizing_swiglu_row_is_refused_on_an_unfused_activation():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_a_quantizing_swiglu_row_is_refused_on_a_vlm_vision_activation_too():
-    """A VLM vision tower with a gated MLP is checked like any other.
+def test_a_quantizing_swiglu_row_is_refused_only_where_the_handle_is_bound():
+    """Vision towers are checked only when they actually build a ``swiglu_mlp``.
 
-    Qwen2.5-VL and Qwen2.5-Omni build `swiglu_mlp` handles inside their vision
-    towers, and those configs declare `depth` rather than `num_hidden_layers`, so a
-    decoder-shaped test let them through: `gelu` plus `swiglu_mlp_implementation='qat'`
-    would have trained the vision MLP at full precision under a QAT config.
-
-    The check refuses any non-SiLU activation on a config that has a gated MLP
-    (`intermediate_size`). That deliberately over-reports: Qwen3-VL's vision tower
-    uses GELU-tanh but binds no `swiglu_mlp`, so it is refused too. A model that
-    cannot quantize that MLP anyway is not a configuration anyone should be able to
-    select, and the message names the key to change.
+    Shape cannot decide this: Qwen2.5-VL's vision tower carries
+    `intermediate_size`, `depth` and an activation *and* binds the handle, while
+    Qwen3-VL's has the same shape and binds nothing there. Guessing one way lets a
+    quantizing selection train unquantized; guessing the other blocks Qwen3-VL's
+    SiLU text MLPs because its vision tower uses GELU. `_binds_swiglu_mlp` names
+    the consumers instead.
     """
     import copy
 
@@ -1140,8 +1136,14 @@ def test_a_quantizing_swiglu_row_is_refused_on_a_vlm_vision_activation_too():
         veomni_config._set_ops_implementation(ops)
         return veomni_config
 
-    # Qwen2.5-VL: the vision tower binds the handle and declares `depth`, not
-    # `num_hidden_layers`. Both towers are SiLU by default, which quantizes fine.
+    # Qwen3-VL: the text MLP is SiLU and quantizes; the vision tower is GELU-tanh
+    # but binds no handle, so it must not veto the selection.
+    qwen3_vl = Qwen3VLMoeConfig()
+    assert qwen3_vl.text_config.hidden_act == "silu"
+    assert qwen3_vl.vision_config.hidden_act == "gelu_pytorch_tanh"
+    assert apply(qwen3_vl, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    # Qwen2.5-VL: the vision tower *does* bind the handle, so its activation counts.
     vl = Qwen2_5_VLConfig()
     assert not hasattr(vl.vision_config, "num_hidden_layers")
     assert vl.vision_config.hidden_act == "silu"
@@ -1152,12 +1154,31 @@ def test_a_quantizing_swiglu_row_is_refused_on_a_vlm_vision_activation_too():
     with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
         apply(gelu_vision, swiglu_mlp_implementation="qat")
 
-    # A reference row keeps the fallback on every activation.
     assert apply(gelu_vision, swiglu_mlp_implementation="eager").ops_config.swiglu_mlp_implementation == "eager"
 
-    # Qwen3-VL's vision tower is GELU-tanh and binds no handle. Refusing it is the
-    # accepted cost of not being able to tell the two shapes apart at config level.
-    qwen3_vl = Qwen3VLMoeConfig()
-    assert qwen3_vl.vision_config.hidden_act == "gelu_pytorch_tanh"
-    with pytest.raises(ValueError, match="hidden_act='gelu_pytorch_tanh'.*round nothing"):
-        apply(qwen3_vl, swiglu_mlp_implementation="qat")
+
+def test_a_child_can_opt_out_of_a_quantizing_root_selection():
+    """A layered override keeps the child's exception instead of inheriting `qat`.
+
+    The vision tower is set to `eager` while the root selects `qat`; the tree is
+    then validated as a whole, which is the path a YAML with per-sub-config
+    overrides takes.
+    """
+    import copy
+
+    from transformers import Qwen2_5_VLConfig
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    config = Qwen2_5_VLConfig()
+    config.vision_config.hidden_act = "gelu"
+
+    veomni_config = as_veomni_config(copy.deepcopy(config), validate=False)
+    veomni_config._set_ops_implementation({"swiglu_mlp_implementation": "qat"}, _is_post_init=True, _validate=False)
+    veomni_config.vision_config._set_ops_implementation(
+        {"swiglu_mlp_implementation": "eager"}, _is_post_init=True, _validate=False
+    )
+    veomni_config._set_ops_implementation({}, _validate_tree=True)
+
+    assert veomni_config.ops_config.swiglu_mlp_implementation == "qat"
+    assert veomni_config.vision_config.ops_config.swiglu_mlp_implementation == "eager"
