@@ -195,8 +195,7 @@ owned by exactly one module. A module's *own* internals are unconstrained — it
 run at any width or length as long as it adapts to the packed layout before the
 scatter. That holds for a family whose modules are different *views of the same
 sequence* — the text encoder owns tokens, the vision tower owns visual rows, the
-backbone reads the whole thing — which is what the packed graphs of Qwen3-VL and
-Janus are.
+backbone reads the whole thing — which is what Qwen3-VL's packed graph is.
 
 It does **not** hold for an arbitrary assembly of modules:
 

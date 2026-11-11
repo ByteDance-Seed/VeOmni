@@ -14,7 +14,6 @@ from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import JanusSiglipConfig
 from ..modeling import JanusSiglip
 from ..processing import JanusSiglipProcessor
-from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -45,7 +44,8 @@ class TrainingMixin(TrainingModuleMixin):
         if get_parallel_state().sp_size > 1:
             self._sp_own_len = pixel_values.size(0)
             pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
-            return {"pixel_values": pixel_values}
+        # ``is_dummy`` travels with the slice: ``forward`` uses it to skip the real
+        # tower for an all-dummy batch (only an FSDP2 wrap needs the anchor).
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
@@ -96,7 +96,7 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     config: JanusSiglipConfig
     _image_processor: JanusSiglipProcessor
 

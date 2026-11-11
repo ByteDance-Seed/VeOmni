@@ -2,10 +2,11 @@
 
 ``JanusLlama(InferenceMixin, PretrainedOmniModule)`` — patched
 ``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
-the text-encoder node.  Packing / FSDP dummy anchors live in ``accelerated.py``.
+the text-encoder node.  The conversation carrier and FSDP dummy anchors are
+handled in ``accelerated.py``.
 
-Multi-modal embedding packing
------------------------------
+Multi-modal embedding concatenation
+-----------------------------------
 :meth:`pre_forward` concatenates each sample's embedded conversation items
 into one packed sequence (``bs=1``), builds per-sample ``position_ids``
 (``range(0, len)`` per sample), and precomputes Flash-Attention varlen
@@ -18,7 +19,7 @@ Sequence parallelism
 ``forward`` is SP-unaware — it computes on whatever (already-sliced) sequence
 it is handed. SP is driven OUTSIDE the model (classic single-pass Ulysses): when
 ``sp_size > 1`` the accelerated ``TrainingMixin``'s ``forward_pre`` hook slices
-the (replicated) packed sample to this rank's ``1/sp_size`` shard (rebuilding
+the (replicated) concatenated sample to this rank's ``1/sp_size`` shard (rebuilding
 the varlen ``cu_seqlens``), ``forward`` runs once (its attention all-to-alls
 over the SP group internally), and the ``forward_post`` hook all-gathers the
 shards back to the full sequence on every rank (both in ``accelerated.py``,

@@ -28,8 +28,8 @@ states:
 
   image_vq:
     body:
-      - { from: janus_vqvae, to: janus_llama }
       - { from: janus_llama, to: janus_vqvae }
+      - { from: janus_vqvae, to: janus_llama }
     transitions:
       - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 

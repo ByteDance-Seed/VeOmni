@@ -35,14 +35,11 @@ the trainer and its `infer.*` block drives the inferencer.
 |------|------|
 | `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. References the module/graph files below. |
 | `train/modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries an embedding-parallel `emb` extra-parallel block (see below). Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
-| `packed/modules_train.yaml` | Same as `train/modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
 | `train/graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
-| `packed/graph_train.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
-| `packed/base.yaml` | Packed-training launcher (`packed/modules_train.yaml` + packed graph). |
 | `train/base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
 | `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager. Select it with `--model.model_config.modules`. |
-| `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
+| `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager`; the file pins `janus_siglip` explicitly and `for_inference` supplies the `eager` default to the rest, so the whole run is a single-process replica. |
 | `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `model.model_config.infer_graph`). |
 
 ---
@@ -75,12 +72,14 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 # configs/seed_omni/Janus/data.yaml
 sources:
   - /mnt/hdfs/user_dir/dataset/imagenet1k_train      # text -> image (T2I)
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data # text-only SFT
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k    # image -> text (I2T)
 names:
   - imagenet1k
+  - tulu-3-sft-mixture
   - sharegpt4v_cap_100k
 schedule:
-  - { schedule_type: const, weights: [0.5, 0.5] }
+  - { schedule_type: const, weights: [0.5, 0.2, 0.3] }
 level: token
 stopping_strategy: all_exhausted
 upstream_sharded: true
@@ -103,21 +102,20 @@ bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 ```
 
-Packed training (CPU-built packed tokens/masks; modules only `masked_scatter`) uses
-`packed/base.yaml`. A single FSDP2 tree over the composed OmniModel uses
-`train/base_model_fsdp.yaml`, or add
-`--model.accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
+The conversation DAG runs every module on the `conversation_list` carrier. A single
+FSDP2 tree over the composed OmniModel uses `train/base_model_fsdp.yaml`, or add
+`--model.accelerator.fsdp_config.fsdp_scope model` to any launcher:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/packed/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.accelerator.fsdp_config.fsdp_scope model
 ```
 
 Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length (large images are resized to fit).
+- `--data.max_seq_len` — sequence length budget (large images are resized to fit).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.checkpoint.save_steps` / `--train.checkpoint.hf_save_steps` — DCP / HF save cadence.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -221,7 +219,7 @@ distributed run. Two ready-made inference module files ship with the config:
 | `--model.model_config.modules` file | Layout | Launch |
 |-------------------------------------|--------|--------|
 | `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
-| `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
+| `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica (the file only pins `janus_siglip`; `for_inference` supplies `fsdp_mode: eager` to the rest) | single-process (`python …`) |
 
 ### 5.1 Inferring from a trained checkpoint
 

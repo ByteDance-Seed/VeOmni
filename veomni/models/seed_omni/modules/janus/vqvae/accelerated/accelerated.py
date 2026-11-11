@@ -21,7 +21,6 @@ from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import JanusVqvaeConfig
 from ..modeling import JanusVqvae
 from ..processing import JanusVqvaeProcessor
-from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -69,14 +68,12 @@ class TrainingMixin(TrainingModuleMixin):
             # batch (the VQVAE codec shards the batch dim — its attention is not
             # Ulysses). Every SP rank already holds the same image batch (the
             # dataloader replicates each shard); pad it to a multiple of ``sp_size``
-            # and take this rank's contiguous chunk. ``is_dummy`` is dropped: the SP
-            # path is a training path that always runs the codec (the FSDP grad
-            # anchor). ``encode_post`` all-gathers the shards back.
+            # and take this rank's contiguous chunk. ``encode_post`` all-gathers the
+            # shards back.
             self._sp_own_len = pixel_values.size(0)
             pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
-            return {"pixel_values": pixel_values}
-        # ``is_dummy`` stays for the plain (non-SP) encode: a non-SP inference/eval
-        # short-circuit that skips the codec for an all-dummy batch with no anchor.
+        # ``is_dummy`` travels with the slice: ``encode`` needs it to skip the codec
+        # for an all-dummy batch unless an FSDP2 wrap maintains a gradient anchor.
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
@@ -199,7 +196,7 @@ class MeterMixin(MetricMeterMixin):
         return 0.0
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """``generate()`` / ``finalize()`` and the VQ-buffer inference state already
     live on the native :class:`~.modeling.JanusVqvae` (via its own
     :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.

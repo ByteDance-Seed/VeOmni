@@ -56,7 +56,11 @@ class JanusTextEncoder(TextEncoder):
             maybe_merge_outputs(conversation_list)
 
             if output_token_id == self._chat_template.boi_token_id:
-                self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, outputs)
+                # Same arming as ``emit_image_start``: the unconditional embeds go on
+                # the item's meta so the VQVAE span runs with guidance.
+                tail.meta["cfg_uncond_inputs_embeds"] = self._maybe_arm_cfg_for_image_gen(
+                    conversation_list, generation_kwargs
+                )
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
             elif output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
@@ -120,12 +124,18 @@ class JanusTextEncoder(TextEncoder):
         self,
         conversation_list: Optional[List[ConversationItem]],
         generation_kwargs: Optional[Dict[str, Any]],
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
+        """Unconditional embeds to carry into the image span, or ``None``.
+
+        Classifier-free guidance only applies to image generation, so this is
+        called at the two points that open a span (``emit_image_start`` and the
+        sampled-``<boi>`` path in ``generate``). The caller stores the result on
+        the output item's ``meta``.
+        """
         cfg_w = generation_kwargs.get("guidance_scale")
         if cfg_w is None or float(cfg_w) <= 1.0:
-            return
-        uncond = self._build_cfg_uncond_embeds(conversation_list)
-        return uncond
+            return None
+        return self._build_cfg_uncond_embeds(conversation_list)
 
     def _build_cfg_uncond_embeds(
         self,
