@@ -562,6 +562,11 @@ def test_a_typo_in_the_worker_model_config_is_an_error(tmp_path: Path):
     The worker selects its chat template from `enable_image`, applying overrides
     with a permissive `update` — so `enable_imag: true` would land as a stray
     attribute and the run would quietly train the text-only template.
+
+    The check must not over-fire either: transformers v5 stores several public
+    config properties under a leading underscore (`output_attentions` ->
+    `_output_attentions`), so a key that is only a near-miss of the *stored* name
+    is still a valid key. And the same dict carries HF load options.
     """
     from unittest.mock import patch
 
@@ -580,6 +585,14 @@ def test_a_typo_in_the_worker_model_config_is_an_error(tmp_path: Path):
 
         with pytest.raises(ValueError, match="look misspelled"):
             Qwen3TextEncoderPreprocessor.from_pretrained(str(config_dir), config_overrides={"enable_imag": True})
+
+        # Valid keys that a naive near-miss check would reject.
+        for accepted in (
+            {"output_attentions": False},
+            {"output_hidden_states": True},
+            {"device_map": "cpu", "torch_dtype": "auto"},
+        ):
+            Qwen3TextEncoderPreprocessor.from_pretrained(str(config_dir), config_overrides=accepted)
 
 
 def _table_rows(weight: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:

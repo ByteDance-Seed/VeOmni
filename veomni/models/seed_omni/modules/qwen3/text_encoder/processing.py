@@ -34,14 +34,19 @@ class Qwen3TextEncoderPreprocessor(TextEncoderPreprocessor):
         stray attribute — ``enable_imag: true`` would load fine and quietly leave
         the worker on the text-only template. So a key that is one character or so
         away from a config field it does not match exactly is reported. Only
-        *near-misses* are rejected: the same dict also carries HF load options
-        (``device_map``, ``torch_dtype``, …) that are not config fields at all.
+        *near-misses* are rejected: HF load options in the same dict
+        (``device_map``, ``torch_dtype``, …) are not config fields at all, and a
+        valid public property must be recognized before the fuzzy match runs.
         """
         config = Qwen3TextEncoderConfig.from_pretrained(module_path, model_config=config_overrides)
-        # Fields the config declares, before the overrides above landed on it: a
-        # misspelled key is now *also* an attribute, so the loaded config cannot be
-        # its own reference.
-        known = set(vars(Qwen3TextEncoderConfig()))
+        # The reference set is a *fresh* config: after the overrides above a
+        # misspelled key is an attribute too, so the loaded config cannot validate
+        # itself. Public properties are included as well as the stored attributes —
+        # transformers v5 keeps several under a leading underscore
+        # (`output_attentions` -> `_output_attentions`), and those are valid keys,
+        # not typos.
+        reference = Qwen3TextEncoderConfig()
+        known = set(vars(reference)) | {name for name in dir(type(reference)) if not name.startswith("__")}
         misspelled = {
             key: difflib.get_close_matches(key, known, n=1, cutoff=0.85)[0]
             for key in (config_overrides or {})
