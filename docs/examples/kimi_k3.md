@@ -55,11 +55,15 @@ from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda_fwd as t; pr
 
 Both packages stay outside VeOmni's lockfile (same policy as the
 `gated_delta_rule` `fla_npu` backend), so stock NPU CI images do not ship
-them. Without them the `chunk_kda` op resolves to the eager reference - the
-registry records `requires=("fla_npu", "triton_ascend_kernels")` on the
-`ascendc` row and falls back automatically - and the AscendC contract tests
-skip with a `missing: ...` reason. Install both packages on production NPU
-hosts as above before selecting `chunk_kda_implementation: ascendc`.
+them. Auto selection (no explicit implementation pinned) falls back to the
+eager reference when they are missing, but this recipe pins
+`chunk_kda_implementation: ascendc` - the registry records
+`requires=("fla_npu", "triton_ascend_kernels")` on that row, and an
+explicitly selected implementation never falls back: it raises a
+`RuntimeError` at op selection instead. To run without the packages,
+switch the recipe to `chunk_kda_implementation: eager`; the AscendC
+contract tests skip with a `missing: ...` reason either way. Install both
+packages on production NPU hosts as above before keeping `ascendc`.
 
 ## Prepare dataset
 
@@ -67,8 +71,7 @@ One JSONL record per sample (image path + caption; `width`/`height` let the
 transform render the exact media header):
 
 ```json
-{"image": "/data/coco2017/val2017/000000039769.jpg", "width": 640, "height": 480,
- "caption": "A cat sitting on a mattress."}
+{"image": "/data/coco2017/val2017/000000039769.jpg", "width": 640, "height": 480, "caption": "A cat sitting on a mattress."}
 ```
 
 Build it from COCO captions with the in-repo converter:
@@ -79,11 +82,12 @@ python scripts/multimodal/convert_data/coco_to_conversations.py \
   --output /data/k3_coco_val2017.jsonl
 ```
 
-Wire it through a data manifest (`configs/multimodal/data/k3_coco.yaml`):
+Point the data manifest at the converter output - edit
+`configs/multimodal/data/k3_coco.yaml` to use the generated dataset:
 
 ```yaml
 sources:
-- /path/to/k3_coco_val2017.jsonl
+- /data/k3_coco_val2017.jsonl
 names:
 - kimi_k3_coco
 schedule:
@@ -105,6 +109,10 @@ have a hub repo, use the in-repo downloader:
 python3 scripts/download_hf_model.py --repo_id <kimi-k3-repo> --local_dir ./kimi_k3_hf
 ```
 
+The downloader appends the repository name to `--local_dir`, so the assets
+land in `./kimi_k3_hf/<repo-name>` - use that directory as the
+`tokenizer_path` in the launch commands below.
+
 The recipe trains from random init (`model_path: null`), so no pretrained
 weights are needed — but the tokenizer directory must still include the
 image processor assets (`preprocessor_config.json`): the transform
@@ -115,7 +123,7 @@ tokenizer-only directory leaves it unset.
 
 ```bash
 bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml \
-    --model.tokenizer_path ./kimi_k3_hf \
+    --model.tokenizer_path ./kimi_k3_hf/<repo-name> \
     --data.train_path configs/multimodal/data/k3_coco.yaml
 ```
 
@@ -126,11 +134,18 @@ Expected on 8×910B3: step-1 loss ≈ 13 (random init over the 163 840 vocab),
 ## Start training on GPU
 
 The model package runs the same trainer on NVIDIA GPUs. Install the GPU
-extra (Python 3.11 or 3.12, glibc >= 2.28, CUDA 12.x / 13.x):
+extra on an x86_64 Linux host (Python 3.11 or 3.12, glibc >= 2.28, CUDA
+12.x / 13.x) - the extra's `flash-attn` build, which K3's vision attention
+imports directly, is published for x86_64 only:
 
 ```bash
-uv sync --extra gpu          # or: pip install -e ".[gpu]"
+uv sync --extra gpu
+source .venv/bin/activate
 ```
+
+`uv` is the supported installer here: the GPU extra pins
+`torch==2.11.0+cu130` and a wheel-only `deep-gemm` build through
+`[tool.uv.sources]`, which `pip install -e ".[gpu]"` cannot resolve.
 
 The GPU recipe `configs/multimodal/kimi_k3/kimi_k3_vl.yaml` pins the
 official-default baseline the NPU fused stack compares against: flash-attn
@@ -141,7 +156,7 @@ exactly like the NPU recipe:
 
 ```bash
 bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl.yaml \
-    --model.tokenizer_path ./kimi_k3_hf \
+    --model.tokenizer_path ./kimi_k3_hf/<repo-name> \
     --data.train_path configs/multimodal/data/k3_coco.yaml
 ```
 
@@ -197,8 +212,10 @@ model:
       num_experts: 16
 ```
 
-Drop the `model_config` block for the full layout (multi-node), or set
-`model_path` to a released checkpoint to fine-tune real weights.
+Drop the `model_config` block for the full layout (multi-node). The same
+applies when fine-tuning a released checkpoint: set `model_path` to the
+checkpoint and remove the `model_config` overrides with it - the recipe's
+reduced 10-layer / 16-expert shape will not match the full weights.
 
 ## Training config notes
 

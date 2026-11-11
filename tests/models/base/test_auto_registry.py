@@ -149,6 +149,8 @@ _NPU_GENERATED_FAMILIES = frozenset(
         "deepseek_v3",
         "deepseek_v4",
         "glm_moe_dsa",
+        "kimi_k3",
+        "kimi_linear",
         "qwen3",
         "qwen3_5",
         "qwen3_5_text",

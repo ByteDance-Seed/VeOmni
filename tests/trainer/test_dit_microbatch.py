@@ -126,6 +126,34 @@ def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
     assert base.train_dataloader.sampler.shuffle is shuffle
 
 
+def test_expanded_length_hook_reaches_base_trainer_dataset(monkeypatch):
+    trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1)
+    built = {}
+
+    def build_dataset(**kwargs):
+        built.update(kwargs)
+        return list(range(4))
+
+    monkeypatch.setattr(base_module, "build_dataset", build_dataset)
+
+    def _length_fn(sample):
+        return 1
+
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None)
+    BaseTrainer._build_dataset(base)
+    assert built["sample_token_len_fn"] is None
+
+    hook = SimpleNamespace(get_dyn_bsz_length_fn=lambda: _length_fn)
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None, model=hook)
+    BaseTrainer._build_dataset(base)
+    assert built["sample_token_len_fn"] is _length_fn
+
+    wrapped = SimpleNamespace(unwrapped_module=hook)
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None, model=wrapped)
+    BaseTrainer._build_dataset(base)
+    assert built["sample_token_len_fn"] is _length_fn
+
+
 class _Condition:
     def __init__(self):
         self.encoded = []

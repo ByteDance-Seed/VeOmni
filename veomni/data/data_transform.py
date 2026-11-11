@@ -54,6 +54,10 @@ def kimi_k3_expanded_length(mh: int, mw: int, sample) -> int:
     add the expanded vision length. Used via functools.partial by the model
     hook ``get_dyn_bsz_length_fn`` -- must stay module-level so trainer-state
     checkpointing can pickle it by reference."""
+    if isinstance(sample, list):
+        # Match get_length_fn's contract (a single sample or a list) so the same
+        # hook serves sample_token_len_fn and dyn_bsz budgeting.
+        return sum(kimi_k3_expanded_length(mh, mw, item) for item in sample)
     n_text = int(sample["attention_mask"].sum())
     grids = sample.get("grid_thws", None)
     if grids is None or int(getattr(grids, "shape", (0,))[0]) == 0:

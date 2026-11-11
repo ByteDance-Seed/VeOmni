@@ -403,6 +403,41 @@ def _make_simple_dataset(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_weighted_multisource_builder_forwards_sample_token_len_fn(monkeypatch, tmp_path):
+    import veomni.data.dataset as dataset_module
+
+    manifest = tmp_path / "multisource.yaml"
+    manifest.write_text(
+        "sources:\n"
+        "- /tmp/a.jsonl\n"
+        "- /tmp/b.jsonl\n"
+        "names:\n"
+        "- a\n"
+        "- b\n"
+        "schedule:\n"
+        "- schedule_type: const\n"
+        "  weights: [0.5, 0.5]\n"
+    )
+    mocks = [
+        MockIterableDataset([{"input_ids": [1]}], name="a"),
+        MockIterableDataset([{"input_ids": [2, 3]}], name="b"),
+    ]
+    monkeypatch.setattr(dataset_module, "build_iterable_dataset", lambda **kwargs: mocks.pop(0))
+
+    def _expanded_len(sample):
+        return 1.0
+
+    dataset = dataset_module.build_weighted_multisource_dataset(
+        train_path=str(manifest),
+        transform=None,
+        seed=7,
+        shuffle=False,
+        sample_token_len_fn=_expanded_len,
+    )
+    assert dataset._sample_token_len_fn is _expanded_len
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_state_dict_structure():
     ds1 = MockIterableDataset([{"input_ids": [1, 2]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [3, 4, 5]}], name="b")

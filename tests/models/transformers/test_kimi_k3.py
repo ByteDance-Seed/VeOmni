@@ -947,3 +947,21 @@ def test_get_seq_length_with_no_full_attention_layers():
     cache.transformer_layers = []
     cache.key_cache = []
     assert cache.get_seq_length() == 0
+
+
+def test_expanded_length_hook_accepts_sample_lists():
+    """The expanded-length hook must match get_length_fn's contract (a single
+    sample or a list) so it can serve sample_token_len_fn as well."""
+    from veomni.data.data_transform import kimi_k3_expanded_length
+
+    def _sample(n_text, grid_thws):
+        return {"attention_mask": torch.ones(n_text), "grid_thws": grid_thws}
+
+    text_only = _sample(7, None)
+    one_image = _sample(7, torch.tensor([[2, 4, 4]]))
+    single_text = kimi_k3_expanded_length(2, 2, text_only)
+    single_image = kimi_k3_expanded_length(2, 2, one_image)
+    assert single_text == 7
+    assert single_image == 7 + 32 // 4 - 1
+    combined = kimi_k3_expanded_length(2, 2, [text_only, one_image, one_image])
+    assert combined == single_text + 2 * single_image
