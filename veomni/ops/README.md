@@ -43,7 +43,7 @@ when the selected implementation runs.
 | Op | Variants | Implementations |
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
-| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
+| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit`, `bagel` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |

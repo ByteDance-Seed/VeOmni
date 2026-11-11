@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
@@ -20,6 +19,7 @@ from veomni.ops import VeomniOp
 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
+from ..position_embedding import PositionEmbedding
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor, BagelSiglipNavitProcessor
@@ -101,6 +101,7 @@ class InferenceMixin:
         conversation_list: list[ConversationItem] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Encode SigLIP context images and scatter visual embeddings onto ``conversation_list``."""
         del kwargs
         batched = [conversation_list]
         image_items = select_siglip_image_items(batched)
@@ -120,6 +121,11 @@ class InferenceMixin:
         return {"conversation_list": batched[0]}
 
 
+def _module_weight(module: nn.Module) -> torch.Tensor:
+    """Return the underlying weight parameter for plain or LoRA-wrapped modules."""
+    return getattr(module, "base_layer", module).weight
+
+
 class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
@@ -129,6 +135,7 @@ class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     _no_split_modules = ["BagelSiglipEncoderLayer"]
     supports_gradient_checkpointing = True
     _supports_sdpa = True
+    _supports_flash_attn = True
 
     def __init__(self, config: BagelSiglipNavitConfig) -> None:
         super().__init__(config)
@@ -146,11 +153,11 @@ class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
 
     @property
     def _vit_device(self) -> torch.device:
-        return self.vision_model.embeddings.patch_embedding.weight.device
+        return _module_weight(self.vision_model.embeddings.patch_embedding).device
 
     @property
     def _connector_device(self) -> torch.device:
-        return self.connector.fc1.weight.device
+        return _module_weight(self.connector.fc1).device
 
     @property
     def _pos_embed_device(self) -> torch.device:
@@ -202,7 +209,8 @@ class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
         vit_hidden: torch.Tensor,
         patchified_position_ids: torch.LongTensor,
     ) -> torch.Tensor:
-        vit_hidden = vit_hidden.to(device=self._connector_device, dtype=self.connector.fc1.weight.dtype)
+        fc1_weight = _module_weight(self.connector.fc1)
+        vit_hidden = vit_hidden.to(device=fc1_weight.device, dtype=fc1_weight.dtype)
         patchified_position_ids = patchified_position_ids.to(device=self._pos_embed_device)
         image_embeds = self.connector(vit_hidden)
         return image_embeds + self.vit_pos_embed(patchified_position_ids).to(
@@ -238,49 +246,6 @@ class RotaryEmbedding2D(nn.Module):
         return emb.cos(), emb.sin()
 
 
-class PositionEmbedding(nn.Module):
-    def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
-        super().__init__()
-        self.max_num_patch_per_side = max_num_patch_per_side
-        self.hidden_size = hidden_size
-        self.pos_embed = nn.Parameter(
-            torch.zeros(max_num_patch_per_side**2, hidden_size),
-            requires_grad=False,
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-        if hasattr(self.pos_embed.data, "to_local"):
-            self.pos_embed.data.to_local().copy_(new_data)
-        else:
-            self.pos_embed.data.copy_(new_data)
-
-    def _init_weights(self) -> None:
-        self.reset_parameters()
-
-    def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
-        return self.pos_embed[position_ids.to(device=self.pos_embed.device)]
-
-
-def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
-    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return torch.from_numpy(np.concatenate([emb_h, emb_w], axis=1)).float()
-
-
-def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-    out = np.einsum("m,d->md", pos.reshape(-1), omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
-
-
 class MLPConnector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_act: str) -> None:
         super().__init__()
@@ -306,28 +271,28 @@ class BagelSiglipVisionEmbeddings(nn.Module):
         patchified_pixel_values: torch.Tensor,
         patchified_position_ids: torch.LongTensor,
     ) -> torch.Tensor:
+        patch_weight = _module_weight(self.patch_embedding)
         patchified_pixel_values = patchified_pixel_values.to(
-            device=self.patch_embedding.weight.device,
-            dtype=self.patch_embedding.weight.dtype,
+            device=patch_weight.device,
+            dtype=patch_weight.dtype,
         )
         patch_embeds = self.patch_embedding(patchified_pixel_values)
         if self.position_embedding is None:
             return patch_embeds
-        position_ids = patchified_position_ids.to(device=self.position_embedding.weight.device, dtype=torch.long)
+        position_weight = _module_weight(self.position_embedding)
+        position_ids = patchified_position_ids.to(device=position_weight.device, dtype=torch.long)
         position_embeds = self.position_embedding(position_ids)
         return patch_embeds + position_embeds.to(device=patch_embeds.device, dtype=patch_embeds.dtype)
 
 
-def _is_flash_attention_impl(impl: str | None) -> bool:
-    return impl is not None and "flash_attention" in impl
-
-
 class BagelSiglipAttention(nn.Module):
     def __init__(self, config: BagelSiglipNavitConfig) -> None:
+        """Initialize NaViT self-attention projections and instance-local ``VeomniOp`` handles."""
         super().__init__()
         self.config = config
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_groups = 1
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
@@ -336,19 +301,22 @@ class BagelSiglipAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
 
-        rope_impl = config.ops_implementation.get(
-            "rotary_pos_emb_vision_implementation",
-            config.ops_implementation.get("rotary_pos_emb_implementation", "eager"),
+        rope_impl = (
+            config.ops_config.rotary_pos_emb_vision_implementation
+            if "rotary_pos_emb_vision_implementation" in config.ops_implementation
+            or "rotary_pos_emb_implementation" not in config.ops_implementation
+            else config.ops_config.rotary_pos_emb_implementation
         )
         self.veomni_rope = VeomniOp("rope", "full", rope_impl)
 
-        attn_impl = config.ops_implementation.get(
-            "attn_implementation",
-            getattr(config, "_attn_implementation", None),
-        )
-        if not attn_impl or attn_impl == "eager":
-            attn_impl = "veomni_sdpa"
-        self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+        attn_impl = config.ops_config.attn_implementation
+        if "attn_implementation" not in config.ops_implementation:
+            try:
+                self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+            except RuntimeError:
+                self.veomni_attn = VeomniOp("attention", "standard", "veomni_sdpa")
+        else:
+            self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 
     def forward(
         self,
@@ -360,6 +328,7 @@ class BagelSiglipAttention(nn.Module):
         cos_w: torch.Tensor | None = None,
         sin_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run varlen non-causal self-attention over packed NaViT patch tokens."""
         total_q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states).view(total_q_len, self.num_heads, self.head_dim)
         key_states = self.k_proj(hidden_states).view(total_q_len, self.num_heads, self.head_dim)
@@ -379,46 +348,31 @@ class BagelSiglipAttention(nn.Module):
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        query_states = query_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
-        key_states = key_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
-        value_states = value_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        attn_dtype = (
+            torch.bfloat16
+            if value_states.dtype == torch.float32 and "flash_attention" in self.veomni_attn.impl
+            else value_states.dtype
+        )
+        query_states = query_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
+        key_states = key_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
+        value_states = value_states.to(attn_dtype).transpose(0, 1).unsqueeze(0)
         dropout = 0.0 if not self.training else self.attention_dropout
 
-        if _is_flash_attention_impl(self.veomni_attn.impl):
-            attn_output, _ = self.veomni_attn(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                skip_ulysses=True,
-            )
-        else:
-            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-            splits = [torch.split(tensor, lengths, dim=2) for tensor in (query_states, key_states, value_states)]
-            attn_outputs = [
-                self.veomni_attn(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=dropout,
-                    is_causal=False,
-                    skip_ulysses=True,
-                )[0]
-                for q, k, v in zip(*splits, strict=True)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
-
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            skip_ulysses=True,
+        )
         return self.out_proj(attn_output.reshape(total_q_len, -1).to(hidden_states.dtype))
 
 

@@ -30,7 +30,13 @@ from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     BagelSiglipNavitPreprocessor,
     BagelSiglipNavitProcessor,
 )
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_CONTEXT_KEY,
+    BAGEL_PHASE_KEY,
+    BAGEL_SIGLIP_CONTEXT,
+    BAGEL_START_TOKEN,
+    BAGEL_VAE_CONTEXT,
+)
 from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
     _OMNI_TOKENIZED as BAGEL_TOK,
@@ -534,9 +540,14 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
     vae_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
     text_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
 
-    assert [item.type for item in batch[0]] == ["text", "image", "text"]
-    assert batch[0][1].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
-    assert torch.equal(batch[0][1].value, image)
+    # infer_und routes the user image to SigLIP only and appends the assistant start
+    # token. Assert by role/tag rather than by fixed positions: the vision module
+    # wraps the media row in its own marker rows, so the count is not load-bearing.
+    image_items = [item for item in batch[0] if item.type == "image"]
+    assert len(image_items) == 1
+    assert image_items[0].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
+    assert torch.equal(image_items[0].value, image)
+    assert batch[0][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
 
 
 def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():

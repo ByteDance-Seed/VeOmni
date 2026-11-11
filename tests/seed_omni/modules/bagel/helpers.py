@@ -22,6 +22,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import PackedConversation, preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
@@ -31,6 +32,61 @@ ALIGN_ATOL = 2e-2
 ALIGN_RTOL = 2e-2
 ALIGN_GRAD_ATOL = 5e-2
 ALIGN_GRAD_RTOL = 5e-2
+
+
+class FakeBagelTokenizer:
+    """Char-ordinal tokenizer with the marker tokens/ids that ``BagelChatTemplate`` resolves."""
+
+    bos_token = "<s>"
+    eos_token = "</s>"
+    boi_token = "<boi>"
+    eoi_token = "<eoi>"
+    bos_token_id = 1
+    eos_token_id = 2
+    boi_token_id = 3
+    eoi_token_id = 4
+    pad_token_id = 0
+    unk_token_id = -1
+    special_tokens = {
+        "<s>": 1,
+        "</s>": 2,
+        "<boi>": 3,
+        "<eoi>": 4,
+        "<|im_start|>": 5,
+        "<|im_end|>": 2,
+        "<|vision_start|>": 7,
+        "<|vision_end|>": 8,
+    }
+
+    def convert_tokens_to_ids(self, token):
+        return self.special_tokens.get(token, self.unk_token_id)
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        special_by_id = {v: k for k, v in self.special_tokens.items()}
+        return "".join(special_by_id.get(int(t), chr(max(32, int(t)))) for t in token_ids)
+
+    def __call__(self, text, add_special_tokens=False):
+        del add_special_tokens
+        input_ids = []
+        index = 0
+        while index < len(text):
+            matched = False
+            for token, token_id in sorted(self.special_tokens.items(), key=lambda item: len(item[0]), reverse=True):
+                if text.startswith(token, index):
+                    input_ids.append(token_id)
+                    index += len(token)
+                    matched = True
+                    break
+            if matched:
+                continue
+            input_ids.append(ord(text[index]))
+            index += 1
+        return {"input_ids": input_ids}
+
+
+def bagel_template() -> BagelChatTemplate:
+    return BagelChatTemplate(FakeBagelTokenizer())
 
 
 def bagel_cfg_dir() -> Path:
@@ -57,6 +113,7 @@ def load_module_runtime_args(
     modules_path: Path,
     for_inference: bool = False,
 ) -> dict:
+    """Build per-module ``OmniModuleRuntimeArguments`` from ``modules_path``."""
     base = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=model_path or ".",
@@ -80,12 +137,15 @@ def load_omni_config(
     infer_graph_path: Path | None = None,
     generation_kwargs: dict | None = None,
 ) -> OmniConfig:
+    """Resolve and project an ``OmniConfig`` from BAGEL module and graph YAML files."""
     model_path = model_path or "."
     model_config = {"modules": str(modules_path)}
     if train_graph_path is not None:
         model_config["train_graph"] = str(train_graph_path)
     if infer_graph_path is not None:
-        model_config["infer_graph"] = str(infer_graph_path)
+        scenario = infer_graph_path.stem.removeprefix("graph_")
+        model_config["infer_graph"] = {scenario: str(infer_graph_path)}
+        model_config["infer_type"] = scenario
     args = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=model_path,
@@ -106,6 +166,14 @@ def tiny_bagel_qwen2_cfg() -> dict:
         num_attention_heads=4,
         num_key_value_heads=4,
         max_position_embeddings=64,
+        bos_token_id=1,
+        eos_token_id=2,
+        ops_implementation={
+            "attn_implementation": "sdpa",
+            "rms_norm_implementation": "eager",
+            "swiglu_mlp_implementation": "eager",
+            "rotary_pos_emb_implementation": "eager",
+        },
     )
 
 
@@ -116,6 +184,7 @@ def tiny_align_qwen2_cfg() -> dict:
 
 
 def _clone_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy a ``ConversationItem.meta`` dict while detaching and cloning tensor values."""
     cloned: dict[str, Any] = {}
     for key, value in meta.items():
         cloned[key] = value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
@@ -156,6 +225,7 @@ def _embed(
     dtype: torch.dtype,
     requires_grad: bool = True,
 ) -> torch.Tensor:
+    """Generate a random ``(length, hidden_size)`` leaf embedding tensor."""
     value = torch.randn(length, hidden_size, generator=generator, device=device, dtype=dtype)
     if requires_grad:
         value = value.requires_grad_()
@@ -238,6 +308,7 @@ def run_eager_mot(
     model: torch.nn.Module,
     conversation: list[list[ConversationItem]],
 ) -> torch.Tensor:
+    """Pack ``conversation``, run eager ``BagelQwen2MoT``, and scatter hidden states back."""
     packed = preprocess_mot_inputs(
         conversation,
         device=model.device,
@@ -272,6 +343,7 @@ def conversation_ce_loss(
     conversation: list[list[ConversationItem]],
     lm_head: torch.nn.Linear,
 ) -> torch.Tensor | None:
+    """Compute shifted causal LM cross-entropy loss over text items in ``conversation``."""
     hidden_parts: list[torch.Tensor] = []
     label_parts: list[torch.Tensor] = []
     for item in (item for sample in conversation for item in sample):
@@ -294,6 +366,7 @@ def conversation_mse_loss(
     conversation: list[list[ConversationItem]],
     llm2vae: torch.nn.Linear,
 ) -> torch.Tensor | None:
+    """Compute flow-matching MSE velocity loss over target image items in ``conversation``."""
     velocity_parts: list[torch.Tensor] = []
     target_parts: list[torch.Tensor] = []
     for item in (item for sample in conversation for item in sample):

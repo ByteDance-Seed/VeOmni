@@ -357,12 +357,11 @@ def _write_hf_view(source: HFSource) -> str:
 
     module_configs = layout.build_module_configs(source.path)
     training_graphs, generation_graphs = layout.load_graphs()
-    infer_type = layout.infer_type if layout.infer_type in generation_graphs else None
     config = OmniConfig(
         _module_entries={name: {"model_path": name} for name in module_configs},
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
-        infer_type=infer_type,
+        infer_type=layout.infer_type,
     )
     config._module_configs = dict(module_configs)
     config.save_pretrained(view)

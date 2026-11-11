@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 
 def is_bagel_vision_marker(item: ConversationItem, *, context: str | None = None) -> bool:
+    """Return whether ``item`` is a single-token text vision marker tagged with a BAGEL context."""
     if item.type != "text":
         return False
     if context is not None and bagel_context(item) != context:
@@ -36,6 +37,7 @@ def is_bagel_vision_marker(item: ConversationItem, *, context: str | None = None
 
 
 def _text_item_length(item: ConversationItem) -> int | None:
+    """Return the token count of a text ``ConversationItem``, or ``None`` if untokenized."""
     value = item.value
     if torch.is_tensor(value):
         if value.dim() == 0:
@@ -60,6 +62,7 @@ def apply_image_marker(
     device: torch.device,
     dtype: torch.dtype,
 ) -> None:
+    """Prepend and append ``marker_embeds`` to ``item.value`` if not already bracketed."""
     image_embeds = item.value
     if not torch.is_tensor(image_embeds):
         return

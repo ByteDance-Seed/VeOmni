@@ -100,6 +100,7 @@ class TrainingMixin(BaseTrainingMixin):
         self,
         conversation_list: Optional[List[List[ConversationItem]]],
     ) -> torch.Tensor:
+        """Pack non-dummy text token IDs into a flat tensor and record segment lengths."""
         if conversation_list is None:
             raise ValueError("BagelTextEncoder._prepare_encode_inputs requires conversation_list.")
 
@@ -114,6 +115,7 @@ class TrainingMixin(BaseTrainingMixin):
         self,
         conversation_list: Optional[List[List[ConversationItem]]],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Collect text hidden states and pre-shifted causal LM labels across ``conversation_list``."""
         if conversation_list is None:
             raise ValueError("BagelTextEncoder._prepare_decode_inputs requires conversation_list.")
 

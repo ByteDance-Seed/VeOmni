@@ -44,6 +44,7 @@ BAGEL_GENERATION_KWARGS = {
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    """Read and parse a UTF-8 JSON file."""
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -53,6 +54,7 @@ def _load_prefixed_safetensors(
     remap: Callable[[str], str | None],
     consumed_keys: set[str] | None = None,
 ) -> dict[str, Any]:
+    """Load safetensors keys selected by ``remap`` onto CPU."""
     state_dict: dict[str, Any] = {}
     with safe_open(path, framework="pt", device="cpu") as f:
         for key in f.keys():
@@ -66,11 +68,13 @@ def _load_prefixed_safetensors(
 
 
 def _safetensor_keys(path: Path) -> set[str]:
+    """Return the set of tensor keys stored in ``path``."""
     with safe_open(path, framework="pt", device="cpu") as f:
         return set(f.keys())
 
 
 def _assert_no_unhandled_keys(path: Path, consumed_keys: set[str], ignored_keys: set[str]) -> None:
+    """Raise if any safetensors key in ``path`` is neither consumed nor ignored."""
     unhandled = sorted(_safetensor_keys(path) - consumed_keys - ignored_keys)
     if unhandled:
         preview = ", ".join(unhandled[:20])
@@ -78,6 +82,7 @@ def _assert_no_unhandled_keys(path: Path, consumed_keys: set[str], ignored_keys:
 
 
 def _instantiate(model_type: str, config: Any):
+    """Instantiate an empty-weight SeedOmni module for ``model_type``."""
     from veomni.models.seed_omni.modules import OMNI_MODEL_REGISTRY
 
     model_cls = OMNI_MODEL_REGISTRY[model_type]()
@@ -86,6 +91,7 @@ def _instantiate(model_type: str, config: Any):
 
 
 def _materialize_allowed_missing_parameters(model: Any, missing: list[str]) -> None:
+    """Materialize and initialize deterministic missing position-embedding parameters."""
     for key in missing:
         if not key.endswith(".pos_embed"):
             continue
@@ -109,6 +115,7 @@ def _build_module(
     *,
     allowed_missing: set[str] | None = None,
 ) -> Any:
+    """Build ``model_type`` from ``config`` and assign ``state_dict`` tensors."""
     model = _instantiate(model_type, config)
     allowed_missing = set() if allowed_missing is None else allowed_missing
     missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)

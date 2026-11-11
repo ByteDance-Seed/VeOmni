@@ -55,6 +55,7 @@ def build_mot_attention_metadata(
 
 
 def _validate_mot_attention_metadata(packed_attention_metadata: torch.Tensor) -> None:
+    """Validate that ``packed_attention_metadata`` is a ``[3, S]`` int32 tensor."""
     if packed_attention_metadata.ndim != 2 or packed_attention_metadata.shape[0] != 3:
         raise ValueError(
             "BAGEL Qwen2-MoT attention metadata must have shape [3, sequence], "
@@ -213,6 +214,7 @@ def build_mot_block_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
 
 
 def _mot_span_mode(full_span_id: int, noise_span_id: int) -> str:
+    """Classify a token span as ``'noise'``, ``'full'``, or ``'causal'`` from its span IDs."""
     if noise_span_id >= 0:
         return "noise"
     if full_span_id >= 0:
@@ -246,6 +248,7 @@ def _iter_mot_spans(packed_attention_metadata: torch.Tensor) -> list[tuple[int, 
 
 
 def _merge_adjacent_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Coalesce contiguous ``(start, end)`` intervals into maximal ranges."""
     if not ranges:
         return []
     merged = [ranges[0]]
@@ -284,6 +287,7 @@ def build_mot_magi_mask(packed_attention_metadata: torch.Tensor) -> MagiAttentio
     current_document_id: int | None = None
 
     def flush_document(spans: list[tuple[int, int, str]]) -> None:
+        """Append Magi Q/K range pairs and attention types for one document's spans."""
         for query_index, (query_start, query_end, query_mode) in enumerate(spans):
             earlier_clean = [
                 (key_start, key_end) for key_start, key_end, key_mode in spans[:query_index] if key_mode != "noise"

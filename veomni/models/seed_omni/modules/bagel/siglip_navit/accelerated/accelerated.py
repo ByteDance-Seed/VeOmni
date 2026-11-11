@@ -47,12 +47,17 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Select preprocessed SigLIP image items and slice across Ulysses SP ranks if enabled."""
         del kwargs
         self._conversation_carrier = conversation_list
 
         self._image_items = select_siglip_image_items(conversation_list)
         out = siglip_inputs_from_preprocessed_items(self._image_items, device=self.device, dtype=self.dtype)
-        self.metric_meter_set_seqlens("forward", self._metric_sample_token_lens(conversation_list))
+        self.metric_meter_set_seqlens(
+            "forward",
+            self._metric_sample_token_lens(conversation_list),
+            image_seqlens=[int(item.meta[_OMNI_TOKEN_LEN]) for item in self._image_items],
+        )
 
         ps = get_parallel_state()
         if ps.sp_size == 1:
@@ -103,12 +108,29 @@ class TrainingMixin(TrainingModuleMixin):
             "token_lens": local_token_lens,
         }
 
+    def forward(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Isolate SP-sharded attention dropout RNG from downstream modules when enabled."""
+        if (
+            get_parallel_state().sp_size > 1
+            and self.training
+            and float(getattr(self.config, "attention_dropout", 0.0)) > 0.0
+        ):
+            fork_kwargs: dict[str, Any] = (
+                {"devices": []}
+                if self.device.type == "cpu"
+                else {"devices": [self.device], "device_type": self.device.type}
+            )
+            with torch.random.fork_rng(**fork_kwargs):
+                return super().forward(*args, **kwargs)
+        return super().forward(*args, **kwargs)
+
     @post_forward("forward")
     def forward_post(
         self,
         image_embeds: torch.Tensor,
         token_lens: torch.Tensor | None = None,
     ) -> dict[str, Any]:
+        """Gather SP image feature shards and scatter ``image_embeds`` onto conversation items."""
         if token_lens is None:
             raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
 
@@ -141,6 +163,7 @@ class TrainingMixin(TrainingModuleMixin):
         self,
         conversation_list: list[list[ConversationItem]],
     ) -> list[int]:
+        """Sum SigLIP patch token lengths per sample for FLOPs metering."""
         sample_lens: list[int] = []
         for sample in conversation_list:
             sample_len = 0
@@ -159,7 +182,48 @@ class MeterMixin(MetricMeterMixin):
 
     config: BagelSiglipNavitConfig
 
-    def estimate_flops(self, seqlens: list[int]) -> float:
+    def metric_meter_set_seqlens(
+        self,
+        method: str,
+        seqlens: list[int],
+        *,
+        image_seqlens: list[int] | None = None,
+    ) -> None:
+        """Stash per-sample ``seqlens`` plus per-image ``image_seqlens`` for attention FLOPs."""
+        super().metric_meter_set_seqlens(method, seqlens)
+        if not hasattr(self, "_metric_full_image_seqlens"):
+            self._metric_full_image_seqlens: dict[str, list[int]] = {}
+        resolved_image_seqlens = seqlens if image_seqlens is None else image_seqlens
+        self._metric_full_image_seqlens[method] = [int(s) for s in resolved_image_seqlens]
+
+    def _metric_meter_image_seqlen_buffer(self) -> list[int]:
+        if not hasattr(self, "_metric_meter_image_seqlens"):
+            self._metric_meter_image_seqlens: list[int] = []
+        return self._metric_meter_image_seqlens
+
+    def metric_meter_add(self, method: str) -> None:
+        """Move stashed per-sample and per-image token lengths into the step buffers."""
+        super().metric_meter_add(method)
+        image_stash = getattr(self, "_metric_full_image_seqlens", None)
+        if image_stash:
+            self._metric_meter_image_seqlen_buffer().extend(image_stash.get(method, []))
+            image_stash.clear()
+
+    def metric_meter_collect(self) -> tuple[float, list[int]]:
+        """Return ``(theoretical_flops, sample_seqlens)`` using per-image lengths for attention FLOPs."""
+        seqlens = self._metric_meter_seqlen_buffer()
+        self._metric_meter_seqlens = []
+        image_seqlens = self._metric_meter_image_seqlen_buffer()
+        self._metric_meter_image_seqlens = []
+        return self.estimate_flops(seqlens, image_seqlens=image_seqlens), seqlens
+
+    def estimate_flops(
+        self,
+        seqlens: list[int],
+        *,
+        image_seqlens: list[int] | None = None,
+    ) -> float:
+        """Estimate TFLOPs for the SigLIP-NaViT encoder and MLP connector over ``seqlens``."""
         cfg = self.config
         dim = cfg.hidden_size
         heads = cfg.num_attention_heads
@@ -169,8 +233,19 @@ class MeterMixin(MetricMeterMixin):
         mlp_n = dim * cfg.intermediate_size * 2
         connector_n = dim * cfg.output_size + cfg.output_size * cfg.output_size
         dense_n = patch_embed_n + (attn_linear_n + mlp_n) * cfg.num_hidden_layers + connector_n
+        if image_seqlens is None:
+            buffered = getattr(self, "_metric_meter_image_seqlens", None)
+            stashed = getattr(self, "_metric_full_image_seqlens", {}).get("forward")
+            if buffered and sum(buffered) == sum(seqlens):
+                attn_seqlens = buffered
+            elif stashed and sum(stashed) == sum(seqlens):
+                attn_seqlens = stashed
+            else:
+                attn_seqlens = seqlens
+        else:
+            attn_seqlens = image_seqlens
         tokens = sum(seqlens)
-        seqlen_sq = sum(length * length for length in seqlens)
+        seqlen_sq = sum(length * length for length in attn_seqlens)
         dense_flops = 6 * dense_n * tokens
         attn_flops = 12 * seqlen_sq * head_dim * heads * cfg.num_hidden_layers
         return (dense_flops + attn_flops) / 1e12

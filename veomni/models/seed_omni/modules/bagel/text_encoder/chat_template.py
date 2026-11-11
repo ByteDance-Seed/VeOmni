@@ -8,9 +8,9 @@ from typing import Any
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from ....utils.conversation import ConversationItem
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
-from ..sources import BAGEL_CONTEXT_KEY, bagel_context
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_PHASE_KEY, BAGEL_START_TOKEN, bagel_context
 from .processing import is_bagel_vision_marker
 
 
@@ -55,6 +55,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
     @staticmethod
     def _resolve_token_id_from_token(tokenizer: PreTrainedTokenizerBase, token: str) -> int:
+        """Look up ``token`` in ``tokenizer`` and raise if it is missing or maps to ``unk_token_id``."""
         token_id = tokenizer.convert_tokens_to_ids(token)
         if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
             raise ValueError(f"BAGEL tokenizer is missing required token: {token!r}.")
@@ -67,13 +68,14 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         add_generation_prompt: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> list[ConversationItem]:
+        """Apply the BAGEL chat template, wrap image rows with vision markers, and tokenize text rows."""
         parts = self.apply_chat_template(
             sample,
             inference=add_generation_prompt,
             generation_kwargs=generation_kwargs,
         )
         if add_generation_prompt:
-            parts = self.apply_generation_prompt(parts)
+            parts = self.apply_generation_prompt(parts, generation_kwargs=generation_kwargs)
         self.tokenize(parts)
         return self.merge_text_embeds(parts)
 
@@ -84,6 +86,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> list[ConversationItem]:
+        """Wrap untokenized text items with ``<|im_start|>...<|im_end|>`` and insert image marker items."""
         del inference, generation_kwargs
 
         for item in sample:
@@ -94,14 +97,34 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
         return self._insert_prompt_context_image_markers(sample)
 
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
-        return sample
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
+        """Append the assistant ``<|im_start|>`` start token for understanding inference."""
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        if infer_type != "infer_und":
+            return sample
+        out = list(sample)
+        out.append(
+            ConversationItem(
+                type="text",
+                value=self.chat_markers.bos_token,
+                role="assistant",
+                meta={"loss_mask": 0, BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
+            )
+        )
+        return out
 
     def tokenize(self, parts: list[ConversationItem]) -> None:
+        """Tokenize untokenized text items in place and populate ``input_ids``, ``labels``, and ``attention_mask``."""
         for item in parts:
             if item.type != "text" or item.is_dummy or item.meta.get(_OMNI_TOKENIZED):
                 continue
 
+            raw_value = item.value
             token_ids = self._token_ids_for_text_item(item)
             loss_mask = int(item.meta.pop("loss_mask", int(item.role == "assistant")))
             item.value = token_ids
@@ -110,10 +133,12 @@ class BagelChatTemplate(TextEncoderChatTemplate):
             item.meta["labels"] = (
                 token_ids.detach().clone() if loss_mask else torch.full_like(token_ids, -100, dtype=torch.long)
             )
+            item.meta[_OMNI_TOKEN_LEN] = int(token_ids.numel())
             item.meta[_OMNI_TOKENIZED] = True
 
             if (
-                item.value in {self.chat_markers.bos_token, self.chat_markers.eos_token}
+                isinstance(raw_value, str)
+                and raw_value in {self.chat_markers.bos_token, self.chat_markers.eos_token}
                 and int(token_ids.numel()) != 1
             ):
                 raise ValueError("BAGEL start/end tokens must tokenize to exactly one token.")
@@ -123,6 +148,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         return parts
 
     def _token_ids_for_text_item(self, item: ConversationItem) -> torch.Tensor:
+        """Convert ``item.value`` (tensor or string) into a 1-D int64 token-id tensor."""
         value = item.value
         if torch.is_tensor(value):
             token_ids = value.detach().reshape(-1).to(dtype=torch.long)
@@ -134,6 +160,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         return token_ids
 
     def _insert_prompt_context_image_markers(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+        """Bracket each non-dummy image item with ``<|vision_start|>`` and ``<|vision_end|>`` marker items."""
         out: list[ConversationItem] = []
 
         index = 0

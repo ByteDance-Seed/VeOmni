@@ -21,7 +21,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 from .configuration import BagelVAEConfig
@@ -77,6 +77,7 @@ class BagelVAEProcessor(BaseImageProcessor):
         dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> BatchFeature:
+        """Resize, normalize, and batch-pad ``images`` into ``pixel_values`` and ``pixel_shapes``."""
         del return_tensors, kwargs
         image_list = images if isinstance(images, list) else [images]
         pixel_values = [
@@ -105,6 +106,7 @@ class BagelVAEProcessor(BaseImageProcessor):
         return BatchFeature(data={"pixel_values": pixel_values, "pixel_shapes": pixel_shapes})
 
     def postprocess(self, images: torch.Tensor | list[torch.Tensor], **kwargs: Any) -> list[Image.Image]:
+        """Convert decoded VAE image tensors in ``[-1, 1]`` back to RGB PIL images."""
         del kwargs
         image_list = images if isinstance(images, list) else [images]
         out: list[Image.Image] = []
@@ -126,6 +128,7 @@ def _preprocess_image(
     image_mean: list[float],
     image_std: list[float],
 ) -> torch.Tensor:
+    """Resize and normalize ``image`` into a stride-aligned ``[3, H, W]`` float32 tensor."""
     if isinstance(image, (Image.Image, np.ndarray)):
         pil_image = _to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
         pil_image = _resize_pil(
@@ -151,6 +154,7 @@ def _preprocess_image(
 
 
 def _to_rgb_tensor(image: Any) -> torch.Tensor:
+    """Convert a PIL image, NumPy array, or tensor into a ``[3, H, W]`` RGB tensor in ``[0, 1]``."""
     if isinstance(image, Image.Image):
         pil_image = _to_rgb_pil(image)
         array = np.array(pil_image, copy=True)
@@ -191,6 +195,7 @@ def _resize_tensor(
     min_image_size: int,
     max_pixels: int,
 ) -> torch.Tensor:
+    """Resize a ``[3, H, W]`` image tensor with bicubic interpolation to stride-aligned bounds."""
     height, width = tensor.shape[-2:]
     new_width, new_height = _target_size(
         width,
@@ -221,6 +226,7 @@ def _resize_pil(
     max_pixels: int,
     img_num: int = 1,
 ) -> Image.Image:
+    """Resize a PIL image with bicubic interpolation to stride-aligned bounds."""
     width, height = image.size
     new_width, new_height = _target_size(
         width,
@@ -241,6 +247,7 @@ def _resize_pil(
 
 
 def _pad_to_batch_size(images: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Zero-pad variable-size ``[C, H, W]`` image tensors on the bottom/right to a common canvas."""
     if not images:
         return images
     max_height = max(int(image.shape[-2]) for image in images)
@@ -255,12 +262,32 @@ def _pad_to_batch_size(images: list[torch.Tensor]) -> list[torch.Tensor]:
     return padded
 
 
+def unpad_vae_item_pixel_values(item: ConversationItem) -> torch.Tensor:
+    """Return ``item.value`` cropped to its ``BAGEL_VAE_PIXEL_SHAPE`` if present."""
+    pixel_values = item.value
+    if not torch.is_tensor(pixel_values):
+        raise TypeError("BAGEL VAE item value must be a tensor.")
+    if pixel_values.dim() == 4 and int(pixel_values.shape[0]) == 1:
+        pixel_values = pixel_values.squeeze(0)
+    if pixel_values.dim() != 3:
+        raise ValueError(f"BAGEL VAE expects rank-3 [C, H, W] image tensor, got {tuple(pixel_values.shape)}.")
+    pixel_shape = item.meta.get(BAGEL_VAE_PIXEL_SHAPE)
+    if torch.is_tensor(pixel_shape):
+        dims = pixel_shape.detach().reshape(-1).tolist()
+        if len(dims) != 2:
+            raise ValueError("BAGEL VAE pixel shape metadata must contain [height, width].")
+        height, width = int(dims[0]), int(dims[1])
+        pixel_values = pixel_values[..., :height, :width]
+    return pixel_values
+
+
 def crop_latent_to_image_shape(
     latent: torch.Tensor,
     pixel_shape: torch.Tensor | None,
     *,
     downsample: int,
 ) -> torch.Tensor:
+    """Crop spatial batch padding off ``latent`` using the pre-pad ``pixel_shape`` metadata."""
     if not torch.is_tensor(pixel_shape):
         return latent
 
@@ -293,6 +320,7 @@ def _target_size(
     min_image_size: int,
     max_pixels: int,
 ) -> tuple[int, int]:
+    """Compute stride-aligned ``(new_width, new_height)`` within pixel and side-length bounds."""
     scale = min(max_image_size / max(width, height), 1.0)
     scale = max(scale, min_image_size / min(width, height))
     new_width, new_height = _apply_scale(width, height, scale, image_stride)
@@ -306,6 +334,7 @@ def _target_size(
 
 
 def _to_rgb_pil(image: Image.Image) -> Image.Image:
+    """Convert ``image`` to RGB, compositing transparency over a white background."""
     if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
         rgba = image.convert("RGBA")
         white = Image.new(mode="RGB", size=rgba.size, color=(255, 255, 255))
@@ -329,6 +358,7 @@ def _apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[in
 
 
 def _decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    """Convert a single decoded ``[-1, 1]`` tensor into an RGB ``PIL.Image``."""
     if image.dim() == 4 and image.shape[0] == 1:
         image = image.squeeze(0)
     if image.dim() != 3:
@@ -343,6 +373,7 @@ def _decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
 
 
 def copy_image_item(item: ConversationItem) -> ConversationItem:
+    """Deep-copy an image ``ConversationItem`` so VAE and SigLIP context copies do not alias."""
     value = item.value
     if torch.is_tensor(value):
         value = value.clone()
@@ -453,7 +484,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
 
     def bind_dummy_inputs(self, config: BagelVAEConfig, dtype: torch.dtype | None = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
-        size = max(int(config.image_stride), int(config.downsample))
+        size = max(int(config.image_stride), int(config.downsample) * 2)
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(int(config.in_channels), size, size, dtype=dtype)
         self._dummy_pixel_shape = torch.tensor([size, size], dtype=torch.long)
@@ -465,6 +496,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
+        """Route image contexts, normalize VAE pixel tensors, and append per-sample dummy anchors."""
         infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
         route_image_contexts(conversation_list, inference=inference, infer_type=infer_type)
 
@@ -475,12 +507,20 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                 iter_desired_items([sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]})
             )
             if sample_image_items:
+                for item in sample_image_items:
+                    if item.meta.get(BAGEL_VAE_POSTERIOR) and _OMNI_TOKEN_LEN not in item.meta:
+                        pixel_shape = item.meta.get(BAGEL_VAE_PIXEL_SHAPE)
+                        stride = max(int(getattr(self._image_processor, "image_stride", 16)), 1)
+                        if torch.is_tensor(pixel_shape) and int(pixel_shape.numel()) == 2:
+                            dims = pixel_shape.detach().reshape(-1).tolist()
+                            item.meta[_OMNI_TOKEN_LEN] = (int(dims[0]) // stride) * (int(dims[1]) // stride)
                 image_items.extend(
                     item for item in sample_image_items if not item.is_dummy and not item.meta.get(BAGEL_VAE_POSTERIOR)
                 )
             elif not inference:
                 missing_samples.append(sample)
 
+        stride = max(int(getattr(self._image_processor, "image_stride", 16)), 1)
         if image_items:
             inputs = self._image_processor(
                 images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
@@ -488,9 +528,12 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
             for item, pixels, pixel_shape in zip(
                 image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
             ):
-                item.value = pixels.to(dtype=self._dtype)
+                dims = pixel_shape.detach().reshape(-1).tolist()
+                height, width = int(dims[0]), int(dims[1])
+                item.value = pixels[..., :height, :width].contiguous().to(dtype=self._dtype)
                 item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
                 item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
+                item.meta[_OMNI_TOKEN_LEN] = max(1, (height // stride) * (width // stride))
 
         if not missing_samples:
             return
@@ -510,6 +553,9 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
             dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
             dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
 
+        dummy_dims = dummy_pixel_shape.detach().reshape(-1).tolist()
+        dummy_token_len = max(1, (int(dummy_dims[0]) // stride) * (int(dummy_dims[1]) // stride))
+
         # The placeholder stands in for a generation target, the primary VAE row.
         for sample in missing_samples:
             sample.append(
@@ -522,6 +568,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                         _IMG_TAG_KEY: "gen",
                         BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
                         BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
+                        _OMNI_TOKEN_LEN: dummy_token_len,
                     },
                 )
             )
@@ -533,4 +580,5 @@ __all__ = [
     "copy_image_item",
     "crop_latent_to_image_shape",
     "route_image_contexts",
+    "unpad_vae_item_pixel_values",
 ]

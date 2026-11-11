@@ -11,13 +11,14 @@ checkpoint converter.
 from __future__ import annotations
 
 import re
+from collections.abc import Generator
 from typing import Any
 
 import torch
 from transformers.conversion_mapping import register_checkpoint_conversion_mapping
 from transformers.core_model_loading import ConversionOps, WeightConverter
 
-from ......models.checkpoint.convert import ConvertedCheckpointTensor
+from ......models.checkpoint.convert import ConvertedCheckpointTensor, export_weights
 
 
 _QKV_COMPONENTS = ("q", "k", "v")
@@ -25,9 +26,15 @@ _QKV_BRANCHES = (
     ("qkv_proj_und", ("q_proj", "k_proj", "v_proj")),
     ("qkv_proj_gen", ("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")),
 )
+_QKV_BRANCH_TARGETS = dict(_QKV_BRANCHES)
 _QKV_CHECKPOINT_RE = re.compile(
     r"^(?P<prefix>.*\.self_attn\.)"
     r"(?P<projection>[qkv]_proj(?:_moe_gen)?)\."
+    r"(?P<kind>weight|bias)$"
+)
+_QKV_FUSED_RE = re.compile(
+    r"^(?P<prefix>.*\.self_attn\.)"
+    r"(?P<fused>qkv_proj_(?:und|gen))\."
     r"(?P<kind>weight|bias)$"
 )
 
@@ -61,35 +68,6 @@ def combine_qkv_state_dict_pre_hook(
             state_dict[combined_key] = torch.cat([state_dict.pop(key) for key in checkpoint_keys], dim=0)
 
 
-def split_qkv_state_dict_post_hook(
-    module: torch.nn.Module,
-    state_dict: dict[str, torch.Tensor],
-    prefix: str,
-    local_metadata: dict[str, Any],
-) -> None:
-    """Expose legacy split Q/K/V keys while keeping combined runtime parameters."""
-    del local_metadata
-    split_sizes = module.qkv_split_sizes
-    for combined_name, checkpoint_names in _QKV_BRANCHES:
-        for kind in ("weight", "bias"):
-            combined_key = f"{prefix}{combined_name}.{kind}"
-            tensor = state_dict.get(combined_key)
-            if tensor is None or tensor.is_meta or hasattr(tensor, "device_mesh"):
-                # Transformers inspects a meta model's state dict to discover the
-                # runtime parameter schema before applying its weight converters.
-                # DCP likewise requires DTensor keys to remain resolvable to the
-                # live combined parameters before the HF export layer converts them.
-                continue
-
-            state_dict.pop(combined_key)
-            for checkpoint_name, chunk in zip(
-                checkpoint_names,
-                tensor.split(split_sizes, dim=0),
-                strict=True,
-            ):
-                state_dict[f"{prefix}{checkpoint_name}.{kind}"] = chunk
-
-
 class _ConcatenateQKV(ConversionOps):
     """Concatenate checkpoint Q/K/V tensors along the projection dimension."""
 
@@ -101,6 +79,7 @@ class _ConcatenateQKV(ConversionOps):
         target_patterns: list[str],
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
+        """Concatenate ``source_patterns`` tensors into a single fused target tensor."""
         del kwargs
         if len(target_patterns) != 1:
             raise ValueError("Combined BAGEL QKV conversion requires one target pattern.")
@@ -127,17 +106,13 @@ class _SplitQKV(ConversionOps):
         target_patterns: list[str],
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
+        """Split a fused QKV tensor into separate Q, K, and V checkpoint tensors."""
         del source_patterns
         if len(input_dict) != 1 or len(target_patterns) != 3:
             raise ValueError("BAGEL QKV export requires one combined source and three target patterns.")
 
         values = next(iter(input_dict.values()))
         tensor = values[0] if isinstance(values, list) else values
-        # FSDP2 / DCP keeps a dim-0 DTensor on the fused parameter. Q/K/V row
-        # sizes do not line up with those shards, so gather before splitting.
-        full_tensor = getattr(tensor, "full_tensor", None)
-        if callable(full_tensor) and getattr(tensor, "device_mesh", None) is not None:
-            tensor = full_tensor()
         config = kwargs["config"]
         head_dim = config.hidden_size // config.num_attention_heads
         split_sizes = (
@@ -145,7 +120,10 @@ class _SplitQKV(ConversionOps):
             config.num_key_value_heads * head_dim,
             config.num_key_value_heads * head_dim,
         )
-        return dict(zip(target_patterns, tensor.split(split_sizes, dim=0), strict=True))
+        return {
+            target: chunk.clone()
+            for target, chunk in zip(target_patterns, tensor.split(split_sizes, dim=0), strict=True)
+        }
 
     @property
     def reverse_op(self) -> ConversionOps:
@@ -153,6 +131,7 @@ class _SplitQKV(ConversionOps):
 
 
 def _qkv_weight_converters() -> list[WeightConverter]:
+    """Build Transformers ``WeightConverter`` rules for both MoT QKV branches."""
     converters: list[WeightConverter] = []
     for branch, source_suffix in (("und", ""), ("gen", "_moe_gen")):
         for kind in ("weight", "bias"):
@@ -195,6 +174,7 @@ class BagelQwen2MoTCheckpointTensorConverter:
         return _QKV_CHECKPOINT_RE.fullmatch(name) is not None
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        """Buffer split Q/K/V tensors and emit the fused ``qkv_proj_{und,gen}`` tensor once complete."""
         match = _QKV_CHECKPOINT_RE.fullmatch(name)
         if match is None:
             return ConvertedCheckpointTensor(name=name, tensor=tensor)
@@ -219,9 +199,35 @@ class BagelQwen2MoTCheckpointTensorConverter:
         )
 
     def finalize(self) -> list[ConvertedCheckpointTensor]:
+        """Verify no partial QKV groups remain buffered at the end of checkpoint loading."""
         if self._pending:
             incomplete = ", ".join(
                 f"{prefix}qkv_proj_{branch}.{kind}" for prefix, branch, kind in sorted(self._pending)
             )
             raise ValueError(f"Incomplete BAGEL QKV checkpoint groups: {incomplete}.")
         return []
+
+    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
+        """Export model parameters in HF checkpoint format with fused ``qkv_proj_{und,gen}`` split into ``{q,k,v}_proj``."""
+        base_model = model
+        while isinstance(getattr(base_model, "module", None), torch.nn.Module):
+            base_model = base_model.module
+        config = base_model.config
+        head_dim = config.hidden_size // config.num_attention_heads
+        split_sizes = (
+            config.num_attention_heads * head_dim,
+            config.num_key_value_heads * head_dim,
+            config.num_key_value_heads * head_dim,
+        )
+        for name, tensor in export_weights(base_model):
+            if tensor.dtype == torch.float32:
+                tensor = tensor.to(torch.bfloat16)
+            match = _QKV_FUSED_RE.fullmatch(name)
+            if match is None:
+                yield name, tensor
+                continue
+            prefix = match.group("prefix")
+            fused = match.group("fused")
+            kind = match.group("kind")
+            for target_proj, chunk in zip(_QKV_BRANCH_TARGETS[fused], tensor.split(split_sizes, dim=0), strict=True):
+                yield f"{prefix}{target_proj}.{kind}", chunk.clone()

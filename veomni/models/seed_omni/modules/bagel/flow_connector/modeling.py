@@ -18,13 +18,13 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
+from ..position_embedding import PositionEmbedding
 from ..sources import (
     BAGEL_CONTEXT_KEY,
     BAGEL_FLOW_HIDDEN,
@@ -102,6 +102,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Embed clean VAE context latents into LLM hidden space during prompt encoding."""
         del generation_kwargs, kwargs
         if conversation_list is None:
             return {"conversation_list": conversation_list}
@@ -133,6 +134,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Embed the current noisy latent tokens and write a ``flow_query`` output item."""
         del kwargs
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
@@ -185,6 +187,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Project MoT denoise hidden states to patch-latent velocity tokens."""
         del generation_kwargs, kwargs
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
@@ -232,6 +235,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Advance the Euler denoise state by one step or emit the final unpatchified latent."""
         del generation_kwargs, kwargs
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
@@ -254,6 +258,7 @@ class InferenceMixin:
         self,
         conversation_list: list[ConversationItem],
     ) -> dict[str, Any]:
+        """Unpatchify the completed latent grid and emit ``image_complete``."""
         x_t = self._generation_state.latents
         item = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         latent = unpatchify_latent_tokens(
@@ -281,12 +286,20 @@ class InferenceMixin:
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
 
+def _module_weight(module: nn.Module) -> torch.Tensor:
+    """Return the underlying weight parameter for plain or LoRA-wrapped linear modules."""
+    return getattr(module, "base_layer", module).weight
+
+
 class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
     config_class = BagelFlowConnectorConfig
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"
     _no_split_modules: list[str] = []
-    _supports_sdpa = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The flow connector projects latent tokens and timesteps; it does not execute attention.
+        return attn_implementation
 
     def __init__(self, config: BagelFlowConnectorConfig) -> None:
         super().__init__(config)
@@ -296,22 +309,25 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
         self._generation_state = FlowGenerationState()
         self.post_init()
-        nn.init.constant_(self.llm2vae.weight, 0)
-        nn.init.constant_(self.llm2vae.bias, 0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, PositionEmbedding):
             module.reset_parameters()
             return
+        if module is self.llm2vae:
+            nn.init.constant_(module.weight, 0)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+            return
         super()._init_weights(module)
 
     @property
     def _vae2llm_device(self) -> torch.device:
-        return self.vae2llm.weight.device
+        return _module_weight(self.vae2llm).device
 
     @property
     def _llm2vae_device(self) -> torch.device:
-        return self.llm2vae.weight.device
+        return _module_weight(self.llm2vae).device
 
     @property
     def _pos_embed_device(self) -> torch.device:
@@ -319,7 +335,7 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
 
     @property
     def _time_embedder_device(self) -> torch.device:
-        return self.time_embedder.mlp[0].weight.device
+        return _module_weight(self.time_embedder.mlp[0]).device
 
     def embed_latent(
         self,
@@ -327,7 +343,9 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         position_ids: torch.LongTensor,
         timesteps: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        latents = latents.to(device=self._vae2llm_device, dtype=self.vae2llm.weight.dtype)
+        """Project patchified latents and add timestep and 2D sinusoidal position embeddings."""
+        vae2llm_weight = _module_weight(self.vae2llm)
+        latents = latents.to(device=vae2llm_weight.device, dtype=vae2llm_weight.dtype)
         position_ids = position_ids.to(device=self._pos_embed_device, dtype=torch.long).reshape(-1)
         timesteps = timesteps.to(device=self._time_embedder_device, dtype=torch.float32).reshape(-1)
         if position_ids.numel() != latents.shape[0]:
@@ -343,7 +361,8 @@ class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
         }
 
     def decode_velocity(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-        hidden_states = hidden_states.to(device=self._llm2vae_device)
+        llm2vae_weight = _module_weight(self.llm2vae)
+        hidden_states = hidden_states.to(device=llm2vae_weight.device, dtype=llm2vae_weight.dtype)
         return {"velocity": self.llm2vae(hidden_states)}
 
 
@@ -359,6 +378,7 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        """Create sinusoidal timestep embeddings of width ``dim``."""
         half = dim // 2
         freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
         args = t[:, None].float() * freqs[None]
@@ -369,55 +389,8 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        first_weight = self.mlp[0].weight
+        first_weight = _module_weight(self.mlp[0])
         return self.mlp(t_freq.to(device=first_weight.device, dtype=first_weight.dtype))
-
-
-class PositionEmbedding(nn.Module):
-    def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
-        super().__init__()
-        self.max_num_patch_per_side = max_num_patch_per_side
-        self.hidden_size = hidden_size
-        self.pos_embed = nn.Parameter(
-            torch.zeros(max_num_patch_per_side**2, hidden_size),
-            requires_grad=False,
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-        if hasattr(self.pos_embed.data, "to_local"):
-            self.pos_embed.data.to_local().copy_(new_data)
-        else:
-            self.pos_embed.data.copy_(new_data)
-
-    def _init_weights(self) -> None:
-        self.reset_parameters()
-
-    def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
-        return self.pos_embed[position_ids.to(device=self.pos_embed.device)]
-
-
-def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape(2, 1, grid_size, grid_size)
-    return torch.from_numpy(_get_2d_sincos_pos_embed_from_grid(embed_dim, grid)).float()
-
-
-def _get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
-    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return np.concatenate([emb_h, emb_w], axis=1)
-
-
-def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-    out = np.einsum("m,d->md", pos.reshape(-1), omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
 
 
 __all__ = [

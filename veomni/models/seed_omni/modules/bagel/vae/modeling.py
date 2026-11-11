@@ -27,7 +27,11 @@ from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_GENERATED_LATENT, BAGEL_PHASE_KEY, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
+from .processing import (
+    BagelVAEPreprocessor,
+    BagelVAEProcessor,
+    unpad_vae_item_pixel_values,
+)
 
 
 def select_bagel_vae_context_items(
@@ -72,16 +76,12 @@ class InferenceMixin:
         if not image_items:
             return {"conversation_list": conversation_list}
 
-        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
-            device=self.device, dtype=self.dtype, non_blocking=True
-        )
+        pixel_values = [
+            unpad_vae_item_pixel_values(item).to(device=self.device, dtype=self.dtype, non_blocking=True)
+            for item in image_items
+        ]
         outputs = self.encode(pixel_values=pixel_values)
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            latent = crop_latent_to_image_shape(
-                latent,
-                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
             image_item.value = latent.to(device=self.device, dtype=self.dtype)
             image_item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
@@ -129,6 +129,7 @@ class InferenceMixin:
     def _select_vae_decode_items(
         self, conversation_list: list[list[ConversationItem]] | None
     ) -> list[ConversationItem]:
+        """Select non-dummy ``generated_latent`` output items for VAE image decoding."""
         if conversation_list is None:
             raise ValueError("BagelVAE decode requires conversation_list to select latent items.")
 
@@ -150,7 +151,10 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
     main_input_name = "pixel_values"
     _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = False
-    _supports_sdpa = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The VAE uses fixed local torch SDPA in its mid-block, with no HF backend dispatch.
+        return attn_implementation
 
     def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
@@ -175,6 +179,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
         self.post_init()
 
     def freeze_model(self) -> None:
+        """Set the VAE to eval mode and disable gradients when ``config.freeze`` is true."""
         if self.config.freeze:
             self.eval()
             self.requires_grad_(False)
@@ -189,6 +194,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
 
     @contextmanager
     def _runtime_context(self, tensor: torch.Tensor):
+        """Enter ``no_grad`` (when frozen) and autocast for VAE encoder/decoder execution."""
         grad_context = torch.enable_grad()
         if self.config.freeze:
             grad_context = torch.no_grad()
@@ -202,10 +208,19 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
 
     def encode(
         self,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | list[torch.Tensor],
         **kwargs: object,
     ) -> dict[str, Any]:
+        """Encode ``pixel_values`` into scaled VAE latent grids."""
         del kwargs
+        if isinstance(pixel_values, list):
+            posteriors = self._encode_posterior_list(pixel_values)
+            latents: list[torch.Tensor] = []
+            for posterior in posteriors:
+                with self._runtime_context(posterior[0]):
+                    latents.append(self._sample_scaled_latents(posterior).squeeze(0).to(dtype=self.dtype))
+            return {"latents": latents}
+
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
             posterior = self._encode_posterior(pixel_values)
@@ -217,6 +232,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
         latents: torch.Tensor,
         **kwargs: object,
     ) -> dict[str, Any]:
+        """Unscale ``latents`` and decode them back to normalized pixel tensors."""
         del kwargs
         latents = latents.to(device=self._decoder_device, dtype=self.dtype)
         latents = latents / self.config.scale_factor + self.config.shift_factor
@@ -226,6 +242,49 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
 
     def _encode_posterior(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.chunk(self.encoder(pixel_values), 2, dim=1)
+
+    def _encode_posterior_list(
+        self,
+        pixel_values: list[torch.Tensor],
+        *,
+        min_passes: int = 0,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Encode a list of ``[C, H, W]`` images at their native shapes, batching equal shapes."""
+        if not pixel_values:
+            return []
+
+        shape_groups: dict[tuple[int, int], list[int]] = {}
+        normalized: list[torch.Tensor] = []
+        for idx, image in enumerate(pixel_values):
+            if image.dim() == 4 and int(image.shape[0]) == 1:
+                image = image.squeeze(0)
+            if image.dim() != 3:
+                raise ValueError(f"BAGEL VAE expects rank-3 [C, H, W] image tensor, got {tuple(image.shape)}.")
+            normalized.append(image)
+            shape_key = (int(image.shape[-2]), int(image.shape[-1]))
+            shape_groups.setdefault(shape_key, []).append(idx)
+
+        group_indices = list(shape_groups.values())
+        posteriors: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(normalized)
+        for indices in group_indices:
+            batch = torch.stack([normalized[i] for i in indices], dim=0).to(
+                device=self._encoder_device, dtype=self.dtype
+            )
+            with self._runtime_context(batch):
+                mean_batch, logvar_batch = self._encode_posterior(batch)
+            for idx, mean_i, logvar_i in zip(indices, mean_batch, logvar_batch, strict=True):
+                posteriors[idx] = (mean_i.unsqueeze(0), logvar_i.unsqueeze(0))
+
+        if min_passes > len(group_indices):
+            dummy_batch = normalized[0].unsqueeze(0).to(device=self._encoder_device, dtype=self.dtype)
+            for _ in range(min_passes - len(group_indices)):
+                with self._runtime_context(dummy_batch):
+                    mean_dummy, logvar_dummy = self._encode_posterior(dummy_batch)
+                assert posteriors[0] is not None
+                anchor = (mean_dummy.sum() + logvar_dummy.sum()) * 0.0
+                posteriors[0] = (posteriors[0][0] + anchor, posteriors[0][1])
+
+        return posteriors  # type: ignore[return-value]
 
     def _sample_scaled_latents(self, posterior: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         mean, logvar = posterior
@@ -356,6 +415,7 @@ class Encoder(nn.Module):
         self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
+        """Encode input image tensor ``x`` into ``2 * z_channels`` mean/logvar parameters."""
         hidden_stack = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -444,6 +504,7 @@ class Decoder(nn.Module):
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: Tensor) -> Tensor:
+        """Decode latent tensor ``z`` into reconstructed RGB image space."""
         hidden_states = self.conv_in(z)
 
         if self.gradient_checkpointing and self.training:

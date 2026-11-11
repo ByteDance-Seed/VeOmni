@@ -21,6 +21,7 @@ from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _OMNI_TOKEN_LEN as _CONVERSATION_TOKEN_LEN
 from ...module_processing_base import ModulePreprocessorBase
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
@@ -86,6 +87,7 @@ class BagelSiglipNavitProcessor(BaseImageProcessor):
         dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> BatchFeature:
+        """Resize, normalize, and patchify ``images`` into NaViT varlen batch tensors."""
         del return_tensors, kwargs
         image_list = images if isinstance(images, list) else [images]
 
@@ -139,6 +141,7 @@ def _preprocess_image(
     image_mean: list[float],
     image_std: list[float],
 ) -> torch.Tensor:
+    """Convert ``image`` to a normalized ``[3, H, W]`` float32 tensor aligned to ``patch_size``."""
     if isinstance(image, (Image.Image, np.ndarray)):
         pil_image = _to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
         pil_image = _resize_pil(
@@ -164,6 +167,7 @@ def _preprocess_image(
 
 
 def _to_rgb_tensor(image: Any) -> torch.Tensor:
+    """Convert a PIL image, NumPy array, or tensor into a ``[3, H, W]`` RGB tensor in ``[0, 1]``."""
     if isinstance(image, Image.Image):
         pil_image = _to_rgb_pil(image)
         array = np.array(pil_image, copy=True)
@@ -205,6 +209,7 @@ def _resize_tensor(
     max_pixels: int,
     img_num: int = 1,
 ) -> torch.Tensor:
+    """Resize a ``[3, H, W]`` image tensor with bicubic interpolation to the target patch grid."""
     height, width = tensor.shape[-2:]
     new_width, new_height = _target_size(
         width,
@@ -236,6 +241,7 @@ def _resize_pil(
     max_pixels: int,
     img_num: int = 1,
 ) -> Image.Image:
+    """Resize a PIL image with bicubic interpolation to the target patch grid."""
     width, height = image.size
     new_width, new_height = _target_size(
         width,
@@ -266,6 +272,7 @@ def _target_size(
     max_pixels: int,
     img_num: int,
 ) -> tuple[int, int]:
+    """Compute patch-stride-aligned ``(new_width, new_height)`` within pixel and side-length bounds."""
     scale = min(image_size / max(width, height), 1.0)
     scale = max(scale, min_image_size / min(width, height))
     new_width, new_height = _apply_scale(width, height, scale, patch_size)
@@ -279,6 +286,7 @@ def _target_size(
 
 
 def _to_rgb_pil(image: Image.Image) -> Image.Image:
+    """Convert ``image`` to RGB, compositing transparency over a white background."""
     if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
         rgba = image.convert("RGBA")
         white = Image.new(mode="RGB", size=rgba.size, color=(255, 255, 255))
@@ -302,6 +310,7 @@ def _apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[in
 
 
 def _patchify_image(image: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Flatten a ``[C, H, W]`` image tensor into ``[(H/P)*(W/P), P*P*C]`` patch rows."""
     channels, height, width = image.shape
     if height % patch_size != 0 or width % patch_size != 0:
         raise ValueError("BAGEL preprocessed image height and width must be divisible by patch_size.")
@@ -355,7 +364,8 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
         processor's geometry, so it agrees with the live model's own config.
         """
         del kwargs
-        config = BagelSiglipNavitConfig.from_pretrained(module_path, **(config_overrides or {}))
+        # ``model_config=`` (not ``**kwargs``): HF drops kwargs the class does not declare.
+        config = BagelSiglipNavitConfig.from_pretrained(module_path, model_config=config_overrides)
         return cls(BagelSiglipNavitProcessor.from_config(config))
 
     def bind_dummy_inputs(self, config: BagelSiglipNavitConfig, dtype: torch.dtype | None = None) -> None:
@@ -371,6 +381,7 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
+        """Patchify SigLIP context images in place and append per-sample dummy anchors in training."""
         del generation_kwargs
 
         image_items: list[ConversationItem] = []
@@ -397,6 +408,7 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
                             BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT,
                             _OMNI_POSITION_IDS: torch.zeros(1, dtype=torch.long),
                             _OMNI_TOKEN_LEN: 1,
+                            _CONVERSATION_TOKEN_LEN: 1,
                         },
                     )
                 )
@@ -417,6 +429,7 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
             item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
             item.meta[_OMNI_POSITION_IDS] = position_ids.to(dtype=torch.long)
             item.meta[_OMNI_TOKEN_LEN] = int(length)
+            item.meta[_CONVERSATION_TOKEN_LEN] = int(length)
 
 
 __all__ = [
