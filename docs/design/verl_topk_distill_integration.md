@@ -8,13 +8,14 @@ Ulysses SP all carry over.
 
 ## VeOmni-side contract
 
-Add two kwargs to the model `forward`; the wrapper routes them through
-to the kernel:
+Forward optional top-k kwargs alongside `return_log_probs=True`; the wrapper
+routes them through to the chunked kernels:
 
 ```python
-teacher_topk_ids: torch.Tensor          # [B, L, K] int64 (dense)
-teacher_topk_log_probs: torch.Tensor    # [B, L, K] fp32
-log_prob_min_clamp: float | None = None # optional, matches DistillationLossConfig
+teacher_topk_ids: torch.Tensor  # [B, L, K] int64 (dense)
+teacher_topk_log_probs: torch.Tensor  # [B, L, K] fp32
+log_prob_min_clamp: float | None = None  # optional, matches DistillationLossConfig
+topk_ids: torch.Tensor | None = None  # [B, L, K] int64 (mutually exclusive with teacher_topk_*)
 ```
 
 When `return_log_probs=True`, the output dataclass exposes a single
@@ -28,9 +29,10 @@ per-token tensors:
 | `distillation_losses` | `[B, L]` | fp32 | `>= 0` | flows |
 | `student_mass` | `[B, L]` | fp32 | `[0, 1]` | detached |
 | `teacher_mass` | `[B, L]` | fp32 | `[0, 1]` | detached |
+| `topk_log_probs` | `[B, L, K]` | fp32 | `<= 0` | flows (when `topk_ids` is passed instead of `teacher_topk_*`) |
 
 `fused_linear_aux is None` on the plain loss path (no
-`return_log_probs`). All five tensors are `0` at `IGNORE_INDEX`
+`return_log_probs`). All per-token tensors are `0` at `IGNORE_INDEX`
 positions and the trailing pad slot. KL formula is verbatim verl's:
 `Σ_k exp(log_p_t,k) · (log_p_t,k - log_q_s,k)` on the top-k support
 (with optional clamp on both terms). The nested-payload shape (rather
@@ -54,9 +56,7 @@ existing `use_fused_kernels and use_remove_padding` block of
 `VeOmniEngineWithLMHead.prepare_model_inputs`:
 
 ```python
-distillation_use_topk = tu.get_non_tensor_data(
-    data=micro_batch, key="distillation_use_topk", default=False
-)
+distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
 if distillation_use_topk:
     teacher_logprobs = micro_batch["teacher_logprobs"]
     teacher_ids = micro_batch["teacher_ids"]

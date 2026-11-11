@@ -377,8 +377,9 @@ token_logprobs_op = resolve_token_logprobs_op(device_type=logits.device.type)
 log_probs = token_logprobs_op(logits, labels, ignore_index=-100)
 
 # Model-facing chunked fused-linear helpers (optional impl or op override):
-log_probs, entropy = chunk_logprobs_function(
-    hidden_states, weights, labels, chunk_size=1024, impl=None
+log_probs, entropy = chunk_logprobs_function(hidden_states, weights, labels, chunk_size=1024, impl=None)
+log_probs, entropy, topk_log_probs = chunk_logprobs_function(
+    hidden_states, weights, labels, chunk_size=1024, topk_ids=topk_ids, impl=None
 )
 log_probs, entropy, distill, student_mass, teacher_mass = chunk_topk_distill_function(
     hidden_states, weights, labels, teacher_topk_ids, teacher_topk_log_probs, chunk_size=1024, impl=None

@@ -95,9 +95,11 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
 
     Mirrors verl's ``FusedLinearForPPOFunction`` (custom autograd
     Function with explicit chunked forward + backward) so the FSDP2
-    correctness story is the same. Returns ``(log_probs, entropy)`` as
-    a 2-tuple; the entropy gradient path in backward is only walked
-    when the caller actually backprops through the entropy output.
+    correctness story is the same. Returns ``(log_probs, entropy)`` by
+    default, or ``(log_probs, entropy, topk_log_probs)`` when optional
+    ``topk_ids`` is supplied; the entropy and ``topk_log_probs`` gradient
+    paths in backward are only walked when the caller actually backprops
+    through those outputs.
     """
 
     @staticmethod
@@ -110,8 +112,9 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         chunk_size: int,
         ignore_index: int,
         token_logprobs_fn: Callable[..., Tensor] | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Stream the lm_head projection chunk-by-chunk to compute log-probs and entropy."""
+        topk_ids: Tensor | None = None,
+    ):
+        """Stream the lm_head projection chunk-by-chunk to compute log-probs, entropy, and optional top-k log-probs."""
         ctx.set_materialize_grads(False)
         if token_logprobs_fn is None:
             token_logprobs_fn = resolve_token_logprobs_fn(device_type=hidden_states.device.type)
@@ -125,6 +128,13 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         h_2d = hidden_states.reshape(-1, hidden_states.size(-1))
         l_1d = labels.reshape(-1)
         T = l_1d.shape[0]
+        has_topk = topk_ids is not None
+        if has_topk:
+            K = topk_ids.shape[-1]
+            ids_2d = topk_ids.reshape(T, K).to(device=h_2d.device, dtype=torch.int64)
+            topk_log_probs = torch.zeros(
+                (T, K), device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad
+            )
 
         log_probs = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
         # Entropy is returned in fp32; verl downcasts to ``hidden_states.dtype``
@@ -159,24 +169,45 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             mask = l_chunk != ignore_index
             entropy[chunk_start:chunk_end] = torch.where(mask, chunk_entropy, torch.zeros_like(chunk_entropy))
 
-        ctx.save_for_backward(h_2d, weight, l_1d)
+            if has_topk:
+                ids_chunk = ids_2d[chunk_start:chunk_end]
+                safe_ids = torch.where(mask.unsqueeze(-1), ids_chunk, 0)
+                chunk_topk_lp = logits.log_softmax(dim=-1).gather(dim=-1, index=safe_ids)
+                topk_log_probs[chunk_start:chunk_end] = torch.where(
+                    mask.unsqueeze(-1), chunk_topk_lp, torch.zeros_like(chunk_topk_lp)
+                )
+
+        if has_topk:
+            ctx.save_for_backward(h_2d, weight, l_1d, ids_2d)
+        else:
+            ctx.save_for_backward(h_2d, weight, l_1d)
+        ctx.has_topk = has_topk
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
         ctx.ignore_index = ignore_index
         ctx.orig_hidden_shape = orig_hidden_shape
 
+        if has_topk:
+            return log_probs.view(orig_shape), entropy.view(orig_shape), topk_log_probs.view(*orig_shape, K)
         return log_probs.view(orig_shape), entropy.view(orig_shape)
 
     @staticmethod
-    def backward(ctx, dlog_probs: Tensor | None, dentropy: Tensor | None):
+    def backward(ctx, dlog_probs: Tensor | None, dentropy: Tensor | None, dtopk_log_probs: Tensor | None = None):
         """Recompute chunked logits and accumulate gradients into ``hidden_states`` and ``weight``."""
-        if dlog_probs is None and dentropy is None:
-            return None, None, None, None, None, None, None
+        if dlog_probs is None and dentropy is None and dtopk_log_probs is None:
+            return None, None, None, None, None, None, None, None
 
-        h_2d, weight, l_1d = ctx.saved_tensors
+        if ctx.has_topk:
+            h_2d, weight, l_1d, ids_2d = ctx.saved_tensors
+            K = ids_2d.shape[-1]
+        else:
+            h_2d, weight, l_1d = ctx.saved_tensors
+            ids_2d = None
+            K = 0
         T = l_1d.shape[0]
-        dlog_probs_1d = dlog_probs.reshape(-1).float() if dlog_probs is not None else None
-        dentropy_1d = dentropy.reshape(-1).float() if dentropy is not None else None
+        dlog_probs_1d = dlog_probs.reshape(T).float() if dlog_probs is not None else None
+        dentropy_1d = dentropy.reshape(T).float() if dentropy is not None else None
+        dtopk_2d = dtopk_log_probs.reshape(T, K).float() if dtopk_log_probs is not None else None
 
         # Saved tensors may have different ``requires_grad`` flags after a
         # reshape copy. Gate gradients on the original Function inputs.
@@ -189,6 +220,7 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             l_chunk = l_1d[chunk_start:chunk_end]
             dlp_chunk = dlog_probs_1d[chunk_start:chunk_end] if dlog_probs_1d is not None else None
             dent_chunk = dentropy_1d[chunk_start:chunk_end] if dentropy_1d is not None else None
+            dtopk_chunk = dtopk_2d[chunk_start:chunk_end] if dtopk_2d is not None else None
 
             # Recompute logits with the same op order as forward so the
             # saved-weight reference (which FSDP2 has unsharded by now
@@ -225,6 +257,17 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
                 masked_dent = (dent_chunk * mask).unsqueeze(-1)
                 dlogits = dlogits + probs * (log_probs_full + entropy_full.unsqueeze(-1)) * (-masked_dent)
 
+            # ── topk_log_probs gradient path ─────────────────────────────
+            # ∂(gather(log_softmax(logits), topk_ids)[k]) / ∂logits[v] =
+            #     δ(v == topk_ids[k]) - softmax(logits)[v]
+            if dtopk_chunk is not None:
+                ids_chunk = ids_2d[chunk_start:chunk_end]
+                bool_mask = l_chunk != ctx.ignore_index
+                safe_ids = torch.where(bool_mask.unsqueeze(-1), ids_chunk, 0)
+                masked_dtopk = dtopk_chunk * mask.unsqueeze(-1)
+                dlogits = dlogits - probs * masked_dtopk.sum(dim=-1, keepdim=True)
+                dlogits.scatter_add_(-1, safe_ids, masked_dtopk)
+
             # Op order mirrors verl's ``_fused_linear_for_ppo_bwd``:
             # cast back to the input dtype first, then divide by
             # temperature, *then* matmul. The cast-before-divide order
@@ -242,7 +285,7 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         if dhidden is not None:
             dhidden = dhidden.view(ctx.orig_hidden_shape)
 
-        return dhidden, dweight, None, None, None, None, None
+        return dhidden, dweight, None, None, None, None, None, None
 
 
 class _ChunkedLinearTopkDistill(torch.autograd.Function):
@@ -490,12 +533,21 @@ def chunk_linear_logprobs(
     chunk_size: int = 1024,
     ignore_index: int = -100,
     token_logprobs_fn: Callable[..., Tensor] | None = None,
-) -> tuple[Tensor, Tensor]:
+    topk_ids: Tensor | None = None,
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Run the tensor-level chunked linear log-probs and entropy autograd Function.
 
-    Assumes ``hidden_states`` and ``labels`` are already aligned along the
-    sequence dimension (no causal shift or trailing padding is applied here).
+    Assumes ``hidden_states``, ``labels``, and optional ``topk_ids`` are already
+    aligned along the sequence dimension (no causal shift or trailing padding is
+    applied here).
     """
+    if topk_ids is not None:
+        if topk_ids.ndim != labels.ndim + 1 or topk_ids.shape[:-1] != labels.shape:
+            raise ValueError(
+                f"topk_ids leading shape {tuple(topk_ids.shape[:-1])} must match labels shape {tuple(labels.shape)}."
+            )
+        if topk_ids.shape[-1] <= 0:
+            raise ValueError(f"topk_ids last dim K must be positive, got {topk_ids.shape[-1]}.")
     return _ChunkedLinearLogProbs.apply(
         hidden_states,
         weights,
@@ -504,6 +556,7 @@ def chunk_linear_logprobs(
         int(chunk_size),
         int(ignore_index),
         token_logprobs_fn,
+        topk_ids,
     )
 
 

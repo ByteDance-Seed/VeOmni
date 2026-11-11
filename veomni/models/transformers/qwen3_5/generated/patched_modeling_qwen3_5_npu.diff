@@ -2279,7 +2279,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2786,105 @@
+@@ -1776,28 +2786,106 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2303,6 +2303,7 @@
 +                labels is not None
 +                and kwargs.get("return_log_probs")
 +                and kwargs.get("teacher_topk_ids") is None
++                and kwargs.get("topk_ids") is None
 +                and not (isinstance(logits_to_keep, int) and logits_to_keep > 0)
 +            ):
 +                shift_labels = kwargs.pop("shift_labels", orig_shift_labels)
@@ -2395,7 +2396,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3071,24 @@
+@@ -1984,6 +3072,24 @@
 
          return input_ids, model_kwargs
 
