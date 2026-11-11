@@ -91,13 +91,14 @@ as described below; the trusted input manifest must also cover the immutable
 DPO reference-model weights. This is a caller attestation; the trainer does not
 hash those weights. The reference is rebuilt from `model.model_path`, and the
 current trainer has no separate reference-model path. Starting a weights-only
-run from an exported policy therefore also changes the reference and the DPO
-objective; it is not an exact continuation. The saved dataset fingerprint is
-checked as an additional guard, not as a substitute for the manifest. Python,
-NumPy, and custom-component random states are not captured by this callback;
-data and worker transforms must also be deterministic, since worker torch RNG is not
-restored by this protocol. Recovery may temporarily copy the buffered samples
-on the host. The native multi-worker recovery checks were exercised with PyTorch 2.10 and torchdata
+run from an exported policy sets the reference to those policy weights and can
+change the DPO objective; it is not an exact continuation. The saved dataset
+fingerprint is checked as an additional guard, not as a substitute for the
+manifest. Python, NumPy, and custom-component random states are not captured by
+this callback; data and worker transforms must also be deterministic, since
+worker torch RNG is not restored by this protocol. Recovery may temporarily copy
+the buffered samples on the host. The native multi-worker recovery checks were
+exercised with PyTorch 2.10 and torchdata
 0.11; other versions require their own validation.
 
 For native fixed-batch DPO on mapping datasets, `drop_last=False` includes a
