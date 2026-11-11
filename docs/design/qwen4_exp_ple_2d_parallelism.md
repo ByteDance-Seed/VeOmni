@@ -449,9 +449,32 @@ checkpoints and remains compatible with older padded checkpoints. Invalid row
 counts and mixed logical/padded formats are rejected. Models with
 `ple_layer_ids=[]` skip PLE row conversion.
 
-DCP clips PLE chunks at their original offsets and loads directly into padded
-runtime shards, avoiding extra device-side projection tensors. HF retains its
-standard DTensor partitioning; other weights and optimizer state are unchanged.
+DCP and distributed HF export clip PLE chunks at their original global offsets.
+The save planner emits logical-row metadata and local prefix views, without
+resharding DTensors or exchanging PLE rows. DCP loads directly into padded
+runtime shards and zeroes only the unsaved tail. Legacy rank-zero HF export
+crops full CPU tensors after reading the checkpoint.
+
+### Checkpoint row contract
+
+The model-owned converter may implement `checkpoint_row_counts()` to return
+`{weight_fqn: (logical_rows, runtime_rows)}`. Names match
+`model.named_parameters()` without the DCP wrapper prefix. Each pair must satisfy
+`0 < logical_rows <= runtime_rows`; padding must be semantically inert.
+Every weight requiring cropping must have metadata, with missing metadata
+reported by the converter. A missing method or empty mapping opts out.
+The getter must not materialize parameter data or perform collectives.
+
+`DistributedCheckpointer.execute_save()` and `.load()` consume this mapping
+through `checkpoint/row_crop.py` and add the outer `model.` prefix. Distributed
+HF saving uses unprefixed names with `RowCropSavePlanner`; legacy rank-zero
+export receives explicit row counts and crops full CPU tensors. Optimizer state
+retains its runtime shapes. The checkpoint layer imports no model packages.
+
+See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)
+and [row-count lookup](../../veomni/checkpoint/row_crop.py#L15).
+
+### ExtraParallel adapter
 
 The existing ExtraParallel DCP adapter drops the ExtraParallel dimension before
 handing an FSDP-local tensor to DCP and restores it afterward. Extend

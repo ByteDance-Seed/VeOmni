@@ -173,9 +173,9 @@ def is_nccl_backend(backend: str | None = None) -> bool:
     return (backend or get_dist_comm_backend()) == "nccl"
 
 
-def is_hccl_backend(backend: str | None = None) -> bool:
+def is_hccl_backend() -> bool:
     """Check if the distributed communication backend is HCCL."""
-    return (backend or get_dist_comm_backend()) == "hccl"
+    return get_dist_comm_backend() == "hccl"
 
 
 def is_cncl_backend() -> bool:

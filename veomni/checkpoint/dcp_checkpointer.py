@@ -58,8 +58,9 @@ from .layout import (
     step_dir,
     weights_dir,
 )
-from .ple_planner import _EXPERT_LAYOUTS_KEY as _EXPERT_LAYOUTS_KEY
-from .ple_planner import PleLoadPlanner, PleSavePlanner, _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
+from .planner import _EXPERT_LAYOUTS_KEY as _EXPERT_LAYOUTS_KEY
+from .planner import _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
+from .row_crop import RowCropLoadPlanner, RowCropSavePlanner, checkpoint_row_counts
 
 
 logger = logging.get_logger(__name__)
@@ -69,10 +70,10 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
-def _model_load_planner(*, strict_model: bool, ple_rows_by_name):
-    """Select the PLE planner only when model weights have PLE row metadata."""
-    if ple_rows_by_name:
-        return PleLoadPlanner(strict_model=strict_model, ple_rows_by_name=ple_rows_by_name)
+def _model_load_planner(*, strict_model: bool, rows_by_name):
+    """Select row-aware loading only when the model reports checkpoint row counts."""
+    if rows_by_name:
+        return RowCropLoadPlanner(strict_model=strict_model, rows_by_name=rows_by_name)
     return _ModelStrictLoadPlanner(strict_model=strict_model)
 
 
@@ -199,12 +200,6 @@ class ModelState(Stateful):
             This is the LoRA / PEFT path: frozen base weights are skipped on save and
             ``set_model_state_dict`` runs in ``strict=False`` mode on load so the
             (already populated from ``model_path``) base params are left untouched.
-        crop_ple: when ``True``, Qwen4-Exp PLE weights are stored at their logical
-            row count. Load then pads the zero tail back onto the runtime parameter.
-            Old checkpoints that still contain the padded shape are loaded with
-            ``crop_ple=False``.
-        load_target: allocate empty logical PLE shards for DCP to fill, avoiding
-            communication of runtime weights while preparing a load.
     """
 
     def __init__(
@@ -212,13 +207,9 @@ class ModelState(Stateful):
         model,
         trainable_only: bool = False,
         parallel_state=None,
-        crop_ple: bool = True,
-        load_target: bool = False,
     ):
         self.model = model
         self.trainable_only = trainable_only
-        self.crop_ple = crop_ple
-        self.load_target = load_target
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
@@ -230,7 +221,7 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
-        """Extract model weights with their checkpoint sharding and optional PLE projection."""
+        """Extract model weights while preserving runtime shapes and checkpoint sharding."""
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
@@ -240,11 +231,6 @@ class ModelState(Stateful):
             # As fsdp+extra parallel and pure extra parallel have different placements, e.g. [Shard(0), Shard(1)] and [Shard(0)],
             # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
-
-        if self.crop_ple:
-            from .ple_rows import crop_ple_state_dict_for_dcp
-
-            model_state_dict = crop_ple_state_dict_for_dcp(self.model, model_state_dict, empty=self.load_target)
 
         return model_state_dict
 
@@ -258,11 +244,6 @@ class ModelState(Stateful):
         model_state_dict = state_dict
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
-
-        if self.crop_ple:
-            from .ple_rows import pad_ple_state_dict_from_dcp
-
-            model_state_dict = pad_ple_state_dict_from_dcp(self.model, model_state_dict)
 
         options = StateDictOptions(strict=False) if self.trainable_only else None
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
@@ -919,9 +900,7 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             cls.execute_save(
                 save_state={
-                    "model": ModelState(
-                        state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
-                    )
+                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
                 },
                 storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
                 save_async=save_async,
@@ -1033,15 +1012,11 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        from .ple_rows import ple_row_counts
-
-        ple_counts = {f"model.{name}": counts for name, counts in ple_row_counts(state["model"]).items()}
+        row_counts = {f"model.{name}": counts for name, counts in checkpoint_row_counts(state["model"]).items()}
 
         def _model_state() -> "ModelState":
             """Build the model load target using its padded runtime shapes."""
-            return ModelState(
-                state["model"], trainable_only=trainable_only, parallel_state=parallel_state, crop_ple=False
-            )
+            return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
 
         def _optimizer_state() -> "OptimizerState":
             return OptimizerState(
@@ -1062,7 +1037,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
+                planner=_model_load_planner(strict_model=not trainable_only, rows_by_name=row_counts),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
@@ -1074,7 +1049,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_path),
             process_group=process_group,
-            planner=_model_load_planner(strict_model=not trainable_only, ple_rows_by_name=ple_counts),
+            planner=_model_load_planner(strict_model=not trainable_only, rows_by_name=row_counts),
         )
         if wants_optimizer:
             dcp.load(
@@ -1220,12 +1195,10 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        from .ple_rows import ple_row_counts
-
         model_state = save_state.get("model")
-        counts = ple_row_counts(model_state.model) if isinstance(model_state, ModelState) else {}
+        counts = checkpoint_row_counts(model_state.model) if isinstance(model_state, ModelState) else {}
         planner = (
-            PleSavePlanner(
+            RowCropSavePlanner(
                 {f"model.{name}": rows for name, rows in counts.items()},
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
             )

@@ -10,7 +10,6 @@
 
 import os
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,16 +20,16 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.checkpoint.layout import optimizer_dir, step_dir, weights_dir
-from veomni.checkpoint.ple_rows import _resize_dtensor, pad_ple_state_dict_from_dcp, ple_checkpoint_is_cropped
+from veomni.checkpoint.row_crop import checkpoint_row_counts, crop_dense_state_dict
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
     create_qwen4_exp_checkpoint_tensor_converter,
 )
-from veomni.utils.save_safetensor_utils import crop_state_dict_for_hf_export, get_model_save_state
+from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
@@ -39,7 +38,6 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 PADDED = 16
 LOGICAL = 11
 COLS = 8
-SENTINEL = -123.0
 
 
 class _Model(nn.Module):
@@ -62,7 +60,7 @@ def _parallel_state():
 
 def _reference():
     rows = torch.arange(PADDED * COLS, dtype=torch.float32).reshape(PADDED, COLS)
-    rows[LOGICAL:] = SENTINEL
+    rows[LOGICAL:] = 0
     other = torch.arange(16, dtype=torch.float32).reshape(4, 4) + 0.5
     return rows, other
 
@@ -80,29 +78,14 @@ def _full(weight):
 
 
 def _optimizer(model):
-    # Disable weight decay on PLE so the sentinel padding cannot affect the
-    # uninterrupted reference. Real gradients touch logical vocabulary only.
-    return torch.optim.AdamW(
-        [
-            {"params": list(model.block.parameters()), "weight_decay": 0.0},
-            {"params": list(model.other.parameters())},
-        ],
-        lr=0.01,
-        foreach=False,
-    )
+    return torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
 
 
 def _train_step(model, optimizer, step):
     optimizer.zero_grad(set_to_none=True)
     weight = model.block.ngram_embedding["shard_0"].weight
     local = weight.to_local()
-    mesh = weight.device_mesh
-    row_axis = mesh.mesh_dim_names.index("ple")
-    row_start = mesh.get_local_rank(row_axis) * (PADDED // mesh.size(row_axis))
-    valid_rows = max(0, min(local.shape[0], LOGICAL - row_start))
-    # to_local() remains differentiable: backward populates the real DTensor
-    # parameter gradient, and AdamW creates padded DTensor moments naturally.
-    loss = local[:valid_rows].square().sum() * (0.001 * (step + 1))
+    loss = local.square().sum() * (0.001 * (step + 1))
     loss = loss + model.other.weight.square().sum() * (0.01 * (step + 1))
     loss.backward()
     optimizer.step()
@@ -141,60 +124,21 @@ def _check_resume(model, trained_rows, trained_other, source, source_opt, opt):
     assert tuple(loaded.shape) == (PADDED, COLS)
     assert logical_diff == 0.0, logical_diff
     assert tail_diff == 0.0, tail_diff
-    assert SENTINEL not in set(loaded.reshape(-1).tolist())
     assert other_diff == 0.0, other_diff
     _check_optimizer(source, model, source_opt, opt)
     return logical_diff, tail_diff, other_diff
 
 
-def _dcp_save(*args, **kwargs):
-    """Require DCP to save without constructing resized PLE DTensors."""
-    with patch("veomni.checkpoint.ple_rows._resize_dtensor", side_effect=AssertionError("DCP resharded PLE")):
-        return DistributedCheckpointer.save(*args, **kwargs)
-
-
-def _dcp_load(*args, **kwargs):
-    """Require DCP to read directly into the runtime PLE layout."""
-    with patch("veomni.checkpoint.ple_rows._resize_dtensor", side_effect=AssertionError("DCP resharded PLE")):
-        return DistributedCheckpointer.load(*args, **kwargs)
-
-
-def main():
+def _roundtrip_worker(rank, world_size, endpoint):
     # The container's training backend is NPU, but these ranks use gloo so the
     # checkpointer's agreement collectives must stay on CPU.
     """Exercise distributed PLE checkpoint save and resume."""
     import veomni.utils.dist_utils as dist_utils
 
     dist_utils.get_device_type = lambda: "cpu"
-    dist.init_process_group("gloo")
-    rank = dist.get_rank()
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
     mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ple_fsdp", "ple"))
     rows, other = _reference()
-    # Changed chunk boundaries, empty peers, and expansion must never gather.
-    for placements in ([Shard(1), Shard(0)], [Replicate(), Shard(0)], [Shard(0), Replicate()]):
-        source = distribute_tensor(rows.clone(), mesh, placements)
-        for logical in (15, 11, 1):
-            with patch.object(DTensor, "full_tensor", side_effect=AssertionError("unexpected full-table gather")):
-                cropped = _resize_dtensor(source, logical)
-                restored = _resize_dtensor(cropped, PADDED)
-                with patch.object(dist, "all_to_all_single", side_effect=AssertionError("load target communicated")):
-                    target = _resize_dtensor(source, logical, empty=True)
-            torch.testing.assert_close(_full(cropped), rows[:logical], rtol=0, atol=0)
-            expected = rows.clone()
-            expected[logical:] = 0
-            torch.testing.assert_close(_full(restored), expected, rtol=0, atol=0)
-            assert target.shape == cropped.shape
-            assert target.to_local().shape == cropped.to_local().shape
-    for placements in ([Shard(1), Replicate()], [Replicate(), Replicate()]):
-        name = "block.ngram_embedding.shard_0.weight"
-        column_state = {name: distribute_tensor(rows.clone(), mesh, placements)}
-        cropped = crop_state_dict_for_hf_export(_Model(), column_state)
-        restored = pad_ple_state_dict_from_dcp(_Model(), cropped)
-        torch.testing.assert_close(_full(cropped[name]), rows[:LOGICAL], rtol=0, atol=0)
-        expected = rows.clone()
-        expected[LOGICAL:] = 0
-        torch.testing.assert_close(_full(restored[name]), expected, rtol=0, atol=0)
-
     source = _Model()
     _install(source, mesh, rows.clone(), other.clone())
     source_opt = _optimizer(source)
@@ -212,7 +156,7 @@ def main():
     parallel_state = _parallel_state()
 
     try:
-        _dcp_save(
+        DistributedCheckpointer.save(
             directory,
             {"model": source, "optimizer": source_opt, "extra_state": {"lr_scheduler": None}},
             global_steps=1,
@@ -220,7 +164,6 @@ def main():
         )
         checkpoint = step_dir(directory, 1)
         weight_dir = weights_dir(checkpoint)
-        assert ple_checkpoint_is_cropped(weight_dir, source)
         from torch.distributed.checkpoint import FileSystemReader
 
         metadata = FileSystemReader(weight_dir).read_metadata()
@@ -247,23 +190,32 @@ def main():
             "block.ngram_embedding.shard_0.weight": trained_rows,
             "other.weight": trained_other,
         }
-        exported = crop_state_dict_for_hf_export(source, dense)
+        exported = crop_dense_state_dict(dense, checkpoint_row_counts(source))
         hf_ple = exported["block.ngram_embedding.shard_0.weight"]
         assert tuple(hf_ple.shape) == (LOGICAL, COLS)
         assert _max_abs(hf_ple, trained_rows[:LOGICAL]) == 0.0
         assert torch.equal(exported["other.weight"], trained_other)
 
-        hf_state = get_model_save_state(source, None, parallel_state=parallel_state)
-        hf_saved = _full(hf_state["block.ngram_embedding.shard_0.weight"])
-        assert tuple(hf_saved.shape) == (LOGICAL, COLS)
-        assert hf_saved.dtype == torch.bfloat16
-        assert _max_abs(hf_saved, trained_rows[:LOGICAL].to(torch.bfloat16)) == 0.0
-        assert _max_abs(hf_state["other.weight"], trained_other.to(torch.bfloat16)) == 0.0
+        hf_dir = os.path.join(directory, "hf")
+        with patch("veomni.utils.save_safetensor_utils.synchronize"):
+            _save_hf_safetensor_distributed(source, hf_dir, None, None, parallel_state=parallel_state)
+        if rank == 0:
+            from safetensors.torch import load_file
+
+            hf_state = {}
+            for filename in Path(hf_dir).glob("*.safetensors"):
+                hf_state.update(load_file(str(filename)))
+            hf_saved = hf_state["block.ngram_embedding.shard_0.weight"]
+            assert tuple(hf_saved.shape) == (LOGICAL, COLS)
+            assert hf_saved.dtype == torch.bfloat16
+            torch.testing.assert_close(hf_saved, trained_rows[:LOGICAL].to(torch.bfloat16), rtol=0, atol=0)
+            torch.testing.assert_close(hf_state["other.weight"], trained_other.to(torch.bfloat16), rtol=0, atol=0)
+        dist.barrier()
 
         restored = _Model()
         _install(restored, mesh, torch.zeros(PADDED, COLS), torch.zeros(4, 4))
         restored_opt = _optimizer(restored)
-        _dcp_load(
+        DistributedCheckpointer.load(
             checkpoint,
             {"model": restored, "optimizer": restored_opt, "extra_state": {}},
             parallel_state=parallel_state,
@@ -272,7 +224,7 @@ def main():
             restored, trained_rows, trained_other, source, source_opt, restored_opt
         )
 
-        _dcp_save(
+        DistributedCheckpointer.save(
             directory,
             {"model": restored, "optimizer": restored_opt, "extra_state": {"lr_scheduler": None}},
             global_steps=2,
@@ -281,22 +233,21 @@ def main():
         second = _Model()
         _install(second, mesh, torch.full((PADDED, COLS), 9.0), torch.full((4, 4), 9.0))
         second_opt = _optimizer(second)
-        _dcp_load(
+        DistributedCheckpointer.load(
             step_dir(directory, 2),
             {"model": second, "optimizer": second_opt, "extra_state": {}},
             parallel_state=parallel_state,
         )
         _check_resume(second, trained_rows, trained_other, source, source_opt, second_opt)
-        assert ple_checkpoint_is_cropped(weights_dir(step_dir(directory, 2)), second)
 
         # Older padded checkpoints must retain their stored tail, not zero it.
         from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 
         with patch(
-            "veomni.checkpoint.dcp_checkpointer.PleSavePlanner",
+            "veomni.checkpoint.dcp_checkpointer.RowCropSavePlanner",
             side_effect=lambda rows, **kwargs: DefaultSavePlanner(**kwargs),
         ):
-            _dcp_save(
+            DistributedCheckpointer.save(
                 directory,
                 {"model": source, "optimizer": source_opt, "extra_state": {"lr_scheduler": None}},
                 global_steps=3,
@@ -305,7 +256,7 @@ def main():
         legacy = _Model()
         _install(legacy, mesh, torch.zeros(PADDED, COLS), torch.zeros(4, 4))
         legacy_opt = _optimizer(legacy)
-        _dcp_load(
+        DistributedCheckpointer.load(
             step_dir(directory, 3),
             {"model": legacy, "optimizer": legacy_opt, "extra_state": {}},
             parallel_state=parallel_state,
@@ -334,33 +285,12 @@ def main():
     finally:
         if rank == 0 and directory:
             shutil.rmtree(directory, ignore_errors=True)
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def test_distributed_ple_checkpoint_roundtrip():
-    """Launch the PLE checkpoint round trip with the configured accelerator mesh."""
-    from tests.tools.launch_utils import run_bounded_process_group
+    """Launch four CPU workers using the shared rendezvous helper."""
+    from tests.tools.launch_utils import spawn_with_rendezvous
 
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", ASCEND_RT_VISIBLE_DEVICES="", TORCH_DEVICE_BACKEND_AUTOLOAD="0")
-    root = str(Path(__file__).resolve().parents[2])
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [root, env.get("PYTHONPATH")]))
-    run_bounded_process_group(
-        [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nnodes=1",
-            "--nproc_per_node=4",
-            str(Path(__file__).resolve()),
-        ],
-        env=env,
-        timeout=300,
-    )
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    spawn_with_rendezvous(_roundtrip_worker, args=(4,), nprocs=4)

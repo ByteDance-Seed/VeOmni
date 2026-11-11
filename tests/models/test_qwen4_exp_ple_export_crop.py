@@ -15,11 +15,10 @@ import torch
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.checkpoint.ple_rows import pad_ple_state_dict_from_dcp, ple_checkpoint_is_cropped
+from veomni.checkpoint.row_crop import checkpoint_row_counts, crop_dense_state_dict
 from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
     create_qwen4_exp_checkpoint_tensor_converter,
 )
-from veomni.utils.save_safetensor_utils import crop_state_dict_for_hf_export
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -91,13 +90,15 @@ def test_crop_rejects_a_short_ple_shard():
 def test_state_dict_helper_skips_models_without_the_crop():
     weight = torch.zeros(3, 2)
     state = {"model.embed_tokens.weight": weight}
-    assert crop_state_dict_for_hf_export(nn.Linear(2, 2), state) is state
+    assert crop_dense_state_dict(state, checkpoint_row_counts(nn.Linear(2, 2))) is state
 
 
 def test_state_dict_helper_crops_a_dense_ple_shard():
     model = _Model()
     weight = _padded_weight()
-    state = crop_state_dict_for_hf_export(model, {_PLE: weight, "model.embed_tokens.weight": torch.zeros(2)})
+    state = crop_dense_state_dict(
+        {_PLE: weight, "model.embed_tokens.weight": torch.zeros(2)}, checkpoint_row_counts(model)
+    )
 
     assert state[_PLE].shape == (10, 4)
     assert state["model.embed_tokens.weight"].shape == (2,)
@@ -110,13 +111,11 @@ def test_multiple_layers_keep_their_own_rows():
         f"layers.{index}.ngram_embedding.shard_0.weight": _padded_weight(logical, padded)
         for index, (logical, padded) in enumerate([(10, 16), (19, 24), (8, 8)])
     }
-    cropped = crop_state_dict_for_hf_export(model, state)
-    restored = pad_ple_state_dict_from_dcp(model, cropped)
+    cropped = crop_dense_state_dict(state, checkpoint_row_counts(model))
     for name, weight in state.items():
         logical, padded = create_qwen4_exp_checkpoint_tensor_converter(model).ple_rows_by_name[name]
         assert cropped[name].shape == (logical, 4)
-        assert restored[name].shape == (padded, 4)
-        torch.testing.assert_close(restored[name], weight, rtol=0, atol=0)
+        torch.testing.assert_close(cropped[name], weight[:logical], rtol=0, atol=0)
 
 
 def test_disabled_ple_does_not_break_converter_or_export():
@@ -124,23 +123,26 @@ def test_disabled_ple_does_not_break_converter_or_export():
     converter = create_qwen4_exp_checkpoint_tensor_converter(model)
     assert converter.ple_rows_by_name == {}
     state = {"model.embed_tokens.weight": torch.ones(3, 4)}
-    assert crop_state_dict_for_hf_export(model, state) is state
-    assert pad_ple_state_dict_from_dcp(model, state) is state
-    # A PLE-free model must not even try to open DCP metadata.
-    assert not ple_checkpoint_is_cropped("/does/not/exist", model)
+    assert crop_dense_state_dict(state, checkpoint_row_counts(model)) is state
 
 
-def test_hf_projection_cpu_offload_preserves_values_and_runtime_weights():
+def test_dense_crop_preserves_values_and_runtime_weights():
     """Verify CPU projection preserves logical values, dtype, and runtime weights."""
-    from veomni.checkpoint.ple_rows import project_state_dict_to_checkpoint
-
     model = _Model()
     weight = _padded_weight()
     original = weight.clone()
     state = {_PLE: weight, "other.weight": torch.ones(2, 4)}
-    projected = project_state_dict_to_checkpoint(model, state, cpu_offload=True)
+    projected = crop_dense_state_dict(state, checkpoint_row_counts(model))
     assert projected[_PLE].device.type == "cpu"
     assert projected[_PLE].dtype == weight.dtype
     torch.testing.assert_close(projected[_PLE], original[:10])
     torch.testing.assert_close(weight, original)
     assert projected["other.weight"] is state["other.weight"]
+
+
+def test_missing_ple_row_metadata_is_rejected():
+    """Reject recognized PLE weights whose module omits the shape contract."""
+    model = _Model()
+    del model.layers[0].rows_per_checkpoint_shard
+    with pytest.raises(RuntimeError, match="no checkpoint row metadata"):
+        checkpoint_row_counts(model)

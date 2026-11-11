@@ -41,6 +41,7 @@ _MTP_PATTERN = re.compile(r"(?:^|\.)mtp(?:\.|$)")
 
 def _ple_rows_from_model(model) -> Dict[str, Tuple[int, int]]:
     """Read logical/runtime rows by weight name; different PLE layers may differ."""
+    # Patchgen PLE modules expose these attributes as their checkpoint shape contract.
     found = {}
     for prefix, module in model.named_modules():
         rows = getattr(module, "rows_per_checkpoint_shard", None)
@@ -56,6 +57,9 @@ def _ple_rows_from_model(model) -> Dict[str, Tuple[int, int]]:
             full_name = f"{prefix + '.' if prefix else ''}ngram_embedding.{name}"
             if _PLE_SHARD_PATTERN.match(full_name):
                 found[full_name] = (rows, padded)
+    for name, _parameter in model.named_parameters():
+        if _PLE_SHARD_PATTERN.match(name) and name not in found:
+            raise RuntimeError(f"{name}: PLE weight has no checkpoint row metadata")
     return found
 
 
@@ -96,6 +100,10 @@ class Qwen4ExpCheckpointTensorConverter:
         """PLE shard conversion is only trailing dim-0 zero-padding."""
         return _PLE_SHARD_PATTERN.match(name) is not None
 
+    def checkpoint_row_counts(self) -> Dict[str, Tuple[int, int]]:
+        """Return full weight names mapped to checkpoint and runtime rows."""
+        return dict(self.ple_rows_by_name)
+
     def crop_hf_export_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         """Drop the runtime dim-0 pad from a full PLE matrix.
 
@@ -106,6 +114,8 @@ class Qwen4ExpCheckpointTensorConverter:
         """
         if _PLE_SHARD_PATTERN.match(name) is None:
             return tensor
+        if name not in self.ple_rows_by_name:
+            raise RuntimeError(f"{name}: PLE weight has no checkpoint row metadata")
         logical_rows, _padded_rows = self.ple_rows_by_name[name]
         rows = tensor.shape[0]
         if rows == logical_rows:
