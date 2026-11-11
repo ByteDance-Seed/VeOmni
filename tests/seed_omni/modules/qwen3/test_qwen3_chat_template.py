@@ -354,7 +354,7 @@ def test_qwen3_accelerated_packed_flex_attention_builds_block_mask_and_matches_s
             ],
         ]
         pre_out = llm_packed.pre_forward("forward", conversation_list=conversations)
-        assert isinstance(pre_out["attention_mask"], dict) and "full_attention" in pre_out["attention_mask"]
+        assert isinstance(pre_out["attention_mask"], torch.Tensor) and pre_out["attention_mask"].ndim == 2
         out_conv = llm_packed.post_forward("forward", **llm_packed(**pre_out))["conversation_list"]
 
         conv_0 = [
