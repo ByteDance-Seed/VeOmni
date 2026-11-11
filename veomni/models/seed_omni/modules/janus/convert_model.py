@@ -38,6 +38,11 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
 
     A DeepSeek-format source (``model_type: multi_modality``) is first converted
     to the HF layout in a temporary directory.
+
+    The graphs below repeat :data:`~.hf_layout.JANUS_HF_LAYOUT`'s declaration on
+    purpose, as the Qwen3-VL converter does: this path also records
+    ``generation_kwargs``, which a layout-driven convert has no field for, so the
+    two are not interchangeable and the defaults stay next to their consumer.
     """
     from veomni.models.seed_omni.modules import read_hf_model_type
 
@@ -52,13 +57,18 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
         training_graph=kwargs.pop("training_graph", None),
         generation_graph=kwargs.pop("generation_graph", None),
     )
+    # The upstream model is instantiated to read its weights, so it needs an
+    # attention backend this host can actually build. `convert_with_hf_layout`
+    # honours this argument for layout-driven families; the converter path has to
+    # do the same or a CPU host dies in `_check_and_adjust_attn_implementation`.
+    attn_implementation = kwargs.pop("attn_implementation", None)
     del kwargs
     if read_hf_model_type(model_path) == "multi_modality":
         with tempfile.TemporaryDirectory(prefix="janus-hf-") as hf_model_path:
             convert_janus_to_hf(local_dir=model_path, output_dir=hf_model_path)
-            modules = _split_janus_hf(hf_model_path)
+            modules = _split_janus_hf(hf_model_path, attn_implementation=attn_implementation)
     else:
-        modules = _split_janus_hf(model_path)
+        modules = _split_janus_hf(model_path, attn_implementation=attn_implementation)
     return {
         "modules": modules,
         "training_graphs": training_graphs,
@@ -68,7 +78,17 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     }
 
 
-def _split_janus_hf(model_path: str) -> dict[str, Any]:
+def _build_kwargs(attn_implementation: str | None) -> dict[str, Any]:
+    """``_from_config`` kwargs recording an explicit attention backend, if one was asked for.
+
+    A module built without one keeps its config default, which is what a plain
+    convert wants; on a host that cannot run that default (CPU, no flash-attn)
+    the caller passes ``eager`` and the split records it.
+    """
+    return {"attn_implementation": attn_implementation} if attn_implementation is not None else {}
+
+
+def _split_janus_hf(model_path: str, *, attn_implementation: str | None = None) -> dict[str, Any]:
     print(f"Loading Janus from: {model_path}")
     import veomni.models.seed_omni.modules  # noqa: F401
     from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
@@ -84,7 +104,11 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
     JanusSiglipProcessor = OMNI_PROCESSOR_REGISTRY["janus_siglip"]()
     JanusVqvaeProcessor = OMNI_PROCESSOR_REGISTRY["janus_vqvae"]()
 
-    model = JanusForConditionalGeneration.from_pretrained(model_path, device_map="cpu")
+    model = JanusForConditionalGeneration.from_pretrained(
+        model_path,
+        device_map="cpu",
+        **({"attn_implementation": attn_implementation} if attn_implementation is not None else {}),
+    )
     image_processor = JanusProcessor.from_pretrained(model_path).image_processor
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     # Janus's vocab is byte-level BPE. An HF export written before
@@ -103,7 +127,7 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
     print("Extracting janus_siglip ...")
     siglip_cfg = JanusSiglipConfig(vision_config=cfg.vision_config.to_dict())
     with no_init_weights(), init_empty_weights():
-        siglip = JanusSiglip._from_config(siglip_cfg)
+        siglip = JanusSiglip._from_config(siglip_cfg, **_build_kwargs(attn_implementation))
     siglip.vision_model.load_state_dict(inner.vision_model.state_dict(), assign=True)
     siglip.aligner.load_state_dict(inner.aligner.state_dict(), assign=True)
     attach_module_assets(siglip, image_processor=JanusSiglipProcessor(**image_processor.to_dict()))
@@ -111,7 +135,7 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
     print("Extracting janus_vqvae ...")
     vqvae_cfg = JanusVqvaeConfig(vq_config=cfg.vq_config.to_dict())
     with no_init_weights(), init_empty_weights():
-        vqvae = JanusVqvae._from_config(vqvae_cfg)
+        vqvae = JanusVqvae._from_config(vqvae_cfg, **_build_kwargs(attn_implementation))
     vqvae.vqmodel.load_state_dict(inner.vqmodel.state_dict(), assign=True)
     vqvae.generation_embeddings.load_state_dict(inner.generation_embeddings.state_dict(), assign=True)
     vqvae.generation_aligner.load_state_dict(inner.generation_aligner.state_dict(), assign=True)
@@ -120,20 +144,25 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
 
     print("Extracting janus_text_encoder ...")
     text_cfg: LlamaConfig = cfg.text_config
+    # Same predicate the layout uses, so the two paths cannot disagree on whether
+    # the module keeps an lm_head.
+    from .hf_layout import _tie_word_embeddings
+
+    tie_word_embeddings = _tie_word_embeddings(cfg)
     te_cfg = JanusTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,
-        tie_word_embeddings=text_cfg.tie_word_embeddings,
+        tie_word_embeddings=tie_word_embeddings,
         lm_head_bias=False,
     )
     with no_init_weights(), init_empty_weights():
-        te = JanusTextEncoder._from_config(te_cfg)
+        te = JanusTextEncoder._from_config(te_cfg, **_build_kwargs(attn_implementation))
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict(), assign=True)
-    if not text_cfg.tie_word_embeddings:
+    if not tie_word_embeddings:
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
         te.lm_head.load_state_dict(src_sd, assign=True)
     attach_module_assets(te, tokenizer=tokenizer)
-    print(f"  tie_word_embeddings={text_cfg.tie_word_embeddings}")
+    print(f"  tie_word_embeddings={tie_word_embeddings}")
 
     print("Extracting janus_llama ...")
     llama_cfg = JanusLlamaConfig(
@@ -142,7 +171,7 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
         gen_image_token_id=int(tokenizer.convert_tokens_to_ids("<image_0>")),
     )
     with no_init_weights(), init_empty_weights():
-        llama = JanusLlama._from_config(llama_cfg)
+        llama = JanusLlama._from_config(llama_cfg, **_build_kwargs(attn_implementation))
     src = {k: v for k, v in inner.language_model.state_dict().items() if not k.startswith("embed_tokens.")}
     llama.language_model.load_state_dict(src, assign=True)
 
