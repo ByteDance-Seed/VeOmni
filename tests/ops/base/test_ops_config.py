@@ -1115,33 +1115,49 @@ def test_a_quantizing_swiglu_row_is_refused_on_an_unfused_activation():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_a_vlm_vision_config_is_not_mistaken_for_the_quantized_decoder():
-    """A VLM's `vision_config` also carries `hidden_act`, but runs no `swiglu_mlp`.
+def test_a_quantizing_swiglu_row_is_refused_on_a_vlm_vision_activation_too():
+    """A VLM vision tower with a gated MLP is checked like any other.
 
-    Gemma-family vision encoders use GELU-tanh, so checking every sub-config would
-    reject a text-side selection that is perfectly valid. Only a config with a
-    decoder stack (``num_hidden_layers``) is inspected.
+    Qwen2.5-VL and Qwen2.5-Omni build `swiglu_mlp` handles inside their vision
+    towers, and those configs declare `depth` rather than `num_hidden_layers`, so a
+    decoder-shaped test let them through: `gelu` plus `swiglu_mlp_implementation='qat'`
+    would have trained the vision MLP at full precision under a QAT config.
+
+    The check refuses any non-SiLU activation on a config that has a gated MLP
+    (`intermediate_size`). That deliberately over-reports: Qwen3-VL's vision tower
+    uses GELU-tanh but binds no `swiglu_mlp`, so it is refused too. A model that
+    cannot quantize that MLP anyway is not a configuration anyone should be able to
+    select, and the message names the key to change.
     """
     import copy
 
-    from transformers import Qwen3VLMoeConfig
+    from transformers import Qwen2_5_VLConfig, Qwen3VLMoeConfig
 
     from veomni.models.configuration_base import as_veomni_config
-
-    config = Qwen3VLMoeConfig()
-    assert config.vision_config.hidden_act == "gelu_pytorch_tanh"
-    assert not hasattr(config.vision_config, "num_hidden_layers")
 
     def apply(source, **ops):
         veomni_config = as_veomni_config(copy.deepcopy(source), validate=False)
         veomni_config._set_ops_implementation(ops)
         return veomni_config
 
-    # Text side is SiLU, so the selection is fine even though vision is not.
-    assert apply(config, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
+    # Qwen2.5-VL: the vision tower binds the handle and declares `depth`, not
+    # `num_hidden_layers`. Both towers are SiLU by default, which quantizes fine.
+    vl = Qwen2_5_VLConfig()
+    assert not hasattr(vl.vision_config, "num_hidden_layers")
+    assert vl.vision_config.hidden_act == "silu"
+    assert apply(vl, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
 
-    # The text side is what decides.
-    gelu_text = copy.deepcopy(config)
-    gelu_text.text_config.hidden_act = "gelu"
+    gelu_vision = copy.deepcopy(vl)
+    gelu_vision.vision_config.hidden_act = "gelu"
     with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
-        apply(gelu_text, swiglu_mlp_implementation="qat")
+        apply(gelu_vision, swiglu_mlp_implementation="qat")
+
+    # A reference row keeps the fallback on every activation.
+    assert apply(gelu_vision, swiglu_mlp_implementation="eager").ops_config.swiglu_mlp_implementation == "eager"
+
+    # Qwen3-VL's vision tower is GELU-tanh and binds no handle. Refusing it is the
+    # accepted cost of not being able to tell the two shapes apart at config level.
+    qwen3_vl = Qwen3VLMoeConfig()
+    assert qwen3_vl.vision_config.hidden_act == "gelu_pytorch_tanh"
+    with pytest.raises(ValueError, match="hidden_act='gelu_pytorch_tanh'.*round nothing"):
+        apply(qwen3_vl, swiglu_mlp_implementation="qat")

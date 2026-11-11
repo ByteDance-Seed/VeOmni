@@ -44,23 +44,25 @@ def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, 
 
     if proposed.get("swiglu_mlp_implementation") not in QUANTIZING_IMPLS:
         return
-    # Only a decoder stack runs the SwiGLU MLP this row serves. A VLM's
-    # ``vision_config`` also carries ``hidden_act`` (Gemma3's is
-    # ``gelu_pytorch_tanh``) but its encoder has no ``swiglu_mlp`` at all, so
-    # checking it would reject a perfectly good text-side selection.
-    if not hasattr(config, "num_hidden_layers"):
+    # A gated MLP is what this row serves, and every such block declares an
+    # ``intermediate_size``. Do not test for a decoder stack (``num_hidden_layers``)
+    # or for ``depth``: Qwen2.5-VL and Qwen2.5-Omni vision towers use ``depth`` and
+    # *do* bind ``swiglu_mlp``, so a stack-shaped test let them through unquantized.
+    # Configs without a gated MLP (embeddings, vocoders, norm-only blocks) have no
+    # ``intermediate_size`` and are skipped.
+    if not hasattr(config, "intermediate_size"):
         return
-    # Gemma-style text configs name the field ``hidden_activation``; the rest use
-    # ``hidden_act``. A config with neither has no SwiGLU MLP to quantize.
+    # Gemma-style configs name the field ``hidden_activation``; the rest use
+    # ``hidden_act``. A config with neither has no MLP activation to check.
     activation = getattr(config, "hidden_act", None) or getattr(config, "hidden_activation", None)
     if activation is None or activation in FUSED_ACTIVATIONS:
         return
     raise ValueError(
         f"swiglu_mlp_implementation={proposed['swiglu_mlp_implementation']!r} cannot run on "
-        f"hidden_act={activation!r}: the fused `swiglu_mlp` rows quantize SiLU (`standard`) or "
-        "GELU-tanh (`geglu`, which registers no quantizing row), so this model's MLP would fall "
-        "back to its projection modules and round nothing. Set swiglu_mlp_implementation='eager' "
-        "to train in the model dtype. Quantizing other activations is tracked in #1430."
+        f"hidden_act={activation!r}: the quantizing `swiglu_mlp` row is registered on the "
+        "`standard` variant, which implements SiLU only, so this MLP would fall back to its "
+        "projection modules and round nothing. Set swiglu_mlp_implementation='eager' to train in "
+        "the model dtype. Quantizing another activation is a variant of its own -- see #1430."
     )
 
 
