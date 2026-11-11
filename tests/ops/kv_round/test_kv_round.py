@@ -21,6 +21,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -204,3 +205,109 @@ def test_storage_rounding_rows_are_straight_through():
         grad = torch.randn_like(y)
         (grad_x,) = torch.autograd.grad(y, x, grad)
         torch.testing.assert_close(grad_x, grad, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# The Triton row
+#
+# Everything above runs on CPU and exercises ``eager``; ``triton`` is only ever
+# asserted to be *unavailable* there. The kernel itself -- the ``float8e4nv``
+# cast, the block scan, the prefix split, the straight-through backward -- had no
+# coverage at all until these tests. They carry their own launch plan because the
+# module-level one pins the whole file to CPU, and ``get_closest_marker`` takes
+# the function-level marker over it.
+# ---------------------------------------------------------------------------
+
+_TRITON_DEVICE = pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))),
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.launch_plan(provider=LaunchSpec()),
+                pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="the kv_round Triton row needs CUDA"),
+            ],
+        ),
+    ],
+)
+
+
+def _triton_op(variant: str, device: str):
+    """Return the Triton row, skipping when it cannot run on this host.
+
+    The row needs Triton and, on NVIDIA, SM89 or later: the kernel casts to
+    ``tl.float8e4nv``, which Triton does not enable on Ampere.
+    """
+    pytest.importorskip("triton")
+    if device == "cpu":
+        pytest.skip("the kv_round Triton row is CUDA-only")
+    if torch.cuda.get_device_capability()[0] < 8 or torch.cuda.get_device_capability() == (8, 0):
+        pytest.skip("the Triton row casts to float8e4nv, which needs SM89+")
+    return VeomniOp("kv_round", variant, "triton")
+
+
+@_TRITON_DEVICE
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_triton_round_trip_matches_eager(device: str, block_size: int):
+    """The kernel must reproduce the eager round trip exactly, not approximately.
+
+    Both rows implement the same recipe -- group amax, round the scale up to a
+    power of two, clamp, cast -- so a difference means the deployment numerics
+    drifted from what training sees.
+    """
+    eager = VeomniOp("kv_round", "standard", "eager")
+    triton = _triton_op("standard", device)
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 5, block_size * 2, dtype=torch.bfloat16, device=device)
+
+    torch.testing.assert_close(triton(x, block_size=block_size), eager(x, block_size=block_size), rtol=0, atol=0)
+
+
+@_TRITON_DEVICE
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_triton_prefix_split_matches_eager(device: str, block_size: int):
+    """``quant_features`` stops the round trip partway; the tail must stay untouched."""
+    eager = VeomniOp("kv_round", "standard", "eager")
+    triton = _triton_op("standard", device)
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 4, block_size * 3, dtype=torch.bfloat16, device=device)
+    prefix = block_size * 2
+
+    actual = triton(x, block_size=block_size, quant_features=prefix)
+
+    torch.testing.assert_close(actual, eager(x, block_size=block_size, quant_features=prefix), rtol=0, atol=0)
+    torch.testing.assert_close(actual[..., prefix:], x[..., prefix:], rtol=0, atol=0)
+
+
+@_TRITON_DEVICE
+def test_triton_deepseek_v4_variants_match_eager(device: str):
+    """Both model geometries go through the same kernel; both must agree with eager."""
+    eager = VeomniOp("kv_round", "deepseek_v4", "eager")
+    triton = _triton_op("deepseek_v4", device)
+
+    torch.manual_seed(2)
+    # A KV entry: 128 NoPE channels in 64-wide groups, 64 RoPE channels kept.
+    kv = torch.randn(2, 3, 192, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(triton(kv, rope_features=64), eager(kv, rope_features=64), rtol=0, atol=0)
+
+    # An indexer activation: the whole 128-wide head, no RoPE split.
+    act = torch.randn(2, 3, 128, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(triton(act), eager(act), rtol=0, atol=0)
+
+
+@_TRITON_DEVICE
+def test_triton_straight_through_backward_matches_eager(device: str):
+    """The backward is the identity for both rows; a kernel that dropped it would show here."""
+    _triton_op("standard", device)
+
+    for impl in ("eager", "triton"):
+        op = VeomniOp("kv_round", "standard", impl)
+        torch.manual_seed(3)
+        x = torch.randn(2, 4, 128, dtype=torch.bfloat16, device=device, requires_grad=True)
+        y = op(x, block_size=64)
+        grad = torch.randn_like(y)
+        (grad_x,) = torch.autograd.grad(y, x, grad)
+        torch.testing.assert_close(grad_x, grad, rtol=0, atol=0, msg=impl)
