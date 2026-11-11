@@ -3,6 +3,7 @@
 
 """Identity of a MultiOptimizer's rank-local parameter and scheduler layout."""
 
+import bisect
 import dis
 import hashlib
 import json
@@ -59,6 +60,93 @@ def _group_option_value(value):
     if torch.is_tensor(value) and value.numel() == 1:
         return {"dtype": str(value.dtype), "value": value.item()}
     return _immutable_value(value)
+
+
+def _model_storage_alias_graph(names, tensors, safe_rope_pairs=()):
+    """Describe local view geometry and shared storage without recording addresses.
+
+    CPU shared mappings are rejected: different virtual addresses can reference
+    the same underlying pages. Accelerator storage must be framework-owned.
+    """
+    from torch.distributed.tensor import DTensor
+
+    intervals, empty_storages, geometry = {}, {}, []
+    for object_id, value in tensors.items():
+        local = value.to_local() if isinstance(value, DTensor) else value
+        if local.layout != torch.strided or local.device.type == "meta" or local.is_quantized:
+            raise RuntimeError("Cannot prove model tensor storage aliases for non-strided, meta or quantized tensors")
+        storage = local.untyped_storage()
+        base, size = storage.data_ptr(), storage.nbytes()
+        if size and not base:
+            raise RuntimeError("Cannot prove model tensor storage aliases without a storage address")
+        for name in sorted(names[object_id]):
+            geometry.append(
+                (
+                    name,
+                    local.device.type,
+                    str(local.dtype),
+                    tuple(local.shape),
+                    tuple(local.stride()),
+                    local.storage_offset(),
+                    size,
+                    local.is_conj(),
+                    local.is_neg(),
+                )
+            )
+            if size:
+                intervals.setdefault(str(local.device), []).append((base, base + size, name))
+            else:
+                storage_identity = getattr(storage, "_cdata", None)
+                if not storage_identity:
+                    raise RuntimeError("Cannot prove empty model tensor storage identity")
+                empty_storages.setdefault((str(local.device), storage_identity), []).append((0, 0, name))
+
+    cpu_intervals = intervals.get("cpu", ())
+    if cpu_intervals:
+        try:
+            with open("/proc/self/maps", "rb") as maps:
+                mappings = []
+                for line in maps:
+                    address, permissions, *_ = line.split(maxsplit=2)
+                    start, end = (int(value, 16) for value in address.split(b"-"))
+                    mappings.append((start, end, permissions))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Cannot prove CPU model tensor storage mapping") from exc
+        starts = [item[0] for item in mappings]
+        for start, end, _ in cpu_intervals:
+            position = start
+            index = bisect.bisect_right(starts, start) - 1
+            while position < end:
+                if index < 0 or index >= len(mappings):
+                    raise RuntimeError("Cannot prove CPU model tensor storage mapping")
+                mapped_start, mapped_end, permissions = mappings[index]
+                if not mapped_start <= position < mapped_end:
+                    raise RuntimeError("Cannot prove CPU model tensor storage mapping")
+                if len(permissions) < 4 or permissions[3:4] != b"p":
+                    raise RuntimeError("Cannot prove aliases for shared CPU model tensor mappings")
+                position = min(end, mapped_end)
+                index += 1
+
+    groups = []
+
+    def append_group(group):
+        group_names = frozenset(item[2] for item in group)
+        if len(group) > 1 and group_names not in safe_rope_pairs:
+            origin = min(item[0] for item in group)
+            groups.append(sorted((name, start - origin, end - start) for start, end, name in group))
+
+    for device_intervals in intervals.values():
+        group, group_end = [], None
+        for item in sorted(device_intervals):
+            if group_end is not None and item[0] >= group_end:
+                append_group(group)
+                group, group_end = [], None
+            group.append(item)
+            group_end = item[1] if group_end is None else max(group_end, item[1])
+        append_group(group)
+    for group in empty_storages.values():
+        append_group(group)
+    return {"geometry": sorted(geometry), "storage_groups": sorted(groups)}
 
 
 def _lr_layout(group, key, aliases):
@@ -228,7 +316,7 @@ def _local_layout(
         raise RuntimeError("MultiOptimizer and checkpoint model have different canonical parameter identities")
     from .dynamic_rope import _is_native_qwen3_dynamic_reset_alias, dynamic_rope_checkpoint_contract
 
-    model_aliases = {}
+    model_aliases, model_tensors = {}, {}
     for kind, items in (
         ("parameter", model.named_parameters(remove_duplicate=False)),
         ("buffer", model.named_buffers(remove_duplicate=False)),
@@ -237,6 +325,7 @@ def _local_layout(
             model_aliases.setdefault(id(value), set()).update(
                 f"{kind}:{name}" for name in _get_fqns(model, runtime_name)
             )
+            model_tensors[id(value)] = value
     safe_rope_pairs = set()
     for module_name, module in model.named_modules(remove_duplicate=False):
         if _is_native_qwen3_dynamic_reset_alias(module):
@@ -391,6 +480,9 @@ def _local_layout(
     layout = {
         "leaves": leaves,
         "model_aliases": alias_graph,
+        # Always bind this proof. Older layouts did not capture storage-sharing
+        # views and therefore cannot establish an exact resume identity.
+        "model_storage_aliases_v1": _model_storage_alias_graph(model_aliases, model_tensors, safe_rope_pairs),
         "model_trainability": sorted(model_trainability.items()),
         "extra_parallel_specs": extra_parallel_specs,
         "scheduler_snapshot": _scheduler_snapshot_value(scheduler_snapshot),
