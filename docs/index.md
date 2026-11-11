@@ -112,6 +112,7 @@ seed_omni/distributed/sequence_parallel.md
 seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
+seed_omni/mixins/configure_optimizer.md
 ```
 
 ```{toctree}
@@ -120,6 +121,7 @@ seed_omni/mixins/offline_encoding.md
 
 seed_omni/models/qwen3.md
 seed_omni/models/qwen3vl.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}
