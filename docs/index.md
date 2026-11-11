@@ -121,6 +121,7 @@ seed_omni/mixins/configure_optimizer.md
 
 seed_omni/models/qwen3.md
 seed_omni/models/qwen3vl.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}
