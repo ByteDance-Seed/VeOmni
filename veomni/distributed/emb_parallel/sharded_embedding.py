@@ -113,8 +113,12 @@ class ShardedEmbedding(nn.Embedding):
             raise self._layout_error(rows, emb_size)
         return True
 
+    # Set by ``torch_parallelize`` on a module built with ``extra_parallel_only``:
+    # no FSDP wrap anywhere, so no parent unit can regather the split rows.
+    outside_fsdp: bool = False
+
     def _check_own_fsdp_unit(self) -> None:
-        if not isinstance(self, FSDPModule):
+        if not isinstance(self, FSDPModule) and not self.outside_fsdp:
             # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
             # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
             raise RuntimeError(
@@ -124,6 +128,16 @@ class ShardedEmbedding(nn.Embedding):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not self._is_split():
+            if self.weight.device != input.device:
+                return F.embedding(
+                    input.to(self.weight.device),
+                    self.weight,
+                    self.padding_idx,
+                    self.max_norm,
+                    self.norm_type,
+                    self.scale_grad_by_freq,
+                    self.sparse,
+                ).to(input.device, non_blocking=True)
             return super().forward(input)
         if self.max_norm is not None or self.scale_grad_by_freq or self.sparse:
             raise NotImplementedError(

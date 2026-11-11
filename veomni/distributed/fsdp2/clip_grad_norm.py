@@ -17,6 +17,8 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
+    if getattr(model, "_extra_parallel_only", False):
+        _average_extra_parallel_only_replicated_grads(model)
     if hasattr(model, "_extra_parallel_param_groups"):
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
@@ -45,6 +47,36 @@ def clip_grad_norm(
     if isinstance(grad_norm, DTensor):
         grad_norm = grad_norm.full_tensor()
     return grad_norm
+
+
+@torch.no_grad()
+def _average_extra_parallel_only_replicated_grads(model) -> None:
+    """Average the grads of parameters an unwrapped ExtraParallel-only module replicates.
+
+    Without the FSDP2 wrap nothing reduces a parameter the plan does not name, so
+    every rank would step its full replica with its own micro-batch's gradient
+    and the replicas would drift apart. Averaging over the FSDP group is what the
+    wrap's reduce-scatter computes, and repeating it is harmless.
+
+    Every rank all-reduces every trainable replicated parameter in the same
+    order, so a parameter that got no gradient on one rank takes a zero one
+    instead of leaving the collectives misaligned.
+    """
+    ps = get_parallel_state()
+    group = ps.fsdp_group
+    group_size = dist.get_world_size(group) if group is not None else 1
+    if group_size <= 1:
+        return
+    ep_param_groups = getattr(model, "_extra_parallel_param_groups", None)
+    if ep_param_groups is not None:
+        replicated_params = ep_param_groups.get("non_extra_parallel", [])
+    else:
+        replicated_params = [p for p in model.parameters() if p.requires_grad and not isinstance(p, DTensor)]
+    for param in replicated_params:
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
+        param.grad.div_(group_size)
 
 
 def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | None]]:
@@ -152,11 +184,13 @@ def extra_parallel_fsdp2_clip_grad_norm(
         p for p in model._extra_parallel_param_groups.get("non_extra_parallel", []) if p.grad is not None
     ]
 
-    # Compute and reduce non-ExtraParallel
+    # Compute and reduce non-ExtraParallel. Without the FSDP2 wrap these are whole
+    # replicas holding identical averaged grads, so summing over the FSDP group
+    # would count each one once per rank.
     non_extra_parallel_total = _fsdp2_reduce_group(
         params=non_extra_parallel_params,
         norm_type=norm_type,
-        reduce_groups=_fsdp_grad_norm_reduce_groups(ps),
+        reduce_groups=[] if getattr(model, "_extra_parallel_only", False) else _fsdp_grad_norm_reduce_groups(ps),
     )
     logger.debug_rank0(f"non_extra_parallel total grad norm: {non_extra_parallel_total}")
 
@@ -247,16 +281,18 @@ def extra_parallel_fsdp2_clip_grad_norm(
 
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
-    # Apply the same clip coefficient to all groups
-    for para in ps.extra_parallel_names:
-        torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
-        torch.nn.utils.clip_grads_with_norm_(
-            extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
-        )
-        torch.nn.utils.clip_grads_with_norm_(
-            persistent_extra_parallel_params[para], max_norm, total_norm, foreach=foreach
-        )
-    torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
+    # Apply the same clip coefficient to all groups only when total_norm is finite;
+    # multiplying by max_norm / (nan + 1e-6) would broadcast NaN into every parameter grad.
+    if bool(torch.isfinite(total_norm).item()):
+        for para in ps.extra_parallel_names:
+            torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+            torch.nn.utils.clip_grads_with_norm_(
+                extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
+            )
+            torch.nn.utils.clip_grads_with_norm_(
+                persistent_extra_parallel_params[para], max_norm, total_norm, foreach=foreach
+            )
+        torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -284,6 +320,7 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
 
     with torch.no_grad():
+        fast_grads: List[torch.Tensor] = []
         for param in params:
             g = param.grad
             if g is None:
@@ -295,13 +332,21 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
             # contrast, ``g.to(float32)`` creates a full-size temporary, which
             # can exceed the remaining VRAM for multi-billion-element experts.
             if g.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                norm = torch.linalg.vector_norm(g, ord=p, dtype=torch.float32)
+                fast_grads.append(g)
             else:
                 # Preserve the previous implementation's behavior for wider
                 # or uncommon dtypes. The memory-sensitive training dtypes
                 # above use in-kernel FP32 accumulation without this copy.
                 norm = torch.linalg.vector_norm(g.to(torch.float32), ord=p)
-            res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
+                res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
+        if fast_grads:
+            by_dtype: dict[torch.dtype, List[torch.Tensor]] = {}
+            for g in fast_grads:
+                by_dtype.setdefault(g.dtype, []).append(g)
+            for _dtype, grads in by_dtype.items():
+                norms = torch._foreach_norm(grads, ord=p, dtype=torch.float32)
+                stacked = torch.stack(norms).to(device=reduce_device, dtype=torch.float32)
+                res = res + stacked.pow(p).sum()
     return res
 
 
