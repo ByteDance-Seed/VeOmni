@@ -47,10 +47,27 @@ class CompileConfig:
 
 
 def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    """Decoder-layer class names in ``_no_split_modules``.
+
+    An entry is either a bare class name (``LlamaDecoderLayer``) or, on a
+    SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``
+    — see ``_scoped_no_split_modules``). The scope has to be stripped because
+    :func:`_is_decoder_block` matches against ``type(module).__name__``, which
+    never carries the scope.
+
+    Nothing upstream catches the mismatch: :func:`validate_compile_model`
+    returns early for :class:`OmniModel` (it inherits
+    ``input_modalities = "text"`` and its config has no ``vision_config`` /
+    ``audio_config``, so :func:`_is_multimodal_model` is ``False``), so keeping
+    the prefix would let the call through and make
+    :func:`compile_decoder_blocks` match zero blocks — a ``RuntimeError`` from
+    ``build_parallelize_model`` after the FSDP wrap has already started.
+    """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
         return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+    class_names = {name.rpartition(".")[2] for name in no_split_modules if isinstance(name, str)}
+    return {name for name in class_names if name.endswith("DecoderLayer")}
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:

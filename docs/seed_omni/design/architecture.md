@@ -96,8 +96,8 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | Hook | When | Purpose |
 |------|------|---------|
 | `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
-| `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
-| `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
+| `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for a packed graph's `pack_*` nodes — Qwen3-VL only) |
+| `post_forward(method, **outputs)` | training | write results back (the conversation list, or the packed graph's batch keys / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
 | `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, right after the optimizer is built and before the lr scheduler and any checkpoint load. **May change the param-group count**, which is part of the optimizer-state key space: a checkpoint is only resumable under the same hook. Full contract: [Optimizer Hook](../mixins/configure_optimizer.md) |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
