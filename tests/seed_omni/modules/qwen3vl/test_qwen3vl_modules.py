@@ -404,3 +404,11 @@ def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Pat
     plain = Vision.from_pretrained(str(source), config=retargeted)
     assert plain._image_processor is not None
     assert plain._video_processor is not None
+
+    # Explicit `ignore_mismatched_sizes` must not collide with the one the retry
+    # passes: it used to raise `TypeError: got multiple values for keyword
+    # argument`. `False` is the interesting case — it is what a caller passes when
+    # they want the strict behaviour, and the module's own retry still applies.
+    for explicit in (False, True):
+        passed = Vision.from_pretrained(str(source), config=retargeted, ignore_mismatched_sizes=explicit)
+        assert passed.visual.merger.linear_fc2.weight.shape[0] == 16, explicit

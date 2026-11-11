@@ -301,15 +301,23 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
         if getattr(kwargs.get("config"), "out_hidden_size", None) is None:
             return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
-        # Loading info is requested unconditionally: the retry needs `mismatched_keys`
-        # to decide whether the shape change is the one this loader re-initialises,
-        # and asking again afterwards would mean a second pass over the weights.
+        # Both are popped so the attempts below can pass their own values: leaving
+        # either in `kwargs` would collide with the explicit keyword on the retry
+        # (`TypeError: got multiple values`). A caller's explicit `True` still wins —
+        # it is a deliberate override of the check this method adds.
         want_info = kwargs.pop("output_loading_info", False)
+        user_ignore = kwargs.pop("ignore_mismatched_sizes", False)
         try:
             model, info = super().from_pretrained(
-                pretrained_model_name_or_path, *args, output_loading_info=True, **kwargs
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=user_ignore,
+                output_loading_info=True,
+                **kwargs,
             )
         except RuntimeError as error:
+            if user_ignore:
+                raise
             # HF reports the mismatch two ways depending on version (a "size mismatch"
             # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
             # retry rather than matching on the message, and let the check below decide.
