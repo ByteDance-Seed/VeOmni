@@ -1,26 +1,20 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Shared conversation packing for standard LLM backbones.
+"""Shared conversation packing for standard AR LLM backbones.
 
 Applies to backbones that consume pre-embedded ``conversation_list`` segments
 with flat 1-D ``position_ids`` and per-token ``attention_mask`` — e.g. Janus
-LLaMA, Qwen3 dense/MoE, and LLaDA2.0-Uni.
+LLaMA and Qwen3 dense/MoE.  Vision-language backbones (Qwen3-VL M-RoPE) and
+packed MoT layouts (BAGEL Qwen2-MoT) keep family-specific packers in their own
+``modeling.py`` files.
 
 ``scatter_llm_hidden_states`` is the inverse scatter step shared by all of the
-above families after ``forward_post`` unflattens backbone outputs back onto
-``conversation_list`` segments.
+above families (including Qwen3-VL) after ``forward_post`` unflattens backbone
+outputs back onto ``conversation_list`` segments.
+
+``SimpleArGenerationMixin`` is the shared no-CFG, single-KV-cache
+``generate()`` used by the dense and MoE Qwen3 backbones (identical decode
+loop; only ``forward`` differs between the two). Janus LLaMA keeps its own
+CFG-aware ``generate()`` natively since it needs a second (unconditional)
+cache.
 """
 
 from __future__ import annotations
@@ -29,6 +23,7 @@ from typing import Any
 
 import torch
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
@@ -39,7 +34,7 @@ def pack_llm_conversations_for_forward(
     conversations: list[list[ConversationItem]],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack conversation embed segments for LLM backbone forward (training + inference).
+    """Pack conversation embed segments for AR backbone forward (training + inference).
 
     Returns ``(inputs_embeds, attention_mask, position_ids, inputs_embeds_shape)``
     with batch dim 0 when the packed sample is a single varlen sequence.
@@ -54,6 +49,11 @@ def pack_llm_conversations_for_forward(
                 continue
             embeds = item.value
             embeds_length = embeds.size(0)
+            # Read, don't consume: packing is not the item's last reader.
+            # scatter_llm_hidden_states writes hidden states back onto these same
+            # items, and any second forward over one conversation (a re-forward,
+            # a reference pass) would otherwise pack it with a fabricated
+            # all-ones mask the second time, silently.
             chunk_attention_mask = item.meta.get("attention_mask")
             if chunk_attention_mask is None:
                 chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=device)
@@ -92,9 +92,17 @@ def scatter_llm_hidden_states(
 
 
 class SimpleArGenerationMixin:
-    """No-CFG, single-KV-cache ``generate()`` for Qwen3-style AR backbones."""
+    """No-CFG, single-KV-cache ``generate()`` for Qwen3-style AR backbones.
+
+    Subclasses must call ``self._past_key_values = None`` in ``__init__`` and
+    provide ``self.forward(inputs_embeds=..., attention_mask=..., past_key_values=...,
+    use_cache=..., **kwargs)`` returning ``{"hidden_states": ..., "past_key_values": ...}``.
+    """
 
     _past_key_values: Any
+    # Prompt mask carried across decode steps: the cached keys include masked
+    # prompt positions, so dropping it would make those keys visible again.
+    _generation_attention_mask: torch.Tensor | None = None
 
     def reset_local_inference_state(self) -> None:
         return
@@ -102,6 +110,7 @@ class SimpleArGenerationMixin:
     def reset_global_inference_state(self) -> None:
         self.reset_local_inference_state()
         self._past_key_values = None
+        self._generation_attention_mask = None
 
     def generate(
         self,
@@ -109,6 +118,12 @@ class SimpleArGenerationMixin:
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "SimpleArGenerationMixin.generate feeds the full prompt to the backbone, which conflicts "
+                "with Ulysses sequence parallelism (attention expects this rank's shard); run inference "
+                "with sp_size=1."
+            )
         if self._past_key_values is None:
             inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
                 [conversation_list], self.device
@@ -117,6 +132,7 @@ class SimpleArGenerationMixin:
                 position_ids
             )
 
+            self._generation_attention_mask = attention_mask
             outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -147,7 +163,7 @@ class SimpleArGenerationMixin:
 
         outputs = self.forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=None,
+            attention_mask=self._extend_generation_attention_mask(),
             past_key_values=self._past_key_values,
             use_cache=True,
         )
@@ -163,33 +179,18 @@ class SimpleArGenerationMixin:
         )
         return {"conversation_list": conversation_list}
 
+    def _extend_generation_attention_mask(self) -> torch.Tensor | None:
+        """Extend the prompt mask by one valid position for each decoded token."""
+        mask = self._generation_attention_mask
+        if mask is None:
+            return None
+        mask = torch.cat([mask, mask.new_ones(1, 1)], dim=1)
+        self._generation_attention_mask = mask
+        return mask
+
     @staticmethod
     def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
             return hidden_states[-1:].contiguous()
         return hidden_states[:, -1:, :].contiguous()
-
-
-def fold_fsdp_dummy_anchors(
-    inputs_embeds: torch.Tensor,
-    conversations: list[list[ConversationItem]],
-) -> torch.Tensor:
-    """Fold dummy items' activations onto ``inputs_embeds`` with ``0.0`` weight so FSDP2 stays connected."""
-    for sample in conversations:
-        for part in sample:
-            if not part.is_dummy:
-                continue
-            if not isinstance(part.value, torch.Tensor):
-                continue
-            fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
-            inputs_embeds = inputs_embeds + fake
-    return inputs_embeds
-
-
-__all__ = [
-    "SimpleArGenerationMixin",
-    "fold_fsdp_dummy_anchors",
-    "pack_llm_conversations_for_forward",
-    "scatter_llm_hidden_states",
-]

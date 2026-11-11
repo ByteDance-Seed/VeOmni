@@ -48,6 +48,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -372,7 +373,16 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  ``SwapAdamW`` is the
+    exception for the parameters it owns as trainable: it allocates their state
+    at construction, so those entries are dense and never-stepped ones carry
+    zero moments and ``step`` 0 — fresh state, as a newly built optimizer has
+    it.  A parameter it was built with frozen (or added while frozen) has no
+    state until its first gradient, like a stock optimizer's, and is absent
+    from the checkpoint until then.  A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the
@@ -503,15 +513,15 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = rewrap_dtensor_local(
             loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
+            mesh=device_mesh,
             placements=[_fsdp_dim_placement(loaded_tensor.placements[0], fsdp_shard_dim)],
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = rewrap_dtensor_local(
             loaded_tensor._local_tensor,
-            device_mesh=device_mesh,
+            mesh=device_mesh,
             placements=[Replicate(), _fsdp_dim_placement(loaded_tensor.placements[1], fsdp_shard_dim)],
         )
     else:
@@ -575,10 +585,21 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
             placements = [fsdp_placement, Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor._local_tensor,
+            mesh=fsdp_mesh,
+            placements=placements,
+        )
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        # If there is no FSDP but only ExtraParallel. Use the helper here too:
+        # ``DTensor.from_local`` copies a host-resident local onto the mesh
+        # device, which would materialize the swap optimizer's host state on the
+        # accelerator during a save.
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor,
+            mesh=extra_parallel_fsdp_mesh,
+            placements=[Shard(0)],
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 

@@ -46,10 +46,14 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         assume_distinct_experts=False,
         activation="silu",
     ):
+        # MOE Step 3: dispatch input tokens to the experts
+        # result shape is (batch_size * sequence_len * topk, hidden_size)
+        # MOE Step 3-1: compute the token num for each expert
+        # splits shape (num_experts)
         """Scatter, split fc1 GEMMs, SwiGLU, fc2, gather."""
         from ..shared.activation import apply_activation, normalize_activation
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
-        from ..shared.group_gemm import group_gemm_same_nk
+        from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
         activation = normalize_activation(activation)
         splits = expert_histogram(expert_index, num_experts)
@@ -89,6 +93,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # DeepSeek-V4's learned top-k layers) and hash-style routers keep the
         # conservative default. See ``compute_max_expert_tokens``.
         max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
         fc1_1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_weight,
@@ -96,6 +101,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # MOE Step 6: compute linear layer 1-2
@@ -107,6 +114,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # MOE Step 5a: gpt-oss-style clamped SwiGLU. No-op when swiglu_limit
@@ -137,6 +146,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc2_weighted_output = fc2_output * scattered_gate_weight
 
@@ -149,6 +160,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             gate_weights,
             fc1_1_weight,
@@ -165,6 +177,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
+            tile_cumsum,
         )
 
         return output
@@ -192,7 +205,9 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc2_output,
             mask_fc1_1,
             mask_fc1_2,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
@@ -218,6 +233,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             cumsum_M=cumsum_t,
             max_M=num_scattered_tokens,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # wgrad
@@ -257,6 +274,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             cumsum_M=cumsum_t,
             max_M=num_scattered_tokens,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # wgrad
@@ -288,6 +307,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             cumsum_M=cumsum_t,
             max_M=num_scattered_tokens,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # wgrad
@@ -334,6 +355,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
     Uses a single group_gemm_same_nk call for fc1 instead of two separate calls,
     avoiding the split+contiguous copy when the caller already has merged weights.
+    Eligible eager calls share a device prefix of same-NK row tiles across
+    forward and backward; other calls retain the shape-derived launch bound.
     """
 
     @staticmethod
@@ -352,7 +375,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         """Scatter, merged fc1 GEMM, SwiGLU, fc2, gather."""
         from ..shared.activation import apply_activation, normalize_activation
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
-        from ..shared.group_gemm import group_gemm_same_nk
+        from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
         activation = normalize_activation(activation)
         splits = expert_histogram(expert_index, num_experts)
@@ -361,21 +384,21 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         cumsum_t = torch.cumsum(splits, dim=0)
 
-        # See ``TritonFusedMoeExpertFunction.forward`` for why ``T`` (the token
-        # count) is a valid, tighter per-expert launch bound than the full
-        # scattered row count under distinct top-k routing. The default is the
-        # conservative ``T * top_k`` bound; distinct routers opt in explicitly
-        # with ``assume_distinct_experts=True``.
+        # Shape metadata remains a safe bound for unsupported schedules and
+        # capture/compile. The optional prefix keeps routing counts on-device.
         max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
 
         # Single fc1 gemm: output shape [T, 2I]
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
         fc1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
             max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
             transpose_a=False,
             transpose_b=True,
+            tile_total_M=tile_total_M,
         )
 
         # chunk is a view, no copy
@@ -404,8 +427,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             b=fc2_weight,
             cumsum_M=cumsum_t,
             max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
             transpose_a=False,
             transpose_b=True,
+            tile_total_M=tile_total_M,
         )
         fc2_weighted_output = fc2_output * scattered_gate_weight
 
@@ -415,8 +440,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -429,6 +456,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
+            tile_cumsum,
         )
 
         return output
@@ -452,8 +480,11 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc2_output,
             mask_fc1_1,
             mask_fc1_2,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
+        max_expert_tokens = ctx.max_expert_tokens
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
@@ -466,9 +497,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_unweighted_output = moe_scatter(grad_output, scatter_index)
-        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
-        # top-k routes can make one expert receive more rows than the original
-        # token count, so the total scattered row count is a safe bound.
+        # Same-MN weight gradients retain the total scattered row count as
+        # their K bound; same-NK dgrad reuses the forward launch bound.
         num_scattered_tokens = grad_unweighted_output.shape[0]
         grad_fc2_output = grad_unweighted_output * scattered_gate_weight
 
@@ -483,8 +513,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=num_scattered_tokens,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
             transpose_b=False,
+            tile_total_M=tile_total_M,
         )
 
         # MOE Step 9 - wgrad
@@ -524,8 +556,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=num_scattered_tokens,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
             transpose_b=False,
+            tile_total_M=tile_total_M,
         )
 
         # MOE Step 4 - single wgrad for merged fc1
@@ -599,13 +633,16 @@ def group_gemm_fused_moe_forward(
     an fp32 activation.
 
     ``assume_distinct_experts``: whether every token routes to ``top_k``
-    distinct experts (true for ``torch.topk``-gated routers). Defaults to
-    ``False`` (conservative ``T * top_k`` launch bound). Opt in with ``True``
-    for the tight ``max_M = T`` bound. Only affects the non-EP Triton path.
+    distinct experts (true for ``torch.topk``-gated routers). For non-EP
+    forward shape-derived fallbacks, ``True`` permits ``max_M = T``;
+    ``False`` uses ``T * top_k``. Eligible eager split/merged execution uses a
+    device tile prefix without a host scalar read, including EP-local GEMMs.
+    This flag does not change EP's original fallback row bounds.
 
     ``activation``: the expert activation named by the model config (for
     example ``gelu_pytorch_tanh``), normalized to the Triton activation it maps
-    to. SiLU keeps the aten kernels; the GELU family runs a Triton kernel.
+    to. SiLU keeps the merged/swiglu kernels; the GELU family runs a Triton
+    elementwise kernel.
     """
     from ..shared.activation import normalize_activation
 

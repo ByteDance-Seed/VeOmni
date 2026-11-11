@@ -32,12 +32,25 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import (
-    fold_fsdp_dummy_anchors,
     pack_llm_conversations_for_forward,
     scatter_llm_hidden_states,
 )
+from ....base.packing import fold_dummy_anchor
 from ..configuration import LladaUniLlmConfig
 from ..modeling import LladaUniLlm
+
+
+def _fold_fsdp_dummy_anchors(
+    inputs_embeds: torch.Tensor,
+    conversations: list[list[ConversationItem]],
+) -> torch.Tensor:
+    """Fold dummy items' activations onto ``inputs_embeds`` with ``0.0`` weight so FSDP2 stays connected."""
+    for sample in conversations:
+        for part in sample:
+            if not part.is_dummy or not isinstance(part.value, torch.Tensor):
+                continue
+            inputs_embeds = fold_dummy_anchor(inputs_embeds, part.value)
+    return inputs_embeds
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -64,7 +77,7 @@ class TrainingMixin(TrainingModuleMixin):
         )
 
         if self.training and get_parallel_state().fsdp_enabled:
-            inputs_embeds = fold_fsdp_dummy_anchors(inputs_embeds, conversation_list)
+            inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, conversation_list)
 
         self._conversation_carrier = conversation_list
         self._pack_inputs_embeds_shape = inputs_embeds_shape
