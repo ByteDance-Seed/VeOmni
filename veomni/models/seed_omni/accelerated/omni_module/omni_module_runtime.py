@@ -238,7 +238,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``model_path`` it is the weight-free view's, where the config and assets
         are read from.
         """
-        return self.hf_source.path if self.hf_source is not None else self.args.model_path
+        return self.hf_source.weights_path if self.hf_source is not None else self.args.model_path
 
     @property
     def module_name(self) -> str:
@@ -349,7 +349,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
             off_rank0 = dist.is_initialized() and dist.get_rank() != 0
             if init_device != "meta" and not (init_device == "cpu" and off_rank0):
-                load_model_weights(self.model, self.hf_source.path, init_device)
+                load_model_weights(self.model, self.hf_source.weights_path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
