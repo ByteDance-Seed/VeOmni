@@ -1024,26 +1024,29 @@ class _SkippingRecorder(_Recorder):
 
 
 def test_the_h3_dit_arms_nothing_itself():
-    """H3 owns no recompute strategy: HF's enable is what puts both attributes on its DiT."""
+    """H3 owns no recompute strategy: HF's enable arms each checkpointing block."""
     model = _tiny_h3_model()
     dit = model.dit
 
-    assert hasattr(dit, "gradient_checkpointing")  # the marker HF's enable walks for
-    assert dit.gradient_checkpointing is False
+    assert not hasattr(dit, "gradient_checkpointing")
     assert "_gradient_checkpointing_func" not in vars(dit)
+    assert all(block.gradient_checkpointing is False for block in dit.blocks)
+    assert all("_gradient_checkpointing_func" not in vars(block) for block in dit.blocks)
 
     model.gradient_checkpointing_enable({"use_reentrant": False})  # the run's own entry point
 
-    assert dit.gradient_checkpointing is True
-    assert "_gradient_checkpointing_func" in vars(dit)
+    assert model.gradient_checkpointing is True
+    assert not hasattr(dit, "gradient_checkpointing")
+    assert "_gradient_checkpointing_func" not in vars(dit)
+    assert all(block.gradient_checkpointing is True for block in dit.blocks)
+    assert all("_gradient_checkpointing_func" in vars(block) for block in dit.blocks)
 
 
 def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
-    """The block loop reads the flag and the bound function; the policy decides per block.
+    """Each H3 block owns the checkpoint entry point that the policy patches.
 
     Called exactly as the runtime does it — HF's enable on the wrapper, then the policy on
-    the wrapper — so the function the loop ends up calling is the framework's container
-    closure, which hands every block it is given that block's own decision.
+    the wrapper — so every block's own function resolves that block's decision.
     """
     recorder = _SkippingRecorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
@@ -1057,14 +1060,13 @@ def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
     )
 
     assert report.bound_blocks == 3  # the stack the policy found on the real DiT
-    # No block carries an entry point of its own; the two the enable wrote (wrapper and DiT)
-    # are containers, and the loop's one is what decides per block.
-    assert (report.patched_blocks, report.patched_containers) == (0, 2)
+    # HF arms each block; the wrapper still carries one container entry point.
+    assert (report.patched_blocks, report.patched_containers) == (3, 1)
     assert report.covered
 
     dit = model.dit
-    dit._gradient_checkpointing_func(dit.blocks[1], torch.zeros(1))  # inside the selective range
-    dit._gradient_checkpointing_func(dit.blocks[2], torch.zeros(1))  # recomputed, but not selectively
+    dit.blocks[1]._gradient_checkpointing_func(lambda: None, torch.zeros(1))  # selective range
+    dit.blocks[2]._gradient_checkpointing_func(lambda: None, torch.zeros(1))  # full recompute
 
     assert recorder.calls == [
         {"use_reentrant": False, "context_fn": noop_context_fn, "early_stop": True},
