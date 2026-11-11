@@ -39,11 +39,16 @@ The BAGEL graphs cover understanding, generation, and edit.
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Checkpoint
 
-The converter reads upstream `llm_config.json`, `vit_config.json`,
-`ema.safetensors`, and `ae.safetensors`, then writes one sub-checkpoint per
-module:
+BAGEL registers an HF layout (`modules/bagel/hf_layout.py`), so
+`model.model_path` can point at the **upstream checkpoint itself** (holding
+`ema.safetensors` and `ae.safetensors`) with no offline convert needed.
+HF exports (`save_hf_weights`) are written back in the upstream layout as
+`ema.safetensors` and `ae.safetensors` (see
+[Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
+
+The offline split also works through the same layout:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
@@ -51,8 +56,9 @@ python scripts/seed_omni/convert_model.py \
   --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
 ```
 
-The family is picked from the source `config.json` (`model_type: bagel`). The
-output root becomes `model.model_path` in `base.yaml`. It contains:
+The family is picked from the source `config.json` (`model_type: bagel`). Either
+the upstream root or the split output root can be used as `model.model_path` in
+`base.yaml`. A split root contains:
 
 ```text
 BAGEL-7B-MoT/
