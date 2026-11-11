@@ -362,13 +362,13 @@ class EnvironMeter:
         lora_config: Optional["VeOmniLoraConfig"] = None,
         freeze_vit: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        counter_kwargs = {}
+        flops_kwargs = {}
         if self.images_seqlens:
-            counter_kwargs["images_seqlens"] = self.images_seqlens
+            flops_kwargs["images_seqlens"] = self.images_seqlens
         lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
         if lora_config is not None:
             if self.supports_lora_flops:
-                counter_kwargs["lora_config"] = lora_config
+                flops_kwargs["lora_config"] = lora_config
             elif not self._warned_unsupported_lora_flops:
                 logger.warning_rank0(
                     "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
@@ -376,15 +376,15 @@ class EnvironMeter:
                 )
                 self._warned_unsupported_lora_flops = True
         if freeze_vit is not None and self.supports_lora_flops:
-            counter_kwargs["freeze_vit"] = freeze_vit
+            flops_kwargs["freeze_vit"] = freeze_vit
         # Omit empty metadata for existing counters; metadata-aware estimators
         # must accept an omitted argument for steps without model-specific data.
         if self._model_metadata:
-            counter_kwargs["model_metadata"] = self._model_metadata
+            flops_kwargs["model_metadata"] = self._model_metadata
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,
-            **counter_kwargs,
+            **flops_kwargs,
         )
         if lora_flops_unavailable:
             flops_achieved = 0
