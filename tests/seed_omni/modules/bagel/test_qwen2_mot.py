@@ -280,3 +280,82 @@ def test_bagel_modules_ops_dispatch_meta_rotary_and_flops(available_nvidia_ops) 
     assert seqlens == [2048]
     assert flops == pytest.approx(acc_siglip.estimate_flops([1024, 1024]))
     assert flops < acc_siglip.estimate_flops([2048])
+
+
+def _two_rank_fsdp2_pos_embed_materialize_worker(rank: int, rendezvous: str) -> None:
+    """Verify two-rank FSDP2 ``meta -> fully_shard -> to_empty -> init_weights`` materializes sharded ``PositionEmbedding``."""
+    import torch.distributed as dist
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
+    try:
+        ps = _init_parallel_state(dp_size=2, dp_shard_size=2, ulysses_size=1, dp_mode="fsdp2", device_type="cpu")
+
+        flow_cfg = OMNI_CONFIG_REGISTRY["bagel_flow_connector"]()(
+            hidden_size=16,
+            z_channels=2,
+            latent_patch_size=1,
+            patch_latent_dim=2,
+            max_latent_size=4,
+            timestep_frequency_embedding_size=4,
+        )
+        eager_flow = OMNI_MODEL_REGISTRY["bagel_flow_connector"]()(flow_cfg)
+        with torch.device("meta"):
+            meta_flow = OMNI_MODEL_REGISTRY["bagel_flow_connector"]()(flow_cfg)
+        fully_shard(meta_flow, mesh=ps.fsdp_mesh)
+        meta_flow.to_empty(device="cpu")
+        meta_flow.init_weights()
+
+        assert isinstance(meta_flow.latent_pos_embed.pos_embed.data, DTensor)
+        assert meta_flow.latent_pos_embed.pos_embed.to_local().shape == (8, 16)
+        torch.testing.assert_close(
+            meta_flow.latent_pos_embed.pos_embed.full_tensor(),
+            eager_flow.latent_pos_embed.pos_embed,
+        )
+        assert torch.count_nonzero(meta_flow.llm2vae.weight.full_tensor()) == 0
+        assert torch.count_nonzero(meta_flow.llm2vae.bias.full_tensor()) == 0
+        assert torch.count_nonzero(meta_flow.vae2llm.weight.full_tensor()) > 0
+
+        siglip_cfg = BagelSiglipNavitConfig(
+            hidden_size=16,
+            output_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            image_size=8,
+            patch_size=4,
+            vit_max_num_patch_per_side=4,
+            ops_implementation={"attn_implementation": "eager", "rotary_pos_emb_vision_implementation": "eager"},
+        )
+        eager_siglip = BagelSiglipNavit(siglip_cfg)
+        with torch.device("meta"):
+            meta_siglip = BagelSiglipNavit(siglip_cfg)
+        fully_shard(meta_siglip, mesh=ps.fsdp_mesh)
+        meta_siglip.to_empty(device="cpu")
+        meta_siglip.init_weights()
+
+        assert isinstance(meta_siglip.vit_pos_embed.pos_embed.data, DTensor)
+        assert meta_siglip.vit_pos_embed.pos_embed.to_local().shape == (8, 16)
+        torch.testing.assert_close(
+            meta_siglip.vit_pos_embed.pos_embed.full_tensor(),
+            eager_siglip.vit_pos_embed.pos_embed,
+        )
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_bagel_pos_embed_two_rank_fsdp2_meta_materialization(tmp_path: Path) -> None:
+    """Verify two-rank FSDP2 config-only initialization distributes ``PositionEmbedding.pos_embed`` across shards."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _two_rank_fsdp2_pos_embed_materialize_worker,
+        args=(str(tmp_path / "rendezvous"),),
+        nprocs=2,
+        join=True,
+    )

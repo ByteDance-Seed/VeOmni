@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 
 class PositionEmbedding(nn.Module):
@@ -22,8 +23,19 @@ class PositionEmbedding(nn.Module):
 
     def reset_parameters(self) -> None:
         """Populate ``pos_embed`` with deterministic 2D sin-cos values."""
+        if self.pos_embed.is_meta:
+            return
         new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-        if hasattr(self.pos_embed.data, "to_local"):
+        if isinstance(self.pos_embed.data, DTensor):
+            local_target = self.pos_embed.data.to_local()
+            sharded = distribute_tensor(
+                new_data.to(device=local_target.device, dtype=local_target.dtype),
+                self.pos_embed.data.device_mesh,
+                self.pos_embed.data.placements,
+                src_data_rank=None,
+            )
+            local_target.copy_(sharded.to_local().to(device=local_target.device, dtype=local_target.dtype))
+        elif hasattr(self.pos_embed.data, "to_local"):
             self.pos_embed.data.to_local().copy_(new_data)
         else:
             self.pos_embed.data.copy_(new_data)
