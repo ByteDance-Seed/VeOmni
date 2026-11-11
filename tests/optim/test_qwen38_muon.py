@@ -55,6 +55,37 @@ def test_qwen_step_stays_fp32_with_bf16_default_dtype(kind):
         torch.set_default_dtype(previous)
 
 
+def _check_qwen_step_hooks_once(kind, device):
+    """Parent optimizer construction must not make Muon step hooks run twice."""
+    from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
+
+    CPUOffloadAdamW([torch.nn.Parameter(torch.ones(1, device=device))])
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    param = torch.nn.Parameter(torch.ones(2, 2, dtype=dtype, device=device))
+    reference_param = torch.nn.Parameter(param.detach().clone())
+    optimizer = make_optimizer(param, [(kind, 0, 2)])
+    reference = make_optimizer(reference_param, [(kind, 0, 2)])
+    calls = []
+    optimizer.register_step_pre_hook(lambda *_: calls.append("pre"))
+    optimizer.register_step_post_hook(lambda *_: calls.append("post"))
+    for step in range(3):
+        grad = torch.full_like(param, 0.1 * (step + 1))
+        param.grad, reference_param.grad = grad, grad.clone()
+        optimizer.step()
+        reference.step()
+        torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
+        for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                optimizer.state[param][key], reference.state[reference_param][key], rtol=0, atol=0
+            )
+    assert calls == ["pre", "post"] * 3
+
+
+@pytest.mark.parametrize("kind", ["adamw", "muon"])
+def test_qwen_step_hooks_run_once_when_parent_step_is_wrapped(kind):
+    _check_qwen_step_hooks_once(kind, "cpu")
+
+
 def test_qwen_multioptimizer_raw_snapshot_is_independent():
     from veomni.optim.optimizer import MultiOptimizer
 
@@ -598,6 +629,14 @@ def test_required_native_lora_test_rejects_missing_npu(monkeypatch):
     monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
     with pytest.raises(pytest.fail.Exception, match="Native NPU test was required"):
         _require_lora_npus(2)
+
+
+@pytest.mark.skipif(_skip_optional_npu_lora(1), reason="requires one Ascend NPU")
+@pytest.mark.launch_plan(provider=_npu_lora_launch(1))
+@pytest.mark.parametrize("kind", ["adamw", "muon"])
+def test_native_qwen_step_hooks_run_once_when_parent_step_is_wrapped(kind):
+    _require_lora_npus(1)
+    _check_qwen_step_hooks_once(kind, "npu")
 
 
 @pytest.mark.skipif(_skip_optional_npu_lora(2), reason="requires two Ascend NPUs")

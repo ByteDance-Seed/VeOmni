@@ -755,7 +755,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         try:
             self.param_groups = adam_groups
             try:
-                super().step()
+                super()._step_adamw_impl()
             except BaseException as exc:
                 adam_error = exc
         finally:
