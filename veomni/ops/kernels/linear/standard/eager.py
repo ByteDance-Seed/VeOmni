@@ -18,18 +18,19 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from .._module import resolve_projection
-
 
 def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
     """Run ``linear`` in the model dtype; ``block_size`` is unused here.
 
     The family-wide keyword is part of the shared signature so a model can call any
     row the same way; this reference does not quantize.
+
+    The module is *called* rather than driven through ``F.linear(x, weight)`` on
+    purpose. Reading the weight directly would skip the module's own hooks, and a
+    projection listed in ``basic_modules`` is ``fully_shard``-wrapped on its own --
+    its unshard hook runs in ``forward``, so bypassing it hands this row a sharded
+    ``DTensor`` weight. Calling the module also covers adapter-wrapped projections
+    without a special case, which is why this row needs no ``resolve_projection``.
     """
     del block_size
-    weight, shortcut = resolve_projection("eager", linear, x)
-    if shortcut is not None:
-        return shortcut
-    bias = getattr(linear, "bias", None)
-    return nn.functional.linear(x, weight, bias)
+    return linear(x)

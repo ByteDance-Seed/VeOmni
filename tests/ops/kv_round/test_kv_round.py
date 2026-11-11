@@ -234,16 +234,18 @@ _TRITON_DEVICE = pytest.mark.parametrize(
 
 
 def _triton_op(variant: str, device: str):
-    """Return the Triton row, skipping when it cannot run on this host.
+    """Return the Triton row, skipping when the registry says it cannot run here.
 
-    The row needs Triton and, on NVIDIA, SM89 or later: the kernel casts to
-    ``tl.float8e4nv``, which Triton does not enable on Ampere.
+    The availability check goes through the registry rather than reading a compute
+    capability here: the row already declares ``NVIDIA_SM89_PLUS`` and its Triton
+    requirement, and duplicating that as a hand-written version test drifts from it
+    -- an SM86 host satisfies neither, so it must skip rather than fail.
     """
-    pytest.importorskip("triton")
     if device == "cpu":
         pytest.skip("the kv_round Triton row is CUDA-only")
-    if torch.cuda.get_device_capability()[0] < 8 or torch.cuda.get_device_capability() == (8, 0):
-        pytest.skip("the Triton row casts to float8e4nv, which needs SM89+")
+    pytest.importorskip("triton")
+    if "triton" not in OP_REGISTRY.list_available("kv_round", variant):
+        pytest.skip("the registry reports no usable kv_round Triton row on this device")
     return VeomniOp("kv_round", variant, "triton")
 
 

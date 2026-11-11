@@ -143,23 +143,64 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
         resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8))
 
 
-def test_the_grouped_row_reads_n_groups_from_the_projection():
-    """The module owns the group count; the caller passes only the tensor."""
-    from torch import nn
+class _GroupedProjection(torch.nn.Linear):
+    """The grouped layout ``DeepseekV4GroupedLinear`` owns: one flat weight, a bmm forward."""
 
-    class Grouped(nn.Linear):
-        def __init__(self, in_per_group, out_features, n_groups):
-            super().__init__(in_per_group, out_features, bias=False)
-            self.n_groups = n_groups
+    def __init__(self, in_per_group, out_features, n_groups):
+        super().__init__(in_per_group, out_features, bias=False)
+        self.n_groups = n_groups
+        self.calls = 0
 
+    def forward(self, x):
+        self.calls += 1
+        input_shape = x.shape[:-2]
+        w = self.weight.view(self.n_groups, -1, x.shape[-1]).transpose(1, 2)
+        grouped = x.reshape(-1, self.n_groups, x.shape[-1]).transpose(0, 1)
+        return torch.bmm(grouped, w).transpose(0, 1).reshape(*input_shape, self.n_groups, -1)
+
+
+def test_the_grouped_row_calls_the_projection_module():
+    """The row delegates to the module, so a per-module FSDP2 hook still runs.
+
+    Driving ``bmm`` from ``linear.weight`` directly would skip the module's
+    ``forward``; a projection listed in ``basic_modules`` is ``fully_shard``-wrapped
+    on its own and unshards its weight in that hook.
+    """
     n_groups, in_per_group, out_per_group = 2, 8, 4
-    linear = Grouped(in_per_group, n_groups * out_per_group, n_groups)
+    linear = _GroupedProjection(in_per_group, n_groups * out_per_group, n_groups)
     x = torch.randn(3, n_groups, in_per_group)
 
     out = VeomniOp("linear", "grouped", "eager")(linear, x)
 
+    assert linear.calls == 1
     expected = torch.bmm(
         x.reshape(-1, n_groups, in_per_group).transpose(0, 1),
         linear.weight.view(n_groups, out_per_group, in_per_group).transpose(1, 2),
     ).transpose(0, 1)
     torch.testing.assert_close(out.reshape(-1, n_groups, out_per_group), expected)
+
+
+def test_the_standard_eager_row_calls_the_projection_module():
+    """Same reason as the grouped row: a ``basic_modules`` wrap unshards in ``forward``.
+
+    Reading ``linear.weight`` here would bypass that hook and hand the row a
+    sharded ``DTensor``.
+    """
+    from torch import nn
+
+    class Probe(nn.Linear):
+        def __init__(self):
+            super().__init__(16, 8)
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            return super().forward(x)
+
+    linear = Probe()
+    x = torch.randn(2, 16)
+
+    out = VeomniOp("linear", "standard", "eager")(linear, x)
+
+    assert linear.calls == 1
+    torch.testing.assert_close(out, F.linear(x, linear.weight, linear.bias))

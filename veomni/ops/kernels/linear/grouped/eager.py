@@ -19,8 +19,6 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .._module import resolve_projection
-
 
 def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, n_groups: int, block_size: int = 128) -> Tensor:
     """Run block-diagonal grouped linear projection over ``n_groups`` head groups.
@@ -49,19 +47,16 @@ def wrapper(x: Tensor, weight: Tensor, bias: Tensor, *, n_groups: int, block_siz
 
 
 def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
-    """Row entry point: take the projection module and dispatch to :func:`wrapper`.
+    """Row entry point: call the projection module.
 
-    ``n_groups`` comes from the module rather than the call, because the grouped
-    layout is a property of the projection, not of the tensor handed in.
+    The module is called rather than driven through :func:`wrapper` on its weight
+    for the same reason as the ``standard`` eager row: a projection listed in
+    ``basic_modules`` is ``fully_shard``-wrapped on its own, and its unshard hook
+    runs in ``forward``. Reading ``linear.weight`` instead would hand this row a
+    sharded ``DTensor``. It also covers adapter-wrapped projections, and the
+    grouped layout stays a property of the module (``n_groups``), not of the call.
+
+    :func:`wrapper` remains the tensor-level form the quantizing row builds on.
     """
-    weight, shortcut = resolve_projection("eager", linear, x)
-    if shortcut is not None:
-        return shortcut
-    bias = getattr(linear, "bias", None)
-    return wrapper(
-        x,
-        weight,
-        bias if bias is not None else weight.new_empty(0),
-        n_groups=linear.n_groups,
-        block_size=block_size,
-    )
+    del block_size
+    return linear(x)
