@@ -459,7 +459,8 @@ crops full CPU tensors after reading the checkpoint.
 
 The model-owned converter may implement `checkpoint_row_counts()` to return
 `{weight_fqn: (logical_rows, runtime_rows)}`. Names match
-`model.named_parameters()` without the DCP wrapper prefix. Each pair must satisfy
+`model.named_parameters()` on the underlying model, without DDP or DCP wrapper
+prefixes. The framework unwraps DDP before querying the converter. Each pair must satisfy
 `0 < logical_rows <= runtime_rows`; padding must be semantically inert.
 Every weight requiring cropping must have metadata, with missing metadata
 reported by the converter. A missing method or empty mapping opts out.
@@ -468,7 +469,9 @@ The getter must not materialize parameter data or perform collectives.
 `DistributedCheckpointer.execute_save()` and `.load()` consume this mapping
 through `checkpoint/row_crop.py` and add the outer `model.` prefix. Distributed
 HF saving uses unprefixed names with `RowCropSavePlanner`; legacy rank-zero
-export receives explicit row counts and crops full CPU tensors. Optimizer state
+export receives explicit row counts derived from the supplied model and crops
+full CPU tensors. Without a model, legacy conversion skips cropping; older padded
+checkpoints need model metadata to export logical rows. Optimizer state
 retains its runtime shapes. The checkpoint layer imports no model packages.
 
 See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)

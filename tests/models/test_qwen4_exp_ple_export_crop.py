@@ -57,16 +57,6 @@ def _padded_weight(logical_rows=10, padded_rows=16, cols=4):
     return weight
 
 
-def test_crop_keeps_logical_prefix_and_drops_zero_tail():
-    model = _Model()
-    converter = create_qwen4_exp_checkpoint_tensor_converter(model)
-    weight = _padded_weight()
-    cropped = converter.crop_hf_export_tensor(_PLE, weight)
-
-    assert cropped.shape == (10, 4)
-    assert torch.equal(cropped, weight[:10])
-
-
 def test_crop_leaves_unpadded_and_non_ple_tensors():
     converter = create_qwen4_exp_checkpoint_tensor_converter(_Model())
     logical = _padded_weight()[:10]
@@ -79,65 +69,38 @@ def test_crop_leaves_unpadded_and_non_ple_tensors():
 def test_crop_rejects_a_short_ple_shard():
     """Reject weights that cannot contain all logical PLE rows."""
     converter = create_qwen4_exp_checkpoint_tensor_converter(_Model())
-    try:
+    with pytest.raises(RuntimeError, match="shorter than logical rows"):
         converter.crop_hf_export_tensor(_PLE, torch.zeros(9, 4))
-    except RuntimeError as exc:
-        assert "shorter than logical rows" in str(exc)
-    else:
-        raise AssertionError("expected a short PLE shard to be rejected")
 
 
-def test_state_dict_helper_skips_models_without_the_crop():
+@pytest.mark.parametrize("ple_disabled", [False, True])
+def test_models_without_ple_skip_cropping(ple_disabled):
+    """Opt out for ordinary models and Qwen4-Exp with PLE disabled."""
+    model = _Model(layer_rows=[]) if ple_disabled else nn.Linear(2, 2)
     weight = torch.zeros(3, 2)
     state = {"model.embed_tokens.weight": weight}
-    assert crop_dense_state_dict(state, checkpoint_row_counts(nn.Linear(2, 2))) is state
-
-
-def test_state_dict_helper_crops_a_dense_ple_shard():
-    model = _Model()
-    weight = _padded_weight()
-    state = crop_dense_state_dict(
-        {_PLE: weight, "model.embed_tokens.weight": torch.zeros(2)}, checkpoint_row_counts(model)
-    )
-
-    assert state[_PLE].shape == (10, 4)
-    assert state["model.embed_tokens.weight"].shape == (2,)
+    assert crop_dense_state_dict(state, checkpoint_row_counts(model)) is state
 
 
 def test_multiple_layers_keep_their_own_rows():
-    """Verify each PLE table is cropped and restored using its own row counts."""
+    """Crop per-table prefixes while preserving dtype, source weights, and other keys."""
     model = _Model(layer_rows=[(10, 16), (19, 24), (8, 8)])
     state = {
         f"layers.{index}.ngram_embedding.shard_0.weight": _padded_weight(logical, padded)
         for index, (logical, padded) in enumerate([(10, 16), (19, 24), (8, 8)])
     }
-    cropped = crop_dense_state_dict(state, checkpoint_row_counts(model))
-    for name, weight in state.items():
-        logical, padded = create_qwen4_exp_checkpoint_tensor_converter(model).ple_rows_by_name[name]
+    original = {name: weight.clone() for name, weight in state.items()}
+    other = torch.ones(2, 4)
+    state["other.weight"] = other
+    counts = checkpoint_row_counts(model)
+    cropped = crop_dense_state_dict(state, counts)
+    assert cropped["other.weight"] is other
+    for name, (logical, _padded) in counts.items():
+        weight = state[name]
+        assert cropped[name].dtype == weight.dtype
+        torch.testing.assert_close(weight, original[name], rtol=0, atol=0)
         assert cropped[name].shape == (logical, 4)
         torch.testing.assert_close(cropped[name], weight[:logical], rtol=0, atol=0)
-
-
-def test_disabled_ple_does_not_break_converter_or_export():
-    model = _Model(layer_rows=[])
-    converter = create_qwen4_exp_checkpoint_tensor_converter(model)
-    assert converter.ple_rows_by_name == {}
-    state = {"model.embed_tokens.weight": torch.ones(3, 4)}
-    assert crop_dense_state_dict(state, checkpoint_row_counts(model)) is state
-
-
-def test_dense_crop_preserves_values_and_runtime_weights():
-    """Verify CPU projection preserves logical values, dtype, and runtime weights."""
-    model = _Model()
-    weight = _padded_weight()
-    original = weight.clone()
-    state = {_PLE: weight, "other.weight": torch.ones(2, 4)}
-    projected = crop_dense_state_dict(state, checkpoint_row_counts(model))
-    assert projected[_PLE].device.type == "cpu"
-    assert projected[_PLE].dtype == weight.dtype
-    torch.testing.assert_close(projected[_PLE], original[:10])
-    torch.testing.assert_close(weight, original)
-    assert projected["other.weight"] is state["other.weight"]
 
 
 def test_missing_ple_row_metadata_is_rejected():

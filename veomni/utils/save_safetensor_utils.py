@@ -278,7 +278,7 @@ def save_hf_safetensor(
     save_checkpoint_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     is_rank_0: bool = False,
-    # Distributed only
+    # Live model for distributed export and legacy checkpoint row metadata
     model: Optional[torch.nn.Module] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
     parallel_state=None,
@@ -291,7 +291,7 @@ def save_hf_safetensor(
     do not need to add external synchronization around this function.
 
     Supports two modes:
-    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
+    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-NPU): Uses HuggingFaceStorageWriter
       for efficient distributed save directly from the live FSDP model. Must be called on all ranks.
     - Legacy mode: Loads from checkpoint and converts to safetensors on rank 0.
 
@@ -304,9 +304,11 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 converts weights; all ranks join the final barrier.
             Required by non-dcp checkpoint managers (e.g., omnistore).
-        model: [Distributed only] Live FSDP model for distributed save.
+        model: Live model for distributed export and row-count metadata in legacy export.
+            Without a model, legacy conversion skips row cropping. Older padded
+            checkpoints require model metadata to export logical rows.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
     """

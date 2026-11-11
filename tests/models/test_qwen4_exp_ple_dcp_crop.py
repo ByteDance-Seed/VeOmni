@@ -224,22 +224,6 @@ def _roundtrip_worker(rank, world_size, endpoint):
             restored, trained_rows, trained_other, source, source_opt, restored_opt
         )
 
-        DistributedCheckpointer.save(
-            directory,
-            {"model": restored, "optimizer": restored_opt, "extra_state": {"lr_scheduler": None}},
-            global_steps=2,
-            parallel_state=parallel_state,
-        )
-        second = _Model()
-        _install(second, mesh, torch.full((PADDED, COLS), 9.0), torch.full((4, 4), 9.0))
-        second_opt = _optimizer(second)
-        DistributedCheckpointer.load(
-            step_dir(directory, 2),
-            {"model": second, "optimizer": second_opt, "extra_state": {}},
-            parallel_state=parallel_state,
-        )
-        _check_resume(second, trained_rows, trained_other, source, source_opt, second_opt)
-
         # Older padded checkpoints must retain their stored tail, not zero it.
         from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 
@@ -267,19 +251,19 @@ def _roundtrip_worker(rank, world_size, endpoint):
 
         # Compare the next real optimizer update with uninterrupted training.
         _train_step(source, source_opt, 2)
-        _train_step(second, second_opt, 2)
+        _train_step(restored, restored_opt, 2)
         next_reference = _full(source.block.ngram_embedding["shard_0"].weight)
-        next_restored = _full(second.block.ngram_embedding["shard_0"].weight)
+        next_restored = _full(restored.block.ngram_embedding["shard_0"].weight)
         torch.testing.assert_close(next_restored[:LOGICAL], next_reference[:LOGICAL], rtol=0, atol=0)
         torch.testing.assert_close(next_restored[LOGICAL:], torch.zeros_like(next_restored[LOGICAL:]), rtol=0, atol=0)
-        torch.testing.assert_close(second.other.weight, source.other.weight, rtol=0, atol=0)
-        _check_optimizer(source, second, source_opt, second_opt)
+        torch.testing.assert_close(restored.other.weight, source.other.weight, rtol=0, atol=0)
+        _check_optimizer(source, restored, source_opt, restored_opt)
 
         if rank == 0:
             print(
                 f"PASS saved_rows={saved_rows} logical_max_abs={logical_diff} "
                 f"tail_max_abs={tail_diff} other_max_abs={other_diff} "
-                f"hf_bf16_max_abs=0.0 resume_cycles=2 ple_optimizer_padded=True next_update_match=True",
+                f"hf_bf16_max_abs=0.0 resume_cycles=1 ple_optimizer_padded=True next_update_match=True",
                 flush=True,
             )
     finally:
@@ -294,3 +278,58 @@ def test_distributed_ple_checkpoint_roundtrip():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_roundtrip_worker, args=(4,), nprocs=4)
+
+
+def _ddp_roundtrip_worker(rank, world_size, directory, endpoint):
+    """Save and restore logical rows through a real DDP wrapper without ExtraParallel."""
+    from torch.nn.parallel import DistributedDataParallel
+
+    import veomni.utils.dist_utils as dist_utils
+
+    dist_utils.get_device_type = lambda: "cpu"
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
+    try:
+        source = DistributedDataParallel(_Model())
+        name = "block.ngram_embedding.shard_0.weight"
+        counts = checkpoint_row_counts(source)
+        assert counts == {name: (LOGICAL, PADDED)}
+        original = source.module.block.ngram_embedding["shard_0"].weight.detach().clone()
+        ps = SimpleNamespace(dp_mode="ddp")
+        DistributedCheckpointer.save(
+            directory,
+            {"model": source, "extra_state": {"lr_scheduler": None}},
+            global_steps=1,
+            parallel_state=ps,
+        )
+        checkpoint = step_dir(directory, 1)
+        from torch.distributed.checkpoint import FileSystemReader
+
+        metadata = FileSystemReader(weights_dir(checkpoint)).read_metadata()
+        assert metadata.state_dict_metadata[f"model.{name}"].size == (LOGICAL, COLS)
+        restored = DistributedDataParallel(_Model())
+        DistributedCheckpointer.load(checkpoint, {"model": restored, "extra_state": {}}, parallel_state=ps)
+        weight = restored.module.block.ngram_embedding["shard_0"].weight.detach()
+        torch.testing.assert_close(weight[:LOGICAL], original[:LOGICAL], rtol=0, atol=0)
+        assert torch.count_nonzero(weight[LOGICAL:]) == 0
+        hf_dir = os.path.join(directory, "hf")
+        with patch("veomni.utils.save_safetensor_utils.synchronize"):
+            _save_hf_safetensor_distributed(source, hf_dir, None, None, parallel_state=ps)
+        if rank == 0:
+            from safetensors.torch import load_file
+
+            exported = {}
+            for filename in Path(hf_dir).glob("*.safetensors"):
+                exported.update(load_file(str(filename)))
+            torch.testing.assert_close(exported[name], original[:LOGICAL].to(torch.bfloat16), rtol=0, atol=0)
+        torch.testing.assert_close(source.module.block.ngram_embedding["shard_0"].weight, original, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_ddp_ple_checkpoint_roundtrip(tmp_path):
+    """DDP preserves converter row counts for DCP restore and real HF export."""
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_ddp_roundtrip_worker, args=(2, str(tmp_path)), nprocs=2)

@@ -8,12 +8,15 @@ import torch
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+from torch.nn.parallel import DistributedDataParallel
 
 from .planner import _ExtraParallelSavePlanner, _ModelStrictLoadPlanner
 
 
 def checkpoint_row_counts(model):
     """Read optional row metadata from the model-owned checkpoint converter."""
+    if isinstance(model, DistributedDataParallel):
+        model = model.module
     factory = getattr(model, "_create_checkpoint_tensor_converter", None)
     if not callable(factory):
         return {}
