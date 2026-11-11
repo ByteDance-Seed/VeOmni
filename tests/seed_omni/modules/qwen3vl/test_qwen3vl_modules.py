@@ -24,6 +24,21 @@ from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated impo
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
+# Small enough to build on CPU in a second; `out_hidden_size` is overridden per
+# test because that is the knob the merger retarget turns on.
+_VISION_ARGS = {
+    "depth": 1,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_heads": 2,
+    "in_channels": 3,
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "spatial_merge_size": 2,
+    "num_position_embeddings": 64,
+    "deepstack_visual_indexes": [],
+}
+
 
 def _save_fake_fast_tokenizer(module_path: Path) -> None:
     """Write a minimal ``PreTrainedTokenizerFast`` sidecar (no sentencepiece needed).
@@ -326,3 +341,74 @@ def test_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert isinstance(te2, TextEncoder)
     assert te2.config.vocab_size == 64
     assert te2.config.hidden_size == 16
+
+
+def test_eager_inference_can_start_from_a_stock_qwen3vl_checkpoint(tmp_path: Path):
+    """Eager loading must accept the merger this module retargets, and only that one.
+
+    Eager inference (`fsdp_mode: eager`, `OmniModel.from_pretrained`) goes through HF's
+    own `from_pretrained`, not VeOmni's loader — so `_MergerProjectionConverter`,
+    which drops the stock-shape `linear_fc2` during training, never runs. Without
+    the retry in :meth:`Qwen3VLVisionEncoder.from_pretrained`, the documented
+    convert-then-infer flow dies at startup with a size-mismatch error. The second
+    case pins the guard: a mismatch that is *not* the retargeted merger still raises.
+    """
+    Vision = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
+    VisionConfig = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
+
+    stock_vision = dict(_VISION_ARGS, out_hidden_size=32)
+    stock_config = VisionConfig(vision_config=stock_vision, ops_implementation=make_eager_ops_config())
+    source = tmp_path / "qwen3vl_vision"
+    source.mkdir(parents=True)
+    Vision(stock_config).save_pretrained(source)
+    from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
+
+    Qwen2VLImageProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
+    Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2).save_pretrained(source)
+
+    retargeted = VisionConfig(
+        vision_config=dict(_VISION_ARGS, out_hidden_size=16),
+        out_hidden_size=16,
+        # What the recipe sets: a plain backbone has no DeepStack path. Without it
+        # the deepstack mergers are retargeted too, which this converter does not
+        # cover — see the class docstring.
+        disable_deepstack=True,
+        ops_implementation=make_eager_ops_config(),
+    )
+    model = Vision.from_pretrained(str(source), config=retargeted)
+    assert model.visual.merger.linear_fc2.weight.shape[0] == 16
+
+    # The guard: retargeting the ViT's hidden size is not the merger mismatch.
+    stray = VisionConfig(
+        vision_config={**stock_vision, "hidden_size": 32, "num_heads": 2},
+        out_hidden_size=16,
+        ops_implementation=make_eager_ops_config(),
+    )
+    with pytest.raises(RuntimeError, match="not the retargeted merger"):
+        Vision.from_pretrained(str(source), config=stray)
+
+    # A caller that asks for the loading info gets it back, and still gets the
+    # retry: `output_loading_info` must not collide with the one the retry sets.
+    loaded, info = Vision.from_pretrained(str(source), config=retargeted, output_loading_info=True)
+    assert loaded.visual.merger.linear_fc2.weight.shape[0] == 16
+    assert {name for name, _, _ in info["mismatched_keys"]} == {
+        "visual.merger.linear_fc2.weight",
+        "visual.merger.linear_fc2.bias",
+    }
+    # Both shapes of this call must still bind the module's processors. HF returns
+    # `(model, info)` when loading info is requested, and that tuple reaching
+    # `bind_module_assets` binds nothing — silently, since a tuple has no
+    # `preprocessor_class`. Assert on the model, not just the return shape.
+    assert loaded._image_processor is not None
+    assert loaded._video_processor is not None
+    plain = Vision.from_pretrained(str(source), config=retargeted)
+    assert plain._image_processor is not None
+    assert plain._video_processor is not None
+
+    # Explicit `ignore_mismatched_sizes` must not collide with the one the retry
+    # passes: it used to raise `TypeError: got multiple values for keyword
+    # argument`. `False` is the interesting case — it is what a caller passes when
+    # they want the strict behaviour, and the module's own retry still applies.
+    for explicit in (False, True):
+        passed = Vision.from_pretrained(str(source), config=retargeted, ignore_mismatched_sizes=explicit)
+        assert passed.visual.merger.linear_fc2.weight.shape[0] == 16, explicit
