@@ -52,11 +52,16 @@ def _decoder_block_class_names(model: nn.Module) -> set[str]:
     An entry is either a bare class name (``LlamaDecoderLayer``) or, on a
     SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``
     — see ``_scoped_no_split_modules``). The scope has to be stripped because
-    matching is against ``type(module).__name__``: a composed ``OmniModel``
-    carries no ``model_type`` in
-    :data:`_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`, so
-    :func:`validate_compile_model` passes it through, and leaving the prefix on
-    would make :func:`compile_decoder_blocks` find zero blocks and raise.
+    :func:`_is_decoder_block` matches against ``type(module).__name__``, which
+    never carries the scope.
+
+    Nothing upstream catches the mismatch: :func:`validate_compile_model`
+    returns early for :class:`OmniModel` (it inherits
+    ``input_modalities = "text"`` and its config has no ``vision_config`` /
+    ``audio_config``, so :func:`_is_multimodal_model` is ``False``), so keeping
+    the prefix would let the call through and make
+    :func:`compile_decoder_blocks` match zero blocks — a ``RuntimeError`` from
+    ``build_parallelize_model`` after the FSDP wrap has already started.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
