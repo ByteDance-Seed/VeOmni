@@ -21,7 +21,7 @@ from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
 from ...moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
-from ...moe_experts.shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from ...moe_experts.shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk, same_nk_tile_schedule
 
 
 def _per_expert_lora_half_forward(
@@ -32,6 +32,8 @@ def _per_expert_lora_half_forward(
     cumsum: torch.Tensor,
     max_t: int,
     scale: float,
+    tile_cumsum: torch.Tensor | None = None,
+    tile_total_M: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One per-expert LoRA forward chain (one of gate / up / down).
 
@@ -45,6 +47,8 @@ def _per_expert_lora_half_forward(
         cumsum_M=cumsum,
         max_M=max_t,
         transpose_b=True,
+        tile_cumsum=tile_cumsum,
+        tile_total_M=tile_total_M,
     )
     delta = group_gemm_same_nk(
         a=tmp,
@@ -52,6 +56,8 @@ def _per_expert_lora_half_forward(
         cumsum_M=cumsum,
         max_M=max_t,
         transpose_b=True,
+        tile_cumsum=tile_cumsum,
+        tile_total_M=tile_total_M,
     )
     return tmp, delta * scale
 
@@ -66,6 +72,8 @@ def _per_expert_lora_half_backward(
     cumsum: torch.Tensor,
     max_t: int,
     scale: float,
+    tile_cumsum: torch.Tensor | None = None,
+    tile_total_M: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """Closed-form backward for one per-expert LoRA half (gate / up / down).
 
@@ -82,6 +90,8 @@ def _per_expert_lora_half_backward(
         cumsum_M=cumsum,
         max_M=max_t,
         transpose_b=False,
+        tile_cumsum=tile_cumsum,
+        tile_total_M=tile_total_M,
     )
     grad_tmp = grad_tmp * scale
 
@@ -118,6 +128,8 @@ def _per_expert_lora_half_backward(
         cumsum_M=cumsum,
         max_M=max_t,
         transpose_b=False,
+        tile_cumsum=tile_cumsum,
+        tile_total_M=tile_total_M,
     )
     return grad_lora_a, grad_lora_b, grad_inp_lora
 
@@ -179,6 +191,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         max_t = scatter_output.shape[0]
 
         # Base fc1 (group-gemm): [T, 2I]
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
         fc1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_2_weight,
@@ -186,6 +199,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Per-expert LoRA on each half — independent rank-r adapters,
@@ -199,6 +214,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum=cumsum_t,
             max_t=max_t,
             scale=lora_scale_gate,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, r], [T, I]
         tmp_up, delta_up = _per_expert_lora_half_forward(
             scatter_output=scatter_output,
@@ -207,6 +224,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum=cumsum_t,
             max_t=max_t,
             scale=lora_scale_up,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, r], [T, I]
         fc1_output = fc1_output + torch.cat([delta_gate, delta_up], dim=-1)
 
@@ -229,6 +248,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # LoRA fc2 delta on down (per-expert).
@@ -238,6 +259,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, r]
         lora_delta_down = group_gemm_same_nk(
             a=tmp_down,
@@ -245,6 +268,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, H]
         lora_delta_down = lora_delta_down * lora_scale_down
         fc2_output = fc2_output + lora_delta_down
@@ -257,6 +282,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -279,6 +305,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         )
 
         return output
@@ -308,7 +335,9 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
         scale_down = ctx.lora_scale_down
@@ -334,6 +363,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum=cumsum_t,
             max_t=max_t,
             scale=scale_down,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # MoE step 9 (base) — dgrad of fc2 wrt fc1_activation.
@@ -343,6 +374,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, I]
         grad_fc1_activation = grad_fc1_activation + grad_fc1_activation_lora
 
@@ -385,6 +418,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum=cumsum_t,
             max_t=max_t,
             scale=scale_gate,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_lora_a_up, grad_lora_b_up, grad_scatter_output_up = _per_expert_lora_half_backward(
             grad_delta=grad_delta_up,
@@ -395,6 +430,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum=cumsum_t,
             max_t=max_t,
             scale=scale_up,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # MoE step 4 (base) — single dgrad for merged fc1, accumulated
@@ -405,6 +442,8 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_scatter_output = grad_scatter_output + grad_scatter_output_gate + grad_scatter_output_up
 
@@ -496,6 +535,7 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
         max_t = permute_tokens.shape[0]
 
         # Base fc1: [T_local, 2I]
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum, permute_tokens.shape[0])
         fc1_output = group_gemm_same_nk(
             a=permute_tokens,
             b=fc1_1_2_weight,
@@ -503,6 +543,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Per-local-expert LoRA on each half — independent rank-r adapters,
@@ -515,6 +557,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum=cumsum,
             max_t=max_t,
             scale=lora_scale_gate,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         tmp_up, delta_up = _per_expert_lora_half_forward(
             scatter_output=permute_tokens,
@@ -523,6 +567,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum=cumsum,
             max_t=max_t,
             scale=lora_scale_up,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc1_output = fc1_output + torch.cat([delta_gate, delta_up], dim=-1)
 
@@ -539,6 +585,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Per-local-expert LoRA delta on down.
@@ -548,6 +596,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T_local, r]
         lora_delta_down = group_gemm_same_nk(
             a=tmp_down,
@@ -555,6 +605,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T_local, H]
         lora_delta_down = lora_delta_down * lora_scale_down
         fc2_output = fc2_output + lora_delta_down
@@ -562,6 +614,7 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -579,6 +632,7 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         )
 
         return fc2_output
@@ -603,7 +657,9 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
         scale_down = ctx.lora_scale_down
@@ -620,6 +676,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum=cumsum,
             max_t=max_t,
             scale=scale_down,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Base fc2 dgrad + LoRA contribution.
@@ -629,6 +687,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_fc1_act = grad_fc1_act + grad_fc1_act_lora
 
@@ -667,6 +727,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum=cumsum,
             max_t=max_t,
             scale=scale_gate,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_lora_a_up, grad_lora_b_up, grad_permute_up = _per_expert_lora_half_backward(
             grad_delta=grad_delta_up,
@@ -677,6 +739,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum=cumsum,
             max_t=max_t,
             scale=scale_up,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Base fc1 dgrad + both half-LoRA contributions.
@@ -686,6 +750,8 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_permute = grad_permute + grad_permute_gate + grad_permute_up
 
