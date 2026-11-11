@@ -130,6 +130,7 @@ def test_omni_composed_wrap_rejects_async_multi_optimizer_before_checkpoint(monk
 
 @pytest.mark.parametrize("multi", [None, False, True])
 def test_omni_module_scope_checks_async_before_checkpoint(monkeypatch, multi):
+    from veomni.arguments import MixedPrecisionConfig
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
     monkeypatch.setattr(ModuleRuntime, "setup", lambda self: None)
@@ -145,7 +146,11 @@ def test_omni_module_scope_checks_async_before_checkpoint(monkeypatch, multi):
     )
     reached_checkpoint = []
     monkeypatch.setattr(ModuleRuntime, "build_checkpoint", lambda self: reached_checkpoint.append(True))
-    accelerator = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module", fsdp_mode="fsdp2"))
+    accelerator = SimpleNamespace(
+        fsdp_config=SimpleNamespace(
+            fsdp_scope="module", fsdp_mode="fsdp2", mixed_precision=MixedPrecisionConfig(enable=False)
+        )
+    )
     train = SimpleNamespace(training_task="sft", checkpoint=SimpleNamespace(save_async=True))
     kwargs = dict(module_config=SimpleNamespace(), global_accelerator=accelerator, train_args=train)
     if multi:

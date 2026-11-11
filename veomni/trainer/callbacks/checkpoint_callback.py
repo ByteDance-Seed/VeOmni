@@ -84,7 +84,10 @@ def _check_multi_destination(trainer, step):
         except FileNotFoundError:
             pass
         else:
-            raise RuntimeError("Cannot overwrite a completed checkpoint transaction with MultiOptimizer state")
+            raise RuntimeError(
+                f"Cannot overwrite a completed checkpoint transaction with MultiOptimizer state at {step_root!r}; "
+                "choose a new checkpoint save_path before retrying"
+            )
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")

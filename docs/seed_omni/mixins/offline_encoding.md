@@ -87,7 +87,7 @@ so the cache looks complete and the error only shows in `offline_training`.
 `offline_embedding` freezes every module, so it never writes or restores module
 weights; encoder weights always come from each module's `model_path`. A saved
 step is therefore only the cursor, and its manifest
-[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L462), so
+[says so](../../../veomni/trainer/callbacks/global_state_callback.py#L473), so
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
@@ -278,7 +278,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L587)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L591)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that

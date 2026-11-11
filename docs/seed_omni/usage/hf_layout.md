@@ -157,7 +157,7 @@ Training from an upstream root:
 
 HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L633)):
 
-- [`_save_hf_source_layout`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L644) exports LoRA modules' adapters per module, skips frozen modules, and makes sure each trained module's DCP exists;
+- [`_save_hf_source_layout`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L646) exports LoRA modules' adapters per module, skips frozen modules, and makes sure each trained module's DCP exists;
 - [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L683) renames keys back (raising on a key with no source key or a different shape), casts to the source dtypes, fills tied duplicates, copies every other source tensor on rank 0, and writes `global_step_N/hf_ckpt/` with the source's shard files and non-weight files.
 
 Bare `OmniModel.from_pretrained` and eager inference:
