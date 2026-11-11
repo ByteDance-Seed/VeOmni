@@ -77,26 +77,6 @@ def test_linear_qat_rows_require_tilelang_on_sm90():
     }
 
 
-@pytest.fixture
-def single_rank_dist(monkeypatch):
-    """Provide a one-rank gloo group and destroy it, so later tests see no leaked state."""
-    import torch.distributed as dist
-
-    from tests.tools.launch_utils import find_free_port
-
-    created = False
-    if not dist.is_initialized():
-        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
-        dist.init_process_group("gloo", rank=0, world_size=1)
-        created = True
-    try:
-        yield
-    finally:
-        if created and dist.is_initialized():
-            dist.destroy_process_group()
-
-
 def test_a_wrapped_projection_falls_back_to_its_own_forward():
     """A wrapped projection keeps its base layer at ``base_layer`` and owns no ``weight``."""
     from torch import nn
