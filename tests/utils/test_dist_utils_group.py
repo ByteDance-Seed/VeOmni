@@ -13,6 +13,7 @@ from veomni.utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 
 
 def _default_gloo_worker(rank, world_size, endpoint):
+    """Check failure propagation uses CPU for default and explicit Gloo groups."""
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
     try:
         # A host may also expose CUDA/NPU devices while the default group is
@@ -42,6 +43,7 @@ def test_any_rank_failed_without_process_group():
 
 
 def _accelerator_group_worker(rank, world_size, endpoint):
+    """Check failure propagation uses the assigned accelerator backend."""
     device = get_torch_device()
     device.set_device(rank)
     backend = get_dist_comm_backend()

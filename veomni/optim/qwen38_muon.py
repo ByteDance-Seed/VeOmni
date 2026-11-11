@@ -517,7 +517,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
             (muon_groups if any(a == "muon" for a, _, _ in plan) else adam_groups).append(group)
         try:
             self.param_groups = adam_groups
-            super().step()
+            super()._step_adamw_impl()
         finally:
             self.param_groups = all_groups
         for group in muon_groups:

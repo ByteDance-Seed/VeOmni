@@ -167,6 +167,11 @@ class CPUOffloadAdamW(FullFP32AdamW):
 
     @torch.no_grad()
     def step(self, closure=None):
+        return self._step_adamw_impl(closure)
+
+    @torch.no_grad()
+    def _step_adamw_impl(self, closure=None):
+        """Run the AdamW update without re-entering optimizer step hooks."""
         loss = None
         if closure is not None:
             with torch.enable_grad():

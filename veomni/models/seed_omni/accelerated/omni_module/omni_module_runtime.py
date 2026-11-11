@@ -129,6 +129,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
+        """Bind the arguments, config and accelerator settings for one module."""
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
@@ -538,6 +539,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def has_trainable_parameters(self) -> bool:
+        """Whether any parameter of this module requires grad (cached after first use)."""
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters
@@ -577,11 +579,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
         time, so it must resolve to this module's mesh, not the orchestrator's.
         A no-op for a fully-frozen module: there is nothing to step.
+
+        A module that defines ``configure_optimizer(optimizer)`` gets the built
+        optimizer before the lr-scheduler is built and a checkpoint is loaded into
+        it, so it can adjust its param groups or register step hooks.
         """
         if not self.has_trainable_parameters:
             return
         with self._scoped():
             super()._build_optimizer(param_groups)
+            configure_optimizer = getattr(self.omni_module, "configure_optimizer", None)
+            if callable(configure_optimizer):
+                configure_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
