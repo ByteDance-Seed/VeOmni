@@ -314,3 +314,5 @@ credentials or raw runtime evidence in source commits.
 claimed successful migrations have execution and CI-selection evidence, and
 remaining scope is visible. Maintainer approval, PR publication and merge are
 separate outcomes requiring their own evidence.
+
+Device portability validation: run `python tests/special_sanity/check_device_api_usage.py -d tests` after generating or adapting tests. Use the existing device availability flags and helpers instead of hard-coded accelerator strings where equivalent; do not broaden the checker whitelist merely to hide a portable-test violation.
