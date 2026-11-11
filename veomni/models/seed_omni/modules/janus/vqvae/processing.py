@@ -121,7 +121,6 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["assistant"]) if not it.is_dummy
@@ -135,25 +134,25 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
+                continue
+            if inference:
+                continue
+            if self._dummy_pixel_values is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                    "before training use (pure inference never reaches this branch)."
+                )
+            # Per sample: the codec still runs on a step with no real target so its
+            # FSDP collectives stay in step with the other ranks.
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="assistant",
+                    is_dummy=True,
+                    meta={_IMG_TAG_KEY: "gen"},
+                )
             )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="assistant",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "gen"},
-            ),
-        )
 
 
 __all__ = ["JanusVqvaeProcessor", "JanusVqvaePreprocessor"]

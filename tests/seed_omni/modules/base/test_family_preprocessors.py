@@ -871,19 +871,19 @@ def _text_only_batch():
     ]
 
 
-def test_siglip_appends_one_batch_anchor_when_no_user_image():
+def test_siglip_appends_a_dummy_per_sample_with_no_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "user")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    d = dummies[0]
-    assert d.type == "image" and d.role == "user" and d.is_dummy
-    assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
-    assert d.meta[_IMG_TAG_KEY] == "und"
+    assert len(dummies) == len(batch)
+    for sample, d in zip(batch, dummies, strict=True):
+        assert d is sample[-1]
+        assert d.type == "image" and d.role == "user" and d.is_dummy
+        assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
+        assert d.meta[_IMG_TAG_KEY] == "und"
 
 
 def test_siglip_no_dummy_when_user_image_present():
@@ -896,7 +896,7 @@ def test_siglip_no_dummy_when_user_image_present():
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
 
 
-def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
+def test_siglip_dummy_only_on_the_sample_without_a_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -906,24 +906,27 @@ def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
     ]
     pre(_b(batch))
 
-    # The real image already anchors the tower for the whole micro-batch.
-    assert _worker_dummies(batch, "user") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    # Per sample: the sample with a real image keeps exactly one row and gains no
+    # placeholder; the text-only sample gets one so the tower still runs for it.
+    dummies = _worker_dummies(batch, "user")
+    assert len(dummies) == 1 and dummies[0] is batch[1][-1]
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
 
 
-def test_vqvae_appends_one_batch_anchor_when_no_assistant_image():
+def test_vqvae_appends_a_dummy_per_sample_with_no_assistant_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "assistant")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    assert dummies[0].meta[_IMG_TAG_KEY] == "gen" and dummies[0].value.shape == (3, 4, 4)
+    assert len(dummies) == len(batch)
+    for sample, d in zip(batch, dummies, strict=True):
+        assert d is sample[-1]
+        assert d.meta[_IMG_TAG_KEY] == "gen" and d.value.shape == (3, 4, 4)
 
 
-def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
+def test_vqvae_dummy_only_on_the_sample_without_a_gen_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -933,8 +936,10 @@ def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "assistant") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    # Per sample: only the sample lacking a generation target gets a placeholder.
+    dummies = _worker_dummies(batch, "assistant")
+    assert len(dummies) == 1 and dummies[0] is batch[1][-1]
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
 
 
 def test_qwen3vl_vision_appends_a_dummy_per_sample_with_grid_when_no_visual():
