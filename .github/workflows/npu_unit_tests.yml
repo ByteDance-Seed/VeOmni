@@ -159,24 +159,13 @@ jobs:
           uv run --frozen ninja --version
           uv run --frozen python -c "import cann_ops_transformer"
       - name: Install triton-ascend
-        # The Ascend Triton kernels (vendored GatedDeltaNet, MoE clamped SwiGLU)
-        # need triton-ascend, which is deliberately not in the lockfile. The image
-        # ships it in its own build-time venv, but the steps above create a fresh
-        # one in the workspace, so install it here. `uv sync` prunes anything
-        # absent from the lockfile; `uv run --frozen` does not, so this survives
-        # every test step below.
-        #
-        # Community triton and triton-ascend both ship triton/_C/libtriton.so and
-        # only triton-ascend's carries the Ascend backend, so whoever writes that
-        # path last wins. Install in two steps to force the order (a single
-        # parallel uv transaction does not guarantee it) and verify the patch
-        # stuck. Mirrors docker/ascend/Dockerfile.ascend_9.1.0_*_910b.x86.
+        # Install the image's local base wheel first, then its Ascend overlay.
+        # Keep uv sync and uv run unchanged; no Triton download is needed here.
         run: |
-          uv pip install --python .venv/bin/python triton==3.2.0
           .venv/bin/python -m ensurepip
-          .venv/bin/python -m pip install triton-ascend==3.2.1 \
-            --index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
-          uv run --frozen python -c "from triton._C.libtriton import ascend"
+          .venv/bin/python -m pip install --no-index --no-deps --force-reinstall /app/triton-3.2.0-*.whl
+          .venv/bin/python -m pip install --no-index --no-deps --force-reinstall /app/triton_ascend-3.2.2-*.whl
+          uv run --frozen python -c "from importlib.metadata import version; assert version('triton') == '3.2.0'; assert version('triton-ascend') == '3.2.2'; from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
           uv pip list
