@@ -166,6 +166,7 @@ model:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: float32
+        cast_forward_inputs: false
 
 data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
