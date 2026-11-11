@@ -21,13 +21,10 @@ FP4 quantizer exists only in TileLang and stays NVIDIA-only.
 
 from __future__ import annotations
 
-from functools import cache
-
 import torch
 from torch import nn
 
-from ...utils.device import get_rocm_gcn_arch
-from ..platform import NVIDIA_SM90_PLUS, ROCM_GPU
+from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
 
 
 TRITON_FP8_ARCHS = ("gfx942", "gfx950")
@@ -153,8 +150,6 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
     configs = _model_torchao_configs(model)
     if not configs:
         return
-    from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
-
     if not IS_CUDA_AVAILABLE:
         return
 
@@ -172,25 +167,34 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
         )
 
 
-@cache
-def quantizer_backend() -> str | None:
-    """Return ``"tilelang"`` or ``"triton"`` for the quantizers this GPU runs, or ``None``."""
-    if NVIDIA_SM90_PLUS.matches():
+def quantizer_backend(device: torch.types.Device | int | None = None) -> str | None:
+    """Return the FP8 backend for ``device``, or ``None`` when that device is unsupported."""
+    if not IS_CUDA_AVAILABLE:
+        return None
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    else:
+        device = torch.device(device)
+    if device.type != "cuda":
+        return None
+    if torch.version.hip is not None:
+        return "triton" if get_rocm_gcn_arch(device) in TRITON_FP8_ARCHS else None
+    if get_gpu_compute_capability(device) >= 90:
         return "tilelang"
-    if ROCM_GPU.matches() and get_rocm_gcn_arch() in TRITON_FP8_ARCHS:
-        return "triton"
     return None
 
 
-def require_tilelang_sm90() -> None:
+def require_tilelang_sm90(device: torch.types.Device | int | None = None) -> None:
     """Reject unsupported hardware before importing the TileLang quantizers."""
-    if quantizer_backend() != "tilelang":
+    if quantizer_backend(device) != "tilelang":
         raise RuntimeError("QAT TileLang quantizers require an SM90 or later NVIDIA CUDA GPU")
 
 
-def fp8_quantizer_backend() -> str:
+def fp8_quantizer_backend(device: torch.types.Device | int | None = None) -> str:
     """Return the FP8 quantizer backend for this GPU, rejecting unsupported hardware first."""
-    backend = quantizer_backend()
+    backend = quantizer_backend(device)
     if backend is None:
         raise RuntimeError(f"QAT FP8 quantizers require {FP8_QUANTIZER_GPUS}")
     return backend

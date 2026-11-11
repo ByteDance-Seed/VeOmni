@@ -1191,9 +1191,8 @@ class TestDeepseekV4ConverterConvert:
     def test_validate_deepseek_v4_export_quant_support_preflight(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import export_quant
 
-        monkeypatch.setattr(export_quant.torch.version, "hip", None, raising=False)
-        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+        error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU")
+        monkeypatch.setattr(export_quant, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
 
         # Unquantized mapping (no .scale keys) succeeds on non-SM90
         validate_deepseek_v4_export_quant_support({"layers.0.attn.wq_a.weight": 1, "embed.weight": 1})
@@ -1211,8 +1210,7 @@ class TestDeepseekV4ConverterConvert:
             )
 
         # On SM90+, preflight validation succeeds
-        monkeypatch.setattr(export_quant.torch.version, "hip", None, raising=False)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 90)
+        monkeypatch.setattr(export_quant, "fp8_quantizer_backend", lambda device=None: "tilelang")
         validate_deepseek_v4_export_quant_support(scaled_mapping)
         DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).validate_export_support(
             fqn_to_index_mapping=scaled_mapping
@@ -1222,9 +1220,9 @@ class TestDeepseekV4ConverterConvert:
         """FP8 export passes on gfx942; FP4 experts still need an SM90+ NVIDIA GPU."""
         from veomni.models.transformers.deepseek_v4 import export_quant
 
-        monkeypatch.setattr(export_quant.torch.version, "hip", "7.14", raising=False)
-        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(export_quant, "get_rocm_gcn_arch", lambda: "gfx942")
+        monkeypatch.setattr(export_quant, "fp8_quantizer_backend", lambda device=None: "triton")
+        error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU")
+        monkeypatch.setattr(export_quant, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
         expert_mapping = {"layers.0.ffn.experts.0.w1.weight": 1, "layers.0.ffn.experts.0.w1.scale": 1}
 
         validate_deepseek_v4_export_quant_support({"layers.0.attn.wq_a.weight": 1, "layers.0.attn.wq_a.scale": 1})
@@ -1240,9 +1238,8 @@ class TestDeepseekV4ConverterConvert:
         from veomni.models.transformers.deepseek_v4 import export_quant
         from veomni.utils import save_safetensor_utils
 
-        monkeypatch.setattr(export_quant.torch.version, "hip", None, raising=False)
-        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+        error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU")
+        monkeypatch.setattr(export_quant, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
         monkeypatch.setattr("veomni.models.checkpoint.manager.build_checkpointer", lambda **kwargs: object())
 
         scaled_mapping = {"layers.0.attn.wq_a.weight": 1, "layers.0.attn.wq_a.scale": 1}

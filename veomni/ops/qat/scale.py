@@ -26,9 +26,11 @@ def validate_fp8_scale_pairing(scale_fmt: str | None, scale_dtype: torch.dtype) 
     dequantizing with the unrounded value makes ``q * stored_scale`` drift
     from the fused dequant path.
     """
+    if scale_fmt not in (None, "ue8m0"):
+        raise ValueError(f"scale_fmt must be None or 'ue8m0', got {scale_fmt!r}")
     if scale_dtype not in (torch.float32, torch.float8_e8m0fnu):
-        raise AssertionError(f"FP8 quantizers support float32 and float8_e8m0fnu scales, got {scale_dtype}")
+        raise ValueError(f"FP8 quantizers support float32 and float8_e8m0fnu scales, got {scale_dtype}")
     if scale_dtype == torch.float8_e8m0fnu and scale_fmt is None:
-        raise AssertionError(
+        raise ValueError(
             'float8_e8m0fnu scales only represent powers of two: pass scale_fmt (DeepSeek V4 uses "ue8m0")'
         )

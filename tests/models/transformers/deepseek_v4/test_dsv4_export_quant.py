@@ -47,9 +47,9 @@ def test_export_wrappers_reject_pre_sm90_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
-    monkeypatch.setattr(quant.torch.version, "hip", None, raising=False)
-    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 89)
+    error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU")
+    monkeypatch.setattr(quant, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(quant, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
 
     with pytest.raises(RuntimeError, match="SM90 or later"):
         quant.fp4_act_quant(torch.empty(0))
@@ -62,10 +62,9 @@ def test_export_wrappers_reject_unsupported_rocm_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
-    monkeypatch.setattr(quant.torch.version, "hip", "6.0", raising=False)
-    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 90)
-    monkeypatch.setattr(quant, "get_rocm_gcn_arch", lambda: "gfx90a")
+    error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU or an AMD ROCm gfx942/gfx950 GPU")
+    monkeypatch.setattr(quant, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(quant, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
 
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         quant.fp4_act_quant(torch.empty(0))
@@ -81,9 +80,9 @@ def test_export_fp8_runs_triton_on_gfx942_and_fp4_stays_nvidia_only(monkeypatch)
     backend = ModuleType("veomni.ops.qat.triton_quant")
     backend.fp8_weight_quant = lambda x, *args: calls.append(args) or (x, x)
     monkeypatch.setitem(sys.modules, "veomni.ops.qat.triton_quant", backend)
-    monkeypatch.setattr(quant.torch.version, "hip", "7.14", raising=False)
-    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(quant, "get_rocm_gcn_arch", lambda: "gfx942")
+    monkeypatch.setattr(quant, "fp8_quantizer_backend", lambda device=None: "triton")
+    error = RuntimeError("requires an SM90 or later NVIDIA CUDA GPU")
+    monkeypatch.setattr(quant, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
 
     quant.fp8_weight_quant(torch.empty(0), 128, "ue8m0", torch.float8_e8m0fnu)
     assert calls == [(128, "ue8m0", torch.float8_e8m0fnu)]
