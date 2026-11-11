@@ -432,6 +432,15 @@ def _restore_config(config_class, state):
     return config
 
 
+def _walk_configs(config: PretrainedConfig):
+    """Yield ``config`` and every ``VeOmniPretrainedConfig`` beneath it."""
+    yield config
+    for key in config.sub_configs:
+        child = getattr(config, key, None)
+        if isinstance(child, VeOmniPretrainedConfig):
+            yield from _walk_configs(child)
+
+
 def as_veomni_config(config: PretrainedConfig, *, validate: bool = True) -> VeOmniPretrainedConfig:
     """Opt a native config tree into VeOmni in place, preserving caller references."""
     native = not isinstance(config, VeOmniPretrainedConfig)
@@ -450,6 +459,15 @@ def as_veomni_config(config: PretrainedConfig, *, validate: bool = True) -> VeOm
         config._set_ops_implementation(None, _is_post_init=True, _validate=False)
     if validate:
         _ = config.ops_config
+        # Resolving the property validates the dataclass but runs no per-config
+        # check, so a tree adopted this way -- what `build_foundation_model` does
+        # with a handed-in `PretrainedConfig` -- skipped the refusal for a
+        # quantizing selection its activation cannot serve. Check each level
+        # directly: routing this through `_set_ops_implementation` would also
+        # re-normalize `attn_implementation` and rewrite an explicit `sdpa` into
+        # its `veomni_sdpa` spelling.
+        for node in _walk_configs(config):
+            _reject_quantized_swiglu_on_an_unfused_activation(node, node.ops_implementation)
         for key in config.sub_configs:
             child = getattr(config, key, None)
             if isinstance(child, VeOmniPretrainedConfig):

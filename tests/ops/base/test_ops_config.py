@@ -1182,3 +1182,45 @@ def test_a_child_can_opt_out_of_a_quantizing_root_selection():
 
     assert veomni_config.ops_config.swiglu_mlp_implementation == "qat"
     assert veomni_config.vision_config.ops_config.swiglu_mlp_implementation == "eager"
+
+
+def test_as_veomni_config_validates_a_directly_constructed_config():
+    """`as_veomni_config` is how `build_foundation_model` adopts a `PretrainedConfig`.
+
+    It used to build the tree with `_validate=False` and then only read
+    `ops_config`, which resolves the dataclass but runs no per-config check. A
+    caller that constructed the model directly therefore skipped the refusal: with
+    `hidden_act='gelu'` and `swiglu_mlp_implementation='qat'`, both the Qwen3 MLP
+    and DeepSeek-V4's shared expert fell through to unquantized projections while
+    the config still claimed QAT.
+    """
+    import copy
+
+    from transformers import DeepseekV4Config, Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    qwen3 = Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+    )
+    qwen3.hidden_act = "gelu"
+    qwen3.ops_implementation = {"swiglu_mlp_implementation": "qat", "moe_implementation": "eager"}
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        as_veomni_config(copy.deepcopy(qwen3))
+
+    deepseek = DeepseekV4Config()
+    deepseek.hidden_act = "gelu"
+    deepseek.ops_implementation = {"swiglu_mlp_implementation": "qat", "moe_implementation": "eager"}
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        as_veomni_config(copy.deepcopy(deepseek))
+
+    # The same shape with a supported activation still loads.
+    qwen3.hidden_act = "silu"
+    assert as_veomni_config(copy.deepcopy(qwen3)).ops_config.swiglu_mlp_implementation == "qat"
