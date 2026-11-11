@@ -517,22 +517,12 @@ def load_module_from_hf_source(
             f"Loading '{module_name}' from a HuggingFace checkpoint cannot offload to disk: {device_map}."
         )
     if len(devices) == 1:
-        target_device = devices.pop()
-        if not source.layout.modules[module_name].key_prefixes:
-            from ....checkpoint.weights import _to_empty_preserving_nonpersistent_buffers
-
-            return _to_empty_preserving_nonpersistent_buffers(model, target_device)
-        load_model_weights(model, source.path, init_device=target_device)
+        load_model_weights(model, source.path, init_device=devices.pop())
         return model
 
     from accelerate import dispatch_model
 
-    if not source.layout.modules[module_name].key_prefixes:
-        from ....checkpoint.weights import _to_empty_preserving_nonpersistent_buffers
-
-        model = _to_empty_preserving_nonpersistent_buffers(model, "cpu")
-    else:
-        load_model_weights(model, source.path, init_device="cpu")
+    load_model_weights(model, source.path, init_device="cpu")
     dispatch_model(
         model,
         device_map=device_map,

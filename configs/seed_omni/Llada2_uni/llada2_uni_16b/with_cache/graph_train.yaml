@@ -1,5 +1,0 @@
-# LLaDA2.0-Uni-16B training DAG from cached VQ token carrier items.
-- { from: llada2_uni_image_tokenizer.online_process, to: llada2_uni_text_encoder.encode }
-- { from: llada2_uni_text_encoder.encode,            to: llada2_uni_llm }
-- { from: llada2_uni_llm,                            to: llada2_uni_text_encoder.decode }
-- { from: llada2_uni_text_encoder.decode,            to: end }

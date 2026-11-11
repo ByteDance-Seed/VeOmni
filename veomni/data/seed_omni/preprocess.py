@@ -131,18 +131,15 @@ def voice_assistant_preprocess(conversations, example, **kwargs):
 
 
 def _sharegpt4v_sft_layout(conversations):
-    if isinstance(conversations, dict):
-        conversations = conversations.get("conversations") or conversations.get("messages") or []
-    role_mapping = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
+    role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []
-    if conversations and conversations[0].get("from", conversations[0].get("role")) not in ("human", "user"):
+    if conversations[0]["from"] != "human":
         conversations = conversations[1:]
-    assert conversations and conversations[0].get("from", conversations[0].get("role")) in ("human", "user")
+    assert conversations[0]["from"] == "human"
 
     for message in conversations:
-        value = message.get("value", message.get("content", ""))
-        raw_role = message.get("from", message.get("role"))
-        role = role_mapping[raw_role]
+        value = message["value"]
+        role = role_mapping[message["from"]]
         if "<image>" in value:
             value = value.replace("<image>", "")
             constructed_conversation.append([role, ("image", None, {_IMG_TAG_KEY: "und"}), ("text", value)])

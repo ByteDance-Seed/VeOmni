@@ -1,8 +1,0 @@
-# LLaDA2.0-Uni-16B training DAG — dLLM (masked diffusion) image-to-text SFT.
-#
-#   llada2_uni_image_tokenizer.encode -> llada2_uni_text_encoder.encode
-#       -> llada2_uni_llm -> llada2_uni_text_encoder.decode -> end
-- { from: llada2_uni_image_tokenizer.encode, to: llada2_uni_text_encoder.encode }
-- { from: llada2_uni_text_encoder.encode,    to: llada2_uni_llm }
-- { from: llada2_uni_llm,                    to: llada2_uni_text_encoder.decode }
-- { from: llada2_uni_text_encoder.decode,    to: end }
