@@ -58,12 +58,11 @@ _VEOMNI_SP_ATTN = (
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:
-    """Let a model config refuse a run it cannot serve, before any weight is read.
+    """Refuse unsupported model capabilities, then run model-specific checks.
 
-    A hook rather than a body: any config class may define
-    ``validate_build_prerequisites`` and this calls it. Nothing here knows which
-    models do, which is the point -- the alternative is a list of model names in the
-    generic builder, and a list is a thing the next model has to be remembered into.
+    QAT defaults to unsupported and is enabled by a capability flag on configs
+    whose generated modeling implements it. Any config may also define
+    ``validate_build_prerequisites`` for cross-field checks specific to that model.
 
     A config already holds its own ``self.ops_config``, and for any run-wide state
     it cannot see on its own (such as the parallel state) the convention is that
@@ -76,6 +75,13 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     indexer and attention it is defined in terms of -- a disagreement between a model
     field and two op selections, which no single dataclass can see.
     """
+    qat_implementation = config.ops_config.qat_implementation
+    if qat_implementation != "none" and not getattr(type(config), "_supports_fp8_blockwise_qat", False):
+        raise ValueError(
+            f"{type(config).__name__} does not implement qat_implementation={qat_implementation!r}; "
+            "set qat_implementation='none'."
+        )
+
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):
         validate()

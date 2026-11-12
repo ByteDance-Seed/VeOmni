@@ -32,10 +32,13 @@ If a field is not in this table, it is not an op-selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
+| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+ or ROCm gfx942/gfx950) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
-rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
+rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU or an
+AMD gfx942/gfx950 GPU. AMD GPUs run a Triton port of the FP8 quantizers that is
+bit-exact with the TileLang kernels; the FP4 quantizer for V4-Flash's FP4
+experts exists only in TileLang and still requires NVIDIA.
 It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
 backend requires `qat_implementation: none` because it already quantizes
 the expert GEMM operands. Conflicting selections raise at config-parse time.

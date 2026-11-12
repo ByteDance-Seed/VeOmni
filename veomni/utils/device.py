@@ -196,6 +196,13 @@ def is_sm90_or_above() -> bool:
     return get_gpu_compute_capability() >= 90
 
 
+def get_rocm_gcn_arch(device: torch.types.Device | int | None = None) -> str | None:
+    """Return the AMD GPU architecture (e.g. ``"gfx950"``), or ``None`` off ROCm."""
+    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+        return None
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+
+
 def create_stream(device=None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
     device_type = get_device_type()
