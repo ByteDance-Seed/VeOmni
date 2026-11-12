@@ -327,3 +327,79 @@ def test_mhc_cann_pre_post_matches_eager():
 def test_mhc_cann_head_is_the_eager_math():
     cann_head = OP_REGISTRY._entries["mhc", "head", "cann", "npu"]
     assert cann_head.wrapper is resolve_op("mhc", "head", "eager").wrapper
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.parametrize("seq_len", [32, 33, 95, 128, 160])
+def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
+    """The kernels tile the query axis without a length guard, so the row pads.
+
+    A packed dynamic-batch step puts each sample's span wherever it lands, and
+    ``cp_size > 1`` slices that span further, so ``seq_len % 128 != 0`` is the
+    normal case rather than an edge. Before the row padded, the tail tile read
+    and wrote past the tensor: on a 256k run that turned one step's gradient into
+    NaN and the next step's ``optimizer.step()`` into NaN weights.
+
+    Both directions are checked because they pad differently -- the fused
+    inference collapse on 32, ``mhc_pre_norm_fn`` and its backward on 128.
+    """
+    torch.manual_seed(seq_len)
+    device = torch.device("cuda")
+    batch, hc_mult, hidden = 1, 4, 256
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=device, dtype=torch.float32) * 0.01
+    eager_pre = resolve_op("mhc", "pre", "eager").wrapper
+    other_pre = resolve_op("mhc", "pre", "tilelang").wrapper
+
+    with torch.no_grad():
+        inference = other_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+        eager_inference = eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected in zip(inference, eager_inference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+        assert actual.shape[1] == seq_len
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected, name in (
+        (post_o, post_e, "post"),
+        (comb_o, comb_e, "comb"),
+        (collapsed_o, collapsed_e, "collapsed"),
+    ):
+        assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grad = torch.randn_like(collapsed_o)
+    other_grads = torch.autograd.grad((collapsed_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((collapsed_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert torch.isfinite(actual).all(), "padded backward must not read uninitialized memory"
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=MHC_FUSED_GRAD_COSINE, norm_rtol=0.25)
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.parametrize("seq_len", [32, 33, 95])
+def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
+    """The final collapse runs the same unguarded tiling as ``pre``."""
+    torch.manual_seed(seq_len + 1)
+    device = torch.device("cuda")
+    batch, hc_mult, hidden = 1, 4, 256
+    norm_eps, hc_eps = 1e-6, 1e-6
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(1, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(hc_mult, device=device, dtype=torch.float32) * 0.01
+    eager = resolve_op("mhc", "head", "eager").wrapper
+    other = resolve_op("mhc", "head", "tilelang").wrapper
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    y_o = other(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, hc_eps)
+    y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
+    assert y_o.shape == y_e.shape
+    torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)

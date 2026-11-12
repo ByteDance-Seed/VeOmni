@@ -36,6 +36,12 @@
 # particular `swiglu_mlp` is the shared expert, which DeepGEMM does not cover -- so the
 # two selections compose rather than conflict.
 #
+# The three GEMM families also accept `deepgemm_fp8` themselves, which replaces the
+# emulation with real FP8 tensor-core forward, dgrad and wgrad. Selecting it everywhere
+# is `deepseek_v4_deepgemm_fp8.yaml`; selecting only the routed experts is the variant
+# above. `qat` and `deepgemm_fp8` are never both selected on one field -- they are two
+# values of the same `*_implementation`, so one replaces the other.
+#
 # Precision: BF16 parameters with FP32 gradient reduction. The fake quantizers are
 # straight-through, so the FP32 master weights keep updating normally and checkpoints
 # stay ordinary floating point -- no quantized tensors are ever persisted.

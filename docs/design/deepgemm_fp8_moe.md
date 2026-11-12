@@ -1,33 +1,52 @@
-# FP8 MoE training with DeepGEMM on Hopper and Blackwell
+# FP8 GEMM training with DeepGEMM on Hopper and Blackwell
 
-`moe_implementation: deepgemm_fp8` selects native FP8 grouped GEMMs for
-routed SwiGLU experts' forward, activation gradients (dgrad), and weight
-gradients (wgrad). It implements the existing `moe_experts/standard` contract
-and is opt-in. It does not require Transformer Engine.
+`deepgemm_fp8` is one implementation name that three GEMM families each register
+on their own field:
+
+| Field | What it replaces | Contract |
+| --- | --- | --- |
+| `moe_implementation` | routed SwiGLU experts' forward, dgrad and wgrad | `moe_experts/standard` |
+| `linear_implementation` | dense (`standard`) and block-diagonal (`grouped`) projections | `linear/standard` and `linear/grouped` |
+| `swiglu_mlp_implementation` | a dense SwiGLU FFN's gate/up/down projections | `swiglu_mlp/standard` |
+
+All three run native FP8 GEMMs on the tensor cores and implement the existing
+contracts, so they are opt-in and a model's `VeomniOp` handles resolve them
+without a modeling change. They do not require Transformer Engine.
+
+The three are independent fields, and that is deliberate. `qat` is the emulating
+counterpart -- it rounds the operands and multiplies in the model dtype -- so for
+each family `qat` and `deepgemm_fp8` are two values of one field and can never
+quantize the same GEMM twice. Across families nothing links them: a run can put
+the routed experts on DeepGEMM (the bulk of a MoE model's FLOPs) while the
+attention projections stay on QAT, or select DeepGEMM everywhere.
 
 ## Configuration
-
-For a model using the standard SwiGLU expert contract:
 
 ```yaml
 model:
   ops_implementation:
+    # Routed experts only.
     moe_implementation: deepgemm_fp8
 ```
 
-The model's existing `VeomniOp` handle resolves the backend at construction.
-Other operators keep their configured implementations. The default MoE backend
-is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
-mixed precision with FP32 master weights. A packed inference checkpoint must
-first pass through its model's existing dequantization/weight-loading path.
+```yaml
+model:
+  ops_implementation:
+    # Every GEMM family on real FP8 tensor cores.
+    linear_implementation: deepgemm_fp8
+    swiglu_mlp_implementation: deepgemm_fp8
+    moe_implementation: deepgemm_fp8
+    # Stored KV / indexer activations are a separate rounding decision.
+    kv_round_implementation: triton
+```
 
-`deepgemm_fp8` and `qat` are two values of the same `moe_implementation` field,
-so the routed experts can never be quantized twice. The other families are
-independent: selecting `qat` for `linear_implementation` or
-`swiglu_mlp_implementation` alongside `deepgemm_fp8` is valid and covers a case
-DeepGEMM does not -- the attention projections and the **shared expert**, which is
-a dense SwiGLU FFN rather than one of the routed experts. Combine them freely;
-this is independent of rollout/export quantization.
+`configs/text/deepseek_v4_deepgemm_fp8.yaml` is the second form on DeepSeek-V4;
+`configs/text/deepseek_v4_qat.yaml` is the same model with the emulating rows.
+
+The default for every field is unchanged, so nothing moves unless it is asked
+for. Use trainable BF16 parameters, or FSDP2 BF16 parameter mixed precision with
+FP32 master weights. A packed inference checkpoint must first pass through its
+model's existing dequantization/weight-loading path.
 
 MoE-LoRA on routed expert weights is unsupported with `deepgemm_fp8`. Both
 shared and independent LoRA wrappers raise before moving the base parameters,
@@ -35,9 +54,28 @@ instead of silently switching to BF16 eager execution. Select a supported
 MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
 the LoRA targets. This restriction does not apply to LoRA on dense modules.
 
+The same refusal covers the dense families for a different reason: `deepgemm_fp8`
+rounds the weight it multiplies, so it reads `module.weight`, and a wrapped
+projection keeps the real weight at `base_layer`. `resolve_projection` raises
+rather than forwarding the unquantized base layer.
+
+## A cached uniform layout for the dense rows
+
+The routed-expert row derives a `GroupedLayout` from per-expert token counts every
+step, because those counts change every step. A dense projection and a shared
+SwiGLU FFN do not: they are one group whose token count is the padded sequence
+length, so `get_uniform_layout` caches the layout per `(rows, groups, device)`.
+Without it each dense projection paid a host read plus a layout-kernel launch per
+layer per step.
+
+The same layout makes the unpad step skippable. ``GroupedLinear`` normally
+gathers its padded output rows back into source order; when every group is already
+a multiple of the alignment -- always true for one group -- that gather is a
+prefix slice, and the row says so through ``layout.is_identity_unpad``.
+
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
-integration test, using its existing merged weights and FP32 router scores.
-This is operator integration, not full-model convergence validation.
+integration test, using its existing merged weights and FP32 router scores. This
+is operator integration, not full-model convergence validation.
 
 ## Requirements and tensor contract
 
@@ -54,10 +92,15 @@ This is operator integration, not full-model convergence validation.
   merged `[E, 2*I, H]` or split into two `[E, I, H]` tensors; down weights are
   `[E, H, I]`. Hidden size `H` and intermediate size `I` must be positive
   multiples of 128. `E` is the local expert count when EP is enabled.
+  The dense `linear` rows require both the input and the output channel count to
+  be multiples of 128 (a grouped projection: per group), and the SwiGLU row the
+  hidden and intermediate sizes; all three refuse a bias whose length does not
+  match its projection or that lives on another device.
 - Routing weights and int64 expert ids have shape `[tokens, top_k]` and share
   the hidden states' device. Routing weights retain the dtype supplied by the
   model and are applied after the down projection; output and hidden gradients
-  are BF16.
+  are BF16. The dense and SwiGLU rows take an empty tensor wherever a bias is
+  unused, matching every other row in those families.
 - Uneven loads, empty experts, empty batches and repeated expert ids are
   supported. The mainline EP dispatcher counts unique token/expert pairs and
   combines repeated slot weights. `assume_distinct_experts` remains an accepted

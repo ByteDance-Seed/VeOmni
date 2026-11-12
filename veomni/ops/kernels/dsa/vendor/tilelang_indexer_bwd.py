@@ -146,6 +146,11 @@ def tl_indexer_bwd_impl(
                     if indices_shared[i] > -1 and indices_shared[i] < seq_len:
                         T.atomic_add(dIndexK[indices_shared[i], j], d_index_k_frag[i, j])
 
+                # The next block reuses the fragment these atomics drained. Without
+                # a barrier a thread can start its next ``T.gemm`` accumulate before
+                # another thread's atomic add lands, so ``dIndexK`` loses rows.
+                T.sync_threads()
+
             T.copy(d_index_q_frag[:heads, :], dIndexQ[bx, :, :])
             T.copy(d_weights_frag[:heads], dWeights[bx, :])
 

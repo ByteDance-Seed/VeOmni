@@ -39,9 +39,15 @@ __all__ = [
 ]
 
 
-#: ``linear`` rows that fake-quantize the weight they are handed, and therefore
+#: ``linear`` rows that quantize the weight they are handed, and therefore
 #: cannot fall back to calling a wrapped projection module.
-QUANTIZING_IMPLS = frozenset({"qat"})
+#:
+#: ``qat`` fake-quantizes both GEMM operands and multiplies in the model dtype;
+#: ``deepgemm_fp8`` quantizes them again inside its own FP8 GEMM. Either way the
+#: row reads ``module.weight``, so a wrapper with the real weight at
+#: ``base_layer`` would leave the config claiming a low-precision GEMM that never
+#: ran.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
 
 
 def resolve_projection(op_impl: str, module: nn.Module, x: Tensor) -> tuple[Tensor | None, Tensor | None]:

@@ -1573,15 +1573,17 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | 'eager'. "
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
+            "'deepgemm_fp8' (SM90/SM100 FP8 tensor-core compute) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
     linear_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
-            "'eager' (PyTorch F.linear). "
+            "help": "Dense and grouped projection. 'qat' (FP8 fake quantization of both GEMM operands, "
+            "SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 tensor-core forward and backward) | "
+            "'eager' (PyTorch F.linear / bmm). "
             "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
@@ -1692,8 +1694,9 @@ class OpsImplementationConfig:
             "row ('eager') does round -- unlike every other field, 'eager' here is not 'off'. "
             "'triton' (GPU) and 'eager' both round stored KV and indexer operands to their inference "
             "storage dtype on every forward, which is what quantization-aware training needs to see "
-            "deployment's rounding. A model selects the variant that owns its geometry; this field "
-            "only chooses the implementation."
+            "deployment's rounding. A model selects the variant that owns its geometry and element "
+            "format -- 'standard' / 'deepseek_v4' for FP8 recipes, 'fp4' for E2M1 storage; this field "
+            "only chooses the backend."
         },
     )
 

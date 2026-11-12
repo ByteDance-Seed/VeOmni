@@ -1,0 +1,115 @@
+# DeepSeek-V4-Flash SFT with every GEMM family on DeepGEMM FP8: forward, input
+# gradient and weight gradient all run on the FP8 tensor cores instead of emulating
+# the rounding in the model dtype. `deepseek_v4_qat.yaml` is the same selection with
+# the emulating `qat` rows; `deepseek_v4.yaml` trains in the model dtype.
+#
+# Quantization is per family, not a global recipe. Each GEMM family names the kernel
+# that rounds and multiplies its operands, and stored KV/indexer activations round
+# through the `kv_round` family. Leaving a field at its reference row trains that
+# family in the model dtype.
+#
+# What each selection rounds:
+#   linear_implementation        attention and indexer projections (q_a/q_b/kv/o_a/o_b):
+#                                DeepGEMM blockwise FP8 GEMMs in forward, dgrad and wgrad.
+#   swiglu_mlp_implementation    the shared expert's gate/up/down projections: one fused
+#                                FP8 grouped GEMM for gate+up, a recomputed Triton SwiGLU
+#                                between them, and an FP8 GEMM for down.
+#   moe_implementation           routed experts: DeepGEMM FP8 grouped GEMMs. Routing
+#                                weights are never rounded -- they choose which experts
+#                                run, not just the arithmetic.
+#   kv_round_implementation      the tensors inference *stores*: window KV in 64-wide
+#                                FP8 groups over the NoPE channels (the RoPE tail stays
+#                                in the model dtype) and indexer logits over whole
+#                                128-wide heads. `kv_round` is the one field with an
+#                                explicit `none` row, because `eager` there is a real
+#                                row that rounds; `none` leaves stored tensors alone.
+#
+# Hardware: every `deepgemm_fp8` row requires `deep_gemm` plus `triton` on NVIDIA Hopper
+# SM90 or Blackwell SM100 -- the library ships no other kernels, so an SM89 host is
+# refused at handle construction rather than inside the first launch. The `kv_round`
+# Triton row is NVIDIA SM89+ (FP8 E4M3).
+#
+# `qat` and `deepgemm_fp8` are not two spellings of one thing. `qat` rounds both
+# operands and then multiplies in the model dtype, which emulates a deployment GEMM.
+# `deepgemm_fp8` rounds them and multiplies on the FP8 tensor cores, which is that
+# deployment GEMM. This file selects the latter on every family; `deepseek_v4_qat.yaml`
+# selects the former. A mixed selection is also valid -- e.g. DeepGEMM experts with a
+# QAT shared expert -- because they are separate fields.
+#
+# Precision: BF16 parameters with FP32 gradient reduction. DeepGEMM quantizes the
+# operands inside each GEMM with a straight-through approximation, so the FP32 master
+# weights keep updating normally and checkpoints stay ordinary floating point -- no
+# quantized tensors are ever persisted.
+
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  ops_implementation:
+    # Kept at their low-precision rows from deepseek_v4.yaml; not GEMM-related.
+    attn_implementation: eager
+    cross_entropy_loss_implementation: liger_kernel
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    mhc_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+    # Every GEMM family on real FP8 tensor cores.
+    linear_implementation: deepgemm_fp8
+    swiglu_mlp_implementation: deepgemm_fp8
+    moe_implementation: deepgemm_fp8
+    kv_round_implementation: triton
+  optimizer:
+    type: muon
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    muon_ns_implementation: gram_quack
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        # FP32 reduction keeps the straight-through gradients in the wider format;
+        # the quantizers themselves upcast internally, so param dtype does not matter
+        # to them.
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  max_seq_len: 2048
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  max_steps: 1000
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_flash_deepgemm_fp8_tulu_sft
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: deepseek_v4_flash_deepgemm_fp8_tulu_sft

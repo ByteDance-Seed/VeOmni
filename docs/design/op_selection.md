@@ -26,9 +26,9 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). **DeepSeek-V4 is currently the only consumer** — the row exists for any model, but no other model binds it yet |
-| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+), `deepgemm_fp8` (SM90/SM100 FP8 compute) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+), `deepgemm_fp8` (SM90/SM100 FP8 compute) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). **DeepSeek-V4 is currently the only consumer** — the row exists for any model, but no other model binds it yet |
+| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the variant that owns its geometry and element format: `deepseek_v4` fixes the model's two FP8 geometries, `fp4` stores E2M1, and `standard` is model-agnostic and takes the geometry as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -73,9 +73,10 @@ kernel does.
 | Argument | Row | What it selects |
 | --- | --- | --- |
 | `block_size` | `linear`, `swiglu_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
-| `block_size` | `kv_round` (`standard`) | Group width over the last dimension |
+| `block_size` | `kv_round` (`standard`, `fp4`) | Group width over the last dimension |
 | `quant_features` | `kv_round` (`standard`) | How many leading channels to round, so a call can stop partway through the last dimension |
 | `rope_features` | `kv_round` (`deepseek_v4`) | Which of the model's two geometries applies: pass the trailing RoPE channels for a KV entry, or `None` to round a whole indexer head |
+| `scale_fmt` | `kv_round` (`fp4`) | `e4m3` (a narrow float scale) or `ue8m0` (a power-of-two exponent) |
 | `expert_dtype` | `moe_experts` (`qat`) | `fp8` tiles or `fp4` groups, following the checkpoint |
 
 One limitation worth stating plainly: on the GEMM rows a single `block_size` sets
@@ -114,9 +115,10 @@ Leaving any of them at its reference row trains that family in the model dtype.
 its reference row rounds: every other family spells "off" as `eager`, which there
 already does nothing. Registering `none` as a row rather than asking callers to skip
 a missing handle keeps the field shaped like the rest — the model always builds its
-handle and the row decides. The variant is `deepseek_v4` whenever a model selects
-this row: the model names its own variant, and the config only chooses the
-implementation.
+handle and the row decides. The variant follows the model *and* its checkpoint:
+`deepseek_v4` names DeepSeek-V4's two FP8 geometries, while `fp4` stores E2M1
+instead of E4M3 at a different group width, so a checkpoint that stores FP4 has
+no FP8 geometry to fall back to. The config only chooses the backend.
 
 One thing is rejected rather than run: a row's hardware and package `requires` are
 checked when its handle is built, so an unavailable selection raises instead of
@@ -219,11 +221,14 @@ Select a quantized run explicitly instead:
 
 ```yaml
 ops_implementation:
-  linear_implementation: qat
+  linear_implementation: qat            # emulated FP8 GEMMs
   swiglu_mlp_implementation: qat
   moe_implementation: qat
-  kv_round_implementation: triton
+  kv_round_implementation: triton       # stored KV and indexer activations
 ```
+
+…or, for real tensor-core compute rather than emulation, the same fields with
+`deepgemm_fp8` on the three GEMM families (see `deepgemm_fp8_moe.md`).
 
 To drop the compatibility, delete `veomni/models/legacy_qat_selections.py` and the
 one import in `configuration_base._resolve_ops` (search for
@@ -582,18 +587,31 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
+| `qat` | TileLang fake-quantized projections, model-dtype multiply | `tilelang`, SM90+ |
+| `deepgemm_fp8` | DeepGEMM FP8 forward, dgrad and wgrad | `deep_gemm`, `triton`, SM90 or SM100 |
 | `eager` | Registered PyTorch reference row | — |
 
 #### `linear_implementation`
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `eager` | Registered `F.linear` row | — |
+| `qat` | TileLang fake-quantized operands, model-dtype multiply | `tilelang`, SM90+ |
+| `deepgemm_fp8` | DeepGEMM FP8 forward, dgrad and wgrad | `deep_gemm`, `triton`, SM90 or SM100 |
+| `eager` | Registered `F.linear` / `bmm` row | — |
+
+`qat` and `deepgemm_fp8` are not two spellings of one thing. `qat` rounds both
+operands and then multiplies in the model dtype, so it *emulates* a deployment
+GEMM and changes nothing about how the product is accumulated. `deepgemm_fp8`
+rounds them and multiplies on the FP8 tensor cores, which is the deployment GEMM
+itself; it covers forward, input gradient and weight gradient. A model can select
+them independently per family, and `deepseek_v4_qat.yaml` documents why: the
+shared expert is a dense SwiGLU FFN that DeepGEMM's expert kernel does not cover,
+so its family can stay on `qat` while the routed experts run `deepgemm_fp8`.
 
 Both quantizing rows refuse to run on a projection substituted after
 construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):
 they raise instead of forwarding the unquantized base, because a graceful
-fallback would leave the config claiming quantization-aware training.
+fallback would leave the config claiming a low-precision GEMM that never ran.
 
 ### What gets patched
 

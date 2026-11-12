@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..helper import require_tilelang_input
+from ..helper import TOKEN_ALIGN, pad_token_axis, require_tilelang_input
 
 
 def wrapper(
@@ -39,8 +39,9 @@ def wrapper(
     fn = fn.float().contiguous()
     if fn.shape[0] < mix_dim:
         fn = F.pad(fn, (0, 0, 0, mix_dim - fn.shape[0]))
+    hs, seq_len = pad_token_axis(hidden_streams, TOKEN_ALIGN)
     mixes = mhc_pre_norm_fn(
-        hidden_streams.contiguous(),
+        hs,
         fn,
         None,
         norm_eps,
@@ -52,4 +53,5 @@ def wrapper(
         base.float().contiguous(),
         hc_eps,
     )
-    return mhc_pre_apply_mix(hidden_streams.contiguous(), mix.unsqueeze(-1))
+    out = mhc_pre_apply_mix(hs, mix.unsqueeze(-1))
+    return out[:, :seq_len] if hs is not hidden_streams else out

@@ -23,21 +23,35 @@ Rows take the projection **module**, not raw tensors: ``op(self.q_a_proj, x)``.
 has to know whether it is looking at an ``nn.Linear`` or a wrapped one, and never
 branches on the row itself.
 
-The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
-operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
-model dtype, which is what an emulated low-precision deployment GEMM computes.
+Two rows quantize the operands they multiply, and they are not the same thing:
+
+* ``qat`` fake-quantizes both GEMM operands with the DeepSeek-V4 TileLang
+  quantizers and keeps the multiply in the model dtype, which is what an emulated
+  low-precision deployment GEMM computes.
+* ``deepgemm_fp8`` quantizes them and then multiplies on the FP8 tensor cores
+  through DeepGEMM, which is real low-precision compute rather than an emulation.
+  It covers forward, input gradient and weight gradient.
+
 torchao-backed formats are registered separately, on top of this family.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
+from .grouped import deepgemm as grouped_deepgemm
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
+from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import qat as standard_qat
 
 
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+#: DeepGEMM ships Hopper and Blackwell kernels only. SM90 and SM100 are named
+#: explicitly so an SM89 (FP8-capable but unsupported by the library) or an SM120
+#: host is refused at resolve time instead of failing inside the first launch.
+_NVIDIA_SM90_OR_SM100 = GpuKernelRequirement(
+    platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
+)
 
 
 register_op(
@@ -60,6 +74,16 @@ register_op(
 
 register_op(
     "linear",
+    "standard",
+    "deepgemm_fp8",
+    description="DeepGEMM blockwise FP8 dense linear forward, input gradients and weight gradients",
+    wrapper=standard_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
+)
+
+register_op(
+    "linear",
     "grouped",
     "eager",
     description="PyTorch block-diagonal grouped linear projection",
@@ -74,4 +98,14 @@ register_op(
     wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
+)
+
+register_op(
+    "linear",
+    "grouped",
+    "deepgemm_fp8",
+    description="DeepGEMM blockwise FP8 grouped linear forward, input gradients and weight gradients",
+    wrapper=grouped_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
 )

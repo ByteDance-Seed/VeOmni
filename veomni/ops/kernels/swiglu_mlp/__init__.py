@@ -21,10 +21,11 @@ Empty biases are unused.
 
 from torch import nn
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
+from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import qat as standard_qat
@@ -33,11 +34,15 @@ from .standard import qat as standard_qat
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+#: DeepGEMM ships Hopper and Blackwell kernels only; see ``linear``.
+_NVIDIA_SM90_OR_SM100 = GpuKernelRequirement(
+    platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
+)
 
-#: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
+#: ``swiglu_mlp`` rows that quantize the weight tensors they are handed.
 #: Only these need a projection's own ``weight``; every other row is a plain
 #: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
-QUANTIZING_IMPLS = frozenset({"qat"})
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
 
 #: Activations the quantizing rows implement. ``standard`` is SiLU in both
 #: directions (forward and backward); ``geglu`` is GELU-tanh but registers no
@@ -140,6 +145,16 @@ register_op(
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
+)
+
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "deepgemm_fp8",
+    description="DeepGEMM blockwise FP8 SwiGLU MLP forward, input gradients and weight gradients",
+    wrapper=standard_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
 )
 
 

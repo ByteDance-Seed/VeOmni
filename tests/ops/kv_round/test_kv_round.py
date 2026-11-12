@@ -313,3 +313,81 @@ def test_triton_straight_through_backward_matches_eager(device: str):
         grad = torch.randn_like(y)
         (grad_x,) = torch.autograd.grad(y, x, grad)
         torch.testing.assert_close(grad_x, grad, rtol=0, atol=0, msg=impl)
+
+
+def test_fp4_registry_entries():
+    assert OP_REGISTRY.list_registered("kv_round", "fp4") == ["none", "eager", "triton"]
+    assert OP_REGISTRY.default_impl("kv_round", "fp4", device="cpu") == "eager"
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_eager_round_trip_and_straight_through_backward(block_size: int, scale_fmt: str):
+    op = VeomniOp("kv_round", "fp4", "eager")
+    x = torch.randn(2, 4, block_size * 2, dtype=torch.bfloat16, requires_grad=True)
+    y = op(x, block_size=block_size, scale_fmt=scale_fmt)
+
+    assert y.shape == x.shape
+    assert y.dtype == x.dtype
+    assert not torch.equal(y, x)
+
+    grad_out = torch.randn_like(y)
+    (grad_x,) = torch.autograd.grad(y, x, grad_out)
+    torch.testing.assert_close(grad_x, grad_out)
+
+
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_round_trip_is_idempotent(scale_fmt: str):
+    """A second round trip must not move any value.
+
+    That is the property a stored cache has to have: the tensor training sees is
+    already on the E2M1 grid, so an encoder that round-trips its own output has to
+    return it bit for bit. It also pins the nibble/midpoint convention -- a value
+    sitting on a quantization boundary that drifted between calls would show up
+    here as a different result on the second pass.
+
+    Note the round trip is *not* required to stay under the input's amax: an E4M3
+    scale is not a power of two, so the largest stored magnitude can be slightly
+    above the block's own maximum. That magnitude is still a value the deployment
+    kernel can represent, which is what ``E2M1 tops out at 6`` means.
+    """
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    x = torch.randn(4, 8, 32, dtype=torch.bfloat16) * 3.0
+    once = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
+    twice = fp4_roundtrip(once, block_size=32, scale_fmt=scale_fmt)
+
+    torch.testing.assert_close(twice, once, rtol=0, atol=0)
+    assert not torch.equal(once, x)
+
+
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_saturates_at_six_times_the_block_scale(scale_fmt: str):
+    """E2M1 has a hard top of 6, so a block of huge values clamps rather than wraps."""
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    x = torch.full((1, 2, 32), 1e4, dtype=torch.bfloat16)
+    y = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
+    # A saturated block stores one identical magnitude in every slot.
+    assert torch.isfinite(y).all()
+    assert (y == y[..., :1]).all()
+
+
+def test_fp4_rejects_an_unknown_scale_format():
+    op = VeomniOp("kv_round", "fp4", "eager")
+    x = torch.randn(2, 4, 32, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="scale_fmt must be one of"):
+        op(x, block_size=32, scale_fmt="fp8")
+
+
+def test_fp4_rejects_a_partial_group():
+    op = VeomniOp("kv_round", "fp4", "eager")
+    x = torch.randn(2, 4, 40, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="not divisible by FP4 group size"):
+        op(x, block_size=32)
+
+
+def test_fp4_none_row_leaves_the_tensor_untouched():
+    op = VeomniOp("kv_round", "fp4", "none")
+    x = torch.randn(2, 4, 32, dtype=torch.bfloat16)
+    assert torch.equal(op(x, block_size=32), x)

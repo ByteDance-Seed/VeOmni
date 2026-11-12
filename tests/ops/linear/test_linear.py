@@ -29,10 +29,20 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat"]
-    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "deepgemm_fp8"]
+    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat", "deepgemm_fp8"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
+
+
+def test_linear_deepgemm_rows_require_deep_gemm_on_sm90_or_sm100():
+    """The DeepGEMM rows carry the hardware and package they need, like the QAT ones."""
+    for variant in ("standard", "grouped"):
+        entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", variant)}
+        assert ("deepgemm_fp8", ("deep_gemm", "triton")) in entries
+    # SM89 has an E4M3 type but no DeepGEMM kernel, so the row must not resolve there.
+    with pytest.raises(RuntimeError, match="not registered for device|requires unavailable package"):
+        VeomniOp("linear", "standard", "deepgemm_fp8")
 
 
 def test_linear_eager_matches_f_linear():
@@ -184,3 +194,31 @@ def test_the_standard_eager_row_calls_the_projection_module():
 
     assert linear.calls == 1
     torch.testing.assert_close(out, F.linear(x, linear.weight, linear.bias))
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """Same refusal as ``qat``: the row must not train at full precision silently.
+
+    Both quantizing impls read ``module.weight``. A wrapper keeps the real weight
+    at ``base_layer``, so a fallback would run an unquantized GEMM under a config
+    that selected a low-precision one.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.linear._module import resolve_projection
+
+    class Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(8, 4, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    with pytest.raises(ValueError, match="cannot run on .Wrapped."):
+        resolve_projection("deepgemm_fp8", Wrapped(), torch.randn(2, 8))
+
+
+def test_both_quantizing_impls_are_declared_together():
+    """``QUANTIZING_IMPLS`` is what the wrapper-refusal and LoRA checks consult."""
+    assert QUANTIZING_IMPLS == frozenset({"qat", "deepgemm_fp8"})
