@@ -1105,6 +1105,9 @@ class PatchedQwen4ExpTextExperts(nn.Module):
 #    never derives them from the on-device cu_seq_lens_q (GPU->CPU sync).
 # 7. Sort shard ids once and pay a single host sync for the per-shard split
 #    sizes instead of one nonzero sync per shard in every PLE lookup.
+# 8. Gather each shard's sorted requests and undo the permutation once, instead
+#    of scattering every shard with ``index_copy`` whose NPU backward runs a
+#    per-index host loop.
 # ================================================================
 @config.add_helper
 class _Qwen4ExpScaleGradient(torch.autograd.Function):
@@ -1200,33 +1203,45 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         row_ids: torch.Tensor,
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        """Gather each request's row from the checkpoint-native shard that owns it."""
         first_embedding = self.ngram_embedding["shard_0"]
         first_weight = first_embedding.weight
         if hasattr(first_weight, "to_local"):
             first_weight = first_weight.to_local()
-        output = first_weight.new_zeros(
-            (shard_ids.numel(), first_weight.shape[1]),
-            dtype=output_dtype or first_weight.dtype,
-        )
         # --- Patch.7: Sort once and take a single host sync for the per-shard
         # split sizes. The previous ``torch.where(shard_ids == shard_idx)[0]``
         # nonzero-synced the match count to the host once per shard per lookup,
         # serialising the host against the device on the PLE hot path. ---
         order = torch.argsort(shard_ids, stable=True)
         shard_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding)).tolist()
+        # --- Patch.7 ---
+        # --- Patch.8: Gather each shard's sorted requests and restore the
+        # request order with one inverse permutation. ``order`` already groups
+        # the requests by shard, so concatenating the per-shard gathers
+        # reproduces the original request order. The per-shard ``index_copy``
+        # scatters this replaces also launch once per shard, but torch_npu runs
+        # their backward as a per-index host loop (71,690 ``select`` /
+        # ``as_strided`` / ``item`` triples, 1.6 s of host time in one measured
+        # step), while the gather backward has no such host path. ---
+        result_dtype = output_dtype or first_weight.dtype
+        if order.numel() == 0:
+            return first_weight.new_empty((0, first_weight.shape[1]), dtype=result_dtype)
+        sorted_row_ids = row_ids[order]
+        gathered = []
         shard_start = 0
         for embedding, shard_count in zip(self.ngram_embedding.values(), shard_counts, strict=True):
             shard_end = shard_start + shard_count
-            if shard_end > shard_start:
-                positions = order[shard_start:shard_end]
+            if shard_count:
                 weight = embedding.weight
                 if hasattr(weight, "to_local"):
                     weight = weight.to_local()
-                values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
-                output = output.index_copy(0, positions, values)
+                gathered.append(nn.functional.embedding(sorted_row_ids[shard_start:shard_end], weight))
             shard_start = shard_end
-        # --- Patch.7 ---
-        return output
+        values = torch.cat(gathered).to(result_dtype)
+        inverse_order = torch.empty_like(order)
+        inverse_order[order] = torch.arange(order.numel(), device=order.device)
+        return values.index_select(0, inverse_order)
+        # --- Patch.8 ---
 
     def _distributed_lookup(
         self,
