@@ -317,6 +317,12 @@ policy, and SP reduction are outside the op in
 `models/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
 causal-only.
 
+On Ascend NPU, `chunk_loss` compacts ignored rows before projection and uses
+native FP32 cross-entropy with first-order gradients for supported FP16, BF16,
+and FP32 inputs. It uses eager CE for logits bias, per-token loss observation,
+compilation, or inputs outside the native kernel contract, such as chunks with
+more than 200,000 flattened rows before compaction.
+
 Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE implementation does the
