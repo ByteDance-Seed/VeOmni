@@ -4,9 +4,9 @@ End-to-end recipe for training and inferring **Janus-1.3B** as a SeedOmni
 graph model: a unified understanding (image→text) + generation (text→image)
 model whose SigLIP / VQVAE / LLaMA backbone are wired as separate OmniModules.
 
-All paths below assume the upstream HuggingFace checkpoint lives at
-`/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B`. Adjust to your
-own storage.
+Paths below are written as the placeholder `Janus-1.3B` for the upstream
+HuggingFace checkpoint — replace it with an absolute path (or `hdfs://` URL) this
+job can read. The same applies to `data.yaml`'s `sources`.
 
 ## Modules
 
@@ -55,7 +55,7 @@ again.
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B
+  --model.model_path Janus-1.3B
 ```
 
 The layout cuts the checkpoint into one sub-checkpoint per OmniModule (SigLIP
@@ -68,8 +68,8 @@ identical module weights:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
-  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  --model_path Janus-1.3B \
+  --output_dir Janus-1.3B-split
 ```
 
 The `output_dir` is then a split-checkpoint root (a folder of per-module
@@ -89,9 +89,9 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 ```yaml
 # configs/seed_omni/Janus/data.yaml
 sources:
-  - /mnt/hdfs/user_dir/dataset/imagenet1k_train      # text -> image (T2I)
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data # text-only SFT
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k    # image -> text (I2T)
+  - imagenet1k_train      # text -> image (T2I)
+  - tulu-3-sft-mixture    # text-only SFT
+  - sharegpt4v_cap_100k   # image -> text (I2T)
 names:
   - imagenet1k
   - tulu-3-sft-mixture
@@ -298,7 +298,7 @@ bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.model_config.infer_type infer_und \
   --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
@@ -313,7 +313,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.model_config.infer_type infer_und \
   --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
@@ -329,7 +329,7 @@ bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.model_config.infer_type infer_gen \
   --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
@@ -344,7 +344,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.model_config.infer_type infer_gen \
   --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \

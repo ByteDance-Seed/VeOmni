@@ -22,8 +22,11 @@
 #     --model.model_config.infer_type infer_gen \
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf_fsdp
+#
+# `model_path` is a placeholder: replace it with an absolute path this job can
+# read (a converted omni root, or the upstream Janus root via the HF layout).
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  model_path: Janus-1.3B
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:
