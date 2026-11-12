@@ -6,7 +6,7 @@ from it directly, or split it offline with ``scripts/seed_omni/convert_model.py`
 (which still goes through the family converter — see
 :mod:`veomni.models.seed_omni.modules.janus.convert_model` — because a DeepSeek
 ``multi_modality`` source has to be rewritten to the HF layout first). Graphs
-come from ``configs/seed_omni/Janus/janus_1.3b/`` (``train/`` DAG, ``infer/``
+come from ``configs/seed_omni/Janus/janus/`` (``train/`` DAG, ``infer/``
 FSM).
 
 Modules::
@@ -263,7 +263,7 @@ JANUS_HF_LAYOUT = OmniHFLayout(
     # that duplicate when the text encoder ties the head instead of holding it.
     # Janus-1.3B is untied, so there the module keeps and loads its own copy.
     tied_source_keys={"lm_head.weight": "model.language_model.embed_tokens.weight"},
-    graph_dir="configs/seed_omni/Janus/janus_1.3b",
+    graph_dir="configs/seed_omni/Janus/janus",
     training_graphs="train/graph_train.yaml",
     generation_graphs={
         "infer_gen": "infer/graph_infer_gen.yaml",

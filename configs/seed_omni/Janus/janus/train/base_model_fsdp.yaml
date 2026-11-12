@@ -6,7 +6,7 @@
 # wrap on every child's _no_split_modules, then the root).
 #
 # Launch:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base_model_fsdp.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base_model_fsdp.yaml
 #
 # To get this wrap on the plain conversation launcher instead, add
 #   --model.accelerator.fsdp_config.fsdp_scope model
@@ -16,12 +16,12 @@
 model:
   model_path: Janus-1.3B
   model_config:
-    modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
-    train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml
+    modules: configs/seed_omni/Janus/janus/train/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus/train/graph_train.yaml
     infer_graph:
-      infer_gen: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml
-      infer_interleave: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml
+      infer_gen: configs/seed_omni/Janus/janus/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus/infer/graph_infer_und.yaml
+      infer_interleave: configs/seed_omni/Janus/janus/infer/graph_infer_interleave.yaml
     infer_type: infer_interleave
   ops_implementation:
     attn_implementation: flash_attention_2

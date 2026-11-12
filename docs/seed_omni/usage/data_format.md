@@ -190,7 +190,7 @@ launch with:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml
 
 # Janus family config (on omniv2 / follow-up model PRs):
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
 See [Training and Inference](training_and_inference.md) for the full convert → train → resume → infer pipeline.

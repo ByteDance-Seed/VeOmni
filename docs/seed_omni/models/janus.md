@@ -26,7 +26,7 @@ walked through in [Architecture](../design/architecture.md#3-training-flow).
 
 ## Config files
 
-Config dir: `configs/seed_omni/Janus/janus_1.3b/` (layout explained in
+Config dir: `configs/seed_omni/Janus/janus/` (layout explained in
 [Training and Inference](../usage/training_and_inference.md#1-config-layout)).
 Training and inference take the **same** `base.yaml`; its `model.*` block drives
 the trainer and its `infer.*` block drives the inferencer.
@@ -54,7 +54,7 @@ again.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_path Janus-1.3B
 ```
 
@@ -117,7 +117,7 @@ or multi-node). Pass the task and config after it.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+  configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
 The conversation DAG runs every module on the `conversation_list` carrier. A single
@@ -126,7 +126,7 @@ FSDP2 tree over the composed OmniModel uses `train/base_model_fsdp.yaml`, or add
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.accelerator.fsdp_config.fsdp_scope model
 ```
 
@@ -162,12 +162,12 @@ accelerator:
 Quick 1-node smoke run (no wandb, tiny step budget). The launcher's
 `modules_train.yaml` shards `embed_tokens.weight` across 4 ranks (`emb=4`), so
 this needs 4 GPUs — on a smaller node `emb` cannot divide the mesh; run
-`--model.model_config.modules configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`
+`--model.model_config.modules configs/seed_omni/Janus/janus/train/modules_train.yaml`
 with the `emb` block removed, or use `train/base_model_fsdp.yaml`:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --train.max_steps 20 \
   --train.checkpoint.save_steps 10 \
   --train.wandb.enable false
@@ -190,7 +190,7 @@ its own `1/sp` token shard):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 4 --train.micro_batch_size 1
 ```
@@ -209,7 +209,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --train.checkpoint.load_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -295,9 +295,9 @@ Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_und \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml \
   --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
@@ -310,9 +310,9 @@ replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_und \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
   --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
@@ -326,9 +326,9 @@ Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_gen \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml \
   --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
@@ -341,9 +341,9 @@ replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_gen \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
   --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \

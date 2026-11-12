@@ -201,7 +201,7 @@ so each module's token count weights its own loss.
 ## 3. Training flow
 
 The default Janus `training_graph`
-(`configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml`):
+(`configs/seed_omni/Janus/janus/train/graph_train.yaml`):
 
 ```mermaid
 flowchart LR

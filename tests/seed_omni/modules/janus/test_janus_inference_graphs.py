@@ -23,7 +23,7 @@ from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 
 def _infer_config(name: str) -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus_1.3b" / "infer" / name
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus" / "infer" / name
 
 
 def _image_vq_order(name: str) -> list[str]:

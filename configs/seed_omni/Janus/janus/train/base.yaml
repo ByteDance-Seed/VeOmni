@@ -1,7 +1,7 @@
 # Janus-1.3B SeedOmni training launcher.
 #
 # Launch:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base.yaml
 #
 # Prerequisites — split the upstream Janus checkpoint, OR point `model_path`
 # straight at the upstream root: `janus/hf_layout.py` registers a `janus` HF
@@ -17,19 +17,19 @@
 # absolute paths this job can read before training.
 #
 # Launch inference (override modules for eager single-process or fsdp distributed):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus/train/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
 #     --infer.prompt "Describe this image." \
 #     --infer.output_dir janus_out
 model:
   model_path: Janus-1.3B
   model_config:
-    modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
-    train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml
+    modules: configs/seed_omni/Janus/janus/train/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus/train/graph_train.yaml
     infer_graph:
-      infer_gen: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml
-      infer_interleave: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml
+      infer_gen: configs/seed_omni/Janus/janus/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus/infer/graph_infer_und.yaml
+      infer_interleave: configs/seed_omni/Janus/janus/infer/graph_infer_interleave.yaml
     infer_type: infer_interleave
   ops_implementation:
     attn_implementation: flash_attention_2
