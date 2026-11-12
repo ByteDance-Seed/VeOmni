@@ -857,13 +857,14 @@ def test_multi_optimizer_rejects_changed_group_identity(tmp_path):
 def test_unversioned_multi_optimizer_checkpoint_fails_closed(tmp_path):
     import torch.distributed.checkpoint as dcp
 
-    from veomni.checkpoint.layout import optimizer_dir
+    from veomni.checkpoint.layout import optimizer_dir, weights_dir
 
     model, optimizer = _model_and_optimizer()
     model.weight.grad = torch.ones_like(model.weight)
     model.bias.grad = torch.ones_like(model.bias)
     optimizer.step()
     # Historical MultiOptimizer format had flat entries but no group identity.
+    dcp.save({"model": model.state_dict()}, checkpoint_id=weights_dir(str(tmp_path)))
     dcp.save({"optimizer": optimizer._sparse_state_dict()}, checkpoint_id=optimizer_dir(str(tmp_path)))
     target, restored = _model_and_optimizer()
     with pytest.raises(RuntimeError, match="(?i)group layout is unproven"):

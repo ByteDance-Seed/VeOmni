@@ -1360,3 +1360,30 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     for tensor in (x, w1, w2):
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
+
+
+def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
+    """A non-SwiGLU activation cannot use a fused expert row, so QAT must be refused.
+
+    The fused kernels call ``aten.silu`` / ``aten.silu_backward`` directly, so the
+    Python ``act_fn`` loop is the only path for another activation -- and that loop
+    cannot reach the family row. Support is tracked in #1430.
+
+    The activation is read from ``use_swiglu_mlp`` because these experts modules are
+    plain ``nn.Module`` objects with no config reference.
+    """
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+
+    def experts(impl, swiglu):
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+
+    # SwiGLU is what every fused row implements.
+    reject_quantizing_act_fn(experts("qat", swiglu=True))
+
+    with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
+        reject_quantizing_act_fn(experts("qat", swiglu=False))
+
+    # A reference row may use the fallback; that is a deliberate precision choice.
+    reject_quantizing_act_fn(experts("eager", swiglu=False))

@@ -20,6 +20,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     ModelState,
     OptimizerState,
     _apply_extra_parallel_dim,
+    _checkpoint_extra_parallel_signature,
     _export_extra_parallel_layout_key,
     _extra_parallel_first_mesh,
     _extra_parallel_layout_key,
@@ -596,8 +597,46 @@ def _high_level_roundtrip_worker(rank, root):
             expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(target_axis)])
             torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
 
-        # V2 checkpoints created before per-tensor layout metadata used the
-        # namespace marker and DCP's default planner. They must remain readable.
+        # A rank-inconsistent version must not invalidate an existing DCP.
+        import hashlib
+        from pathlib import Path
+
+        path = f"{root}/high-0"
+
+        def fingerprint():
+            return {
+                str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in Path(path).rglob("*")
+                if p.is_file()
+            }
+
+        before = fingerprint()
+        source = model_for(0, ep_local)
+        source._fqn2spec_info["weight"].checkpoint_layout_v2 = rank % 2 == 0
+        with pytest.raises(RuntimeError, match="layout version differs across ranks"):
+            DistributedCheckpointer.save(path, {"model": source}, parallel_state=parallel)
+        assert fingerprint() == before
+        for mismatch in ("axis", "trainable_only", "freeze"):
+            source = model_for(0, ep_local)
+            if mismatch == "axis" and rank % 2:
+                source._fqn2spec_info["weight"].fsdp_shard_dim = 1
+            if mismatch == "freeze" and rank % 2:
+                source.weight.requires_grad_(False)
+            with pytest.raises(RuntimeError, match="layout or optimizer policy differs across ranks"):
+                DistributedCheckpointer.save(
+                    path,
+                    {"model": source},
+                    trainable_only=mismatch == "freeze" or (mismatch == "trainable_only" and rank % 2 == 0),
+                    parallel_state=parallel,
+                )
+            assert fingerprint() == before
+        target = model_for(0, torch.zeros_like(ep_local))
+        DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
+        expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(0)])
+        torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
+
+        # V2 split-layout checkpoints created before per-tensor layout metadata
+        # used the namespace marker and DCP's default planner; these still load.
         source = model_for(0, ep_local)
         path = f"{root}/namespaced-before-planner"
         old_state = ModelState(source, parallel_state=parallel).state_dict()
@@ -610,12 +649,22 @@ def _high_level_roundtrip_worker(rank, root):
             shape=full.shape,
             stride=full.stride(),
         )
-        dcp.save({"model": old_state}, checkpoint_id=path)
+        dcp.save({"model": old_state}, checkpoint_id=weights_dir(path))
         for target_axis in (0, 1):
             target = model_for(target_axis, torch.zeros_like(ep_local))
             DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
             expected = distribute_tensor(ep_local, fsdp_mesh, [Shard(target_axis)])
             torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
+
+        # The upstream pre-split layout is intentionally unsupported, even if
+        # its tensors have a versioned marker. Refuse before changing the target.
+        pre_split = f"{root}/pre-split-namespaced"
+        dcp.save({"model": old_state}, checkpoint_id=pre_split)
+        target = model_for(0, torch.zeros_like(ep_local))
+        before = target.weight.to_local().clone()
+        with pytest.raises(FileNotFoundError, match="not resumable"):
+            DistributedCheckpointer.load(pre_split, {"model": target}, parallel_state=parallel)
+        torch.testing.assert_close(target.weight.to_local(), before, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
@@ -623,6 +672,91 @@ def _high_level_roundtrip_worker(rank, root):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
 def test_high_level_v2_cross_layout_model_only_roundtrip(tmp_path):
     torch.multiprocessing.spawn(_high_level_roundtrip_worker, args=(str(tmp_path),), nprocs=4, join=True)
+
+
+def test_logical_signature_normalizes_negative_axes_but_preserves_singleton_axes():
+    mesh = SimpleNamespace(shape=(1, 1), mesh_dim_names=("ep_fsdp", "ep"))
+    first = SpecInfo("ep", Shard(0), "weight", mesh, 0, None, (8, 8), True)
+    second = SpecInfo("ep", Shard(-1), "weight", mesh, -1, None, (8, 8), True)
+    equivalent = SpecInfo("ep", Shard(1), "weight", mesh, 1, None, (8, 8), True)
+
+    def signature(spec):
+        return _checkpoint_extra_parallel_signature({"weight": spec}, optimizer_present=False, trainable_only=False)
+
+    assert signature(first) != signature(second)
+    assert signature(equivalent) == signature(second)
+    persistent = SpecInfo("ep", Shard(0), "weight", mesh, 0, 1, (8, 8), False)
+    persistent_unused_fields = SpecInfo("ep", Shard(0), "weight", mesh, 1, 1, (8, 8), True)
+    assert signature(persistent) == signature(persistent_unused_fields)
+    persistent_unknown_shape = SpecInfo("ep", Shard(-1), "weight", mesh, 0, -1, None, False)
+    persistent_positive = SpecInfo("ep", Shard(1), "weight", mesh, 0, 1, None, False)
+    assert _checkpoint_extra_parallel_signature(
+        {"weight": persistent_unknown_shape},
+        optimizer_present=False,
+        trainable_only=False,
+        runtime_ndims={"weight": 2},
+    ) == _checkpoint_extra_parallel_signature(
+        {"weight": persistent_positive}, optimizer_present=False, trainable_only=False, runtime_ndims={"weight": 2}
+    )
+    assert signature(first) != _checkpoint_extra_parallel_signature(
+        {"weight": first}, optimizer_present=False, trainable_only=True
+    )
+
+
+def _singleton_axis_guard_worker(rank, root, singleton):
+    import hashlib
+    from datetime import timedelta
+    from pathlib import Path
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{root}/init-singleton", rank=rank, world_size=4, timeout=timedelta(seconds=45)
+    )
+    try:
+        shape = (2, 1, 2) if singleton == "fsdp" else (2, 2, 1)
+        mesh = init_device_mesh("cpu", shape, mesh_dim_names=("ep_replicate", "ep_fsdp", "ep"))
+        fsdp_mesh = mesh[("ep_replicate", "ep_fsdp")]
+        ep_local = (
+            torch.arange(64, dtype=torch.float32).reshape(8, 8).chunk(shape[-1], dim=0)[mesh.get_local_rank("ep")]
+        )
+        parallel = SimpleNamespace(
+            dp_mode="fsdp2", extra_parallel_names=("ep",), extra_parallel_fsdp_device_mesh={"ep": mesh}
+        )
+
+        def model_for(axis, ep_axis=0):
+            model = torch.nn.Module()
+            value = distribute_tensor(ep_local.contiguous(), fsdp_mesh, [Replicate(), Shard(axis)])
+            model.register_parameter("weight", torch.nn.Parameter(value))
+            model._fqn2spec_info = {"weight": SpecInfo("ep", Shard(ep_axis), "weight", mesh, axis, None, (8, 8), True)}
+            return model
+
+        path = f"{root}/singleton-checkpoint"
+        DistributedCheckpointer.save(path, {"model": model_for(0)}, parallel_state=parallel)
+
+        def fingerprint():
+            return {
+                str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in Path(path).rglob("*")
+                if p.is_file()
+            }
+
+        before = fingerprint()
+        with pytest.raises(RuntimeError, match="layout or optimizer policy differs across ranks"):
+            model = model_for(rank % 2 if singleton == "fsdp" else 0, rank % 2 if singleton == "ep" else 0)
+            DistributedCheckpointer.save(path, {"model": model}, parallel_state=parallel)
+        assert fingerprint() == before
+        target = model_for(0)
+        target.weight.data.zero_()
+        DistributedCheckpointer.load(path, {"model": target}, parallel_state=parallel)
+        expected = distribute_tensor(ep_local.contiguous(), fsdp_mesh, [Replicate(), Shard(0)])
+        torch.testing.assert_close(target.weight.to_local(), expected.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
+@pytest.mark.parametrize("singleton", ["fsdp", "ep"])
+def test_singleton_axis_disagreement_preserves_checkpoint(tmp_path, singleton):
+    torch.multiprocessing.spawn(_singleton_axis_guard_worker, args=(str(tmp_path), singleton), nprocs=4, join=True)
 
 
 def test_regular_nested_tensor_list_loads_with_strict_planner(tmp_path):

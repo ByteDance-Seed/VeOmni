@@ -69,7 +69,6 @@ def same_checkpoint_path(left, right) -> bool:
 MODEL_DIRNAME = "model"
 WEIGHTS_DIRNAME = "ckpt"
 OPTIMIZER_DIRNAME = "optimizer"
-LR_SCHEDULER_FILENAME = "lr_scheduler.pt"
 LOADER_DIRNAME = "loader"
 EXTRA_STATE_DIRNAME = "extra_state"
 RANK_FILE_FORMAT = "rank_{}.pt"
@@ -117,11 +116,6 @@ def optimizer_dir(step_root: str, module: str = "") -> str:
     return os.path.join(model_dir(step_root, module), OPTIMIZER_DIRNAME)
 
 
-def lr_scheduler_path(step_root: str, module: str = "") -> str:
-    """Replicated scheduler pickle, beside the two DCP directories."""
-    return os.path.join(model_dir(step_root, module), LR_SCHEDULER_FILENAME)
-
-
 def loader_path(step_root: str, rank: int) -> str:
     """Rank-local dataloader cursor. Not nested per module: one job, one cursor."""
     return os.path.join(step_root, LOADER_DIRNAME, RANK_FILE_FORMAT.format(rank))
@@ -161,6 +155,7 @@ def assets_dir(assets_root: str, module: str = "") -> str:
 
 
 def manifest_path(step_root: str) -> str:
+    """Path of the step's completion marker, at the step root."""
     return os.path.join(step_root, MANIFEST_FILENAME)
 
 
@@ -295,7 +290,6 @@ __all__ = [
     "HF_EXPORT_DIRNAME",
     "LORA_EXPORT_DIRNAME",
     "LOADER_DIRNAME",
-    "LR_SCHEDULER_FILENAME",
     "MANIFEST_FILENAME",
     "MANIFEST_FORMAT_VERSION",
     "MODEL_DIRNAME",
@@ -310,7 +304,6 @@ __all__ = [
     "hf_export_dir",
     "loader_path",
     "lora_export_dir",
-    "lr_scheduler_path",
     "manifest_path",
     "model_dir",
     "optimizer_dir",
