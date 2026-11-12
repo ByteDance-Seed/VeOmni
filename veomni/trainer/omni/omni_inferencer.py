@@ -145,7 +145,7 @@ class OmniInferencer:
             self.model = OmniModel.from_pretrained(
                 self.checkpoint_root,
                 config=config,
-                torch_dtype=torch.bfloat16,
+                torch_dtype="auto",
                 device_map="auto",
             ).eval()
             logger.info_rank0(
@@ -242,6 +242,7 @@ class OmniInferencer:
             videos=req.videos or None,
             mm_configs=req.mm_configs or None,
             inference=True,
+            **req.generation_kwargs,
         )
         if self._distributed:
             # Every module sits on this rank's device, as in training. An eager

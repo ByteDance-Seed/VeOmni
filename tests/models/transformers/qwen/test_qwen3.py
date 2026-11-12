@@ -339,7 +339,7 @@ def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
         full_qkv_by_layer["k"] = k_all.transpose(1, 2)
         full_qkv_by_layer["v"] = v_all.transpose(1, 2)
 
-        from transformers.masking_utils import create_causal_mask
+        from veomni.models.utils.mask_utils import create_causal_mask
 
         # Pre-built 4D mask from create_causal_mask with local inputs_embeds (4 tokens) and full 2D mask (8 tokens)
         causal_4d = create_causal_mask(
@@ -349,8 +349,10 @@ def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
             past_key_values=None,
             position_ids=full_position_ids[:, :4],
             allow_is_causal_skip=False,
+            cu_seq_lens_q=cu_seqlens,
         )
         assert causal_4d.shape == (1, 1, 8, 8)
+        assert not bool(causal_4d[0, 0, 3, 0])
 
         rank_outputs = {}
 
@@ -380,12 +382,234 @@ def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
 
         # Compare against non-SP reference attention on the same layer
         monkeypatch.setattr(ulysses_mod, "get_parallel_state", lambda: SimpleNamespace(ulysses_size=1))
+        ref_mask = create_causal_mask(
+            config=ref_model.config,
+            inputs_embeds=full_normed,
+            attention_mask=torch.ones(1, 8, dtype=torch.bool),
+            past_key_values=None,
+            position_ids=full_position_ids,
+            cu_seq_lens_q=cu_seqlens,
+        )
         ref_attn_proj, _ = ref_model.model.layers[0].self_attn(
             hidden_states=full_normed,
             position_embeddings=full_pos_emb,
-            attention_mask=torch.ones(1, 8, dtype=torch.bool),
+            attention_mask=ref_mask,
             cu_seq_lens_q=cu_seqlens,
             cu_seq_lens_k=cu_seqlens,
         )
         torch.testing.assert_close(sp_attn_proj, ref_attn_proj, atol=EAGER_ATOL, rtol=EAGER_RTOL)
         assert ref_logits.shape == (1, 8, config.vocab_size)
+
+
+def test_qwen3_routes_full_and_sliding_packed_flex_masks(monkeypatch, available_nvidia_ops):
+    """Packed Qwen3 with a 2D all-ones attention_mask must build isolating BlockMasks for full and sliding layers."""
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    captured = []
+
+    def fake_flex(module, query, key, value, attention_mask, *, sliding_window=None, **kwargs):
+        captured.append((module.layer_type, attention_mask, sliding_window))
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_flex_attention", fake_flex)
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_flex_attention"
+    config = _tiny_config(
+        layer_types=["full_attention", "sliding_attention"],
+        use_sliding_window=True,
+        sliding_window=3,
+    )
+    model = _build_qwen3(config, ops).eval()
+    input_ids = torch.randint(3, model.config.vocab_size, (1, 8))
+
+    with torch.no_grad():
+        output = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+            cu_seq_lens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 3, 8], dtype=torch.int32),
+            use_cache=False,
+        )
+
+    assert torch.isfinite(output.logits).all()
+    assert [layer_type for layer_type, _, _ in captured] == ["full_attention", "sliding_attention"]
+    assert all(isinstance(attention_mask, BlockMask) for _, attention_mask, _ in captured)
+    assert [sliding_window for _, _, sliding_window in captured] == [None, 3]
+
+    zero = torch.tensor(0)
+    full_mask = captured[0][1]
+    sliding_mask = captured[1][1]
+    # Sample 1 (tokens 3..7) must not attend to sample 0 (tokens 0..2), even with 2D all-ones attention_mask.
+    assert not full_mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+    assert full_mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
+    assert not sliding_mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+    # Sliding window=3 within sample 1: query 7 sees keys 5..7, not key 3.
+    assert not sliding_mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(3))
+    assert sliding_mask.mask_mod(zero, zero, torch.tensor(7), torch.tensor(5))
+
+
+def test_qwen3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch, available_nvidia_ops):
+    """Under Ulysses SP=2, Qwen3Model.forward builds global 8x8 packed BlockMasks from local 4-token shards."""
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    from veomni.ops.kernels.attention import ulysses
+
+    captured = []
+
+    def fake_flex(module, query, key, value, attention_mask, **kwargs):
+        captured.append(attention_mask)
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setattr(
+        ulysses,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_size=2, async_enabled=False),
+    )
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_flex_attention", fake_flex)
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_flex_attention"
+    config = _tiny_config()
+    model = _build_qwen3(config, ops).eval()
+    local_input_ids = torch.randint(3, model.config.vocab_size, (1, 4))
+
+    with torch.no_grad():
+        model(
+            input_ids=local_input_ids,
+            attention_mask=torch.ones(1, 8, dtype=torch.long),
+            position_ids=torch.tensor([[0, 1, 2, 0]]),
+            cu_seq_lens_q=torch.tensor([0, 3, 5, 8], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 3, 5, 8], dtype=torch.int32),
+            use_cache=False,
+        )
+
+    assert len(captured) == config.num_hidden_layers
+    zero = torch.tensor(0)
+    for block_mask in captured:
+        assert isinstance(block_mask, BlockMask)
+        assert block_mask.shape == (1, 1, 8, 8)
+        assert not block_mask.mask_mod(zero, zero, torch.tensor(3), torch.tensor(2))
+        assert not block_mask.mask_mod(zero, zero, torch.tensor(5), torch.tensor(4))
+        assert block_mask.mask_mod(zero, zero, torch.tensor(6), torch.tensor(5))
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Qwen3 packed FlexAttention requires CUDA")
+def test_qwen3_packed_flex_matches_independent_samples_on_cuda():
+    """Packed Qwen3 with veomni_flex_attention and 2D all-ones attention_mask matches independent samples."""
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    torch.manual_seed(127)
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_flex_attention"
+    model = _build_qwen3(_tiny_config(), ops).to(device=device, dtype=dtype).eval()
+    packed_inputs = torch.randn(
+        1,
+        8,
+        model.config.hidden_size,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    with torch.no_grad():
+        first_logits = model(
+            inputs_embeds=packed_inputs[:, :3].detach(),
+            attention_mask=torch.ones(1, 3, device=device, dtype=torch.long),
+            position_ids=torch.arange(3, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], device=device, dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 3], device=device, dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            inputs_embeds=packed_inputs[:, 3:].detach(),
+            attention_mask=torch.ones(1, 5, device=device, dtype=torch.long),
+            position_ids=torch.arange(5, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], device=device, dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 5], device=device, dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    packed_logits = model(
+        inputs_embeds=packed_inputs,
+        attention_mask=torch.ones(1, 8, device=device, dtype=torch.long),
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]], device=device),
+        cu_seq_lens_q=torch.tensor([0, 3, 8], device=device, dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 3, 8], device=device, dtype=torch.int32),
+        use_cache=False,
+    ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, rtol=3e-2, atol=3e-2)
+
+    # Loss on sample 1 only must not backpropagate into sample 0 inputs.
+    packed_logits[:, 3:].float().square().mean().backward()
+    assert packed_inputs.grad is not None
+    torch.testing.assert_close(
+        packed_inputs.grad[:, :3],
+        torch.zeros_like(packed_inputs.grad[:, :3]),
+    )
+    assert packed_inputs.grad[:, 3:].abs().max() > 0
+
+
+def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, available_nvidia_ops):
+    """Packed Qwen3 inference with ``veomni_sage_attention`` routes through the segment-splitting adapter."""
+    from veomni.ops.kernels.attention.standard import sage as sage_backend
+
+    def fake_sage(query, key, value, tensor_layout="HND", is_causal=False, sm_scale=None):
+        del tensor_layout
+        num_kv_groups = query.shape[1] // key.shape[1]
+        if num_kv_groups > 1:
+            key = key.repeat_interleave(num_kv_groups, dim=1)
+            value = value.repeat_interleave(num_kv_groups, dim=1)
+        scale = (query.shape[-1] ** -0.5) if sm_scale is None else sm_scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        if is_causal and query.shape[-2] > 1:
+            causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device).tril()
+            scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        return torch.matmul(weights, value)
+
+    monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+
+    torch.manual_seed(129)
+    config = _tiny_config()
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_sage_attention"
+    model = _build_qwen3(config, ops).eval()
+
+    first_input_ids = torch.tensor([[5, 6, 7]])
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    with torch.no_grad():
+        packed_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=torch.ones_like(packed_input_ids),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            use_cache=False,
+        ).logits
+        first_logits = model(
+            input_ids=first_input_ids,
+            attention_mask=torch.ones_like(first_input_ids),
+            position_ids=torch.arange(3).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 3], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            input_ids=second_input_ids,
+            attention_mask=torch.ones_like(second_input_ids),
+            position_ids=torch.arange(5).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 5], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)

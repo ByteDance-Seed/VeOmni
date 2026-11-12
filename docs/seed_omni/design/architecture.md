@@ -99,6 +99,7 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
+| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, right after the optimizer is built and before the lr scheduler and any checkpoint load. **May change the param-group count**, which is part of the optimizer-state key space: a checkpoint is only resumable under the same hook. Full contract: [Optimizer Hook](../mixins/configure_optimizer.md) |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |
@@ -121,9 +122,11 @@ and FSDP dummy anchors, and once per request with `inference=True` before the
 generation FSM during inference). Optional capabilities on the model itself are
 mixins on the accelerated class, each with its own page:
 [Metric Meter](../mixins/metric_meter.md) (per-module tokens and theoretical
-FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on) and
+FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on),
 [Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder
-output once and train from the cache).
+output once and train from the cache), and
+[Optimizer Hook](../mixins/configure_optimizer.md) (adjust the module's param
+groups or register step hooks once its optimizer is built).
 
 ### 2.2 `ConversationItem`: the data carrier (`utils/conversation.py`)
 

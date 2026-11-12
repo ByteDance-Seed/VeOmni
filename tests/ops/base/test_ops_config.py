@@ -55,19 +55,33 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("parse_config", [False, True], ids=["dataclass", "parser"])
-def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_config):
+@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, parse_config, field):
+    """A DeepGEMM expert GEMM and a quantizing dense family round different operands.
+
+    ``deepgemm_fp8`` and ``qat`` are two values of the same ``moe_implementation``
+    field, so the routed experts can never be quantized twice. The shared expert
+    (``swiglu_mlp``) and the attention projections (``linear``) are separate dense
+    GEMMs, so quantizing them alongside is a valid recipe -- and a useful one, since
+    DeepGEMM covers only the experts.
+    """
     from veomni.arguments import OpsImplementationConfig
     from veomni.arguments.parser import _instantiate_recursive
 
-    # An invalid combination must report the config conflict even without CUDA.
-    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
-    values = {"moe_implementation": "deepgemm_fp8", "qat_implementation": "fp8_blockwise"}
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise") as error:
-        if parse_config:
-            _instantiate_recursive(OpsImplementationConfig, values)
-        else:
-            OpsImplementationConfig(**values)
-    assert "Set qat_implementation='none'" in str(error.value)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
+
+    values = {"moe_implementation": "deepgemm_fp8", field: "qat"}
+    config = (
+        _instantiate_recursive(OpsImplementationConfig, values) if parse_config else OpsImplementationConfig(**values)
+    )
+
+    assert config.moe_implementation == "deepgemm_fp8"
+    assert getattr(config, field) == "qat"
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -75,11 +89,13 @@ def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_conf
     "values",
     [
         {"moe_implementation": "deepgemm_fp8"},
-        {"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
-        {"moe_implementation": None, "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "eager", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_quack", "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "eager"},
+        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "torchao_mxfp4"},
+        {"moe_implementation": None, "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_quack", "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "swiglu_mlp_implementation": "qat"},
     ],
 )
 def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
@@ -95,7 +111,8 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
 
     config = OpsImplementationConfig(**values)
     assert config.moe_implementation == values["moe_implementation"]
-    assert config.qat_implementation == values.get("qat_implementation", "none")
+    expected = values.get("linear_implementation")
+    assert config.linear_implementation == expected
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
@@ -523,7 +540,13 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
 
 
 def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
-    """Sparse overrides on existing or loaded configs validate the merged state at every node."""
+    """Sparse overrides on existing or loaded configs validate the merged state at every node.
+
+    The conflict used here is a GPU-only kernel selected on an Ascend host: it is
+    decided by the merged state (device plus value), so an override that leaves the
+    incompatible pair in place has to be rejected, and one that removes it has to be
+    accepted -- atomically, including inside a sub-config.
+    """
     from transformers.models.llama.configuration_llama import LlamaConfig
 
     LlamaConfig = get_veomni_config_class(LlamaConfig)
@@ -533,12 +556,10 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
 
     import veomni.models  # noqa: F401
 
-    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    # Simulate an Ascend host so `liger_kernel` is an incompatible explicit value.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
-    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
-    monkeypatch.setattr("torch.version.hip", None)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
 
     llama_dir = tmp_path / "llama"
     cfg = LlamaConfig(
@@ -546,41 +567,39 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
         intermediate_size=128,
         num_hidden_layers=2,
         num_attention_heads=4,
-        ops_implementation={"moe_implementation": "deepgemm_fp8"},
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
     )
     cfg.save_pretrained(llama_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
-    assert cfg.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        cfg._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
+    assert cfg.ops_implementation == {"rms_norm_implementation": "torch_npu"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"rms_norm_implementation": "liger_kernel"})
 
-    # Overriding moe_implementation away from deepgemm_fp8 at the same time is valid.
+    # Replacing the incompatible value in the same override is valid.
     reloaded = LlamaConfig.from_pretrained(
         llama_dir,
-        ops_implementation={"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
+        ops_implementation={"rms_norm_implementation": "eager"},
     )
-    assert reloaded.ops_implementation == {
-        "moe_implementation": "fused_triton",
-        "qat_implementation": "fp8_blockwise",
-    }
+    assert reloaded.ops_implementation == {"rms_norm_implementation": "eager"}
 
-    # Sub-config cross-field conflicts must also be rejected atomically.
+    # Sub-config validation is atomic: the rejected override must leave both levels
+    # exactly as they were.
     vl_dir = tmp_path / "qwen3_vl"
     vl_cfg = Qwen3VLConfig(
-        text_config={"ops_implementation": {"moe_implementation": "deepgemm_fp8"}},
+        text_config={"ops_implementation": {"rms_norm_implementation": "torch_npu"}},
     )
     vl_cfg.save_pretrained(vl_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        vl_cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        vl_cfg._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
     assert vl_cfg.ops_implementation == {}
-    assert vl_cfg.text_config.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+    assert vl_cfg.text_config.ops_implementation == {"rms_norm_implementation": "torch_npu"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"rms_norm_implementation": "liger_kernel"})
 
 
 def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path, monkeypatch):
@@ -994,3 +1013,214 @@ def test_config_normalizes_deprecated_attention_aliases(tmp_path, entrypoint):
             config.ops_implementation["attn_implementation"] = legacy
     assert config.ops_config.attn_implementation == "veomni_flash_attention_2"
     assert config._attn_implementation == "veomni_flash_attention_2"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_checkpoint_written_before_the_per_family_rows_still_loads(tmp_path):
+    """Every pre-refactor export carries ``qat_implementation``; it must not become unloadable.
+
+    The default value was ``"none"``, so most published configs hold it. Migrating
+    means dropping the removed key, which is what "train in the model dtype" already
+    meant.
+    """
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"qat_implementation": "none", "rms_norm_implementation": "eager"},
+    ).save_pretrained(tmp_path)
+
+    config = build_config(str(tmp_path))
+
+    assert "qat_implementation" not in config.ops_implementation
+    assert config.ops_implementation["rms_norm_implementation"] == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_legacy_quantizing_recipe_names_the_replacement_fields(tmp_path):
+    """The quantizing value cannot be translated without knowing the model, so it explains itself."""
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"qat_implementation": "fp8_blockwise"},
+    ).save_pretrained(tmp_path)
+
+    with pytest.raises(ValueError, match="became per-family") as error:
+        build_config(str(tmp_path))
+    assert "linear_implementation" in str(error.value)
+    assert "kv_round_implementation" in str(error.value)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_current_selections_are_untouched_by_the_migration():
+    from veomni.models.legacy_qat_selections import migrate_retired_selections
+
+    selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
+    assert migrate_retired_selections(selections) == selections
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_quantizing_swiglu_row_is_refused_on_an_unfused_activation():
+    """SiLU is the only activation with a quantizing row, so `gelu` must not be accepted.
+
+    The model's MLP falls back to its projection modules for any other activation,
+    which never reaches the row -- the config would claim QAT while the step ran in
+    the model dtype. The check lives in the config layer because that is the one
+    place every model reaches, and it fails at load time rather than on step one.
+    """
+    import copy
+
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    def apply(activation, impl):
+        config = Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+        )
+        config.hidden_act = activation
+        veomni_config = as_veomni_config(copy.deepcopy(config), validate=False)
+        veomni_config._set_ops_implementation({"swiglu_mlp_implementation": impl})
+        return veomni_config
+
+    # SiLU is what the row implements; the default selection is unaffected.
+    assert apply("silu", "qat").ops_config.swiglu_mlp_implementation == "qat"
+    assert apply("swish", "qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        apply("gelu", "qat")
+
+    # A reference row trains in the model dtype on purpose, so it stays available.
+    assert apply("gelu", "eager").ops_config.swiglu_mlp_implementation == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_quantizing_swiglu_row_is_refused_only_where_the_handle_is_bound():
+    """Vision towers are checked only when they actually build a ``swiglu_mlp``.
+
+    Shape cannot decide this: Qwen2.5-VL's vision tower carries
+    `intermediate_size`, `depth` and an activation *and* binds the handle, while
+    Qwen3-VL's has the same shape and binds nothing there. Guessing one way lets a
+    quantizing selection train unquantized; guessing the other blocks Qwen3-VL's
+    SiLU text MLPs because its vision tower uses GELU. `_binds_swiglu_mlp` names
+    the consumers instead.
+    """
+    import copy
+
+    from transformers import Qwen2_5_VLConfig, Qwen3VLMoeConfig
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    def apply(source, **ops):
+        veomni_config = as_veomni_config(copy.deepcopy(source), validate=False)
+        veomni_config._set_ops_implementation(ops)
+        return veomni_config
+
+    # Qwen3-VL: the text MLP is SiLU and quantizes; the vision tower is GELU-tanh
+    # but binds no handle, so it must not veto the selection.
+    qwen3_vl = Qwen3VLMoeConfig()
+    assert qwen3_vl.text_config.hidden_act == "silu"
+    assert qwen3_vl.vision_config.hidden_act == "gelu_pytorch_tanh"
+    assert apply(qwen3_vl, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    # Qwen2.5-VL: the vision tower *does* bind the handle, so its activation counts.
+    vl = Qwen2_5_VLConfig()
+    assert not hasattr(vl.vision_config, "num_hidden_layers")
+    assert vl.vision_config.hidden_act == "silu"
+    assert apply(vl, swiglu_mlp_implementation="qat").ops_config.swiglu_mlp_implementation == "qat"
+
+    gelu_vision = copy.deepcopy(vl)
+    gelu_vision.vision_config.hidden_act = "gelu"
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        apply(gelu_vision, swiglu_mlp_implementation="qat")
+
+    assert apply(gelu_vision, swiglu_mlp_implementation="eager").ops_config.swiglu_mlp_implementation == "eager"
+
+
+def test_a_child_can_opt_out_of_a_quantizing_root_selection():
+    """A layered override keeps the child's exception instead of inheriting `qat`.
+
+    The vision tower is set to `eager` while the root selects `qat`; the tree is
+    then validated as a whole, which is the path a YAML with per-sub-config
+    overrides takes.
+    """
+    import copy
+
+    from transformers import Qwen2_5_VLConfig
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    config = Qwen2_5_VLConfig()
+    config.vision_config.hidden_act = "gelu"
+
+    veomni_config = as_veomni_config(copy.deepcopy(config), validate=False)
+    veomni_config._set_ops_implementation({"swiglu_mlp_implementation": "qat"}, _is_post_init=True, _validate=False)
+    veomni_config.vision_config._set_ops_implementation(
+        {"swiglu_mlp_implementation": "eager"}, _is_post_init=True, _validate=False
+    )
+    veomni_config._set_ops_implementation({}, _validate_tree=True)
+
+    assert veomni_config.ops_config.swiglu_mlp_implementation == "qat"
+    assert veomni_config.vision_config.ops_config.swiglu_mlp_implementation == "eager"
+
+
+def test_as_veomni_config_validates_a_directly_constructed_config():
+    """`as_veomni_config` is how `build_foundation_model` adopts a `PretrainedConfig`.
+
+    It used to build the tree with `_validate=False` and then only read
+    `ops_config`, which resolves the dataclass but runs no per-config check. A
+    caller that constructed the model directly therefore skipped the refusal: with
+    `hidden_act='gelu'` and `swiglu_mlp_implementation='qat'`, both the Qwen3 MLP
+    and DeepSeek-V4's shared expert fell through to unquantized projections while
+    the config still claimed QAT.
+    """
+    import copy
+
+    from transformers import DeepseekV4Config, Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    qwen3 = Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+    )
+    qwen3.hidden_act = "gelu"
+    qwen3.ops_implementation = {"swiglu_mlp_implementation": "qat", "moe_implementation": "eager"}
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        as_veomni_config(copy.deepcopy(qwen3))
+
+    deepseek = DeepseekV4Config()
+    deepseek.hidden_act = "gelu"
+    deepseek.ops_implementation = {"swiglu_mlp_implementation": "qat", "moe_implementation": "eager"}
+
+    with pytest.raises(ValueError, match="hidden_act='gelu'.*round nothing"):
+        as_veomni_config(copy.deepcopy(deepseek))
+
+    # The same shape with a supported activation still loads.
+    qwen3.hidden_act = "silu"
+    assert as_veomni_config(copy.deepcopy(qwen3)).ops_config.swiglu_mlp_implementation == "qat"

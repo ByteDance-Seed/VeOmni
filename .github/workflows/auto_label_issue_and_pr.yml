@@ -69,6 +69,13 @@ jobs:
 
             } else {
               // Case C: Issue Opened/Edited
+              // `payload.issue` and `payload.action` are read here rather than left
+              // to an enclosing scope: this block has none of its own, so an
+              // undeclared name throws a ReferenceError and fails the whole job
+              // on every issue open/edit.
+              const target = payload.issue;
+              const action = payload.action;
+              targetNumber = target.number;
               if (action === 'opened') {
                 // Check Title + Body if issue newly opened
                 textToCheck = (target.title + " " + (target.body || "")).toLowerCase();
