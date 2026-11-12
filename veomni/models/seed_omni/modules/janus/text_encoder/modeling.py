@@ -65,13 +65,12 @@ class JanusTextEncoder(TextEncoder):
                     conversation_list, generation_kwargs
                 )
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-                # Flush the preceding text *without* sealing this ``<boi>`` row:
-                # ``image_vq`` starts with ``janus_llama.generate``, which asserts the
-                # tail is an ``output`` item and consumes ``value[-1:]`` as its input
-                # embedding. Sealing would turn it into text and raise. ``<boi>``
-                # itself belongs to the image span, not to the reported text.
+                # Seal as usual: ``<boi>`` is an ordinary text token (the training
+                # template emits it as one), and the image span simply re-encodes
+                # the row's last embedding. ``<boi>`` itself belongs to the image
+                # span, so it is not part of the reported text.
                 self._text_token_cache.pop()
-                generated = self._flush_text_generated(conversation_list, seal=False)
+                generated = self._flush_text_generated(conversation_list)
                 if generated:
                     outputs["generated"] = generated
             elif output_token_id == self._chat_template.eos_token_id:
