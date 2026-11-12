@@ -384,3 +384,13 @@ def test_skip_sp_gather_between_modules_propagates_to_modules_and_parallel_state
         assert ps.skip_sp_gather_between_modules is True
     finally:
         clear_parallel_state()
+
+    with pytest.raises(ValueError, match="skip_sp_gather_between_modules"):
+        build_omni_model_runtime_args(
+            _fake_args(
+                accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True),
+                modules_override={
+                    MODULE_A: {"accelerator": {"skip_sp_gather_between_modules": False}},
+                },
+            )
+        )

@@ -118,6 +118,10 @@ def gather_sp_sharded_items(
         [it.value.squeeze(0) if it.value.dim() == 3 else it.value for it in items],
         dim=0,
     )
+    ps = get_parallel_state()
+    local_len = (valid_len + (-valid_len % ps.sp_size)) // ps.sp_size if ps.sp_size > 1 else valid_len
+    if local_cat.size(0) != local_len:
+        return
     full_cat = gather_outputs(local_cat, gather_dim=0, group=sp_group).narrow(0, 0, valid_len)
     for it, chunk in zip(items, torch.split(full_cat, lengths, dim=0), strict=True):
         it.value = chunk
@@ -163,8 +167,23 @@ def can_use_sp_sharded_embeds_directly(conversations: list[list[ConversationItem
     """True when non-dummy ``item.value`` shards already partition the packed backbone sequence without interleaving."""
     if not conversations:
         return False
-    non_dummy_types = {item.type for sample in conversations for item in sample if not item.is_dummy}
-    return non_dummy_types in ({"text"}, {"image"}, {"video"})
+    ps = get_parallel_state()
+    if ps.sp_size <= 1 or not ps.skip_sp_gather_between_modules:
+        return False
+    non_dummy_items = [item for sample in conversations for item in sample if not item.is_dummy]
+    if not non_dummy_items:
+        return False
+    non_dummy_types = {item.type for item in non_dummy_items}
+    if non_dummy_types not in ({"text"}, {"image"}, {"video"}):
+        return False
+    if not all(isinstance(it.value, torch.Tensor) and it.value.dim() >= 2 for it in non_dummy_items):
+        return False
+    valid_len = sum(item_token_len(it) for it in non_dummy_items)
+    local_len = (valid_len + (-valid_len % ps.sp_size)) // ps.sp_size
+    actual_rows = sum(
+        int((it.value.squeeze(0) if it.value.dim() == 3 else it.value).size(0)) for it in non_dummy_items
+    )
+    return actual_rows == local_len
 
 
 def is_text_only_conversation(conversations: list[list[ConversationItem]] | None) -> bool:

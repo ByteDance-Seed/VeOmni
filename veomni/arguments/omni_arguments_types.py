@@ -899,6 +899,20 @@ def _validate_omni_dp_size(
             "resolve to the same `dp_size`."
         )
 
+    skip_flags = {
+        name: bool(mod_args.accelerator.skip_sp_gather_between_modules)
+        for name, mod_args in distributed_modules.items()
+    }
+    if len(set(skip_flags.values())) > 1 or bool(top_accelerator.skip_sp_gather_between_modules) not in set(
+        skip_flags.values()
+    ):
+        details = ", ".join(f"{name}: {flag}" for name, flag in skip_flags.items())
+        raise ValueError(
+            "`skip_sp_gather_between_modules` is an inter-module handoff contract and must match "
+            f"across `model.accelerator` ({bool(top_accelerator.skip_sp_gather_between_modules)}) "
+            f"and all distributed SeedOmni modules ({details})."
+        )
+
 
 @dataclass
 class OmniArguments:
