@@ -132,7 +132,8 @@ def convert_float8_linears(model: nn.Module, config: Float8TrainingConfig) -> li
         installed_version = version("torchao")
     except PackageNotFoundError as exc:
         raise ImportError(
-            "float8 training requires the GPU dependency torchao==0.18.0: uv sync --extra gpu --dev"
+            "float8 training requires torchao==0.18.0, which is an optional extra: "
+            "uv sync --extra gpu --extra float8 --dev"
         ) from exc
     if Version(installed_version).public != "0.18.0":
         raise ImportError(f"float8 training requires torchao==0.18.0; found {installed_version}.")

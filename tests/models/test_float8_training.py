@@ -174,6 +174,34 @@ def test_float8_selection_validates_before_optional_import(case, message):
 
 
 @cpu
+@pytest.mark.parametrize(
+    ("installed", "message"),
+    [
+        (None, r"optional extra: uv sync --extra gpu --extra float8 --dev"),
+        ("0.17.0", r"requires torchao==0\.18\.0; found 0\.17\.0"),
+    ],
+)
+def test_float8_reports_a_missing_or_mismatched_torchao_extra(monkeypatch, installed, message):
+    """torchao is the optional ``float8`` extra, so a missing package must name the extra to install."""
+    from importlib.metadata import PackageNotFoundError
+
+    import veomni.distributed.float8 as float8
+
+    def fake_version(name):
+        assert name == "torchao"
+        if installed is None:
+            raise PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setattr(float8, "version", fake_version)
+    model = DenseModel()
+    original = model.fc
+    with pytest.raises(ImportError, match=message):
+        convert_float8_linears(model, Float8TrainingConfig(enable=True, target_modules=[TARGET]))
+    assert model.fc is original
+
+
+@cpu
 def test_float8_dit_selection_allows_block_projections_and_rejects_heads():
     from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
         WanTransformer3DModelConfig,

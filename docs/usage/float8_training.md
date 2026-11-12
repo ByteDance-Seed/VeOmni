@@ -13,11 +13,18 @@ and [Tracking Issue #1366](https://github.com/ByteDance-Seed/VeOmni/issues/1366)
 
 ## Install and configure
 
-Install the optional GPU environment, which includes the pinned torchao backend:
+The torchao backend is an optional extra, not part of the `gpu` extra, so GPU
+jobs that never enable float8 do not install it. Add the `float8` extra to the
+GPU environment:
 
 ```bash
-uv sync --extra gpu --dev
+uv sync --extra gpu --extra float8 --dev
 ```
+
+Enabling float8 without the extra raises `ImportError: float8 training requires
+torchao==0.18.0, which is an optional extra: uv sync --extra gpu --extra float8 --dev`
+before any module is converted. The exact pin is checked because torchao's
+`convert_to_float8_training` internals are not stable across minor versions.
 
 For dense Qwen3 or Llama with rowwise float8:
 
@@ -88,8 +95,8 @@ Model-specific eligible DiT projection patterns:
 | Checkpoints | Existing HF weight loading, DCP model/optimizer resume, and floating-point HF export |
 
 Configuration is defined by [Float8TrainingConfig](../../veomni/arguments/arguments_types.py#L604),
-validated by [validate_float8_training](../../veomni/distributed/float8.py#L50),
-and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L85)
+validated by [validate_float8_training](../../veomni/distributed/float8.py#L51),
+and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L86)
 inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L428)
 before FSDP2 wraps transformer blocks.
 
@@ -99,3 +106,19 @@ before FSDP2 wraps transformer blocks.
 - **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for the forward GEMM, token-wise `grad_output` scaling with tensorwise weight scaling for the activation-gradient (`dX`) GEMM, and skips FP8 casts for the weight-gradient (`dW`) operands.
 - **`rowwise`**: Uses rowwise scaling across all three GEMMs (`output`, `dX`, `dW`).
 - **`torch.compile` status**: `model.accelerator.torch_compile.enable=True` is currently rejected by `validate_float8_training()` (`ValueError: float8 training with torch.compile is not yet validated.`), so supported FSDP2 float8 training runs in eager mode (`torch_compile.enable=False`). In standalone block microbenchmarks outside `validate_float8_training()`, wrapping `Float8Linear` blocks with `torch.compile` fuses torchao's dynamic scaling and transpose into a single Triton kernel before `aten::_scaled_mm`.
+
+## Tests and CI coverage
+
+`tests/models/test_float8_training.py` holds the float8 tests. Configuration
+validation, the lazy-import guard, and the missing/mismatched-torchao errors
+run on CPU without torchao. The GPU cases (kernel dispatch, numerics, FSDP2
+training, DCP resume and HF export) call `pytest.importorskip("torchao.float8")`
+and also need an NVIDIA SM89+ device, so they **skip** on any machine where the
+`float8` extra is not installed — including CI jobs that install only
+`--extra gpu`. A skip there is not a pass: the tests stay in-tree so whoever
+installs the extra on SM89+ hardware runs them:
+
+```bash
+uv sync --extra gpu --extra float8 --dev
+pytest tests/models/test_float8_training.py
+```
