@@ -656,6 +656,13 @@ def test_logical_signature_normalizes_negative_axes_but_preserves_singleton_axes
     persistent = SpecInfo("ep", Shard(0), "weight", mesh, 0, 1, (8, 8), False)
     persistent_unused_fields = SpecInfo("ep", Shard(0), "weight", mesh, 1, 1, (8, 8), True)
     assert signature(persistent) == signature(persistent_unused_fields)
+    replicated_expert = SpecInfo("ep", Replicate(), "experts.weight", mesh)
+    replicated_other = SpecInfo("ple", Replicate(), "experts.weight", mesh)
+    assert _checkpoint_extra_parallel_signature(
+        {"experts.weight": replicated_expert}, optimizer_present=False, trainable_only=False
+    ) != _checkpoint_extra_parallel_signature(
+        {"experts.weight": replicated_other}, optimizer_present=False, trainable_only=False
+    )
     persistent_unknown_shape = SpecInfo("ep", Shard(-1), "weight", mesh, 0, -1, None, False)
     persistent_positive = SpecInfo("ep", Shard(1), "weight", mesh, 0, 1, None, False)
     assert _checkpoint_extra_parallel_signature(

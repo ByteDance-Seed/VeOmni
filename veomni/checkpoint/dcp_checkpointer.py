@@ -760,27 +760,41 @@ def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=No
             if has_v2:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if has_v2:
+            named_params = list(state["model"].named_parameters(remove_duplicate=False))
+            if ps is None:
+                ps = parallel_state if parallel_state is not None else get_parallel_state()
+            aliases = {}
+            for name, param in named_params:
+                aliases.setdefault(id(param), []).append(name)
+            expert_aliases = {
+                name
+                for names in aliases.values()
+                if any("experts" in alias.split(".") for alias in names)
+                for name in names
+            }
+            ordinary_experts = (
+                tuple(sorted(_ordinary_expert_fqns(state["model"], ps)))
+                if isinstance(ps, ParallelState) and any(size != 1 for size in ps.extra_parallel_sizes.values())
+                else ()
+            )
             logical_signature = _checkpoint_extra_parallel_signature(
                 specs,
                 optimizer_present=state.get("optimizer") is not None,
                 trainable_only=trainable_only,
                 trainability=(
-                    tuple(
-                        sorted(
-                            (name, param.requires_grad)
-                            for name, param in state["model"].named_parameters(remove_duplicate=False)
-                        )
-                    )
+                    tuple(sorted((name, param.requires_grad) for name, param in named_params))
                     if trainable_only
                     else ()
                 ),
                 runtime_ndims={
                     name: tensor.ndim
-                    for name, tensor in (
-                        list(state["model"].named_parameters(remove_duplicate=False))
-                        + list(state["model"].named_buffers(remove_duplicate=False))
-                    )
+                    for name, tensor in (named_params + list(state["model"].named_buffers(remove_duplicate=False)))
                 },
+                expert_aliases=expert_aliases,
+                ordinary_experts=ordinary_experts,
+                shared_lora=tuple(sorted(_shared_lora_fqns(state["model"], ordinary_experts)))
+                if ordinary_experts
+                else (),
             )
     except BaseException as exc:
         error = exc
@@ -814,7 +828,15 @@ def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=No
 
 
 def _checkpoint_extra_parallel_signature(
-    specs, *, optimizer_present, trainable_only, trainability=(), runtime_ndims=None
+    specs,
+    *,
+    optimizer_present,
+    trainable_only,
+    trainability=(),
+    runtime_ndims=None,
+    expert_aliases=(),
+    ordinary_experts=(),
+    shared_lora=(),
 ):
     """Describe logical layout, excluding rank-local coordinates and tensor contents."""
     entries = []
@@ -822,6 +844,18 @@ def _checkpoint_extra_parallel_signature(
         mesh = getattr(spec, "para_fsdp_mesh", None)
         shape = getattr(spec, "global_shape", None)
         placement = getattr(spec, "placement", None)
+        if isinstance(placement, Replicate) and ("experts" in name.split(".") or name in expert_aliases):
+            mesh_names = getattr(mesh, "mesh_dim_names", None)
+            entries.append(
+                (
+                    name,
+                    spec.para_name,
+                    "Replicate",
+                    tuple(mesh_names) if mesh_names is not None else None,
+                    tuple(mesh.shape) if mesh is not None else None,
+                )
+            )
+            continue
         if not isinstance(placement, Shard):
             continue
         axis = placement.dim
@@ -854,7 +888,14 @@ def _checkpoint_extra_parallel_signature(
                 tuple(mesh.shape) if mesh is not None else None,
             )
         )
-    return bool(optimizer_present), bool(trainable_only), tuple(trainability), tuple(entries)
+    return (
+        bool(optimizer_present),
+        bool(trainable_only),
+        tuple(trainability),
+        tuple(ordinary_experts),
+        tuple(shared_lora),
+        tuple(entries),
+    )
 
 
 def _check_extra_parallel_signature_across_ranks(has_v2, signature, *, group=None):
