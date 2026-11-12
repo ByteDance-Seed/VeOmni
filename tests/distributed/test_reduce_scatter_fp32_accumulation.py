@@ -1052,7 +1052,8 @@ def _run_fsdp2_hccl_optimizer_step():
 
     baseline = build(False)
     candidate = build(True)
-    inputs = torch.full((8, 32), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{rank}")
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    inputs = torch.full((8, 32), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{local_rank}")
     baseline(inputs).sum().backward()
     with mock.patch.object(dist, "all_to_all_single", wraps=dist.all_to_all_single) as exchange:
         candidate(inputs).sum().backward()
@@ -1092,7 +1093,8 @@ def _run_fsdp2_hccl_expert_optimizer_step():
         )
 
     baseline, candidate = build(False), build(True)
-    inputs = torch.full((16,), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{rank}")
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    inputs = torch.full((16,), (rank + 1) / 8, dtype=torch.bfloat16, device=f"npu:{local_rank}")
     factor = (rank + 1) / world_size
     (baseline(inputs).float() * factor).backward()
     with mock.patch.object(dist, "all_to_all_single", wraps=dist.all_to_all_single) as exchange:
