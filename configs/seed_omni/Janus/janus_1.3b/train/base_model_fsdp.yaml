@@ -10,8 +10,11 @@
 #
 # To get this wrap on the plain conversation launcher instead, add
 #   --model.accelerator.fsdp_config.fsdp_scope model
+#
+# `model_path` is a placeholder: replace it with an absolute path this job can
+# read (the upstream Janus root, or a split root from convert_model.py).
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  model_path: Janus-1.3B
   model_config:
     modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
     train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml

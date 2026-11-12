@@ -3,12 +3,18 @@
 # Launch:
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 #
-# Prerequisites:
+# Prerequisites — split the upstream Janus checkpoint, OR point `model_path`
+# straight at the upstream root: `janus/hf_layout.py` registers a `janus` HF
+# layout, so an upstream checkpoint loads with no offline split and its HF export
+# is written back in the upstream layout.
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
-#     --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+#     --model_path Janus-1.3B \
+#     --output_dir Janus-1.3B-split
 #
 # See docs/seed_omni/models/janus.md for the full pipeline.
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# absolute paths this job can read before training.
 #
 # Launch inference (override modules for eager single-process or fsdp distributed):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
@@ -16,7 +22,7 @@
 #     --infer.prompt "Describe this image." \
 #     --infer.output_dir janus_out
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  model_path: Janus-1.3B
   model_config:
     modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
     train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml
