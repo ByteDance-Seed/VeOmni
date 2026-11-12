@@ -230,6 +230,19 @@ class PrecomputePositionIDsCollator(DataCollator):
         return features
 
 
+def _clone_fallback_tensors(value):
+    """Separate fallback containers from cached tensor storage without changing values."""
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _clone_fallback_tensors(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_fallback_tensors(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_fallback_tensors(item) for item in value)
+    return value
+
+
 @dataclass
 class PackingCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
@@ -240,6 +253,7 @@ class PackingCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    clone_fallback_tensors: bool = False
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -295,7 +309,8 @@ class PackingCollator(DataCollator):
                         batch[key] = default_collate(batch[key])
                 except Exception:
                     # use List of tensor, for example: num, height, width, c in different resolution
-                    pass
+                    if self.clone_fallback_tensors:
+                        batch[key] = _clone_fallback_tensors(batch[key])
             else:
                 pack_dim = collate_info.pack_dim
 
