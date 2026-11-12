@@ -23,8 +23,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 from veomni.utils import logging
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint.convert import ConvertedCheckpointTensor
@@ -158,12 +158,6 @@ def scatter_qwen3vl_visual_embeds(
         slot.item.value = embeds_split[idx]
         slot.item.meta["grid_thw"] = slot.grid
         slot.item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import Qwen3VLVisionModel
-else:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import Qwen3VLVisionModel
 
 
 logger = logging.get_logger(__name__)

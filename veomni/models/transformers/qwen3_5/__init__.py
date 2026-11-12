@@ -15,15 +15,11 @@
 """Qwen3.5 modeling that calls local ``VeomniOp`` handles."""
 
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 @MODELING_REGISTRY.register("qwen3_5")
 def register_qwen3_5_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
-    else:
-        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
+    from .modeling_qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5Model
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3_5ForConditionalGeneration
@@ -35,10 +31,7 @@ def register_qwen3_5_modeling(architecture: str):
 
 @MODELING_REGISTRY.register("qwen3_5_text")
 def register_qwen3_5_text_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForCausalLM, Qwen3_5TextModel
-    else:
-        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForCausalLM, Qwen3_5TextModel
+    from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextModel
 
     if "ForCausalLM" in architecture:
         return Qwen3_5ForCausalLM

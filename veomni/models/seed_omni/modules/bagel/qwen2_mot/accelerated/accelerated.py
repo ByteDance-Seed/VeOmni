@@ -20,10 +20,10 @@ from .......distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
-from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+from .......models.transformers.qwen2.modeling_qwen2 import (
     Qwen2MLP as PatchedQwen2MLP,
 )
-from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+from .......models.transformers.qwen2.modeling_qwen2 import (
     Qwen2RMSNorm as PatchedQwen2RMSNorm,
 )
 from .......ops import VeomniOp

@@ -16,7 +16,6 @@
 
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets
 from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_qwen3_omni_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -54,22 +53,14 @@ def register_qwen3_omni_moe_config():
 
 
 def _get_qwen3_omni_moe_modeling_classes():
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_omni_moe_npu import (
-            Qwen3OmniMoeForConditionalGeneration,
-            Qwen3OmniMoeThinkerForConditionalGeneration,
-            Qwen3OmniMoeThinkerTextModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_omni_moe_gpu import (
-            Qwen3OmniMoeForConditionalGeneration,
-            Qwen3OmniMoeThinkerForConditionalGeneration,
-            Qwen3OmniMoeThinkerTextModel,
-        )
-
     from .checkpoint_tensor_converter import (
         convert_qwen3_omni_moe_fqn_to_index_mapping,
         create_qwen3_omni_moe_checkpoint_tensor_converter,
+    )
+    from .modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerTextModel,
     )
 
     for model_cls in (

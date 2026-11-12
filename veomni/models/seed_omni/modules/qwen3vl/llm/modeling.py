@@ -6,18 +6,12 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
 from veomni.utils.tensor_utils import naflatten
 
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLLlmConfig
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import Qwen3VLTextModel
-else:
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import Qwen3VLTextModel
 
 
 def _cumsum(values: list[int]) -> list[int]:

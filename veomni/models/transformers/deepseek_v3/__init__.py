@@ -15,7 +15,6 @@
 """DeepSeek-V3 modeling that calls local ``VeomniOp`` handles."""
 
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 @MODELING_REGISTRY.register("deepseek_v3")
@@ -24,16 +23,12 @@ def register_deepseek_v3_modeling(architecture: str):
         convert_deepseek_v3_fqn_to_index_mapping,
         create_deepseek_v3_checkpoint_tensor_converter,
     )
-
-    if IS_NPU_AVAILABLE:
-        from .generated import patched_modeling_deepseek_v3_npu as gen
-    else:
-        from .generated import patched_modeling_deepseek_v3_gpu as gen
-
-    DeepseekV3ForCausalLM = gen.DeepseekV3ForCausalLM
-    DeepseekV3ForSequenceClassification = gen.DeepseekV3ForSequenceClassification
-    DeepseekV3ForTokenClassification = gen.DeepseekV3ForTokenClassification
-    DeepseekV3Model = gen.DeepseekV3Model
+    from .modeling_deepseek_v3 import (
+        DeepseekV3ForCausalLM,
+        DeepseekV3ForSequenceClassification,
+        DeepseekV3ForTokenClassification,
+        DeepseekV3Model,
+    )
 
     for model_cls in (
         DeepseekV3ForCausalLM,

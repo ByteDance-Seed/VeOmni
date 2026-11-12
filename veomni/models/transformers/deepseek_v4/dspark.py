@@ -35,7 +35,6 @@ from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 if TYPE_CHECKING:
@@ -156,10 +155,8 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def _resolve_default_dsv4_classes() -> tuple[type[nn.Module], ...]:
-    if IS_NPU_AVAILABLE:
-        from .generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from .generated import patched_modeling_deepseek_v4_gpu as gen
+    from . import modeling_deepseek_v4 as gen
+
     return (
         gen.DeepseekV4Attention,
         gen.DeepseekV4SparseMoeBlock,

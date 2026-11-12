@@ -16,7 +16,6 @@
 
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_qwen3_vl_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -49,19 +48,11 @@ def _convert_qwen3_vl_moe_text_lora_targets_to_parameters(_model, lora_modules, 
 @MODELING_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_modeling(architecture: str):
     from .checkpoint_tensor_converter import create_qwen3_vl_moe_checkpoint_tensor_converter
-
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_vl_moe_npu import (
-            Qwen3VLMoeForConditionalGeneration,
-            Qwen3VLMoeModel,
-            Qwen3VLMoeTextModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_vl_moe_gpu import (
-            Qwen3VLMoeForConditionalGeneration,
-            Qwen3VLMoeModel,
-            Qwen3VLMoeTextModel,
-        )
+    from .modeling_qwen3_vl_moe import (
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel,
+        Qwen3VLMoeTextModel,
+    )
 
     for model_cls in (Qwen3VLMoeForConditionalGeneration, Qwen3VLMoeModel, Qwen3VLMoeTextModel):
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_vl_moe_checkpoint_tensor_converter)
