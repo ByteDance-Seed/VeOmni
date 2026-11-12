@@ -20,6 +20,7 @@ states:
 
   text_ar:
     body:
+      - { from: janus_text_encoder, to: janus_llama }
       - { from: janus_llama,        to: janus_text_encoder }
       - { from: janus_text_encoder, to: end }
     transitions:

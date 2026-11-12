@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
+from veomni.distributed.parallel_state import get_parallel_state
+
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import JanusSiglipConfig
@@ -80,7 +82,15 @@ class JanusSiglip(InferenceMixin, PretrainedOmniModule):
         self.post_init()
 
     def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        vision_out = self.vision_model(pixel_values, return_dict=True)
+        # ``skip_ulysses`` on the SP path: the accelerated ``forward_pre`` slices
+        # the image **batch** across the SP group, so each rank's rows are whole
+        # images, not a sequence shard. Letting attention gather along the token
+        # axis would splice patches from different images into one sequence and
+        # silently corrupt both embeddings and gradients. Under SP the caller
+        # all-gathers the batch back in ``forward_post``, so no Ulysses exchange
+        # belongs inside the tower. Without SP the flag is a no-op.
+        skip_ulysses = get_parallel_state().sp_size > 1
+        vision_out = self.vision_model(pixel_values, return_dict=True, skip_ulysses=skip_ulysses)
         return self.aligner(vision_out.last_hidden_state)
 
     def forward(

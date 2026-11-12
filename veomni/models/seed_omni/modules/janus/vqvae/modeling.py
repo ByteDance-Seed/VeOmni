@@ -93,6 +93,14 @@ class InferenceMixin:
             seal_outputs(conversation_list, new_type="image")
             conversation_list.append(tail_part)
 
+            # The last sampled token still has to reach the conditional cache: in
+            # ``infer_interleave`` the next state (``image_vq_end``) emits ``<eoi>``
+            # through this backbone, and its forward reads ``value[-1:]`` as the
+            # input. Leaving the previous token there drops the final VQ token from
+            # the cache and shifts the resumed text by one position.
+            tail_part.value = self.generation_aligner(self.generation_embeddings(sampled))
+            maybe_merge_outputs(conversation_list)
+
             outputs["generated"] = generated
             outputs[FSM_SIGNAL_KEY] = "image_complete"
         else:

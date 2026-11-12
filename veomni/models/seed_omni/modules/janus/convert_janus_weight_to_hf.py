@@ -285,219 +285,240 @@ def convert_model(
         os.makedirs(output_dir, exist_ok=True)
         print(f"Created/verified output directory: {output_dir}")
 
+    # ``set_default_dtype`` is process-wide and this runs inside a larger job
+    # (the convert script, or the family converter), so restore the caller's
+    # default on both the success and the failure path.
+    previous_default_dtype = torch.get_default_dtype()
+
     torch.set_default_dtype(torch.float16)
-    # Download or locate model files
-    input_path = ensure_model_downloaded(repo_id=repo_id, revision=revision, local_dir=local_dir)
+    try:
+        # Download or locate model files
+        input_path = ensure_model_downloaded(repo_id=repo_id, revision=revision, local_dir=local_dir)
 
-    # Load the raw state dict up front so we can detect whether the source
-    # checkpoint ships a genuinely separate ``language_model.lm_head.weight``
-    # (DeepSeek's Janus-1.3B does, with a norm ~70x smaller than
-    # ``embed_tokens.weight``). ``LlamaConfig`` defaults ``tie_word_embeddings``
-    # to ``True``, and the raw checkpoint's ``config.json`` doesn't set the
-    # field either — so without this check, ``model.tie_weights()`` below
-    # would silently discard the real lm_head and alias it to ``embed_tokens``,
-    # corrupting every logit computed at inference time.
-    raw_state_dict = load_model_state_dict(input_path)
-    text_tie_word_embeddings = not any(k.endswith("lm_head.weight") for k in raw_state_dict)
+        # Load the raw state dict up front so we can detect whether the source
+        # checkpoint ships a genuinely separate ``language_model.lm_head.weight``
+        # (DeepSeek's Janus-1.3B does, with a norm ~70x smaller than
+        # ``embed_tokens.weight``). ``LlamaConfig`` defaults ``tie_word_embeddings``
+        # to ``True``, and the raw checkpoint's ``config.json`` doesn't set the
+        # field either — so without this check, ``model.tie_weights()`` below
+        # would silently discard the real lm_head and alias it to ``embed_tokens``,
+        # corrupting every logit computed at inference time.
+        raw_state_dict = load_model_state_dict(input_path)
+        text_tie_word_embeddings = not any(k.endswith("lm_head.weight") for k in raw_state_dict)
 
-    # Load configuration files
-    required_files = ["config.json", "preprocessor_config.json", "special_tokens_map.json", "tokenizer_config.json"]
+        # Load configuration files
+        required_files = [
+            "config.json",
+            "preprocessor_config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ]
 
-    missing_files = [f for f in required_files if not os.path.exists(os.path.join(input_path, f))]
-    if missing_files:
-        raise ValueError(
-            f"The following required configuration files are missing from {input_path}: {', '.join(missing_files)}. "
-            "Please ensure you have downloaded all necessary model files."
-        )
+        missing_files = [f for f in required_files if not os.path.exists(os.path.join(input_path, f))]
+        if missing_files:
+            raise ValueError(
+                f"The following required configuration files are missing from {input_path}: {', '.join(missing_files)}. "
+                "Please ensure you have downloaded all necessary model files."
+            )
 
-    with open(os.path.join(input_path, "config.json")) as f:
-        config_data = json.load(f)
-    with open(os.path.join(input_path, "preprocessor_config.json")) as f:
-        preprocessor_config = json.load(f)
-    with open(os.path.join(input_path, "special_tokens_map.json")) as f:
-        special_tokens_map = json.load(f)
-    with open(os.path.join(input_path, "tokenizer_config.json")) as f:
-        tokenizer_config = json.load(f)
+        with open(os.path.join(input_path, "config.json")) as f:
+            config_data = json.load(f)
+        with open(os.path.join(input_path, "preprocessor_config.json")) as f:
+            preprocessor_config = json.load(f)
+        with open(os.path.join(input_path, "special_tokens_map.json")) as f:
+            special_tokens_map = json.load(f)
+        with open(os.path.join(input_path, "tokenizer_config.json")) as f:
+            tokenizer_config = json.load(f)
 
-    # Create tokenizer directly from tokenizer.json if it exists
-    tokenizer_json_path = os.path.join(input_path, "tokenizer.json")
-    special_image_tokens = {
-        "image_token": "<image_placeholder>",
-        "boi_token": "<begin_of_image>",
-        "eoi_token": "<end_of_image>",
-    }
-
-    if os.path.exists(tokenizer_json_path) and not text_model_id:
-        # DeepSeek's Janus-1.3B ships a real byte-level BPE ``tokenizer.json``
-        # (``decoder``/``pre_tokenizer`` both ``ByteLevel``) but mislabels
-        # ``tokenizer_config.json["tokenizer_class"] == "LlamaTokenizer"``.
-        # ``AutoTokenizer.from_pretrained`` honors that class hint and rebuilds
-        # a generic SentencePiece/``Metaspace`` pipeline around the vocab —
-        # silently discarding the real ``ByteLevel`` decoder, so every decoded
-        # string loses its BPE space markers (e.g. ``"TheĠimage"`` instead of
-        # ``"The image"``). Load the fast tokenizer directly from
-        # ``tokenizer.json`` instead, bypassing the ``tokenizer_class`` dispatch.
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=tokenizer_json_path,
-            bos_token=special_tokens_map["bos_token"],
-            eos_token=special_tokens_map["eos_token"],
-            pad_token=special_tokens_map["pad_token"],
-            additional_special_tokens=special_tokens_map.get("additional_special_tokens", []),
-            model_max_length=tokenizer_config["model_max_length"],
-            extra_special_tokens=special_image_tokens,
-        )
-    else:
-        # Fallback to creating from text_model_id with special tokens
-        tokenizer = AutoTokenizer.from_pretrained(
-            text_model_id,
-            bos_token=special_tokens_map["bos_token"],
-            eos_token=special_tokens_map["eos_token"],
-            pad_token=special_tokens_map["pad_token"],
-            additional_special_tokens=special_tokens_map["additional_special_tokens"],
-            model_max_length=tokenizer_config["model_max_length"],
-            extra_special_tokens=special_image_tokens,
-        )
-
-    # Create image processor from config
-    image_processor_kwargs = {}
-    for key in ["do_normalize", "image_mean", "image_std", "min_size", "rescale_factor"]:
-        if key in preprocessor_config:
-            image_processor_kwargs[key] = preprocessor_config[key]
-
-    if "image_size" in preprocessor_config:
-        image_processor_kwargs["size"] = {
-            "height": preprocessor_config["image_size"],
-            "width": preprocessor_config["image_size"],
+        # Create tokenizer directly from tokenizer.json if it exists
+        tokenizer_json_path = os.path.join(input_path, "tokenizer.json")
+        special_image_tokens = {
+            "image_token": "<image_placeholder>",
+            "boi_token": "<begin_of_image>",
+            "eoi_token": "<end_of_image>",
         }
 
-    image_processor = JanusImageProcessor(**image_processor_kwargs)
+        if os.path.exists(tokenizer_json_path) and not text_model_id:
+            # DeepSeek's Janus-1.3B ships a real byte-level BPE ``tokenizer.json``
+            # (``decoder``/``pre_tokenizer`` both ``ByteLevel``) but mislabels
+            # ``tokenizer_config.json["tokenizer_class"] == "LlamaTokenizer"``.
+            # ``AutoTokenizer.from_pretrained`` honors that class hint and rebuilds
+            # a generic SentencePiece/``Metaspace`` pipeline around the vocab —
+            # silently discarding the real ``ByteLevel`` decoder, so every decoded
+            # string loses its BPE space markers (e.g. ``"TheĠimage"`` instead of
+            # ``"The image"``). Load the fast tokenizer directly from
+            # ``tokenizer.json`` instead, bypassing the ``tokenizer_class`` dispatch.
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_file=tokenizer_json_path,
+                bos_token=special_tokens_map["bos_token"],
+                eos_token=special_tokens_map["eos_token"],
+                pad_token=special_tokens_map["pad_token"],
+                additional_special_tokens=special_tokens_map.get("additional_special_tokens", []),
+                model_max_length=tokenizer_config["model_max_length"],
+                extra_special_tokens=special_image_tokens,
+            )
+        else:
+            # Fallback to creating from text_model_id with special tokens
+            tokenizer = AutoTokenizer.from_pretrained(
+                text_model_id,
+                bos_token=special_tokens_map["bos_token"],
+                eos_token=special_tokens_map["eos_token"],
+                pad_token=special_tokens_map["pad_token"],
+                additional_special_tokens=special_tokens_map.get("additional_special_tokens", []),
+                model_max_length=tokenizer_config["model_max_length"],
+                extra_special_tokens=special_image_tokens,
+            )
 
-    # Create processor with chat template
-    processor = JanusProcessor(
-        image_processor=image_processor,
-        tokenizer=tokenizer,
-        chat_template=CHAT_TEMPLATE,
-        use_default_system_prompt=True,
-    )
+        # Create image processor from config
+        image_processor_kwargs = {}
+        for key in ["do_normalize", "image_mean", "image_std", "min_size", "rescale_factor"]:
+            if key in preprocessor_config:
+                image_processor_kwargs[key] = preprocessor_config[key]
 
-    if output_dir:
-        print(f"Saving processor to {output_dir}...")
-        processor.save_pretrained(output_dir)
-    if output_hub_path:
-        print(f"Pushing processor to hub at {output_hub_path}...")
-        processor.push_to_hub(output_hub_path)
+        if "image_size" in preprocessor_config:
+            image_processor_kwargs["size"] = {
+                "height": preprocessor_config["image_size"],
+                "width": preprocessor_config["image_size"],
+            }
 
-    # Create model configurations
-    text_config_kwargs = {}
-    for key in [
-        "vocab_size",
-        "hidden_size",
-        "intermediate_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "hidden_act",
-        "max_position_embeddings",
-        "dtype",
-    ]:
-        if key in config_data["language_config"]:
-            text_config_kwargs[key] = config_data["language_config"][key]
+        image_processor = JanusImageProcessor(**image_processor_kwargs)
 
-    # Add token IDs from tokenizer
-    text_config_kwargs.update(
-        {
-            "pad_token_id": tokenizer.pad_token_id,
-            "bos_token_id": tokenizer.bos_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-            "tie_word_embeddings": text_tie_word_embeddings,
-        }
-    )
+        # Create processor with chat template
+        processor = JanusProcessor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            chat_template=CHAT_TEMPLATE,
+            use_default_system_prompt=True,
+        )
 
-    text_config = LlamaConfig(**text_config_kwargs)
-    # Create vision config
-    vision_config_kwargs = {}
-    if "image_size" in config_data["vision_config"]["params"]:
-        vision_config_kwargs["image_size"] = config_data["vision_config"]["params"]["image_size"]
+        if output_dir:
+            print(f"Saving processor to {output_dir}...")
+            processor.save_pretrained(output_dir)
+        if output_hub_path:
+            print(f"Pushing processor to hub at {output_hub_path}...")
+            processor.push_to_hub(output_hub_path)
 
-    # Add aligner params if present
-    if "aligner_config" in config_data and "params" in config_data["aligner_config"]:
-        if "n_embed" in config_data["aligner_config"]["params"]:
-            vision_config_kwargs["projection_dim"] = config_data["aligner_config"]["params"]["n_embed"]
-        if "depth" in config_data["aligner_config"]["params"]:
-            vision_config_kwargs["depth"] = config_data["aligner_config"]["params"]["depth"]
+        # Create model configurations
+        text_config_kwargs = {}
+        for key in [
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "hidden_act",
+            "max_position_embeddings",
+            "dtype",
+        ]:
+            if key in config_data["language_config"]:
+                text_config_kwargs[key] = config_data["language_config"][key]
 
-    vision_config = JanusVisionConfig(**vision_config_kwargs)
+        # Add token IDs from tokenizer
+        text_config_kwargs.update(
+            {
+                "pad_token_id": tokenizer.pad_token_id,
+                "bos_token_id": tokenizer.bos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "tie_word_embeddings": text_tie_word_embeddings,
+            }
+        )
 
-    vq_config = JanusVQVAEConfig(
-        embed_dim=config_data["gen_vision_config"]["params"]["n_embed"],
-        num_embeddings=config_data["gen_vision_config"]["params"]["image_token_size"],
-        projection_dim=config_data["gen_aligner_config"]["params"]["n_embed"],
-        depth=config_data["gen_aligner_config"]["params"]["depth"],
-        image_token_embed_dim=config_data["gen_head_config"]["params"]["image_token_embed"],
-    )
+        text_config = LlamaConfig(**text_config_kwargs)
+        # Create vision config
+        vision_config_kwargs = {}
+        if "image_size" in config_data["vision_config"]["params"]:
+            vision_config_kwargs["image_size"] = config_data["vision_config"]["params"]["image_size"]
 
-    # Create the main config
-    config = JanusConfig(
-        text_config=text_config,
-        vision_config=vision_config,
-        vq_config=vq_config,
-        image_token_id=tokenizer.vocab.get("<image_placeholder>"),
-    )
-    # ``JanusForConditionalGeneration.tie_weights()`` checks the *top-level*
-    # ``config.tie_word_embeddings`` (defaults to ``True`` regardless of
-    # ``text_config.tie_word_embeddings``) — keep both in sync so an untied
-    # source checkpoint (e.g. Janus-1.3B) isn't silently re-tied below.
-    config.tie_word_embeddings = text_tie_word_embeddings
+        # Add aligner params if present
+        if "aligner_config" in config_data and "params" in config_data["aligner_config"]:
+            if "n_embed" in config_data["aligner_config"]["params"]:
+                vision_config_kwargs["projection_dim"] = config_data["aligner_config"]["params"]["n_embed"]
+            if "depth" in config_data["aligner_config"]["params"]:
+                vision_config_kwargs["depth"] = config_data["aligner_config"]["params"]["depth"]
 
-    # Save the config
-    if output_dir:
-        config.save_pretrained(output_dir)
-    if output_hub_path:
-        config.push_to_hub(output_hub_path)
+        vision_config = JanusVisionConfig(**vision_config_kwargs)
 
-    # Initialize model with empty weights
-    print("Creating empty model...")
-    with torch.device("meta"):
-        model = JanusForConditionalGeneration(config)
+        vq_config = JanusVQVAEConfig(
+            embed_dim=config_data["gen_vision_config"]["params"]["n_embed"],
+            num_embeddings=config_data["gen_vision_config"]["params"]["image_token_size"],
+            projection_dim=config_data["gen_aligner_config"]["params"]["n_embed"],
+            depth=config_data["gen_aligner_config"]["params"]["depth"],
+            image_token_embed_dim=config_data["gen_head_config"]["params"]["image_token_embed"],
+        )
 
-    model.generation_config._from_model_config = False
-    model.generation_config.temperature = 1
-    model.generation_config.guidance_scale = 5
-    model.generation_config.pad_token_id = tokenizer.vocab.get("<\uff5c\u2581pad\u2581\uff5c>")
-    if not hasattr(model.generation_config, "generation_kwargs"):
-        model.generation_config.generation_kwargs = {}
-    model.generation_config.generation_kwargs["boi_token_id"] = tokenizer.vocab.get("<begin_of_image>")
+        # Create the main config
+        config = JanusConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            vq_config=vq_config,
+            image_token_id=tokenizer.vocab.get("<image_placeholder>"),
+        )
+        # ``JanusForConditionalGeneration.tie_weights()`` checks the *top-level*
+        # ``config.tie_word_embeddings`` (defaults to ``True`` regardless of
+        # ``text_config.tie_word_embeddings``) — keep both in sync so an untied
+        # source checkpoint (e.g. Janus-1.3B) isn't silently re-tied below.
+        config.tie_word_embeddings = text_tie_word_embeddings
 
-    # Convert the already-loaded raw state dict (see ``text_tie_word_embeddings``
-    # detection above — avoids loading the checkpoint from disk twice).
-    print("Converting state dict...")
-    state_dict = convert_state_dict_to_hf(raw_state_dict)
+        # Save the config
+        if output_dir:
+            config.save_pretrained(output_dir)
+        if output_hub_path:
+            config.push_to_hub(output_hub_path)
 
-    # Load converted state dict
-    print("Loading converted weights into model...")
-    model.load_state_dict(state_dict, strict=True, assign=True)
+        # Initialize model with empty weights
+        print("Creating empty model...")
+        with torch.device("meta"):
+            model = JanusForConditionalGeneration(config)
 
-    # Tie weights before any device mapping. With ``text_tie_word_embeddings``
-    # correctly reflecting whether the source checkpoint has a distinct
-    # ``lm_head.weight``, this is a no-op when untied (Janus-1.3B) and only
-    # actually ties when the source checkpoint has none (tied variants).
-    print("Tying weights...")
-    model.tie_weights()
+        model.generation_config._from_model_config = False
+        model.generation_config.temperature = 1
+        model.generation_config.guidance_scale = 5
+        model.generation_config.pad_token_id = tokenizer.vocab.get("<\uff5c\u2581pad\u2581\uff5c>")
+        if not hasattr(model.generation_config, "generation_kwargs"):
+            model.generation_config.generation_kwargs = {}
+        model.generation_config.generation_kwargs["boi_token_id"] = tokenizer.vocab.get("<begin_of_image>")
 
-    # Save the model
-    if output_dir:
-        print(f"Saving model to {output_dir}...")
-        model.save_pretrained(output_dir)
-    if output_hub_path:
-        print(f"Pushing model to hub at {output_hub_path}...")
-        model.push_to_hub(output_hub_path)
+        # Convert the already-loaded raw state dict (see ``text_tie_word_embeddings``
+        # detection above — avoids loading the checkpoint from disk twice).
+        print("Converting state dict...")
+        state_dict = convert_state_dict_to_hf(raw_state_dict)
 
-    del state_dict, raw_state_dict, model
-    gc.collect()
+        # Load converted state dict
+        print("Loading converted weights into model...")
+        # A tied source omits ``lm_head.weight``, but ``JanusForConditionalGeneration``
+        # always defines it, so a strict load would report it missing before
+        # ``tie_weights()`` below can alias it. Fill it from the embedding; an untied
+        # source keeps its own distinct head untouched.
+        if "lm_head.weight" not in state_dict:
+            state_dict["lm_head.weight"] = state_dict["model.language_model.embed_tokens.weight"]
+        model.load_state_dict(state_dict, strict=True, assign=True)
 
-    # Validate the saved model if saved locally
-    if output_dir:
-        print("Reloading the local model to check if it's saved correctly...")
-        # TODO: warning about weights not being tied is raised here regardless of model.tie_weights() above
-        JanusForConditionalGeneration.from_pretrained(output_dir, device_map="auto")
-        print("Local model reloaded successfully.")
+        # Tie weights before any device mapping. With ``text_tie_word_embeddings``
+        # correctly reflecting whether the source checkpoint has a distinct
+        # ``lm_head.weight``, this is a no-op when untied (Janus-1.3B) and only
+        # actually ties when the source checkpoint has none (tied variants).
+        print("Tying weights...")
+        model.tie_weights()
+
+        # Save the model
+        if output_dir:
+            print(f"Saving model to {output_dir}...")
+            model.save_pretrained(output_dir)
+        if output_hub_path:
+            print(f"Pushing model to hub at {output_hub_path}...")
+            model.push_to_hub(output_hub_path)
+
+        del state_dict, raw_state_dict, model
+        gc.collect()
+
+        # Validate the saved model if saved locally
+        if output_dir:
+            print("Reloading the local model to check if it's saved correctly...")
+            # TODO: warning about weights not being tied is raised here regardless of model.tie_weights() above
+            JanusForConditionalGeneration.from_pretrained(output_dir, device_map="auto")
+            print("Local model reloaded successfully.")
+    finally:
+        # ``set_default_dtype`` is process-wide and this converter can run inside a
+        # larger job, so hand the caller its default back on every path.
+        torch.set_default_dtype(previous_default_dtype)

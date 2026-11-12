@@ -53,20 +53,32 @@ class JanusTextEncoder(TextEncoder):
             inputs_embeds = self.encode(input_ids)["inputs_embeds"]
 
             tail.value = inputs_embeds
+            # ``maybe_merge_outputs`` folds this row into the previous one and
+            # drops it, so every write below has to go through the live tail.
             maybe_merge_outputs(conversation_list)
+            current = conversation_list[-1]
 
             if output_token_id == self._chat_template.boi_token_id:
                 # Same arming as ``emit_image_start``: the unconditional embeds go on
                 # the item's meta so the VQVAE span runs with guidance.
-                tail.meta["cfg_uncond_inputs_embeds"] = self._maybe_arm_cfg_for_image_gen(
+                current.meta["cfg_uncond_inputs_embeds"] = self._maybe_arm_cfg_for_image_gen(
                     conversation_list, generation_kwargs
                 )
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
+                # Flush the preceding text *without* sealing this ``<boi>`` row:
+                # ``image_vq`` starts with ``janus_llama.generate``, which asserts the
+                # tail is an ``output`` item and consumes ``value[-1:]`` as its input
+                # embedding. Sealing would turn it into text and raise. ``<boi>``
+                # itself belongs to the image span, not to the reported text.
+                self._text_token_cache.pop()
+                generated = self._flush_text_generated(conversation_list, seal=False)
+                if generated:
+                    outputs["generated"] = generated
             elif output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
-
-            if FSM_SIGNAL_KEY in outputs and outputs[FSM_SIGNAL_KEY] in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
-                outputs["generated"] = self._flush_text_generated(conversation_list)
+                generated = self._flush_text_generated(conversation_list)
+                if generated:
+                    outputs["generated"] = generated
             return outputs
 
         raise ValueError(f"Invalid type: {tail.type}")
@@ -132,7 +144,7 @@ class JanusTextEncoder(TextEncoder):
         sampled-``<boi>`` path in ``generate``). The caller stores the result on
         the output item's ``meta``.
         """
-        cfg_w = generation_kwargs.get("guidance_scale")
+        cfg_w = (generation_kwargs or {}).get("guidance_scale")
         if cfg_w is None or float(cfg_w) <= 1.0:
             return None
         return self._build_cfg_uncond_embeds(conversation_list)
