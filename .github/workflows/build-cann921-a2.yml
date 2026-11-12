@@ -5,7 +5,8 @@ on:
     branches: [zpl1n/ascend-cann921-a2-a3]
     paths:
       - .github/workflows/build-cann921-a2.yml
-      - docker/ascend/**
+      - docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86
+      - docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm
 permissions:
   contents: read
   packages: write
