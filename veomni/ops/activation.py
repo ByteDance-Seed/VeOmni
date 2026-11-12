@@ -65,26 +65,28 @@ __all__ = [
 ]
 
 
-#: Names this module evaluates, exactly as a config spells them. Membership is
-#: checked against ``transformers.activations.ACT2FN`` at import time so a
-#: transformers upgrade that renames or drops one fails here, not mid-training.
-ACTIVATIONS: tuple[str, ...] = (
-    "silu",
-    "swish",
-    "gelu",
-    "gelu_new",
-    "gelu_pytorch_tanh",
-)
+#: ``ACT2FN`` entries this module will not evaluate, with the reason. Everything
+#: else in ``ACT2FN`` is served as-is, so a transformers release that adds an
+#: activation needs no change here -- only a genuinely incompatible one does.
+_DISALLOWED: dict[str, str] = {
+    "prelu": "carries a learnable `num_parameters` slope, so an inline instance would train "
+    "a different function from the model's own",
+    "xielu": "carries learnable `alpha_p` / `alpha_n` parameters, same problem as `prelu`",
+    "laplace": "normalizes along the last dimension rather than acting elementwise, so "
+    "`activation(gate) * up` would not mean what the row assumes",
+    "gelu_10": "its forward takes `min` / `max` bounds in addition to the input, so it is not a "
+    "one-argument activation",
+}
 
 
 @lru_cache(maxsize=None)
 def _resolver(name: str):
     """The transformers implementation for *name*, or ``None`` if it has none.
 
-    ``ACT2FN`` maps most names to a *class* (``NewGELUActivation``,
-    ``PytorchGELUTanh``) and a few to a bare function. Instantiating the classes
-    once here keeps callers free of that distinction, and the cache is what makes
-    repeated evaluation during training cheap.
+    ``ACT2FN`` mixes three shapes: a *class* (``NewGELUActivation``), an already
+    instantiated ``nn.Module`` (``ClippedGELUActivation()``), and occasionally a
+    bare function. Normalizing to something callable here keeps callers free of
+    that, and the cache is what makes repeated evaluation during training cheap.
     """
     from transformers.activations import ACT2FN
 
@@ -92,17 +94,27 @@ def _resolver(name: str):
         # HF aliases this to SiLU, and naming it explicitly keeps the lookup from
         # depending on whether that alias survives a transformers upgrade.
         name = "silu"
-    implementation = ACT2FN.get(name)
-    if implementation is None:
+    if name not in ACT2FN:
         return None
+    # Subscript, not ``.get``: ``ACT2FN`` is a ``ClassInstantier`` whose ``__getitem__``
+    # turns a stored ``(cls, kwargs)`` pair into an instance. ``.get`` returns that
+    # raw pair, which is not callable.
+    implementation = ACT2FN[name]
     if inspect.isclass(implementation):
-        return implementation()
-    return implementation
+        implementation = implementation()
+    return implementation if callable(implementation) else None
 
 
 def supported_activations() -> frozenset[str]:
-    """Every config-level activation name this module can evaluate."""
-    return frozenset(name for name in ACTIVATIONS if _resolver(name) is not None)
+    """Every config-level activation name this module can evaluate.
+
+    Derived from ``ACT2FN`` so the set tracks the installed transformers rather
+    than a list that drifts from it. ``swish`` is added explicitly because HF
+    aliases it to ``silu`` and the alias has not always been present.
+    """
+    from transformers.activations import ACT2FN
+
+    return (frozenset(ACT2FN) - frozenset(_DISALLOWED)) | {"swish"}
 
 
 def supports(activation: str) -> bool:
@@ -114,19 +126,26 @@ def normalize_activation(activation: str) -> str:
     """Return the canonical spelling of *activation*.
 
     Raises:
-        ValueError: if the name has no implementation. Refusing is the point: the
-            caller has a config asking for a function the row cannot compute, and
-            substituting SiLU would train a different model than the one
-            described.
+        ValueError: if the name is not in ``ACT2FN``, or is one of the entries
+            ``_DISALLOWED`` rejects. Refusing is the point: the caller has a config
+            asking for a function the row cannot compute, and substituting SiLU
+            would train a different model than the one described.
     """
     name = activation.value if hasattr(activation, "value") else activation
     if name == "swish":
         name = "silu"
+    if name in _DISALLOWED:
+        raise ValueError(
+            f"Activation {name!r} cannot run through a gated-MLP row: it {_DISALLOWED[name]}. "
+            f"Leave the model on its `eager` projection fallback, which calls the model's own "
+            f"`act_fn` module."
+        )
     if _resolver(name) is None:
         raise ValueError(
-            f"Unsupported MLP activation {name!r}. The gated-MLP rows implement "
-            f"{sorted(supported_activations())}. Select a row that evaluates this activation, or "
-            f"leave the model on its `eager` projection fallback."
+            f"Unsupported MLP activation {name!r}: it is not in `transformers.activations.ACT2FN`. "
+            f"The rows evaluate {len(supported_activations())} names from that table, excluding "
+            f"{sorted(_DISALLOWED)}. Select a row that evaluates this activation, or leave the "
+            f"model on its `eager` projection fallback."
         )
     return name
 

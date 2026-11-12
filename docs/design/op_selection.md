@@ -138,11 +138,20 @@ Only quantizing rows are affected — every reference row keeps its fallback.
 
 The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
 decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
-evaluates the config's spellings by delegating to transformers' own implementation
-of each name -- `gelu_new` and `gelu_pytorch_tanh` are *different* functions whose
-bf16 intermediates round differently, so they are not normalized onto one formula.
-SiLU keeps its ATen spelling so the quantizing row reuses `eager`'s gradient bit
-for bit.
+serves every name in `transformers.activations.ACT2FN` except four, delegating to
+transformers' own implementation of each -- `gelu_new` and `gelu_pytorch_tanh` are
+*different* functions whose bf16 intermediates round differently, so they are not
+normalized onto one formula. SiLU keeps its ATen spelling so the quantizing row
+reuses `eager`'s gradient bit for bit.
+
+The four exclusions are incompatible with `activation(gate) * up`, and each says
+why rather than silently computing something else:
+
+| Name | Why not |
+| --- | --- |
+| `prelu`, `xielu` | carry learnable parameters, so an inline instance would train a different function from the model's own |
+| `laplace` | normalizes along the last dimension instead of acting elementwise |
+| `gelu_10` | its forward takes `min` / `max` bounds in addition to the input |
 
 Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
 a row's activation support is part of its contract:

@@ -37,6 +37,7 @@ from tests.ops.tol import (
     SWIGLU_FUSED_RTOL,
 )
 from veomni.ops import resolve_op
+from veomni.ops.activation import supported_activations
 from veomni.ops.kernels.swiglu_mlp.geglu import liger_kernel as geglu_liger
 from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
@@ -637,3 +638,94 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     # The FP32 clamp disagrees, so the assertion above is not vacuous.
     widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
     assert not torch.equal(expected, widened)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("activation", sorted(supported_activations()))
+def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
+    """The row takes the activation as an argument, so a non-SiLU model can quantize.
+
+    The oracle is ``ACT2FN[activation]``, not a formula restated here. That is the
+    point: ``gelu_new`` (``NewGELUActivation``) stages ``torch.pow(x, 3.0)`` while
+    ``gelu_pytorch_tanh`` (``PytorchGELUTanh``) writes ``x * x * x``, and the two
+    round differently in bf16. A hand-written tanh formula would have accepted the
+    wrong function for one of them.
+
+    Parametrized over ``supported_activations()`` rather than a list here, so the
+    test and the implementation cannot disagree about what is supported.
+    """
+    import torch.nn.functional as F
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 16, dtype=dtype)
+    gate_w = torch.randn(32, 16, dtype=dtype) * 0.2
+    up_w = torch.randn(32, 16, dtype=dtype) * 0.2
+    down_w = torch.randn(16, 32, dtype=dtype) * 0.2
+    empty = torch.empty(0)
+
+    out, _ = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+
+    expected = F.linear(ACT2FN[activation](F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("activation", sorted(supported_activations()))
+def test_the_eager_row_backward_matches_autograd_for_every_activation(activation):
+    """The derivative comes from autograd inside the custom Function, and must match.
+
+    A wrong derivative leaves the forward bit-exact while every gradient is off --
+    the shape of bug a forward-only test cannot see. It happened once here: an
+    early draft dropped the ``up`` factor from ``d/dgate``, and the forward matched
+    perfectly.
+    """
+    import torch.nn.functional as F
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 16, dtype=torch.float32, requires_grad=True)
+    gate_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+    up_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+    down_w = (torch.randn(16, 32, dtype=torch.float32) * 0.2).requires_grad_()
+    empty = torch.empty(0)
+
+    out, saved = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+    grad_out = torch.randn_like(out)
+    grads = [g for g in eager.backward(grad_out, saved) if g is not None]
+
+    reference = F.linear(ACT2FN[activation](F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    expected = torch.autograd.grad(reference, (x, gate_w, up_w, down_w), grad_out)
+
+    assert len(grads) == len(expected)
+    for got, want in zip(grads, expected):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+
+def test_liger_kernels_refuses_an_activation_it_cannot_compute():
+    """Liger's swiglu kernels are SiLU only, and say so instead of computing SiLU anyway."""
+    from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel
+
+    empty = torch.empty(0)
+    x = torch.randn(2, 16)
+
+    with pytest.raises(ValueError, match="computes SiLU only"):
+        liger_kernel.forward(x, x.T, empty, x.T, empty, x.T, empty, activation="gelu")
+
+
+def test_the_disallowed_activations_are_refused_with_a_reason():
+    """`prelu` / `xielu` carry parameters, `laplace` is not elementwise, `gelu_10` takes bounds.
+
+    Each would silently mean something other than ``activation(gate) * up``, so the
+    set is asserted rather than left to drift with a transformers upgrade.
+    """
+    from veomni.ops.activation import _DISALLOWED, normalize_activation, supports
+
+    assert set(_DISALLOWED) == {"prelu", "xielu", "laplace", "gelu_10"}
+    for name in _DISALLOWED:
+        assert not supports(name)
+        with pytest.raises(ValueError, match="cannot run through a gated-MLP row"):
+            normalize_activation(name)
