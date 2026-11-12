@@ -26,6 +26,8 @@ and wins over the backbone's shorter ``model.language_model.``.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -39,7 +41,7 @@ from .vqvae.configuration import JanusVqvaeConfig
 
 
 _TIED_EMBEDDING_SOURCE_KEY = "__janus_tied_embedding_source__"
-"""Attribute set by :func:`_read_hf_config`: should the text encoder tie its head?
+"""Attribute set by :meth:`JanusHFLayout.read_hf_config`: should the text encoder tie its head?
 
 ``True`` when the checkpoint stores no ``lm_head.weight`` (a tied export) or
 stores it byte-identical to the embedding (a tied model that wrote the duplicate
@@ -58,7 +60,6 @@ def _tie_verdict_from_weights(
     absent or byte-identical to the embedding; it refuses only when both keys are
     present with different values. Returns ``None`` when there is nothing to read.
     """
-    import os
 
     from safetensors import safe_open
 
@@ -77,37 +78,6 @@ def _tie_verdict_from_weights(
     # Equal values mean a tied model that wrote the duplicate out; keep the tie so
     # SFT cannot drift head and embedding apart.
     return bool(torch.equal(head, embed))
-
-
-def _read_hf_config(source_path: str):
-    """Read the upstream config and record what the weight files say about the head.
-
-    ``transformers`` refuses to tie when ``lm_head.weight`` and
-    ``model.language_model.embed_tokens.weight`` are both stored with *different*
-    values, but keeps the tie when they are identical (a tied model that wrote the
-    duplicate out). Reading the tensors here — the only place that sees the files —
-    lets :func:`_tie_word_embeddings` reproduce that decision.
-    """
-    from transformers import AutoConfig
-
-    from ...utils.hf_layout import source_weight_files
-
-    hf_config = AutoConfig.from_pretrained(source_path)
-    try:
-        weight_files = source_weight_files(source_path)
-    except FileNotFoundError:
-        # No safetensors weights to inspect (e.g. a bin-only or fixture root):
-        # fall back to the config flags alone.
-        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-    else:
-        setattr(
-            hf_config,
-            _TIED_EMBEDDING_SOURCE_KEY,
-            _tie_verdict_from_weights(
-                source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
-            ),
-        )
-    return hf_config
 
 
 def _siglip_config(hf_config: Any) -> JanusSiglipConfig:
@@ -185,7 +155,6 @@ def _tokenizer(model_path: str) -> dict[str, Any]:
     class carries a rebuilt Metaspace pipeline that decodes differently
     (``"TheĠimage"``), so the same check the family converter runs applies here.
     """
-    import json
 
     from transformers import AutoTokenizer
 
@@ -232,7 +201,36 @@ def _vqvae_assets(model_path: str) -> dict[str, Any]:
     return {"image_processor": JanusVqvaeProcessor(**processor.to_dict())}
 
 
-JANUS_HF_LAYOUT = OmniHFLayout(
+class JanusHFLayout(OmniHFLayout):
+    """Janus' upstream layout, deciding the head/embedding tie from the weight files.
+
+    ``read_hf_config`` is the only place that sees the checkpoint's tensors before
+    the module configs are built, so the tie verdict is recorded on the config
+    there and :func:`_tie_word_embeddings` reads it back.
+    """
+
+    def read_hf_config(self, source_path: str):
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(source_path)
+        try:
+            weight_files = self.source_weight_files(source_path)
+        except FileNotFoundError:
+            # No safetensors weights to inspect (e.g. a bin-only or fixture root):
+            # fall back to the config flags alone.
+            setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+        else:
+            setattr(
+                hf_config,
+                _TIED_EMBEDDING_SOURCE_KEY,
+                _tie_verdict_from_weights(
+                    source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
+                ),
+            )
+        return hf_config
+
+
+JANUS_HF_LAYOUT = JanusHFLayout(
     modules={
         "janus_siglip": OmniHFModuleLayout(
             key_prefixes=(
@@ -277,9 +275,6 @@ JANUS_HF_LAYOUT = OmniHFLayout(
         "infer_interleave": "infer/graph_infer_interleave.yaml",
     },
     infer_type="infer_interleave",
-    # Tying depends on whether the checkpoint stores ``lm_head.weight``, which
-    # only the weight files reveal; this reads them alongside the config.
-    load_hf_config=_read_hf_config,
 )
 
 
