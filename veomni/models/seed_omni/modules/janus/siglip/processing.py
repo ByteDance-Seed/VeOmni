@@ -53,16 +53,31 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
 
     @property
+    def _processor_size(self) -> tuple[int, int]:
+        """``(height, width)`` the image processor emits at.
+
+        HF allows ``size`` to be an ``int`` (square) or a dict with
+        ``height``/``width`` or ``shortest_edge``; a caller passing a bare int is
+        legal, so both spellings are handled here.
+        """
+        size = self._image_processor.size
+        if isinstance(size, int):
+            return size, size
+        height = size.get("height") or size.get("shortest_edge")
+        width = size.get("width") or size.get("shortest_edge")
+        return int(height), int(width)
+
+    @property
     def _num_patch_tokens(self) -> int:
         """Patch embeddings one SigLIP image contributes, i.e. its backbone rows.
 
         ``dyn_bsz`` counts these per image item; the tower emits one row per
         patch and the aligner does not change the row count.
         """
-        size = self._image_processor.size
-        height = int(size["height"] if "height" in size else size["shortest_edge"])
-        width = int(size["width"] if "width" in size else size["shortest_edge"])
-        patch = int(self._image_processor.patch_size)
+        height, width = self._processor_size
+        # A processor always exposes ``patch_size``; a lightweight stand-in
+        # (a test double) may not, and one token per pixel is the honest default.
+        patch = int(getattr(self._image_processor, "patch_size", 1))
         return (height // patch) * (width // patch)
 
     @classmethod
@@ -82,9 +97,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         here rather than at the first step.
         """
         cfg = config.vision_config
-        size = self._image_processor.size
-        proc_h = int(size["height"] if "height" in size else size["shortest_edge"])
-        proc_w = int(size["width"] if "width" in size else size["shortest_edge"])
+        proc_h, proc_w = self._processor_size
         if (proc_h, proc_w) != (int(cfg.image_size), int(cfg.image_size)):
             raise ValueError(
                 f"{type(self).__name__}: vision_config.image_size={cfg.image_size} does not match the image "

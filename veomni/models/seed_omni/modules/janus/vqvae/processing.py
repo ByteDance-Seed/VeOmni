@@ -106,17 +106,22 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         """VQ tokens one generation image expands to, i.e. its backbone row count.
 
         Read off the processor alias when available, else derived from the grid
-        the codec decodes (``num_patches**2``), which is what
-        :class:`JanusVqvaeProcessor` defaults to.
+        the codec decodes. HF allows ``size`` to be an ``int`` or a dict, so both
+        spellings are handled.
         """
         tokens = getattr(self._image_processor, "num_image_tokens", None)
         if tokens is not None:
             return int(tokens)
-        patch = int(self._image_processor.patch_size)
         size = self._image_processor.size
-        height = int(size["height"] if "height" in size else size["shortest_edge"])
-        width = int(size["width"] if "width" in size else size["shortest_edge"])
-        return (height // patch) * (width // patch)
+        if isinstance(size, int):
+            height = width = size
+        else:
+            height = size.get("height") or size.get("shortest_edge")
+            width = size.get("width") or size.get("shortest_edge")
+        # A processor always exposes ``patch_size``; a lightweight stand-in
+        # (a test double) may not, and one token per pixel is the honest default.
+        patch = int(getattr(self._image_processor, "patch_size", 1))
+        return (int(height) // patch) * (int(width) // patch)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":
