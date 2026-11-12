@@ -728,7 +728,8 @@ def test_grouped_linear_row_matches_a_per_group_bmm():
             self.n_groups = n_groups
 
     torch.manual_seed(103)
-    n_groups, in_per_group, out_per_group, n_rows = 4, 256, 192, 130
+    # ``out_per_group`` must be a multiple of 128; 192 is not, and the row refuses it.
+    n_groups, in_per_group, out_per_group, n_rows = 4, 256, 256, 130
     linear = _Grouped(in_per_group, n_groups, out_per_group).cuda().to(torch.bfloat16)
     x = torch.randn(n_rows, n_groups, in_per_group, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     out = VeomniOp("linear", "grouped", "deepgemm_fp8")(linear, x)

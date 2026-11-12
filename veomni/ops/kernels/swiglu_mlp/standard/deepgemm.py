@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 
 from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
+from ...linear._module import require_deepgemm_block_size
 
 
 def wrapper(
@@ -39,9 +40,10 @@ def wrapper(
     Uses DeepGEMM blockwise FP8 grouped GEMMs (single group) for the gate/up and
     down projections and recomputed Triton SwiGLU activation with optional
     clamping. Hidden and intermediate dimensions must be positive multiples of
-    128. Empty bias tensors denote unused biases.
+    128. Empty bias tensors denote unused biases. ``block_size`` is fixed by
+    DeepGEMM's blockwise recipe at 128; see the ``linear`` rows.
     """
-    del block_size
+    require_deepgemm_block_size(block_size)
     if not is_nvidia_cuda_device(x.device) or get_gpu_compute_capability(x.device) not in (90, 100):
         raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if x.ndim < 2 or x.dtype != torch.bfloat16:

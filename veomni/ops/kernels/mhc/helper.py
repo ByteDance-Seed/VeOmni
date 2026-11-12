@@ -68,4 +68,7 @@ def pad_token_axis(x: Tensor, align: int) -> tuple[Tensor, int]:
     pad = -seq_len % align
     if not pad:
         return x.contiguous(), seq_len
-    return F.pad(x, (0, 0, 0, 0, 0, pad)), seq_len
+    # ``contiguous()`` after the pad, not before: ``F.pad`` preserves a
+    # ``channels_last`` memory format, and the kernels ``view(...)`` the result to
+    # flatten batch and sequence, which a preserved stride layout breaks.
+    return F.pad(x, (0, 0, 0, 0, 0, pad)).contiguous(), seq_len

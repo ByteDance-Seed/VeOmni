@@ -56,13 +56,15 @@ def _triton_fp4_roundtrip_kernel(
     x = tl.load(X + row * X_STRIDE_ROW + col_offs).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     if USE_E4M3_SCALE:
-        # Floor the *amax* at E4M3's smallest normal, then divide by 6, then clamp
-        # the ratio into the castable range. The cast is narrowing, so an
-        # unclamped ratio above 448 becomes NaN and takes the block's scale with
-        # it. Both floors are on the same quantity as the eager row's, which is
-        # what keeps the two backends bit-identical.
-        scale = (tl.maximum(amax, 6.0 * (2.0**-9)) * (1.0 / 6.0)).to(tl.float32)
-        scale = tl.minimum(scale, 448.0).to(tl.float8e4nv).to(tl.float32)
+        # Mirror the eager row's arithmetic exactly, because the two are compared
+        # bitwise: floor the *amax* at E4M3's smallest normal, divide by 6 (not
+        # multiply by a reciprocal -- they differ in fp32 for a third of inputs),
+        # clamp the ratio into the castable range, then cast. The cast is
+        # narrowing, so an unclamped ratio above 448 would become NaN and take the
+        # block's scale with it.
+        scale = tl.maximum(amax, 6.0 * (2.0**-9)) / 6.0
+        scale = tl.minimum(scale, 448.0)
+        scale = scale.to(tl.float8e4nv).to(tl.float32)
     else:
         # Smallest E8M0 exponent step, then round the ratio up to a power of two.
         scaled = tl.maximum(amax, 6.0 * (2.0**-126)) * (1.0 / 6.0)
@@ -85,5 +87,10 @@ def _triton_fp4_roundtrip_kernel(
             tl.where(a <= 5.0, 4.0, 6.0),
         ),
     )
-    sign = tl.where(v < 0.0, -1.0, tl.where(v > 0.0, 1.0, 0.0))
-    tl.store(Y + row * Y_STRIDE_ROW + col_offs, (sign * nearest * scale).to(Y.dtype.element_ty))
+    # Preserve the input's sign bit, including ``-0.0``. ``v < 0`` alone makes a
+    # small negative value store ``+0``, and the release keeps ``-0`` as its own
+    # E2M1 codepoint. Reading the bit directly is the same test the eager row's
+    # ``torch.signbit`` makes, and it needs no libdevice symbol.
+    negative = v.to(tl.int32, bitcast=True) < 0
+    rounded = tl.where(negative, -nearest, nearest)
+    tl.store(Y + row * Y_STRIDE_ROW + col_offs, (rounded * scale).to(Y.dtype.element_ty))

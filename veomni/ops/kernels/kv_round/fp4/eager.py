@@ -38,7 +38,7 @@ SCALE_FORMATS = ("e4m3", "ue8m0")
 
 
 def _round_to_fp4(values: Tensor) -> Tensor:
-    """Round to the nearest E2M1 magnitude, keeping the sign.
+    """Round to the nearest E2M1 magnitude, keeping the sign *including its zero*.
 
     The midpoints between consecutive magnitudes are ``0.25, 0.75, 1.25, 1.75,
     2.5, 3.5, 5.0``; a value exactly on one rounds *down*. That is what the
@@ -47,6 +47,12 @@ def _round_to_fp4(values: Tensor) -> Tensor:
     round-half-to-even (``0.75 -> 0.5``, ``2.5 -> 2.0``), which is what a
     hardware E2M1 convert typically does. Written out rather than derived from a
     table because the table would have to be indexed by an already-quantized code.
+
+    The sign comes from the magnitude of the *encoded* value via ``signbit``
+    rather than ``sign()``: ``sign()`` returns ``0`` for ``-0.0``, so a small
+    negative input would be stored as ``+0`` and lose the distinction the release
+    preserves. ``-0.0`` is a real E2M1 codepoint (bit pattern ``0x8``), so it has
+    to survive the round trip.
     """
     a = values.abs()
     nearest = torch.where(
@@ -62,7 +68,7 @@ def _round_to_fp4(values: Tensor) -> Tensor:
             torch.where(a <= 5.0, 4.0, 6.0),
         ),
     )
-    return values.sign() * nearest
+    return torch.where(torch.signbit(values), -nearest, nearest)
 
 
 def _pow2_scale(amax: Tensor) -> Tensor:
@@ -78,10 +84,18 @@ def fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3") -> T
 
     One scale per block per row along the last dimension. Unlike the FP8 round
     trip this saturates: E2M1 tops out at 6, so a block whose amax rounds down
-    (an ``e4m3`` scale is not a power of two, and neither format represents every
-    ratio exactly) clamps its largest entries. The straight-through backward is
-    still what a deployment kernel effectively does -- it reads back the rounded
-    values and multiplies them.
+    (an ``e4m3`` scale is not a power of two and rounds to nearest, so ``6 *
+    scale`` can land below the amax) clamps its largest entries. The
+    straight-through backward is still what a deployment kernel effectively does
+    -- it reads back the rounded values and multiplies them.
+
+    The round trip is idempotent for ``ue8m0`` scales, whose power-of-two step
+    keeps ``scale(round(x)) == scale(x)``, but **not** for every ``e4m3`` block:
+    near the subnormal floor an already-rounded value can select the next scale
+    down (``39/2048 -> 15.6/1024 -> 12/1024``). That is a property of rounding a
+    scale to three mantissa bits, not a bug, and it matches what re-encoding a
+    stored tensor through the reference quantizer does. Callers treat this as an
+    encode, not a lossless transform -- which is how training uses it.
     """
     if scale_fmt not in SCALE_FORMATS:
         raise ValueError(f"scale_fmt must be one of {SCALE_FORMATS}, got {scale_fmt!r}")
@@ -96,6 +110,10 @@ def fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3") -> T
     blocks = rows.reshape(rows.shape[0], n_blocks, block_size)
     amax = blocks.abs().amax(-1, keepdim=True)
     if scale_fmt == "e4m3":
+        # Keep this arithmetic identical to the Triton kernel's: floor the amax,
+        # *divide* by 6 (a reciprocal multiply differs in fp32 for about a third of
+        # inputs and the two rows are compared bitwise), then clamp before the
+        # narrowing cast.
         ratio = (amax.clamp_min(_E4M3_AMAX_FLOOR) / FP4_MAX).clamp(max=_E4M3_MAX_RATIO)
         scale = ratio.to(torch.float8_e4m3fn).float()
     else:

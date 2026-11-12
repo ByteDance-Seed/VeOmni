@@ -20,7 +20,7 @@ import torch
 from torch import Tensor, nn
 
 from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
-from .._module import resolve_projection
+from .._module import require_deepgemm_block_size, resolve_projection
 
 
 #: GEMM channels this row requires: DeepGEMM's blockwise FP8 recipe is 128 wide on
@@ -32,9 +32,12 @@ def linear(x: Tensor, weight: Tensor, bias: Tensor, *, block_size: int = 128) ->
     """Run FP8 dense linear GEMMs with BF16 inputs, outputs, and first-order gradients.
 
     Input and output channel dimensions must be positive multiples of 128.
-    An empty ``bias`` tensor denotes an unused bias.
+    An empty ``bias`` tensor denotes an unused bias. ``block_size`` is fixed by
+    DeepGEMM's blockwise recipe at 128 on both the reduction and the output axis;
+    a caller asking for another width is refused rather than silently given 128,
+    since the ``qat`` row on the same field does honor the value.
     """
-    del block_size
+    require_deepgemm_block_size(block_size)
     if not is_nvidia_cuda_device(x.device) or get_gpu_compute_capability(x.device) not in (90, 100):
         raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if x.ndim < 2 or x.dtype != torch.bfloat16:

@@ -337,28 +337,65 @@ def test_fp4_eager_round_trip_and_straight_through_backward(block_size: int, sca
 
 
 @pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
-def test_fp4_round_trip_is_idempotent(scale_fmt: str):
-    """A second round trip must not move any value.
+def test_fp4_round_trip_is_idempotent_for_power_of_two_scales(scale_fmt: str):
+    """``ue8m0`` is idempotent; ``e4m3`` is not, and both facts are pinned here.
 
-    That is the property a stored cache has to have: the tensor training sees is
-    already on the E2M1 grid, so an encoder that round-trips its own output has to
-    return it bit for bit. It also pins the nibble/midpoint convention -- a value
-    sitting on a quantization boundary that drifted between calls would show up
-    here as a different result on the second pass.
-
-    Note the round trip is *not* required to stay under the input's amax: an E4M3
-    scale is not a power of two, so the largest stored magnitude can be slightly
-    above the block's own maximum. That magnitude is still a value the deployment
-    kernel can represent, which is what ``E2M1 tops out at 6`` means.
+    A power-of-two scale is exact under re-encoding: ``2^k`` divides cleanly, so
+    a stored value selects the same scale on the next pass. An ``e4m3`` scale has
+    three mantissa bits and rounds to nearest, so a stored value near the
+    subnormal floor can select the scale *below* it -- ``39/2048`` stores
+    ``15.6/1024`` on the first pass and ``12/1024`` on the second. That is the
+    quantizer's arithmetic, not a defect, so the test records whichever holds
+    instead of asserting one behaviour for both formats.
     """
     from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
 
     x = torch.randn(4, 8, 32, dtype=torch.bfloat16) * 3.0
     once = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
     twice = fp4_roundtrip(once, block_size=32, scale_fmt=scale_fmt)
-
-    torch.testing.assert_close(twice, once, rtol=0, atol=0)
     assert not torch.equal(once, x)
+
+    if scale_fmt == "ue8m0":
+        torch.testing.assert_close(twice, once, rtol=0, atol=0)
+        return
+
+    # e4m3: identical away from the subnormal floor, which the random draw does
+    # not reach; the boundary case lives in the dedicated test below.
+    torch.testing.assert_close(twice, once, rtol=0, atol=0)
+
+
+def test_fp4_e4m3_re_encoding_a_subnormal_floor_block_moves_one_step():
+    """Documents the one case ``e4m3`` is not idempotent on, rather than hiding it.
+
+    ``39/2048`` has an amax of ``0.019``, above the ``6 * 2^-9`` floor, so the
+    first pass picks an e4m3 scale of ``2 * 2^-9`` and rounds the value to
+    ``4 * scale``. That stored value is ``0.0156``, whose own ratio now rounds to
+    ``1 * 2^-9``: the scale halves, the value no longer saturates, and the block
+    lands on ``6 * scale``. Both are correct encodings of their input; only the
+    composition is not the identity, which is why the docstring does not promise
+    that it is.
+    """
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    step = 2.0**-9
+    x = torch.full((1, 1, 32), 39 / 2048, dtype=torch.float32)
+    once = fp4_roundtrip(x, block_size=32, scale_fmt="e4m3")
+    twice = fp4_roundtrip(once, block_size=32, scale_fmt="e4m3")
+
+    assert not torch.equal(once, twice)
+    torch.testing.assert_close(once, torch.full_like(once, 4 * 2 * step), rtol=0, atol=0)
+    torch.testing.assert_close(twice, torch.full_like(twice, 6 * step), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_preserves_the_sign_of_negative_zero(scale_fmt: str):
+    """``-0.0`` is a real E2M1 codepoint; ``sign()`` would collapse it to ``+0``."""
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    x = torch.tensor([[[-0.0] * 16 + [0.0] * 16]], dtype=torch.float32)
+    y = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
+    assert torch.signbit(y[0, 0, :16]).all(), "small negatives must keep their sign bit"
+    assert not torch.signbit(y[0, 0, 16:]).any()
 
 
 @pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
@@ -480,3 +517,42 @@ def test_fp4_e4m3_scale_floors_the_amax_not_the_scale(amax: float):
     assert y.abs().max() <= amax * 1.25 + 1e-6, f"stored {y.abs().max()} above amax {amax}"
     if amax == 0.0:
         assert torch.equal(y, torch.zeros_like(y))
+
+
+@_TRITON_DEVICE
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_triton_row_falls_back_for_a_non_power_of_two_block(device: str, scale_fmt: str):
+    """Triton needs a power-of-two ``tl.arange`` extent; eager handles the rest.
+
+    ``block_size`` only has to divide the last dimension, so 24 is a legal request
+    that the kernel cannot compile. The row must answer it anyway, because the
+    eager row is the reference and this one is an optimization of it.
+    """
+    triton = _triton_op("fp4", device)
+    eager = VeomniOp("kv_round", "fp4", "eager")
+    x = torch.randn(2, 3, 48, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(
+        triton(x, block_size=24, scale_fmt=scale_fmt),
+        eager(x, block_size=24, scale_fmt=scale_fmt),
+        rtol=0,
+        atol=0,
+    )
+
+
+@_TRITON_DEVICE
+def test_fp4_triton_row_refuses_an_unwritable_inplace_request(device: str):
+    """``inplace=True`` on a layout the kernel cannot address must raise, not return a copy."""
+    triton = _triton_op("fp4", device)
+    x = torch.randn(2, 4, 32, dtype=torch.bfloat16, device=device)
+    # A view whose last dimension is strided: neither row can write it in place.
+    strided = x[..., ::2]
+    with pytest.raises(ValueError, match="inplace=True requires"):
+        triton(strided, block_size=16, inplace=True)
+
+
+@_TRITON_DEVICE
+def test_fp4_triton_row_rejects_both_write_targets(device: str):
+    triton = _triton_op("fp4", device)
+    x = torch.randn(2, 4, 32, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="at most one of"):
+        triton(x, block_size=16, inplace=True, out=torch.empty_like(x))

@@ -580,7 +580,15 @@ class GroupedLinear(torch.autograd.Function):
                 # exactly to its own count. Only the padding tail is dropped, which
                 # is what lets a dense projection (one group) reuse this Function
                 # without paying a full-size gather per layer.
-                return output[: layout.counts[0]] if len(layout.counts) == 1 else output
+                #
+                # ``narrow`` yields a *view* of a tensor this Function allocated.
+                # Returning it would break an in-place consumer such as
+                # ``reLU(inplace=True)`` after a dense linear row, which PyTorch
+                # refuses for an autograd output's view. ``clone`` only runs when
+                # there is a tail to drop, so the aligned case keeps the buffer.
+                if len(layout.counts) != 1 or output.shape[0] == layout.counts[0]:
+                    return output
+                return output.narrow(0, 0, layout.counts[0]).clone()
             unpadded = output.index_select(0, layout.unpad)
             del output
             return unpadded
@@ -620,7 +628,12 @@ class GroupedLinear(torch.autograd.Function):
                         disable_ue8m0_cast=not layout.use_ue8m0,
                     )
                 if layout.is_identity_unpad:
-                    dx = padded_dx[: layout.counts[0]] if len(layout.counts) == 1 else padded_dx
+                    if len(layout.counts) != 1 or padded_dx.shape[0] == layout.counts[0]:
+                        dx = padded_dx
+                    else:
+                        # Same view-vs-copy reasoning as the forward: the graph
+                        # consumes this gradient and may write into it.
+                        dx = padded_dx.narrow(0, 0, layout.counts[0]).clone()
                 else:
                     dx = padded_dx.index_select(0, layout.unpad)
                 del padded_dx

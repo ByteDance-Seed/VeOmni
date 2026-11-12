@@ -35,14 +35,22 @@ def test_linear_registry_entries():
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
 
 
-def test_linear_deepgemm_rows_require_deep_gemm_on_sm90_or_sm100():
-    """The DeepGEMM rows carry the hardware and package they need, like the QAT ones."""
+def test_linear_deepgemm_rows_declare_deep_gemm_on_sm90_or_sm100():
+    """The DeepGEMM rows carry the hardware and package they need, like the QAT ones.
+
+    Read the registered metadata rather than resolving the handle: whether
+    resolution *fails* depends on the host this runs on, and this file also runs
+    on the GPU CI workers, where the row legitimately resolves.
+    """
     for variant in ("standard", "grouped"):
-        entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", variant)}
-        assert ("deepgemm_fp8", ("deep_gemm", "triton")) in entries
-    # SM89 has an E4M3 type but no DeepGEMM kernel, so the row must not resolve there.
-    with pytest.raises(RuntimeError, match="not registered for device|requires unavailable package"):
-        VeomniOp("linear", "standard", "deepgemm_fp8")
+        entries = {entry.impl: entry for entry in OP_REGISTRY.list_entries("linear", variant)}
+        assert "deepgemm_fp8" in entries, variant
+        entry = entries["deepgemm_fp8"]
+        assert entry.requires == ("deep_gemm", "triton"), variant
+        # SM90 and SM100 named explicitly: SM89 has an E4M3 type but no DeepGEMM
+        # kernel, so it must not satisfy this requirement.
+        platforms = entry.requirement.platforms
+        assert {(p.min_cc, p.max_cc) for p in platforms} == {(90, 90), (100, 100)}, variant
 
 
 def test_linear_eager_matches_f_linear():
@@ -222,3 +230,17 @@ def test_the_deepgemm_row_refuses_a_wrapped_projection():
 def test_both_quantizing_impls_are_declared_together():
     """``QUANTIZING_IMPLS`` is what the wrapper-refusal and LoRA checks consult."""
     assert QUANTIZING_IMPLS == frozenset({"qat", "deepgemm_fp8"})
+
+
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_deepgemm_rows_refuse_a_block_size_they_cannot_honor(block_size: int):
+    """``qat`` honors ``block_size``; ``deepgemm_fp8``'s recipe is fixed at 128.
+
+    Accepting and ignoring the keyword would make one field mean two different
+    recipes depending on which row the config selected.
+    """
+    from veomni.ops.kernels.linear._module import require_deepgemm_block_size
+
+    require_deepgemm_block_size(128)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        require_deepgemm_block_size(block_size)

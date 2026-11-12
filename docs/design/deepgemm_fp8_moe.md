@@ -84,8 +84,9 @@ integration, not full-model convergence validation.
 
 All of these tests need SM90/SM100 hardware and `deep_gemm`, so they skip on the
 CPU-only hosts that run part of CI — a green CI run does not by itself prove the
-rows execute. Check `tests/ops/moe_experts/test_deepgemm_fp8.py` on a Hopper or
-Blackwell host after changing `GroupedLinear`, the layout, or a quantizer.
+rows execute. After changing `GroupedLinear`, the layout, or a quantizer, run
+`tests/ops/moe_experts/test_deepgemm_fp8.py` (the expert row) and
+`tests/ops/linear/test_linear.py` (the dense rows) on a Hopper or Blackwell host.
 
 ## Requirements and tensor contract
 
@@ -359,7 +360,7 @@ Run on Hopper or Blackwell SM100 after syncing the GPU environment:
 
 ```bash
 OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
-  tests/ops/moe_experts/ tests/ops/base/
+  tests/ops/moe_experts/ tests/ops/linear/ tests/ops/kv_round/ tests/ops/base/
 
 OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
   tests/models/transformers/deepseek_v4/test_deepseek_v4.py \

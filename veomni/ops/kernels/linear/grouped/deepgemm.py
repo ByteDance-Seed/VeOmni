@@ -20,7 +20,7 @@ import torch
 from torch import Tensor, nn
 
 from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
-from .._module import resolve_projection
+from .._module import require_deepgemm_block_size, resolve_projection
 
 
 def grouped_linear(
@@ -35,9 +35,10 @@ def grouped_linear(
 
     ``x`` has shape ``[..., n_groups, in_per_group]`` and ``weight`` has shape
     ``[n_groups * out_per_group, in_per_group]``. Both ``in_per_group`` and
-    ``out_per_group`` must be positive multiples of 128.
+    ``out_per_group`` must be positive multiples of 128. ``block_size`` is fixed
+    by DeepGEMM's blockwise recipe at 128; see the ``standard`` row.
     """
-    del block_size
+    require_deepgemm_block_size(block_size)
     if not is_nvidia_cuda_device(x.device) or get_gpu_compute_capability(x.device) not in (90, 100):
         raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if x.ndim < 2 or x.dtype != torch.bfloat16:

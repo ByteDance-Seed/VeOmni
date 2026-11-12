@@ -403,3 +403,15 @@ def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(seq_len: 
     y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
     assert y_o.shape == y_e.shape
     torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+
+def test_pad_token_axis_returns_row_major_contiguous():
+    """``F.pad`` preserves ``channels_last``; the kernels ``view`` the result."""
+    from veomni.ops.kernels.mhc.helper import TOKEN_ALIGN, pad_token_axis
+
+    for seq_len in (33, TOKEN_ALIGN):
+        x = torch.randn(2, seq_len, 4, 256).to(memory_format=torch.channels_last)
+        padded, reported = pad_token_axis(x, TOKEN_ALIGN)
+        assert reported == seq_len
+        assert padded.is_contiguous(), seq_len
+        assert padded.shape[1] % TOKEN_ALIGN == 0
