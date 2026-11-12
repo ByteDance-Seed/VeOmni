@@ -68,11 +68,10 @@ def select_graph(
     empty_hint: str = "",
     unknown_hint: str = "scenario",
 ) -> Any:
-    """Pick the active graph out of a scenario map; unset ``scenario`` takes the first."""
+    """Pick the active graph out of a scenario map."""
     if not graphs:
         raise ValueError(f"No graph scenarios are declared. {empty_hint}".strip())
-    if scenario is None:
-        return next(iter(graphs.values()))
+    assert scenario is not None, f"`{unknown_hint}` must be normalized before calling `select_graph`."
     if scenario not in graphs:
         known = ", ".join(graphs)
         raise KeyError(f"Unknown {unknown_hint} {scenario!r}; expected one of: {known}.")
@@ -220,6 +219,7 @@ class OmniConfig(VeOmniPretrainedConfig):
         check_infer_type_names(generation_graphs or {})
         self.train_type = train_type
         self.infer_type = infer_type
+        self._resolve_graph_types()
         self.generation_kwargs = generation_kwargs
         # Model-level kernels: this composed model's defaults for every module
         # it holds. Sparse — only what was explicitly selected. A loaded module
@@ -454,6 +454,17 @@ class OmniConfig(VeOmniPretrainedConfig):
                 base_ops_implementation=self.ops_implementation,
             )
 
+    def _resolve_graph_types(self) -> None:
+        """Bind the active scenario in each graph map once the map is final."""
+        for graphs, attr in ((self.training_graphs, "train_type"), (self.generation_graphs, "infer_type")):
+            if not graphs:
+                continue
+            selected = getattr(self, attr)
+            if selected is None:
+                setattr(self, attr, next(iter(graphs)))
+            elif selected not in graphs:
+                raise KeyError(f"Unknown {attr} {selected!r}; expected one of: {', '.join(graphs)}.")
+
     def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.
 
@@ -469,6 +480,7 @@ class OmniConfig(VeOmniPretrainedConfig):
         if not self.generation_graphs:
             self.generation_graphs = self._read_graph_sidecar(root, DEFAULT_GENERATION_GRAPH_FILE, dict)
             check_infer_type_names(self.generation_graphs)
+        self._resolve_graph_types()
 
     @classmethod
     def _read_graph_sidecar(cls, root: str, filename: str, payload_type: type) -> Dict:

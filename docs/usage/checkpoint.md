@@ -11,7 +11,8 @@ checkpoints/global_step_{N}/
 ├── model/[<module>/]
 │   ├── ckpt/                     # weights, DCP
 │   ├── optimizer/                # optimizer state, DCP
-│   └── extra_state/extra_state_rank_{R}.pt # scheduler and model runtime state
+│   └── extra_state/
+│       └── extra_state_rank_{R}.pt   # scheduler, condition-model RNG
 ├── loader/rank_{R}.pt            # dataloader / sampler cursor
 ├── extra_state/rank_{R}.pt       # global_step, RNG, meters
 ├── hf_ckpt/[<module>/]           # full-model export, not resume
@@ -29,7 +30,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 |------|-------|------------|
 | `model/**/ckpt/` | Weights. A LoRA run stores only the trainable adapter tensors; the frozen base is reloaded from `model.model_path`. | All ranks, via DCP |
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
-| `model/**/extra_state/extra_state_rank_{R}.pt` | `lr_scheduler` state and model runtime-specific state (for example, a condition-model RNG). | Rank R |
+| `model/**/extra_state/extra_state_rank_{R}.pt` | Model-bound extra state: `lr_scheduler.state_dict()` and whatever the runtime contributes (e.g. the DiT condition model's RNG). | Rank R |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
 | `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
@@ -51,9 +52,9 @@ Three splits in the tree above are deliberate:
   Iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` and the
   multisource sampler filters on `dp_rank`, so restoring rank 0's cursor
   everywhere would replay rank 0's shard and skip the rest. RNG and meters are
-  rank-local for the same reason. The scheduler is replicated, but is saved inside each rank's model
-  `extra_state/extra_state_rank_{R}.pt` alongside rank-local runtime state.
-  Each rank restores its own model sidecar.
+  rank-local for the same reason. Scheduler state is also saved and restored per rank: it lives in
+  each rank's `model/<module>/extra_state/extra_state_rank_{R}.pt`, beside the
+  runtime-contributed state, rather than in a replicated sidecar.
 - **Weights and optimizer are two DCP directories** because they have different
   lifetimes. Optimizer state is roughly twice the size of the weights under Adam
   and is useless outside this run, so a checkpoint being shipped, archived or
@@ -83,7 +84,7 @@ output_dir/
 ├── checkpoints/global_step_{N}/
 │   ├── checkpoint_manifest.json      # trainer cursor is down; does not list modules
 │   ├── model/
-│   │   ├── janus_siglip/             # each module directory holds the same three
+│   │   ├── janus_siglip/             # each module directory holds the same
 │   │   │   ├── ckpt/                 # things as a single-module model/
 │   │   │   ├── optimizer/
 │   │   │   └── extra_state/extra_state_rank_{R}.pt
@@ -133,7 +134,7 @@ half-loaded.
 The one step with a single half is a run that saves no model state. SeedOmni's
 `offline_embedding` freezes every module, so no module has a checkpoint
 manager and the step has no `model/`. Its manifest records
-[`model_state: false`](../../veomni/checkpoint/layout.py#L259), and the manifest
+[`model_state: false`](../../veomni/checkpoint/layout.py#L254), and the manifest
 alone then marks the step complete. Without that field, the same tree would look
 like a step whose shards never started. A manifest written before the field
 existed counts as carrying model state.
@@ -141,9 +142,7 @@ existed counts as carrying model state.
 Rewriting a step — a restarted run reaching the same step again — deletes the
 markers first, so an interrupted rewrite cannot leave a stale one standing over
 new, partial data. Each half clears its own, right before it writes it back:
-`DistributedCheckpointer` drops the module's `.metadata` files (including the
-one at the step root that an older VeOmni's fused save left, which would
-otherwise keep the step discoverable through the legacy fallback below), and
+`DistributedCheckpointer` drops the module's `.metadata` files and
 `GlobalStateCallback` drops the manifest. Since completeness is the conjunction,
 the step is correctly rejected throughout, including in the window where one
 half has been invalidated and the other has not.
@@ -161,11 +160,6 @@ LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
 
-Checkpoints from older layouts have no manifest; discovery falls back to a
-`.metadata` at the step root, which is what marked those steps complete, but
-only while the step is still entirely pre-split. See
-[Resuming older checkpoints](#resuming-older-checkpoints).
-
 SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
 `ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
 through the shared `GlobalStateCallback`, so its steps carry the same per-rank
@@ -181,9 +175,9 @@ staged copy, so it would write straight to the destination staging was meant to
 avoid.
 
 With `stage_dir` (synchronous), the whole `model/` subtree — both DCP
-directories and per-rank model `extra_state/` sidecars — is written to node-local scratch and copied
-into the step directory afterwards, with every `.metadata` copied last. The
-staging directory is never part of the checkpoint itself. The copy's collectives
+directories and the per-rank `extra_state/` pickles — is written to node-local
+scratch and copied into the step directory afterwards, with every `.metadata`
+copied last. The staging directory is never part of the checkpoint itself. The copy's collectives
 run on a dedicated Gloo group rather than the training backend, bounded by
 `train.checkpoint.save_timeout_seconds` (Gloo's 30-minute default when unset):
 the ranks not copying wait on it for the whole copy. A multi-node staged save
@@ -191,29 +185,38 @@ therefore needs working Gloo networking (for example `GLOO_SOCKET_IFNAME`), and 
 misconfiguration only shows at the first checkpoint.
 
 With `save_async` (unstaged), `model/` is written in place and the call returns
-while the DCP write is still in flight. The model's `extra_state/extra_state_rank_{R}.pt` is written synchronously on each
-rank before either DCP save starts; it includes scheduler and runtime state. Weights and optimizer are two independent
-saves, each holding its own future and its own Gloo process group (also bounded
-by `save_timeout_seconds`) so they overlap rather than serialise. Nothing downstream waits for them: the cursor
-files and the manifest claim only what they cover, and the shards answer for
-themselves through the `.metadata` DCP writes last. Pending saves are drained at
+while the DCP write is still in flight. The per-rank `extra_state/` pickles are
+written first, before either DCP save starts. Weights and optimizer are two
+independent saves, each holding its own future and its own Gloo process group
+(also bounded by `save_timeout_seconds`) so they overlap rather than serialise.
+Nothing downstream waits for them: the cursor files and the manifest claim only
+what they cover, and the shards answer for themselves through the `.metadata`
+DCP writes last. Pending saves are drained at
 the next save of the same kind and at train end; a drain that finds a failed
 save raises on every rank, not just the one that saw it, agreeing on that
 save's own Gloo group so the ranks whose write finished first wait there
 rather than on the training backend.
 
-## Resuming older checkpoints
+## Older checkpoints do not resume
 
-Temporary. New saves never produce the older shapes, and the compatibility
-loader in `veomni/checkpoint/legacy_v0_1_12.py` will be removed. Current files
-always win — a fallback is consulted only when the current path is absent.
+Only the layout above is read. A step written by an older VeOmni — one whose
+root was the DCP directory, whose cursor lived in `extra_state_rank_{R}.pt` or
+`trainer_state_rank_{R}.pt`, or whose module directories were nested one level
+too shallow — carries no `checkpoint_manifest.json` where this layout puts one,
+so `load_path: auto` skips it. An explicit `train.checkpoint.load_path` at such
+a step still attempts the load, and `DistributedCheckpointer.load` raises a
+`FileNotFoundError` naming the missing `model/<module>/ckpt/.metadata`, pointing
+here. The same error is what an interrupted save looks like: a directory that
+was begun and never finished is indistinguishable from an old one on disk, so
+both are reported the same way. Nothing translates either.
 
-| Missing in the current layout | Falls back to |
-|-------------------------------|---------------|
-| `checkpoint_manifest.json` (discovery, `load_path: auto`) | `.metadata` at the step root, which is what marked an older step complete — unless the step also has a `model/`, which means a current-layout rewrite landed on it and did not finish |
-| `model/ckpt/.metadata` | `.metadata` at the step root; weights and optimizer are both read from that fused directory |
-| `model/extra_state/extra_state_rank_{R}.pt` | The model-side loader reads this sidecar from the resolved model directory if present; it does not restore a standalone `lr_scheduler.pt`. |
-| `loader/rank_{R}.pt`, `extra_state/rank_{R}.pt` | `trainer_state_rank_{R}.pt`, then the 0.1.12 pickle's job cursor when `global_step` is present |
+The compatibility loader that handled VeOmni 0.1.12 and 0.2.x
+(`veomni/checkpoint/legacy_v0_1_12.py`) has been removed. To keep training from
+such a run, restart it, or convert the weights out first with
+[Checkpoint conversion](checkpoint_conversion.md) and resume from the converted
+export as a fresh run.
+
+### Split-layout checkpoints missing model sidecars
 
 A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
 can pass marker discovery even when the per-rank model sidecars are missing.
@@ -230,29 +233,6 @@ state as well. This is a format conversion, not a file rename; the repository
 does not provide an automatic standalone-scheduler fallback here. Validate the
 restored scheduler state and next learning-rate update against a compatible
 resume before using the converted checkpoint for training.
-
-What those older shapes looked like:
-
-| Era | Step directory |
-|-----|----------------|
-| 0.1.12 | Step root *was* the DCP directory (`.metadata` + fused `__{i}_{rank}.distcp`); `extra_state/extra_state_rank_{R}.pt` mixed the scheduler and the job cursor; the LoRA adapter went to `<output_dir>/global_step_{N}/`, a sibling of `checkpoints/` |
-| 0.2.x flat | The same, with the cursor split out into `trainer_state_rank_{R}.pt` and `extra_state_rank_{R}.pt` left holding the scheduler alone |
-| SeedOmni modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
-
-The same fallbacks resolve a SeedOmni module checkpoint, because they are applied
-*within* a module's directory: a module whose `model/<name>/` is absent falls
-back to `<name>/` at the step root.
-
-`extra_state/` therefore needs its full path to identify its owner. In the
-current layout, job state lives at `extra_state/rank_{R}.pt`, while model state
-lives at `model/[<module>/]extra_state/extra_state_rank_{R}.pt`. Older layouts
-may place model sidecars at the step root. Discovery of an older checkpoint
-does not guarantee restoration of every sidecar; verify scheduler and runtime
-state when resuming it.
-
-To drop legacy resume, delete `veomni/checkpoint/legacy_v0_1_12.py` and the
-imports that load it (search for `legacy_v0_1_12`). An old checkpoint then fails
-resume instead of falling back.
 
 ## Related pages
 

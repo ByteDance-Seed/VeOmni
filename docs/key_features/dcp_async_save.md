@@ -172,7 +172,7 @@ does not require an optimizer marker. A manifest with `model_state: false`
 requires no model markers. These are marker-existence checks, not validation of
 every shard, sidecar or file's contents; successful discovery alone does not prove
 that a full training resume will succeed. See [checkpoint layout](../usage/checkpoint.md) for discovery and
-legacy layouts; the per-rank model sidecar shown above follows this revision's
+unsupported older layouts; the per-rank model sidecar shown above follows this revision's
 `_save_extra_state` implementation.
 
 Do not set the derived `save_path` field in YAML. For recovery after successful

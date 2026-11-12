@@ -354,7 +354,7 @@ def test_qwen3_accelerated_packed_flex_attention_builds_block_mask_and_matches_s
             ],
         ]
         pre_out = llm_packed.pre_forward("forward", conversation_list=conversations)
-        assert isinstance(pre_out["attention_mask"], dict) and "full_attention" in pre_out["attention_mask"]
+        assert isinstance(pre_out["attention_mask"], torch.Tensor) and pre_out["attention_mask"].ndim == 2
         out_conv = llm_packed.post_forward("forward", **llm_packed(**pre_out))["conversation_list"]
 
         conv_0 = [
@@ -401,14 +401,14 @@ def test_qwen3_train_and_infer_yaml_configs_load():
         build_omni_model_runtime_args,
     )
 
-    cfg_dir = Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b" / "train"
+    cfg_dir = Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3"
     args = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=".",
             model_config={
-                "modules": str(cfg_dir / "modules_train.yaml"),
-                "train_graph": str(cfg_dir / "graph_train.yaml"),
-                "infer_graph": str(cfg_dir / "graph_infer.yaml"),
+                "modules": str(cfg_dir / "train/modules_train.yaml"),
+                "train_graph": str(cfg_dir / "train/graph_train.yaml"),
+                "infer_graph": str(cfg_dir / "infer/graph_infer.yaml"),
             },
         ),
         data=OmniDataArguments(train_path="."),
