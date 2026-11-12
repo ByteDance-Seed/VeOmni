@@ -122,7 +122,28 @@ def test_multiple_cycles_emit_exact_coverage_and_short_tail():
     for seen_cycle in cycles:
         assert sorted(seen_cycle) == list(range(len(dataset)))
         assert len(seen_cycle) == len(set(seen_cycle))
+    assert all(seen_cycle == cycles[0] for seen_cycle in cycles[1:])
     assert all(torch.equal(row["labels"], row["input_ids"]) for row in dataset.rows)
+
+
+def test_greedy_order_repeats_across_epoch_resume():
+    opts = dict(max_seq_len=5, buffer_size=3, micro_batches_per_step=3, train_steps=4, train_epochs=2)
+    step = SimpleNamespace(value=0)
+    data = loader(Samples(lengths=(4, 3, 1)), step, **opts)
+    data.set_epoch(0)
+    for _ in range(4):
+        batch = advance(data, step)
+        assert [group["ids"] for group in batch] == [[0, 2], [1]]
+    snapshot = data.state_dict()
+    restored_step = SimpleNamespace(value=4)
+    restored = loader(Samples(lengths=(4, 3, 1)), restored_step, require_resume=True, **opts)
+    restored.load_state_dict(snapshot)
+    data.set_epoch(1)
+    restored.set_epoch(1)
+    expected = advance(data, step)
+    actual = advance(restored, restored_step)
+    assert [group["ids"] for group in actual] == [[0, 2], [1]]
+    assert compact(actual) == compact(expected)
 
 
 def test_packing_budget_is_independent_of_backing_storage_capacity():
