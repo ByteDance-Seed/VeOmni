@@ -290,7 +290,10 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         generation_graphs=generation_graphs,
         train_type=train_type,
         infer_type=infer_type,
-        generation_kwargs=dict(args.infer.generation_kwargs),
+        generation_kwargs={
+            **(omni_cfg.generation_kwargs or {} if omni_cfg is not None else {}),
+            **args.infer.generation_kwargs,
+        },
     )
 
 

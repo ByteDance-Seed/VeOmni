@@ -48,6 +48,7 @@ from .device import (
     get_torch_device,
 )
 from .dist_utils import all_reduce
+from .flops_meter import get_flops_metadata_callback
 from .multisource_utils import parse_multisource_config
 from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
@@ -129,29 +130,6 @@ def _compute_image_seqlens(
             tokens_per_image = (pixel_values.shape[-2] // patch_size) * (pixel_values.shape[-1] // patch_size)
             image_seqlens.extend([tokens_per_image] * pixel_values.shape[0])
     return image_seqlens
-
-
-def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    if "latents" not in micro_batch:
-        return []
-    dit_latents_seqlens = []
-    for latents in micro_batch["latents"]:
-        latent_shape = latents.shape
-        if len(latent_shape) == 3:
-            B, seq_len, _C = latent_shape
-            dit_latents_seqlens.append(B * seq_len)
-            continue
-        if len(latent_shape) == 5:
-            B = latent_shape[0]
-        else:
-            B = 1
-        C, T, H, W = latent_shape[-4:]
-        T_out = int((T - 1) / 1 + 1)
-        H_out = int((H - 2) / 2 + 1)
-        W_out = int((W - 2) / 2 + 1)
-        seqlens = B * T_out * H_out * W_out
-        dit_latents_seqlens.append(seqlens)
-    return dit_latents_seqlens
 
 
 def _as_index_list(ds_idx: Any) -> List[int]:
@@ -254,6 +232,8 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self._flops_metadata_callback = get_flops_metadata_callback(config)
+        self._model_metadata = {}
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 
@@ -308,8 +288,11 @@ class EnvironMeter:
                 self._record_token_stats(micro_batch)
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
-        else:  # dit diffusers model
-            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
+        else:
+            seq_lens, model_metadata = self._flops_metadata_callback(micro_batch)
+            self.batch_seqlens.extend(seq_lens)
+            for name, values in model_metadata.items():
+                self._model_metadata.setdefault(name, []).extend(values)
 
     def _record_token_stats(self, batch):
         """Meter standard packed batches without changing existing data-cursor accounting.
@@ -394,6 +377,10 @@ class EnvironMeter:
                 self._warned_unsupported_lora_flops = True
         if freeze_vit is not None and self.supports_lora_flops:
             flops_kwargs["freeze_vit"] = freeze_vit
+        # Omit empty metadata for existing counters; metadata-aware estimators
+        # must accept an omitted argument for steps without model-specific data.
+        if self._model_metadata:
+            flops_kwargs["model_metadata"] = self._model_metadata
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,
@@ -484,6 +471,7 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self._model_metadata = {}
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 
