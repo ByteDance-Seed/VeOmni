@@ -72,9 +72,10 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
 
     reject_quantizing_row(
         mlp,
-        "a wrapped projection: a layer substituted after construction (LoRA) keeps the base weights at "
-        "`base_layer`, so the handle cannot read the weight the row asks for",
-        remedy="Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down.",
+        "a wrapped projection or an nn.Linear subclass: LoRA keeps the base weights at `base_layer`, and a "
+        "subclass such as torchao's Float8Linear computes its own GEMM in forward, so the handle cannot "
+        "fake-quantize the weight the projection actually uses",
+        remedy="Set swiglu_mlp_implementation='eager' for adapter or float8 training on gate/up/down.",
     )
     return False
 

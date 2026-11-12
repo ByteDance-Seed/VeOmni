@@ -637,3 +637,35 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     # The FP32 clamp disagrees, so the assertion above is not vacuous.
     widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
     assert not torch.equal(expected, widened)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_linear_subclass_projection_skips_the_fused_path():
+    """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
+
+    torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
+    ``forward``. An ``isinstance`` check would let the fused row read its weight and
+    silently skip float8, so the check must be on the exact type. A quantizing row
+    on such a projection is refused instead of falling back.
+    """
+    from veomni.ops import VeomniOp
+    from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+
+    class _SubclassLinear(nn.Linear):
+        pass
+
+    mlp = _tiny_qwen3_mlp()
+    assert has_plain_linear_projections(mlp)
+
+    mlp.up_proj = _SubclassLinear(mlp.hidden_size, mlp.intermediate_size, bias=False)
+    mlp.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", "eager")
+    assert not has_plain_linear_projections(mlp)
+
+    # The quantizing check runs before the row is resolved, so a stub handle
+    # carrying the impl name is enough; the real ``qat`` row needs SM90 + TileLang.
+    class _QatHandle:
+        impl = "qat"
+
+    mlp.veomni_swiglu_mlp = _QatHandle()
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        has_plain_linear_projections(mlp)

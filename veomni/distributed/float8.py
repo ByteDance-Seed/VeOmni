@@ -34,7 +34,7 @@ _ELIGIBLE_PROJECTIONS: dict[str, re.Pattern[str]] = {
     "qwen3": re.compile(r"model\.layers\.\d+\.(?:mlp\.(?:gate|up|down)_proj|self_attn\.(?:q|k|v|o)_proj)"),
     "llama": re.compile(r"model\.layers\.\d+\.(?:mlp\.(?:gate|up|down)_proj|self_attn\.(?:q|k|v|o)_proj)"),
     "WanTransformer3DModel": re.compile(
-        r"blocks\.\d+\.(?:attn[12]\.(?:to_[qkv]|to_out\.0|add_[kv]_proj)|ffn\.net\.(?:0\.proj|2))"
+        r"blocks\.\d+\.(?:attn1\.(?:to_[qkv]|to_out\.0)|attn2\.(?:to_[qkv]|to_out\.0|add_[kv]_proj)|ffn\.net\.(?:0\.proj|2))"
     ),
     "QwenImageTransformer2DModel": re.compile(
         r"transformer_blocks\.\d+\.(?:attn\.(?:to_[qkv]|to_out\.0|add_[qkv]_proj|to_add_out)|(?:img|txt)_mlp\.net\.(?:0\.proj|2))"

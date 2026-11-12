@@ -77,7 +77,7 @@ model:
 ```
 
 Model-specific eligible DiT projection patterns:
-- `WanTransformer3DModel`: `blocks.*.attn1.{to_q,to_k,to_v,to_out.0,add_k_proj,add_v_proj}`, `blocks.*.attn2.{to_q,to_k,to_v,to_out.0}`, `blocks.*.ffn.net.{0.proj,2}`
+- `WanTransformer3DModel`: `blocks.*.attn1.{to_q,to_k,to_v,to_out.0}`, `blocks.*.attn2.{to_q,to_k,to_v,to_out.0}`, `blocks.*.attn2.{add_k_proj,add_v_proj}` (only present when `added_kv_proj_dim` is set, i.e. I2V image cross-attention), `blocks.*.ffn.net.{0.proj,2}`
 - `QwenImageTransformer2DModel`: `transformer_blocks.*.attn.{to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj,to_add_out}`, `transformer_blocks.*.{img_mlp,txt_mlp}.net.{0.proj,2}`
 - `LTXVideoTransformerModel`: `transformer_blocks.*.{attn1,attn2,audio_attn1,audio_attn2,audio_to_video_attn,video_to_audio_attn}.{to_q,to_k,to_v,to_out.0}`, `transformer_blocks.*.{ff,audio_ff}.net.{0.proj,2}`
 - `MiniMaxH3DiTModel`: `dit.blocks.*.attn.{qkv_proj,out_proj}`, `dit.blocks.*.mlp.{fc1,fc2}`, `dit.token_refiner.blocks.*.attn.{qkv_proj,out_proj}`, `dit.token_refiner.blocks.*.mlp.{fc1,fc2}`
@@ -100,12 +100,30 @@ and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L86)
 inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L428)
 before FSDP2 wraps transformer blocks.
 
+### Interactions
+
+- **Fused SwiGLU MLP**: converting a model's MLP `gate_proj` / `up_proj` /
+  `down_proj` replaces them with torchao's `Float8Linear`, an `nn.Linear`
+  subclass whose `forward` runs the float8 GEMMs. The fused `swiglu_mlp` row
+  (including the GPU default `liger_kernel`) reads projection weights directly,
+  so for those MLPs it is bypassed and the model runs the unfused
+  `down_proj(act_fn(gate_proj(x)) * up_proj(x))`. A quantizing
+  `swiglu_mlp_implementation` (`qat`) on converted projections is refused.
+- **PEFT interop**: `peft==0.18.1` (from the `gpu` extra) imports
+  `LinearActivationQuantizedTensor` from torchao when torchao is installed, and
+  torchao 0.18.0 no longer provides it. With the `float8` extra installed,
+  PEFT-format LoRA interop (for example
+  `tests/lora/test_veomni_lora_native.py::test_peft_bidirectional_interop`)
+  fails with `ImportError`. Native `veomni.lora` does not import PEFT, and
+  float8 training rejects LoRA anyway, so float8 runs are unaffected; use an
+  environment without the extra for PEFT interop.
+
 ## Recipe selection
 
 - **`tensorwise`**: Uses per-tensor dynamic scaling across all three GEMMs (`output`, `dX`, `dW`).
 - **`rowwise_with_gw_hp`**: Uses token-wise activation scaling and channel-wise weight scaling for the forward GEMM, token-wise `grad_output` scaling with tensorwise weight scaling for the activation-gradient (`dX`) GEMM, and skips FP8 casts for the weight-gradient (`dW`) operands.
 - **`rowwise`**: Uses rowwise scaling across all three GEMMs (`output`, `dX`, `dW`).
-- **`torch.compile` status**: `model.accelerator.torch_compile.enable=True` is currently rejected by `validate_float8_training()` (`ValueError: float8 training with torch.compile is not yet validated.`), so supported FSDP2 float8 training runs in eager mode (`torch_compile.enable=False`). In standalone block microbenchmarks outside `validate_float8_training()`, wrapping `Float8Linear` blocks with `torch.compile` fuses torchao's dynamic scaling and transpose into a single Triton kernel before `aten::_scaled_mm`.
+- **`torch.compile` status**: `model.accelerator.torch_compile.enable=True` is currently rejected by `validate_float8_training()` (`ValueError: float8 training with torch.compile is not yet validated.`), so supported FSDP2 float8 training runs in eager mode (`torch_compile.enable=False`).
 
 ## Tests and CI coverage
 

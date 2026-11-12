@@ -13,7 +13,8 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
   matrix, so a version bump has to be applied file by file
 - torch uses **direct wheel URLs** (not just version bumps)
 - three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
-  each a complete superset, plus optional `--extra magi` (combine with `gpu`)
+  each a complete superset, plus optional `--extra magi` and `--extra float8`
+  (combine with `gpu`)
 
 `pyproject.toml` is the source of truth for every version claim below. Read the
 relevant block before editing — this file describes *where* things live, not
