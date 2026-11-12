@@ -153,6 +153,14 @@ class JanusTextEncoder(TextEncoder):
         self,
         conversation_list: List[ConversationItem],
     ) -> Optional[torch.Tensor]:
+        """Unconditional prompt embeds, padded to the conditional prefix length.
+
+        The conditional cache already holds every position generated so far; the
+        unconditional one starts fresh. The two CFG branches must therefore enter
+        the image span at the *same* sequence position, so the uncond side is
+        padded out to the conditional prompt length with the pad token — matching
+        what the upstream Janus implementation does for interleaved generation.
+        """
         bos_id = self._chat_template.bos_token_id
         pad_id = self._chat_template.pad_token_id
 
@@ -164,6 +172,16 @@ class JanusTextEncoder(TextEncoder):
             if part.type == "output":
                 break
             input_ids.extend([pad_id] * len(part.value))
+
+        # Positions the conditional side has generated (each output row is one
+        # token, already merged into a single row by ``maybe_merge_outputs``).
+        generated = sum(
+            int(part.value.size(-2)) if part.value is not None and hasattr(part.value, "size") else 0
+            for part in conversation_list
+            if part.type == "output"
+        )
+        if generated:
+            input_ids.extend([pad_id] * generated)
 
         uncond_inputs_embeds = self.embed_tokens(torch.tensor(input_ids, dtype=torch.long, device=self.device))
         return uncond_inputs_embeds

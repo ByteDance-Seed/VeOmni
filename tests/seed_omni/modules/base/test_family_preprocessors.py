@@ -123,11 +123,20 @@ class FakeTokenizer:
 
 
 class FakeImageProcessor:
-    """Returns a fixed-shape normalized pixel batch (fp32) for the given images."""
+    """Returns a fixed-shape normalized pixel batch (fp32) for the given images.
 
-    def __init__(self, channels=3, size=4):
+    ``patch_size`` stands in for the vision config value the real
+    ``JanusImageProcessor`` does not carry; the preprocessors need it to record a
+    per-image ``_omni_token_len``.
+    """
+
+    def __init__(self, channels=3, size=4, patch_size=4):
         self.channels = channels
         self.size = size
+        self.patch_size = patch_size
+        # Mirrors ``JanusVqvaeProcessor``: the codec's token count is stated by the
+        # processor alias, which the VQVAE preprocessor falls back to.
+        self.num_image_tokens = (size // patch_size) ** 2
 
     def __call__(self, images, return_tensors="pt"):
         # Deterministic content keyed on the (uint8) input so equivalence is checkable.

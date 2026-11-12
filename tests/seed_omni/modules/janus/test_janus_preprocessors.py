@@ -97,3 +97,65 @@ def test_siglip_dummy_matches_a_real_image_shape():
 
     stacked = torch.stack([real[0].value, empty[-1].value])
     assert stacked.shape == (2, 3, IMAGE_SIZE, IMAGE_SIZE)
+
+
+def test_siglip_patch_count_does_not_depend_on_a_processor_patch_size():
+    """``JanusImageProcessor`` normally has no ``patch_size``; the config supplies it.
+
+    A processor loaded from a real checkpoint (and the one the family converter
+    saves) does not carry the field. Reading it off the processor would raise, or
+    with a permissive fallback count one token per pixel — 147456 instead of 576
+    at 384/16. Build the processor the way a checkpoint does: no ``patch_size``.
+    """
+    processor = JanusImageProcessor(size={"height": IMAGE_SIZE, "width": IMAGE_SIZE})
+    assert not hasattr(processor, "patch_size")
+
+    pre = JanusSiglipPreprocessor(processor, dtype=torch.bfloat16)
+    config = JanusSiglipConfig(vision_config={**processor.to_dict(), "image_size": IMAGE_SIZE})
+    pre.bind_dummy_inputs(config, torch.bfloat16)
+
+    assert pre._num_patch_tokens == IMAGE_TOKENS
+
+
+def test_siglip_refuses_to_count_tokens_before_the_patch_size_is_known():
+    """No config recorded and no ``patch_size`` on the processor: raise, do not guess."""
+    processor = JanusImageProcessor(size={"height": IMAGE_SIZE, "width": IMAGE_SIZE})
+    assert not hasattr(processor, "patch_size")
+    pre = JanusSiglipPreprocessor(processor, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="patch size unknown"):
+        _ = pre._num_patch_tokens
+
+
+def test_vqvae_token_count_follows_the_configured_grid_not_the_class_default():
+    """``JanusVqvaeProcessor.num_image_tokens`` is a fixed 576; the grid decides."""
+    processor = _processor()
+    pre = JanusVqvaePreprocessor(processor, dtype=torch.bfloat16)
+    # num_patches is the grid side length, so 24 -> 576 tokens.
+    pre.bind_dummy_inputs(JanusVqvaeConfig(vq_config={"num_patches": 24}), torch.bfloat16)
+    assert pre._num_image_tokens == 576
+
+    pre.bind_dummy_inputs(JanusVqvaeConfig(vq_config={"num_patches": 2}), torch.bfloat16)
+    assert pre._num_image_tokens == 4
+
+
+def test_vqvae_config_defaults_to_the_grid_the_processor_emits():
+    """HF's ``num_patches=32`` grid expects 1024 tokens; the processor emits 576."""
+    config = JanusVqvaeConfig()
+    assert config.vq_config.num_patches**2 == 576
+
+
+def test_the_codec_refuses_a_trainable_setting_it_cannot_feed():
+    """``freeze=False`` would open gradients with no loss path into the codec.
+
+    The graphs consume only the discrete VQ tokens, so ``embedding_loss`` never
+    reaches the total; the parameters would look trainable while nothing updated
+    them. Rejecting is better than silently training nothing.
+    """
+    from veomni.models.seed_omni.modules.janus.vqvae.modeling import JanusVqvae
+
+    config = JanusVqvaeConfig(vq_config={"num_patches": 24}, freeze=False)
+    model = JanusVqvae.__new__(JanusVqvae)
+    model.config = config
+
+    with pytest.raises(NotImplementedError, match="freeze=False is unsupported"):
+        model._encode_pixels(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))

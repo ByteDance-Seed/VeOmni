@@ -26,7 +26,10 @@ and wins over the backbone's shorter ``model.language_model.``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
+
+import torch
 
 from ...utils.hf_layout import OMNI_HF_LAYOUT_REGISTRY, OmniHFLayout, OmniHFModuleLayout
 from .llama.configuration import JanusLlamaConfig
@@ -36,20 +39,54 @@ from .vqvae.configuration import JanusVqvaeConfig
 
 
 _TIED_EMBEDDING_SOURCE_KEY = "__janus_tied_embedding_source__"
-"""Attribute set by :func:`_read_hf_config` recording whether the checkpoint stores ``lm_head.weight``.
+"""Attribute set by :func:`_read_hf_config`: should the text encoder tie its head?
 
-``build_config`` only receives a config, so the fact has to travel on it. The
-name is private to this module and never serialised.
+``True`` when the checkpoint stores no ``lm_head.weight`` (a tied export) or
+stores it byte-identical to the embedding (a tied model that wrote the duplicate
+out); ``False`` when the two differ; ``None`` when the weights could not be
+inspected. ``build_config`` only receives a config, so the verdict travels on it;
+the name is private to this module and never serialised.
 """
+
+
+def _tie_verdict_from_weights(
+    source_path: str, weight_files: Mapping[str, str], head_key: str, embed_key: str
+) -> bool | None:
+    """Whether the text encoder should tie, judged from the stored tensors.
+
+    ``transformers`` ties when the config asks *and* the stored head is either
+    absent or byte-identical to the embedding; it refuses only when both keys are
+    present with different values. Returns ``None`` when there is nothing to read.
+    """
+    import os
+
+    from safetensors import safe_open
+
+    if head_key not in weight_files:
+        # A tied export omits the key: the head is the embedding.
+        return True
+    if embed_key not in weight_files:
+        return None
+    tensors = {}
+    for key in (head_key, embed_key):
+        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
+            tensors[key] = f.get_tensor(key)
+    head, embed = tensors[head_key], tensors[embed_key]
+    if head.shape != embed.shape or head.dtype != embed.dtype:
+        return False
+    # Equal values mean a tied model that wrote the duplicate out; keep the tie so
+    # SFT cannot drift head and embedding apart.
+    return bool(torch.equal(head, embed))
 
 
 def _read_hf_config(source_path: str):
     """Read the upstream config and record what the weight files say about the head.
 
-    ``transformers`` decides the tie from *both* the flag and the stored keys:
-    when ``lm_head.weight`` sits beside ``model.language_model.embed_tokens.weight``
-    it declines to tie and warns. Reading the key list here is the only place
-    that sees the files, so the decision is recorded for :func:`_tie_word_embeddings`.
+    ``transformers`` refuses to tie when ``lm_head.weight`` and
+    ``model.language_model.embed_tokens.weight`` are both stored with *different*
+    values, but keeps the tie when they are identical (a tied model that wrote the
+    duplicate out). Reading the tensors here — the only place that sees the files —
+    lets :func:`_tie_word_embeddings` reproduce that decision.
     """
     from transformers import AutoConfig
 
@@ -57,13 +94,19 @@ def _read_hf_config(source_path: str):
 
     hf_config = AutoConfig.from_pretrained(source_path)
     try:
-        stored = set(source_weight_files(source_path))
+        weight_files = source_weight_files(source_path)
     except FileNotFoundError:
         # No safetensors weights to inspect (e.g. a bin-only or fixture root):
-        # fall back to the flags alone.
+        # fall back to the config flags alone.
         setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
     else:
-        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, "lm_head.weight" in stored)
+        setattr(
+            hf_config,
+            _TIED_EMBEDDING_SOURCE_KEY,
+            _tie_verdict_from_weights(
+                source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
+            ),
+        )
     return hf_config
 
 
@@ -78,25 +121,28 @@ def _vqvae_config(hf_config: Any) -> JanusVqvaeConfig:
 def _tie_word_embeddings(hf_config: Any) -> bool:
     """Whether the text encoder can tie its head to the input embedding.
 
-    ``transformers`` ties only when the config asks *and* the checkpoint stores
-    no separate ``lm_head.weight``: given both keys it declines to tie and warns
-    ("both are present in the checkpoints with different values, so we will NOT
-    tie them"). Mirroring that matters in both directions:
+    ``transformers`` ties when the config asks *and* the stored head either is
+    absent or is byte-identical to the embedding. Given both keys with
+    **different** values it declines to tie and warns ("both are present in the
+    checkpoints with different values, so we will NOT tie them"). Mirroring that
+    matters in every direction:
 
-    * A checkpoint with the head stored but a stale ``tie_word_embeddings: true``
-      (the ``JanusConfig`` dataclass default) must still get its head — reading
-      the flag alone silently substituted the embedding for it.
+    * A checkpoint storing a distinct head beside a stale
+      ``tie_word_embeddings: true`` (the ``JanusConfig`` dataclass default) must
+      keep its head — reading the flag alone silently substituted the embedding.
     * A genuinely tied export omits the key, and building a head there would
       initialise it from nothing.
+    * A tied model that wrote the duplicate out stores two *equal* tensors.
+      Splitting those into independent weights would let SFT drift them apart,
+      changing the source model's behaviour.
 
-    When the source key list is unavailable, both flags are ANDed, the same
+    When the weights cannot be inspected, both flags are ANDed, the same
     predicate :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
     applies to the loaded module.
     """
-    stored = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-    if stored is not None:
-        return not stored
-
+    matches = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+    if matches is not None:
+        return matches
     outer = getattr(hf_config, "tie_word_embeddings", None)
     nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
     if outer is None and nested is None:

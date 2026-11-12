@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional
+from typing import Collection, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -46,28 +46,44 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
 
 
-def _decoder_block_class_names(model: nn.Module) -> set[str]:
-    """Decoder-layer class names in ``_no_split_modules``.
+def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
+    """``(class name, child scope)`` for each decoder layer in ``_no_split_modules``.
 
-    An entry is either a bare class name (``LlamaDecoderLayer``) or, on a
-    SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``
-    — see ``_scoped_no_split_modules``). The scope has to be stripped because
-    :func:`_is_decoder_block` matches against ``type(module).__name__``, which
-    never carries the scope.
+    An entry is either a bare class name (``LlamaDecoderLayer``, scope ``None``,
+    matches anywhere) or scoped to a child (``janus_llama.LlamaDecoderLayer`` —
+    see ``_scoped_no_split_modules``, matches only under that child).
 
-    Nothing upstream catches the mismatch: :func:`validate_compile_model`
+    Keeping the scope — rather than reducing every entry to its class name — is
+    what stops two children that happen to use the same layer class from both
+    being compiled: the composed-model contract says a scoped target covers that
+    child only. Only the scope is stripped from the *name* used for the class
+    comparison, because :func:`_is_decoder_block` matches
+    ``type(module).__name__``, which never carries one.
+
+    Nothing upstream catches a bare-name mismatch: :func:`validate_compile_model`
     returns early for :class:`OmniModel` (it inherits
     ``input_modalities = "text"`` and its config has no ``vision_config`` /
-    ``audio_config``, so :func:`_is_multimodal_model` is ``False``), so keeping
-    the prefix would let the call through and make
-    :func:`compile_decoder_blocks` match zero blocks — a ``RuntimeError`` from
-    ``build_parallelize_model`` after the FSDP wrap has already started.
+    ``audio_config``, so :func:`_is_multimodal_model` is ``False``), so an
+    unusable entry lets the call through and :func:`compile_decoder_blocks` then
+    matches zero blocks — a ``RuntimeError`` from ``build_parallelize_model``
+    after the FSDP wrap has already started.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
-        return set()
-    class_names = {name.rpartition(".")[2] for name in no_split_modules if isinstance(name, str)}
-    return {name for name in class_names if name.endswith("DecoderLayer")}
+        return []
+    specs: list[tuple[str, str | None]] = []
+    for entry in no_split_modules:
+        if not isinstance(entry, str):
+            continue
+        scope, _, class_name = entry.rpartition(".")
+        if class_name.endswith("DecoderLayer"):
+            specs.append((class_name, scope or None))
+    return specs
+
+
+def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    """Decoder-layer class names in ``_no_split_modules`` (scope stripped)."""
+    return {class_name for class_name, _ in _decoder_block_specs(model)}
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:
@@ -130,14 +146,34 @@ def validate_compile_model(
         )
 
 
-def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
+def _is_decoder_block(
+    module: nn.Module,
+    decoder_block_class_names: Optional[Collection[str]] = None,
+    *,
+    fqn: str | None = None,
+    decoder_block_specs: Optional[Sequence[tuple[str, str | None]]] = None,
+) -> bool:
     """Check decoder blocks using the model's ``_no_split_modules`` list.
 
     HuggingFace model classes typically list the decoder layer class in
     ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
     vision/audio blocks in the same list, so the compile path keeps only
     entries that are decoder layers.
+
+    When ``fqn`` and ``decoder_block_specs`` are given, a *scoped* entry
+    (``janus_llama.LlamaDecoderLayer``) matches only modules under that child, so
+    a sibling reusing the same layer class is left alone. A bare entry still
+    matches anywhere.
     """
+
+    if decoder_block_specs is not None:
+        class_name = type(module).__name__
+        if fqn is None:
+            return any(name == class_name for name, _ in decoder_block_specs)
+        return any(
+            name == class_name and (scope is None or fqn == scope or fqn.startswith(scope + "."))
+            for name, scope in decoder_block_specs
+        )
 
     if decoder_block_class_names is None:
         decoder_block_class_names = _decoder_block_class_names(module)
@@ -218,10 +254,10 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_class_names = _decoder_block_class_names(model)
+    decoder_block_specs = _decoder_block_specs(model)
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, decoder_block_class_names):
+        if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
             continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue

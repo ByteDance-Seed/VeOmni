@@ -133,7 +133,9 @@ bash train.sh tasks/omni/train_omni.py \
 Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — sequence length budget (large images are resized to fit).
+- `--data.max_seq_len` — sequence length budget. It does **not** resize images: the
+  Janus image processor emits its configured size, and the transform's own
+  `image_max_pixels` bounds the initial downscale.
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.checkpoint.save_steps` / `--train.checkpoint.hf_save_steps` — DCP / HF save cadence.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -157,7 +159,11 @@ accelerator:
   extra_parallel_placement_innermost: [false]
 ```
 
-Quick 1-node smoke run (no wandb, tiny step budget):
+Quick 1-node smoke run (no wandb, tiny step budget). The launcher's
+`modules_train.yaml` shards `embed_tokens.weight` across 4 ranks (`emb=4`), so
+this needs 4 GPUs — on a smaller node `emb` cannot divide the mesh; run
+`--model.model_config.modules configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`
+with the `emb` block removed, or use `train/base_model_fsdp.yaml`:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \

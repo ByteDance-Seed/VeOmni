@@ -31,7 +31,15 @@ class JanusVqvaeConfig(OmniModuleConfig):
         freeze: bool = True,
         **kwargs,
     ):
-        self.vq_config = _hfvqconfig(**vq_config) if vq_config else _hfvqconfig()
+        if vq_config:
+            self.vq_config = _hfvqconfig(**vq_config)
+        else:
+            # HF's default ``num_patches=32`` expects a 1024-token grid, but the
+            # Janus image processor emits 576 (24x24) tokens; decoding a 576-token
+            # span with the default grid raises. Every in-repo producer (the family
+            # converter and the HF-layout loader) passes ``vq_config``, so this only
+            # affects a config that omits it.
+            self.vq_config = _hfvqconfig(num_patches=24)
         # Module-level freeze knob.  ``JanusVqvae.freeze_model`` interprets it
         # as a *partial* freeze (only the inner ``vqmodel``); the generation
         # heads stay trainable.

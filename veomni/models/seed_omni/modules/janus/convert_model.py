@@ -11,6 +11,7 @@ import json
 import tempfile
 from typing import Any
 
+import torch
 from transformers import AutoTokenizer, JanusForConditionalGeneration, JanusProcessor, LlamaConfig
 from transformers.initialization import no_init_weights
 
@@ -144,21 +145,21 @@ def _split_janus_hf(model_path: str, *, attn_implementation: str | None = None) 
 
     print("Extracting janus_text_encoder ...")
     text_cfg: LlamaConfig = cfg.text_config
-    # Same question the layout answers from the weight files, so the two paths
-    # cannot disagree on whether the module keeps an lm_head: does the *source
-    # checkpoint* store a head of its own? ``model.lm_head`` always exists (HF
-    # builds it either way), so it cannot stand in for the file's contents.
-    from ...utils.hf_layout import source_weight_files
-    from .hf_layout import _tie_word_embeddings
+    # Same verdict the layout derives from the weight files, so the two paths
+    # cannot disagree on whether the module keeps an lm_head: tie when the stored
+    # head is byte-identical to the embedding (or absent), keep it independent
+    # when the two differ. ``model.lm_head`` always exists (HF builds it either
+    # way), so this reads the loaded weights, which works for a ``.bin``-only
+    # source as well as safetensors.
+    head_weight = model.lm_head.weight
+    embed_weight = model.model.language_model.embed_tokens.weight
+    tie_word_embeddings = head_weight.shape == embed_weight.shape and bool(torch.equal(head_weight, embed_weight))
+    if tie_word_embeddings and not bool(getattr(cfg, "tie_word_embeddings", True)):
+        # The config says untied even though the tensors happen to match: keep the
+        # config's word, which is what the layout path also honours.
+        from .hf_layout import _tie_word_embeddings
 
-    try:
-        source_keys = set(source_weight_files(model_path))
-    except FileNotFoundError:
-        source_keys = None
-    if source_keys is None:
         tie_word_embeddings = _tie_word_embeddings(cfg)
-    else:
-        tie_word_embeddings = "lm_head.weight" not in source_keys
     te_cfg = JanusTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,

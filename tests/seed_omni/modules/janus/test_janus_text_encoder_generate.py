@@ -106,3 +106,23 @@ def test_generate_accepts_no_generation_kwargs(monkeypatch):
     outputs = model.generate(conversation, generation_kwargs=None)
 
     assert "text_done" in str(outputs)
+
+
+def test_cfg_uncond_prefix_covers_the_text_already_generated():
+    """Both CFG branches must enter the image span at the same position.
+
+    The conditional cache holds every token generated so far; the unconditional one
+    starts from the prompt. If the uncond prefix stopped at the prompt, the two
+    branches would run the image span at different positions.
+    """
+    model = _encoder()
+    prompt_len = 4
+    generated = 3
+    conversation = [
+        ConversationItem(type="text", value=torch.zeros(prompt_len, dtype=torch.long), role="user"),
+        ConversationItem(type="output", value=torch.zeros(1, generated, 8), role="assistant", meta={}),
+    ]
+
+    embeds = model._build_cfg_uncond_embeds(conversation)
+
+    assert embeds.shape[-2] == prompt_len + generated
