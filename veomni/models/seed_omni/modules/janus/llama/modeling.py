@@ -100,8 +100,17 @@ class InferenceMixin:
                 )
             )
             return {"conversation_list": conversation_list}
+        # The tail row carries the embedding of the last token, whatever its type:
+        # an ``output`` row holds a token the model just sampled (or the hidden
+        # state priming the cache), and a ``text`` row holds the ``<boi>`` embed
+        # that opens an image span. Both are consumed the same way -- one token's
+        # embedding, re-fed through the backbone -- so the type is not a contract
+        # here. ``value[-1:]`` is the only thing read.
         tail_part = conversation_list[-1]
-        assert tail_part.type == "output"
+        if tail_part.value is None:
+            raise ValueError(
+                f"JanusLlama.generate expects the conversation tail to hold embeddings; got type={tail_part.type!r}."
+            )
 
         cfg_uncond_inputs_embeds = tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
         if cfg_uncond_inputs_embeds is not None and not self._cfg_active:

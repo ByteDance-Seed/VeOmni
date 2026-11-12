@@ -58,15 +58,19 @@ def _conversation() -> list[ConversationItem]:
     ]
 
 
-def test_a_sampled_boi_keeps_an_output_tail_for_the_image_span(monkeypatch):
+def test_a_sampled_boi_seals_the_tail_as_text(monkeypatch):
+    """``<boi>`` is an ordinary text token, exactly as the training template emits it.
+
+    The image span re-encodes the row's last embedding, so nothing about the
+    backbone step depends on the row still being an ``output``.
+    """
     model = _encoder()
     monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.boi_token_id)
 
     conversation = _conversation()
     outputs = model.generate(conversation, generation_kwargs={"guidance_scale": 5.0})
 
-    # ``image_vq`` opens with janus_llama.generate, which asserts on this.
-    assert conversation[-1].type == "output"
+    assert conversation[-1].type == "text"
     assert outputs.get("signal") == "start_image_gen" or "start_image_gen" in str(outputs)
 
 
@@ -92,9 +96,9 @@ def test_a_sampled_boi_reports_the_text_so_far(monkeypatch):
 
     assert outputs["generated"]["type"] == "text"
     assert outputs["generated"]["meta"]["token_ids"] == [10, 11]
-    # The text before the image is sealed, the ``<boi>`` row is not: the list ends
-    # with an output row for the backbone to consume.
-    assert conversation[-1].type == "output"
+    # The whole span, ``<boi>`` included, is sealed as text; ``<boi>`` is dropped
+    # from the reported token ids because it belongs to the image span.
+    assert conversation[-1].type == "text"
 
 
 def test_generate_accepts_no_generation_kwargs(monkeypatch):
