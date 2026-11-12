@@ -233,7 +233,7 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
 (`veomni/models/checkpoint/manager.py`). That writes the
 weights to `model/ckpt/` and the optimizer to `model/optimizer/` — two separate DCP
-directories — plus a replicated `model/lr_scheduler.pt`. For LoRA training the DCP
+directories — plus the scheduler in each rank's `model/extra_state/`. For LoRA training the DCP
 stores only the trainable adapter parameters and optimizer state; the frozen base is
 reloaded from `model.model_path`. Job-level state is written separately by
 `GlobalStateCallback`, as `loader/rank_{R}.pt` for the dataloader cursor and
@@ -265,7 +265,7 @@ Output structure for each checkpoint:
 │       ├── model/
 │       │   ├── ckpt/                    ← adapter weights, DCP
 │       │   ├── optimizer/               ← adapter optimizer state, DCP
-│       │   └── lr_scheduler.pt
+│       │   └── extra_state/             ← scheduler, per rank
 │       ├── loader/rank_{R}.pt
 │       ├── extra_state/rank_{R}.pt
 │       └── lora_ckpt/                   ← the inference artifact

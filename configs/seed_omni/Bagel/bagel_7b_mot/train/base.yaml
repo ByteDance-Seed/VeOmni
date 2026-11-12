@@ -1,4 +1,6 @@
 # VeOmni training / inference config for OmniModel - BAGEL-7B-MoT.
+# `model.model_path` accepts either the upstream BAGEL checkpoint
+# (via `modules/bagel/hf_layout.py`) or a split checkpoint from `convert_model.py`.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT

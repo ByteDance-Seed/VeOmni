@@ -397,9 +397,13 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    block_size: int = 128,
+    expert_dtype: str = "fp8",
     fp32_wgrad: bool = False,
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
+    # Quantization is performed by the QAT row, not the NPU fused row.
+    del block_size, expert_dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return npu_fused_moe_forward(
         num_experts,
