@@ -167,6 +167,8 @@ class ParallelPlan:
                             para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=Replicate(), fqn=fqn
                         )
 
+        self.post_shard(model)
+
         for fqn, param in model.named_parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
 
@@ -180,13 +182,27 @@ class ParallelPlan:
         # resume that truncated shard is assigned over the correctly assembled parameter,
         # leaving every rank with one rank's experts. The spec describes the parameter
         # rather than the name, so an alias reuses the one already resolved for it.
+        # An existing entry is overwritten too: a model whose aliases are only tied in
+        # ``post_shard`` (DiffusionGemma built with weights, under ``no_init_weights``)
+        # had its alias walked above as a separate, unsharded parameter, and that stale
+        # ``Replicate`` entry would hide the sharded parameter now living at the name.
         for fqn, param in model.named_parameters(remove_duplicate=False):
             spec_info = getattr(param, "spec_info", None)
-            if spec_info is not None and fqn not in fqn2spec_info:
+            if spec_info is not None:
                 fqn2spec_info[fqn] = spec_info
 
         model._fqn2spec_info = fqn2spec_info
         return fqn2spec_info
+
+    def post_shard(self, model: nn.Module) -> None:
+        """Hook run after sharding, before the completeness check.
+
+        No-op by default. Sharding rebinds each matched parameter to a fresh object,
+        which breaks any tie that reaches outside the matched FQN. A model that shares
+        parameters across submodules restores those ties here: doing it after ``apply``
+        returns is too late, because the check below would already have tripped over
+        the orphaned copy, which never got a ``spec_info``.
+        """
 
     def _get_persistent_fsdp_shard_dim(self, para_name: str, parameter_fqn: str) -> Optional[int]:
         """Return the persistent complementary shard dim for ``parameter_fqn``."""

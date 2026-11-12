@@ -85,7 +85,7 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "adafactor", "anyprecision_adamw", "muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -1198,7 +1198,14 @@ class TrainingArguments:
     )
     enable_full_determinism: bool = field(
         default=False,
-        metadata={"help": "Enable full determinism."},
+        metadata={
+            "help": (
+                "Enable full determinism. Also turns off SDPA's memory-efficient and cuDNN "
+                "backends, whose backwards are nondeterministic, so masked attention falls "
+                "to math at a transient peak growing with seq_len^2 rather than seq_len -- "
+                "check the headroom before enabling it at long context."
+            )
+        },
     )
     enable_batch_invariant_mode: bool = field(
         default=False,
@@ -2119,7 +2126,18 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+    data_type: Literal[
+        "plaintext",
+        "conversation",
+        "diffusion",
+        "diffusion_gemma",
+        "diffusion_gemma_mm",
+        "llada",
+        "llada_v",
+        "llada2_uni",
+        "classification",
+        "dpo",
+    ] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -2173,12 +2191,14 @@ class DataArguments:
         if self.text_keys is None:
             if self.data_type == "plaintext":
                 self.text_keys = "content_split"
-            elif self.data_type == "conversation":
+            elif self.data_type in ("conversation", "llada", "llada_v", "llada2_uni"):
                 self.text_keys = "messages"
             elif self.data_type == "classification":
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type in ("diffusion", "diffusion_gemma", "diffusion_gemma_mm"):
+                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

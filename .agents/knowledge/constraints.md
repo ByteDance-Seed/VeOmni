@@ -25,8 +25,10 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 4. **Transformers version: pinned to v5.16.1**
    - VeOmni installs `transformers==5.16.1` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
-   - The legacy v4 path was removed; all modeling under
-     `veomni/models/transformers/<m>/` is patchgen-generated.
+   - The legacy v4 path was removed; modeling under
+     `veomni/models/transformers/<m>/` is patchgen-generated except
+     `diffusion_gemma` and `llada*`, which are vendored (see constraint 31). The VeOmni
+     registry overrides HuggingFace's built-in `diffusion_gemma`.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
      gates (for HF APIs newer than the current pin) — do **not** add new
@@ -234,7 +236,7 @@ Core files:
 ## Trainer Extensions
 
 24. **Trainer callback lifecycle changes must cover composed trainers**
-   - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
+   - `TextDPOTrainer`, `DiTTrainer`, and `DllmTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
 25. **Kernel handles belong to model instances**
@@ -318,3 +320,21 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
   GEMM. The generic ATen float8-copy path can spend more time converting and
   moving values than FP8 all-gather saves. Use the tiled byte transpose for
   dgrad; square block scales transpose without requantization.
+
+## DiffusionGemma and dLLM
+
+31. **DiffusionGemma and the LLaDA family are vendored, not patchgen-generated**
+    - `veomni/models/transformers/diffusion_gemma/` overrides HuggingFace's built-in `diffusion_gemma` (present in transformers 5.16.1) with canvas training, packing, FFPA/DG_PREFIX/hole/varlen kernels and generation. Do not convert it to patchgen until those extensions live upstream. Do not edit a `generated/` tree for it; there is none.
+    - `llada`, `llada_moe`, `llada_v` and `llada2_uni` are also vendored mask predictors (HuggingFace does not ship them). Bidirectional packed attention, Ulysses image-slot slicing and MoE aux-loss reduction live in `llada/dllm_utils.py`; see source-numbered 46 below.
+
+Comments in that package, the dLLM kernels, and their tests say "constraint N" using the **source-numbered** list from the original DiffusionGemma work (24–45), not the VeOmni-wide numbers above. Resume RNG is keyed on `global_step` because `GlobalStateCallback` persists only the default CPU and device RNGs. Accelerator, optimizer and chat template live on `model.*` in this tree. The load-bearing rules:
+
+- Self-conditioning Bernoulli: one draw per canvas, from `(train.seed, global_step, micro-step)`, never a default generator after a Triton kernel (source 24). `tests/checkpoints/test_diffusion_gemma_resume.py`.
+- Last canvas is EOS-filled, not PAD (source 25).
+- `compute_all_canvas_df_loss` averages inside one example; decoder-pass count must match across ranks; `flat_seq` is the only mode that lowers attention materialisation (source 26).
+- Corruption noise from `(seed, epoch, sample)`, via `DiffusionGemmaCorruptionEpoch`, never process RNG or `partial` keywords (source 27).
+- `attn_ffpa` / `attn_dg_prefix` refuse rather than downgrade; FlashAttention is detected after both name rewrites (source 28).
+- `flex_attention` needs uncompiled BlockMasks, a raised Dynamo budget, contiguous q/k/v; at the 26B recipe it is slower than sdpa, which stays the default (source 30–31). See `docs/examples/diffusion_gemma.md`.
+- Packed encoder rows need `wide_varlen_attention`; `dyn_bsz` is refused without `canvas_batching: flat_seq_pack`; a sample costs `L + K*C`; images cannot pack; bf16 packed-vs-apart equivalence is not assertable (source 32–38).
+- Ulysses only under `flat_seq_pack` + `attn_dg_prefix`; collect on the `ulysses` mesh dimension, not flattened `sp` (source 39).
+- LLaDA packed rows: count segments not rows, reduce aux loss after the per-sample division, SP via `sum_over_ulysses_shards` (source 46). `create_bidirectional_mask` returns `None` for `veomni_flash_*`; sdpa/eager need `bidirectional_attention_mask` from `position_ids` or a packed row attends across samples. Under Ulysses, `pixel_values` stay whole and `ulysses_local_image_slots` keeps the shard's image rows; vision towers are pinned to sdpa.

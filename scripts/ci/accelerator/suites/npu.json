@@ -424,6 +424,23 @@
     ]
   },
   {
+    "name": "npu-unit-39a-dllm",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_sum_over_shards.py",
+      "tests/parallel/test_parallel_plan_post_shard.py",
+      "tests/trainer/test_dllm_sample_count.py",
+      "tests/trainer/test_dllm_nonfinite.py",
+      "tests/trainer/test_trace_callback.py",
+      "tests/trainer/test_process_group_timeout.py",
+      "tests/utils/test_dllm_loss_reduce.py"
+    ]
+  },
+  {
     "name": "npu-e2e-40",
     "suite": "e2e",
     "args": [

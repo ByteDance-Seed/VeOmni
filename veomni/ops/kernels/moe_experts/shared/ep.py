@@ -38,10 +38,13 @@ class EPGroupGemm(torch.autograd.Function):
         fc1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        activation="silu",
     ):
-        """Split fc1 GEMMs, SwiGLU, and fc2. No routing scale."""
+        """Split fc1 GEMMs, gated activation, and fc2. No routing scale."""
+        from .activation import apply_activation, normalize_activation
         from .group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
+        activation = normalize_activation(activation)
         tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum, permute_tokens.shape[0])
         fc1_1_output = group_gemm_same_nk(
             a=permute_tokens,
@@ -66,7 +69,7 @@ class EPGroupGemm(torch.autograd.Function):
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
         )
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, activation)
         fc1_output = fc1_1_activation * fc1_2_output
         fc2_output = group_gemm_same_nk(
             a=fc1_output,
@@ -80,6 +83,7 @@ class EPGroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
@@ -98,6 +102,7 @@ class EPGroupGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Split-fc1 dgrad and wgrad on permuted tokens."""
+        from .activation import apply_activation, apply_activation_backward
         from .group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
         (
@@ -124,7 +129,7 @@ class EPGroupGemm(torch.autograd.Function):
             tile_cumsum=tile_cumsum,
             tile_total_M=tile_total_M,
         )
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
         fc1_output = fc1_1_activation * fc1_2_output
 
         grad_fc2_weight = None
@@ -167,7 +172,7 @@ class EPGroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -200,6 +205,7 @@ class EPGroupGemm(torch.autograd.Function):
             grad_fc1_2_weight,
             grad_fc2_weight,
             None,
+            None,
         )
 
 
@@ -214,10 +220,13 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        activation="silu",
     ):
-        """Merged fc1 GEMM, SwiGLU, and fc2. No routing scale."""
+        """Merged fc1 GEMM, gated activation, and fc2. No routing scale."""
+        from .activation import apply_activation, normalize_activation
         from .group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
+        activation = normalize_activation(activation)
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )
@@ -236,7 +245,11 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
         )
-        fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+        if activation == "silu":
+            fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+        else:
+            fc1_1_activation = apply_activation(fc1_1_output, activation)
+            fc1_result = fc1_1_activation * fc1_2_output
         fc2_output = group_gemm_same_nk(
             a=fc1_result,
             b=fc2_weight,
@@ -249,6 +262,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
@@ -266,6 +280,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Merged-fc1 dgrad and wgrad on permuted tokens."""
+        from .activation import apply_activation, apply_activation_backward
         from .group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
         (
@@ -282,7 +297,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
         fc1_result = fc1_1_activation * fc1_2_output
         grad_fc1_result = group_gemm_same_nk(
             a=grad_output,
@@ -309,7 +324,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         grad_fc1_2_output = fc1_1_activation * grad_fc1_result
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
             grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
@@ -343,5 +358,6 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             None,
             grad_fc1_1_2_weight,
             grad_fc2_weight,
+            None,
             None,
         )

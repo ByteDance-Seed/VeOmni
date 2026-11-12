@@ -63,16 +63,28 @@ def _allreduce_ddp_sp_grads(model: torch.nn.Module, parallel_state: ParallelStat
 
 
 def veomni_clip_grad_norm(
-    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+    model,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    clip: bool = True,
 ):
+    """Return the global gradient norm, clipping the grads to ``max_norm`` when ``clip``."""
     parallel_state = get_parallel_state()
     dp_mode = parallel_state.dp_mode
     if dp_mode == "fsdp2":
-        grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
+        grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach, clip=clip)
     elif dp_mode == "ddp":
         if parallel_state.sp_size > 1:
             _allreduce_ddp_sp_grads(model, parallel_state)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)
+        if clip:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm, error_if_nonfinite=error_if_nonfinite, foreach=foreach
+            )
+        else:
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            grad_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
         if isinstance(grad_norm, DTensor):
             # TP grads would make the norm a DTensor too, and ``.item()`` below
             # reads a DTensor's local shard rather than the global value. The
@@ -84,6 +96,12 @@ def veomni_clip_grad_norm(
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
 
     return grad_norm
+
+
+def veomni_compute_grad_norm(model, norm_type: float = 2.0) -> float:
+    """Global gradient norm without clipping, reduced the same way as ``veomni_clip_grad_norm``."""
+    grad_norm = veomni_clip_grad_norm(model, max_norm=0.0, norm_type=norm_type, clip=False)
+    return grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
 
 
 # The two clippers below serve an OmniModel, where every module runs under its own

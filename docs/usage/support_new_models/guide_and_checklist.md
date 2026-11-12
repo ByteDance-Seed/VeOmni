@@ -136,6 +136,30 @@ def get_parallel_plan():
 
 > **Finding correct paths:** run `for name, _ in model.named_parameters(): print(name)` on the unpatched HF model.
 
+#### Models that share parameters across submodules
+
+The input/output embedding tie is handled for you. A model that ties more than that,
+the way DiffusionGemma runs its encoder and decoder on one transformer stack, has to
+restore the tie itself, because `to_empty()` clones every tensor and sharding rebinds
+each sharded parameter to a new object. Two hooks do it:
+
+- **`retie_shared_weights(self) -> int`**, an instance method the model class *may
+  define*. It re-points every alias at the canonical parameter and returns how many it
+  re-tied. The framework calls it through `retie_model_shared_weights` in
+  [weights.py](../../../veomni/models/checkpoint/weights.py) every time the model is
+  materialized: after the HF weight load (`post_process_after_weight_loading`), and on
+  the random-init and checkpoint-resume paths of `_materialize_and_load_weights` in
+  [torch_parallelize.py](../../../veomni/distributed/torch_parallelize.py), before
+  `init_weights` and the first forward. It is looked up on the class, so a wrapper that
+  forwards attributes does not opt in, and it must be idempotent: with EP it can run
+  after `post_shard` has already re-tied. The effect is one parameter object per tie, so
+  the alias gets no gradient or optimizer state of its own.
+- **`ParallelPlan.post_shard(model)`**, which a model's plan *may override*. It runs
+  inside `ParallelPlan.apply`, after the ExtraParallel sharding and before the
+  `spec_info` completeness check. Re-tie there so the alias points at the sharded
+  parameter; `apply` then registers the alias name under that parameter's spec, which
+  is what makes DCP save and restore the alias with its ExtraParallel dimension.
+
 ### Step 6: Patch the Processor (`processing_*.py`, multimodal only)
 
 Two common issues:

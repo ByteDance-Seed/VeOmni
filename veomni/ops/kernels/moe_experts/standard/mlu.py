@@ -206,6 +206,7 @@ def mlu_group_gemm_fused_moe_forward(
     fc1_1_2_weight: Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ) -> Tensor:
     """MLU grouped-gemm fused MoE. Empty weights are ``None``.
 
@@ -213,6 +214,8 @@ def mlu_group_gemm_fused_moe_forward(
     ``assume_distinct_experts`` only tightens the Triton grouped-GEMM
     launch bound, so the flag is a no-op here.
     """
+    if activation not in ("silu", "swish"):
+        raise ValueError(f"MLU fused MoE only supports SiLU, got activation={activation!r}.")
     # Router scores stay float32. Cast before the fused scale so the MLU GEMM
     # does not see an fp32 activation against bf16 weights.
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
@@ -288,6 +291,7 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
     return mlu_group_gemm_fused_moe_forward(
@@ -301,4 +305,5 @@ def wrapper(
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

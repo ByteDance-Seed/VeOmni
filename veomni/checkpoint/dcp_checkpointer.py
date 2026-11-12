@@ -481,6 +481,17 @@ class OptimizerState(Stateful):
         )
 
 
+def _fsdp_dim_placement(placement, fsdp_shard_dim: int):
+    """Placement on the ``ep_fsdp`` mesh dim for a tensor crossing the DCP boundary.
+
+    Parameters and most optimizer states are ``Shard(fsdp_shard_dim)`` there, but a
+    reduced optimizer statistic (Adafactor's factored column state, the mean over the
+    FSDP-sharded dim) is ``Replicate()``; forcing it to ``Shard`` would misdescribe
+    its global shape.
+    """
+    return Replicate() if isinstance(placement, Replicate) else Shard(fsdp_shard_dim)
+
+
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
@@ -505,13 +516,13 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
         tensor_to_put = rewrap_dtensor_local(
             loaded_tensor._local_tensor,
             mesh=device_mesh,
-            placements=[Shard(fsdp_shard_dim)],
+            placements=[_fsdp_dim_placement(loaded_tensor.placements[0], fsdp_shard_dim)],
         )
     elif num_placements == 3:
         tensor_to_put = rewrap_dtensor_local(
             loaded_tensor._local_tensor,
             mesh=device_mesh,
-            placements=[Replicate(), Shard(fsdp_shard_dim)],
+            placements=[Replicate(), _fsdp_dim_placement(loaded_tensor.placements[1], fsdp_shard_dim)],
         )
     else:
         raise RuntimeError(
@@ -560,11 +571,16 @@ def restore_extra_parallel_dim(
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
         # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
-        fsdp_placement = (
-            _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1))
-            if ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
-            else Shard(fsdp_shard_dim)
+        assert len(orgin_tensor.placements) == fsdp_mesh.ndim - 1, (
+            f"Expected an FSDP DTensor with {fsdp_mesh.ndim - 1} placement(s) before restoring "
+            f"ExtraParallel, got {orgin_tensor.placements}"
         )
+        if isinstance(orgin_tensor.placements[-1], Replicate):
+            fsdp_placement = Replicate()
+        elif ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1:
+            fsdp_placement = _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1))
+        else:
+            fsdp_placement = Shard(fsdp_shard_dim)
         if fsdp_mesh.ndim == 3:
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
