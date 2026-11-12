@@ -18,7 +18,7 @@ from torch.distributed._tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import ModelArguments
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm, veomni_compute_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
@@ -305,6 +305,15 @@ def _run_clip_scenario(
                 + 16
                 + 64 * 16
                 + (64 * 16 * 32) * (1 / ps.extra_parallel_sizes["ep"] ** 2)
+            )
+            unclipped_grad_norm = veomni_compute_grad_norm(model)
+            torch.testing.assert_close(unclipped_grad_norm, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
+            check_model_param_grad_one_by_one(
+                model,
+                expected_grad=expected,
+                ep_expected_grad=ep_expected,
+                emb_expected_grad=emb_expected,
+                msg=f"After measuring the unclipped norm step={step}",
             )
             total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
 

@@ -119,10 +119,15 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Release unused accelerator cache when the active device supports it."""
-    device = get_torch_device()
-    if hasattr(device, "empty_cache"):
-        device.empty_cache()
+    """Release accelerator cache when the selected backend exposes one.
+
+    CPU-only utilities such as DCP-to-HF conversion deliberately hide CUDA so
+    worker processes do not create GPU contexts.  ``torch.cpu`` has no
+    ``empty_cache`` API, and there is no device cache to release in that mode.
+    """
+    empty_cache_fn = getattr(get_torch_device(), "empty_cache", None)
+    if empty_cache_fn is not None:
+        empty_cache_fn()
 
 
 def set_device(device: torch.types.Device) -> None:

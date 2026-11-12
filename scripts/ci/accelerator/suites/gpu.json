@@ -620,6 +620,29 @@
     ]
   },
   {
+    "name": "58a-dllm-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_sum_over_shards.py",
+      "tests/parallel/test_parallel_plan_post_shard.py",
+      "tests/trainer/test_dllm_sample_count.py",
+      "tests/trainer/test_dllm_nonfinite.py",
+      "tests/trainer/test_trace_callback.py",
+      "tests/trainer/test_process_group_timeout.py",
+      "tests/utils/test_dllm_loss_reduce.py",
+      "tests/utils/test_full_determinism_attention.py",
+      "tests/optim/test_adafactor_fsdp2.py",
+      "tests/distributed/test_diffusion_gemma_fsdp2.py",
+      "tests/distributed/test_diffusion_gemma_dcp_ep.py",
+      "tests/distributed/test_diffusion_gemma_align_nemo_ep.py",
+      "tests/distributed/test_diffusion_gemma_ulysses.py",
+      "tests/distributed/test_dllm_ulysses.py"
+    ]
+  },
+  {
     "name": "59-e2e",
     "suite": "e2e",
     "conditional": false,

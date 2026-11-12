@@ -1,0 +1,61 @@
+# LLaDA2.0-Uni image-understanding (I2T) masked-diffusion SFT with DllmTrainer.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada2_uni_16b.yaml
+#
+# Convert first (config rewrite, symlinked backbone and image-tokenizer weights, one merged
+# index; per-expert tensors are fused at load time):
+#   python scripts/convert_llada2uni_to_veomni.py --src LLaDA2.0-Uni --dst LLaDA2.0-Uni-veomni
+#
+# `data_type: llada2_uni` reads ShareGPT / OpenAI-style `messages` with `<image>` placeholders
+# and the matching `images`. The frozen GlmImage tokenizer turns each image into h*w VQ tokens
+# (16px patches, 512^2 to 2048^2 pixels per image), which are never masked; only the answer
+# text is. A sample whose image does not fit in `max_seq_len` is dropped to an unsupervised
+# placeholder (warned once): at the checkpoint's 512^2..2048^2 budget an image takes 1024 to
+# 16384 tokens, so with `max_seq_len: 4096` anything above ~1M pixels is dropped. Lower
+# `size.longest_edge` (max_pixels) in the converted `preprocessor_config.json`, or raise
+# `max_seq_len`, to match your data.
+model:
+  model_path: LLaDA2.0-Uni-veomni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  chat_template: llada2_uni
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide 16 query heads and divide or be a multiple of 4 KV heads
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: sharegpt4v
+  data_type: llada2_uni
+  max_seq_len: 4096
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  dyn_bsz: false
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: LLaDA2.0-Uni-sft
+    manager: dcp
+    save_steps: 500
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: LLaDA2.0-Uni-sft

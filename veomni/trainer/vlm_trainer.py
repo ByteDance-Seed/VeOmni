@@ -324,6 +324,7 @@ class VLMTrainer:
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
         self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
+        self.base.on_micro_batches_ready(micro_batches)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

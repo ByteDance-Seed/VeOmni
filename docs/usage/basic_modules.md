@@ -27,6 +27,14 @@
         --train.wandb.name your_experiment_name
     ```
 
+    Launch-time environment variables:
+
+    | Env var | Effect |
+    |---------|--------|
+    | `NNODES`, `NODE_RANK`, `NPROC_PER_NODE`, `MASTER_ADDR`, `MASTER_PORT` | Read by `train.sh` to build the `torchrun` command. |
+    | `RDZV_ENDPOINT` | Multi-node rendezvous endpoint. Defaults to `MASTER_ADDR:MASTER_PORT`; an IPv6 `MASTER_ADDR` is bracketed (`[addr]:port`). |
+    | `NCCL_TIMEOUT` | Positive integer, in seconds. The trainer passes it as the NCCL process-group timeout; unset keeps the backend default. Ignored for non-NCCL backends. |
+
 ## Arguments
 **Default Parameter Access**:  
 VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in [`arguments_types.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/arguments/arguments_types.py).
@@ -377,11 +385,12 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `model.optimizer.type`:
+`build_optimizer` supports four optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
+| `adafactor` | `DistributedAdafactor`: Hugging Face Adafactor whose factored row/column statistics keep their FSDP2 DTensor placement. Fixed `lr` (no relative step), `beta1=None`, `decay_rate=-0.8`, `clip_threshold=1.0`; `betas` and `eps` are ignored. Works with FSDP2 and FSDP2 + ExtraParallel. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 

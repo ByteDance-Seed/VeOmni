@@ -330,6 +330,7 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    activation: str = "silu",
 ):
     """NPU fused MoE entry. Branches on EP."""
     # Router scores stay float32. Cast before the fused scale so the NPU GEMM
@@ -339,6 +340,9 @@ def npu_fused_moe_forward(
     # launch bound in the Triton backend. The NPU group GEMM has no such launch
     # bound to tighten, so the flag is a no-op here.
     del assume_distinct_experts
+    if activation not in ("silu", "swish"):
+        raise ValueError(f"NPU fused MoE only supports SiLU, got activation={activation!r}.")
+
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
@@ -380,6 +384,7 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
     # Empty tensor = unused layout. Registry args stay tensors.
@@ -394,4 +399,5 @@ def wrapper(
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

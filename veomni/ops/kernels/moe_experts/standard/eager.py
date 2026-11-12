@@ -33,6 +33,7 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
@@ -51,6 +52,13 @@ def wrapper(
     if has_split and fc1_2_weight.numel() == 0:
         raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
 
+    if activation in ("silu", "swish"):
+        act_fn = F.silu
+    else:
+        from transformers.activations import ACT2FN
+
+        act_fn = ACT2FN[activation]
+
     output = torch.zeros_like(hidden_states)
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -67,7 +75,7 @@ def wrapper(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
+        y = F.linear(act_fn(gate) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

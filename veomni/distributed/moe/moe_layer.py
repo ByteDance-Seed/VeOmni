@@ -83,7 +83,14 @@ def token_pre_all2all(
     org_hidden_states_shape = hidden_states.shape
     routing_map = expert_mask.sum(dim=1)
 
-    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
+    # ``expert_mask`` is [experts, top_k, tokens], so dim 1 is the routing width, not the
+    # expert count. Both directions of the permutation need it, and both need the routing
+    # to give every token exactly that many distinct experts -- the reduction groups by a
+    # fixed stride, so a router that dropped or repeated one would mis-pair entries with
+    # tokens instead of failing.
+    local_permuted_hidden_states, local_input_permutation_mapping = permute(
+        hidden_states, routing_map, expert_mask.shape[1]
+    )
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
@@ -172,7 +179,7 @@ def dispatch_to_ep_class(
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
     routing_weights: torch.Tensor,
-    selected_experts: int,
+    selected_experts: torch.Tensor,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,
@@ -202,6 +209,7 @@ def tokens_post_all2all(
         org_hidden_states_shape,
         local_input_permutation_mapping,
         routing_map,
+        selected_experts.shape[-1],
     )
 
     return unpermute_outputs

@@ -33,6 +33,7 @@ from ..arguments.arguments_types import (
     validate_low_precision_reduce_scatter_comm,
 )
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..models.checkpoint.weights import retie_model_shared_weights
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -215,6 +216,9 @@ def _materialize_and_load_weights(
             model, materialize_device, preserve_persistent_buffers=not should_skip_hf_weight_load
         )
         _reset_hf_initialized_flag(model)
+        retie_model_shared_weights(
+            model, "checkpoint-resume materialization" if should_skip_hf_weight_load else "random init"
+        )
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
             model.init_weights()
