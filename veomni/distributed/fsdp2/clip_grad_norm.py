@@ -340,10 +340,14 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
                 norm = torch.linalg.vector_norm(g.to(torch.float32), ord=p)
                 res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
         if fast_grads:
-            by_dtype: dict[torch.dtype, List[torch.Tensor]] = {}
+            # Grouped by device as well as dtype: a group can mix a CPU-resident
+            # offloaded table with accelerator parameters of the same dtype, and
+            # ``_foreach_norm`` then returns scalars on each gradient's own device,
+            # which ``torch.stack`` refuses.
+            by_device_dtype: dict[tuple[torch.device, torch.dtype], List[torch.Tensor]] = {}
             for g in fast_grads:
-                by_dtype.setdefault(g.dtype, []).append(g)
-            for _dtype, grads in by_dtype.items():
+                by_device_dtype.setdefault((g.device, g.dtype), []).append(g)
+            for grads in by_device_dtype.values():
                 norms = torch._foreach_norm(grads, ord=p, dtype=torch.float32)
                 stacked = torch.stack(norms).to(device=reduce_device, dtype=torch.float32)
                 res = res + stacked.pow(p).sum()

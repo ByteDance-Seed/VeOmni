@@ -10,6 +10,7 @@ Usage:
     python tests/utils/test_save_safetensor_utils.py -v
 """
 
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -87,6 +88,10 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         patch(f"{_MOD}.helper", MagicMock()),
         patch(f"{_MOD}.gc", MagicMock()),
         patch(f"{_MOD}.synchronize", MagicMock()),
+        # The staging directory is never created here, and its cleanup is not
+        # mocked, so an unmocked rmtree would delete a real ``<save_path>/sharded``
+        # that belongs to something else.
+        patch("shutil.rmtree", MagicMock()),
     ):
         from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
@@ -437,10 +442,10 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
 
     def test_none_mapping_becomes_size_balanced_files(self):
         fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16), "b": torch.randn(4, dtype=torch.bfloat16)}
-        with patch(f"{_MOD}._MAX_SHARD_BYTES", 32):
+        with patch(f"{_MOD}._MAX_SHARD_BYTES", 32), tempfile.TemporaryDirectory() as save_root:
             _, writer_cls, _, _ = _call_save_distributed(
                 self.model,
-                "/tmp/test",
+                save_root,
                 None,
                 None,
                 fake,
@@ -731,6 +736,11 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         mapping = {"k_shard1": 1, "k_shard2": 2, "mtp.0.weight": 3}
 
         def fake_all_gather_object(output_list, obj):
+            # Also used by the deferred-set gather, whose payload is a dict.
+            if isinstance(obj, dict):
+                for index in range(len(output_list)):
+                    output_list[index] = {}
+                return
             output_list[0] = ["k_shard2"]
             output_list[1] = ["k_shard1"]
 
@@ -753,6 +763,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             patch(f"{_MOD}.helper", MagicMock()),
             patch(f"{_MOD}.gc", MagicMock()),
             patch(f"{_MOD}.synchronize", MagicMock()),
+            patch("shutil.rmtree", MagicMock()),
         ):
             from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
@@ -815,7 +826,11 @@ class TestConsolidationWait(unittest.TestCase):
         import veomni.utils.save_safetensor_utils as mod
 
         group = object()
-        fake_dist = MagicMock(is_initialized=MagicMock(return_value=True), new_group=MagicMock(return_value=group))
+        fake_dist = MagicMock(
+            is_initialized=MagicMock(return_value=True),
+            get_world_size=MagicMock(return_value=2),
+            new_group=MagicMock(return_value=group),
+        )
         on_every_rank = MagicMock()
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock()),
@@ -828,6 +843,7 @@ class TestConsolidationWait(unittest.TestCase):
             patch(f"{_MOD}.save_model_assets", MagicMock()),
             patch(f"{_MOD}.helper", MagicMock()),
             patch(f"{_MOD}.gc", MagicMock()),
+            patch("shutil.rmtree", MagicMock()),
         ):
             mod._save_hf_safetensor_distributed(
                 model=_TinyModel(), save_path="/tmp/test", fqn_to_index_mapping=None, model_assets=None
@@ -913,6 +929,37 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         self.assertEqual(getattr(model, "_veomni_fqn_to_index_mapping", None), mapping)
         self.assertEqual(getattr(model, "_veomni_prepared_fqn_to_index_mapping", None), mapping)
+
+    def test_materialize_keeps_the_plan_spec_info_on_every_parameter(self):
+        """``to_empty`` rebuilds each Parameter, dropping the ``spec_info`` the plan set.
+
+        Without it a plan shard looks like a plain local tensor: the optimizer then
+        classifies rows that differ per rank as a replica and averages them, which
+        corrupts every plan-sharded update.
+        """
+        from types import SimpleNamespace
+
+        from veomni.distributed.torch_parallelize import _materialize_and_load_weights
+        from veomni.models.checkpoint import init_empty_weights
+
+        with init_empty_weights():
+            model = _TinyModel()
+        model.init_weights = lambda: None
+        spec = SimpleNamespace(para_name="emb", placement=object())
+        model.embed_tokens.weight.spec_info = spec
+
+        _materialize_and_load_weights(
+            model,
+            weights_path="/tmp/nonexistent",
+            materialize_device="cpu",
+            should_skip_hf_weight_load=True,
+            is_peft_model=False,
+            adapter_path=None,
+            broadcast_from_rank0=False,
+        )
+
+        self.assertIs(getattr(model.embed_tokens.weight, "spec_info", None), spec)
+        self.assertFalse(getattr(model.linear.weight, "spec_info", None))
 
 
 if __name__ == "__main__":

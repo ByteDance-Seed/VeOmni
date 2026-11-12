@@ -134,8 +134,14 @@ def _write_checkpoint(path: Path) -> dict:
     return state
 
 
-def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Module) -> list:
-    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole."""
+def _load_as_rank(
+    monkeypatch, weights_path: Path, ep_rank: int, model: nn.Module, *, wrap_safe_open: bool = True
+) -> list:
+    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole.
+
+    ``wrap_safe_open=False`` leaves ``checkpoint_weights.safe_open`` alone, so a
+    caller that has already installed its own proxy (e.g. a no-read guard) keeps it.
+    """
     parallel_state = SimpleNamespace(
         extra_parallel_enabled=lambda name: True,
         extra_parallel_sizes={"ep": EP_SIZE},
@@ -167,7 +173,8 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
         def __exit__(self, *exc):
             return self._handle.__exit__(*exc)
 
-    monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
+    if wrap_safe_open:
+        monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
     checkpoint_weights.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
     return read_keys
 
@@ -253,7 +260,10 @@ def test_a_whole_tensor_extra_parallel_transform_is_refused_before_any_read(monk
         NotImplementedError,
         match=r"transforms ExtraParallel key 'model\.layers\.0\.mlp\.experts\.gate_up_proj'",
     ):
-        _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_ClaimsFusedSlabConverter))
+        # ``wrap_safe_open=False`` keeps ``_NoReads`` installed: the loader must
+        # refuse this checkpoint before reading any tensor, and the recorder
+        # helper would otherwise swap the guard out.
+        _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_ClaimsFusedSlabConverter), wrap_safe_open=False)
 
 
 @pytest.mark.parametrize("ep_rank", range(EP_SIZE))

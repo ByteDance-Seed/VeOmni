@@ -94,7 +94,19 @@ def _to_empty_preserving_nonpersistent_buffers(
                 continue
             buffers.append((module, name, buffer.detach().clone()))
 
+    # ``to_empty`` rebuilds every Parameter object, so the ``spec_info`` the
+    # parallel plan attached to the meta parameters is gone afterwards. Keep it
+    # by name and re-attach: without it a plan shard looks like a plain local
+    # tensor, and the optimizer then treats rows that differ per rank as a
+    # replica (averaging them in the gradient clip / step).
+    spec_infos = {
+        name: spec_info for name, param in model.named_parameters() if (spec_info := getattr(param, "spec_info", None))
+    }
     model.to_empty(device=device)
+    if spec_infos:
+        for name, param in model.named_parameters():
+            if name in spec_infos:
+                param.spec_info = spec_infos[name]
 
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]
@@ -474,6 +486,17 @@ def _finish_without_fsdp_wrap(
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False) or bool(
         getattr(getattr(model, "config", None), "cpu_offload", False)
     )
+    if enable_fsdp_cpu_offload and replicated_bytes:
+        # FSDP CPU offload works by staging parameters back onto the accelerator
+        # in a pre-forward hook. There is no hook here, so the parameters the plan
+        # does not name would be materialized on the host and stay there, and the
+        # first operator to meet an accelerator activation raises a device
+        # mismatch. Refuse instead of producing that later.
+        raise ValueError(
+            "fsdp_config.offload cannot be combined with fsdp_config.extra_parallel_only: FSDP CPU "
+            "offload stages parameters back onto the accelerator through FSDP's own hooks, and this "
+            "path has none. Keep the wrap, or leave offload off."
+        )
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
@@ -1256,20 +1279,7 @@ def build_parallelize_model(
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
-        if (
-            muon_expert_zero_comm
-            and parallel_state.ep_enabled
-            and mixed_precision.param_dtype in ("bfloat16", "float16")
-        ):
-            expert_dtype = getattr(torch, mixed_precision.param_dtype)
-            for _p in model.parameters():
-                if _p.is_floating_point():
-                    _p.data = _p.data.to(expert_dtype) if _p.ndim == 3 else _p.data.float()
-            for _b in model.buffers():
-                if _b.is_floating_point():
-                    _b.data = _b.data.float()
-        else:
-            model = model.float()
+        model = model.float()
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):

@@ -454,6 +454,23 @@ def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int],
     os.replace(partial_path, output_path)
 
 
+def _export_path(save_path: str, relative: str) -> str:
+    """Resolve ``relative`` inside ``save_path``, refusing an escape.
+
+    Both the marker and the index name files the merge then deletes and
+    rewrites, and an export is a directory that can be copied or downloaded. An
+    absolute path, a ``..`` segment, or a symlink pointing out would otherwise
+    let either file reach outside the export.
+    """
+    if not relative or os.path.isabs(relative):
+        raise ValueError(f"{relative!r} is not a relative path inside {save_path}.")
+    root = os.path.realpath(save_path)
+    resolved = os.path.realpath(os.path.join(root, relative))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        raise ValueError(f"{relative!r} resolves outside {save_path} ({resolved}).")
+    return resolved
+
+
 def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -> None:
     """Write out the files an HF export deferred, then drop its marker and shards.
 
@@ -463,12 +480,12 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    marker = os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME)
+    marker = _export_path(save_path, layout.HF_PENDING_MERGE_FILENAME)
     with open(marker) as f:
         pending = json.load(f)
     tensors = pending["tensors"]
-    sharded_path = os.path.join(save_path, pending["sharded_dir"])
-    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    sharded_path = _export_path(save_path, pending["sharded_dir"])
+    index_path = _export_path(save_path, "model.safetensors.index.json")
     weight_map = {}
     if os.path.exists(index_path):
         with open(index_path) as f:
@@ -478,10 +495,11 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
             f"{index_path} is missing or does not name the files {marker} lists: the save stopped "
             "before writing it. Export this checkpoint again."
         )
+    output_paths = {fqn: _export_path(save_path, t["file"]) for fqn, t in tensors.items()}
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=num_threads or len(tensors)) as pool:
         futures = [
-            pool.submit(_merge_rows, sharded_path, os.path.join(save_path, t["file"]), fqn, t["shape"], t["nbytes"])
+            pool.submit(_merge_rows, sharded_path, output_paths[fqn], fqn, t["shape"], t["nbytes"])
             for fqn, t in tensors.items()
         ]
         for future in futures:
@@ -542,9 +560,22 @@ def _save_hf_safetensor_distributed(
         fqn: {"shape": list(save_state[fqn].shape), "nbytes": save_state[fqn].numel() * save_state[fqn].element_size()}
         for fqn in _deferred_merge_fqns(model, save_state)
     }
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        # ``save_state`` is rank-partitioned when a converter hands each key to one
+        # rank, so the owner may be the only one that can see the tensor. Every rank
+        # still has to agree on which tensors are deferred: it decides the file
+        # mapping *and* which consolidation branch runs, and a mismatch would make
+        # the ranks write different file sets.
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, deferred)
+        deferred = {fqn: descriptor for part in gathered if part for fqn, descriptor in part.items()}
     if deferred:
         fqn_to_index_mapping = _isolate_deferred(fqn_to_index_mapping, set(deferred))
         total_size = sum(tensor.numel() * tensor.element_size() for tensor in save_state.values())
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            sizes = [None] * dist.get_world_size()
+            dist.all_gather_object(sizes, total_size)
+            total_size = sum(size for size in sizes if size is not None)
 
     # Consolidation runs on every rank, one output file each, instead of in the
     # writer's finish step: there only the coordinator rewrites the whole model

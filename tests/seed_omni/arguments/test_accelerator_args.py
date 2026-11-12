@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -98,6 +99,43 @@ def test_the_generic_runtime_refuses_eager_rather_than_falling_back_to_ddp():
 
     with pytest.raises(ValueError, match="eager"):
         runtime._build_parallelized_model()
+
+
+def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeypatch):
+    """The no-wrap mode is a builder argument, not something the plan can imply.
+
+    Left unforwarded, an `extra_parallel_only` module would still be FSDP2-wrapped
+    -- and a mixed-dtype quantized layer cannot be, so it would fail to load.
+    """
+    from veomni.distributed import torch_parallelize
+
+    seen = {}
+
+    def fake_build(model, **kwargs):
+        seen.update(kwargs)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", fake_build)
+    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime.model = nn.Module()
+    runtime.train_args = None
+    runtime.args = SimpleNamespace(
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True),
+        ),
+        basic_modules=[],
+        lora_config=None,
+        fqn_to_index_mapping=None,
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
+        model_path=None,
+        optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
+    )
+    monkeypatch.setattr(VeOmniModelRuntime, "skip_hf_weight_load", False, raising=False)
+
+    runtime._build_parallelized_model()
+
+    assert seen["extra_parallel_only"] is True
 
 
 def test_module_runtime_arguments_inherit_weight_load_knobs():

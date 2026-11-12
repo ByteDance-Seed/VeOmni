@@ -163,7 +163,7 @@ embedding parallelism (`emb`) shards by whole rows (`Shard(0)`) and that is
 larger than one output file (5 GB) is left as the per-rank shards DCP wrote.
 Whole rows means the table is not also FSDP-sharded by columns, so the module
 sets `extra_parallel_only: true`. This
-applies only to the distributed export (`ckpt_manager: dcp`, torch >= 2.9, not
+applies only to the distributed export (`train.checkpoint.manager: dcp`, torch >= 2.9, not
 on NPU); other tables and export paths still consolidate every tensor. Consolidating it would mean
 one rank streaming the whole tensor into one file while every other rank waits:
 about an hour for a 200 GB row-sharded table on an HDFS mount.

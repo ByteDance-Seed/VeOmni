@@ -861,10 +861,13 @@ def save_hf_source_checkpoint(
     loads wherever the source does.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
-    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-        consolidate_safetensors_files,
-        consolidate_safetensors_files_on_every_rank,
-    )
+
+    try:
+        from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+            consolidate_safetensors_files_on_every_rank,
+        )
+    except ImportError:  # torch 2.10 (the NPU stack) has only the single-process helper
+        consolidate_safetensors_files_on_every_rank = None
 
     from ....checkpoint.dcp_checkpointer import ModelState
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
@@ -882,7 +885,24 @@ def save_hf_source_checkpoint(
     for name, (model, parallel_state) in modules.items():
         module_state = ModelState(model, parallel_state=parallel_state).state_dict()
         tied = _tied_parameter_names(model)
-        export_state = layout.modules[name].export_state
+        # The hook answers in *source* terms, so it must see the source's own key
+        # layout: a model that declares weight conversions has a state dict in
+        # transformers' fused form, and an `export_state` written against the
+        # release layout would see names it does not know. `_revert_...` is a
+        # no-op for a model that declares none.
+        from ....utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
+
+        module_state = _revert_model_weight_conversions_for_hf(model, module_state)
+        module_layout = layout.modules[name]
+        # Keys this module computes instead of loading (:meth:`OmniHFModuleLayout.
+        # generated_tensors`). The source has no such tensor by construction, so
+        # they are neither written back nor counted as unmapped.
+        generated_keys = (
+            set(module_layout.generated_tensors(source.path, model.config))
+            if module_layout.generated_tensors is not None
+            else set()
+        )
+        export_state = module_layout.export_state
         exported_keys = list(module_state)
         if export_state is not None:
             module_state = export_state(model, module_state)
@@ -891,6 +911,8 @@ def save_hf_source_checkpoint(
         for key in exported_keys:
             source_key = layout.source_key(name, key)
             if source_key is None or source_key not in weight_files:
+                if key in generated_keys:
+                    continue
                 # A tied alias the source does not store (``tie_word_embeddings``
                 # checkpoints omit ``lm_head.weight``) is written through its original.
                 if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
@@ -958,19 +980,24 @@ def save_hf_source_checkpoint(
     del save_state
     if dist.is_initialized():
         dist.barrier(group=group)
-        consolidate_safetensors_files_on_every_rank(
-            input_dir=sharded_path,
-            output_dir=save_path,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-            process_group=group,
-        )
+        if consolidate_safetensors_files_on_every_rank is not None:
+            consolidate_safetensors_files_on_every_rank(
+                input_dir=sharded_path,
+                output_dir=save_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+                process_group=group,
+            )
+        else:
+            # torch 2.10 has no per-rank consolidation, and the single-process
+            # helper writes no index. Rank 0 consolidates every file and writes
+            # `model.safetensors.index.json` from the same mapping, so the export
+            # is still loadable; the others wait.
+            if dist.get_rank(group=group) == 0:
+                _consolidate_and_write_index(sharded_path, save_path, fqn_to_index_mapping)
+            dist.barrier(group=group)
     else:
-        consolidate_safetensors_files(
-            input_dir=sharded_path,
-            output_dir=save_path,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-            num_threads=5,
-        )
+        # Single process: the same helper, which also writes the index.
+        _consolidate_and_write_index(sharded_path, save_path, fqn_to_index_mapping)
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         shutil.rmtree(sharded_path, ignore_errors=True)
@@ -986,8 +1013,42 @@ def save_hf_source_checkpoint(
     )
 
 
+def _consolidate_and_write_index(
+    sharded_path: str,
+    save_path: str,
+    fqn_to_index_mapping: dict[str, int],
+) -> None:
+    """Consolidate every output file, then write the index the writer would have.
+
+    ``consolidate_safetensors_files_on_every_rank`` gathers its per-file metadata
+    onto rank 0 and writes ``model.safetensors.index.json`` itself. torch 2.10
+    (the NPU stack) ships only the synchronous helper, which writes the files but
+    not the index -- and an export without an index over several files does not
+    load. Derive the index from ``fqn_to_index_mapping`` and the files it wrote.
+    """
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
+    from torch.distributed.checkpoint._hf_utils import _gen_file_name
+
+    consolidate_safetensors_files(
+        input_dir=sharded_path,
+        output_dir=save_path,
+        fqn_to_index_mapping=fqn_to_index_mapping,
+        num_threads=5,
+    )
+    if len(set(fqn_to_index_mapping.values())) == 1:
+        return
+    max_index = max(fqn_to_index_mapping.values())
+    weight_map = {fqn: _gen_file_name(index, max_index) for fqn, index in fqn_to_index_mapping.items()}
+    total_size = 0
+    for filename in set(weight_map.values()):
+        path = os.path.join(save_path, filename)
+        if os.path.isfile(path):
+            total_size += os.path.getsize(path)
+    with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
+
+
 def _restore_single_file_name(save_path: str) -> None:
-    """Rename the writer's lone ``model-00001-of-00001.safetensors`` back to ``model.safetensors``."""
     shards = [name for name in os.listdir(save_path) if name.endswith(".safetensors")]
     if len(shards) != 1:
         raise RuntimeError(f"Expected one safetensors file in {save_path}, found {shards}.")

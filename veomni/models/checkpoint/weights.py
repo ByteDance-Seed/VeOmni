@@ -1070,6 +1070,12 @@ def load_model_weights_ep_sharded(
                         row_transform = _companion_row_transform(
                             converter, bare_name, file_to_path[key_to_file[companion_raw]], companion_raw
                         )
+                        # `dim0_rowwise_companion` is declared to allow a rows-split
+                        # key, which the companion hook's contract states as
+                        # "zero-fill any rows past the checkpoint's". Without this a
+                        # converter implementing only the companion hooks would be
+                        # held to strict shape equality and refuse a padded table.
+                        zero_pad = True
 
                     spec_info = getattr(model, "_fqn2spec_info", {}).get(name)
                     if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
@@ -1089,6 +1095,11 @@ def load_model_weights_ep_sharded(
                             parameter=parameter,
                             zero_pad_dim0=zero_pad,
                         )
+                        # `row_transform` is refused above, so the slice is raw
+                        # checkpoint storage: a converter that claims this key by
+                        # content (a quantized weight) must not reach the parameter
+                        # unconverted, exactly as on the non-persistent branch.
+                        _refuse_unconverted_tensor(converter, bare_name, tensor)
                         _dispatch_parameter(
                             model,
                             name,
