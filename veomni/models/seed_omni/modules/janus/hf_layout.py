@@ -118,36 +118,42 @@ def _vqvae_config(hf_config: Any) -> JanusVqvaeConfig:
     return JanusVqvaeConfig(vq_config=hf_config.vq_config.to_dict())
 
 
-def _tie_word_embeddings(hf_config: Any) -> bool:
-    """Whether the text encoder can tie its head to the input embedding.
+def _config_allows_tie(hf_config: Any) -> bool:
+    """Whether the config itself asks for a tie.
 
-    ``transformers`` ties when the config asks *and* the stored head either is
-    absent or is byte-identical to the embedding. Given both keys with
-    **different** values it declines to tie and warns ("both are present in the
-    checkpoints with different values, so we will NOT tie them"). Mirroring that
-    matters in every direction:
-
-    * A checkpoint storing a distinct head beside a stale
-      ``tie_word_embeddings: true`` (the ``JanusConfig`` dataclass default) must
-      keep its head — reading the flag alone silently substituted the embedding.
-    * A genuinely tied export omits the key, and building a head there would
-      initialise it from nothing.
-    * A tied model that wrote the duplicate out stores two *equal* tensors.
-      Splitting those into independent weights would let SFT drift them apart,
-      changing the source model's behaviour.
-
-    When the weights cannot be inspected, both flags are ANDed, the same
-    predicate :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
-    applies to the loaded module.
+    Both flags are consulted — the AND that
+    :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
+    applies to the loaded module. An explicit ``False`` on either side is the
+    author's decision and outranks anything the tensors look like.
     """
-    matches = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-    if matches is not None:
-        return matches
     outer = getattr(hf_config, "tie_word_embeddings", None)
     nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
     if outer is None and nested is None:
         return True
     return bool(True if outer is None else outer) and bool(True if nested is None else nested)
+
+
+def _tie_word_embeddings(hf_config: Any) -> bool:
+    """Whether the text encoder can tie its head to the input embedding.
+
+    A tie needs both the config's permission and weights that support it:
+
+    * **The config must ask.** An explicit ``tie_word_embeddings: false`` — on the
+      top level or the nested ``text_config`` — is the author's decision; a
+      checkpoint that happens to store two equal tensors anyway must not be
+      re-tied behind their back, because SFT would then couple them.
+    * **The weights must allow it.** ``transformers`` declines to tie when the head
+      and embedding are stored with *different* values, and warns; with the key
+      absent it is a genuinely tied export. Comparing the tensors also catches a
+      tied model that wrote the duplicate out (two *equal* tensors), where
+      splitting them into independent weights would let SFT drift them apart.
+
+    When the weights cannot be inspected, only the config's word is available.
+    """
+    if not _config_allows_tie(hf_config):
+        return False
+    matches = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+    return True if matches is None else matches
 
 
 def _text_encoder_config(hf_config: Any) -> JanusTextEncoderConfig:

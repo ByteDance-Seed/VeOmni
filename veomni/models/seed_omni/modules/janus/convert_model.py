@@ -145,21 +145,20 @@ def _split_janus_hf(model_path: str, *, attn_implementation: str | None = None) 
 
     print("Extracting janus_text_encoder ...")
     text_cfg: LlamaConfig = cfg.text_config
-    # Same verdict the layout derives from the weight files, so the two paths
-    # cannot disagree on whether the module keeps an lm_head: tie when the stored
-    # head is byte-identical to the embedding (or absent), keep it independent
-    # when the two differ. ``model.lm_head`` always exists (HF builds it either
-    # way), so this reads the loaded weights, which works for a ``.bin``-only
-    # source as well as safetensors.
+    # Same verdict the layout derives, so the two paths cannot disagree on whether
+    # the module keeps an lm_head: the config must ask for a tie (either level) and
+    # the two loaded tensors must agree. ``model.lm_head`` always exists (HF builds
+    # it either way), so this reads the loaded weights, which works for a
+    # ``.bin``-only source as well as safetensors.
+    from .hf_layout import _config_allows_tie
+
     head_weight = model.lm_head.weight
     embed_weight = model.model.language_model.embed_tokens.weight
-    tie_word_embeddings = head_weight.shape == embed_weight.shape and bool(torch.equal(head_weight, embed_weight))
-    if tie_word_embeddings and not bool(getattr(cfg, "tie_word_embeddings", True)):
-        # The config says untied even though the tensors happen to match: keep the
-        # config's word, which is what the layout path also honours.
-        from .hf_layout import _tie_word_embeddings
-
-        tie_word_embeddings = _tie_word_embeddings(cfg)
+    tie_word_embeddings = (
+        _config_allows_tie(cfg)
+        and head_weight.shape == embed_weight.shape
+        and bool(torch.equal(head_weight, embed_weight))
+    )
     te_cfg = JanusTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,
