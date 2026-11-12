@@ -1650,10 +1650,12 @@ class DeepseekV4MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # One call covers every row: the quantizing rows fake-quantize the weights
-        # they are handed, and the clamp stays in the model dtype either way. The
-        # selection lives on the op, so this forward has no recipe to branch on.
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        # One call covers every row, whatever the activation: it travels with the call
+        # because it is a property of the model, and each row either evaluates it or
+        # refuses it at handle-building time. `has_plain_linear_projections` still
+        # guards the one case a row cannot serve -- a projection wrapped after
+        # construction, whose weight the row cannot read.
+        if has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -1663,6 +1665,7 @@ class DeepseekV4MLP(nn.Module):
                 self.down_proj.weight,
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
                 swiglu_limit=self.limit,
+                activation=self.config.hidden_act,
             )
         gate = self.gate_proj(x).float().clamp(max=self.limit)
         up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)

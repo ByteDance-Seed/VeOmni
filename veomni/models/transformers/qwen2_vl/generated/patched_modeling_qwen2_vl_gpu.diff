@@ -474,7 +474,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -460,10 +520,26 @@
+@@ -460,10 +520,27 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -483,7 +483,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
++        if has_plain_linear_projections(self):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -492,6 +492,7 @@
 +                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
 +                self.down_proj.weight,
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
++                activation=self.config.hidden_act,
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 +
@@ -503,7 +504,7 @@
 
 
  class Qwen2VLAttention(nn.Module):
-@@ -472,6 +548,7 @@
+@@ -472,6 +549,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
@@ -511,7 +512,7 @@
      def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -504,6 +581,9 @@
+@@ -504,6 +582,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -521,7 +522,7 @@
 
      def forward(
          self,
-@@ -516,6 +596,7 @@
+@@ -516,6 +597,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -529,7 +530,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -527,18 +608,18 @@
+@@ -527,18 +609,18 @@
          value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -555,7 +556,7 @@
              self,
              query_states,
              key_states,
-@@ -547,7 +628,7 @@
+@@ -547,7 +629,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -564,7 +565,7 @@
              **kwargs,
          )
 
-@@ -556,21 +637,27 @@
+@@ -556,21 +638,27 @@
          return attn_output, attn_weights
 
 
@@ -601,7 +602,7 @@
 
      def forward(
          self,
-@@ -645,6 +732,12 @@
+@@ -645,6 +733,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -614,7 +615,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -698,19 +791,86 @@
+@@ -698,19 +792,86 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -706,7 +707,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -728,6 +888,53 @@
+@@ -728,6 +889,53 @@
              pooler_output=merged_hidden_states,
          )
 
@@ -760,7 +761,7 @@
 
  @auto_docstring
  class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
-@@ -738,24 +945,30 @@
+@@ -738,24 +946,30 @@
          "attentions": Qwen2VLAttention,
      }
 
@@ -798,7 +799,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -787,16 +1000,6 @@
+@@ -787,16 +1001,6 @@
          elif position_ids.ndim == 2:
              position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -815,7 +816,7 @@
          if position_ids.ndim == 3 and position_ids.shape[0] == 4:
              text_position_ids = position_ids[0]
              position_ids = position_ids[1:]
-@@ -806,8 +1009,10 @@
+@@ -806,8 +1010,10 @@
 
          # It may already have been prepared by e.g. `generate`
          if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -826,7 +827,7 @@
                  "config": self.config,
                  "inputs_embeds": inputs_embeds,
                  "attention_mask": attention_mask,
-@@ -821,6 +1026,7 @@
+@@ -821,6 +1027,7 @@
              # The sliding window alternating layers are not always activated depending on the config
              if self.has_sliding_layers:
                  causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
@@ -834,7 +835,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
-@@ -842,6 +1048,12 @@
+@@ -842,6 +1049,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -847,7 +848,7 @@
 
 
  @auto_docstring
-@@ -1024,11 +1236,14 @@
+@@ -1024,11 +1237,14 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -866,7 +867,7 @@
 
          return vision_outputs
 
-@@ -1041,11 +1256,14 @@
+@@ -1041,11 +1257,14 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -885,7 +886,7 @@
 
          return vision_outputs
 
-@@ -1149,33 +1367,128 @@
+@@ -1149,33 +1368,128 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1025,7 +1026,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1185,6 +1498,10 @@
+@@ -1185,6 +1499,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1036,7 +1037,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1193,15 +1510,27 @@
+@@ -1193,15 +1511,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1065,7 +1066,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1211,7 +1540,9 @@
+@@ -1211,7 +1541,9 @@
          super().__init__(config)
          self.model = Qwen2VLModel(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -1076,7 +1077,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1251,90 +1582,82 @@
+@@ -1251,90 +1583,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1210,7 +1211,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1514,5 +1837,51 @@
+@@ -1514,5 +1838,51 @@
 
          return input_ids, model_kwargs
 

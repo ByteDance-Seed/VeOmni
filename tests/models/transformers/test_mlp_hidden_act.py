@@ -75,16 +75,19 @@ def _pair(ours_cls, hf_cls, config):
     config._set_ops_implementation(eager_ops_config())
     ours = ours_cls(config)
     ours.load_state_dict(hf.state_dict())
+    # ``swiglu_mlp`` takes the activation as a call argument, so every activation
+    # goes through it. ``moe_experts`` cannot: its fused kernel bakes SiLU into
+    # both directions, so another activation falls back to the Python expert loop
+    # and the row must not be reached. Both cases are asserted below.
     counter = None
-    if config.hidden_act in {"silu", "swish"}:
-        handle_name = "veomni_swiglu_mlp" if hasattr(ours, "veomni_swiglu_mlp") else "veomni_moe"
-        counter = _CallCounter(getattr(ours, handle_name))
-        setattr(ours, handle_name, counter)
-    else:
-        if hasattr(ours, "veomni_swiglu_mlp"):
-            ours.veomni_swiglu_mlp = _raise_if_called
-        if hasattr(ours, "veomni_moe"):
-            ours.veomni_moe = _raise_if_called
+    if hasattr(ours, "veomni_swiglu_mlp"):
+        counter = _CallCounter(ours.veomni_swiglu_mlp)
+        ours.veomni_swiglu_mlp = counter
+    elif hasattr(ours, "veomni_moe") and config.hidden_act in {"silu", "swish"}:
+        counter = _CallCounter(ours.veomni_moe)
+        ours.veomni_moe = counter
+    elif hasattr(ours, "veomni_moe"):
+        ours.veomni_moe = _raise_if_called
     return hf, ours, counter
 
 

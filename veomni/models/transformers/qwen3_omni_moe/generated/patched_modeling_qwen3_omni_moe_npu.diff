@@ -1541,7 +1541,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-@@ -1509,15 +1800,31 @@
+@@ -1509,15 +1800,32 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -1550,7 +1550,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
++        if has_plain_linear_projections(self):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -1559,6 +1559,7 @@
 +                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
 +                self.down_proj.weight,
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
++                activation=self.config.hidden_act,
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 +
@@ -1576,7 +1577,7 @@
          self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_idx)
          if (layer_idx not in config.mlp_only_layers) and (
              config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-@@ -1525,8 +1832,12 @@
+@@ -1525,8 +1833,12 @@
              self.mlp = Qwen3OmniMoeThinkerTextSparseMoeBlock(config)
          else:
              self.mlp = Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.intermediate_size)
@@ -1591,7 +1592,7 @@
          self.hidden_size = config.hidden_size
 
      def forward(
-@@ -1592,25 +1903,31 @@
+@@ -1592,25 +1904,31 @@
              init.normal_(module.weight, mean=0.0, std=std)
 
 
@@ -1634,7 +1635,7 @@
 
 
  @auto_docstring(
-@@ -1629,8 +1946,8 @@
+@@ -1629,8 +1947,8 @@
          "router_logits": OutputRecorder(Qwen3OmniMoeThinkerTextTopKRouter, index=0),
      }
 
@@ -1645,7 +1646,7 @@
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
 
-@@ -1638,87 +1955,106 @@
+@@ -1638,87 +1956,106 @@
          self.layers = nn.ModuleList(
              [Qwen3OmniMoeThinkerTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1783,7 +1784,7 @@
              if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                  hidden_states = self._deepstack_process(
                      hidden_states,
-@@ -1728,20 +2064,44 @@
+@@ -1728,20 +2065,44 @@
 
          hidden_states = self.norm(hidden_states)
 
@@ -1832,7 +1833,7 @@
 
 
  @auto_docstring
-@@ -1823,6 +2183,12 @@
+@@ -1823,6 +2184,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -1845,7 +1846,7 @@
 
 
  @auto_docstring(
-@@ -1860,6 +2226,15 @@
+@@ -1860,6 +2227,15 @@
          self.num_experts = config.text_config.num_experts
          self.num_experts_per_tok = config.text_config.num_experts_per_tok
          self.router_aux_loss_coef = config.text_config.router_aux_loss_coef
@@ -1861,7 +1862,7 @@
          self.post_init()
 
      def get_input_embeddings(self):
-@@ -1882,13 +2257,20 @@
+@@ -1882,13 +2258,20 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithDeepstackFeatures:
@@ -1888,7 +1889,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1898,40 +2280,39 @@
+@@ -1898,40 +2281,39 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithDeepstackFeatures:
@@ -1953,7 +1954,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -2027,6 +2408,25 @@
+@@ -2027,6 +2409,25 @@
              position_ids = None
          return position_ids
 
@@ -1979,7 +1980,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2038,146 +2438,280 @@
+@@ -2038,146 +2439,280 @@
          image_grid_thw=None,
          video_grid_thw=None,
          attention_mask=None,
@@ -2355,7 +2356,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2186,39 +2720,52 @@
+@@ -2186,39 +2721,52 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -2418,7 +2419,7 @@
          )
 
      def _expand_inputs_for_generation(
-@@ -2284,1340 +2831,34 @@
+@@ -2284,1340 +2832,34 @@
 
          return position_ids
 
@@ -3787,7 +3788,7 @@
 
 
  class Qwen3OmniMoeSnakeBeta(nn.Module):
-@@ -3661,138 +2902,87 @@
+@@ -3661,138 +2903,87 @@
          return hidden_states
 
 
@@ -3997,7 +3998,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4136,19 +3326,67 @@
+@@ -4136,19 +3327,67 @@
 
          return thinker_result.sequences, talker_wavs
 

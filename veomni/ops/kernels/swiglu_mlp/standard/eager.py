@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ....activation import ActivationType, apply_activation, apply_activation_backward
 from ....registry import SavedState
 
 
@@ -35,6 +36,7 @@ class _Meta:
     has_gate_bias: bool
     has_up_bias: bool
     has_down_bias: bool
+    activation: str = ActivationType.SILU.value
 
 
 def optional_bias(bias: Tensor) -> Tensor | None:
@@ -110,8 +112,9 @@ def mlp_hidden(
     up_b: Tensor,
     *,
     swiglu_limit: float | None,
+    activation: str = ActivationType.SILU.value,
 ) -> tuple[Tensor, Tensor, Tensor, torch.dtype]:
-    """Project, optional clamp, then ``silu * up``.
+    """Project, optional clamp, then ``activation(gate) * up``.
 
     When *swiglu_limit* is set, clamp and the silu-mul run in fp32, then the
     hidden state is cast back to ``x.dtype`` before the down projection,
@@ -124,7 +127,7 @@ def mlp_hidden(
         gate = gate.float()
         up = up.float()
     gate_c, up_c = clamp_gate_up(gate, up, swiglu_limit)
-    hidden = silu_mul(gate_c, up_c)
+    hidden = apply_activation(gate_c, activation) * up_c
     if hidden.dtype != x.dtype:
         hidden = hidden.to(dtype=x.dtype)
     return hidden, gate, up, projection_dtype
@@ -145,8 +148,9 @@ def forward(
     down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
+    activation: str = ActivationType.SILU.value,
 ) -> tuple[Tensor, SavedState]:
-    """Full SwiGLU MLP: ``down(silu(gate(x)) * up(x))``.
+    """Full gated MLP: ``down(activation(gate(x)) * up(x))``.
 
     Empty biases are unused. ``swiglu_limit`` is the DeepSeek-V4 clamp; ``None``
     skips it.
@@ -159,10 +163,13 @@ def forward(
             gate_b.numel() > 0,
             up_b.numel() > 0,
             down_b.numel() > 0,
+            activation,
         )
         return empty_output(x, down_w), SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b), meta)
 
-    hidden, gate, up, projection_dtype = mlp_hidden(x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit)
+    hidden, gate, up, projection_dtype = mlp_hidden(
+        x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation
+    )
     meta = _Meta(
         False,
         swiglu_limit,
@@ -170,6 +177,7 @@ def forward(
         gate_b.numel() > 0,
         up_b.numel() > 0,
         down_b.numel() > 0,
+        activation,
     )
     output = linear(hidden, down_w, down_b)
     return output, SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden), meta)
@@ -202,12 +210,16 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     if meta.swiglu_limit is not None:
         gate_c, up_c = clamp_gate_up(gate, up, meta.swiglu_limit)
         grad_hidden = grad_hidden.to(dtype=gate_c.dtype)
-        grad_gate_c, grad_up_c = silu_mul_backward(grad_hidden, gate_c, up_c)
+        # ``d/dgate`` needs the ``up`` factor: activation_backward multiplies by
+        # the derivative only, matching ``aten.silu_backward``'s contract.
+        grad_gate_c = apply_activation_backward(grad_hidden * up_c, gate_c, meta.activation)
+        grad_up_c = grad_hidden * apply_activation(gate_c, meta.activation)
         grad_gate = unclamp_gate(grad_gate_c, gate, meta.swiglu_limit).to(dtype=meta.projection_dtype)
         grad_up = unclamp_up(grad_up_c, up, meta.swiglu_limit).to(dtype=meta.projection_dtype)
     else:
         grad_hidden = grad_hidden.to(dtype=meta.projection_dtype)
-        grad_gate, grad_up = silu_mul_backward(grad_hidden, gate, up)
+        grad_gate = apply_activation_backward(grad_hidden * up, gate, meta.activation)
+        grad_up = grad_hidden * apply_activation(gate, meta.activation)
 
     grad_x_gate, grad_gate_w, grad_gate_b = linear_backward(
         grad_gate,

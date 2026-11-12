@@ -155,7 +155,7 @@ def qwen2_5_vl_vision_mlp_init_patched(self, config, bias: bool = False):
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen2_5_vl_vision_mlp_forward_patched(self, hidden_state):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    if has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             hidden_state,
             self.gate_proj.weight,
@@ -294,7 +294,7 @@ def qwen2_5_vl_text_model_init_patched(self, config):
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen2_5_vl_text_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    if has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -303,6 +303,7 @@ def qwen2_5_vl_text_mlp_forward_patched(self, x):
             self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
             self.down_proj.weight,
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            activation=self.config.hidden_act,
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

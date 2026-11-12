@@ -210,7 +210,7 @@ class DeepseekV3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -219,6 +219,7 @@ class DeepseekV3MLP(nn.Module):
                 self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
                 self.down_proj.weight,
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+                activation=self.config.hidden_act,
             )
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

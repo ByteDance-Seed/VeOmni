@@ -637,3 +637,176 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     # The FP32 clamp disagrees, so the assertion above is not vacuous.
     widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
     assert not torch.equal(expected, widened)
+
+
+def test_the_eager_row_evaluates_every_supported_activation():
+    """The activation is a call argument, so one row serves any config's ``hidden_act``.
+
+    This is what removed the per-model refusals: the row reads the config's
+    activation instead of assuming SiLU, so a ``gelu`` model quantizes through it
+    rather than falling back to its projection modules unquantized.
+    """
+    import torch.nn.functional as F
+
+    from veomni.ops.activation import supported_activations
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 16, dtype=torch.float32)
+    gate_w = torch.randn(32, 16, dtype=torch.float32) * 0.2
+    up_w = torch.randn(32, 16, dtype=torch.float32) * 0.2
+    down_w = torch.randn(16, 32, dtype=torch.float32) * 0.2
+    empty = torch.empty(0)
+
+    references = {
+        "silu": F.silu,
+        "swish": F.silu,
+        "gelu": F.gelu,
+        "gelu_new": lambda t: F.gelu(t, approximate="tanh"),
+        "gelu_pytorch_tanh": lambda t: F.gelu(t, approximate="tanh"),
+        "gelu_tanh": lambda t: F.gelu(t, approximate="tanh"),
+    }
+    assert set(references) == set(supported_activations())
+
+    for activation, act in references.items():
+        actual, _ = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+        expected = F.linear(act(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=activation)
+
+
+def test_the_eager_row_backward_matches_autograd_for_every_activation():
+    """A forward-only check would miss a wrong derivative term.
+
+    The first version of this change dropped the ``up`` factor from ``d/dgate``;
+    every forward assertion still passed.
+    """
+    import torch.nn.functional as F
+
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    references = {
+        "silu": F.silu,
+        "gelu": F.gelu,
+        "gelu_pytorch_tanh": lambda t: F.gelu(t, approximate="tanh"),
+    }
+    for activation, act in references.items():
+        torch.manual_seed(0)
+        x = torch.randn(3, 16, dtype=torch.float32, requires_grad=True)
+        gate_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+        up_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+        down_w = (torch.randn(16, 32, dtype=torch.float32) * 0.2).requires_grad_()
+        empty = torch.empty(0)
+
+        output, saved = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+        grad_output = torch.randn_like(output)
+        actual = [grad for grad in eager.backward(grad_output, saved) if grad is not None]
+
+        expected = torch.autograd.grad(
+            F.linear(act(F.linear(x, gate_w)) * F.linear(x, up_w), down_w),
+            (x, gate_w, up_w, down_w),
+            grad_output,
+        )
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6, msg=activation)
+
+
+def test_the_liger_row_refuses_an_activation_it_cannot_compute():
+    """Liger's ``swiglu_forward`` is SiLU; another activation must not be silently SiLU."""
+    import pytest as _pytest
+
+    from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel
+
+    empty = torch.empty(0)
+    x = torch.randn(2, 4)
+    with _pytest.raises(ValueError, match="computes SiLU only"):
+        liger_kernel.forward(x, empty, empty, empty, empty, empty, empty, activation="gelu")
+
+
+def test_the_qat_row_accepts_any_supported_activation():
+    """The quantizing row must not be SiLU-only -- that was the whole point.
+
+    It cannot run here (the TileLang quantizers need SM90), so this pins the
+    signature and the validation path rather than the numerics.
+    """
+    import inspect
+
+    from veomni.ops.kernels.swiglu_mlp.standard import qat
+
+    assert "activation" in inspect.signature(qat.wrapper).parameters
+    assert inspect.signature(qat.wrapper).parameters["activation"].default == "silu"
+
+
+@pytest.mark.parametrize("activation", ["silu", "swish", "gelu", "gelu_pytorch_tanh", "gelu_new"])
+def test_the_eager_row_evaluates_the_activation_it_is_given(activation):
+    """The row takes the activation as an argument, so a non-SiLU model can quantize.
+
+    Before this, ``eager`` and ``qat`` hard-coded SiLU, so a model with ``gelu``
+    had to fall back to its projection modules -- unquantized. The activation is an
+    elementwise step between GEMMs, so nothing about it constrains the quantization.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 16, dtype=torch.float32)
+    gate_w = torch.randn(32, 16, dtype=torch.float32) * 0.2
+    up_w = torch.randn(32, 16, dtype=torch.float32) * 0.2
+    down_w = torch.randn(16, 32, dtype=torch.float32) * 0.2
+    empty = torch.empty(0)
+
+    out, _ = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+
+    act = {"silu": F.silu, "swish": F.silu, "gelu": F.gelu}.get(activation)
+    if act is None:
+        act = lambda t: F.gelu(t, approximate="tanh")  # noqa: E731
+    expected = F.linear(act(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
+def test_the_eager_row_backward_matches_autograd_for_each_activation(activation):
+    """The derivative is written out inside the custom Function, so it is checked here.
+
+    A wrong ``d/dgate`` would leave the forward correct while every gradient is
+    off -- the shape of bug a forward-only test cannot see.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from veomni.ops.kernels.swiglu_mlp.standard import eager
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 16, dtype=torch.float32, requires_grad=True)
+    gate_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+    up_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
+    down_w = (torch.randn(16, 32, dtype=torch.float32) * 0.2).requires_grad_()
+    empty = torch.empty(0)
+
+    out, saved = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+    grad_out = torch.randn_like(out)
+    grads = [g for g in eager.backward(grad_out, saved) if g is not None]
+
+    act = {"silu": F.silu, "gelu": F.gelu}.get(activation)
+    if act is None:
+        act = lambda t: F.gelu(t, approximate="tanh")  # noqa: E731
+    reference = F.linear(act(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    expected = torch.autograd.grad(reference, (x, gate_w, up_w, down_w), grad_out)
+
+    assert len(grads) == len(expected)
+    for got, want in zip(grads, expected):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+
+def test_liger_kernels_refuses_an_activation_it_cannot_compute():
+    """Liger's swiglu kernels are SiLU only, and say so instead of computing SiLU anyway."""
+    import torch
+
+    from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel
+
+    empty = torch.empty(0)
+    x = torch.randn(2, 16)
+
+    with pytest.raises(ValueError, match="computes SiLU only"):
+        liger_kernel.forward(x, x.T, empty, x.T, empty, x.T, empty, activation="gelu")
