@@ -58,6 +58,7 @@ class _StatelessMainCollator:
         self.checkpoint_collator_identity = self._configuration_identity()
 
     def _configuration_identity(self):
+        """Identify the supported native collator pipeline and its options."""
         from . import data_collator
 
         pipeline = self._collator.preforward_pipeline
@@ -93,11 +94,13 @@ class _StatelessMainCollator:
         return self._collator(features)
 
     def validate_checkpoint_identity(self):
+        """Reject a collator configuration that changed since construction."""
         if self._configuration_identity() != self.checkpoint_collator_identity:
             raise ValueError("cyclic packing collator configuration changed")
 
 
 def _hash_part(digest, tag: bytes, value: bytes) -> None:
+    """Append a tagged, length-delimited value to a hash."""
     digest.update(tag)
     digest.update(len(value).to_bytes(8, "big"))
     digest.update(value)
@@ -139,6 +142,7 @@ def _hash_value(digest, value: Any) -> None:
 
 
 def _feature_hash(feature: dict) -> str:
+    """Return a content hash for a feature or collated output."""
     digest = hashlib.sha256()
     _hash_value(digest, feature)
     return digest.hexdigest()
@@ -164,6 +168,7 @@ def _feature_logical_bytes(feature: Any) -> int:
 
 
 def _signature(value: Any) -> str:
+    """Hash a JSON-serializable configuration using canonical ordering."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -173,6 +178,7 @@ def _rng_snapshot():
 
 
 def _assert_rng_unchanged(before):
+    """Reject transforms that consume Python, NumPy, or Torch CPU RNG."""
     if before[0] != random.getstate() or before[1] != pickle.dumps(np.random.get_state()):
         raise ValueError("cyclic packing does not support transforms that consume global RNG")
     if not torch.equal(before[2], torch.get_rng_state()):
@@ -293,6 +299,7 @@ class CyclicPackedLoader:
         self._reset_cycle()
 
     def _reset_cycle(self):
+        """Reset the replay frontier and hashes for a new data cycle."""
         self._source_index = 0
         self._pending = deque()
         self._lookahead = None
@@ -309,10 +316,12 @@ class CyclicPackedLoader:
         return self
 
     def set_epoch(self, epoch: int) -> None:
+        """Require the trainer epoch to match the committed step."""
         if self._pending_step or epoch != self._committed_step // self._train_steps or epoch >= self._train_epochs:
             raise ValueError("trainer epoch does not match the committed cyclic packing step")
 
     def _load_item(self):
+        """Load and validate one deterministic source feature."""
         if self._source_index >= self._source_len:
             return None
         index = self._source_index
@@ -347,6 +356,7 @@ class CyclicPackedLoader:
         return index, item, length, size, digest
 
     def _next_group(self):
+        """Build the next packed group from the bounded replay buffer."""
         while len(self._pending) < self._buffer_size:
             if self._lookahead is None:
                 self._lookahead = self._load_item()
@@ -379,9 +389,11 @@ class CyclicPackedLoader:
         return group
 
     def _cycle_complete(self):
+        """Return whether the source and all buffered items are exhausted."""
         return self._source_index == self._source_len and not self._pending and self._lookahead is None
 
     def _collate_group(self, group):
+        """Copy feature dictionaries and labels, then collate and hash the output."""
         # PackingCollator may mask a boundary label in-place. Copy the dict and
         # labels so repeated dataset reads cannot be mutated.
         features = []
@@ -397,6 +409,8 @@ class CyclicPackedLoader:
         return output
 
     def _frontier(self):
+        """Hash the buffered and lookahead positions needed for exact replay."""
+
         def descriptor(item):
             return None if item is None else (item[0], item[2], item[3], item[4])
 
@@ -410,6 +424,7 @@ class CyclicPackedLoader:
         )
 
     def __next__(self):
+        """Prepare a training step without committing its data cursor."""
         error = None
         batches = []
         done = False
@@ -509,6 +524,7 @@ class CyclicPackedLoader:
             raise RuntimeError("cannot commit cyclic data before its optimizer step")
 
     def commit_step(self) -> None:
+        """Commit prepared data after the matching optimizer step succeeds."""
         self.validate_pending_step()
         self._committed_step += 1
         self._pending_step = False
@@ -534,6 +550,7 @@ class CyclicPackedLoader:
         )
 
     def state_dict(self):
+        """Snapshot the committed cursor, identity, and replay frontier."""
         if self._poisoned or self._pending_step or self._step_getter() != self._committed_step:
             raise RuntimeError("cannot snapshot an uncommitted cyclic packing step")
         if self._require_resume and not self._restored:
@@ -555,6 +572,7 @@ class CyclicPackedLoader:
         }
 
     def load_state_dict(self, state):
+        """Replay and verify a committed cursor into a fresh loader."""
         if self._poisoned or self._pending_step or self._committed_step or self._cycle_groups:
             raise RuntimeError("cyclic loader must be fresh before restoring")
         self._poisoned = True
