@@ -144,11 +144,21 @@ def _split_janus_hf(model_path: str, *, attn_implementation: str | None = None) 
 
     print("Extracting janus_text_encoder ...")
     text_cfg: LlamaConfig = cfg.text_config
-    # Same predicate the layout uses, so the two paths cannot disagree on whether
-    # the module keeps an lm_head.
+    # Same question the layout answers from the weight files, so the two paths
+    # cannot disagree on whether the module keeps an lm_head: does the *source
+    # checkpoint* store a head of its own? ``model.lm_head`` always exists (HF
+    # builds it either way), so it cannot stand in for the file's contents.
+    from ...utils.hf_layout import source_weight_files
     from .hf_layout import _tie_word_embeddings
 
-    tie_word_embeddings = _tie_word_embeddings(cfg)
+    try:
+        source_keys = set(source_weight_files(model_path))
+    except FileNotFoundError:
+        source_keys = None
+    if source_keys is None:
+        tie_word_embeddings = _tie_word_embeddings(cfg)
+    else:
+        tie_word_embeddings = "lm_head.weight" not in source_keys
     te_cfg = JanusTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,

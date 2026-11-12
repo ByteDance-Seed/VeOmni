@@ -22,7 +22,7 @@ from typing import Any, Optional
 import torch
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusSiglipConfig
 
@@ -52,6 +52,19 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
 
+    @property
+    def _num_patch_tokens(self) -> int:
+        """Patch embeddings one SigLIP image contributes, i.e. its backbone rows.
+
+        ``dyn_bsz`` counts these per image item; the tower emits one row per
+        patch and the aligner does not change the row count.
+        """
+        size = self._image_processor.size
+        height = int(size["height"] if "height" in size else size["shortest_edge"])
+        width = int(size["width"] if "width" in size else size["shortest_edge"])
+        patch = int(self._image_processor.patch_size)
+        return (height // patch) * (width // patch)
+
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusSiglipPreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
@@ -59,10 +72,27 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         return cls(JanusSiglipProcessor.from_pretrained(module_path))
 
     def bind_dummy_inputs(self, config: JanusSiglipConfig, dtype: Optional[torch.dtype] = None) -> None:
-        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
+        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model.
+
+        The shape must match what ``self._image_processor`` produces, because a
+        mixed real/dummy batch is ``torch.stack``ed together. A ``vision_config``
+        override that moves ``image_size`` away from the checkpoint's
+        ``preprocessor_config.json`` would otherwise pair real 384px images with a
+        differently sized dummy and fail the stack, so that mismatch is rejected
+        here rather than at the first step.
+        """
         cfg = config.vision_config
+        size = self._image_processor.size
+        proc_h = int(size["height"] if "height" in size else size["shortest_edge"])
+        proc_w = int(size["width"] if "width" in size else size["shortest_edge"])
+        if (proc_h, proc_w) != (int(cfg.image_size), int(cfg.image_size)):
+            raise ValueError(
+                f"{type(self).__name__}: vision_config.image_size={cfg.image_size} does not match the image "
+                f"processor's {(proc_h, proc_w)} from preprocessor_config.json. Override both together, or "
+                "drop the vision_config override — a mixed real/dummy batch would fail to stack."
+            )
         self._dtype = dtype
-        self._dummy_pixel_values = torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=dtype)
+        self._dummy_pixel_values = torch.zeros(cfg.num_channels, proc_h, proc_w, dtype=dtype)
 
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
@@ -81,6 +111,10 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
+                    # ``dyn_bsz`` counts backbone rows before collation, so each
+                    # image item must state how many tokens it contributes:
+                    # SigLIP turns one image into ``patches`` patch embeddings.
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_patch_tokens
                 continue
             if inference:
                 continue
@@ -97,7 +131,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                     value=self._dummy_pixel_values,
                     role="user",
                     is_dummy=True,
-                    meta={_IMG_TAG_KEY: "und"},
+                    meta={_IMG_TAG_KEY: "und", _OMNI_TOKEN_LEN: self._num_patch_tokens},
                 )
             )
 

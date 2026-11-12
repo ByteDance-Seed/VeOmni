@@ -35,6 +35,38 @@ from .text_encoder.configuration import JanusTextEncoderConfig
 from .vqvae.configuration import JanusVqvaeConfig
 
 
+_TIED_EMBEDDING_SOURCE_KEY = "__janus_tied_embedding_source__"
+"""Attribute set by :func:`_read_hf_config` recording whether the checkpoint stores ``lm_head.weight``.
+
+``build_config`` only receives a config, so the fact has to travel on it. The
+name is private to this module and never serialised.
+"""
+
+
+def _read_hf_config(source_path: str):
+    """Read the upstream config and record what the weight files say about the head.
+
+    ``transformers`` decides the tie from *both* the flag and the stored keys:
+    when ``lm_head.weight`` sits beside ``model.language_model.embed_tokens.weight``
+    it declines to tie and warns. Reading the key list here is the only place
+    that sees the files, so the decision is recorded for :func:`_tie_word_embeddings`.
+    """
+    from transformers import AutoConfig
+
+    from ...utils.hf_layout import source_weight_files
+
+    hf_config = AutoConfig.from_pretrained(source_path)
+    try:
+        stored = set(source_weight_files(source_path))
+    except FileNotFoundError:
+        # No safetensors weights to inspect (e.g. a bin-only or fixture root):
+        # fall back to the flags alone.
+        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+    else:
+        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, "lm_head.weight" in stored)
+    return hf_config
+
+
 def _siglip_config(hf_config: Any) -> JanusSiglipConfig:
     return JanusSiglipConfig(vision_config=hf_config.vision_config.to_dict())
 
@@ -46,21 +78,25 @@ def _vqvae_config(hf_config: Any) -> JanusVqvaeConfig:
 def _tie_word_embeddings(hf_config: Any) -> bool:
     """Whether the text encoder can tie its head to the input embedding.
 
-    Both flags are consulted — the same AND that
-    :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
-    applies — because ``build_config`` cannot see the weight files and guessing
-    from one flag alone loses information in one direction:
+    ``transformers`` ties only when the config asks *and* the checkpoint stores
+    no separate ``lm_head.weight``: given both keys it declines to tie and warns
+    ("both are present in the checkpoints with different values, so we will NOT
+    tie them"). Mirroring that matters in both directions:
 
-    * ``tie_weights`` on ``JanusForConditionalGeneration`` reads the *top-level*
-      field, and ``save_pretrained`` writes ``lm_head.weight`` separately only
-      when that flag is off. Every checkpoint this repo produces agrees on both
-      levels: ``convert_janus_weight_to_hf`` syncs the top-level flag from
-      ``text_config`` precisely so an untied source (Janus-1.3B) is not re-tied.
-    * When they disagree, the checkpoint stores a real head — a stale or
-      hand-edited top-level flag must not let the layout drop it. Answering
-      ``False`` builds the head, and a genuinely tied source then loads its own
-      embedding copy, so no case loses weights.
+    * A checkpoint with the head stored but a stale ``tie_word_embeddings: true``
+      (the ``JanusConfig`` dataclass default) must still get its head — reading
+      the flag alone silently substituted the embedding for it.
+    * A genuinely tied export omits the key, and building a head there would
+      initialise it from nothing.
+
+    When the source key list is unavailable, both flags are ANDed, the same
+    predicate :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
+    applies to the loaded module.
     """
+    stored = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+    if stored is not None:
+        return not stored
+
     outer = getattr(hf_config, "tie_word_embeddings", None)
     nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
     if outer is None and nested is None:
@@ -90,9 +126,27 @@ def _llm_config(hf_config: Any) -> JanusLlamaConfig:
 
 
 def _tokenizer(model_path: str) -> dict[str, Any]:
+    """The byte-level tokenizer, rejecting a rebuilt Metaspace one.
+
+    Janus's vocab is byte-level BPE. An HF export written before
+    ``convert_janus_weight_to_hf`` bypassed the mislabelled ``LlamaTokenizer``
+    class carries a rebuilt Metaspace pipeline that decodes differently
+    (``"TheĠimage"``), so the same check the family converter runs applies here.
+    """
+    import json
+
     from transformers import AutoTokenizer
 
-    return {"tokenizer": AutoTokenizer.from_pretrained(model_path)}
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is not None:
+        pre_tokenizer = json.loads(backend.to_str()).get("pre_tokenizer") or {}
+        if pre_tokenizer.get("type") == "Metaspace":
+            raise ValueError(
+                f"{model_path} holds a Metaspace tokenizer; Janus needs the byte-level one. "
+                "Convert from the DeepSeek checkpoint (the directory without the -hf suffix) instead."
+            )
+    return {"tokenizer": tokenizer}
 
 
 def _image_processor(model_path: str) -> dict[str, Any]:
@@ -171,6 +225,9 @@ JANUS_HF_LAYOUT = OmniHFLayout(
         "infer_interleave": "infer/graph_infer_interleave.yaml",
     },
     infer_type="infer_interleave",
+    # Tying depends on whether the checkpoint stores ``lm_head.weight``, which
+    # only the weight files reveal; this reads them alongside the config.
+    load_hf_config=_read_hf_config,
 )
 
 

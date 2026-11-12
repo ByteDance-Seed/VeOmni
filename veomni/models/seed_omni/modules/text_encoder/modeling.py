@@ -164,14 +164,21 @@ class InferenceMixin:
             return {}
         return {"generated": flushed}
 
-    def _flush_text_generated(self, conversation_list: List[ConversationItem]) -> Dict[str, Any]:
+    def _flush_text_generated(self, conversation_list: List[ConversationItem], *, seal: bool = True) -> Dict[str, Any]:
+        """Report the tokens decoded since the last flush.
+
+        ``seal=False`` keeps the current ``output`` row an output: the
+        sampled-``<boi>`` path still has to hand that row's embedding to the
+        backbone opening the image span, so only the text before it is reported.
+        """
         token_ids = list(self._text_token_cache)
         self._text_token_cache.clear()
         if not token_ids:
             return {}
         meta = {"token_ids": token_ids}
         text = self._tokenizer.decode(token_ids, skip_special_tokens=True)
-        seal_outputs(conversation_list, new_type="text")
+        if seal:
+            seal_outputs(conversation_list, new_type="text")
         return {"type": "text", "value": text, "meta": meta}
 
 

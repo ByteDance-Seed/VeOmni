@@ -38,7 +38,7 @@ the trainer and its `infer.*` block drives the inferencer.
 | `train/graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
 | `train/base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
 | `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
-| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager. Select it with `--model.model_config.modules`. |
+| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` (`fsdp2` + `emb`), `janus_llama` `fsdp2`, `janus_vqvae` `ddp`, `janus_siglip` eager. Select it with `--model.model_config.modules`. |
 | `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager`; the file pins `janus_siglip` explicitly and `for_inference` supplies the `eager` default to the rest, so the whole run is a single-process replica. |
 | `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `model.model_config.infer_graph`). |
 
@@ -237,7 +237,7 @@ distributed run. Two ready-made inference module files ship with the config:
 
 | `--model.model_config.modules` file | Layout | Launch |
 |-------------------------------------|--------|--------|
-| `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
+| `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `fsdp2`, `janus_vqvae` → `ddp`, `janus_siglip` → eager | **torchrun** (`bash train.sh …`) |
 | `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica (the file only pins `janus_siglip`; `for_inference` supplies `fsdp_mode: eager` to the rest) | single-process (`python …`) |
 
 ### 5.1 Inferring from a trained checkpoint
@@ -252,16 +252,32 @@ to `--model.model_path` (the layout loads it again) or to `transformers`:
 --model.model_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_20/hf_ckpt
 ```
 
+Two cases do **not** produce that merged export:
+
+- A **LoRA** run saves adapters per module instead. With only LoRA-trained
+  modules there is no `hf_ckpt/` at all; with mixed full/LoRA modules the merged
+  export carries the original bases, not the adapter updates. Load the adapters
+  on top of the base (`model.model_path=<HF root>` plus the per-module adapter
+  path) rather than pointing at `hf_ckpt/`.
+- A module that ended up **fully frozen** (for example one whose LoRA targets
+  matched nothing) has no per-module export, so the assembled root below would
+  lack its weights. Copy those modules from the original checkpoint.
+
 A split-checkpoint run (no HF layout to write back to) instead writes per-module
 folders under `hf_ckpt/<module>/`; assemble those into a flat root by linking
-each module's folder to `<root>/<module>`:
+each module's folder to `<root>/<module>`. A module with no `hf_ckpt/` folder was
+fully frozen, so it comes from `$ORIG` instead:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
 ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
+ORIG=/path/to/split/checkpoint          # the step-1 convert output
 mkdir -p "$ASM"
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
-  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
+  src="$STEP/hf_ckpt/$m"
+  [ -d "$src" ] || src="$ORIG/$m"
+  [ -d "$src" ] || { echo "missing module: $m" >&2; exit 1; }
+  ln -sfn "$(realpath "$src")" "$ASM/$m"
 done
 ```
 

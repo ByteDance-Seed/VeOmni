@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusVqvaeConfig
 
@@ -101,6 +101,23 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
 
+    @property
+    def _num_image_tokens(self) -> int:
+        """VQ tokens one generation image expands to, i.e. its backbone row count.
+
+        Read off the processor alias when available, else derived from the grid
+        the codec decodes (``num_patches**2``), which is what
+        :class:`JanusVqvaeProcessor` defaults to.
+        """
+        tokens = getattr(self._image_processor, "num_image_tokens", None)
+        if tokens is not None:
+            return int(tokens)
+        patch = int(self._image_processor.patch_size)
+        size = self._image_processor.size
+        height = int(size["height"] if "height" in size else size["shortest_edge"])
+        width = int(size["width"] if "width" in size else size["shortest_edge"])
+        return (height // patch) * (width // patch)
+
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
@@ -134,6 +151,9 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
+                    # A generation image occupies one VQ token per codebook row, which
+                    # is what the backbone sees once the codec has emitted them.
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_image_tokens
                 continue
             if inference:
                 continue
@@ -150,7 +170,10 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                     value=self._dummy_pixel_values,
                     role="assistant",
                     is_dummy=True,
-                    meta={_IMG_TAG_KEY: "gen"},
+                    meta={
+                        _IMG_TAG_KEY: "gen",
+                        _OMNI_TOKEN_LEN: self._num_image_tokens,
+                    },
                 )
             )
 

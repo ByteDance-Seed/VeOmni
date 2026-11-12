@@ -142,3 +142,40 @@ def test_expand_text_only_t2i_skips_system_prompt():
     rendered = tmpl.render_template_string(parts)
     assert rendered.startswith("<s><|User|>: ")
     assert _SYSTEM_PROMPT_MARKER not in rendered
+
+
+def test_multi_turn_closes_every_assistant_turn_with_eos():
+    """Janus' wire format ends each assistant turn, not just the sample."""
+    sample = [
+        ConversationItem(type="text", value="q1", role="user"),
+        ConversationItem(type="text", value="a1", role="assistant"),
+        ConversationItem(type="text", value="q2", role="user"),
+        ConversationItem(type="text", value="a2", role="assistant"),
+    ]
+    tmpl = _template()
+    rendered = tmpl.render_template_string(tmpl.apply_chat_template(sample))
+    assert "a1</s>" in rendered, rendered
+    assert rendered.count("</s>") == 2, rendered
+    # The intermediate stop token is supervised; only a generated-image turn is masked.
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "a1</s>a2</s>"
+
+
+def test_multi_turn_eos_after_a_generated_image_stays_unscored():
+    """A turn ending on a generated image leaves its EOS untrained, as at sample end."""
+    sample = [
+        ConversationItem(type="text", value="draw", role="user"),
+        ConversationItem(type="image", value=None, role="assistant"),
+        ConversationItem(type="text", value="now describe", role="user"),
+        ConversationItem(type="text", value="ok", role="assistant"),
+    ]
+    tmpl = _template()
+    parts = tmpl.apply_chat_template(sample)
+    # Both EOS rows are emitted; only the trailing one is scored. Checked before
+    # ``tokenize`` rewrites ``value`` into ids.
+    eos_rows = [p for p in parts if p.type == "text" and str(p.value) == "</s>"]
+    assert [p.meta.get("loss_mask") for p in eos_rows] == [0, 1]
+
+    # The image turn's EOS is not scored, the trailing text turn's is.
+    supervised = _supervised_text(tmpl, parts)
+    assert supervised.endswith("ok</s>")
+    assert supervised.count("</s>") == 1, supervised
