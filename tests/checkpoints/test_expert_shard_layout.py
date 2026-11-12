@@ -874,6 +874,41 @@ def _ple_and_ordinary_expert_worker(rank, root, endpoint):
                     result[0] = repr(exc)
             dist.broadcast_object_list(result, src=0)
             assert result[0] is None, result[0]
+
+        # Versioned PLE plus an ordinary expert: inconsistent expert provenance
+        # must fail before replacing an existing checkpoint's completion marker.
+        import hashlib
+        from pathlib import Path
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        model.shard_expert_alias = False
+        ple_mesh = parallel.extra_parallel_fsdp_device_mesh["ple"]
+        fsdp_mesh = ple_mesh[ple_mesh.mesh_dim_names[:-1]]
+        model.ple.weight = torch.nn.Parameter(distribute_tensor(model.ple.weight.detach(), fsdp_mesh, [Shard(1)]))
+        model._fqn2spec_info["ple.weight"].checkpoint_layout_v2 = True
+        path = f"{root}-guard"
+        DistributedCheckpointer.save(path, {"model": model}, parallel_state=parallel)
+
+        def fingerprint():
+            return {
+                str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in Path(path).rglob("*")
+                if p.is_file()
+            }
+
+        before = fingerprint()
+        if rank == 1:
+            model._fqn2spec_info["experts.alias"].para_name = "ep"
+        with pytest.raises(RuntimeError, match="layout or optimizer policy differs across ranks"):
+            DistributedCheckpointer.save(path, {"model": model}, parallel_state=parallel)
+        assert fingerprint() == before
+        if rank == 1:
+            model._fqn2spec_info["experts.alias"].para_name = "ple"
+            model.shard_expert_alias = True
+        with pytest.raises(RuntimeError, match="layout or optimizer policy differs across ranks"):
+            DistributedCheckpointer.save(path, {"model": model}, parallel_state=parallel)
+        assert fingerprint() == before
     finally:
         clear_parallel_state()
         dist.destroy_process_group()

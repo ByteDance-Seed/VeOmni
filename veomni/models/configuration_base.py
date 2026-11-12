@@ -28,6 +28,71 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
 
+#: Config classes whose blocks build a ``swiglu_mlp`` handle, keyed by class name,
+#: so the check can tell a real consumer from a config that merely happens to carry
+#: a gated-MLP shape. Everything with a text decoder is a consumer; these are the
+#: two vision towers that also are, because their patches bind the handle too
+#: (``qwen2_5_vl_vision_mlp_init_patched`` and its Omni sibling).
+_EXTRA_SWIGLU_VISION_CONFIGS = frozenset(
+    {
+        "Qwen2_5_VLVisionConfig",
+        "Qwen2_5OmniVisionEncoderConfig",
+    }
+)
+
+
+def _binds_swiglu_mlp(config: PretrainedConfig) -> bool:
+    """Whether ``config``'s blocks build a ``swiglu_mlp`` handle.
+
+    A config-level test cannot infer this from shape alone: Qwen2.5-VL's vision
+    tower carries ``intermediate_size``, ``depth`` and an activation, and *does*
+    bind the handle, while Qwen3-VL's vision tower has the same shape and binds
+    nothing. Guessing either way gets a real configuration wrong -- the first
+    would let a quantizing selection train unquantized, the second would block a
+    perfectly good text-side selection because a vision tower uses GELU.
+
+    So: the language model is always a consumer (its MLP is what the row serves),
+    and the two vision towers that bind the handle are named explicitly. A new
+    model that binds ``swiglu_mlp`` outside its text stack adds its config class
+    here.
+    """
+    if "text" in type(config).__name__.lower() or hasattr(config, "num_hidden_layers"):
+        return True
+    return type(config).__name__ in _EXTRA_SWIGLU_VISION_CONFIGS
+
+
+def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, proposed: Mapping) -> None:
+    """Refuse a quantizing ``swiglu_mlp`` selection the model's activation cannot run.
+
+    The fused rows implement SiLU (``standard``) and GELU-tanh (``geglu``). A model
+    whose activation is anything else falls back to its projection modules, which
+    never reach the row -- so the config would claim quantization-aware training
+    while the step ran in the model dtype.
+
+    Checked here rather than at each forward: this is the one place every model
+    reaches, including a VLM's ``text_config``, because ``collect`` already walks
+    ``sub_configs``. It also fails at load time instead of on the first step.
+    """
+    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS, QUANTIZING_IMPLS
+
+    if proposed.get("swiglu_mlp_implementation") not in QUANTIZING_IMPLS:
+        return
+    if not _binds_swiglu_mlp(config):
+        return
+    # Gemma-style configs name the field ``hidden_activation``; the rest use
+    # ``hidden_act``. A config with neither has no MLP activation to check.
+    activation = getattr(config, "hidden_act", None) or getattr(config, "hidden_activation", None)
+    if activation is None or activation in FUSED_ACTIVATIONS:
+        return
+    raise ValueError(
+        f"swiglu_mlp_implementation={proposed['swiglu_mlp_implementation']!r} cannot run on "
+        f"hidden_act={activation!r}: the quantizing `swiglu_mlp` row is registered on the "
+        "`standard` variant, which implements SiLU only, so this MLP would fall back to its "
+        "projection modules and round nothing. Set swiglu_mlp_implementation='eager' to train in "
+        "the model dtype. Quantizing another activation is a variant of its own -- see #1430."
+    )
+
+
 def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) -> None:
     if not diff.get("ops_implementation"):
         diff.pop("ops_implementation", None)
@@ -185,6 +250,10 @@ class VeOmniPretrainedConfig(PretrainedConfig):
                 proposed["attn_implementation"] = OpsImplementationConfig.normalize_attention_backend(
                     proposed["attn_implementation"]
                 )
+            # Only the validating pass reports; the post-init and load-time passes
+            # build the tree first and are checked once the whole picture is known.
+            if _validate:
+                _reject_quantized_swiglu_on_an_unfused_activation(config, proposed)
             pending.append((config, proposed))
             for key in config.sub_configs:
                 child = getattr(config, key, None)
@@ -284,7 +353,12 @@ def _ops_dict(value):
 def _resolve_ops(selections):
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
+    from .legacy_qat_selections import migrate_retired_selections
 
+    # Configs written before QAT became per-family still carry the retired names.
+    # See veomni/models/legacy_qat_selections.py -- deleting that module and this
+    # line drops the compatibility.
+    selections = migrate_retired_selections(selections)
     resolved = OpsImplementationConfig(**{key: value for key, value in selections.items() if value is not None})
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:
@@ -358,6 +432,15 @@ def _restore_config(config_class, state):
     return config
 
 
+def _walk_configs(config: PretrainedConfig):
+    """Yield ``config`` and every ``VeOmniPretrainedConfig`` beneath it."""
+    yield config
+    for key in config.sub_configs:
+        child = getattr(config, key, None)
+        if isinstance(child, VeOmniPretrainedConfig):
+            yield from _walk_configs(child)
+
+
 def as_veomni_config(config: PretrainedConfig, *, validate: bool = True) -> VeOmniPretrainedConfig:
     """Opt a native config tree into VeOmni in place, preserving caller references."""
     native = not isinstance(config, VeOmniPretrainedConfig)
@@ -376,6 +459,15 @@ def as_veomni_config(config: PretrainedConfig, *, validate: bool = True) -> VeOm
         config._set_ops_implementation(None, _is_post_init=True, _validate=False)
     if validate:
         _ = config.ops_config
+        # Resolving the property validates the dataclass but runs no per-config
+        # check, so a tree adopted this way -- what `build_foundation_model` does
+        # with a handed-in `PretrainedConfig` -- skipped the refusal for a
+        # quantizing selection its activation cannot serve. Check each level
+        # directly: routing this through `_set_ops_implementation` would also
+        # re-normalize `attn_implementation` and rewrite an explicit `sdpa` into
+        # its `veomni_sdpa` spelling.
+        for node in _walk_configs(config):
+            _reject_quantized_swiglu_on_an_unfused_activation(node, node.ops_implementation)
         for key in config.sub_configs:
             child = getattr(config, key, None)
             if isinstance(child, VeOmniPretrainedConfig):

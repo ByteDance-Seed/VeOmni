@@ -72,6 +72,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -140,6 +141,7 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -449,6 +451,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
