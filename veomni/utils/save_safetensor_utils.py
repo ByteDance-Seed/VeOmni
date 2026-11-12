@@ -25,6 +25,14 @@ import torch.distributed.checkpoint as dcp
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
 from veomni.models.checkpoint.weights import _save_state_dict
+from veomni.models.qwen4_gdn_precision import (
+    expected_qwen4_gdn_layer_ids,
+    has_qwen4_exp_assets,
+    is_qwen4_exp_model,
+    is_qwen4_gdn_parameter,
+    qwen4_exp_model_config,
+    validate_qwen4_gdn_pairs,
+)
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
@@ -53,12 +61,19 @@ def get_model_save_state(
     """
     from contextlib import nullcontext
 
-    from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.checkpoint.dcp_checkpointer import (
+        _QWEN4_GDN_FP32_LEGACY_MARKER,
+        _QWEN4_GDN_FP32_MARKER,
+        ModelState,
+        _export_extra_parallel_layout_key,
+    )
     from veomni.distributed.parallel_state import use_parallel_state
     from veomni.models.checkpoint import get_checkpoint_tensor_converter
 
     converter = get_checkpoint_tensor_converter(model) if model is not None else None
     if converter is not None and callable(getattr(converter, "export_weights", None)):
+        if is_qwen4_exp_model(model) and expected_qwen4_gdn_layer_ids(qwen4_exp_model_config(model)) != set():
+            raise NotImplementedError("Qwen4 converter-based online export has not been validated for FP32 GDN")
         import inspect
 
         effective_mapping = (
@@ -126,13 +141,33 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    raw_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    save_state = {}
+    for name, value in raw_state.items():
+        if name in (_QWEN4_GDN_FP32_MARKER, _QWEN4_GDN_FP32_LEGACY_MARKER):
+            continue
+        name = _export_extra_parallel_layout_key(name)
+        if name in (_QWEN4_GDN_FP32_MARKER, _QWEN4_GDN_FP32_LEGACY_MARKER):
+            continue
+        if name is not None:
+            if name in save_state:
+                raise RuntimeError(f"Multiple checkpoint tensors map to export key {name}")
+            save_state[name] = value
+    is_qwen4 = is_qwen4_exp_model(model)
+    gdn_names = set()
+    if is_qwen4:
+        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        validate_qwen4_gdn_pairs(save_state, getattr(raw_model, "config", None))
+        gdn_names = {name for name in save_state if is_qwen4_gdn_parameter(name)}
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
     converted_state = {}
     for k, v in save_state.items():
-        if v.dtype == torch.float32:
+        preserve_gdn = is_qwen4 and is_qwen4_gdn_parameter(k)
+        if preserve_gdn and v.dtype != torch.float32:
+            raise RuntimeError(f"Cannot export non-FP32 Qwen4 GDN parameter without explicit migration: {k}")
+        if v.dtype == torch.float32 and not preserve_gdn:
             logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
             converted_state[k] = v.to(torch.bfloat16)
         else:
@@ -155,6 +190,12 @@ def get_model_save_state(
             "all model weights into a single safetensors file."
         )
 
+    if is_qwen4:
+        # Filtering tied weights must never silently drop a GDN scalar or layer.
+        validate_qwen4_gdn_pairs(save_state, getattr(raw_model, "config", None))
+        if {name for name in save_state if is_qwen4_gdn_parameter(name)} != gdn_names:
+            raise RuntimeError("HF weight_map dropped Qwen4 GDN parameters during export")
+
     return save_state
 
 
@@ -171,14 +212,23 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
+    from veomni.checkpoint.dcp_checkpointer import _reject_unproven_extra_parallel_optimizer
+
     # Apply DCP consolidation patch just-in-time for HDFS FUSE compatibility
     # This patches torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
     # to use append mode instead of r+b mode, which is required for append-only file systems
     from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    from veomni.utils.dist_utils import raise_if_any_rank_failed
 
     apply_dcp_consolidation_patch()
 
-    save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
+    _reject_unproven_extra_parallel_optimizer({"model": model}, parallel_state)
+    save_state, error = None, None
+    try:
+        save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "preparing distributed HF checkpoint")
 
     # Filter fqn_to_index_mapping to only include keys that exist in save_state.
     # This is necessary when training excludes certain modules (e.g., MTP) but the original
@@ -238,6 +288,7 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
+    model: Optional[torch.nn.Module] = None,
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -245,7 +296,42 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    qwen4_model = is_qwen4_exp_model(model)
+    if qwen4_model:
+        validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
+    qwen4_gdn_fp32 = qwen4_model and expected_qwen4_gdn_layer_ids(qwen4_exp_model_config(model)) != set()
+    if ckpt_manager == "dcp" and save_checkpoint_path and os.path.isdir(save_checkpoint_path):
+        from torch.distributed.checkpoint import FileSystemReader
+
+        from veomni.checkpoint.dcp_checkpointer import (
+            _QWEN4_GDN_FP32_LEGACY_MARKER,
+            _QWEN4_GDN_FP32_MARKER,
+            read_qwen4_gdn_manifest,
+        )
+
+        metadata = FileSystemReader(save_checkpoint_path).read_metadata().state_dict_metadata
+        if (
+            f"model.{_QWEN4_GDN_FP32_LEGACY_MARKER}" in metadata
+            and f"model.{_QWEN4_GDN_FP32_MARKER}" not in metadata
+            and not (qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets))
+        ):
+            raise RuntimeError("Legacy Qwen4 GDN marker needs the Qwen4 model or model assets for export")
+
+        manifest = read_qwen4_gdn_manifest(save_checkpoint_path)
+        if manifest is not None:
+            actual = {name for name in model_state_dict if is_qwen4_gdn_parameter(name)}
+            if actual != manifest:
+                raise RuntimeError("Qwen4 GDN checkpoint inventory does not match model tensors")
+            qwen4_gdn_fp32 = True
+    if qwen4_gdn_fp32:
+        validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
+    save_model_weights(
+        save_hf_safetensor_path,
+        model_state_dict,
+        model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
+        legacy_fuse_fallback=True,
+    )
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -279,26 +365,29 @@ def save_hf_safetensor(
     """Save model weights in HuggingFace safetensors format.
 
     This function is self-contained w.r.t. synchronization: it calls ``synchronize()`` at
-    entry to flush pending GPU operations before reading tensor data, and calls
-    ``dist.barrier()`` before returning to ensure all ranks complete the save. Callers
-    do not need to add external synchronization around this function.
+    entry to flush pending device operations before reading tensor data. When
+    distributed is initialized, all ranks must call this function. The legacy
+    path coordinates the rank-0 export result on the default world group before
+    returning, even when a per-module parallel state is provided.
 
     Supports two modes:
-    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
-      for efficient distributed save directly from the live FSDP model. Must be called on all ranks.
-    - Legacy mode: Loads from checkpoint and converts to safetensors on rank 0.
+    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-NPU): Uses HuggingFaceStorageWriter
+      for efficient distributed save directly from the live FSDP model.
+    - Legacy mode, including NPU: Loads from checkpoint and converts to safetensors on rank 0.
 
     Args:
         save_hf_safetensor_path: Output path for saved HuggingFace safetensors.
-        ckpt_manager: Checkpoint manager type. Used for routing (distributed when "dcp")
-            and passed to legacy ``ckpt_to_state_dict``.
+        ckpt_manager: Checkpoint manager type. Used for routing and passed to legacy
+            ``ckpt_to_state_dict``. On NPU, "dcp" also uses the legacy path.
         model_assets: Model assets (e.g., config, tokenizer) to save alongside weights.
 
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
-            Required by non-dcp checkpoint managers (e.g., omnistore).
+            Only rank 0 reads, converts and writes the checkpoint in legacy mode.
+            When distributed is initialized, all ranks must call this function
+            to participate in the failure-coordination collective.
+            Set to true on the global rank 0 whenever the legacy path is selected.
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
@@ -322,15 +411,26 @@ def save_hf_safetensor(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
-        if is_rank_0:
-            _save_hf_safetensor_legacy(
-                save_checkpoint_path,
-                save_hf_safetensor_path,
-                model_assets,
-                ckpt_manager,
-                output_dir,
-            )
+        # A rank-0 export error must reach every participant before any rank
+        # proceeds. A plain barrier would strand peers when validation fails.
+        from veomni.utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if is_rank_0:
+                _save_hf_safetensor_legacy(
+                    save_checkpoint_path,
+                    save_hf_safetensor_path,
+                    model_assets,
+                    ckpt_manager,
+                    output_dir,
+                    model=model,
+                )
+        except BaseException as exc:
+            error = exc
+        group = dist.group.WORLD if dist.is_initialized() else None
+        raise_if_any_rank_failed(error, "rank-0 HuggingFace export", group=group)
+        return
 
     # Ensure all ranks finish saving before anyone proceeds
     if dist.is_initialized():
@@ -343,6 +443,7 @@ def save_lora_adapter_with_dcp(
     save_path: str,
     adapter_name: str = "default",
     dcp_subdir: str = ".lora_dcp_tmp",
+    parallel_state=None,
 ) -> None:
     """Save LoRA adapter with DCP parallel write and rank-0 consolidation.
 
@@ -357,8 +458,11 @@ def save_lora_adapter_with_dcp(
     MoE-LoRA adapter instead of every rank reading the whole gathered ``[E, ...]``
     tensor. ``load_adapter_state_dict`` already prefers ``adapter_model.safetensors``.
     """
+    from torch.distributed.tensor import Shard
+
+    from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
     from veomni.lora import is_veomni_lora_model
-    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.lora.state_dict import get_lora_state_dict, validate_lora_export_covers_trainable
 
     if not is_veomni_lora_model(model):
         raise TypeError(
@@ -366,16 +470,63 @@ def save_lora_adapter_with_dcp(
             "LoRA is served exclusively by the native veomni.lora stack."
         )
 
+    from ..checkpoint.dcp_checkpointer import (
+        _extra_parallel_layout_key,
+        _ExtraParallelSavePlanner,
+        _needs_extra_parallel_layout_marker,
+        _validate_extra_parallel_tensor_v2,
+    )
+    from .dist_utils import raise_if_any_rank_failed
+
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    lora_state, error = None, None
+    try:
+        lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
+        validate_lora_export_covers_trainable(model, lora_state)
+        if _needs_extra_parallel_layout_marker(fqn2spec_info):
+            _extra_parallel_layout_key(fqn2spec_info)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking LoRA ExtraParallel layout")
+
     synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     os.makedirs(save_path, exist_ok=True)
     dcp_save_path = os.path.join(save_path, dcp_subdir)
+    error = None
+    try:
+        qwen4_model = is_qwen4_exp_model(model)
+        for name, value in lora_state.items():
+            if qwen4_model and is_qwen4_gdn_parameter(name):
+                if value.dtype != torch.float32:
+                    raise RuntimeError(f"Qwen4 LoRA GDN parameter {name} must be FP32, got {value.dtype}")
+            elif value.dtype == torch.float32:
+                lora_state[name] = value.to(torch.bfloat16)
+        for name, value in lora_state.items():
+            spec = (fqn2spec_info or {}).get(name)
+            if spec is None and name.endswith(".weight"):
+                spec = (fqn2spec_info or {}).get(f"{name[: -len('.weight')]}.{adapter_name}.weight")
+            if (
+                spec is not None
+                and getattr(spec, "checkpoint_layout_v2", False)
+                and isinstance(spec.placement, Shard)
+                and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+            ):
+                mesh = spec.para_fsdp_mesh
+                _validate_extra_parallel_tensor_v2(
+                    value,
+                    mesh,
+                    mesh[mesh.mesh_dim_names[:-1]],
+                    spec.placement.dim,
+                    spec.fsdp_shard_dim,
+                    spec.global_shape,
+                )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking LoRA ExtraParallel runtime tensors")
     os.makedirs(dcp_save_path, exist_ok=True)
-
-    lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
-    lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
 
     # Restore the EP shard dim before DCP sees the LoRA tensors. After
     # ``ParallelPlan.apply`` the EP-sharded params are stored as plain
@@ -388,11 +539,10 @@ def save_lora_adapter_with_dcp(
     # as a 2-D (FSDP+EP) DTensor so DCP gathers both dimensions.
     # Mirrors what ``ModelState.get_state_dict_with_extra_parallel_dim_preprocess``
     # does for the regular checkpoint path.
-    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
     if fqn2spec_info is not None:
         from torch.distributed._tensor import Shard as _ShardPlacement
 
-        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim, restore_extra_parallel_dim_v2
 
         # ``get_peft_model_state_dict`` strips the adapter name from keys
         # (``...gate_proj.lora_A.default.weight`` -> ``...gate_proj.lora_A.weight``)
@@ -405,14 +555,29 @@ def save_lora_adapter_with_dcp(
             if spec is None and name.endswith(".weight"):
                 spec_key = f"{name[: -len('.weight')]}.{adapter_name}.weight"
                 spec = fqn2spec_info.get(spec_key)
-            if spec is not None and isinstance(spec.placement, _ShardPlacement) and spec.para_fsdp_mesh is not None:
-                lora_state[name] = restore_extra_parallel_dim(
-                    lora_state[name],
-                    spec.para_fsdp_mesh,
-                    spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
-                    ep_shard_dim=spec.placement.dim,
-                    fsdp_shard_dim=spec.fsdp_shard_dim,
-                )
+            if (
+                spec is not None
+                and isinstance(spec.placement, _ShardPlacement)
+                and spec.para_fsdp_mesh is not None
+                and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+            ):
+                if getattr(spec, "checkpoint_layout_v2", False):
+                    lora_state[name] = restore_extra_parallel_dim_v2(
+                        lora_state[name],
+                        spec.para_fsdp_mesh,
+                        spec.para_fsdp_mesh[spec.para_fsdp_mesh.mesh_dim_names[:-1]],
+                        ep_shard_dim=spec.placement.dim,
+                        fsdp_shard_dim=spec.fsdp_shard_dim,
+                        global_shape=spec.global_shape,
+                    )
+                else:
+                    lora_state[name] = restore_extra_parallel_dim(
+                        lora_state[name],
+                        spec.para_fsdp_mesh,
+                        spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                        ep_shard_dim=spec.placement.dim,
+                        fsdp_shard_dim=spec.fsdp_shard_dim,
+                    )
 
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
     # Prefix LoRA keys temporarily for DCP save so consolidation can reuse existing conversion logic.
@@ -424,36 +589,61 @@ def save_lora_adapter_with_dcp(
         single_file_per_rank=True,
         sync_files=False,
     )
+    planner, error = None, None
+    try:
+        single_process = (
+            dist.get_world_size() == 1 if dist.is_initialized() else os.environ.get("WORLD_SIZE", "1") == "1"
+        )
+        planner = _ExtraParallelSavePlanner(
+            parallel_state=(
+                parallel_state
+                if parallel_state is not None
+                else get_parallel_state()
+                if is_parallel_state_initialized() or single_process
+                else None
+            ),
+            source_model=model,
+            adapter_name=adapter_name,
+        )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "preparing the LoRA checkpoint save planner")
     dcp.save(
         state_dict=dcp_lora_state,
         storage_writer=storage_writer,
+        planner=planner,
     )
 
     if dist.is_initialized():
         dist.barrier()
 
     is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
-    if is_rank_0:
-        consolidated_state = ckpt_to_state_dict(
-            save_checkpoint_path=dcp_save_path,
-            ckpt_manager="dcp",
-        )
-        # safetensors needs contiguous, non-aliased tensors; consolidation returns
-        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
-        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
-        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
+    error = None
+    try:
+        if is_rank_0:
+            consolidated_state = ckpt_to_state_dict(
+                save_checkpoint_path=dcp_save_path,
+                ckpt_manager="dcp",
+            )
+            # safetensors needs contiguous, non-aliased tensors; consolidation returns
+            # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+            consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+            adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+            _save_state_dict(
+                consolidated_state, adapter_model_file, safe_serialization=True, legacy_fuse_fallback=True
+            )
 
-        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
-        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
-        # separate sidecar).
-        model.get_lora_config().save_pretrained(save_path)
+            # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+            # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+            # separate sidecar).
+            model.get_lora_config().save_pretrained(save_path)
 
-        shutil.rmtree(dcp_save_path, ignore_errors=True)
-        logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
-
-    if dist.is_initialized():
-        dist.barrier()
+            shutil.rmtree(dcp_save_path, ignore_errors=True)
+            logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+    except BaseException as exc:
+        error = exc
+    group = dist.group.WORLD if dist.is_initialized() else None
+    raise_if_any_rank_failed(error, "rank-0 LoRA adapter export", group=group)
 
     gc.collect()
     helper.empty_cache()

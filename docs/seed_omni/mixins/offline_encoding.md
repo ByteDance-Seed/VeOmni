@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1013),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1138),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 
@@ -371,7 +371,7 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L638).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2706).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2798).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):

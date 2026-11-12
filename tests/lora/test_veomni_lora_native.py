@@ -35,6 +35,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
@@ -71,6 +72,16 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
             if isinstance(module, LoraLinear):
                 for lin in module.lora_B.values():
                     lin.weight.normal_(0.0, 0.02)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_adapter_export_rejects_trainable_base_before_writing(tmp_path):
+    model = VeOmniLoraModel(Toy(), _base_config())
+    model.get_base_model().lin3.weight.requires_grad_(True)
+    path = tmp_path / "adapter"
+    with pytest.raises(ValueError, match="Adapter-only export would omit trainable parameters.*lin3"):
+        model.save_pretrained(str(path))
+    assert not path.exists()
 
 
 # ----------------------------------------------------------------------------

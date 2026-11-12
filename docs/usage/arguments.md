@@ -498,7 +498,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw", "qwen38_muon"]` | `"adamw"` | Optimizer type. The FP32 variants use FP32 master weights; `cpu_offload_adamw` supports selective CPU state offload. `muon` and [`qwen38_muon`](qwen38_muon.md) combine Muon with AdamW. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -524,7 +524,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
-| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
+| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). It cannot be combined with selective ExtraParallel parameter CPU offload. |
 | state_offload_device_memory_fraction | `float` | `0.8` | With `state_offload="cpu"`, fraction of currently free device memory used to size one streamed batch of optimizer states. It is recomputed every step; a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
 | state_offload_pin_memory | `bool` | `True` | With `state_offload="cpu"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
@@ -931,6 +931,7 @@ and is not intended to be captured by `torch.compile`.
 | hf_save_steps | `int` | `0` | Steps between HuggingFace weight saves. `0` to disable. |
 | hf_save_epochs | `int` | `0` | Epochs between HuggingFace weight saves. `0` to disable. |
 | save_hf_weights | `bool` | `True` | Save HuggingFace-format weights to the last checkpoint directory. |
+| extra_parallel_canonical_layout | `bool` | `False` | Opt in to versioned canonical EP/PLE model checkpoint layout. See [layout compatibility and migration restrictions](checkpoint.md#versioned-extraparallel-layout). |
 
 ### InferArguments
 

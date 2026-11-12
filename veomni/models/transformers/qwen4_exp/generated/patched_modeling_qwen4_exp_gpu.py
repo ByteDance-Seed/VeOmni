@@ -1426,7 +1426,7 @@ class Qwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self._veomni_fp32_expert_wgrad, self.use_swiglu_mlp = False, config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -1456,7 +1456,7 @@ class Qwen4ExpTextExperts(nn.Module):
             unused,
             self.down_proj,
             self.gate_up_proj,
-            num_experts=self.num_experts,
+            **dict(num_experts=self.num_experts, **({"fp32_wgrad": True} if self._veomni_fp32_expert_wgrad else {})),
         )
         # --- Patch.1 ---
 

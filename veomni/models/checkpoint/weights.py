@@ -18,16 +18,22 @@ Public entry points cover meta-device construction, safetensors / bin load,
 ExtraParallel slice streaming, rank-0 broadcast, and sharded save.
 """
 
+import errno
+import gc
 import itertools
 import json
 import math
 import os
 import re
+import shutil
+import stat
+import tempfile
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
@@ -37,7 +43,7 @@ try:
     from hdfs_io import copy  # for internal use only
 except ImportError:
     from veomni.utils.hdfs_io import copy
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
@@ -55,6 +61,15 @@ from veomni.models.checkpoint.convert import (
     checkpoint_converter_supports_expert_streaming,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
+)
+from veomni.models.qwen4_gdn_precision import (
+    has_qwen4_exp_assets,
+    is_qwen4_exp_config,
+    is_qwen4_gdn_parameter,
+    preserve_qwen4_gdn_fp32,
+    qwen4_bf16_hf_source_allowed,
+    qwen4_gdn_bf16_source_policy,
+    validate_qwen4_gdn_pairs,
 )
 from veomni.utils import logging
 from veomni.utils.device import get_device_type, synchronize
@@ -149,6 +164,128 @@ def init_empty_weights():
         nn.Module.register_parameter = old_register_parameter
 
 
+def _hf_read_cache_advice_enabled():
+    value = os.getenv("VEOMNI_HF_DROP_READ_CACHE", "0")
+    if value not in ("0", "1"):
+        # This is a best-effort memory hint, and individual loaders can run on
+        # only a subset of ranks. A local error here can strand peers in a model
+        # broadcast, so disable the hint rather than diverge on a typo.
+        logger.warning("VEOMNI_HF_DROP_READ_CACHE must be 0 or 1; disabling read-cache advice")
+        return False
+    return value == "1"
+
+
+def _release_hf_read_cache(paths):
+    """Optionally advise the OS that completed checkpoint reads can be evicted.
+
+    This is a hint only: it neither changes the files nor prevents future
+    reads. Each reader advises after it has finished loading so a slower rank
+    can still reread a page and release it when its own load completes.
+    """
+    enabled = _hf_read_cache_advice_enabled()
+    result = {"enabled": enabled, "attempted": 0, "succeeded": 0, "failed": 0}
+    if not enabled:
+        return result
+    paths = {os.fspath(path) for path in paths}
+    if not callable(getattr(os, "posix_fadvise", None)) or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        logger.warning("HF read cache advice is unavailable on this platform")
+        result["failed"] = len(paths)
+        return result
+
+    for path in sorted(paths):
+        result["attempted"] += 1
+        fd = None
+        error = None
+        try:
+            # Opening read-only also permits ordinary Hugging Face cache
+            # symlinks; fadvise never writes to the source checkpoint.
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("checkpoint shard is not a regular file")
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            error = exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    # A failed close must not be retried: the fd number may
+                    # already have been released and reused by another thread.
+                    error = error or exc
+        if error is None:
+            result["succeeded"] += 1
+        else:
+            result["failed"] += 1
+            if result["failed"] == 1:
+                logger.warning("HF read cache advice failed; checkpoint data remains intact: %s", error)
+    logger.info_rank0("HF read cache advice: %s", result)
+    return result
+
+
+_RESOLVED_BASE_CHECKPOINT_PATHS = ContextVar("veomni_resolved_base_checkpoint_paths", default=None)
+
+
+def _capture_hf_checkpoint_paths(mode):
+    """Capture the exact paths returned by a loader's first base resolver."""
+
+    def decorate(resolver):
+        @wraps(resolver)
+        def wrapped(*args, **kwargs):
+            resolved = resolver(*args, **kwargs)
+            capture = _RESOLVED_BASE_CHECKPOINT_PATHS.get()
+            if capture is not None and capture["mode"] == mode and capture["paths"] is None:
+                if mode == "ep":
+                    capture["paths"] = tuple(resolved[1].values())
+                else:
+                    capture["paths"] = tuple(iterator.filepath for iterator in resolved)
+            return resolved
+
+        return wrapped
+
+    return decorate
+
+
+def _advise_after_hf_load(mode):
+    """Apply optional read-cache advice only after the loader's frame exits."""
+
+    def decorate(loader):
+        @wraps(loader)
+        def wrapped(model, weights_path, *args, **kwargs):
+            if not _hf_read_cache_advice_enabled():
+                return loader(model, weights_path, *args, **kwargs)
+            distributed = dist.is_available() and dist.is_initialized()
+            capture = {"mode": "ep" if mode == "ep" else "standard", "paths": None}
+            token = _RESOLVED_BASE_CHECKPOINT_PATHS.set(capture)
+            try:
+                result = loader(model, weights_path, *args, **kwargs)
+            finally:
+                _RESOLVED_BASE_CHECKPOINT_PATHS.reset(token)
+            # The non-distributed broadcast path delegates to the decorated
+            # ordinary loader, which already performs the advice.
+            if mode == "broadcast" and not distributed:
+                return result
+            if mode == "broadcast" and dist.get_rank() != 0:
+                return result
+            try:
+                # Source tensor/slice references in the loader frame must be
+                # gone before DONTNEED can evict their mmap-backed pages.
+                gc.collect()
+                if capture["paths"] is None:
+                    logger.warning("No resolved HF base shards were recorded for cache advice")
+                    return result
+                _release_hf_read_cache(capture["paths"])
+            except Exception as error:
+                # Advice is optional and must not turn a completed load into a
+                # rank-local failure that strands distributed peers.
+                logger.warning("Unable to release completed HF read cache: %s", error)
+            return result
+
+        return wrapped
+
+    return decorate
+
+
 @dataclass
 class StateDictIterator:
     filepath: str
@@ -209,6 +346,7 @@ def _skip_without_loading_fn(
     return skip_key
 
 
+@_capture_hf_checkpoint_paths("standard")
 def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
@@ -274,8 +412,33 @@ def _dispatch_parameter(
     NOTE: FSDP module must use in-place operators.
     """
     full_param_name = name
+    strict_gdn = is_qwen4_exp_config(getattr(module, "config", None)) and is_qwen4_gdn_parameter(name)
     module, local_name = _find_submodule(module, name)
-    orig_tensor = module._parameters[local_name].data
+    # Keep the FSDP parameter and its local storage intact. A legacy .data
+    # alias can fail when native CPU offload pins a DTensor's local shard.
+    orig_tensor = module._parameters[local_name]
+    if strict_gdn:
+        if tensor.dtype == torch.bfloat16 and orig_tensor.dtype == torch.float32 and qwen4_bf16_hf_source_allowed():
+            logger.warning_once(
+                "Loading BF16 Qwen4 GDN source values as FP32 by explicit opt-in. "
+                "The BF16 values are represented exactly; any precision lost before loading is not recoverable."
+            )
+            tensor = tensor.float()
+        if tensor.dtype != torch.float32 or orig_tensor.dtype != torch.float32:
+            hint = ""
+            if (
+                tensor.dtype == torch.bfloat16
+                and orig_tensor.dtype == torch.float32
+                and dist.is_initialized()
+                and os.environ.get("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE") == "1"
+            ):
+                hint = " Distributed BF16 source opt-in requires a coordinated FSDP2 or rank-0 broadcast load."
+            raise RuntimeError(
+                f"Qwen4 GDN {full_param_name} requires FP32 source and target; "
+                f"got source={tensor.dtype}, target={orig_tensor.dtype}.{hint}"
+            )
+        if not tensor_is_local_dtensor_shard and tuple(tensor.shape) != tuple(orig_tensor.shape):
+            raise RuntimeError(f"Qwen4 GDN {full_param_name} source and target shapes differ")
 
     # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
@@ -407,6 +570,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
 
 
 @torch.no_grad()
+@_advise_after_hf_load("standard")
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
@@ -502,6 +666,7 @@ def load_model_weights(
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
+@_capture_hf_checkpoint_paths("ep")
 def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Resolve a (sharded) safetensors checkpoint for per-key streaming reads.
 
@@ -657,6 +822,7 @@ def _read_persistent_extra_parallel_slice(
 
 
 @torch.no_grad()
+@_advise_after_hf_load("ep")
 def load_model_weights_ep_sharded(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
@@ -1204,7 +1370,18 @@ def _stream_lora_adapter_ep_sharded(
     )
 
 
+def _coordinated_qwen4_gdn_source_policy(loader):
+    @wraps(loader)
+    def wrapped(model, *args, **kwargs):
+        with qwen4_gdn_bf16_source_policy(model):
+            return loader(model, *args, **kwargs)
+
+    return wrapped
+
+
 @torch.no_grad()
+@_advise_after_hf_load("broadcast")
+@_coordinated_qwen4_gdn_source_policy
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
@@ -1662,6 +1839,11 @@ def post_process_after_weight_loading(
     """
     parameter_names_left = parameter_names_left or set()
 
+    if is_qwen4_exp_config(getattr(model, "config", None)):
+        missing_gdn = sorted(name for name in parameter_names_left if is_qwen4_gdn_parameter(name))
+        if missing_gdn:
+            raise RuntimeError(f"Qwen4 checkpoint is missing required FP32 GDN parameters: {missing_gdn}")
+
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu)
     if parameter_names_left:
@@ -1730,6 +1912,7 @@ def _get_shard_info(
     save_dtype: Optional[Union[str, "torch.dtype"]],
     shard_size: int,
     safe_serialization: bool,
+    preserve_fp32_keys: Optional[set[str]] = None,
 ) -> Tuple[bool, int, Dict[str, str]]:
     """
     Gets the shard information, should be executed at rank 0.
@@ -1738,7 +1921,11 @@ def _get_shard_info(
     current_size, total_size = 0, 0
     current_shard, shard_list = [], []
     for name, tensor in state_dict.items():
-        dtype = _resolve_save_dtype(tensor, save_dtype)
+        dtype = (
+            tensor.dtype
+            if preserve_fp32_keys and name in preserve_fp32_keys
+            else _resolve_save_dtype(tensor, save_dtype)
+        )
         tensor_size = _get_tensor_save_size(tensor, dtype, safe_serialization)
         if current_size != 0 and current_size + tensor_size > shard_size:
             total_size += current_size
@@ -1772,15 +1959,59 @@ def _get_shard_info(
     return is_sharded, total_size, weight_map
 
 
+def _cleanup_safetensors_temp(path: str) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("Could not remove temporary safetensors directory %s: %s", path, error)
+
+
+def _save_legacy_safetensors(state_dict: Dict[str, "torch.Tensor"], path_to_save: "os.PathLike") -> None:
+    """Write a single HF shard, staging locally when serialization reports ENOSYS."""
+    destination_dir = os.path.dirname(os.path.abspath(path_to_save))
+    destination_stage = tempfile.mkdtemp(prefix=".veomni-safetensors-", dir=destination_dir)
+    temporary_path = os.path.join(destination_stage, "weights.safetensors")
+    try:
+        try:
+            save_file(state_dict, temporary_path, metadata={"format": "pt"})
+        except SafetensorError as error:
+            # The Rust exception has no errno attribute; restrict retry to ENOSYS.
+            if f"(os error {errno.ENOSYS})" not in str(error):
+                raise
+            logger.warning_once(
+                "safetensors direct save returned ENOSYS; staging one shard in the local temporary directory"
+            )
+            stage_dir = tempfile.mkdtemp(prefix="veomni-safetensors-")
+            try:
+                local_path = os.path.join(stage_dir, "weights.safetensors")
+                save_file(state_dict, local_path, metadata={"format": "pt"})
+                permissions = stat.S_IMODE(os.stat(local_path).st_mode)
+                temporary_path = os.path.join(destination_stage, "fallback.safetensors")
+                descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, permissions)
+                with os.fdopen(descriptor, "wb") as target, open(local_path, "rb") as source:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            finally:
+                _cleanup_safetensors_temp(stage_dir)
+        os.replace(temporary_path, path_to_save)
+    finally:
+        _cleanup_safetensors_temp(destination_stage)
+
+
 def _save_state_dict(
     state_dict: Dict[str, "torch.Tensor"],
     path_to_save: "os.PathLike",
     safe_serialization: bool,
+    *,
+    legacy_fuse_fallback: bool = False,
 ) -> None:
     """
     Save function.
     """
-    if safe_serialization:
+    if safe_serialization and legacy_fuse_fallback:
+        _save_legacy_safetensors(state_dict, path_to_save)
+    elif safe_serialization:
         save_file(state_dict, path_to_save, metadata={"format": "pt"})
     else:
         torch.save(state_dict, path_to_save)
@@ -1795,12 +2026,16 @@ def save_model_weights(
     shard_size: int = 5_000_000_000,
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
+    qwen4_gdn_fp32: bool = False,
+    legacy_fuse_fallback: bool = False,
 ) -> None:
     """
     Saves full model weights. The model parameters should be either tensor or dtensor.
 
     If global_rank is given, it will assume it is executed on all ranks.
     """
+    if legacy_fuse_fallback and global_rank is not None:
+        raise ValueError("legacy_fuse_fallback requires a rank-0-only export")
     if output_dir.startswith("hdfs://"):
         hdfs_dir = output_dir
         hdfs_upper_dir = output_dir.rstrip("/")
@@ -1811,7 +2046,33 @@ def save_model_weights(
 
     os.makedirs(output_dir, exist_ok=True)
     save_dtype = _normalize_save_dtype(save_dtype)
-    is_sharded, total_size, weight_map = _get_shard_info(state_dict, save_dtype, shard_size, safe_serialization)
+    if qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets):
+        qwen4_config = next((asset for asset in model_assets or () if is_qwen4_exp_config(asset)), None)
+        validate_qwen4_gdn_pairs(state_dict, qwen4_config)
+        invalid = [
+            name
+            for name, tensor in state_dict.items()
+            if is_qwen4_gdn_parameter(name) and tensor.dtype != torch.float32
+        ]
+        if invalid:
+            raise RuntimeError(f"Cannot export non-FP32 Qwen4 GDN parameters without explicit migration: {invalid}")
+    elif not any(getattr(asset, "model_type", None) for asset in model_assets or ()) and any(
+        is_qwen4_gdn_parameter(name)
+        and tensor.is_floating_point()
+        and _resolve_save_dtype(tensor, save_dtype) != tensor.dtype
+        for name, tensor in state_dict.items()
+    ):
+        logger.warning_rank0(
+            "GDN model identity is unknown; provide Qwen4 model assets or qwen4_gdn_fp32 to preserve precision."
+        )
+    preserve_fp32_keys = (
+        {name for name in state_dict if is_qwen4_gdn_parameter(name)}
+        if qwen4_gdn_fp32 or preserve_qwen4_gdn_fp32(model_assets)
+        else set()
+    )
+    is_sharded, total_size, weight_map = _get_shard_info(
+        state_dict, save_dtype, shard_size, safe_serialization, preserve_fp32_keys
+    )
     full_state_dict = OrderedDict()
     prev_file_name = None
     for name, tensor in state_dict.items():
@@ -1820,13 +2081,18 @@ def save_model_weights(
         else:
             tensor = tensor.data
 
-        target_dtype = _resolve_save_dtype(tensor, save_dtype)
+        target_dtype = tensor.dtype if name in preserve_fp32_keys else _resolve_save_dtype(tensor, save_dtype)
         if tensor.dtype != target_dtype:
             tensor = tensor.to(dtype=target_dtype)
 
         if prev_file_name is not None and weight_map[name] != prev_file_name:
             if global_rank is None or global_rank == 0:
-                _save_state_dict(full_state_dict, os.path.join(output_dir, prev_file_name), safe_serialization)
+                _save_state_dict(
+                    full_state_dict,
+                    os.path.join(output_dir, prev_file_name),
+                    safe_serialization,
+                    legacy_fuse_fallback=legacy_fuse_fallback,
+                )
                 full_state_dict = OrderedDict()
 
             empty_cache()
@@ -1842,7 +2108,12 @@ def save_model_weights(
 
     if global_rank is None or global_rank == 0:
         if len(full_state_dict):
-            _save_state_dict(full_state_dict, os.path.join(output_dir, prev_file_name), safe_serialization)
+            _save_state_dict(
+                full_state_dict,
+                os.path.join(output_dir, prev_file_name),
+                safe_serialization,
+                legacy_fuse_fallback=legacy_fuse_fallback,
+            )
 
         if is_sharded:
             index = {

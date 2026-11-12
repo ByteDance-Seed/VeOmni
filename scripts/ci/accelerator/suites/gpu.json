@@ -1,8 +1,23 @@
 [
   {
+    "name": "qwen38-lora-export-guard-cpu",
+    "suite": "unit",
+    "args": ["-s", "-x", "tests/lora/test_veomni_lora_native.py::test_adapter_export_rejects_trainable_base_before_writing"]
+  },
+  {
+    "name": "device-api-scoped-exceptions-unit",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/special_sanity/test_device_api_usage.py"]
+  },
+  {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
-    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_dist_utils_group.py"
+    ]
   },
   {
     "name": "01-unit",
@@ -41,6 +56,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "gpu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
     ]
   },
   {
@@ -460,6 +485,16 @@
     ]
   },
   {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
+    ]
+  },
+  {
     "name": "43-unit",
     "suite": "unit",
     "conditional": false,
@@ -667,6 +702,42 @@
       "-s",
       "-x",
       "tests/optim/test_swap_adamw_device.py"
+    ]
+  },
+  {
+    "name": "qwen38-cpu-offload-adamw-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_cpu_offload_adamw.py",
+      "tests/optim/test_cpu_offload_adamw_device.py",
+      "tests/optim/test_master_fp32_adamw.py"
+    ]
+  },
+  {
+    "name": "qwen38-muon-checkpoint-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_qwen38_muon.py",
+      "tests/optim/test_qwen38_muon_device.py",
+      "tests/optim/test_qwen38_muon_dormant_checkpoint.py",
+      "tests/optim/test_qwen38_cuda_preflight.py",
+      "tests/optim/test_qwen38_muon_distributed_builder.py",
+      "tests/optim/test_ple_world_profile.py",
+      "tests/optim/test_qwen38_fileback_current_dcp.py",
+      "tests/optim/test_file_backed_state.py"
+    ]
+  },
+  {
+    "name": "qwen38-muon-cuda-native-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_qwen38_cuda_native.py"
     ]
   }
 ]
