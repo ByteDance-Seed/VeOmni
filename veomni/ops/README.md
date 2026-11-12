@@ -43,18 +43,20 @@ when the selected implementation runs.
 | Op | Variants | Implementations |
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
-| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
+| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit`, `bagel` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
+| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (FP8 QAT) is `standard` only |
+| `linear` | `standard`, `grouped` | `eager`, `qat` (FP8 QAT). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (FP8/FP4 QAT), `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm, FP8 E4M3); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
@@ -117,11 +119,19 @@ uv sync --extra gpu --extra magi --dev
 
 The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
 for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
-Its hidden states and expert weights remain BF16; routing weights retain their
-supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+Its hidden states and weight interface remain BF16; optional FSDP2
+`expert_weight_fp8_all_gather` supplies block-quantized expert payloads directly. Routing
+weights retain their supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
 gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
 Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
 for dependency installation, configuration, precision and distributed coverage.
+
+The common EP combine uses the registered `moe_unpermute/standard` op:
+`triton` on NVIDIA GPUs and `eager` elsewhere or in deterministic mode. It accepts routed tokens
+`[R,H]`, route weights `[R]`, valid destination indices `[R]`, and the output
+token count. The Triton implementation fuses weighting with FP32 scatter
+accumulation and computes both token and router-weight gradients without
+expanded intermediate tensors. This optimization also applies to BF16 GEMMs.
 
 ## Registering an op
 

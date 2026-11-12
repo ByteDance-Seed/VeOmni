@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -18,7 +23,9 @@
       "-x",
       "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence",
       "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence",
-      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence"
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_hybrid",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py::test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_hybrid"
     ]
   },
   {
@@ -448,6 +455,38 @@
       "-s",
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "npu-unit-42",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_get_compute_units.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
     ]
   }
 ]

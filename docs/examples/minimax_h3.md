@@ -190,6 +190,30 @@ train:
 
 ## Packed Offline Training
 
+For full-parameter offline H3 training, the existing `mfu` metric estimates
+useful model FLOPs from the valid packed positions and each sample's text length.
+Legacy tail padding is excluded. For direct calls to `VeomniFlopsCounter.estimate_flops`,
+nonempty H3 batches require `model_metadata={"h3_text_seqlens": lengths}`: one
+nonnegative text-refiner length per sample, in the same order as `batch_seqlens`
+and no greater than its main length.
+
+The estimate includes the main DiT and text-refiner projection and attention
+operations. It excludes activation-checkpoint recomputation, CFG's extra forward,
+and smaller operations, and is not a device-profiler measurement. H3 LoRA uses
+the existing unsupported-model zero-FLOPs fallback. Inputs without usable packed
+lengths contribute no FLOPs; other available inputs and ranks are still counted.
+Thus missing metadata can make the reported MFU an underestimate. Online encoding
+may construct `packed` only after the meter runs, resulting in zero MFU when no
+rank has usable lengths.
+
+For the model-specific FLOPs metadata callback contract, see:
+
+```{toctree}
+:maxdepth: 1
+
+../design/flops_metadata_callback.md
+```
+
 With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
 Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
 audio) use `process_condition(**batch) → model(**batch)` and return sample-mean

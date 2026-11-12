@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.ops.moe_experts.reference import standard_ep_reference
 from tests.ops.tol import (
     MOE_EP_PRE_SM90_ATOL,
@@ -36,9 +37,13 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
 )
 from tests.ops.utils import assert_close_with_error, assert_reference_signal
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
+
+
+_EP_DISPATCH_PLAN = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _skip_if_unsupported():
@@ -617,3 +622,93 @@ def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float
         rtol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
         atol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     )
+
+
+def _distributed_standard_ep_worker(rank, merged, endpoint):
+    """Compare real token exchange and every gradient with a non-EP replica."""
+    import torch.distributed as dist
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+    from veomni.ops import resolve_op
+
+    world = _EP_DISPATCH_PLAN.nproc
+    get_torch_device().set_device(rank)
+    dist.init_process_group("nccl", store=endpoint.connect(), rank=rank, world_size=world)
+    try:
+        device = torch.device(get_device_type(), rank)
+        generator = torch.Generator().manual_seed(20261105)
+        tokens, experts, hidden, intermediate, top_k = 128, 4, 512, 256, 2
+
+        def random(shape):
+            return (0.1 * torch.randn(shape, generator=generator)).to(device=device, dtype=torch.bfloat16)
+
+        inputs = random((world, tokens, hidden))[rank]
+        gate = random((experts, intermediate, hidden))
+        up = random((experts, intermediate, hidden))
+        down = random((experts, hidden, intermediate))
+        upstream = random((world, tokens, hidden))[rank]
+        ids = torch.arange(tokens, device=device)
+        routes = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
+        routing = torch.tensor([0.75, 0.25], device=device, dtype=torch.float32).expand(tokens, top_k).contiguous()
+        full_weights = [torch.cat((gate, up), dim=1), down] if merged else [gate, up, down]
+        reference_weights = [w.detach().clone().requires_grad_() for w in full_weights]
+        local_experts = experts // world
+        local_weights = [
+            w[rank * local_experts : (rank + 1) * local_experts].detach().clone().requires_grad_()
+            for w in full_weights
+        ]
+        reference_input = inputs.detach().clone().requires_grad_()
+        actual_input = inputs.detach().clone().requires_grad_()
+        reference_routing = routing.detach().clone().requires_grad_()
+        actual_routing = routing.detach().clone().requires_grad_()
+        empty = torch.empty(0, device=device, dtype=torch.bfloat16)
+        fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+
+        def forward(x, weights, scores):
+            if merged:
+                return fused(x, scores, routes, empty, empty, weights[1], weights[0], num_experts=experts)
+            return fused(x, scores, routes, weights[0], weights[1], weights[2], empty, num_experts=experts)
+
+        nonep_state = _init_parallel_state(dp_size=world, device_type=get_device_type(), name="schedule_nonep")
+        ep_state = _init_parallel_state(
+            dp_size=world, device_type=get_device_type(), extra_parallel_sizes=(world,), name="schedule_ep"
+        )
+        with use_parallel_state(nonep_state):
+            expected = forward(reference_input, reference_weights, reference_routing)
+            reference_grads = torch.autograd.grad(
+                expected, [reference_input, reference_routing, *reference_weights], upstream
+            )
+        with use_parallel_state(ep_state):
+            actual = forward(actual_input, local_weights, actual_routing)
+            actual_grads = torch.autograd.grad(actual, [actual_input, actual_routing, *local_weights], upstream)
+
+        # Finish all collectives before any assertion can send a peer to cleanup.
+        weight_pairs = []
+        names = ["fc1 gradient", "fc2 gradient"] if merged else ["fc1_1 gradient", "fc1_2 gradient", "fc2 gradient"]
+        for name, observed, full_grad in zip(names, actual_grads[2:], reference_grads[2:], strict=True):
+            full = full_grad.float()
+            dist.all_reduce(full, op=dist.ReduceOp.SUM)
+            target = full[rank * local_experts : (rank + 1) * local_experts].to(observed.dtype)
+            weight_pairs.append((name, observed, target))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=_ep_atol())
+        _assert_ep_reference_grads(
+            [
+                ("hidden gradient", actual_grads[0], reference_grads[0]),
+                ("routing gradient", actual_grads[1], reference_grads[1]),
+                *weight_pairs,
+            ],
+            *_ep_gradient_tolerances(None),
+        )
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
+@pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
+def test_distributed_standard_ep_dispatch_matches_nonep(merged):
+    """Exercise the compact expert schedule behind real all-to-all dispatch."""
+    _skip_if_unsupported()
+    if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
+        pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
+    spawn_with_rendezvous(_distributed_standard_ep_worker, args=(merged,), nprocs=_EP_DISPATCH_PLAN.nproc)

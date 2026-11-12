@@ -30,12 +30,9 @@ scale up, so ``x / scale`` stays inside the representable FP8 range and no
 element sits in a saturated region whose gradient would have to be masked.
 
 Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU.
-``qat_linear(..., enabled=False)`` calls the original module directly and
-bypasses quantization and those restrictions.
 """
 
 import torch
-from torch import nn
 from torch.distributed.tensor import DTensor
 
 from ._hardware import require_tilelang_sm90
@@ -53,7 +50,6 @@ __all__ = [
     "fp8_fake_quant_act_prefix",
     "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
-    "qat_linear",
 ]
 
 
@@ -239,48 +235,3 @@ def fp8_fake_quant_stacked_weight(
         raise ValueError(f"per-expert weight shape {(rows, cols)} is not divisible by block_size {block_size}")
     flat = _Fp8FakeQuantWeight.apply(weight.reshape(experts * rows, cols), block_size, scale_fmt)
     return flat.view(experts, rows, cols)
-
-
-def qat_linear(
-    linear: nn.Module,
-    x: torch.Tensor,
-    *,
-    enabled: bool = True,
-    quantize_activation: bool = True,
-    act_block_size: int = 128,
-    weight_block_size: int = 128,
-    scale_fmt: str | None = DEFAULT_SCALE_FMT,
-) -> torch.Tensor:
-    """Run ``linear`` with FP8 fake-quantized operands.
-
-    This is the single substitution point for every linear that an FP8
-    inference kernel would run as a true FP8 GEMM. With ``enabled=False`` it is
-    the identity wrapper over ``linear(x)``, so a call site can be converted
-    once and stay valid whether or not QAT is switched on.
-
-    ``linear`` is invoked through its own ``forward``, so layers that are not a
-    plain ``F.linear`` -- DeepSeek-V4's grouped output projection runs a
-    ``bmm`` over reshaped weights -- keep their arithmetic.
-
-    Args:
-        linear: Any module exposing a ``weight`` parameter, typically an
-            ``nn.Linear`` or a subclass of one.
-        x: BF16 input activation.
-        enabled: When false, bypass quantization entirely.
-        quantize_activation: Whether the activation operand is quantized too.
-            False gives a weight-only (W8A16) round trip.
-        act_block_size: Activation block size, along the last dimension.
-        weight_block_size: Side length of the square weight tile.
-        scale_fmt: See :func:`fp8_fake_quant_act`.
-    """
-    if not enabled:
-        return linear(x)
-    if "weight" not in linear._parameters:
-        raise TypeError(f"{type(linear).__name__} does not own a 'weight' parameter, so it cannot be fake-quantized")
-    if quantize_activation:
-        x = fp8_fake_quant_act(x, act_block_size, scale_fmt)
-    weight = fp8_fake_quant_weight(linear.weight, weight_block_size, scale_fmt)
-    # `functional_call` swaps the parameter for the duration of the call and
-    # restores it afterwards, so the fake-quantized weight reaches the module's
-    # own forward while gradients still flow back to the real parameter.
-    return torch.func.functional_call(linear, {"weight": weight}, (x,))

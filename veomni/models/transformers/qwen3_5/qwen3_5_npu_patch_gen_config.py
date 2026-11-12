@@ -70,7 +70,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
@@ -84,7 +84,7 @@ config = PatchConfig(
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
@@ -116,9 +116,12 @@ config.add_import(
 )  # noqa: F401
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3_5TextModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -141,7 +144,6 @@ sp_pad_and_slice = None
 # Names referenced by the patched Qwen3_5TextModel.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 DynamicCache = None
-create_causal_mask = None
 Qwen3_5ModelOutputWithPast = None
 
 # Same GPU VisionAttention.forward consumer: bind ``self.veomni_attn`` via
@@ -502,14 +504,7 @@ def qwen3_5_decoder_layer_forward_patched(
             shared_prefix_plan=shared_prefix_plan,
         )
     elif self.block_type == "full_attention":
-        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
-        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=attn_impl.impl if attn_impl is not None else "eager",
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
+        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -517,7 +512,7 @@ def qwen3_5_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **attn_kwargs,
+            **kwargs,
         )
 
     hidden_states = residual + hidden_states
@@ -598,10 +593,15 @@ def qwen3_5_text_model_forward_patched(
             "past_key_values": past_key_values,
             "position_ids": text_position_ids,
         }
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-        }
+        # --- Patch.1 ---
+        # Only build the mask for layer types present in ``self.config.layer_types``
+        # and forward ``**kwargs`` into ``create_causal_mask`` for packed sequences.
+        causal_mask_mapping = {}
+        if "full_attention" in self.config.layer_types:
+            causal_mask_mapping["full_attention"] = create_causal_mask(**{**kwargs, **mask_kwargs})
+        if "linear_attention" in self.config.layer_types:
+            causal_mask_mapping["linear_attention"] = create_recurrent_attention_mask(**mask_kwargs)
+        # --- Patch.1 ---
 
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
