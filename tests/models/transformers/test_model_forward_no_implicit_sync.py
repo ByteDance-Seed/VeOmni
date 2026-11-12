@@ -135,6 +135,7 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
     "qwen3_vl_moe-fa2-fused": "fused_triton",
     "qwen3_omni_moe-fa2-fused": "fused_triton",
+    "minimax_m3_vl-fa2-fused": "fused_triton",
 }
 
 
@@ -301,6 +302,9 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # MiniMax's collator hook supplies image/video grid lists, so the patched
+    # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
+    "minimax_m3_vl-fa2-fused": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -326,6 +330,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2-fused",
 }
 
 
@@ -670,6 +675,30 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"That function no longer issues a sync — drop the entry."
             )
         raise AssertionError(f"[{case.case_id}]\n" + "\n\n".join(problems))
+
+
+@pytest.mark.parametrize("variant", ["gpu", "npu"])
+def test_minimax_m3_vl_vision_rope_grid_list_has_no_implicit_sync(variant):
+    """Host grid metadata must not cause a GPU readback or blocking coordinate upload."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    modeling = importlib.import_module(
+        f"veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_{variant}"
+    )
+    device = get_device_type()
+    grid_list = [[1, 4, 6], [3, 6, 4]]
+    grid = torch.tensor(grid_list, device=device)
+    rope = modeling.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=2)
+    expected = rope(grid, device, torch.float32)
+    synchronize()
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        actual = rope(grid, device, torch.float32, grid_thw_list=grid_list)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result, ref, rtol=0, atol=0)
 
 
 # Cases the equivalence test below covers: every multimodal-metadata-wired

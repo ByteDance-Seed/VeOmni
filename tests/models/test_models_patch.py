@@ -279,6 +279,7 @@ MODEL_TO_DATASET = {
     "qwen2_5_vl": "qwen2vl",
     "qwen2_5_omni": "qwen2omni",
     "qwen3_omni_moe": "qwen3omni",
+    "minimax_m3_vl": "minimax_m3_vl",
 }
 
 
@@ -494,6 +495,7 @@ TEST_CASES = [
     pytest.param("deepseek_v3_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="deepseek_v3"),
     pytest.param("glm_moe_dsa_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="glm_moe_dsa"),
     pytest.param("deepseek_v4_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="deepseek_v4"),
+    pytest.param("minimax_m3_vl_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="minimax_m3_vl"),
 ]
 
 
@@ -535,6 +537,14 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
             ModelMode("veomni", "eager", moe_implementation=_FUSED_MOE_IMPL),
         ]
 
+    if case_id == "minimax_m3_vl":
+        # Upstream MiniMax M3 VL runs Flash Attention only through MiniMax's own
+        # Hub kernel and does not pack sequences, so the HF reference runs eager
+        # attention. VeOmni runs the dense language layers and the ViT on the
+        # selected varlen backend and the sparse layers on the packed MiniMax
+        # sparse attention ops, so the default VeOmni mode grid still applies.
+        hf_modes = [ModelMode("hf", "eager")]
+
     if case_id in ("qwen3_5", "qwen3_5_moe"):
         if IS_NPU_AVAILABLE:
             pytest.skip("Qwen3.5 GatedDeltaNet keeps the fla default, which this case does not run on NPU")
@@ -575,9 +585,11 @@ def test_models_patch_fwd_bwd(
     built_config = trainer.model.model_config
     trainer._release_model()
 
-    # Upstream DeepSeek-V4 eager attention ignores packed cu-seqlens, so two packed
-    # samples would compare different attention semantics; keep V4 to one sequence.
-    num_samples = 1 if case_id == "deepseek_v4" else 2
+    # Upstream DeepSeek-V4 and MiniMax M3 VL eager attention ignore packed cu-seqlens,
+    # so two packed samples would compare different attention semantics; keep them to
+    # one sequence. MiniMax per-sample isolation is covered by
+    # ``test_minimax_m3_vl_packed_attention_matches_separate_samples``.
+    num_samples = 1 if case_id in ("deepseek_v4", "minimax_m3_vl") else 2
     features = prepare_data(case_id, max_seq_len=1024, model_config=built_config, num_samples=num_samples)
 
     results: dict[ModelMode, dict[str, Any]] = {}

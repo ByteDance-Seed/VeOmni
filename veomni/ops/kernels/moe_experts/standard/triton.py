@@ -26,7 +26,7 @@ from torch import Tensor
 from .....distributed.parallel_state import get_parallel_state
 from ..shared import swiglu
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
-from ..shared.swiglu import apply_swiglu_clamp
+from ..shared.swiglu import apply_swiglu_clamp, swiglu_activation, swiglu_activation_backward
 
 
 class TritonFusedMoeExpertFunction(torch.autograd.Function):
@@ -365,8 +365,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc2_weight,
         swiglu_limit=None,
         assume_distinct_experts=False,
+        swiglu_alpha=None,
     ):
-        """Scatter, merged fc1 GEMM, SwiGLU, fc2, gather."""
+        """Scatter, merged fc1 GEMM, SwiGLU (or SwiGLU-OAI), fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
@@ -404,7 +405,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+        if swiglu_alpha is None:
+            fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+        else:
+            fc1_activation = swiglu_activation(fc1_1_output, fc1_2_output, swiglu_alpha)
 
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -427,6 +431,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
@@ -470,12 +475,14 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
         tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
+        swiglu_alpha = ctx.swiglu_alpha
         max_expert_tokens = ctx.max_expert_tokens
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_activation = fc1_1_activation * fc1_2_output
+        fc1_activation, fc1_1_activation = swiglu_activation(
+            fc1_1_output, fc1_2_output, swiglu_alpha, return_gate_activation=True
+        )
 
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -520,13 +527,11 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             )
         del fc1_activation, grad_fc2_output
 
-        # MOE Step 7
-        grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
-
-        # MOE Step 5
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        del fc1_1_activation, grad_fc1_activation, grad_fc1_1_activation
+        # MOE Step 7 + 5: gated-activation backward
+        grad_fc1_1_output, grad_fc1_2_output = swiglu_activation_backward(
+            grad_fc1_activation, fc1_1_output, fc1_2_output, swiglu_alpha, fc1_1_activation
+        )
+        del fc1_1_activation, grad_fc1_activation
 
         # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
         if swiglu_limit is not None:
@@ -579,6 +584,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
             None,  # assume_distinct_experts
+            None,  # swiglu_alpha
         )
 
 
@@ -593,6 +599,7 @@ def group_gemm_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    swiglu_alpha: float | None = None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -620,7 +627,13 @@ def group_gemm_fused_moe_forward(
     ``False`` uses ``T * top_k``. Eligible eager split/merged execution uses a
     device tile prefix without a host scalar read, including EP-local GEMMs.
     This flag does not change EP's original fallback row bounds.
+
+    ``swiglu_alpha``: switches the gated activation to SwiGLU-OAI
+    (``(up + 1) * gate * sigmoid(alpha * gate)``, MiniMax M3). Only the merged
+    ``fc1_1_2_weight`` paths implement it.
     """
+    if swiglu_alpha is not None and fc1_1_2_weight is None:
+        raise ValueError("SwiGLU-OAI (swiglu_alpha) requires the merged fc1_1_2_weight.")
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
@@ -639,6 +652,7 @@ def group_gemm_fused_moe_forward(
                 fc1_1_2_weight,
                 fc2_weight,
                 swiglu_limit,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -667,6 +681,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 swiglu_limit,
                 assume_distinct_experts,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
