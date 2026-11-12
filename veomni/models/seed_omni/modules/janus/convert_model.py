@@ -2,7 +2,7 @@
 
 Registered under ``OMNI_CONVERT_REGISTRY["janus"]`` (HF) and
 ``["multi_modality"]`` (DeepSeek); :func:`convert_checkpoint` writes the omni
-checkpoint. Graphs come from ``configs/seed_omni/Janus/janus_1.3b/``.
+checkpoint. Graphs come from ``configs/seed_omni/Janus/janus/``.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     from veomni.models.seed_omni.modules import read_hf_model_type
 
     training_graphs, generation_graphs = load_family_graphs(
-        "configs/seed_omni/Janus/janus_1.3b",
+        "configs/seed_omni/Janus/janus",
         training="train/graph_train.yaml",
         generation={
             "infer_gen": "infer/graph_infer_gen.yaml",
